@@ -148,6 +148,34 @@ impl EditorState {
         }
     }
 
+    pub fn delete_word_backward(&mut self) {
+        if self.column == 0 {
+            self.backspace();
+            return;
+        }
+
+        let end_column = self.column;
+        self.move_word_left();
+        let line = &mut self.lines[self.row];
+        let start = char_to_byte(line, self.column);
+        let end = char_to_byte(line, end_column);
+        line.replace_range(start..end, "");
+        self.mark_changed();
+    }
+
+    pub fn delete_to_line_start(&mut self) {
+        if self.column == 0 {
+            self.backspace();
+            return;
+        }
+
+        let line = &mut self.lines[self.row];
+        let end = char_to_byte(line, self.column);
+        line.replace_range(..end, "");
+        self.column = 0;
+        self.mark_changed();
+    }
+
     pub fn delete(&mut self) {
         let line_len = self.lines[self.row].chars().count();
         if self.column < line_len {
@@ -469,5 +497,17 @@ mod tests {
         editor.insert_char('$');
 
         assert_eq!(editor.text(), "^first\nsecond$");
+    }
+
+    #[test]
+    fn deletes_by_word_and_to_the_line_start() {
+        let mut editor = EditorState::default();
+        editor.set_text("one two.three");
+        editor.delete_word_backward();
+        assert_eq!(editor.text(), "one two.");
+        editor.delete_word_backward();
+        assert_eq!(editor.text(), "one two");
+        editor.delete_to_line_start();
+        assert!(editor.is_blank());
     }
 }

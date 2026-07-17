@@ -10,6 +10,7 @@ use crate::{
     },
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
+    handoff::HandoffPackage,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
     session::{ProviderRecord, SessionRecord},
     transcript::{EntryKind, EntryStatus, Transcript},
@@ -58,6 +59,16 @@ struct OutgoingPrompt {
     id: String,
     text: String,
     model: Option<String>,
+    handoff: Option<HandoffPackage>,
+}
+
+impl OutgoingPrompt {
+    fn wire_text(&self) -> String {
+        self.handoff.as_ref().map_or_else(
+            || self.text.clone(),
+            |handoff| handoff.render_with_prompt(&self.text),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,6 +170,7 @@ pub struct AppState {
     pending_session_prompt: Option<OutgoingPrompt>,
     starting_turn: Option<OutgoingPrompt>,
     pending_steer: Option<PendingSteer>,
+    pending_handoff: Option<HandoffPackage>,
     resuming_session: Option<SessionRecord>,
     startup_resume: Option<String>,
     item_turns: HashMap<String, String>,
@@ -241,6 +253,7 @@ impl AppState {
             pending_session_prompt: None,
             starting_turn: None,
             pending_steer: None,
+            pending_handoff: None,
             resuming_session: None,
             startup_resume: None,
             item_turns: HashMap::new(),
@@ -380,6 +393,7 @@ impl AppState {
             self.status_message = format!("{} does not support session resume.", self.backend_name);
             return Vec::new();
         }
+        self.pending_handoff = None;
         let old_provider_session = self.provider_session_id.clone();
         self.resuming_session = Some(session.clone());
         self.session_picker = None;
@@ -587,6 +601,7 @@ impl AppState {
         self.pending_session_prompt = None;
         self.starting_turn = None;
         self.pending_steer = None;
+        self.pending_handoff = None;
         self.resuming_session = None;
         self.item_turns.clear();
         self.approvals.clear();
@@ -808,13 +823,47 @@ impl AppState {
             .copied()
             .cloned();
         if let Some(selected) = selected {
+            let provider_changed = selected.provider != self.backend_provider;
+            let source_provider = self.backend_provider.clone();
+            let source_name = self.backend_name.clone();
+            let source_model = self.selected_model.clone();
+            let source_session = self.provider_session_id.clone();
+            let target_name = self
+                .provider_contexts
+                .get(&selected.provider)
+                .map_or_else(|| selected.provider.clone(), |context| context.name.clone());
+            let handoff = provider_changed.then(|| {
+                HandoffPackage::from_transcript(
+                    source_provider.clone(),
+                    source_model,
+                    source_session,
+                    selected.provider.clone(),
+                    self.transcript.entries(),
+                )
+            });
             if !self.activate_provider(&selected.provider) {
                 return Vec::new();
+            }
+            if provider_changed {
+                self.provider_session_id = None;
+                self.session_id = None;
+                self.pending_handoff = handoff.flatten();
+                self.sync_active_provider_context();
+                if self.pending_handoff.is_some() {
+                    self.transcript.push(
+                        EntryKind::System,
+                        format!("HANDOFF · {source_name} → {target_name}"),
+                        "The next message will continue in a fresh provider-native session.",
+                        EntryStatus::Complete,
+                    );
+                }
             }
             let active = self.active_turn.is_some();
             let qualified = selected.qualified_id();
             self.selected_model = Some(qualified.clone());
-            self.status_message = if active {
+            self.status_message = if provider_changed && self.pending_handoff.is_some() {
+                format!("Selected {qualified}. The next message includes a continuity handoff.")
+            } else if active {
                 format!("Next model: {qualified}. The active turn is unchanged.")
             } else {
                 format!("Selected model: {qualified}.")
@@ -1371,6 +1420,7 @@ impl AppState {
                 .is_supported()
                 .then(|| self.selected_model_for_active_provider())
                 .flatten(),
+            handoff: self.pending_handoff.take(),
         };
         self.transcript.upsert(
             format!("user:{}", prompt.id),
@@ -1409,12 +1459,13 @@ impl AppState {
         prompt: OutgoingPrompt,
         provider_session_id: String,
     ) -> Vec<Effect> {
+        let wire_text = prompt.wire_text();
         self.starting_turn = Some(prompt.clone());
         self.set_status("Starting turn…");
         vec![Effect::Backend(BackendCommand::StartTurn {
             session_id: provider_session_id,
             client_id: prompt.id,
-            prompt: prompt.text,
+            prompt: wire_text,
             model: prompt.model,
         })]
     }
@@ -1659,6 +1710,7 @@ impl AppState {
     fn restore_failed_prompt(&mut self, prompt: &OutgoingPrompt) {
         self.transcript
             .set_status(&format!("user:{}", prompt.id), EntryStatus::Failed);
+        self.pending_handoff.clone_from(&prompt.handoff);
         if self.editor.is_blank() {
             self.editor.set_text(&prompt.text);
             self.status_message.push_str(" Draft restored.");
@@ -2393,5 +2445,89 @@ mod tests {
         let _ = state.picker_select();
         assert_eq!(state.backend_provider, DEVIN_PROVIDER);
         assert_eq!(state.selected_model.as_deref(), Some("devin-acp/shared"));
+    }
+
+    #[test]
+    fn cross_provider_model_switch_hands_visible_dialogue_to_a_fresh_session() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        for (provider, name) in [(CODEX_PROVIDER, "Codex"), (DEVIN_PROVIDER, "Devin")] {
+            state.handle_provider_backend(
+                provider,
+                BackendEvent::Ready(BackendIdentity {
+                    provider: provider.to_owned(),
+                    display_name: name.to_owned(),
+                    version: None,
+                    capabilities: BackendCapabilities {
+                        model_catalog: CapabilitySupport::Supported,
+                        ..BackendCapabilities::default()
+                    },
+                }),
+            );
+            state.handle_provider_backend(
+                provider,
+                BackendEvent::Models(vec![ModelInfo {
+                    provider: String::new(),
+                    id: "shared".to_owned(),
+                    is_default: true,
+                }]),
+            );
+        }
+        state.provider_session_id = Some("codex-thread".to_owned());
+        state.transcript.push(
+            crate::transcript::EntryKind::User,
+            "YOU",
+            "My name is Quill.",
+            crate::transcript::EntryStatus::Complete,
+        );
+        state.transcript.push(
+            crate::transcript::EntryKind::Assistant,
+            "ASSISTANT",
+            "Nice to meet you.",
+            crate::transcript::EntryStatus::Complete,
+        );
+
+        let _ = state.open_model_picker();
+        state.picker_move(-1);
+        assert!(state.picker_select().is_empty());
+
+        assert_eq!(state.backend_provider, DEVIN_PROVIDER);
+        assert!(state.provider_session_id.is_none());
+        assert!(state.session_id.is_none());
+        assert!(state.status_message.contains("continuity handoff"));
+        assert!(state.transcript.entries().iter().any(|entry| {
+            entry.title == "HANDOFF · Codex → Devin"
+                && entry.body.contains("fresh provider-native session")
+        }));
+
+        state.editor.set_text("What is my name?");
+        assert!(matches!(
+            state.submit_editor().as_slice(),
+            [Effect::Backend(BackendCommand::StartSession { .. })]
+        ));
+        let effects = state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "devin-thread".to_owned(),
+            model: "shared".to_owned(),
+        });
+        let [
+            Effect::PersistSession { title, .. },
+            Effect::Backend(BackendCommand::StartTurn { prompt, .. }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected a persisted target session and its first turn");
+        };
+
+        assert_eq!(title, "What is my name?");
+        assert!(prompt.contains("# Flock continuity handoff"));
+        assert!(prompt.contains("My name is Quill."));
+        assert!(prompt.contains("Nice to meet you."));
+        assert!(prompt.ends_with("What is my name?"));
+        let displayed_user = state
+            .transcript
+            .entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == crate::transcript::EntryKind::User)
+            .expect("displayed user prompt");
+        assert_eq!(displayed_user.body, "What is my name?");
     }
 }

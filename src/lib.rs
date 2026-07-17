@@ -6,6 +6,7 @@ pub mod commands;
 pub mod config;
 pub mod devin;
 pub mod editor;
+pub mod handoff;
 pub mod pty;
 pub mod render;
 pub mod selection;

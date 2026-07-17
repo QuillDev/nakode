@@ -438,6 +438,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Enter if alt => state.enqueue_editor(),
         KeyCode::Enter if !boundary => state.submit_or_steer_editor(),
+        KeyCode::Backspace if alt => {
+            state.editor.delete_word_backward();
+            Vec::new()
+        }
+        KeyCode::Backspace if boundary => {
+            state.editor.delete_to_line_start();
+            Vec::new()
+        }
         KeyCode::Backspace => {
             state.editor.backspace();
             Vec::new()
@@ -779,6 +787,23 @@ mod tests {
         state.editor.insert_char('$');
 
         assert_eq!(state.editor.text(), "^one |two$");
+    }
+
+    #[test]
+    fn modified_backspace_deletes_by_word_and_line() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("one two");
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        );
+        assert_eq!(state.editor.text(), "one ");
+
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER),
+        );
+        assert!(state.editor.is_blank());
     }
 
     #[test]

@@ -74,7 +74,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         ])
         .split(area);
 
-    render_header(frame, regions[0], state);
+    render_header(frame, regions[0]);
     render_transcript(frame, regions[1], state);
     if queue_height > 0 {
         render_queue(frame, regions[2], state);
@@ -108,7 +108,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     let selectable_regions = if state.approvals.front().is_some() {
         vec![bordered_inner(centered(area, 76, 12))]
     } else if state.show_help {
-        vec![bordered_inner(centered(area, 76, 24))]
+        vec![bordered_inner(centered(area, 76, 25))]
     } else if state.session_picker.is_some() {
         vec![bordered_inner(centered(area, 78, 18))]
     } else if state.provider_picker.is_some() {
@@ -176,32 +176,11 @@ fn rect_contains(area: Rect, point: ScreenPoint) -> bool {
         && point.row < area.bottom()
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let model = state.selected_model.as_deref().unwrap_or("catalog…");
-    let activity = if let Some(turn) = &state.active_turn {
-        if turn.cancelling {
-            "cancelling"
-        } else {
-            "working"
-        }
-    } else if state.is_busy() {
-        "starting"
-    } else {
-        state.connection.label()
-    };
-    let line = Line::from(vec![
-        Span::styled(" FLOCK ", Style::default().bg(ACCENT).fg(BACKGROUND).bold()),
-        Span::styled(
-            format!("  ● {activity}"),
-            Style::default().fg(status_color(state)),
-        ),
-        Span::styled("  model ", Style::default().fg(MUTED)),
-        Span::styled(model, Style::default().fg(ACCENT_BRIGHT)),
-        Span::styled(
-            format!("  queue {}", state.queue.len()),
-            Style::default().fg(MUTED),
-        ),
-    ]);
+fn render_header(frame: &mut Frame<'_>, area: Rect) {
+    let line = Line::from(Span::styled(
+        " FLOCK ",
+        Style::default().bg(ACCENT).fg(BACKGROUND).bold(),
+    ));
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(SURFACE)),
         area,
@@ -220,25 +199,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let visible = state
         .transcript
         .visible(width, height, state.scroll_from_bottom);
-    let title = if visible.total_lines > 0 {
-        format!(
-            " Transcript · {}–{} / {} ",
-            visible.first_line.saturating_add(1),
-            visible.first_line + visible.lines.len(),
-            visible.total_lines
-        )
-    } else {
-        " Transcript ".to_owned()
-    };
-    frame.render_widget(
-        Paragraph::new(title).style(Style::default().fg(MUTED).bg(BACKGROUND)),
-        Rect::new(
-            area.x.saturating_add(2),
-            area.y,
-            area.width.saturating_sub(4),
-            1,
-        ),
-    );
 
     let lines = visible
         .lines
@@ -385,7 +345,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, 76, 24);
+    let popup = centered(area, 76, 25);
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::styled("Compose", Style::default().fg(ACCENT_BRIGHT).bold()),
@@ -400,6 +360,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::styled("Navigate", Style::default().fg(ACCENT_BRIGHT).bold()),
         Line::raw("  Alt+←/→   previous/next word     Ctrl/Cmd+←/→   line edge"),
         Line::raw("  Ctrl/Cmd+↑/↓   prompt edge       PageUp/PageDown   transcript"),
+        Line::raw("  Alt+Backspace   previous word    Ctrl/Cmd+Backspace   line start"),
         Line::raw("  Ctrl+L   latest   F2 models   Alt+↑/↓ queue   Alt+Delete remove"),
         Line::raw("  Mouse drag   select and auto-copy rendered text"),
         Line::default(),
@@ -663,21 +624,6 @@ fn transcript_line(line: ProjectedLine) -> Line<'static> {
     Line::styled(line.text, style)
 }
 
-fn status_color(state: &AppState) -> Color {
-    match &state.connection {
-        crate::state::ConnectionState::Starting => WARNING,
-        crate::state::ConnectionState::Ready { .. } => {
-            if state.active_turn.is_some() {
-                ACCENT
-            } else {
-                SUCCESS
-            }
-        }
-        crate::state::ConnectionState::Failed(_)
-        | crate::state::ConnectionState::Disconnected(_) => DANGER,
-    }
-}
-
 fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
     let width = area
         .width
@@ -727,8 +673,10 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("FLOCK"));
-        assert!(rendered.contains("Transcript"));
         assert!(rendered.contains("Prompt"));
+        assert!(!rendered.contains("Transcript"));
+        assert!(!rendered.contains("fixture-model"));
+        assert!(!rendered.contains("queue 0"));
         assert!(!rendered.contains("F1 help"));
 
         let buffer = terminal.backend().buffer();
