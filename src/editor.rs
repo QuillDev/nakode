@@ -13,6 +13,15 @@ pub struct EditorWindow {
     pub lines: Vec<String>,
     pub cursor_x: u16,
     pub cursor_y: u16,
+    pub first_row: usize,
+    pub horizontal_offset: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CursorToken {
+    pub text: String,
+    pub at_prompt_start: bool,
+    character_count: usize,
 }
 
 impl Default for EditorState {
@@ -40,6 +49,40 @@ impl EditorState {
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    #[must_use]
+    pub fn token_before_cursor(&self) -> CursorToken {
+        let prefix = self.lines[self.row]
+            .chars()
+            .take(self.column)
+            .collect::<Vec<_>>();
+        let word_start = prefix
+            .iter()
+            .rposition(|character| character.is_whitespace())
+            .map_or(0, |index| index + 1);
+        let start = prefix[word_start..]
+            .iter()
+            .rposition(|character| *character == '/')
+            .map_or(word_start, |index| word_start + index);
+        CursorToken {
+            text: prefix[start..].iter().collect(),
+            at_prompt_start: self.row == 0 && start == 0,
+            character_count: prefix.len().saturating_sub(start),
+        }
+    }
+
+    pub fn replace_token_before_cursor(&mut self, replacement: &str) {
+        let token = self.token_before_cursor();
+        let line = &mut self.lines[self.row];
+        let end = char_to_byte(line, self.column);
+        let start = char_to_byte(line, self.column.saturating_sub(token.character_count));
+        line.replace_range(start..end, replacement);
+        self.column = self
+            .column
+            .saturating_sub(token.character_count)
+            .saturating_add(replacement.chars().count());
+        self.mark_changed();
     }
 
     pub fn clear(&mut self) {
@@ -192,6 +235,8 @@ impl EditorState {
             .expect("cursor x is bounded by the u16 terminal width"),
             cursor_y: u16::try_from(self.row.saturating_sub(first_row))
                 .expect("cursor y is bounded by the u16 terminal height"),
+            first_row,
+            horizontal_offset,
         }
     }
 
@@ -306,5 +351,21 @@ mod tests {
 
         assert_eq!(window.cursor_x, 4);
         assert_eq!(window.lines, vec!["世界"]);
+    }
+
+    #[test]
+    fn identifies_and_replaces_the_token_before_the_cursor() {
+        let mut editor = EditorState::default();
+        editor.insert_str("please(/sk later");
+        for _ in 0..6 {
+            editor.move_left();
+        }
+
+        let token = editor.token_before_cursor();
+        assert_eq!(token.text, "/sk");
+        assert!(!token.at_prompt_start);
+
+        editor.replace_token_before_cursor("/skill:");
+        assert_eq!(editor.text(), "please(/skill: later");
     }
 }

@@ -8,6 +8,7 @@ use crate::{
         CODEX_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem,
         SessionHistoryItem, TurnOutcome,
     },
+    commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
     session::{ProviderRecord, SessionRecord},
@@ -145,6 +146,7 @@ pub struct AppState {
     pub model_picker: Option<ModelPicker>,
     pub session_picker: Option<SessionPicker>,
     pub provider_picker: Option<ProviderPicker>,
+    command_completion_selection: usize,
     pending_model_picker: Option<()>,
     pub show_help: bool,
     pub text_selection: Option<TextSelection>,
@@ -233,6 +235,7 @@ impl AppState {
             model_picker: None,
             session_picker: None,
             provider_picker: None,
+            command_completion_selection: 0,
             pending_model_picker: None,
             show_help: false,
             text_selection: None,
@@ -453,6 +456,53 @@ impl AppState {
             || self.active_turn.is_some()
     }
 
+    #[must_use]
+    pub fn command_completions(&self) -> Vec<&'static CommandSpec> {
+        let token = self.editor.token_before_cursor();
+        commands::matching(&token.text, token.at_prompt_start)
+    }
+
+    #[must_use]
+    pub fn selected_command_completion(&self) -> Option<&'static CommandSpec> {
+        let completions = self.command_completions();
+        let selected = self
+            .command_completion_selection
+            .min(completions.len().saturating_sub(1));
+        completions.get(selected).copied()
+    }
+
+    #[must_use]
+    pub fn command_completion_is_exact(&self) -> bool {
+        self.selected_command_completion()
+            .is_some_and(|completion| {
+                completion.invocation == self.editor.token_before_cursor().text
+            })
+    }
+
+    pub fn move_command_completion(&mut self, delta: isize) {
+        let completion_count = self.command_completions().len();
+        if completion_count == 0 {
+            self.command_completion_selection = 0;
+            return;
+        }
+        let selected = self
+            .command_completion_selection
+            .min(completion_count - 1)
+            .saturating_add_signed(delta)
+            .min(completion_count - 1);
+        self.command_completion_selection = selected;
+    }
+
+    pub fn accept_command_completion(&mut self) {
+        let Some(completion) = self.selected_command_completion() else {
+            return;
+        };
+        self.editor
+            .replace_token_before_cursor(completion.invocation);
+        self.command_completion_selection = 0;
+        self.status_message = format!("Inserted {}.", completion.invocation);
+    }
+
     pub fn submit_editor(&mut self) -> Vec<Effect> {
         if self.editor.is_blank() {
             self.set_status("Write a message before sending.");
@@ -463,49 +513,46 @@ impl AppState {
             return Vec::new();
         }
 
-        let command = self.editor.text().trim().to_owned();
-        if command == "/new" {
-            self.editor.clear();
-            return self.new_session();
-        }
-        if command == "/providers" {
-            self.editor.clear();
-            self.provider_picker = Some(ProviderPicker {
-                providers: Vec::new(),
-                selected: 0,
-                loading: true,
-            });
-            self.set_status("Loading providers…");
-            return vec![Effect::ListProviders];
-        }
-        if command == "/reload" {
-            self.editor.clear();
-            return self.reload_backend();
-        }
-        if command == "/resume" {
-            if self.is_busy() {
-                self.set_status("Cannot switch sessions while a turn is active.");
-                return Vec::new();
+        let editor_text = self.editor.text();
+        if let Some(command) = commands::parse_prompt_command(&editor_text) {
+            match command {
+                ParsedPromptCommand::New => {
+                    self.editor.clear();
+                    return self.new_session();
+                }
+                ParsedPromptCommand::Providers => {
+                    self.editor.clear();
+                    self.provider_picker = Some(ProviderPicker {
+                        providers: Vec::new(),
+                        selected: 0,
+                        loading: true,
+                    });
+                    self.set_status("Loading providers…");
+                    return vec![Effect::ListProviders];
+                }
+                ParsedPromptCommand::Reload => {
+                    self.editor.clear();
+                    return self.reload_backend();
+                }
+                ParsedPromptCommand::Resume(session_id) => {
+                    if self.is_busy() {
+                        self.set_status("Cannot switch sessions while a turn is active.");
+                        return Vec::new();
+                    }
+                    self.editor.clear();
+                    if let Some(session_id) = session_id {
+                        self.status_message = format!("Looking up session {session_id}…");
+                        return vec![Effect::ResolveSession(session_id.to_owned())];
+                    }
+                    self.session_picker = Some(SessionPicker {
+                        sessions: Vec::new(),
+                        selected: 0,
+                        loading: true,
+                    });
+                    self.set_status("Loading sessions…");
+                    return vec![Effect::ListSessions];
+                }
             }
-            self.editor.clear();
-            self.session_picker = Some(SessionPicker {
-                sessions: Vec::new(),
-                selected: 0,
-                loading: true,
-            });
-            self.set_status("Loading sessions…");
-            return vec![Effect::ListSessions];
-        }
-        if let Some(id) = command.strip_prefix("/resume ").map(str::trim)
-            && !id.is_empty()
-        {
-            if self.is_busy() {
-                self.set_status("Cannot switch sessions while a turn is active.");
-                return Vec::new();
-            }
-            self.editor.clear();
-            self.status_message = format!("Looking up session {id}…");
-            return vec![Effect::ResolveSession(id.to_owned())];
         }
 
         if self.is_busy() {

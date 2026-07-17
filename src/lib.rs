@@ -2,6 +2,7 @@ pub mod app;
 pub mod backend;
 pub mod clipboard;
 pub mod codex;
+pub mod commands;
 pub mod config;
 pub mod devin;
 pub mod editor;

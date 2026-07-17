@@ -389,6 +389,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    if let Some(effects) = handle_command_completion_key(state, key, control, alt, shift) {
+        return effects;
+    }
 
     match key.code {
         KeyCode::Char('c') if control => state.cancel_or_quit(),
@@ -476,6 +479,29 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         _ => Vec::new(),
     }
+}
+
+fn handle_command_completion_key(
+    state: &mut AppState,
+    key: KeyEvent,
+    control: bool,
+    alt: bool,
+    shift: bool,
+) -> Option<Vec<Effect>> {
+    if state.command_completions().is_empty() {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Up if !alt => state.move_command_completion(-1),
+        KeyCode::Down if !alt => state.move_command_completion(1),
+        KeyCode::Tab if !control && !alt => state.accept_command_completion(),
+        KeyCode::Enter if !control && !alt && !shift && !state.command_completion_is_exact() => {
+            state.accept_command_completion();
+        }
+        _ => return None,
+    }
+    Some(Vec::new())
 }
 
 fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> {
@@ -672,5 +698,21 @@ mod tests {
         state.editor.insert_str("second");
 
         assert_eq!(state.editor.text(), "first\nsecond");
+    }
+
+    #[test]
+    fn tab_completes_commands_only_where_their_placement_allows() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("/pro");
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.editor.text(), "/providers");
+
+        state.editor.set_text("please /pro");
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.editor.text(), "please /pro\t");
+
+        state.editor.set_text("please(/sk");
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.editor.text(), "please(/skill:");
     }
 }

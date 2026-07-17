@@ -3,31 +3,57 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
 };
 
 use crate::{
     backend::ApprovalRequest,
+    commands,
     selection::{ScreenPoint, ScreenSnapshot},
     state::AppState,
     transcript::{LineTone, ProjectedLine},
 };
 
-const BG: Color = Color::Rgb(12, 15, 20);
-const PANEL: Color = Color::Rgb(18, 23, 31);
-const BORDER: Color = Color::Rgb(51, 63, 78);
-const TEXT: Color = Color::Rgb(211, 219, 229);
-const MUTED: Color = Color::Rgb(118, 131, 148);
-const CYAN: Color = Color::Rgb(87, 201, 221);
-const BLUE: Color = Color::Rgb(114, 159, 255);
-const GREEN: Color = Color::Rgb(104, 211, 145);
-const YELLOW: Color = Color::Rgb(239, 198, 92);
-const RED: Color = Color::Rgb(246, 112, 116);
-const MAGENTA: Color = Color::Rgb(202, 141, 255);
+// Flock shares the opaque pink-on-black visual language used across Quill's apps.
+// Pink communicates interaction and focus; green, amber, and red are reserved for
+// semantic state so the interface remains calm and immediately scannable.
+const BACKGROUND: Color = Color::Rgb(10, 10, 13);
+const SURFACE: Color = Color::Rgb(18, 19, 25);
+const SURFACE_RAISED: Color = Color::Rgb(27, 29, 38);
+const BORDER: Color = Color::Rgb(42, 45, 58);
+const TEXT: Color = Color::Rgb(232, 233, 238);
+const MUTED: Color = Color::Rgb(139, 144, 160);
+const ACCENT: Color = Color::Rgb(246, 92, 142);
+const ACCENT_BRIGHT: Color = Color::Rgb(255, 122, 165);
+const ACCENT_DEEP: Color = Color::Rgb(216, 69, 111);
+const SUCCESS: Color = Color::Rgb(74, 222, 128);
+const WARNING: Color = Color::Rgb(250, 204, 21);
+const DANGER: Color = Color::Rgb(248, 113, 113);
+
+fn panel_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(BACKGROUND).fg(TEXT))
+}
+
+fn overlay_block<'a>(title: impl Into<Line<'a>>, border: Color) -> Block<'a> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(SURFACE).fg(TEXT))
+}
 
 pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     let area = frame.area();
-    frame.render_widget(Block::new().style(Style::default().bg(BG).fg(TEXT)), area);
+    frame.render_widget(
+        Block::new().style(Style::default().bg(BACKGROUND).fg(TEXT)),
+        area,
+    );
 
     let queue_height = if state.queue.is_empty() {
         0
@@ -56,6 +82,15 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     let cursor = render_composer(frame, regions[3], state);
     render_footer(frame, regions[4], state);
 
+    let has_modal = state.approvals.front().is_some()
+        || state.show_help
+        || state.session_picker.is_some()
+        || state.provider_picker.is_some()
+        || state.model_picker.is_some();
+    if !has_modal {
+        render_command_completions(frame, regions[3], state);
+    }
+
     if let Some(approval) = state.approvals.front() {
         render_approval(frame, area, approval);
     } else if state.show_help {
@@ -73,7 +108,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     let selectable_regions = if state.approvals.front().is_some() {
         vec![bordered_inner(centered(area, 76, 12))]
     } else if state.show_help {
-        vec![bordered_inner(centered(area, 72, 22))]
+        vec![bordered_inner(centered(area, 72, 23))]
     } else if state.session_picker.is_some() {
         vec![bordered_inner(centered(area, 78, 18))]
     } else if state.provider_picker.is_some() {
@@ -155,26 +190,26 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         state.connection.label()
     };
     let line = Line::from(vec![
-        Span::styled(" FLOCK ", Style::default().bg(CYAN).fg(BG).bold()),
+        Span::styled(" FLOCK ", Style::default().bg(ACCENT).fg(BACKGROUND).bold()),
         Span::styled(
-            format!("  {activity}"),
+            format!("  ● {activity}"),
             Style::default().fg(status_color(state)),
         ),
         Span::styled("  model ", Style::default().fg(MUTED)),
-        Span::styled(model, Style::default().fg(BLUE)),
+        Span::styled(model, Style::default().fg(ACCENT_BRIGHT)),
         Span::styled(
             format!("  queue {}", state.queue.len()),
             Style::default().fg(MUTED),
         ),
     ]);
-    frame.render_widget(Paragraph::new(line).style(Style::default().bg(PANEL)), area);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(SURFACE)),
+        area,
+    );
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(BG));
+    let block = panel_block(Line::default());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -196,7 +231,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         " Transcript ".to_owned()
     };
     frame.render_widget(
-        Paragraph::new(title).style(Style::default().fg(MUTED).bg(BG)),
+        Paragraph::new(title).style(Style::default().fg(MUTED).bg(BACKGROUND)),
         Rect::new(
             area.x.saturating_add(2),
             area.y,
@@ -219,25 +254,24 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .iter()
         .enumerate()
         .map(|(index, prompt)| {
-            let marker = if state.queue_selection == Some(index) {
-                "›"
-            } else {
-                " "
-            };
+            let selected = state.queue_selection == Some(index);
+            let marker = if selected { "›" } else { " " };
             let summary = prompt.text.lines().next().unwrap_or_default();
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{marker} {}  ", index + 1),
-                    Style::default().fg(YELLOW),
+                    Style::default().fg(if selected { ACCENT_BRIGHT } else { MUTED }),
                 ),
                 Span::styled(summary, Style::default().fg(TEXT)),
             ]))
+            .style(Style::default().bg(if selected {
+                SURFACE_RAISED
+            } else {
+                BACKGROUND
+            }))
         })
         .collect::<Vec<_>>();
-    let block = Block::default()
-        .title(" Queue · Alt+↑/↓ select · Alt+Delete remove ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER));
+    let block = panel_block(" Queue · Alt+↑/↓ select · Alt+Delete remove ");
     frame.render_widget(List::new(items).block(block), area);
 }
 
@@ -247,15 +281,14 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Optio
     } else {
         " Prompt · Enter send "
     };
-    let block = Block::default()
-        .title(busy_label)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if state.editor.is_blank() {
+    let block = overlay_block(
+        busy_label,
+        if state.editor.is_blank() {
             BORDER
         } else {
-            CYAN
-        }))
-        .style(Style::default().bg(PANEL));
+            ACCENT
+        },
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -266,13 +299,86 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Optio
     let lines = window
         .lines
         .into_iter()
-        .map(|line| Line::styled(line, Style::default().fg(TEXT)))
+        .enumerate()
+        .map(|(index, line)| {
+            styled_composer_line(
+                line,
+                window.first_row + index == 0 && window.horizontal_offset == 0,
+            )
+        })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     Some(Position::new(
         inner.x.saturating_add(window.cursor_x),
         inner.y.saturating_add(window.cursor_y),
     ))
+}
+
+fn styled_composer_line(line: String, first_prompt_line: bool) -> Line<'static> {
+    let ranges = commands::highlighted_ranges(&line, first_prompt_line);
+    if ranges.is_empty() {
+        return Line::styled(line, Style::default().fg(TEXT));
+    }
+
+    let mut spans = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(1));
+    let mut offset = 0;
+    for range in ranges {
+        if offset < range.start {
+            spans.push(Span::styled(
+                line[offset..range.start].to_owned(),
+                Style::default().fg(TEXT),
+            ));
+        }
+        spans.push(Span::styled(
+            line[range.clone()].to_owned(),
+            Style::default().fg(ACCENT_BRIGHT).bold(),
+        ));
+        offset = range.end;
+    }
+    if offset < line.len() {
+        spans.push(Span::styled(
+            line[offset..].to_owned(),
+            Style::default().fg(TEXT),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn render_command_completions(frame: &mut Frame<'_>, composer_area: Rect, state: &AppState) {
+    let completions = state.command_completions();
+    if completions.is_empty() || composer_area.width < 4 {
+        return;
+    }
+
+    let selected = state.selected_command_completion();
+    let height = u16::try_from(completions.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let popup = Rect::new(
+        composer_area.x.saturating_add(1),
+        composer_area.y.saturating_sub(height),
+        composer_area.width.saturating_sub(2).min(68),
+        height,
+    );
+    frame.render_widget(Clear, popup);
+
+    let items = completions.into_iter().map(|completion| {
+        let is_selected = selected == Some(completion);
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                if is_selected { " › " } else { "   " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!("{:<12}", completion.invocation),
+                Style::default().fg(ACCENT_BRIGHT).bold(),
+            ),
+            Span::styled(completion.description, Style::default().fg(MUTED)),
+        ]))
+        .style(Style::default().bg(if is_selected { SURFACE_RAISED } else { SURFACE }))
+    });
+    let block = overlay_block(" Commands · ↑/↓ select · Tab complete ", ACCENT);
+    frame.render_widget(List::new(items).block(block), popup);
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -292,45 +398,42 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
     frame.render_widget(
         Paragraph::new(format!(" {}", state.status_message))
-            .style(Style::default().fg(MUTED).bg(PANEL)),
+            .style(Style::default().fg(MUTED).bg(SURFACE)),
         status_area,
     );
     frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(TEXT).bg(PANEL)),
+        Paragraph::new(help).style(Style::default().fg(TEXT).bg(SURFACE)),
         help_area,
     );
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, 72, 22);
+    let popup = centered(area, 72, 23);
     frame.render_widget(Clear, popup);
     let lines = vec![
-        Line::styled("Compose", Style::default().fg(CYAN).bold()),
+        Line::styled("Compose", Style::default().fg(ACCENT_BRIGHT).bold()),
         Line::raw("  Enter / Ctrl+Enter   send, or queue while busy"),
         Line::raw("  Alt+Enter / Shift+Enter / Ctrl+J   newline"),
         Line::default(),
-        Line::styled("Active turn", Style::default().fg(CYAN).bold()),
+        Line::styled("Active turn", Style::default().fg(ACCENT_BRIGHT).bold()),
         Line::raw("  Ctrl+Q   queue draft     Ctrl+S   steer now"),
         Line::raw("  Ctrl+C   interrupt       Ctrl+C again   exit"),
         Line::default(),
-        Line::styled("Navigate", Style::default().fg(CYAN).bold()),
+        Line::styled("Navigate", Style::default().fg(ACCENT_BRIGHT).bold()),
         Line::raw("  PageUp/PageDown   transcript     Ctrl+L   latest"),
         Line::raw("  F2   models       Alt+Up/Down   queue selection"),
         Line::raw("  Alt+Delete   remove queued message"),
         Line::raw("  Mouse drag   select and auto-copy rendered text"),
         Line::default(),
-        Line::styled("Sessions", Style::default().fg(CYAN).bold()),
+        Line::styled("Sessions", Style::default().fg(ACCENT_BRIGHT).bold()),
         Line::raw("  /resume   picker    /resume ID   resume    /new   fresh"),
         Line::raw("  /reload   refresh backend metadata and models"),
         Line::raw("  /providers manage enabled agent backends"),
+        Line::raw("  /skill:name reference a skill anywhere in the prompt"),
         Line::default(),
         Line::styled("F1 or Esc closes this help.", Style::default().fg(MUTED)),
     ];
-    let block = Block::default()
-        .title(" Help ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(CYAN))
-        .style(Style::default().bg(PANEL));
+    let block = overlay_block(" Help ", ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -364,28 +467,37 @@ fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             } else {
                 "disabled"
             };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    marker,
-                    Style::default().fg(if selected { CYAN } else { MUTED }),
-                ),
-                Span::styled(
-                    &provider.display_name,
-                    Style::default().fg(if selected { TEXT } else { BLUE }),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    state_label,
-                    Style::default().fg(if provider.enabled { GREEN } else { MUTED }),
-                ),
-            ]));
+            lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        marker,
+                        Style::default().fg(if selected { ACCENT } else { MUTED }),
+                    ),
+                    Span::styled(
+                        &provider.display_name,
+                        Style::default()
+                            .fg(if selected { TEXT } else { MUTED })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        state_label,
+                        Style::default().fg(if provider.enabled { SUCCESS } else { MUTED }),
+                    ),
+                ])
+                .style(Style::default().bg(if selected {
+                    SURFACE_RAISED
+                } else {
+                    SURFACE
+                })),
+            );
         }
     }
-    let block = Block::default()
-        .title(" Providers ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(CYAN))
-        .style(Style::default().bg(PANEL));
+    let block = overlay_block(" Providers ", ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -396,13 +508,9 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalRequest
     let text = Text::from(vec![
         Line::styled(&approval.detail, Style::default().fg(TEXT)),
         Line::default(),
-        Line::styled(controls, Style::default().fg(YELLOW).bold()),
+        Line::styled(controls, Style::default().fg(WARNING).bold()),
     ]);
-    let block = Block::default()
-        .title(format!(" {} ", approval.title))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(YELLOW))
-        .style(Style::default().bg(PANEL));
+    let block = overlay_block(format!(" {} ", approval.title), WARNING);
     frame.render_widget(
         Paragraph::new(text)
             .block(block)
@@ -441,26 +549,33 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             let selected = index == picker.selected;
             let marker = if selected { "› " } else { "  " };
             let short_id = session.id.get(..8).unwrap_or(&session.id);
-            lines.push(Line::from(vec![
-                Span::styled(
-                    marker,
-                    Style::default().fg(if selected { CYAN } else { MUTED }),
-                ),
-                Span::styled(
-                    &session.title,
-                    Style::default()
-                        .fg(if selected { TEXT } else { BLUE })
-                        .add_modifier(if selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(
-                    format!("  {short_id}  {}", relative_time(session.updated_at)),
-                    Style::default().fg(MUTED),
-                ),
-            ]));
+            lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        marker,
+                        Style::default().fg(if selected { ACCENT } else { MUTED }),
+                    ),
+                    Span::styled(
+                        &session.title,
+                        Style::default()
+                            .fg(if selected { TEXT } else { MUTED })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(
+                        format!("  {short_id}  {}", relative_time(session.updated_at)),
+                        Style::default().fg(MUTED),
+                    ),
+                ])
+                .style(Style::default().bg(if selected {
+                    SURFACE_RAISED
+                } else {
+                    SURFACE
+                })),
+            );
         }
     }
     lines.push(Line::default());
@@ -468,11 +583,7 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         "↑/↓ select · Enter resume · Esc cancel",
         Style::default().fg(MUTED),
     ));
-    let block = Block::default()
-        .title(" Resume session ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(CYAN))
-        .style(Style::default().bg(PANEL));
+    let block = overlay_block(" Resume session ", ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -513,28 +624,35 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         } else {
             ""
         };
-        lines.push(Line::from(vec![
-            Span::styled(
-                marker,
-                Style::default().fg(if selected { CYAN } else { MUTED }),
-            ),
-            Span::styled(
-                qualified,
-                Style::default()
-                    .fg(if selected { TEXT } else { BLUE })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(current, Style::default().fg(MUTED)),
-        ]));
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(if selected { ACCENT } else { MUTED }),
+                ),
+                Span::styled(
+                    qualified,
+                    Style::default()
+                        .fg(if selected { TEXT } else { MUTED })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(current, Style::default().fg(MUTED)),
+            ])
+            .style(Style::default().bg(if selected {
+                SURFACE_RAISED
+            } else {
+                SURFACE
+            })),
+        );
     }
     if filtered.is_empty() {
         lines.push(Line::styled(
             "  No matching models",
-            Style::default().fg(RED),
+            Style::default().fg(DANGER),
         ));
     }
     lines.push(Line::default());
@@ -543,25 +661,19 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Style::default().fg(MUTED),
     ));
 
-    let block = Block::default()
-        .title(" Models ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(CYAN))
-        .style(Style::default().bg(PANEL));
+    let block = overlay_block(" Models ", ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 fn transcript_line(line: ProjectedLine) -> Line<'static> {
     let color = match line.tone {
         LineTone::Muted | LineTone::Reasoning => MUTED,
-        LineTone::User | LineTone::DiffHeader => CYAN,
-        LineTone::Assistant => BLUE,
-        LineTone::Steering => MAGENTA,
-        LineTone::Tool | LineTone::Warning => YELLOW,
-        LineTone::DiffAdd => GREEN,
-        LineTone::Error | LineTone::DiffRemove => RED,
-        LineTone::Body => TEXT,
-        LineTone::Code => Color::Rgb(180, 205, 225),
+        LineTone::User => ACCENT_BRIGHT,
+        LineTone::Steering => ACCENT_DEEP,
+        LineTone::Tool | LineTone::Warning => WARNING,
+        LineTone::DiffAdd => SUCCESS,
+        LineTone::Error | LineTone::DiffRemove => DANGER,
+        LineTone::Assistant | LineTone::Body | LineTone::Code | LineTone::DiffHeader => TEXT,
     };
     let mut style = Style::default().fg(color);
     if line.bold {
@@ -572,16 +684,16 @@ fn transcript_line(line: ProjectedLine) -> Line<'static> {
 
 fn status_color(state: &AppState) -> Color {
     match &state.connection {
-        crate::state::ConnectionState::Starting => YELLOW,
+        crate::state::ConnectionState::Starting => WARNING,
         crate::state::ConnectionState::Ready { .. } => {
             if state.active_turn.is_some() {
-                CYAN
+                ACCENT
             } else {
-                GREEN
+                SUCCESS
             }
         }
         crate::state::ConnectionState::Failed(_)
-        | crate::state::ConnectionState::Disconnected(_) => RED,
+        | crate::state::ConnectionState::Disconnected(_) => DANGER,
     }
 }
 
@@ -636,6 +748,12 @@ mod tests {
         assert!(rendered.contains("FLOCK"));
         assert!(rendered.contains("Transcript"));
         assert!(rendered.contains("Prompt"));
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].bg, super::ACCENT);
+        assert_eq!(buffer[(0, 0)].fg, super::BACKGROUND);
+        assert_eq!(buffer[(0, 1)].symbol(), "╭");
+        assert_eq!(buffer[(0, 1)].fg, super::BORDER);
     }
 
     #[test]
@@ -659,5 +777,42 @@ mod tests {
         assert!(rendered.contains("Active turn"));
         assert!(rendered.contains("Ctrl+S"));
         assert!(rendered.contains("F1 or Esc"));
+    }
+
+    #[test]
+    fn slash_input_renders_command_completions() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("/");
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render command completions");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Commands"));
+        assert!(rendered.contains("/providers"));
+        assert!(rendered.contains("/skill:"));
+    }
+
+    #[test]
+    fn valid_commands_are_styled_with_the_accent() {
+        let command = super::styled_composer_line("/new prompt".to_owned(), true);
+        assert_eq!(command.spans[0].content, "/new");
+        assert_eq!(command.spans[0].style.fg, Some(super::ACCENT_BRIGHT));
+
+        let invalid = super::styled_composer_line("inside /new".to_owned(), true);
+        assert_eq!(invalid.style.fg, Some(super::TEXT));
+
+        let skill = super::styled_composer_line("inside(/skill:review".to_owned(), false);
+        assert_eq!(skill.spans[1].content, "/skill:review");
+        assert_eq!(skill.spans[1].style.fg, Some(super::ACCENT_BRIGHT));
     }
 }
