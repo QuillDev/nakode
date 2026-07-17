@@ -1,0 +1,33 @@
+[package]
+name = "flock"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A provider-neutral terminal layer for agent sessions and orchestration"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+directories = "6"
+futures-util = "0.3"
+portable-pty = "0.9"
+ratatui = "0.30"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1.52", features = [
+  "fs",
+  "io-util",
+  "macros",
+  "process",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v7"] }
