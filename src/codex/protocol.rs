@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -29,7 +31,8 @@ pub struct RpcMessage {
     pub error: Option<RpcError>,
 }
 
-pub fn request(id: u64, method: &str, params: Value) -> Value {
+#[must_use]
+pub fn request(id: u64, method: &str, params: &Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -38,6 +41,7 @@ pub fn request(id: u64, method: &str, params: Value) -> Value {
     })
 }
 
+#[must_use]
 pub fn notification(method: &str, params: Option<Value>) -> Value {
     let mut value = json!({
         "jsonrpc": "2.0",
@@ -49,7 +53,8 @@ pub fn notification(method: &str, params: Option<Value>) -> Value {
     value
 }
 
-pub fn response(id: Value, result: Result<Value, RpcError>) -> Value {
+#[must_use]
+pub fn response(id: &Value, result: Result<Value, RpcError>) -> Value {
     match result {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err(error) => json!({
@@ -64,17 +69,22 @@ pub fn response(id: Value, result: Result<Value, RpcError>) -> Value {
     }
 }
 
+/// Parses one JSON-RPC message from a line of app-server output.
+///
+/// # Errors
+///
+/// Returns an error when `line` is not valid JSON for an RPC message.
 pub fn parse_message(line: &str) -> Result<RpcMessage, serde_json::Error> {
     serde_json::from_str(line)
 }
 
-pub fn normalize_notification(method: &str, params: Value) -> Option<BackendEvent> {
+pub fn normalize_notification(method: &str, params: &Value) -> Option<BackendEvent> {
     match method {
         "thread/started" => Some(BackendEvent::SessionObserved {
-            provider_session_id: nested_string(&params, &["thread", "id"]),
+            provider_session_id: nested_string(params, &["thread", "id"]),
         }),
         "turn/started" => Some(BackendEvent::TurnStarted {
-            turn_id: nested_string(&params, &["turn", "id"]),
+            turn_id: nested_string(params, &["turn", "id"]),
         }),
         "turn/completed" => {
             let turn = params.get("turn")?;
@@ -102,7 +112,7 @@ pub fn normalize_notification(method: &str, params: Value) -> Option<BackendEven
             })
         }
         "item/started" | "item/completed" => {
-            let turn_id = string(&params, "turnId");
+            let turn_id = string(params, "turnId");
             let item = normalize_item(params.get("item")?);
             if method == "item/started" {
                 Some(BackendEvent::ItemStarted { turn_id, item })
@@ -110,25 +120,25 @@ pub fn normalize_notification(method: &str, params: Value) -> Option<BackendEven
                 Some(BackendEvent::ItemCompleted { turn_id, item })
             }
         }
-        "item/agentMessage/delta" => delta_event(&params, DeltaKind::Assistant, "delta"),
-        "item/plan/delta" => delta_event(&params, DeltaKind::Plan, "delta"),
+        "item/agentMessage/delta" => Some(delta_event(params, DeltaKind::Assistant, "delta")),
+        "item/plan/delta" => Some(delta_event(params, DeltaKind::Plan, "delta")),
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-            delta_event(&params, DeltaKind::Reasoning, "delta")
+            Some(delta_event(params, DeltaKind::Reasoning, "delta"))
         }
         "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
-            delta_event(&params, DeltaKind::Tool, "delta")
+            Some(delta_event(params, DeltaKind::Tool, "delta"))
         }
-        "item/mcpToolCall/progress" => delta_event(&params, DeltaKind::Tool, "message"),
+        "item/mcpToolCall/progress" => Some(delta_event(params, DeltaKind::Tool, "message")),
         "turn/diff/updated" => Some(BackendEvent::TurnDiff {
-            turn_id: string(&params, "turnId"),
-            diff: string(&params, "diff"),
+            turn_id: string(params, "turnId"),
+            diff: string(params, "diff"),
         }),
         "turn/plan/updated" => Some(BackendEvent::TurnPlan {
-            turn_id: string(&params, "turnId"),
-            plan: format_plan(&params),
+            turn_id: string(params, "turnId"),
+            plan: format_plan(params),
         }),
         "item/fileChange/patchUpdated" => {
-            let item_id = string(&params, "itemId");
+            let item_id = string(params, "itemId");
             let item = json!({
                 "type": "fileChange",
                 "id": item_id,
@@ -136,39 +146,38 @@ pub fn normalize_notification(method: &str, params: Value) -> Option<BackendEven
                 "status": "inProgress",
             });
             Some(BackendEvent::ItemStarted {
-                turn_id: string(&params, "turnId"),
+                turn_id: string(params, "turnId"),
                 item: normalize_item(&item),
             })
         }
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => None,
         "serverRequest/resolved" => Some(BackendEvent::ApprovalResolved {
             request_id: params.get("requestId").cloned().unwrap_or(Value::Null),
         }),
         "error" => Some(BackendEvent::TurnError {
-            turn_id: string(&params, "turnId"),
-            message: nested_string(&params, &["error", "message"]),
+            turn_id: string(params, "turnId"),
+            message: nested_string(params, &["error", "message"]),
             will_retry: params
                 .get("willRetry")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         }),
-        "warning" | "guardianWarning" => Some(BackendEvent::Warning(string(&params, "message"))),
+        "warning" | "guardianWarning" => Some(BackendEvent::Warning(string(params, "message"))),
         "configWarning" | "deprecationNotice" => {
-            Some(BackendEvent::Warning(config_warning_text(&params)))
+            Some(BackendEvent::Warning(config_warning_text(params)))
         }
         "model/rerouted" => Some(BackendEvent::ModelRerouted {
-            turn_id: string(&params, "turnId"),
-            from: string(&params, "fromModel"),
-            to: string(&params, "toModel"),
+            turn_id: string(params, "turnId"),
+            from: string(params, "fromModel"),
+            to: string(params, "toModel"),
         }),
         "thread/closed" => Some(BackendEvent::SessionClosed {
-            provider_session_id: string(&params, "threadId"),
+            provider_session_id: string(params, "threadId"),
         }),
         _ => None,
     }
 }
 
-pub fn normalize_server_request(id: Value, method: String, params: Value) -> ApprovalRequest {
+pub fn normalize_server_request(id: Value, method: String, params: &Value) -> ApprovalRequest {
     let (kind, title, detail) = match method.as_str() {
         "item/commandExecution/requestApproval" | "execCommandApproval" => {
             let command = command_text(params.get("command"));
@@ -176,10 +185,11 @@ pub fn normalize_server_request(id: Value, method: String, params: Value) -> App
             let reason = params.get("reason").and_then(Value::as_str).unwrap_or("");
             let mut detail = command;
             if !cwd.is_empty() {
-                detail.push_str(&format!("\n\nWorking directory: {cwd}"));
+                write!(detail, "\n\nWorking directory: {cwd}")
+                    .expect("writing to a String cannot fail");
             }
             if !reason.is_empty() {
-                detail.push_str(&format!("\n\nReason: {reason}"));
+                write!(detail, "\n\nReason: {reason}").expect("writing to a String cannot fail");
             }
             (ApprovalKind::Command, "Command approval".to_owned(), detail)
         }
@@ -275,6 +285,7 @@ pub fn parse_models(result: &Value) -> Vec<ModelInfo> {
         .collect()
 }
 
+#[must_use]
 pub fn normalize_item(item: &Value) -> NormalizedItem {
     let item_type = string(item, "type");
     let id = string(item, "id");
@@ -307,6 +318,41 @@ pub fn normalize_item(item: &Value) -> NormalizedItem {
             body: string(item, "text"),
             status: ItemStatus::Complete,
         },
+        "commandExecution"
+        | "fileChange"
+        | "mcpToolCall"
+        | "dynamicToolCall"
+        | "collabAgentToolCall" => normalize_tool_item(&item_type, id, item),
+        "webSearch" => NormalizedItem {
+            id,
+            kind: ItemKind::Tool,
+            title: "WEB SEARCH".to_owned(),
+            body: pretty(item),
+            status: ItemStatus::Complete,
+        },
+        "contextCompaction" => NormalizedItem {
+            id,
+            kind: ItemKind::System,
+            title: "CONTEXT COMPACTED".to_owned(),
+            body: String::new(),
+            status: ItemStatus::Complete,
+        },
+        _ => NormalizedItem {
+            id,
+            kind: ItemKind::System,
+            title: if item_type.is_empty() {
+                "CODEX ITEM".to_owned()
+            } else {
+                item_type.to_uppercase()
+            },
+            body: pretty(item),
+            status: item_status(item),
+        },
+    }
+}
+
+fn normalize_tool_item(item_type: &str, id: String, item: &Value) -> NormalizedItem {
+    match item_type {
         "commandExecution" => {
             let output = item
                 .get("aggregatedOutput")
@@ -361,41 +407,17 @@ pub fn normalize_item(item: &Value) -> NormalizedItem {
             body: pretty(item),
             status: item_status(item),
         },
-        "webSearch" => NormalizedItem {
-            id,
-            kind: ItemKind::Tool,
-            title: "WEB SEARCH".to_owned(),
-            body: pretty(item),
-            status: ItemStatus::Complete,
-        },
-        "contextCompaction" => NormalizedItem {
-            id,
-            kind: ItemKind::System,
-            title: "CONTEXT COMPACTED".to_owned(),
-            body: String::new(),
-            status: ItemStatus::Complete,
-        },
-        _ => NormalizedItem {
-            id,
-            kind: ItemKind::System,
-            title: if item_type.is_empty() {
-                "CODEX ITEM".to_owned()
-            } else {
-                item_type.to_uppercase()
-            },
-            body: pretty(item),
-            status: item_status(item),
-        },
+        _ => unreachable!("caller filters tool item types"),
     }
 }
 
-fn delta_event(params: &Value, kind: DeltaKind, field: &str) -> Option<BackendEvent> {
-    Some(BackendEvent::ItemDelta {
+fn delta_event(params: &Value, kind: DeltaKind, field: &str) -> BackendEvent {
+    BackendEvent::ItemDelta {
         turn_id: string(params, "turnId"),
         item_id: string(params, "itemId"),
         kind,
         delta: string(params, field),
-    })
+    }
 }
 
 fn item_status(item: &Value) -> ItemStatus {
@@ -403,7 +425,7 @@ fn item_status(item: &Value) -> ItemStatus {
         Some("inProgress") | None => ItemStatus::Running,
         Some("completed") => ItemStatus::Complete,
         Some("declined") => ItemStatus::Declined,
-        Some("failed") | Some(_) => ItemStatus::Failed,
+        Some("failed" | _) => ItemStatus::Failed,
     }
 }
 
@@ -544,7 +566,7 @@ mod tests {
     fn parses_installed_agent_delta_shape() {
         let event = normalize_notification(
             "item/agentMessage/delta",
-            json!({
+            &json!({
                 "threadId": "thread-1",
                 "turnId": "turn-1",
                 "itemId": "item-1",
@@ -567,7 +589,7 @@ mod tests {
     fn config_warning_uses_summary_and_details_shape() {
         let event = normalize_notification(
             "deprecationNotice",
-            json!({
+            &json!({
                 "summary": "old option",
                 "details": "use the replacement",
             }),
@@ -617,7 +639,7 @@ mod tests {
     fn parses_failed_turn() {
         let event = normalize_notification(
             "turn/completed",
-            json!({
+            &json!({
                 "threadId": "thread-1",
                 "turn": {
                     "id": "turn-1",
@@ -641,7 +663,7 @@ mod tests {
     fn unknown_completed_status_is_not_reported_as_success() {
         let event = normalize_notification(
             "turn/completed",
-            json!({
+            &json!({
                 "threadId": "thread-1",
                 "turn": {"id": "turn-1", "status": "futureStatus", "error": null}
             }),

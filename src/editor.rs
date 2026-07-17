@@ -27,14 +27,17 @@ impl Default for EditorState {
 }
 
 impl EditorState {
+    #[must_use]
     pub fn text(&self) -> String {
         self.lines.join("\n")
     }
 
+    #[must_use]
     pub fn is_blank(&self) -> bool {
         self.lines.iter().all(|line| line.trim().is_empty())
     }
 
+    #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -158,6 +161,12 @@ impl EditorState {
         self.column = self.lines[self.row].chars().count();
     }
 
+    #[must_use]
+    /// Returns the visible editor window for the supplied terminal dimensions.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the editor's internal cursor invariant is broken.
     pub fn window(&self, height: u16, width: u16) -> EditorWindow {
         let height = usize::from(height.max(1));
         let width = usize::from(width.max(1));
@@ -175,10 +184,14 @@ impl EditorState {
 
         EditorWindow {
             lines,
-            cursor_x: cursor_display_x
-                .saturating_sub(horizontal_offset)
-                .min(width - 1) as u16,
-            cursor_y: self.row.saturating_sub(first_row) as u16,
+            cursor_x: u16::try_from(
+                cursor_display_x
+                    .saturating_sub(horizontal_offset)
+                    .min(width - 1),
+            )
+            .expect("cursor x is bounded by the u16 terminal width"),
+            cursor_y: u16::try_from(self.row.saturating_sub(first_row))
+                .expect("cursor y is bounded by the u16 terminal height"),
         }
     }
 

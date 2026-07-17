@@ -75,6 +75,7 @@ pub struct Transcript {
 }
 
 impl Transcript {
+    #[must_use]
     pub fn new(limit: usize) -> Self {
         Self {
             entries: Vec::new(),
@@ -87,6 +88,7 @@ impl Transcript {
         }
     }
 
+    #[must_use]
     pub fn entries(&self) -> &[TranscriptEntry] {
         &self.entries
     }

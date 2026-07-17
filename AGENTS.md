@@ -197,17 +197,6 @@ at least:
 Provider-native history remains authoritative for provider execution context.
 Flock persistence owns discovery, relationships, shared state, and provenance.
 
-## Process boundaries
-
-Keep terminal rendering and input, application state, orchestration, session
-persistence, backend contracts, provider adapters, skills, memory, artifacts,
-and PTY/process supervision as separate boundaries.
-
-Continue preserving the proven foundations: Ratatui/Crossterm terminal
-ownership, bounded channels, normalized event reduction, provider-native
-authentication, queue-versus-steer semantics, SQLite metadata, and terminal and
-child-process cleanup on every exit path.
-
 ## Migration order
 
 1. Define provider-neutral backend events, capabilities, logical sessions,
@@ -219,6 +208,47 @@ child-process cleanup on every exit path.
 5. Add bounded `delegate` and `review` flows before fan-out or nested
    orchestration.
 
+## Code principles
+
+Code must be clear, direct, self-documenting, and compliant with the project's
+quality rules. Do not bypass a lint because compliance requires more design or
+implementation work. Refactor the code so that its types, ownership, control
+flow, and decomposition express the intent explicitly.
+
+Do not add `#[allow(...)]`, manifest-level lint exemptions, or other lint
+suppression. If a lint exposes an architectural problem, fix the architecture.
+
+### Process boundaries
+
+Keep terminal rendering and input, application state, orchestration, session
+persistence, backend contracts, provider adapters, skills, memory, artifacts,
+and PTY/process supervision as separate boundaries.
+
+Continue preserving the proven foundations: Ratatui/Crossterm terminal
+ownership, bounded channels, normalized event reduction, provider-native
+authentication, queue-versus-steer semantics, SQLite metadata, and terminal and
+child-process cleanup on every exit path.
+
+### Change discipline
+
 Remove superseded implementation paths deliberately: update fixtures,
 dependencies, documentation, and tests in the same change, and preserve current
 behavior until its provider-native replacement is verified.
+
+### Rust quality gate
+
+The crate enables Clippy's `pedantic` lint group. Treat those lints as required
+code quality rules, not optional suggestions.
+
+Do not interrupt ordinary implementation work to chase Clippy warnings after
+every edit. Batch that cleanup into the final pre-commit pass. Before creating
+any commit, run:
+
+```text
+cargo fmt --all -- --check
+cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Fix every reported warning before committing. A work-in-progress tree may
+temporarily have warnings, but a commit must not.

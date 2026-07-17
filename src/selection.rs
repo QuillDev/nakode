@@ -8,6 +8,7 @@ pub struct ScreenPoint {
 }
 
 impl ScreenPoint {
+    #[must_use]
     pub const fn new(column: u16, row: u16) -> Self {
         Self { column, row }
     }
@@ -20,6 +21,7 @@ pub struct TextSelection {
 }
 
 impl TextSelection {
+    #[must_use]
     pub const fn new(anchor: ScreenPoint) -> Self {
         Self {
             anchor,
@@ -31,10 +33,12 @@ impl TextSelection {
         self.head = head;
     }
 
+    #[must_use]
     pub const fn is_range(self) -> bool {
         self.anchor.column != self.head.column || self.anchor.row != self.head.row
     }
 
+    #[must_use]
     pub fn contains(self, point: ScreenPoint) -> bool {
         let (start, end) = self.ordered();
         point_key(point) >= point_key(start) && point_key(point) <= point_key(end)
@@ -63,6 +67,12 @@ pub struct ScreenSnapshot {
 }
 
 impl ScreenSnapshot {
+    #[must_use]
+    /// Captures selectable text and byte boundaries from a rendered buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if `area` describes cells outside `buffer`.
     pub fn capture(buffer: &Buffer, area: Rect, selectable_regions: Vec<Rect>) -> Self {
         let mut rows = Vec::with_capacity(usize::from(area.height));
         for row in area.y..area.y.saturating_add(area.height) {
@@ -78,7 +88,10 @@ impl ScreenSnapshot {
                     continue;
                 }
 
-                let column = area.x.saturating_add(column_offset as u16);
+                let column = area.x.saturating_add(
+                    u16::try_from(column_offset)
+                        .expect("column offset is bounded by the u16 terminal width"),
+                );
                 let symbol = buffer[(column, row)].symbol();
                 text.push_str(symbol);
                 let display_width = UnicodeWidthStr::width(symbol).max(1);
@@ -95,6 +108,7 @@ impl ScreenSnapshot {
         }
     }
 
+    #[must_use]
     pub fn selected_text(&self, selection: TextSelection) -> Option<String> {
         if !selection.is_range() || self.area.width == 0 || self.area.height == 0 {
             return None;
@@ -106,8 +120,8 @@ impl ScreenSnapshot {
             .copied()
             .find(|area| contains(*area, selection.anchor) && contains(*area, selection.head))
             .unwrap_or(self.area);
-        let anchor = self.clamp(selection.anchor, selection_area);
-        let head = self.clamp(selection.head, selection_area);
+        let anchor = Self::clamp(selection.anchor, selection_area);
+        let head = Self::clamp(selection.head, selection_area);
         let selection = TextSelection { anchor, head };
         let (start, end) = selection.ordered();
         let mut lines = Vec::with_capacity(usize::from(end.row - start.row + 1));
@@ -135,7 +149,7 @@ impl ScreenSnapshot {
         (!text.trim().is_empty()).then_some(text)
     }
 
-    fn clamp(&self, point: ScreenPoint, area: Rect) -> ScreenPoint {
+    fn clamp(point: ScreenPoint, area: Rect) -> ScreenPoint {
         ScreenPoint {
             column: point.column.clamp(area.x, area.right() - 1),
             row: point.row.clamp(area.y, area.bottom() - 1),

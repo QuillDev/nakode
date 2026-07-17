@@ -113,6 +113,12 @@ impl BackendRegistry {
     }
 }
 
+/// Runs the interactive application until the user exits or a subsystem fails.
+///
+/// # Errors
+///
+/// Returns an error when provider startup, persistence, signal handling, or
+/// terminal ownership fails.
 pub async fn run(config: Config) -> Result<(), AppError> {
     let mut signals = ShutdownSignals::install()?;
     let sessions = SqliteSessionRepository::open_default()?;
@@ -142,8 +148,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let active_name = providers
         .iter()
         .find(|p| p.provider == active_provider)
-        .map(|p| p.display_name.as_str())
-        .unwrap_or(&active_provider);
+        .map_or(active_provider.as_str(), |p| p.display_name.as_str());
     let mut state = AppState::new_for_backend(
         config.workspace.to_string_lossy(),
         config.model,
@@ -211,22 +216,19 @@ async fn run_loop(
                 }
             }
             backend_event = backends.events.recv(), if backend_open => {
-                match backend_event {
-                    Some((provider, event)) => {
-                        let effects = state.handle_provider_backend(&provider, event);
-                        if apply_effects(state, effects, backends, sessions).await {
-                            break;
-                        }
-                        dirty = true;
+                if let Some((provider, event)) = backend_event {
+                    let effects = state.handle_provider_backend(&provider, event);
+                    if apply_effects(state, effects, backends, sessions).await {
+                        break;
                     }
-                    None => {
-                        backend_open = false;
-                        state.status_message = "All provider event channels closed.".to_owned();
-                        dirty = true;
-                    }
+                    dirty = true;
+                } else {
+                    backend_open = false;
+                    state.set_status("All provider event channels closed.");
+                    dirty = true;
                 }
             }
-            _ = signals.recv() => {
+            () = signals.recv() => {
                 state.should_quit = true;
                 break;
             }
@@ -298,7 +300,7 @@ async fn apply_effects(
                 &title,
                 model.as_deref(),
             ) {
-                Ok(record) => state.session_persisted(record),
+                Ok(record) => state.session_persisted(&record),
                 Err(error) => state.session_store_failed(error.to_string()),
             },
             Effect::PersistModels { provider, models } => {
@@ -348,7 +350,7 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
                 && state.approvals.is_empty()
             {
                 state.editor.insert_str(&text);
-                state.status_message = "Pasted text into the draft.".to_owned();
+                state.set_status("Pasted text into the draft.");
             }
             Vec::new()
         }
@@ -375,98 +377,13 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
             state.clear_text_selection();
             Vec::new()
         }
-        Event::FocusGained | Event::FocusLost => Vec::new(),
-        _ => Vec::new(),
+        Event::FocusGained | Event::FocusLost | Event::Key(_) => Vec::new(),
     }
 }
 
 fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
-    if !state.approvals.is_empty() {
-        return match key.code {
-            KeyCode::Char('y') => state.resolve_approval(ApprovalDecision::AcceptOnce),
-            KeyCode::Char('a') => state.resolve_approval(ApprovalDecision::AcceptForSession),
-            KeyCode::Char('n') | KeyCode::Esc => state.resolve_approval(ApprovalDecision::Decline),
-            _ => Vec::new(),
-        };
-    }
-
-    if state.show_help {
-        if matches!(key.code, KeyCode::Esc | KeyCode::F(1)) {
-            state.show_help = false;
-        }
-        return Vec::new();
-    }
-
-    if key.code == KeyCode::F(1) {
-        state.model_picker = None;
-        state.session_picker = None;
-        state.show_help = true;
-        return Vec::new();
-    }
-
-    if state.session_picker.is_some() {
-        return match key.code {
-            KeyCode::Esc => {
-                state.close_session_picker();
-                Vec::new()
-            }
-            KeyCode::Enter => state.select_session(),
-            KeyCode::Up => {
-                state.session_picker_move(-1);
-                Vec::new()
-            }
-            KeyCode::Down => {
-                state.session_picker_move(1);
-                Vec::new()
-            }
-            _ => Vec::new(),
-        };
-    }
-
-    if state.provider_picker.is_some() {
-        return match key.code {
-            KeyCode::Esc => {
-                state.close_provider_picker();
-                Vec::new()
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => state.toggle_provider(),
-            KeyCode::Up => {
-                state.provider_picker_move(-1);
-                Vec::new()
-            }
-            KeyCode::Down => {
-                state.provider_picker_move(1);
-                Vec::new()
-            }
-            _ => Vec::new(),
-        };
-    }
-
-    if state.model_picker.is_some() {
-        if key.code == KeyCode::Enter {
-            return state.picker_select();
-        }
-        match key.code {
-            KeyCode::Esc => state.close_model_picker(),
-            KeyCode::Up => state.picker_move(-1),
-            KeyCode::Down => state.picker_move(1),
-            KeyCode::Backspace => state.picker_backspace(),
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(picker) = &mut state.model_picker {
-                    picker.filter.clear();
-                    picker.selected = 0;
-                }
-            }
-            KeyCode::Char(character)
-                if !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER,
-                ) =>
-            {
-                state.picker_insert(character);
-            }
-            _ => {}
-        }
-        return Vec::new();
+    if let Some(effects) = handle_modal_key(state, key) {
+        return effects;
     }
 
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -480,7 +397,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('s') if control => state.steer_editor(),
         KeyCode::Char('l') if control => {
             state.scroll_from_bottom = 0;
-            state.status_message = "Jumped to the latest output.".to_owned();
+            state.set_status("Jumped to the latest output.");
             Vec::new()
         }
         KeyCode::Char('j') if control => {
@@ -559,6 +476,97 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         _ => Vec::new(),
     }
+}
+
+fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> {
+    if !state.approvals.is_empty() {
+        return Some(match key.code {
+            KeyCode::Char('y') => state.resolve_approval(ApprovalDecision::AcceptOnce),
+            KeyCode::Char('a') => state.resolve_approval(ApprovalDecision::AcceptForSession),
+            KeyCode::Char('n') | KeyCode::Esc => state.resolve_approval(ApprovalDecision::Decline),
+            _ => Vec::new(),
+        });
+    }
+
+    if state.show_help {
+        if matches!(key.code, KeyCode::Esc | KeyCode::F(1)) {
+            state.show_help = false;
+        }
+        return Some(Vec::new());
+    }
+
+    if key.code == KeyCode::F(1) {
+        state.model_picker = None;
+        state.session_picker = None;
+        state.show_help = true;
+        return Some(Vec::new());
+    }
+
+    if state.session_picker.is_some() {
+        return Some(match key.code {
+            KeyCode::Esc => {
+                state.close_session_picker();
+                Vec::new()
+            }
+            KeyCode::Enter => state.select_session(),
+            KeyCode::Up => {
+                state.session_picker_move(-1);
+                Vec::new()
+            }
+            KeyCode::Down => {
+                state.session_picker_move(1);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        });
+    }
+
+    if state.provider_picker.is_some() {
+        return Some(match key.code {
+            KeyCode::Esc => {
+                state.close_provider_picker();
+                Vec::new()
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => state.toggle_provider(),
+            KeyCode::Up => {
+                state.provider_picker_move(-1);
+                Vec::new()
+            }
+            KeyCode::Down => {
+                state.provider_picker_move(1);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        });
+    }
+
+    if state.model_picker.is_some() {
+        if key.code == KeyCode::Enter {
+            return Some(state.picker_select());
+        }
+        match key.code {
+            KeyCode::Esc => state.close_model_picker(),
+            KeyCode::Up => state.picker_move(-1),
+            KeyCode::Down => state.picker_move(1),
+            KeyCode::Backspace => state.picker_backspace(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(picker) = &mut state.model_picker {
+                    picker.filter.clear();
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER,
+                ) =>
+            {
+                state.picker_insert(character);
+            }
+            _ => {}
+        }
+        return Some(Vec::new());
+    }
+    None
 }
 
 #[cfg(unix)]

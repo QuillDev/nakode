@@ -26,6 +26,10 @@ impl PtySession {
     /// This API is synchronous by design. Tokio callers should perform reads
     /// and blocking waits inside `spawn_blocking` tasks, then forward bytes to
     /// the application reducer through bounded channels.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PTY or child process cannot be created.
     pub fn spawn(
         program: impl Into<OsString>,
         args: impl IntoIterator<Item = OsString>,
@@ -58,6 +62,11 @@ impl PtySession {
         &mut *self.writer
     }
 
+    /// Resizes the child process's terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform rejects the new terminal size.
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         self.master.resize(PtySize {
             rows,
@@ -68,18 +77,34 @@ impl PtySession {
         Ok(())
     }
 
+    #[must_use]
     pub fn process_id(&self) -> Option<u32> {
         self.child.process_id()
     }
 
+    /// Checks whether the child has exited without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the child status cannot be read.
     pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }
 
+    /// Waits for the child process to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when waiting for the child fails.
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
         self.child.wait()
     }
 
+    /// Terminates the child process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the termination request fails.
     pub fn kill(&mut self) -> std::io::Result<()> {
         self.child.kill()
     }

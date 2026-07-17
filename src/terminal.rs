@@ -21,6 +21,11 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
+    /// Takes ownership of the terminal and enters the interactive screen.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when raw mode or terminal initialization fails.
     pub fn enter() -> io::Result<Self> {
         install_panic_hook();
         enable_raw_mode()?;
@@ -55,6 +60,11 @@ impl TerminalSession {
         &mut self.terminal
     }
 
+    /// Restores the terminal modes held by this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the terminal cannot be restored.
     pub fn restore(&mut self) -> io::Result<()> {
         if self.restored {
             return Ok(());

@@ -16,8 +16,9 @@ use tokio::{
 
 use crate::backend::{
     ApprovalDecision, ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand,
-    BackendError, BackendEvent, BackendHandle, BackendIdentity, BackendOperation, DEVIN_PROVIDER,
-    DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem, SessionHistoryItem, TurnOutcome,
+    BackendError, BackendEvent, BackendHandle, BackendIdentity, BackendOperation,
+    CapabilitySupport, DEVIN_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem,
+    SessionHistoryItem, TurnOutcome,
 };
 
 const COMMAND_CAPACITY: usize = 128;
@@ -32,6 +33,7 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    #[must_use]
     pub fn devin(program: PathBuf, workspace: PathBuf) -> Self {
         Self {
             program,
@@ -43,27 +45,48 @@ impl BackendConfig {
 
 #[derive(Clone, Debug, Default)]
 struct AcpCapabilities {
-    load_session: bool,
-    resume_session: bool,
-    close_session: bool,
-    mcp: bool,
+    load_session: Option<()>,
+    resume_session: Option<()>,
+    close_session: Option<()>,
+    mcp: Option<()>,
 }
 
 impl AcpCapabilities {
     fn backend(&self) -> BackendCapabilities {
         BackendCapabilities {
-            resume: self.load_session || self.resume_session,
-            steering: false,
-            interruption: true,
-            model_catalog: true,
-            models_require_session: true,
-            session_model_config: true,
-            approvals: true,
-            native_tools: true,
-            mcp: self.mcp,
-            close_session: self.close_session,
+            resume: if self.load_session.is_some() || self.resume_session.is_some() {
+                CapabilitySupport::Supported
+            } else {
+                CapabilitySupport::Unsupported
+            },
+            steering: CapabilitySupport::Unsupported,
+            interruption: CapabilitySupport::Supported,
+            model_catalog: CapabilitySupport::Supported,
+            models_require_session: CapabilitySupport::Supported,
+            session_model_config: CapabilitySupport::Supported,
+            approvals: CapabilitySupport::Supported,
+            native_tools: CapabilitySupport::Supported,
+            mcp: self.mcp.map_or(CapabilitySupport::Unsupported, |()| {
+                CapabilitySupport::Supported
+            }),
+            close_session: self
+                .close_session
+                .map_or(CapabilitySupport::Unsupported, |()| {
+                    CapabilitySupport::Supported
+                }),
         }
     }
+}
+
+struct AcpRuntime {
+    pending: HashMap<u64, PendingRequest>,
+    next_id: u64,
+    capabilities: AcpCapabilities,
+    initialized: bool,
+    active_turns: HashMap<String, String>,
+    replay: HashMap<String, Vec<SessionHistoryItem>>,
+    model_options: HashMap<String, SessionModelOption>,
+    permissions: HashMap<String, PermissionOptions>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +134,12 @@ struct PermissionOptions {
     decline: Option<String>,
 }
 
+/// Starts a Devin ACP adapter.
+///
+/// # Errors
+///
+/// Returns an error when the child process cannot be spawned or its standard
+/// streams are unavailable.
 pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError> {
     let mut child = Command::new(&config.program)
         .args(&config.args)
@@ -154,7 +183,7 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
     let initialize = request(
         1,
         "initialize",
-        json!({
+        &json!({
             "protocolVersion": 1,
             "clientCapabilities": {},
             "clientInfo": {
@@ -180,54 +209,68 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
         },
     );
 
-    let task = tokio::spawn(run_supervisor(
+    let task = tokio::spawn(run_supervisor(SupervisorInput {
         child,
         stdin,
-        BufReader::new(stdout).lines(),
-        command_rx,
-        event_tx,
-        stderr_rx,
+        stdout: BufReader::new(stdout).lines(),
+        commands: command_rx,
+        events: event_tx,
+        stderr: stderr_rx,
         pending,
-        config.workspace,
-    ));
+        workspace: config.workspace,
+    }));
     Ok(BackendHandle::new(command_tx, event_rx, task))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_supervisor(
-    mut child: tokio::process::Child,
-    mut stdin: ChildStdin,
-    mut stdout: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    mut commands: mpsc::Receiver<BackendCommand>,
+struct SupervisorInput {
+    child: tokio::process::Child,
+    stdin: ChildStdin,
+    stdout: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    commands: mpsc::Receiver<BackendCommand>,
     events: mpsc::Sender<BackendEvent>,
-    mut stderr: mpsc::Receiver<String>,
-    mut pending: HashMap<u64, PendingRequest>,
+    stderr: mpsc::Receiver<String>,
+    pending: HashMap<u64, PendingRequest>,
     workspace: PathBuf,
-) {
-    let mut next_id = 2_u64;
-    let mut initialized = false;
+}
+
+async fn run_supervisor(input: SupervisorInput) {
+    let SupervisorInput {
+        child,
+        mut stdin,
+        mut stdout,
+        mut commands,
+        events,
+        mut stderr,
+        pending,
+        workspace,
+    } = input;
     let mut deferred = VecDeque::new();
-    let mut capabilities = AcpCapabilities::default();
-    let mut active_turns = HashMap::new();
-    let mut replay = HashMap::<String, Vec<SessionHistoryItem>>::new();
-    let mut model_options = HashMap::<String, SessionModelOption>::new();
-    let mut permissions = HashMap::<String, PermissionOptions>::new();
+    let mut runtime = AcpRuntime {
+        pending,
+        next_id: 2,
+        capabilities: AcpCapabilities::default(),
+        initialized: false,
+        active_turns: HashMap::new(),
+        replay: HashMap::new(),
+        model_options: HashMap::new(),
+        permissions: HashMap::new(),
+    };
     let mut timeout_tick = interval(Duration::from_secs(1));
-    let mut last_stderr = None;
-    let mut requested_shutdown = false;
+    let mut last_error = None;
+    let mut shutdown = false;
 
     'supervisor: loop {
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else {
-                    requested_shutdown = true;
+                    shutdown = true;
                     break;
                 };
                 if matches!(command, BackendCommand::Shutdown) {
-                    requested_shutdown = true;
+                    shutdown = true;
                     break;
                 }
-                if !initialized {
+                if !runtime.initialized {
                     deferred.push_back(command);
                     continue;
                 }
@@ -235,14 +278,8 @@ async fn run_supervisor(
                     command,
                     &mut stdin,
                     &events,
-                    &mut pending,
-                    &mut next_id,
                     &workspace,
-                    &capabilities,
-                    &mut active_turns,
-                    &mut replay,
-                    &mut model_options,
-                    &mut permissions,
+                    &mut runtime,
                 ).await {
                     let _ = events.send(BackendEvent::Disconnected {
                         reason: format!("failed to write to Devin ACP: {error}"),
@@ -259,103 +296,135 @@ async fn run_supervisor(
                                 message,
                                 &mut stdin,
                                 &events,
-                                &mut pending,
-                                &mut next_id,
-                                &mut capabilities,
-                                &mut initialized,
-                                &mut active_turns,
-                                &mut replay,
-                                &mut model_options,
-                                &mut permissions,
+                                &mut runtime,
                             ).await.is_err() {
                                 break;
                             }
-                            if initialized {
-                                while let Some(command) = deferred.pop_front() {
-                                    if let Err(error) = handle_command(
-                                        command,
-                                        &mut stdin,
-                                        &events,
-                                        &mut pending,
-                                        &mut next_id,
-                                        &workspace,
-                                        &capabilities,
-                                        &mut active_turns,
-                                        &mut replay,
-                                        &mut model_options,
-                                        &mut permissions,
-                                    ).await {
-                                        let _ = events.send(BackendEvent::Disconnected {
-                                            reason: format!("failed to write to Devin ACP: {error}"),
-                                        }).await;
-                                        break 'supervisor;
-                                    }
-                                }
+                            if runtime.initialized
+                                && drain_deferred(
+                                    &mut deferred, &mut stdin, &events, &workspace, &mut runtime,
+                                ).await.is_err()
+                            {
+                                break 'supervisor;
                             }
                         }
                         Err(error) => {
-                            let preview: String = line.chars().take(180).collect();
-                            let _ = events.send(BackendEvent::ProtocolDiagnostic(format!(
-                                "malformed ACP JSON ({error}): {preview}"
-                            ))).await;
+                            report_malformed_json(&events, &line, &error).await;
                         }
                     },
                     Ok(None) => break,
                     Err(error) => {
-                        last_stderr = Some(format!("stdout read failed: {error}"));
+                        last_error = Some(format!("stdout read failed: {error}"));
                         break;
                     }
                 }
             }
             line = stderr.recv() => {
-                if let Some(line) = line {
-                    if actionable_stderr_warning(&line) {
-                        let _ = events
-                            .send(BackendEvent::Warning(format!("Devin: {line}")))
-                            .await;
-                    }
-                    last_stderr = Some(line);
-                }
+                record_stderr(line, &events, &mut last_error).await;
             }
-            _ = timeout_tick.tick() => {
-                let now = Instant::now();
-                let timed_out = pending.iter()
-                    .filter(|(_, request)| now.duration_since(request.sent_at) >= REQUEST_TIMEOUT)
-                    .map(|(id, _)| *id)
-                    .collect::<Vec<_>>();
-                for id in timed_out {
-                    if let Some(request) = pending.remove(&id) {
-                        let message = format!(
-                            "request {id} timed out after {}s",
-                            REQUEST_TIMEOUT.as_secs()
-                        );
-                        let _ = emit_request_failure(
-                            request,
-                            -32001,
-                            message,
-                            &events,
-                            &mut active_turns,
-                            &model_options,
-                        )
-                        .await;
-                    }
-                }
-            }
+            _ = timeout_tick.tick() => report_timeouts(&mut runtime, &events).await,
         }
     }
 
+    finish(child, stdin, runtime.pending, &events, shutdown, last_error).await;
+}
+
+async fn drain_deferred(
+    commands: &mut VecDeque<BackendCommand>,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+    workspace: &std::path::Path,
+    runtime: &mut AcpRuntime,
+) -> Result<(), ()> {
+    while let Some(command) = commands.pop_front() {
+        if let Err(error) = handle_command(command, stdin, events, workspace, runtime).await {
+            let _ = events
+                .send(BackendEvent::Disconnected {
+                    reason: format!("failed to write to Devin ACP: {error}"),
+                })
+                .await;
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+async fn report_timeouts(runtime: &mut AcpRuntime, events: &mpsc::Sender<BackendEvent>) {
+    let now = Instant::now();
+    let timed_out = runtime
+        .pending
+        .iter()
+        .filter(|(_, request)| now.duration_since(request.sent_at) >= REQUEST_TIMEOUT)
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    for id in timed_out {
+        if let Some(request) = runtime.pending.remove(&id) {
+            let message = format!(
+                "request {id} timed out after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            );
+            let _ = emit_request_failure(
+                request,
+                -32001,
+                message,
+                events,
+                &mut runtime.active_turns,
+                &runtime.model_options,
+            )
+            .await;
+        }
+    }
+}
+
+async fn report_malformed_json(
+    events: &mpsc::Sender<BackendEvent>,
+    line: &str,
+    error: &serde_json::Error,
+) {
+    let preview: String = line.chars().take(180).collect();
+    let _ = events
+        .send(BackendEvent::ProtocolDiagnostic(format!(
+            "malformed ACP JSON ({error}): {preview}"
+        )))
+        .await;
+}
+
+async fn record_stderr(
+    line: Option<String>,
+    events: &mpsc::Sender<BackendEvent>,
+    last_error: &mut Option<String>,
+) {
+    if let Some(line) = line {
+        if actionable_stderr_warning(&line) {
+            let _ = events
+                .send(BackendEvent::Warning(format!("Devin: {line}")))
+                .await;
+        }
+        *last_error = Some(line);
+    }
+}
+
+async fn finish(
+    mut child: tokio::process::Child,
+    stdin: ChildStdin,
+    pending: HashMap<u64, PendingRequest>,
+    events: &mpsc::Sender<BackendEvent>,
+    shutdown: bool,
+    last_error: Option<String>,
+) {
     drop(stdin);
-    if requested_shutdown {
+    if shutdown {
         if timeout(Duration::from_secs(2), child.wait()).await.is_err() {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
     } else {
         let status = child.wait().await.ok();
-        let mut reason = status
-            .map(|status| format!("Devin ACP exited with {status}"))
-            .unwrap_or_else(|| "Devin ACP disconnected".to_owned());
-        if let Some(stderr) = last_stderr {
+        let mut reason = status.map_or_else(
+            || "Devin ACP disconnected".to_owned(),
+            |status| format!("Devin ACP exited with {status}"),
+        );
+        if let Some(stderr) = last_error {
             reason.push_str(": ");
             reason.push_str(&stderr);
         }
@@ -376,20 +445,20 @@ async fn run_supervisor(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     command: BackendCommand,
     stdin: &mut ChildStdin,
     events: &mpsc::Sender<BackendEvent>,
-    pending: &mut HashMap<u64, PendingRequest>,
-    next_id: &mut u64,
     workspace: &std::path::Path,
-    capabilities: &AcpCapabilities,
-    active_turns: &mut HashMap<String, String>,
-    replay: &mut HashMap<String, Vec<SessionHistoryItem>>,
-    model_options: &mut HashMap<String, SessionModelOption>,
-    permissions: &mut HashMap<String, PermissionOptions>,
+    runtime: &mut AcpRuntime,
 ) -> std::io::Result<()> {
+    let AcpRuntime {
+        pending,
+        next_id,
+        capabilities,
+        permissions,
+        ..
+    } = runtime;
     match command {
         BackendCommand::StartSession { model } => {
             send_request(
@@ -406,114 +475,18 @@ async fn handle_command(
             .await
         }
         BackendCommand::Reload { session_id } => {
-            if let Some(session_id) = session_id {
-                let Some(option) = model_options.get(&session_id).cloned() else {
-                    let _ = events
-                        .send(BackendEvent::RequestFailed {
-                            operation: BackendOperation::Reload,
-                            code: -32601,
-                            message: "Devin session did not expose a model config option"
-                                .to_owned(),
-                        })
-                        .await;
-                    return Ok(());
-                };
-                send_model_request(
-                    stdin,
-                    pending,
-                    next_id,
-                    PendingKind::ReloadModels {
-                        session_id: session_id.clone(),
-                    },
-                    BackendOperation::Reload,
-                    &session_id,
-                    &option.config_id,
-                    &option.current_value,
-                )
-                .await
-            } else {
-                send_request(
-                    stdin,
-                    pending,
-                    next_id,
-                    PendingKind::StartSession {
-                        requested_model: None,
-                    },
-                    BackendOperation::Reload,
-                    "session/new",
-                    json!({"cwd": workspace.to_string_lossy(), "mcpServers": []}),
-                )
-                .await
-            }
+            reload_models(session_id, stdin, events, workspace, runtime).await
         }
         BackendCommand::SetSessionModel { session_id, model } => {
-            let Some(option) = model_options.get(&session_id).cloned() else {
-                let _ = events
-                    .send(BackendEvent::RequestFailed {
-                        operation: BackendOperation::SetSessionModel,
-                        code: -32601,
-                        message: "Devin session did not expose a model config option".to_owned(),
-                    })
-                    .await;
-                return Ok(());
-            };
-            send_model_request(
-                stdin,
-                pending,
-                next_id,
-                PendingKind::SetModel {
-                    session_id: session_id.clone(),
-                    announce_session: false,
-                },
-                BackendOperation::SetSessionModel,
-                &session_id,
-                &option.config_id,
-                &model,
-            )
-            .await
+            set_session_model(session_id, model, stdin, events, runtime).await
         }
         BackendCommand::ResumeSession {
             provider_session_id,
-        } => {
-            let (method, replay_history) = if capabilities.load_session {
-                ("session/load", true)
-            } else if capabilities.resume_session {
-                ("session/resume", false)
-            } else {
-                let _ = events
-                    .send(BackendEvent::RequestFailed {
-                        operation: BackendOperation::ResumeSession,
-                        code: -32601,
-                        message: "Devin ACP did not advertise session resume".to_owned(),
-                    })
-                    .await;
-                return Ok(());
-            };
-            if replay_history {
-                replay.insert(provider_session_id.clone(), Vec::new());
-            }
-            send_request(
-                stdin,
-                pending,
-                next_id,
-                PendingKind::ResumeSession {
-                    session_id: provider_session_id.clone(),
-                    replay: replay_history,
-                },
-                BackendOperation::ResumeSession,
-                method,
-                json!({
-                    "sessionId": provider_session_id,
-                    "cwd": workspace.to_string_lossy(),
-                    "mcpServers": [],
-                }),
-            )
-            .await
-        }
+        } => resume_session(provider_session_id, stdin, events, workspace, runtime).await,
         BackendCommand::UnsubscribeSession {
             provider_session_id,
         } => {
-            if !capabilities.close_session {
+            if capabilities.close_session.is_none() {
                 let _ = events.send(BackendEvent::SessionUnsubscribed).await;
                 return Ok(());
             }
@@ -533,36 +506,7 @@ async fn handle_command(
             client_id,
             prompt,
             model: _,
-        } => {
-            let turn_id = client_id;
-            let id = allocate_request_id(pending, next_id);
-            write_json(
-                stdin,
-                &request(
-                    id,
-                    "session/prompt",
-                    json!({
-                        "sessionId": session_id,
-                        "prompt": [{"type": "text", "text": prompt}],
-                    }),
-                ),
-            )
-            .await?;
-            pending.insert(
-                id,
-                PendingRequest {
-                    kind: PendingKind::StartTurn {
-                        session_id: session_id.clone(),
-                        turn_id: turn_id.clone(),
-                    },
-                    operation: BackendOperation::StartTurn,
-                    sent_at: Instant::now(),
-                },
-            );
-            active_turns.insert(session_id, turn_id.clone());
-            let _ = events.send(BackendEvent::TurnAccepted { turn_id }).await;
-            Ok(())
-        }
+        } => start_turn(session_id, client_id, prompt, stdin, events, runtime).await,
         BackendCommand::SteerTurn { .. } => {
             let _ = events
                 .send(BackendEvent::RequestFailed {
@@ -576,7 +520,7 @@ async fn handle_command(
         BackendCommand::InterruptTurn { session_id, .. } => {
             write_json(
                 stdin,
-                &notification("session/cancel", json!({"sessionId": session_id})),
+                &notification("session/cancel", &json!({"sessionId": session_id})),
             )
             .await?;
             let _ = events.send(BackendEvent::InterruptAccepted).await;
@@ -589,56 +533,449 @@ async fn handle_command(
                 ApprovalDecision::AcceptForSession => options.accept_always.or(options.accept_once),
                 ApprovalDecision::Decline => options.decline,
             };
-            let result = selected
-                .map(|option_id| json!({"outcome": {"outcome": "selected", "optionId": option_id}}))
-                .unwrap_or_else(|| json!({"outcome": {"outcome": "cancelled"}}));
-            write_json(stdin, &response(id, result)).await
+            let result = selected.map_or_else(
+                || json!({"outcome": {"outcome": "cancelled"}}),
+                |option_id| json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+            );
+            write_json(stdin, &response(&id, &result)).await
         }
         BackendCommand::Shutdown => Ok(()),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn process_message(
-    message: Value,
+async fn set_session_model(
+    session_id: String,
+    model: String,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+    runtime: &mut AcpRuntime,
+) -> std::io::Result<()> {
+    let Some(option) = runtime.model_options.get(&session_id).cloned() else {
+        let _ = events
+            .send(BackendEvent::RequestFailed {
+                operation: BackendOperation::SetSessionModel,
+                code: -32601,
+                message: "Devin session did not expose a model config option".to_owned(),
+            })
+            .await;
+        return Ok(());
+    };
+    send_model_request(
+        stdin,
+        &mut runtime.pending,
+        &mut runtime.next_id,
+        ModelRequest {
+            kind: PendingKind::SetModel {
+                session_id: session_id.clone(),
+                announce_session: false,
+            },
+            operation: BackendOperation::SetSessionModel,
+            session_id: &session_id,
+            config_id: &option.config_id,
+            model: &model,
+        },
+    )
+    .await
+}
+
+async fn start_turn(
+    session_id: String,
+    turn_id: String,
+    prompt: String,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+    runtime: &mut AcpRuntime,
+) -> std::io::Result<()> {
+    let id = allocate_request_id(&runtime.pending, &mut runtime.next_id);
+    write_json(
+        stdin,
+        &request(
+            id,
+            "session/prompt",
+            &json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": prompt}],
+            }),
+        ),
+    )
+    .await?;
+    runtime.pending.insert(
+        id,
+        PendingRequest {
+            kind: PendingKind::StartTurn {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+            },
+            operation: BackendOperation::StartTurn,
+            sent_at: Instant::now(),
+        },
+    );
+    runtime.active_turns.insert(session_id, turn_id.clone());
+    let _ = events.send(BackendEvent::TurnAccepted { turn_id }).await;
+    Ok(())
+}
+
+async fn reload_models(
+    session_id: Option<String>,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+    workspace: &std::path::Path,
+    runtime: &mut AcpRuntime,
+) -> std::io::Result<()> {
+    let Some(session_id) = session_id else {
+        return send_request(
+            stdin,
+            &mut runtime.pending,
+            &mut runtime.next_id,
+            PendingKind::StartSession {
+                requested_model: None,
+            },
+            BackendOperation::Reload,
+            "session/new",
+            json!({"cwd": workspace.to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    };
+    let Some(option) = runtime.model_options.get(&session_id).cloned() else {
+        let _ = events
+            .send(BackendEvent::RequestFailed {
+                operation: BackendOperation::Reload,
+                code: -32601,
+                message: "Devin session did not expose a model config option".to_owned(),
+            })
+            .await;
+        return Ok(());
+    };
+    send_model_request(
+        stdin,
+        &mut runtime.pending,
+        &mut runtime.next_id,
+        ModelRequest {
+            kind: PendingKind::ReloadModels {
+                session_id: session_id.clone(),
+            },
+            operation: BackendOperation::Reload,
+            session_id: &session_id,
+            config_id: &option.config_id,
+            model: &option.current_value,
+        },
+    )
+    .await
+}
+
+async fn resume_session(
+    session_id: String,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+    workspace: &std::path::Path,
+    runtime: &mut AcpRuntime,
+) -> std::io::Result<()> {
+    let (method, replay_history) = if runtime.capabilities.load_session.is_some() {
+        ("session/load", true)
+    } else if runtime.capabilities.resume_session.is_some() {
+        ("session/resume", false)
+    } else {
+        let _ = events
+            .send(BackendEvent::RequestFailed {
+                operation: BackendOperation::ResumeSession,
+                code: -32601,
+                message: "Devin ACP did not advertise session resume".to_owned(),
+            })
+            .await;
+        return Ok(());
+    };
+    if replay_history {
+        runtime.replay.insert(session_id.clone(), Vec::new());
+    }
+    send_request(
+        stdin,
+        &mut runtime.pending,
+        &mut runtime.next_id,
+        PendingKind::ResumeSession {
+            session_id: session_id.clone(),
+            replay: replay_history,
+        },
+        BackendOperation::ResumeSession,
+        method,
+        json!({
+            "sessionId": session_id,
+            "cwd": workspace.to_string_lossy(),
+            "mcpServers": [],
+        }),
+    )
+    .await
+}
+
+async fn process_method(
+    message: &Value,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+    runtime: &mut AcpRuntime,
+) -> Result<(), ()> {
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .expect("caller verified the method");
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    if let Some(id) = message.get("id").cloned() {
+        if method == "session/request_permission" {
+            let approval = normalize_permission(id, &params, &mut runtime.permissions);
+            events
+                .send(BackendEvent::ApprovalRequested(approval))
+                .await
+                .map_err(|_| ())?;
+        } else {
+            let message = format!("Flock does not support ACP client method {method}");
+            write_json(stdin, &error_response(&id, -32601, &message))
+                .await
+                .map_err(|_| ())?;
+        }
+    } else if method == "session/update" {
+        normalize_update(&params, events, &runtime.active_turns, &mut runtime.replay).await?;
+    }
+    Ok(())
+}
+
+async fn init(
+    result: &Value,
+    events: &mpsc::Sender<BackendEvent>,
+    capabilities: &mut AcpCapabilities,
+    initialized: &mut bool,
+) -> Result<(), ()> {
+    let protocol_version = result
+        .get("protocolVersion")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if protocol_version != 1 {
+        events
+            .send(BackendEvent::RequestFailed {
+                operation: BackendOperation::Initialize,
+                code: -32600,
+                message: format!("unsupported ACP protocol version {protocol_version}"),
+            })
+            .await
+            .map_err(|_| ())?;
+        return Err(());
+    }
+    let caps = result.get("agentCapabilities").unwrap_or(&Value::Null);
+    capabilities.load_session = caps
+        .get("loadSession")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        .then_some(());
+    capabilities.resume_session =
+        capability_supported(caps.pointer("/sessionCapabilities/resume")).then_some(());
+    capabilities.close_session =
+        capability_supported(caps.pointer("/sessionCapabilities/close")).then_some(());
+    capabilities.mcp = caps.get("mcpCapabilities").map(|_| ());
+    let info = result.get("agentInfo").unwrap_or(&Value::Null);
+    let display_name = info
+        .get("title")
+        .or_else(|| info.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("Devin")
+        .to_owned();
+    let version = info
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    *initialized = true;
+    events
+        .send(BackendEvent::Ready(BackendIdentity {
+            provider: DEVIN_PROVIDER.to_owned(),
+            display_name,
+            version,
+            capabilities: capabilities.backend(),
+        }))
+        .await
+        .map_err(|_| ())
+}
+
+async fn handle_started_session(
+    requested_model: Option<String>,
+    result: &Value,
     stdin: &mut ChildStdin,
     events: &mpsc::Sender<BackendEvent>,
     pending: &mut HashMap<u64, PendingRequest>,
     next_id: &mut u64,
-    capabilities: &mut AcpCapabilities,
-    initialized: &mut bool,
-    active_turns: &mut HashMap<String, String>,
+    model_options: &mut HashMap<String, SessionModelOption>,
+) -> Result<(), ()> {
+    let session_id = string(result, "sessionId");
+    let model_state = parse_model_options(result);
+    if let Some(model_state) = model_state.clone() {
+        model_options.insert(session_id.clone(), model_state.clone());
+        if let Some(requested_model) = requested_model
+            && requested_model != model_state.current_value
+            && model_state
+                .models
+                .iter()
+                .any(|model| model.id == requested_model)
+        {
+            send_model_request(
+                stdin,
+                pending,
+                next_id,
+                ModelRequest {
+                    kind: PendingKind::SetModel {
+                        session_id: session_id.clone(),
+                        announce_session: true,
+                    },
+                    operation: BackendOperation::SetSessionModel,
+                    session_id: &session_id,
+                    config_id: &model_state.config_id,
+                    model: &requested_model,
+                },
+            )
+            .await
+            .map_err(|_| ())?;
+            return Ok(());
+        }
+    }
+    announce_session_models(&session_id, model_state.as_ref(), events).await
+}
+
+async fn handle_resumed_session(
+    session_id: String,
+    replay_history: bool,
+    result: &Value,
+    events: &mpsc::Sender<BackendEvent>,
     replay: &mut HashMap<String, Vec<SessionHistoryItem>>,
     model_options: &mut HashMap<String, SessionModelOption>,
-    permissions: &mut HashMap<String, PermissionOptions>,
 ) -> Result<(), ()> {
-    if let Some(method) = message.get("method").and_then(Value::as_str) {
-        let params = message.get("params").cloned().unwrap_or(Value::Null);
-        if let Some(id) = message.get("id").cloned() {
-            if method == "session/request_permission" {
-                let approval = normalize_permission(id.clone(), &params, permissions);
-                events
-                    .send(BackendEvent::ApprovalRequested(approval))
-                    .await
-                    .map_err(|_| ())?;
-            } else {
-                write_json(
-                    stdin,
-                    &error_response(
-                        id,
-                        -32601,
-                        format!("Flock does not support ACP client method {method}"),
-                    ),
-                )
+    let history = if replay_history {
+        replay.remove(&session_id).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let model_state = parse_model_options(result);
+    if let Some(model_state) = model_state.clone() {
+        model_options.insert(session_id.clone(), model_state);
+    }
+    events
+        .send(BackendEvent::SessionResumed {
+            provider_session_id: session_id,
+            model: model_state
+                .as_ref()
+                .map(|state| state.current_value.clone())
+                .unwrap_or_default(),
+            history,
+        })
+        .await
+        .map_err(|_| ())?;
+    if let Some(model_state) = model_state {
+        events
+            .send(BackendEvent::Models(model_state.models))
+            .await
+            .map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+async fn handle_model_selection(
+    session_id: &str,
+    announce_session: bool,
+    result: &Value,
+    events: &mpsc::Sender<BackendEvent>,
+    model_options: &mut HashMap<String, SessionModelOption>,
+) -> Result<(), ()> {
+    let Some(model_state) = parse_model_options(result) else {
+        events
+            .send(BackendEvent::RequestFailed {
+                operation: BackendOperation::SetSessionModel,
+                code: -32603,
+                message: "Devin returned no model options after selection".to_owned(),
+            })
+            .await
+            .map_err(|_| ())?;
+        if announce_session {
+            announce_session_models(session_id, model_options.get(session_id), events).await?;
+        } else if let Some(cached) = model_options.get(session_id) {
+            events
+                .send(BackendEvent::Models(cached.models.clone()))
                 .await
                 .map_err(|_| ())?;
-            }
-        } else if method == "session/update" {
-            normalize_update(&params, events, active_turns, replay).await?;
         }
         return Ok(());
+    };
+    model_options.insert(session_id.to_owned(), model_state.clone());
+    if announce_session {
+        announce_session_models(session_id, Some(&model_state), events).await
+    } else {
+        events
+            .send(BackendEvent::Models(model_state.models))
+            .await
+            .map_err(|_| ())
     }
+}
 
+async fn handle_reloaded_models(
+    session_id: String,
+    result: &Value,
+    events: &mpsc::Sender<BackendEvent>,
+    model_options: &mut HashMap<String, SessionModelOption>,
+) -> Result<(), ()> {
+    let Some(model_state) = parse_model_options(result) else {
+        events
+            .send(BackendEvent::RequestFailed {
+                operation: BackendOperation::Reload,
+                code: -32603,
+                message: "Devin returned no model options during refresh".to_owned(),
+            })
+            .await
+            .map_err(|_| ())?;
+        return Ok(());
+    };
+    model_options.insert(session_id, model_state.clone());
+    events
+        .send(BackendEvent::Models(model_state.models))
+        .await
+        .map_err(|_| ())
+}
+
+async fn handle_completed_turn(
+    session_id: String,
+    turn_id: String,
+    result: &Value,
+    events: &mpsc::Sender<BackendEvent>,
+    active_turns: &mut HashMap<String, String>,
+) -> Result<(), ()> {
+    active_turns.remove(&session_id);
+    let reason = string(result, "stopReason");
+    let outcome = match reason.as_str() {
+        "end_turn" => TurnOutcome::Completed,
+        "cancelled" => TurnOutcome::Interrupted,
+        _ => TurnOutcome::Failed,
+    };
+    let error = (outcome == TurnOutcome::Failed).then(|| format!("Devin stopped: {reason}"));
+    events
+        .send(BackendEvent::TurnCompleted {
+            turn_id,
+            outcome,
+            error,
+        })
+        .await
+        .map_err(|_| ())
+}
+
+async fn process_message(
+    message: Value,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+    runtime: &mut AcpRuntime,
+) -> Result<(), ()> {
+    if message.get("method").and_then(Value::as_str).is_some() {
+        return process_method(&message, stdin, events, runtime).await;
+    }
+    let AcpRuntime {
+        pending,
+        next_id,
+        capabilities,
+        initialized,
+        active_turns,
+        replay,
+        model_options,
+        ..
+    } = runtime;
     let Some(id) = message.get("id").and_then(Value::as_u64) else {
         events
             .send(BackendEvent::ProtocolDiagnostic(
@@ -669,199 +1006,65 @@ async fn process_message(
     }
     let result = message.get("result").cloned().unwrap_or(Value::Null);
     match request.kind {
-        PendingKind::Initialize => {
-            let version = result
-                .get("protocolVersion")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            if version != 1 {
-                events
-                    .send(BackendEvent::RequestFailed {
-                        operation: BackendOperation::Initialize,
-                        code: -32600,
-                        message: format!("unsupported ACP protocol version {version}"),
-                    })
-                    .await
-                    .map_err(|_| ())?;
-                return Err(());
-            }
-            let caps = result.get("agentCapabilities").unwrap_or(&Value::Null);
-            capabilities.load_session = caps
-                .get("loadSession")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            capabilities.resume_session =
-                capability_supported(caps.pointer("/sessionCapabilities/resume"));
-            capabilities.close_session =
-                capability_supported(caps.pointer("/sessionCapabilities/close"));
-            capabilities.mcp = caps.get("mcpCapabilities").is_some();
-            let info = result.get("agentInfo").unwrap_or(&Value::Null);
-            let name = info
-                .get("title")
-                .or_else(|| info.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("Devin")
-                .to_owned();
-            let version = info
-                .get("version")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            *initialized = true;
-            events
-                .send(BackendEvent::Ready(BackendIdentity {
-                    provider: DEVIN_PROVIDER.to_owned(),
-                    display_name: name,
-                    version,
-                    capabilities: capabilities.backend(),
-                }))
-                .await
-                .map_err(|_| ())?;
-        }
+        PendingKind::Initialize => init(&result, events, capabilities, initialized).await?,
         PendingKind::StartSession { requested_model } => {
-            let session_id = string(&result, "sessionId");
-            let model_state = parse_model_options(&result);
-            if let Some(model_state) = model_state.clone() {
-                model_options.insert(session_id.clone(), model_state.clone());
-                if let Some(requested_model) = requested_model
-                    && requested_model != model_state.current_value
-                    && model_state
-                        .models
-                        .iter()
-                        .any(|model| model.id == requested_model)
-                {
-                    send_model_request(
-                        stdin,
-                        pending,
-                        next_id,
-                        PendingKind::SetModel {
-                            session_id: session_id.clone(),
-                            announce_session: true,
-                        },
-                        BackendOperation::SetSessionModel,
-                        &session_id,
-                        &model_state.config_id,
-                        &requested_model,
-                    )
-                    .await
-                    .map_err(|_| ())?;
-                    return Ok(());
-                }
-            }
-            announce_session_models(&session_id, model_state.as_ref(), events).await?;
+            handle_started_session(
+                requested_model,
+                &result,
+                stdin,
+                events,
+                pending,
+                next_id,
+                model_options,
+            )
+            .await?;
         }
         PendingKind::ResumeSession {
             session_id,
             replay: replay_history,
         } => {
-            let history = if replay_history {
-                replay.remove(&session_id).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let model_state = parse_model_options(&result);
-            if let Some(model_state) = model_state.clone() {
-                model_options.insert(session_id.clone(), model_state);
-            }
-            events
-                .send(BackendEvent::SessionResumed {
-                    provider_session_id: session_id,
-                    model: model_state
-                        .as_ref()
-                        .map(|state| state.current_value.clone())
-                        .unwrap_or_default(),
-                    history,
-                })
-                .await
-                .map_err(|_| ())?;
-            if let Some(model_state) = model_state {
-                events
-                    .send(BackendEvent::Models(model_state.models))
-                    .await
-                    .map_err(|_| ())?;
-            }
+            handle_resumed_session(
+                session_id,
+                replay_history,
+                &result,
+                events,
+                replay,
+                model_options,
+            )
+            .await?;
         }
         PendingKind::SetModel {
             session_id,
             announce_session,
         } => {
-            let Some(model_state) = parse_model_options(&result) else {
-                events
-                    .send(BackendEvent::RequestFailed {
-                        operation: BackendOperation::SetSessionModel,
-                        code: -32603,
-                        message: "Devin returned no model options after selection".to_owned(),
-                    })
-                    .await
-                    .map_err(|_| ())?;
-                if announce_session {
-                    announce_session_models(&session_id, model_options.get(&session_id), events)
-                        .await?;
-                } else if let Some(cached) = model_options.get(&session_id) {
-                    events
-                        .send(BackendEvent::Models(cached.models.clone()))
-                        .await
-                        .map_err(|_| ())?;
-                }
-                return Ok(());
-            };
-            model_options.insert(session_id.clone(), model_state.clone());
-            if announce_session {
-                announce_session_models(&session_id, Some(&model_state), events).await?;
-            } else {
-                events
-                    .send(BackendEvent::Models(model_state.models))
-                    .await
-                    .map_err(|_| ())?;
-            }
+            handle_model_selection(
+                &session_id,
+                announce_session,
+                &result,
+                events,
+                model_options,
+            )
+            .await?;
         }
         PendingKind::ReloadModels { session_id } => {
-            let Some(model_state) = parse_model_options(&result) else {
-                events
-                    .send(BackendEvent::RequestFailed {
-                        operation: BackendOperation::Reload,
-                        code: -32603,
-                        message: "Devin returned no model options during refresh".to_owned(),
-                    })
-                    .await
-                    .map_err(|_| ())?;
-                return Ok(());
-            };
-            model_options.insert(session_id, model_state.clone());
-            events
-                .send(BackendEvent::Models(model_state.models))
-                .await
-                .map_err(|_| ())?;
+            handle_reloaded_models(session_id, &result, events, model_options).await?;
         }
         PendingKind::StartTurn {
             session_id,
             turn_id,
         } => {
-            active_turns.remove(&session_id);
-            let reason = string(&result, "stopReason");
-            let outcome = match reason.as_str() {
-                "end_turn" => TurnOutcome::Completed,
-                "cancelled" => TurnOutcome::Interrupted,
-                _ => TurnOutcome::Failed,
-            };
-            let error =
-                (outcome == TurnOutcome::Failed).then(|| format!("Devin stopped: {reason}"));
-            events
-                .send(BackendEvent::TurnCompleted {
-                    turn_id,
-                    outcome,
-                    error,
-                })
-                .await
-                .map_err(|_| ())?;
+            handle_completed_turn(session_id, turn_id, &result, events, active_turns).await?;
         }
-        PendingKind::CloseSession => {
-            events
-                .send(BackendEvent::SessionUnsubscribed)
-                .await
-                .map_err(|_| ())?;
-        }
+        PendingKind::CloseSession => announce_closed(events).await?,
     }
     Ok(())
+}
+
+async fn announce_closed(events: &mpsc::Sender<BackendEvent>) -> Result<(), ()> {
+    events
+        .send(BackendEvent::SessionUnsubscribed)
+        .await
+        .map_err(|_| ())
 }
 
 async fn emit_request_failure(
@@ -954,8 +1157,7 @@ async fn normalize_update(
             let item_id = update
                 .get("messageId")
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("{kind}:{turn_id}"));
+                .map_or_else(|| format!("{kind}:{turn_id}"), str::to_owned);
             if let Some(history) = replay.get_mut(&session_id) {
                 let item_kind = if kind == "user_message_chunk" {
                     ItemKind::User
@@ -1052,7 +1254,7 @@ fn normalize_permission(
             "allow_once" => choices.accept_once = Some(option_id),
             "allow_always" => choices.accept_always = Some(option_id),
             "reject_once" | "reject_always" if choices.decline.is_none() => {
-                choices.decline = Some(option_id)
+                choices.decline = Some(option_id);
             }
             _ => {}
         }
@@ -1075,8 +1277,7 @@ fn normalize_permission(
             .to_owned(),
         detail: tool
             .get("rawInput")
-            .map(pretty)
-            .unwrap_or_else(|| string(tool, "toolCallId")),
+            .map_or_else(|| string(tool, "toolCallId"), pretty),
     }
 }
 
@@ -1192,28 +1393,31 @@ async fn announce_session_models(
         .map_err(|_| ())
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ModelRequest<'a> {
+    kind: PendingKind,
+    operation: BackendOperation,
+    session_id: &'a str,
+    config_id: &'a str,
+    model: &'a str,
+}
+
 async fn send_model_request(
     stdin: &mut ChildStdin,
     pending: &mut HashMap<u64, PendingRequest>,
     next_id: &mut u64,
-    kind: PendingKind,
-    operation: BackendOperation,
-    session_id: &str,
-    config_id: &str,
-    model: &str,
+    request: ModelRequest<'_>,
 ) -> std::io::Result<()> {
     send_request(
         stdin,
         pending,
         next_id,
-        kind,
-        operation,
+        request.kind,
+        request.operation,
         "session/set_config_option",
         json!({
-            "sessionId": session_id,
-            "configId": config_id,
-            "value": model,
+            "sessionId": request.session_id,
+            "configId": request.config_id,
+            "value": request.model,
         }),
     )
     .await
@@ -1229,7 +1433,7 @@ async fn send_request(
     params: Value,
 ) -> std::io::Result<()> {
     let id = allocate_request_id(pending, next_id);
-    write_json(stdin, &request(id, method, params)).await?;
+    write_json(stdin, &request(id, method, &params)).await?;
     pending.insert(
         id,
         PendingRequest {
@@ -1251,19 +1455,19 @@ fn allocate_request_id(pending: &HashMap<u64, PendingRequest>, next_id: &mut u64
     }
 }
 
-fn request(id: u64, method: &str, params: Value) -> Value {
+fn request(id: u64, method: &str, params: &Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
 }
 
-fn notification(method: &str, params: Value) -> Value {
+fn notification(method: &str, params: &Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
 }
 
-fn response(id: Value, result: Value) -> Value {
+fn response(id: &Value, result: &Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-fn error_response(id: Value, code: i64, message: String) -> Value {
+fn error_response(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 

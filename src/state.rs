@@ -23,6 +23,7 @@ pub enum ConnectionState {
 }
 
 impl ConnectionState {
+    #[must_use]
     pub fn label(&self) -> &str {
         match self {
             Self::Starting => "connecting",
@@ -32,6 +33,7 @@ impl ConnectionState {
         }
     }
 
+    #[must_use]
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready { .. })
     }
@@ -143,7 +145,7 @@ pub struct AppState {
     pub model_picker: Option<ModelPicker>,
     pub session_picker: Option<SessionPicker>,
     pub provider_picker: Option<ProviderPicker>,
-    pending_model_picker: bool,
+    pending_model_picker: Option<()>,
     pub show_help: bool,
     pub text_selection: Option<TextSelection>,
     pub approvals: VecDeque<ApprovalRequest>,
@@ -151,7 +153,7 @@ pub struct AppState {
     pub status_message: String,
     pub diagnostic_count: usize,
     pub should_quit: bool,
-    creating_session: bool,
+    creating_session: Option<()>,
     pending_session_prompt: Option<OutgoingPrompt>,
     starting_turn: Option<OutgoingPrompt>,
     pending_steer: Option<PendingSteer>,
@@ -165,6 +167,11 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn set_status(&mut self, message: &str) {
+        self.status_message.clear();
+        self.status_message.push_str(message);
+    }
+
     pub fn new(
         workspace: impl Into<String>,
         initial_model: Option<String>,
@@ -226,7 +233,7 @@ impl AppState {
             model_picker: None,
             session_picker: None,
             provider_picker: None,
-            pending_model_picker: false,
+            pending_model_picker: None,
             show_help: false,
             text_selection: None,
             approvals: VecDeque::new(),
@@ -234,7 +241,7 @@ impl AppState {
             status_message: format!("Connecting to {backend_name}…"),
             diagnostic_count: 0,
             should_quit: false,
-            creating_session: false,
+            creating_session: None,
             pending_session_prompt: None,
             starting_turn: None,
             pending_steer: None,
@@ -294,13 +301,12 @@ impl AppState {
         if picker.providers.is_empty() {
             return;
         }
-        picker.selected =
-            (picker.selected as isize + delta).rem_euclid(picker.providers.len() as isize) as usize;
+        picker.selected = offset_index(picker.selected, picker.providers.len(), delta);
     }
 
     pub fn close_provider_picker(&mut self) {
         self.provider_picker = None;
-        self.status_message = "Provider settings closed.".to_owned();
+        self.set_status("Provider settings closed.");
     }
 
     pub fn toggle_provider(&mut self) -> Vec<Effect> {
@@ -326,7 +332,7 @@ impl AppState {
         }]
     }
 
-    pub fn session_persisted(&mut self, session: SessionRecord) {
+    pub fn session_persisted(&mut self, session: &SessionRecord) {
         self.session_id = Some(session.id.clone());
         self.status_message = format!("Session {} started.", short_id(&session.id));
     }
@@ -346,7 +352,7 @@ impl AppState {
 
     pub fn close_session_picker(&mut self) {
         self.session_picker = None;
-        self.status_message = "Session selection cancelled.".to_owned();
+        self.set_status("Session selection cancelled.");
     }
 
     pub fn select_session(&mut self) -> Vec<Effect> {
@@ -356,7 +362,7 @@ impl AppState {
             .and_then(|picker| picker.sessions.get(picker.selected))
             .cloned();
         let Some(session) = session else {
-            self.status_message = "No session is selected.".to_owned();
+            self.set_status("No session is selected.");
             return Vec::new();
         };
         self.begin_resume(session)
@@ -364,17 +370,17 @@ impl AppState {
 
     pub fn begin_resume(&mut self, session: SessionRecord) -> Vec<Effect> {
         if self.is_busy() {
-            self.status_message = "Cannot switch sessions while a turn is active.".to_owned();
+            self.set_status("Cannot switch sessions while a turn is active.");
             return Vec::new();
         }
         if session.workspace != self.workspace {
-            self.status_message = "That session belongs to a different workspace.".to_owned();
+            self.set_status("That session belongs to a different workspace.");
             return Vec::new();
         }
         if !self.activate_provider(&session.provider) {
             return Vec::new();
         }
-        if !self.backend_capabilities.resume {
+        if !self.backend_capabilities.resume.is_supported() {
             self.status_message = format!("{} does not support session resume.", self.backend_name);
             return Vec::new();
         }
@@ -440,17 +446,20 @@ impl AppState {
         self.status_message = format!("Could not copy selection: {error}");
     }
 
+    #[must_use]
     pub fn is_busy(&self) -> bool {
-        self.creating_session || self.starting_turn.is_some() || self.active_turn.is_some()
+        self.creating_session.is_some()
+            || self.starting_turn.is_some()
+            || self.active_turn.is_some()
     }
 
     pub fn submit_editor(&mut self) -> Vec<Effect> {
         if self.editor.is_blank() {
-            self.status_message = "Write a message before sending.".to_owned();
+            self.set_status("Write a message before sending.");
             return Vec::new();
         }
         if !self.connection.is_ready() {
-            self.status_message = "The backend is not ready; the draft was preserved.".to_owned();
+            self.set_status("The backend is not ready; the draft was preserved.");
             return Vec::new();
         }
 
@@ -466,7 +475,7 @@ impl AppState {
                 selected: 0,
                 loading: true,
             });
-            self.status_message = "Loading providers…".to_owned();
+            self.set_status("Loading providers…");
             return vec![Effect::ListProviders];
         }
         if command == "/reload" {
@@ -475,7 +484,7 @@ impl AppState {
         }
         if command == "/resume" {
             if self.is_busy() {
-                self.status_message = "Cannot switch sessions while a turn is active.".to_owned();
+                self.set_status("Cannot switch sessions while a turn is active.");
                 return Vec::new();
             }
             self.editor.clear();
@@ -484,14 +493,14 @@ impl AppState {
                 selected: 0,
                 loading: true,
             });
-            self.status_message = "Loading sessions…".to_owned();
+            self.set_status("Loading sessions…");
             return vec![Effect::ListSessions];
         }
         if let Some(id) = command.strip_prefix("/resume ").map(str::trim)
             && !id.is_empty()
         {
             if self.is_busy() {
-                self.status_message = "Cannot switch sessions while a turn is active.".to_owned();
+                self.set_status("Cannot switch sessions while a turn is active.");
                 return Vec::new();
             }
             self.editor.clear();
@@ -509,11 +518,16 @@ impl AppState {
 
     fn reload_backend(&mut self) -> Vec<Effect> {
         if self.is_busy() {
-            self.status_message = "Cannot reload while a turn is active.".to_owned();
+            self.set_status("Cannot reload while a turn is active.");
             return Vec::new();
         }
-        if self.backend_capabilities.models_require_session && self.provider_session_id.is_none() {
-            self.creating_session = true;
+        if self
+            .backend_capabilities
+            .models_require_session
+            .is_supported()
+            && self.provider_session_id.is_none()
+        {
+            self.creating_session = Some(());
         }
         self.status_message = format!("Reloading {} metadata…", self.backend_name);
         vec![Effect::Backend(BackendCommand::Reload {
@@ -523,13 +537,13 @@ impl AppState {
 
     fn new_session(&mut self) -> Vec<Effect> {
         if self.is_busy() {
-            self.status_message = "Cannot start a new session while a turn is active.".to_owned();
+            self.set_status("Cannot start a new session while a turn is active.");
             return Vec::new();
         }
         let previous = self.provider_session_id.take();
         self.session_id = None;
         self.active_turn = None;
-        self.creating_session = false;
+        self.creating_session = None;
         self.pending_session_prompt = None;
         self.starting_turn = None;
         self.pending_steer = None;
@@ -545,7 +559,7 @@ impl AppState {
             "New session. Send a message to begin.",
             EntryStatus::Complete,
         );
-        self.status_message = "New session ready.".to_owned();
+        self.set_status("New session ready.");
         previous
             .map(|provider_session_id| {
                 vec![Effect::Backend(BackendCommand::UnsubscribeSession {
@@ -557,7 +571,7 @@ impl AppState {
 
     pub fn enqueue_editor(&mut self) -> Vec<Effect> {
         if self.editor.is_blank() {
-            self.status_message = "Write a message before queueing.".to_owned();
+            self.set_status("Write a message before queueing.");
             return Vec::new();
         }
         if !self.is_busy() {
@@ -573,28 +587,28 @@ impl AppState {
 
     pub fn steer_editor(&mut self) -> Vec<Effect> {
         if self.editor.is_blank() {
-            self.status_message = "Write steering guidance first.".to_owned();
+            self.set_status("Write steering guidance first.");
             return Vec::new();
         }
-        if !self.backend_capabilities.steering {
+        if !self.backend_capabilities.steering.is_supported() {
             self.status_message = format!("{} does not support steering.", self.backend_name);
             return Vec::new();
         }
         if self.pending_steer.is_some() {
-            self.status_message = "A steer request is already awaiting the backend.".to_owned();
+            self.set_status("A steer request is already awaiting the backend.");
             return Vec::new();
         }
         let Some(active) = self.active_turn.as_ref() else {
-            self.status_message = "There is no active turn to steer.".to_owned();
+            self.set_status("There is no active turn to steer.");
             return Vec::new();
         };
         if active.cancelling {
-            self.status_message = "The active turn is being cancelled.".to_owned();
+            self.set_status("The active turn is being cancelled.");
             return Vec::new();
         }
         let turn_id = active.id.clone();
         let Some(provider_session_id) = self.provider_session_id.clone() else {
-            self.status_message = "The active provider session is unavailable.".to_owned();
+            self.set_status("The active provider session is unavailable.");
             return Vec::new();
         };
 
@@ -606,7 +620,7 @@ impl AppState {
             turn_id: turn_id.clone(),
             editor_revision: self.editor.revision(),
         });
-        self.status_message = "Sending steering guidance…".to_owned();
+        self.set_status("Sending steering guidance…");
         vec![Effect::Backend(BackendCommand::SteerTurn {
             session_id: provider_session_id,
             turn_id,
@@ -620,7 +634,7 @@ impl AppState {
             self.should_quit = true;
             return vec![Effect::Backend(BackendCommand::Shutdown), Effect::Quit];
         };
-        if !self.backend_capabilities.interruption {
+        if !self.backend_capabilities.interruption.is_supported() {
             self.status_message = format!("{} does not support interruption.", self.backend_name);
             return Vec::new();
         }
@@ -629,13 +643,14 @@ impl AppState {
             return vec![Effect::Backend(BackendCommand::Shutdown), Effect::Quit];
         }
         let Some(provider_session_id) = self.provider_session_id.clone() else {
-            self.status_message =
-                "Cannot cancel: the provider session id is unavailable.".to_owned();
+            self.set_status("Cannot cancel: the provider session id is unavailable.");
             return Vec::new();
         };
 
         active.cancelling = true;
-        self.status_message = "Cancelling… Press Ctrl+C again to exit Flock.".to_owned();
+        self.status_message.clear();
+        self.status_message
+            .push_str("Cancelling… Press Ctrl+C again to exit Flock.");
         vec![Effect::Backend(BackendCommand::InterruptTurn {
             session_id: provider_session_id,
             turn_id: active.id.clone(),
@@ -644,8 +659,7 @@ impl AppState {
 
     pub fn request_quit(&mut self) -> Vec<Effect> {
         if self.is_busy() {
-            self.status_message =
-                "A turn is active. Cancel it with Ctrl+C before exiting.".to_owned();
+            self.set_status("A turn is active. Cancel it with Ctrl+C before exiting.");
             Vec::new()
         } else {
             self.should_quit = true;
@@ -662,8 +676,8 @@ impl AppState {
     }
 
     pub fn open_model_picker(&mut self) -> Vec<Effect> {
-        if self.pending_model_picker
-            || (self.creating_session && self.provider_session_id.is_none())
+        if self.pending_model_picker.is_some()
+            || (self.creating_session.is_some() && self.provider_session_id.is_none())
         {
             self.status_message = format!("Loading {} models…", self.backend_name);
             return Vec::new();
@@ -672,14 +686,19 @@ impl AppState {
             self.show_model_picker();
             return Vec::new();
         }
-        if !self.backend_capabilities.model_catalog {
+        if !self.backend_capabilities.model_catalog.is_supported() {
             self.status_message = format!("{} does not expose model selection.", self.backend_name);
             return Vec::new();
         }
-        self.pending_model_picker = true;
+        self.pending_model_picker = Some(());
         self.status_message = format!("Loading {} models…", self.backend_name);
-        if self.backend_capabilities.models_require_session && self.provider_session_id.is_none() {
-            self.creating_session = true;
+        if self
+            .backend_capabilities
+            .models_require_session
+            .is_supported()
+            && self.provider_session_id.is_none()
+        {
+            self.creating_session = Some(());
         }
         vec![Effect::Backend(BackendCommand::Reload {
             session_id: self.provider_session_id.clone(),
@@ -700,7 +719,7 @@ impl AppState {
             filter: String::new(),
             selected,
         });
-        self.pending_model_picker = false;
+        self.pending_model_picker = None;
     }
 
     pub fn picker_insert(&mut self, character: char) {
@@ -728,7 +747,7 @@ impl AppState {
             picker.selected = 0;
             return;
         }
-        picker.selected = (picker.selected as isize + delta).rem_euclid(count as isize) as usize;
+        picker.selected = offset_index(picker.selected, count, delta);
     }
 
     pub fn picker_select(&mut self) -> Vec<Effect> {
@@ -737,7 +756,7 @@ impl AppState {
             .model_picker
             .as_ref()
             .and_then(|picker| filtered.get(picker.selected))
-            .cloned()
+            .copied()
             .cloned();
         if let Some(selected) = selected {
             if !self.activate_provider(&selected.provider) {
@@ -752,7 +771,10 @@ impl AppState {
                 format!("Selected model: {qualified}.")
             };
             self.model_picker = None;
-            if self.backend_capabilities.session_model_config
+            if self
+                .backend_capabilities
+                .session_model_config
+                .is_supported()
                 && let Some(session_id) = self.provider_session_id.clone()
             {
                 return vec![Effect::Backend(BackendCommand::SetSessionModel {
@@ -770,6 +792,7 @@ impl AppState {
         Vec::new()
     }
 
+    #[must_use]
     pub fn filtered_models(&self) -> Vec<&ModelInfo> {
         let Some(picker) = &self.model_picker else {
             return self.models.iter().collect();
@@ -785,7 +808,7 @@ impl AppState {
 
     pub fn close_model_picker(&mut self) {
         self.model_picker = None;
-        self.status_message = "Model selection cancelled.".to_owned();
+        self.set_status("Model selection cancelled.");
     }
 
     pub fn move_queue_selection(&mut self, delta: isize) {
@@ -794,8 +817,7 @@ impl AppState {
             return;
         }
         let current = self.queue_selection.unwrap_or(0);
-        self.queue_selection =
-            Some((current as isize + delta).rem_euclid(self.queue.len() as isize) as usize);
+        self.queue_selection = Some(offset_index(current, self.queue.len(), delta));
     }
 
     pub fn remove_selected_queue_item(&mut self) {
@@ -860,12 +882,12 @@ impl AppState {
             BackendEvent::Models(models) => {
                 let mut models = models.clone();
                 for model in &mut models {
-                    model.provider = provider.to_owned();
+                    provider.clone_into(&mut model.provider);
                 }
                 if !models.is_empty() {
                     self.install_models(models.clone());
                 }
-                if self.pending_model_picker && !self.models.is_empty() {
+                if self.pending_model_picker.is_some() && !self.models.is_empty() {
                     self.show_model_picker();
                 }
                 return vec![Effect::PersistModels {
@@ -893,11 +915,11 @@ impl AppState {
                 self.diagnostic_count += 1;
                 self.transcript.push(
                     EntryKind::System,
-                    format!("{} WARNING", provider),
+                    format!("{provider} WARNING"),
                     message,
                     EntryStatus::Complete,
                 );
-                self.status_message = message.clone();
+                self.status_message.clone_from(message);
                 return Vec::new();
             }
             _ => {}
@@ -922,11 +944,13 @@ impl AppState {
                 provider_session_id: None,
                 session_id: None,
             });
-        context.name = self.backend_name.clone();
+        context.name.clone_from(&self.backend_name);
         context.capabilities = self.backend_capabilities.clone();
         context.connection = self.connection.clone();
-        context.provider_session_id = self.provider_session_id.clone();
-        context.session_id = self.session_id.clone();
+        context
+            .provider_session_id
+            .clone_from(&self.provider_session_id);
+        context.session_id.clone_from(&self.session_id);
     }
 
     fn activate_provider(&mut self, provider: &str) -> bool {
@@ -934,7 +958,7 @@ impl AppState {
             return true;
         }
         if self.is_busy() {
-            self.status_message = "Cannot change provider while a turn is active.".to_owned();
+            self.set_status("Cannot change provider while a turn is active.");
             return false;
         }
         self.sync_active_provider_context();
@@ -942,7 +966,7 @@ impl AppState {
             self.status_message = format!("Provider {provider} is not available.");
             return false;
         };
-        self.backend_provider = provider.to_owned();
+        provider.clone_into(&mut self.backend_provider);
         self.backend_name = context.name;
         self.backend_capabilities = context.capabilities;
         self.connection = context.connection;
@@ -953,113 +977,25 @@ impl AppState {
 
     pub fn handle_backend(&mut self, event: BackendEvent) -> Vec<Effect> {
         match event {
-            BackendEvent::Ready(identity) => {
-                self.backend_provider = identity.provider;
-                self.backend_name = identity.display_name;
-                self.backend_capabilities = identity.capabilities;
-                self.connection = ConnectionState::Ready {
-                    server: self.backend_name.clone(),
-                };
-                self.transcript.upsert(
-                    "flock:startup",
-                    EntryKind::System,
-                    "FLOCK",
-                    format!("Connected to {}.", self.backend_name),
-                    EntryStatus::Complete,
-                );
-                self.status_message = "Ready.".to_owned();
-                if let Some(session_id) = self.startup_resume.take() {
-                    return vec![Effect::ResolveSession(session_id)];
-                }
-            }
-            BackendEvent::Models(models) => {
-                if models.is_empty() {
-                    self.pending_model_picker = false;
-                    if self.models.is_empty() {
-                        self.install_models(models);
-                    } else {
-                        self.status_message =
-                            "Model refresh returned no choices; kept the cached catalog."
-                                .to_owned();
-                    }
-                    return Vec::new();
-                }
-                let cached = models.clone();
-                self.install_models(models);
-                if self.pending_model_picker {
-                    self.show_model_picker();
-                }
-                let mut effects = vec![Effect::PersistModels {
-                    provider: self.backend_provider.clone(),
-                    models: cached,
-                }];
-                if let (Some(session_id), Some(model)) =
-                    (self.session_id.clone(), self.selected_model.clone())
-                {
-                    effects.push(Effect::UpdateSessionModel {
-                        session_id,
-                        model: Some(model),
-                    });
-                }
-                return effects;
-            }
+            BackendEvent::Ready(identity) => return self.handle_ready(identity),
+            BackendEvent::Models(models) => return self.handle_models(models),
             BackendEvent::SessionCreated {
                 provider_session_id,
                 model,
             } => {
-                if provider_session_id.is_empty() {
-                    return self.protocol_problem("session creation returned an empty provider id");
-                }
-                self.provider_session_id = Some(provider_session_id.clone());
-                self.creating_session = false;
-                if !model.is_empty() {
-                    let qualified = self.qualify_active_model(&model);
-                    if self.selected_model.as_deref() != Some(qualified.as_str()) {
-                        self.selected_model = Some(qualified.clone());
-                        self.status_message =
-                            format!("{} selected model {qualified}.", self.backend_name);
-                    }
-                }
-                if let Some(prompt) = self.pending_session_prompt.take() {
-                    let mut effects = vec![Effect::PersistSession {
-                        provider: self.backend_provider.clone(),
-                        provider_session_id: provider_session_id.clone(),
-                        workspace: self.workspace.clone(),
-                        title: prompt.text.clone(),
-                        model: self.selected_model.clone(),
-                    }];
-                    effects.extend(self.start_prompt_on_session(prompt, provider_session_id));
-                    return effects;
-                }
+                return self.handle_session_created(provider_session_id, &model);
             }
             BackendEvent::SessionResumed {
                 provider_session_id,
                 model,
                 history,
             } => {
-                let Some(session) = self.resuming_session.take() else {
-                    return self.protocol_problem("received an unexpected session resume response");
-                };
-                if provider_session_id.is_empty() {
-                    return self.protocol_problem("session resume returned an empty provider id");
-                }
-                self.provider_session_id = Some(provider_session_id);
-                self.session_id = Some(session.id.clone());
-                if !model.is_empty() {
-                    self.selected_model = Some(self.qualify_active_model(&model));
-                }
-                self.install_history(history);
-                self.status_message = format!("Resumed session {}.", short_id(&session.id));
-                return vec![Effect::TouchSession(session.id)];
+                return self.handle_session_resumed(provider_session_id, &model, history);
             }
             BackendEvent::SessionUnsubscribed => {}
             BackendEvent::SessionObserved {
                 provider_session_id,
-            } => {
-                if self.provider_session_id.is_none() && !provider_session_id.is_empty() {
-                    self.provider_session_id = Some(provider_session_id);
-                }
-            }
+            } => self.observe_session(provider_session_id),
             BackendEvent::TurnAccepted { turn_id } | BackendEvent::TurnStarted { turn_id } => {
                 if turn_id.is_empty() {
                     return self.protocol_problem("turn event returned an empty turn id");
@@ -1070,7 +1006,7 @@ impl AppState {
                 turn_id,
                 outcome,
                 error,
-            } => return self.complete_turn(turn_id, outcome, error),
+            } => return self.complete_turn(&turn_id, outcome, error),
             BackendEvent::ItemStarted { turn_id, item } => {
                 self.observe_item(turn_id, item, false);
             }
@@ -1082,125 +1018,33 @@ impl AppState {
                 item_id,
                 kind,
                 delta,
-            } => self.observe_delta(turn_id, item_id, kind, delta),
+            } => self.observe_delta(turn_id, item_id, kind, &delta),
             BackendEvent::TurnDiff { turn_id, diff } => {
-                if self.turn_is_current(&turn_id) {
-                    self.transcript.upsert(
-                        format!("turn:{turn_id}:diff"),
-                        EntryKind::Diff,
-                        "TURN DIFF",
-                        diff,
-                        EntryStatus::Running,
-                    );
-                }
+                self.observe_turn_artifact(&turn_id, diff, EntryKind::Diff, "TURN DIFF", "diff");
             }
             BackendEvent::TurnPlan { turn_id, plan } => {
-                if self.turn_is_current(&turn_id) {
-                    self.transcript.upsert(
-                        format!("turn:{turn_id}:plan"),
-                        EntryKind::Reasoning,
-                        "PLAN",
-                        plan,
-                        EntryStatus::Running,
-                    );
-                }
+                self.observe_turn_artifact(&turn_id, plan, EntryKind::Reasoning, "PLAN", "plan");
             }
             BackendEvent::ApprovalRequested(approval) => {
                 self.status_message = format!("Approval required: {}", approval.title);
                 self.approvals.push_back(approval);
             }
             BackendEvent::ApprovalResolved { request_id } => {
-                if let Some(index) = self
-                    .approvals
-                    .iter()
-                    .position(|approval| approval.id == request_id)
-                {
-                    self.approvals.remove(index);
-                    self.status_message = "Approval was resolved by another client.".to_owned();
-                }
+                self.resolve_external_approval(&request_id);
             }
-            BackendEvent::SteerAccepted { turn_id } => {
-                if let Some(pending) = self.pending_steer.take() {
-                    if pending.turn_id == turn_id && self.turn_is_current(&turn_id) {
-                        if self.editor.revision() == pending.editor_revision {
-                            self.editor.clear();
-                        }
-                        self.transcript.push(
-                            EntryKind::Steering,
-                            format!("STEER · {}", pending.id),
-                            pending.text,
-                            EntryStatus::Complete,
-                        );
-                        self.status_message = "Steering guidance accepted.".to_owned();
-                    } else {
-                        self.status_message =
-                            "A late steer response was ignored; the draft was preserved."
-                                .to_owned();
-                    }
-                } else {
-                    self.status_message =
-                        "A late steer response arrived after the turn ended.".to_owned();
-                }
-            }
+            BackendEvent::SteerAccepted { turn_id } => self.handle_steer_accepted(&turn_id),
             BackendEvent::InterruptAccepted => {
-                self.status_message =
-                    "Interrupt accepted; waiting for the turn to stop…".to_owned();
+                self.set_status("Interrupt accepted; waiting for the turn to stop…");
             }
             BackendEvent::ModelRerouted { turn_id, from, to } => {
-                if let Some(active) = self
-                    .active_turn
-                    .as_mut()
-                    .filter(|active| active.id == turn_id)
-                {
-                    active.model = Some(to.clone());
-                    self.transcript.push(
-                        EntryKind::Warning,
-                        "MODEL REROUTED",
-                        format!(
-                            "{} changed this turn from {from} to {to}.",
-                            self.backend_name
-                        ),
-                        EntryStatus::Complete,
-                    );
-                    self.status_message = format!("Model rerouted to {to}.");
-                } else {
-                    self.diagnostic_count += 1;
-                }
+                self.handle_model_rerouted(&turn_id, &from, &to);
             }
-            BackendEvent::Warning(message) => {
-                self.transcript.push(
-                    EntryKind::Warning,
-                    "BACKEND WARNING",
-                    &message,
-                    EntryStatus::Complete,
-                );
-                self.status_message = message;
-            }
+            BackendEvent::Warning(message) => self.handle_warning(message),
             BackendEvent::TurnError {
                 turn_id,
                 message,
                 will_retry,
-            } => {
-                self.transcript.push(
-                    EntryKind::Error,
-                    "BACKEND ERROR",
-                    if will_retry {
-                        format!("{message}\n{} will retry.", self.backend_name)
-                    } else {
-                        message.clone()
-                    },
-                    if will_retry {
-                        EntryStatus::Running
-                    } else {
-                        EntryStatus::Failed
-                    },
-                );
-                self.status_message = if will_retry {
-                    format!("{} error on {turn_id}; retrying…", self.backend_name)
-                } else {
-                    message
-                };
-            }
+            } => self.handle_turn_error(&turn_id, message, will_retry),
             BackendEvent::RequestFailed {
                 operation,
                 code,
@@ -1212,45 +1056,258 @@ impl AppState {
             }
             BackendEvent::SessionClosed {
                 provider_session_id,
-            } => {
-                if self.provider_session_id.as_deref() == Some(provider_session_id.as_str()) {
-                    let pending_prompt = self
-                        .pending_session_prompt
-                        .take()
-                        .or_else(|| self.starting_turn.take());
-                    self.provider_session_id = None;
-                    self.active_turn = None;
-                    self.creating_session = false;
-                    self.pending_steer = None;
-                    self.approvals.clear();
-                    self.status_message = "The provider session was closed.".to_owned();
-                    if let Some(prompt) = pending_prompt {
-                        self.restore_failed_prompt(prompt);
-                    }
-                }
-            }
-            BackendEvent::Disconnected { reason } => {
-                let pending_prompt = self
-                    .pending_session_prompt
-                    .take()
-                    .or_else(|| self.starting_turn.take());
-                self.connection = ConnectionState::Disconnected(reason.clone());
-                self.active_turn = None;
-                self.creating_session = false;
-                self.pending_steer = None;
-                self.transcript.push(
-                    EntryKind::Error,
-                    "BACKEND DISCONNECTED",
-                    &reason,
-                    EntryStatus::Failed,
-                );
-                self.status_message = reason;
-                if let Some(prompt) = pending_prompt {
-                    self.restore_failed_prompt(prompt);
-                }
-            }
+            } => self.handle_session_closed(&provider_session_id),
+            BackendEvent::Disconnected { reason } => self.handle_disconnected(reason),
         }
         Vec::new()
+    }
+
+    fn handle_ready(&mut self, identity: crate::backend::BackendIdentity) -> Vec<Effect> {
+        self.backend_provider = identity.provider;
+        self.backend_name = identity.display_name;
+        self.backend_capabilities = identity.capabilities;
+        self.connection = ConnectionState::Ready {
+            server: self.backend_name.clone(),
+        };
+        self.transcript.upsert(
+            "flock:startup",
+            EntryKind::System,
+            "FLOCK",
+            format!("Connected to {}.", self.backend_name),
+            EntryStatus::Complete,
+        );
+        self.set_status("Ready.");
+        self.startup_resume
+            .take()
+            .map_or_else(Vec::new, |id| vec![Effect::ResolveSession(id)])
+    }
+
+    fn observe_session(&mut self, provider_session_id: String) {
+        if self.provider_session_id.is_none() && !provider_session_id.is_empty() {
+            self.provider_session_id = Some(provider_session_id);
+        }
+    }
+
+    fn resolve_external_approval(&mut self, request_id: &serde_json::Value) {
+        if let Some(index) = self
+            .approvals
+            .iter()
+            .position(|approval| &approval.id == request_id)
+        {
+            self.approvals.remove(index);
+            self.set_status("Approval was resolved by another client.");
+        }
+    }
+
+    fn handle_warning(&mut self, message: String) {
+        self.transcript.push(
+            EntryKind::Warning,
+            "BACKEND WARNING",
+            &message,
+            EntryStatus::Complete,
+        );
+        self.status_message = message;
+    }
+
+    fn handle_models(&mut self, models: Vec<ModelInfo>) -> Vec<Effect> {
+        if models.is_empty() {
+            self.pending_model_picker = None;
+            if self.models.is_empty() {
+                self.install_models(models);
+            } else {
+                self.set_status("Model refresh returned no choices; kept the cached catalog.");
+            }
+            return Vec::new();
+        }
+        let cached = models.clone();
+        self.install_models(models);
+        if self.pending_model_picker.is_some() {
+            self.show_model_picker();
+        }
+        let mut effects = vec![Effect::PersistModels {
+            provider: self.backend_provider.clone(),
+            models: cached,
+        }];
+        if let (Some(session_id), Some(model)) =
+            (self.session_id.clone(), self.selected_model.clone())
+        {
+            effects.push(Effect::UpdateSessionModel {
+                session_id,
+                model: Some(model),
+            });
+        }
+        effects
+    }
+
+    fn handle_session_created(&mut self, provider_session_id: String, model: &str) -> Vec<Effect> {
+        if provider_session_id.is_empty() {
+            return self.protocol_problem("session creation returned an empty provider id");
+        }
+        self.provider_session_id = Some(provider_session_id.clone());
+        self.creating_session = None;
+        if !model.is_empty() {
+            let qualified = self.qualify_active_model(model);
+            if self.selected_model.as_deref() != Some(qualified.as_str()) {
+                self.selected_model = Some(qualified.clone());
+                self.status_message = format!("{} selected model {qualified}.", self.backend_name);
+            }
+        }
+        let Some(prompt) = self.pending_session_prompt.take() else {
+            return Vec::new();
+        };
+        let mut effects = vec![Effect::PersistSession {
+            provider: self.backend_provider.clone(),
+            provider_session_id: provider_session_id.clone(),
+            workspace: self.workspace.clone(),
+            title: prompt.text.clone(),
+            model: self.selected_model.clone(),
+        }];
+        effects.extend(self.start_prompt_on_session(prompt, provider_session_id));
+        effects
+    }
+
+    fn handle_session_resumed(
+        &mut self,
+        provider_session_id: String,
+        model: &str,
+        history: Vec<SessionHistoryItem>,
+    ) -> Vec<Effect> {
+        let Some(session) = self.resuming_session.take() else {
+            return self.protocol_problem("received an unexpected session resume response");
+        };
+        if provider_session_id.is_empty() {
+            return self.protocol_problem("session resume returned an empty provider id");
+        }
+        self.provider_session_id = Some(provider_session_id);
+        self.session_id = Some(session.id.clone());
+        if !model.is_empty() {
+            self.selected_model = Some(self.qualify_active_model(model));
+        }
+        self.install_history(history);
+        self.status_message = format!("Resumed session {}.", short_id(&session.id));
+        vec![Effect::TouchSession(session.id)]
+    }
+
+    fn observe_turn_artifact(
+        &mut self,
+        turn_id: &str,
+        body: String,
+        kind: EntryKind,
+        title: &str,
+        suffix: &str,
+    ) {
+        if self.turn_is_current(turn_id) {
+            self.transcript.upsert(
+                format!("turn:{turn_id}:{suffix}"),
+                kind,
+                title,
+                body,
+                EntryStatus::Running,
+            );
+        }
+    }
+
+    fn handle_steer_accepted(&mut self, turn_id: &str) {
+        let Some(pending) = self.pending_steer.take() else {
+            self.set_status("A late steer response arrived after the turn ended.");
+            return;
+        };
+        if pending.turn_id != turn_id || !self.turn_is_current(turn_id) {
+            self.set_status("A late steer response was ignored; the draft was preserved.");
+            return;
+        }
+        if self.editor.revision() == pending.editor_revision {
+            self.editor.clear();
+        }
+        self.transcript.push(
+            EntryKind::Steering,
+            format!("STEER · {}", pending.id),
+            pending.text,
+            EntryStatus::Complete,
+        );
+        self.set_status("Steering guidance accepted.");
+    }
+
+    fn handle_model_rerouted(&mut self, turn_id: &str, from: &str, to: &str) {
+        let Some(active) = self
+            .active_turn
+            .as_mut()
+            .filter(|active| active.id == turn_id)
+        else {
+            self.diagnostic_count += 1;
+            return;
+        };
+        active.model = Some(to.to_owned());
+        self.transcript.push(
+            EntryKind::Warning,
+            "MODEL REROUTED",
+            format!(
+                "{} changed this turn from {from} to {to}.",
+                self.backend_name
+            ),
+            EntryStatus::Complete,
+        );
+        self.status_message = format!("Model rerouted to {to}.");
+    }
+
+    fn handle_turn_error(&mut self, turn_id: &str, message: String, will_retry: bool) {
+        let body = if will_retry {
+            format!("{message}\n{} will retry.", self.backend_name)
+        } else {
+            message.clone()
+        };
+        let status = if will_retry {
+            EntryStatus::Running
+        } else {
+            EntryStatus::Failed
+        };
+        self.transcript
+            .push(EntryKind::Error, "BACKEND ERROR", body, status);
+        self.status_message = if will_retry {
+            format!("{} error on {turn_id}; retrying…", self.backend_name)
+        } else {
+            message
+        };
+    }
+
+    fn handle_session_closed(&mut self, provider_session_id: &str) {
+        if self.provider_session_id.as_deref() != Some(provider_session_id) {
+            return;
+        }
+        let pending_prompt = self
+            .pending_session_prompt
+            .take()
+            .or_else(|| self.starting_turn.take());
+        self.provider_session_id = None;
+        self.active_turn = None;
+        self.creating_session = None;
+        self.pending_steer = None;
+        self.approvals.clear();
+        self.set_status("The provider session was closed.");
+        if let Some(prompt) = pending_prompt {
+            self.restore_failed_prompt(&prompt);
+        }
+    }
+
+    fn handle_disconnected(&mut self, reason: String) {
+        let pending_prompt = self
+            .pending_session_prompt
+            .take()
+            .or_else(|| self.starting_turn.take());
+        self.connection = ConnectionState::Disconnected(reason.clone());
+        self.active_turn = None;
+        self.creating_session = None;
+        self.pending_steer = None;
+        self.transcript.push(
+            EntryKind::Error,
+            "BACKEND DISCONNECTED",
+            &reason,
+            EntryStatus::Failed,
+        );
+        self.status_message = reason;
+        if let Some(prompt) = pending_prompt {
+            self.restore_failed_prompt(&prompt);
+        }
     }
 
     fn take_editor_prompt(&mut self) -> QueuedPrompt {
@@ -1269,6 +1326,7 @@ impl AppState {
             model: self
                 .backend_capabilities
                 .model_catalog
+                .is_supported()
                 .then(|| self.selected_model_for_active_provider())
                 .flatten(),
         };
@@ -1295,7 +1353,7 @@ impl AppState {
             }
             effects
         } else {
-            self.creating_session = true;
+            self.creating_session = Some(());
             self.pending_session_prompt = Some(prompt.clone());
             self.status_message = format!("Creating a {} session…", self.backend_name);
             vec![Effect::Backend(BackendCommand::StartSession {
@@ -1310,7 +1368,7 @@ impl AppState {
         provider_session_id: String,
     ) -> Vec<Effect> {
         self.starting_turn = Some(prompt.clone());
-        self.status_message = "Starting turn…".to_owned();
+        self.set_status("Starting turn…");
         vec![Effect::Backend(BackendCommand::StartTurn {
             session_id: provider_session_id,
             client_id: prompt.id,
@@ -1342,14 +1400,14 @@ impl AppState {
 
     fn complete_turn(
         &mut self,
-        turn_id: String,
+        turn_id: &str,
         outcome: TurnOutcome,
         error: Option<String>,
     ) -> Vec<Effect> {
         if self.active_turn.is_none() && self.starting_turn.is_some() {
-            self.observe_turn_started(turn_id.clone());
+            self.observe_turn_started(turn_id.to_owned());
         }
-        if !self.turn_is_current(&turn_id) {
+        if !self.turn_is_current(turn_id) {
             self.diagnostic_count += 1;
             self.status_message = format!("Ignored completion for inactive turn {turn_id}.");
             return Vec::new();
@@ -1363,7 +1421,7 @@ impl AppState {
         let item_ids = self
             .item_turns
             .iter()
-            .filter(|(_, item_turn_id)| *item_turn_id == &turn_id)
+            .filter(|(_, item_turn_id)| item_turn_id.as_str() == turn_id)
             .map(|(item_id, _)| item_id.clone())
             .collect::<Vec<_>>();
         for item_id in item_ids {
@@ -1374,7 +1432,7 @@ impl AppState {
         self.transcript
             .set_status(&format!("turn:{turn_id}:plan"), final_item_status);
         self.item_turns
-            .retain(|_, item_turn_id| item_turn_id != &turn_id);
+            .retain(|_, item_turn_id| item_turn_id != turn_id);
 
         self.active_turn = None;
         self.starting_turn = None;
@@ -1384,12 +1442,12 @@ impl AppState {
             .is_some_and(|pending| pending.turn_id == turn_id)
         {
             self.pending_steer = None;
-            self.status_message = "Steer was too late; the draft was preserved.".to_owned();
+            self.set_status("Steer was too late; the draft was preserved.");
         }
 
         match outcome {
             TurnOutcome::Completed => {
-                self.status_message = "Turn completed.".to_owned();
+                self.set_status("Turn completed.");
             }
             TurnOutcome::Interrupted => {
                 self.transcript.push(
@@ -1398,7 +1456,7 @@ impl AppState {
                     "The active turn was cancelled.",
                     EntryStatus::Interrupted,
                 );
-                self.status_message = "Turn interrupted.".to_owned();
+                self.set_status("Turn interrupted.");
             }
             TurnOutcome::Failed => {
                 let message = error.unwrap_or_else(|| "The turn failed.".to_owned());
@@ -1475,7 +1533,7 @@ impl AppState {
         }
     }
 
-    fn observe_delta(&mut self, turn_id: String, item_id: String, kind: DeltaKind, delta: String) {
+    fn observe_delta(&mut self, turn_id: String, item_id: String, kind: DeltaKind, delta: &str) {
         if !self.turn_is_current(&turn_id) {
             self.diagnostic_count += 1;
             return;
@@ -1488,7 +1546,7 @@ impl AppState {
             DeltaKind::Tool => (EntryKind::Tool, "TOOL OUTPUT"),
         };
         self.transcript
-            .append_delta(item_id, entry_kind, title, &delta);
+            .append_delta(item_id, entry_kind, title, delta);
     }
 
     fn request_failed(
@@ -1514,31 +1572,32 @@ impl AppState {
             | BackendOperation::SetSessionModel
             | BackendOperation::UnsubscribeSession => {}
             BackendOperation::Reload => {
-                self.creating_session = false;
-                self.pending_model_picker = false;
+                self.creating_session = None;
+                self.pending_model_picker = None;
             }
             BackendOperation::ResumeSession => {
                 self.resuming_session = None;
             }
             BackendOperation::StartSession => {
                 if code == -32001 {
-                    self.status_message =
-                        "Session start timed out; waiting for a definitive backend event."
-                            .to_owned();
+                    self.set_status(
+                        "Session start timed out; waiting for a definitive backend event.",
+                    );
                 } else {
-                    self.creating_session = false;
+                    self.creating_session = None;
                     if let Some(prompt) = self.pending_session_prompt.take() {
-                        self.restore_failed_prompt(prompt);
+                        self.restore_failed_prompt(&prompt);
                     }
                 }
             }
             BackendOperation::StartTurn => {
                 if code == -32001 {
-                    self.status_message =
-                        "Turn start timed out; waiting for a definitive backend event.".to_owned();
+                    self.set_status(
+                        "Turn start timed out; waiting for a definitive backend event.",
+                    );
                 } else {
                     if let Some(prompt) = self.starting_turn.take() {
-                        self.restore_failed_prompt(prompt);
+                        self.restore_failed_prompt(&prompt);
                     }
                     return self.drain_queue();
                 }
@@ -1555,7 +1614,7 @@ impl AppState {
         Vec::new()
     }
 
-    fn restore_failed_prompt(&mut self, prompt: OutgoingPrompt) {
+    fn restore_failed_prompt(&mut self, prompt: &OutgoingPrompt) {
         self.transcript
             .set_status(&format!("user:{}", prompt.id), EntryStatus::Failed);
         if self.editor.is_blank() {
@@ -1595,7 +1654,7 @@ impl AppState {
         self.models.sort_by_key(ModelInfo::qualified_id);
         if self.models.is_empty() {
             self.status_message = format!("{} returned an empty model catalog.", self.backend_name);
-            self.pending_model_picker = false;
+            self.pending_model_picker = None;
             return;
         }
 
@@ -1611,7 +1670,7 @@ impl AppState {
                     self.selected_model = Some(initial);
                 } else {
                     let fallback = self.default_model();
-                    self.selected_model = fallback.clone();
+                    self.selected_model.clone_from(&fallback);
                     self.status_message = match fallback {
                         Some(fallback) => {
                             format!("Model {initial} is unavailable; using {fallback}.")
@@ -1620,7 +1679,10 @@ impl AppState {
                     };
                 }
             }
-        } else if self.backend_capabilities.session_model_config
+        } else if self
+            .backend_capabilities
+            .session_model_config
+            .is_supported()
             || self.selected_model.as_ref().is_none_or(|selected| {
                 !self
                     .models
@@ -1647,7 +1709,7 @@ impl AppState {
 
     fn protocol_problem(&mut self, message: &str) -> Vec<Effect> {
         self.diagnostic_count += 1;
-        self.status_message = message.to_owned();
+        message.clone_into(&mut self.status_message);
         self.transcript.push(
             EntryKind::Error,
             "PROTOCOL ERROR",
@@ -1667,6 +1729,16 @@ impl AppState {
         let id = format!("flock-{kind}-{:06}", self.next_local_id);
         self.next_local_id = self.next_local_id.wrapping_add(1);
         id
+    }
+}
+
+fn offset_index(index: usize, len: usize, delta: isize) -> usize {
+    debug_assert!(len > 0);
+    let distance = delta.unsigned_abs() % len;
+    if delta.is_negative() {
+        (index + len - distance) % len
+    } else {
+        (index + distance) % len
     }
 }
 
@@ -1699,8 +1771,8 @@ mod tests {
     use crate::{
         backend::{
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
-            BackendIdentity, BackendOperation, CODEX_PROVIDER, DEVIN_PROVIDER, ItemKind,
-            ItemStatus, ModelInfo, NormalizedItem, SessionHistoryItem, TurnOutcome,
+            BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, DEVIN_PROVIDER,
+            ItemKind, ItemStatus, ModelInfo, NormalizedItem, SessionHistoryItem, TurnOutcome,
         },
         session::SessionRecord,
     };
@@ -1714,16 +1786,16 @@ mod tests {
             display_name: "codex-test".to_owned(),
             version: None,
             capabilities: BackendCapabilities {
-                resume: true,
-                steering: true,
-                interruption: true,
-                model_catalog: true,
-                models_require_session: false,
-                session_model_config: false,
-                approvals: true,
-                native_tools: true,
-                mcp: true,
-                close_session: true,
+                resume: CapabilitySupport::Supported,
+                steering: CapabilitySupport::Supported,
+                interruption: CapabilitySupport::Supported,
+                model_catalog: CapabilitySupport::Supported,
+                models_require_session: CapabilitySupport::Unsupported,
+                session_model_config: CapabilitySupport::Unsupported,
+                approvals: CapabilitySupport::Supported,
+                native_tools: CapabilitySupport::Supported,
+                mcp: CapabilitySupport::Supported,
+                close_session: CapabilitySupport::Supported,
             },
         }));
         state.handle_backend(BackendEvent::Models(vec![ModelInfo {
@@ -1748,9 +1820,9 @@ mod tests {
             display_name: "Devin".to_owned(),
             version: None,
             capabilities: BackendCapabilities {
-                interruption: true,
-                native_tools: true,
-                approvals: true,
+                interruption: CapabilitySupport::Supported,
+                native_tools: CapabilitySupport::Supported,
+                approvals: CapabilitySupport::Supported,
                 ..BackendCapabilities::default()
             },
         }));
@@ -1781,12 +1853,12 @@ mod tests {
             display_name: "Devin".to_owned(),
             version: None,
             capabilities: BackendCapabilities {
-                model_catalog: true,
-                models_require_session: true,
-                session_model_config: true,
-                interruption: true,
-                native_tools: true,
-                approvals: true,
+                model_catalog: CapabilitySupport::Supported,
+                models_require_session: CapabilitySupport::Supported,
+                session_model_config: CapabilitySupport::Supported,
+                interruption: CapabilitySupport::Supported,
+                native_tools: CapabilitySupport::Supported,
+                approvals: CapabilitySupport::Supported,
                 ..BackendCapabilities::default()
             },
         }));
@@ -2250,7 +2322,7 @@ mod tests {
                     display_name: name.to_owned(),
                     version: None,
                     capabilities: BackendCapabilities {
-                        model_catalog: true,
+                        model_catalog: CapabilitySupport::Supported,
                         ..BackendCapabilities::default()
                     },
                 }),

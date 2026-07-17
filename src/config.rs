@@ -53,10 +53,20 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// Loads configuration from command-line arguments and the environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the supplied configuration is invalid.
     pub fn load() -> Result<Self, ConfigError> {
         Self::parse().validated()
     }
 
+    /// Validates and normalizes this configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace or initial model is invalid.
     pub fn validated(mut self) -> Result<Self, ConfigError> {
         if !self.workspace.exists() {
             return Err(ConfigError::MissingWorkspace(self.workspace));

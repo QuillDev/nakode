@@ -16,7 +16,7 @@ use tokio::{
 
 use crate::backend::{
     ApprovalDecision, BackendCapabilities, BackendCommand, BackendError, BackendEvent,
-    BackendHandle, BackendIdentity, BackendOperation, CODEX_PROVIDER,
+    BackendHandle, BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport,
 };
 
 use super::protocol::{
@@ -36,6 +36,7 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    #[must_use]
     pub fn codex(program: PathBuf, workspace: PathBuf) -> Self {
         Self {
             program,
@@ -51,6 +52,12 @@ struct PendingRequest {
     sent_at: Instant,
 }
 
+/// Starts a Codex app-server adapter.
+///
+/// # Errors
+///
+/// Returns an error when the child process cannot be spawned or its standard
+/// streams are unavailable.
 pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError> {
     let mut child = Command::new(&config.program)
         .args(&config.args)
@@ -97,7 +104,7 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
     let initialize = request(
         initialize_id,
         "initialize",
-        json!({
+        &json!({
             "clientInfo": {
                 "name": "flock",
                 "title": "Flock",
@@ -124,33 +131,45 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
         },
     );
 
-    let task = tokio::spawn(run_supervisor(
+    let task = tokio::spawn(run_supervisor(SupervisorInput {
         child,
         stdin,
-        BufReader::new(stdout).lines(),
-        command_rx,
-        event_tx,
-        stderr_rx,
+        stdout: BufReader::new(stdout).lines(),
+        commands: command_rx,
+        events: event_tx,
+        stderr: stderr_rx,
         pending,
-        config.workspace,
-        initialize_id + 1,
-    ));
+        workspace: config.workspace,
+        next_id: initialize_id + 1,
+    }));
 
     Ok(BackendHandle::new(command_tx, event_rx, task))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_supervisor(
-    mut child: tokio::process::Child,
-    mut stdin: ChildStdin,
-    mut stdout: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    mut commands: mpsc::Receiver<BackendCommand>,
+struct SupervisorInput {
+    child: tokio::process::Child,
+    stdin: ChildStdin,
+    stdout: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    commands: mpsc::Receiver<BackendCommand>,
     events: mpsc::Sender<BackendEvent>,
-    mut stderr: mpsc::Receiver<String>,
-    mut pending: HashMap<u64, PendingRequest>,
+    stderr: mpsc::Receiver<String>,
+    pending: HashMap<u64, PendingRequest>,
     workspace: PathBuf,
-    mut next_id: u64,
-) {
+    next_id: u64,
+}
+
+async fn run_supervisor(input: SupervisorInput) {
+    let SupervisorInput {
+        child,
+        mut stdin,
+        mut stdout,
+        mut commands,
+        events,
+        mut stderr,
+        mut pending,
+        workspace,
+        mut next_id,
+    } = input;
     let mut initialized = false;
     let mut deferred_commands = VecDeque::new();
     let mut pending_approvals = HashMap::new();
@@ -204,29 +223,17 @@ async fn run_supervisor(
                                 ).await.is_err() {
                                     break;
                                 }
-                                if initialized {
-                                    while let Some(command) = deferred_commands.pop_front() {
-                                        if let Err(error) = handle_command(
-                                            command,
-                                            &mut stdin,
-                                            &mut pending,
-                                            &mut next_id,
-                                            &workspace,
-                                            &mut pending_approvals,
-                                        ).await {
-                                            let _ = events.send(BackendEvent::Disconnected {
-                                                reason: format!("failed to write to Codex: {error}"),
-                                            }).await;
-                                            break 'supervisor;
-                                        }
-                                    }
+                                if initialized
+                                    && drain_deferred_commands(
+                                        &mut deferred_commands, &mut stdin, &mut pending,
+                                        &mut next_id, &workspace, &mut pending_approvals, &events,
+                                    ).await.is_err()
+                                {
+                                    break 'supervisor;
                                 }
                             }
                             Err(error) => {
-                                let preview: String = line.chars().take(180).collect();
-                                let _ = events.send(BackendEvent::ProtocolDiagnostic(format!(
-                                    "malformed Codex JSON ({error}): {preview}"
-                                ))).await;
+                                report_malformed_json(&events, &line, &error).await;
                             }
                         }
                     }
@@ -237,31 +244,100 @@ async fn run_supervisor(
                     }
                 }
             }
-            line = stderr.recv() => {
-                if let Some(line) = line {
-                    last_stderr = Some(line);
-                }
-            }
-            _ = timeout_tick.tick() => {
-                let now = Instant::now();
-                let timed_out = pending
-                    .iter()
-                    .filter(|(_, request)| now.duration_since(request.sent_at) >= REQUEST_TIMEOUT)
-                    .map(|(id, _)| *id)
-                    .collect::<Vec<_>>();
-                for id in timed_out {
-                    if let Some(request) = pending.remove(&id) {
-                        let _ = events.send(BackendEvent::RequestFailed {
-                            operation: request.operation,
-                            code: -32001,
-                            message: format!("request {id} timed out after {}s", REQUEST_TIMEOUT.as_secs()),
-                        }).await;
-                    }
-                }
-            }
+            line = stderr.recv() => last_stderr = line.or(last_stderr),
+            _ = timeout_tick.tick() => report_timeouts(&mut pending, &events).await,
         }
     }
 
+    finish(
+        child,
+        stdin,
+        pending,
+        &events,
+        requested_shutdown,
+        last_stderr,
+    )
+    .await;
+}
+
+async fn report_malformed_json(
+    events: &mpsc::Sender<BackendEvent>,
+    line: &str,
+    error: &serde_json::Error,
+) {
+    let preview: String = line.chars().take(180).collect();
+    let _ = events
+        .send(BackendEvent::ProtocolDiagnostic(format!(
+            "malformed Codex JSON ({error}): {preview}"
+        )))
+        .await;
+}
+
+async fn drain_deferred_commands(
+    commands: &mut VecDeque<BackendCommand>,
+    stdin: &mut ChildStdin,
+    pending: &mut HashMap<u64, PendingRequest>,
+    next_id: &mut u64,
+    workspace: &std::path::Path,
+    pending_approvals: &mut HashMap<String, String>,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), ()> {
+    while let Some(command) = commands.pop_front() {
+        if let Err(error) = handle_command(
+            command,
+            stdin,
+            pending,
+            next_id,
+            workspace,
+            pending_approvals,
+        )
+        .await
+        {
+            let _ = events
+                .send(BackendEvent::Disconnected {
+                    reason: format!("failed to write to Codex: {error}"),
+                })
+                .await;
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+async fn report_timeouts(
+    pending: &mut HashMap<u64, PendingRequest>,
+    events: &mpsc::Sender<BackendEvent>,
+) {
+    let now = Instant::now();
+    let timed_out = pending
+        .iter()
+        .filter(|(_, request)| now.duration_since(request.sent_at) >= REQUEST_TIMEOUT)
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    for id in timed_out {
+        if let Some(request) = pending.remove(&id) {
+            let _ = events
+                .send(BackendEvent::RequestFailed {
+                    operation: request.operation,
+                    code: -32001,
+                    message: format!(
+                        "request {id} timed out after {}s",
+                        REQUEST_TIMEOUT.as_secs()
+                    ),
+                })
+                .await;
+        }
+    }
+}
+
+async fn finish(
+    mut child: tokio::process::Child,
+    stdin: ChildStdin,
+    pending: HashMap<u64, PendingRequest>,
+    events: &mpsc::Sender<BackendEvent>,
+    requested_shutdown: bool,
+    last_stderr: Option<String>,
+) {
     drop(stdin);
     if requested_shutdown {
         if timeout(Duration::from_secs(2), child.wait()).await.is_err() {
@@ -334,14 +410,25 @@ async fn handle_command(
                 (false, ApprovalDecision::AcceptForSession) => "acceptForSession",
                 (false, ApprovalDecision::Decline) => "decline",
             };
-            return write_json(stdin, &response(id, Ok(json!({"decision": wire_decision})))).await;
+            return write_json(
+                stdin,
+                &response(&id, Ok(json!({"decision": wire_decision}))),
+            )
+            .await;
         }
-        BackendCommand::SetSessionModel { .. } => return Ok(()),
-        BackendCommand::Shutdown => return Ok(()),
+        BackendCommand::SetSessionModel { .. } | BackendCommand::Shutdown => return Ok(()),
         _ => {}
     }
 
-    let (operation, method, params) = match command {
+    let (operation, method, params) = command_request(command, workspace);
+    send_request(stdin, pending, next_id, operation, method, params).await
+}
+
+fn command_request(
+    command: BackendCommand,
+    workspace: &std::path::Path,
+) -> (BackendOperation, &'static str, Value) {
+    match command {
         BackendCommand::Reload { .. } => (
             BackendOperation::Reload,
             "model/list",
@@ -420,12 +507,9 @@ async fn handle_command(
         BackendCommand::SetSessionModel { .. }
         | BackendCommand::ResolveApproval { .. }
         | BackendCommand::Shutdown => unreachable!(),
-    };
-
-    send_request(stdin, pending, next_id, operation, method, params).await
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn process_message(
     message: RpcMessage,
     stdin: &mut ChildStdin,
@@ -440,7 +524,7 @@ async fn process_message(
         if let Some(id) = message.id {
             if is_approval_method(&method) {
                 pending_approvals.insert(approval_key(&id), method.clone());
-                let approval = normalize_server_request(id, method, params);
+                let approval = normalize_server_request(id, method, &params);
                 events
                     .send(BackendEvent::ApprovalRequested(approval))
                     .await
@@ -449,7 +533,7 @@ async fn process_message(
                 write_json(
                     stdin,
                     &response(
-                        id,
+                        &id,
                         Err(RpcError {
                             code: -32601,
                             message: format!("Flock does not support server request {method}"),
@@ -460,7 +544,7 @@ async fn process_message(
                 .await
                 .map_err(|_| ())?;
             }
-        } else if let Some(event) = normalize_notification(&method, params) {
+        } else if let Some(event) = normalize_notification(&method, &params) {
             events.send(event).await.map_err(|_| ())?;
         }
         return Ok(());
@@ -498,48 +582,30 @@ async fn process_message(
     }
 
     let result = message.result.unwrap_or(Value::Null);
-    match request.operation {
+    process_response(
+        request.operation,
+        result,
+        stdin,
+        events,
+        pending,
+        next_id,
+        initialized,
+    )
+    .await
+}
+
+async fn process_response(
+    operation: BackendOperation,
+    result: Value,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+    pending: &mut HashMap<u64, PendingRequest>,
+    next_id: &mut u64,
+    initialized: &mut bool,
+) -> Result<(), ()> {
+    match operation {
         BackendOperation::Initialize => {
-            *initialized = true;
-            let initialized_notification = notification("initialized", None);
-            write_json(stdin, &initialized_notification)
-                .await
-                .map_err(|_| ())?;
-            let user_agent = result
-                .get("userAgent")
-                .and_then(Value::as_str)
-                .unwrap_or("Codex")
-                .to_owned();
-            events
-                .send(BackendEvent::Ready(BackendIdentity {
-                    provider: CODEX_PROVIDER.to_owned(),
-                    display_name: user_agent,
-                    version: None,
-                    capabilities: BackendCapabilities {
-                        resume: true,
-                        steering: true,
-                        interruption: true,
-                        model_catalog: true,
-                        models_require_session: false,
-                        session_model_config: false,
-                        approvals: true,
-                        native_tools: true,
-                        mcp: true,
-                        close_session: true,
-                    },
-                }))
-                .await
-                .map_err(|_| ())?;
-            send_request(
-                stdin,
-                pending,
-                next_id,
-                BackendOperation::ModelList,
-                "model/list",
-                json!({"limit": 100}),
-            )
-            .await
-            .map_err(|_| ())?;
+            initialize_response(&result, stdin, events, pending, next_id, initialized).await?;
         }
         BackendOperation::ModelList | BackendOperation::Reload => {
             events
@@ -611,6 +677,55 @@ async fn process_message(
     Ok(())
 }
 
+async fn initialize_response(
+    result: &Value,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+    pending: &mut HashMap<u64, PendingRequest>,
+    next_id: &mut u64,
+    initialized: &mut bool,
+) -> Result<(), ()> {
+    *initialized = true;
+    write_json(stdin, &notification("initialized", None))
+        .await
+        .map_err(|_| ())?;
+    let display_name = result
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .unwrap_or("Codex")
+        .to_owned();
+    events
+        .send(BackendEvent::Ready(BackendIdentity {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name,
+            version: None,
+            capabilities: BackendCapabilities {
+                resume: CapabilitySupport::Supported,
+                steering: CapabilitySupport::Supported,
+                interruption: CapabilitySupport::Supported,
+                model_catalog: CapabilitySupport::Supported,
+                models_require_session: CapabilitySupport::Unsupported,
+                session_model_config: CapabilitySupport::Unsupported,
+                approvals: CapabilitySupport::Supported,
+                native_tools: CapabilitySupport::Supported,
+                mcp: CapabilitySupport::Supported,
+                close_session: CapabilitySupport::Supported,
+            },
+        }))
+        .await
+        .map_err(|_| ())?;
+    send_request(
+        stdin,
+        pending,
+        next_id,
+        BackendOperation::ModelList,
+        "model/list",
+        json!({"limit": 100}),
+    )
+    .await
+    .map_err(|_| ())
+}
+
 fn approval_key(id: &Value) -> String {
     serde_json::to_string(id).unwrap_or_default()
 }
@@ -634,7 +749,7 @@ async fn send_request(
     params: Value,
 ) -> std::io::Result<()> {
     let id = allocate_request_id(pending, next_id);
-    write_json(stdin, &request(id, method, params)).await?;
+    write_json(stdin, &request(id, method, &params)).await?;
     pending.insert(
         id,
         PendingRequest {

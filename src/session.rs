@@ -47,12 +47,24 @@ pub enum SessionError {
 }
 
 pub trait SessionRepository: Send + Sync {
+    /// Lists the most recently used sessions in a workspace.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried.
     fn list_recent(
         &self,
         workspace: &str,
         limit: usize,
     ) -> Result<Vec<SessionRecord>, SessionError>;
+    /// Finds a session by its full id or unambiguous prefix.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried or the prefix is ambiguous.
     fn find(&self, id: &str) -> Result<Option<SessionRecord>, SessionError>;
+    /// Creates a logical session record.
+    ///
+    /// # Errors
+    /// Returns an error when the record cannot be persisted.
     fn create(
         &self,
         provider: &str,
@@ -61,11 +73,35 @@ pub trait SessionRepository: Send + Sync {
         title: &str,
         model: Option<&str>,
     ) -> Result<SessionRecord, SessionError>;
+    /// Marks a session as recently used.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
     fn touch(&self, id: &str) -> Result<(), SessionError>;
+    /// Updates the model associated with a session.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
     fn update_model(&self, id: &str, model: Option<&str>) -> Result<(), SessionError>;
+    /// Lists cached models for a provider.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried.
     fn list_models(&self, provider: &str) -> Result<Vec<ModelInfo>, SessionError>;
+    /// Replaces the cached model catalog for a provider.
+    ///
+    /// # Errors
+    /// Returns an error when the transaction cannot be committed.
     fn replace_models(&self, provider: &str, models: &[ModelInfo]) -> Result<(), SessionError>;
+    /// Lists configured providers.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried.
     fn list_providers(&self) -> Result<Vec<ProviderRecord>, SessionError>;
+    /// Changes whether a provider accepts new work.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
     fn set_provider_enabled(&self, provider: &str, enabled: bool) -> Result<(), SessionError>;
 }
 
@@ -74,6 +110,11 @@ pub struct SqliteSessionRepository {
 }
 
 impl SqliteSessionRepository {
+    /// Opens the repository in Flock's platform-specific data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the data directory or database cannot be opened.
     pub fn open_default() -> Result<Self, SessionError> {
         let project =
             ProjectDirs::from("dev", "flock", "Flock").ok_or(SessionError::MissingDataDirectory)?;
@@ -85,6 +126,11 @@ impl SqliteSessionRepository {
         Self::open(directory.join("sessions.sqlite3"))
     }
 
+    /// Opens or creates a repository at `path` and applies its schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let connection = Connection::open(path)?;
         connection.execute_batch(
@@ -176,7 +222,8 @@ impl SessionRepository for SqliteSessionRepository {
             "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![workspace, limit.min(500) as i64], Self::row)?;
+        let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
+        let rows = statement.query_map(params![workspace, bounded_limit], Self::row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -355,7 +402,9 @@ fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64
+        .as_secs()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

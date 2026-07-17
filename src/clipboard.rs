@@ -13,6 +13,12 @@ pub enum ClipboardError {
     Io(#[from] io::Error),
 }
 
+/// Writes `text` as an OSC 52 clipboard sequence.
+///
+/// # Errors
+///
+/// Returns an error when the payload is too large or the destination cannot be
+/// written.
 pub fn write_osc52(
     writer: &mut impl Write,
     text: &str,

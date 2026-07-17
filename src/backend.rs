@@ -8,18 +8,32 @@ pub const CODEX_PROVIDER: &str = "openai-codex";
 pub const DEVIN_PROVIDER: &str = "devin-acp";
 
 /// Features declared by the active provider adapter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CapabilitySupport {
+    #[default]
+    Unsupported,
+    Supported,
+}
+
+impl CapabilitySupport {
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BackendCapabilities {
-    pub resume: bool,
-    pub steering: bool,
-    pub interruption: bool,
-    pub model_catalog: bool,
-    pub models_require_session: bool,
-    pub session_model_config: bool,
-    pub approvals: bool,
-    pub native_tools: bool,
-    pub mcp: bool,
-    pub close_session: bool,
+    pub resume: CapabilitySupport,
+    pub steering: CapabilitySupport,
+    pub interruption: CapabilitySupport,
+    pub model_catalog: CapabilitySupport,
+    pub models_require_session: CapabilitySupport,
+    pub session_model_config: CapabilitySupport,
+    pub approvals: CapabilitySupport,
+    pub native_tools: CapabilitySupport,
+    pub mcp: CapabilitySupport,
+    pub close_session: CapabilitySupport,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +52,7 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
+    #[must_use]
     pub fn qualified_id(&self) -> String {
         format!("{}/{}", self.provider, self.id)
     }
@@ -129,6 +144,7 @@ pub enum BackendOperation {
 }
 
 impl BackendOperation {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Initialize => "initialize backend",

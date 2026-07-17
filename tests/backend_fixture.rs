@@ -82,12 +82,24 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
         })
         .await?;
 
+    let (streamed, final_text, steer_accepted) = observe_codex_turn(&mut backend).await?;
+
+    assert_eq!(streamed, "hello world");
+    assert_eq!(final_text.as_deref(), Some("hello world"));
+    assert!(steer_accepted);
+    backend.commands.send(BackendCommand::Shutdown).await?;
+    timeout(Duration::from_secs(5), backend.join()).await?;
+    Ok(())
+}
+
+async fn observe_codex_turn(
+    backend: &mut BackendHandle,
+) -> TestResult<(String, Option<String>, bool)> {
     let mut streamed = String::new();
     let mut final_text = None;
     let mut steer_accepted = false;
-    let mut completed = false;
-    while !completed {
-        match next_event(&mut backend).await? {
+    loop {
+        match next_event(backend).await? {
             BackendEvent::SessionObserved {
                 provider_session_id,
             } => {
@@ -142,18 +154,12 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
             BackendEvent::TurnCompleted { turn_id, error, .. } => {
                 assert_eq!(turn_id, "turn-fixture");
                 assert_eq!(error, None);
-                completed = true;
+                break;
             }
             event => panic!("unexpected turn event: {event:?}"),
         }
     }
-
-    assert_eq!(streamed, "hello world");
-    assert_eq!(final_text.as_deref(), Some("hello world"));
-    assert!(steer_accepted);
-    backend.commands.send(BackendCommand::Shutdown).await?;
-    timeout(Duration::from_secs(5), backend.join()).await?;
-    Ok(())
+    Ok((streamed, final_text, steer_accepted))
 }
 
 #[tokio::test]

@@ -32,7 +32,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     let queue_height = if state.queue.is_empty() {
         0
     } else {
-        (state.queue.len() as u16 + 2).min(5)
+        u16::try_from(state.queue.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(5)
     };
     let regions = Layout::default()
         .direction(Direction::Vertical)
@@ -278,7 +281,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     } else {
         " Alt+Enter newline  Enter send  PgUp/PgDn scroll  F2 models  F1 help "
     };
-    let status_width = area.width.saturating_sub(help.len() as u16);
+    let help_width = u16::try_from(help.len()).unwrap_or(u16::MAX);
+    let status_width = area.width.saturating_sub(help_width);
     let status_area = Rect::new(area.x, area.y, status_width, 1);
     let help_area = Rect::new(
         area.x.saturating_add(status_width),
@@ -476,7 +480,9 @@ fn relative_time(timestamp: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64;
+        .as_secs()
+        .try_into()
+        .unwrap_or(i64::MAX);
     let age = now.saturating_sub(timestamp);
     match age {
         0..=59 => "now".to_owned(),
@@ -547,17 +553,13 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn transcript_line(line: ProjectedLine) -> Line<'static> {
     let color = match line.tone {
-        LineTone::Muted => MUTED,
-        LineTone::User => CYAN,
+        LineTone::Muted | LineTone::Reasoning => MUTED,
+        LineTone::User | LineTone::DiffHeader => CYAN,
         LineTone::Assistant => BLUE,
         LineTone::Steering => MAGENTA,
-        LineTone::Reasoning => MUTED,
-        LineTone::Tool => YELLOW,
+        LineTone::Tool | LineTone::Warning => YELLOW,
         LineTone::DiffAdd => GREEN,
-        LineTone::DiffRemove => RED,
-        LineTone::DiffHeader => CYAN,
-        LineTone::Warning => YELLOW,
-        LineTone::Error => RED,
+        LineTone::Error | LineTone::DiffRemove => RED,
         LineTone::Body => TEXT,
         LineTone::Code => Color::Rgb(180, 205, 225),
     };
@@ -629,7 +631,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("FLOCK"));
         assert!(rendered.contains("Transcript"));
@@ -652,7 +654,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("Active turn"));
         assert!(rendered.contains("Ctrl+S"));
