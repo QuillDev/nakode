@@ -59,6 +59,8 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         render_help(frame, area);
     } else if state.session_picker.is_some() {
         render_session_picker(frame, area, state);
+    } else if state.provider_picker.is_some() {
+        render_provider_picker(frame, area, state);
     } else if state.model_picker.is_some() {
         render_model_picker(frame, area, state);
     } else if let Some(position) = cursor {
@@ -71,6 +73,8 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         vec![bordered_inner(centered(area, 72, 22))]
     } else if state.session_picker.is_some() {
         vec![bordered_inner(centered(area, 78, 18))]
+    } else if state.provider_picker.is_some() {
+        vec![bordered_inner(centered(area, 64, 14))]
     } else if state.model_picker.is_some() {
         vec![bordered_inner(centered(area, 72, 18))]
     } else {
@@ -314,11 +318,67 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::styled("Sessions", Style::default().fg(CYAN).bold()),
         Line::raw("  /resume   picker    /resume ID   resume    /new   fresh"),
         Line::raw("  /reload   refresh backend metadata and models"),
+        Line::raw("  /providers manage enabled agent backends"),
         Line::default(),
         Line::styled("F1 or Esc closes this help.", Style::default().fg(MUTED)),
     ];
     let block = Block::default()
         .title(" Help ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN))
+        .style(Style::default().bg(PANEL));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let popup = centered(area, 64, 14);
+    frame.render_widget(Clear, popup);
+    let picker = state.provider_picker.as_ref().expect("picker checked");
+    let mut lines = vec![
+        Line::styled(
+            "↑/↓ select · Enter or Space toggle · Esc close",
+            Style::default().fg(MUTED),
+        ),
+        Line::default(),
+    ];
+    if picker.loading {
+        lines.push(Line::styled(
+            "Loading providers…",
+            Style::default().fg(MUTED),
+        ));
+    } else if picker.providers.is_empty() {
+        lines.push(Line::styled(
+            "No providers registered.",
+            Style::default().fg(MUTED),
+        ));
+    } else {
+        for (index, provider) in picker.providers.iter().enumerate() {
+            let selected = index == picker.selected;
+            let marker = if selected { "› " } else { "  " };
+            let state_label = if provider.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(if selected { CYAN } else { MUTED }),
+                ),
+                Span::styled(
+                    &provider.display_name,
+                    Style::default().fg(if selected { TEXT } else { BLUE }),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    state_label,
+                    Style::default().fg(if provider.enabled { GREEN } else { MUTED }),
+                ),
+            ]));
+        }
+    }
+    let block = Block::default()
+        .title(" Providers ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(CYAN))
         .style(Style::default().bg(PANEL));
@@ -439,7 +499,8 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     for (index, model) in filtered.iter().enumerate() {
         let selected = index == picker.selected;
         let marker = if selected { "› " } else { "  " };
-        let current = if state.selected_model.as_deref() == Some(model.id.as_str()) {
+        let qualified = model.qualified_id();
+        let current = if state.selected_model.as_deref() == Some(qualified.as_str()) {
             "  current"
         } else if model.is_default {
             "  default"
@@ -452,7 +513,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 Style::default().fg(if selected { CYAN } else { MUTED }),
             ),
             Span::styled(
-                &model.display_name,
+                qualified,
                 Style::default()
                     .fg(if selected { TEXT } else { BLUE })
                     .add_modifier(if selected {
@@ -463,12 +524,6 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             ),
             Span::styled(current, Style::default().fg(MUTED)),
         ]));
-        if selected && !model.description.is_empty() {
-            lines.push(Line::styled(
-                format!("    {}", model.description),
-                Style::default().fg(MUTED),
-            ));
-        }
     }
     if filtered.is_empty() {
         lines.push(Line::styled(

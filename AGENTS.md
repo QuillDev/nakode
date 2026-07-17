@@ -83,6 +83,14 @@ useful groundwork but is not the final data model.
 Codex is the first adapter, not the application model. New providers must be
 addable without changing shared session, task, memory, skill, or UI semantics.
 
+All enabled providers participate in the runtime by default. Flock must not
+have a global backend selector: backend choice belongs to a model, agent
+session, task, or orchestration run. Model identities are always canonical,
+provider-qualified slugs in the form `provider-slug/model-slug`; model search,
+persistence, handoffs, and user-facing selection use that same form. A single
+logical Flock session may use models from multiple providers, including for
+delegated workers and reviewers.
+
 Backend contracts should expose lifecycle operations plus a capability
 snapshot. Capabilities may include resume, steering, interruption, forking,
 native tools, MCP, native skill injection, approvals, structured output, and
@@ -95,6 +103,9 @@ subagents.
   semantics.
 - Preserve native authentication, model selection, tools, and approval policy.
 - Record the capability snapshot used by each orchestration run.
+- Treat provider enablement as a persisted registry preference. A disabled
+  provider is unavailable for new work; it is not replaced by a process-wide
+  `--backend` mode.
 
 Do not disable useful native provider capabilities merely to create a lowest
 common denominator across backends. Safety policy may still restrict a

@@ -39,9 +39,9 @@ provide coding tools; each backend retains its native tool and approval model.
 ## Requirements
 
 - Rust 1.88 or newer
-- At least one supported backend installed and authenticated:
-  - `codex` for the default Codex backend
-  - `devin` for `--backend devin`
+- At least one supported provider installed and authenticated:
+  - `codex` for the Codex provider
+  - `devin` for the Devin provider
 - A real interactive terminal
 
 This build has been exercised against `codex-cli 0.144.5`. The app-server API
@@ -55,29 +55,31 @@ codex app-server generate-ts --experimental --out /tmp/codex-ts
 ## Run
 
 ```sh
-# Codex (default)
-cargo run --release -- --workspace /path/to/project
+# Development build
+./dev.sh --workspace /path/to/project
 
-# Devin through `devin acp`
-cargo run --release -- --backend devin --workspace /path/to/project
+# Start every enabled provider
+cargo run --release -- --workspace /path/to/project
 ```
 
 Options:
 
 ```text
---backend <BACKEND>  codex or devin (or FLOCK_BACKEND; default: codex)
 --codex <PATH>       Codex executable (or FLOCK_CODEX)
 --devin <PATH>       Devin executable (or FLOCK_DEVIN)
 --workspace <PATH>   Working directory (or FLOCK_WORKSPACE)
---model <MODEL>      Initial model when supported (or FLOCK_MODEL)
+--model <MODEL>      Initial provider/model (or FLOCK_MODEL)
 --resume <ID>        Resume a Flock session by ID or unique prefix (or FLOCK_RESUME)
 --scrollback <N>     Logical transcript entry limit (or FLOCK_SCROLLBACK)
 ```
 
-Flock uses each provider's existing authentication and does not store
-credentials. Devin model choices come from each ACP session's model-category
-`configOptions`; Flock caches the discovered list in SQLite and applies changes
-through `session/set_config_option`. ACP does not define turn steering.
+Flock starts every enabled provider and uses each provider's existing
+authentication without storing credentials. Models are referenced uniformly as
+`provider-slug/model-slug`, such as `openai-codex/gpt-5`; F2 searches this
+unified catalog, and model selection routes new work to that provider. Devin
+model choices come from each ACP session's model-category `configOptions`;
+Flock caches the discovered list in SQLite and applies changes through
+`session/set_config_option`. ACP does not define turn steering.
 
 ## Controls
 
@@ -93,6 +95,7 @@ through `session/set_config_option`. ACP does not define turn steering.
 | `/resume` | Open the recent-session picker for this workspace |
 | `/resume ID` | Resume a saved session by Flock ID or unique prefix |
 | `/new` | Unsubscribe from the current backend session and start fresh |
+| `/providers` | Open the provider registry and enable or disable adapters |
 | `/reload` | Refresh backend metadata and model choices; updates the cache |
 | `PageUp` / `PageDown` | Scroll transcript |
 | `Ctrl+L` | Jump to latest output |
@@ -109,9 +112,12 @@ sanitized data rather than executed terminal control.
 
 ## Current behavior
 
-- Initializes the selected backend and records its declared capabilities.
-- Loads and caches Codex model catalogs and Devin ACP session model options.
-- Lazily creates a Devin session when F2 needs an uncached model list.
+- Initializes every enabled provider and records each declared capability set.
+- Persists the provider registry; Codex and Devin are enabled by default and
+  can be toggled from `/providers`.
+- Loads and caches provider-qualified model catalogs from enabled providers.
+- Discovers provider model catalogs at startup; providers that require a native
+  session for discovery create one through their native adapter.
 - Refreshes backend metadata and model caches with `/reload`.
 - Runs sequential turns in one active provider session at a time.
 - Stores provider-neutral session metadata in SQLite and supports `--resume`,
@@ -119,7 +125,8 @@ sanitized data rather than executed terminal control.
   model context and reconstructed transcript history.
 - Streams assistant, reasoning, plan, command, MCP, file-change, and tool items
   by protocol item ID.
-- Leaves coding tools, execution policy, and approvals to the selected backend.
+- Leaves coding tools, execution policy, and approvals to the provider selected
+  by each model/session.
 - Keeps queued prompts in app-owned FIFO state.
 - Keeps steering separate from queueing and handles completion races
   deterministically.
@@ -150,13 +157,14 @@ provider coding tools.
 ## Current implementation architecture
 
 ```text
-Crossterm events ─┐
-                  ├─> single AppState reducer ─> Ratatui projection
-Backend events ───┘            │
-                               └─> provider-neutral commands
+Crossterm events ─────────┐
+                         ├─> single AppState reducer ─> Ratatui projection
+provider-tagged events ───┘            │
+                                      └─> provider-routed commands
 
-codex app-server <─ JSONL stdio ─> Codex adapter
-    devin acp     <─ ACP stdio ───> Devin adapter
+enabled-provider registry
+├── codex app-server <─ JSONL stdio ─> Codex adapter
+└──     devin acp   <─ ACP stdio ───> Devin adapter
 provider processes <─ PTY I/O ───> dedicated portable-pty boundary
 ```
 

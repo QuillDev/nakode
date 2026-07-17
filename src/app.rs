@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{collections::HashMap, io, time::Duration};
 
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -10,10 +10,10 @@ use tokio::{sync::mpsc, time::MissedTickBehavior};
 use crate::{
     backend::{BackendCommand, BackendError, BackendEvent, BackendHandle},
     clipboard, codex,
-    config::{BackendChoice, Config},
+    config::Config,
     devin, render,
     selection::ScreenPoint,
-    session::{SessionError, SessionRepository, SqliteSessionRepository},
+    session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
     state::{AppState, ApprovalDecision, Effect},
     terminal::{TerminalSession, Tui},
 };
@@ -26,23 +26,89 @@ pub enum AppError {
     Terminal(#[from] io::Error),
     #[error(transparent)]
     Session(#[from] SessionError),
+    #[error("no enabled provider could be started: {0}")]
+    NoProviders(String),
 }
 
-async fn spawn_backend(config: &Config) -> Result<BackendHandle, BackendError> {
-    match config.backend {
-        BackendChoice::Codex => {
-            codex::spawn(codex::BackendConfig::codex(
-                config.codex.clone(),
-                config.workspace.clone(),
-            ))
-            .await
+struct BackendRegistry {
+    commands: HashMap<String, mpsc::Sender<BackendCommand>>,
+    events: mpsc::Receiver<(String, BackendEvent)>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    failures: Vec<String>,
+}
+
+impl BackendRegistry {
+    async fn spawn(config: &Config, providers: &[ProviderRecord]) -> Self {
+        let (event_tx, events) = mpsc::channel(512);
+        let mut registry = Self {
+            commands: HashMap::new(),
+            events,
+            tasks: Vec::new(),
+            failures: Vec::new(),
+        };
+        for provider in providers.iter().filter(|provider| provider.enabled) {
+            let result = match provider.provider.as_str() {
+                crate::backend::CODEX_PROVIDER => {
+                    codex::spawn(codex::BackendConfig::codex(
+                        config.codex.clone(),
+                        config.workspace.clone(),
+                    ))
+                    .await
+                }
+                crate::backend::DEVIN_PROVIDER => {
+                    devin::spawn(devin::BackendConfig::devin(
+                        config.devin.clone(),
+                        config.workspace.clone(),
+                    ))
+                    .await
+                }
+                unknown => {
+                    registry
+                        .failures
+                        .push(format!("unknown enabled provider {unknown}"));
+                    continue;
+                }
+            };
+            match result {
+                Ok(handle) => registry.insert(provider.provider.clone(), handle, event_tx.clone()),
+                Err(error) => registry.failures.push(error.to_string()),
+            }
         }
-        BackendChoice::Devin => {
-            devin::spawn(devin::BackendConfig::devin(
-                config.devin.clone(),
-                config.workspace.clone(),
-            ))
-            .await
+        drop(event_tx);
+        registry
+    }
+
+    fn insert(
+        &mut self,
+        provider: String,
+        handle: BackendHandle,
+        event_tx: mpsc::Sender<(String, BackendEvent)>,
+    ) {
+        let (commands, mut events, task) = handle.into_parts();
+        self.commands.insert(provider.clone(), commands);
+        self.tasks.push(task);
+        self.tasks.push(tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if event_tx.send((provider.clone(), event)).await.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    async fn send(&self, provider: &str, command: BackendCommand) -> bool {
+        let Some(commands) = self.commands.get(provider) else {
+            return false;
+        };
+        commands.send(command).await.is_ok()
+    }
+
+    async fn shutdown(self) {
+        for commands in self.commands.values() {
+            let _ = commands.send(BackendCommand::Shutdown).await;
+        }
+        for task in self.tasks {
+            let _ = task.await;
         }
     }
 }
@@ -50,41 +116,63 @@ async fn spawn_backend(config: &Config) -> Result<BackendHandle, BackendError> {
 pub async fn run(config: Config) -> Result<(), AppError> {
     let mut signals = ShutdownSignals::install()?;
     let sessions = SqliteSessionRepository::open_default()?;
-    let mut backend = spawn_backend(&config).await?;
+    let providers = sessions.list_providers()?;
+    let mut backends = BackendRegistry::spawn(&config, &providers).await;
+    let active_provider = if backends
+        .commands
+        .contains_key(crate::backend::CODEX_PROVIDER)
+    {
+        crate::backend::CODEX_PROVIDER
+    } else {
+        backends
+            .commands
+            .keys()
+            .next()
+            .map(String::as_str)
+            .ok_or_else(|| AppError::NoProviders(backends.failures.join("; ")))?
+    }
+    .to_owned();
     let mut terminal = match TerminalSession::enter() {
         Ok(terminal) => terminal,
         Err(error) => {
-            let _ = backend.commands.send(BackendCommand::Shutdown).await;
-            backend.join().await;
+            backends.shutdown().await;
             return Err(AppError::Terminal(error));
         }
     };
+    let active_name = providers
+        .iter()
+        .find(|p| p.provider == active_provider)
+        .map(|p| p.display_name.as_str())
+        .unwrap_or(&active_provider);
     let mut state = AppState::new_for_backend(
         config.workspace.to_string_lossy(),
         config.model,
         config.scrollback,
-        config.backend.provider(),
-        config.backend.display_name(),
+        &active_provider,
+        active_name,
     );
-    match sessions.list_models(config.backend.provider()) {
-        Ok(models) => state.install_cached_models(models),
-        Err(error) => state.session_store_failed(error.to_string()),
+    for provider in backends.commands.keys() {
+        match sessions.list_models(provider) {
+            Ok(models) => state.install_cached_models(models),
+            Err(error) => state.session_store_failed(error.to_string()),
+        }
+        let _ = backends
+            .send(provider, BackendCommand::Reload { session_id: None })
+            .await;
     }
     state.set_startup_resume(config.resume);
 
     let loop_result = run_loop(
         terminal.terminal_mut(),
         &mut state,
-        &backend.commands,
-        &mut backend.events,
+        &mut backends,
         &sessions,
         &mut signals,
     )
     .await;
 
-    let _ = backend.commands.send(BackendCommand::Shutdown).await;
     let restore_result = terminal.restore();
-    backend.join().await;
+    backends.shutdown().await;
 
     loop_result?;
     restore_result.map_err(AppError::Terminal)
@@ -93,8 +181,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 async fn run_loop(
     terminal: &mut Tui,
     state: &mut AppState,
-    commands: &mpsc::Sender<BackendCommand>,
-    backend_events: &mut mpsc::Receiver<BackendEvent>,
+    backends: &mut BackendRegistry,
     sessions: &dyn SessionRepository,
     signals: &mut ShutdownSignals,
 ) -> io::Result<()> {
@@ -111,7 +198,7 @@ async fn run_loop(
                     Some(Ok(event)) => {
                         let effects = handle_terminal_event(state, event);
                         flush_pending_clipboard(terminal, state);
-                        if apply_effects(state, effects, commands, sessions).await {
+                        if apply_effects(state, effects, backends, sessions).await {
                             break;
                         }
                         dirty = true;
@@ -123,20 +210,18 @@ async fn run_loop(
                     }
                 }
             }
-            backend_event = backend_events.recv(), if backend_open => {
+            backend_event = backends.events.recv(), if backend_open => {
                 match backend_event {
-                    Some(event) => {
-                        let effects = state.handle_backend(event);
-                        if apply_effects(state, effects, commands, sessions).await {
+                    Some((provider, event)) => {
+                        let effects = state.handle_provider_backend(&provider, event);
+                        if apply_effects(state, effects, backends, sessions).await {
                             break;
                         }
                         dirty = true;
                     }
                     None => {
                         backend_open = false;
-                        state.handle_backend(BackendEvent::Disconnected {
-                            reason: "backend event channel closed".to_owned(),
-                        });
+                        state.status_message = "All provider event channels closed.".to_owned();
                         dirty = true;
                     }
                 }
@@ -164,7 +249,7 @@ async fn run_loop(
 async fn apply_effects(
     state: &mut AppState,
     effects: Vec<Effect>,
-    commands: &mpsc::Sender<BackendCommand>,
+    backends: &BackendRegistry,
     sessions: &dyn SessionRepository,
 ) -> bool {
     let mut quit = false;
@@ -172,16 +257,29 @@ async fn apply_effects(
     while let Some(effect) = pending.pop_front() {
         match effect {
             Effect::Backend(command) => {
-                if commands.send(command).await.is_err() {
-                    state.handle_backend(BackendEvent::Disconnected {
-                        reason: "backend command channel closed".to_owned(),
-                    });
+                let provider = state.backend_provider.clone();
+                if !backends.send(&provider, command).await {
+                    state.handle_provider_backend(
+                        &provider,
+                        BackendEvent::Disconnected {
+                            reason: "backend command channel closed".to_owned(),
+                        },
+                    );
                 }
             }
             Effect::ListSessions => match sessions.list_recent(&state.workspace, 100) {
                 Ok(records) => state.install_sessions(records),
                 Err(error) => state.session_store_failed(error.to_string()),
             },
+            Effect::ListProviders => match sessions.list_providers() {
+                Ok(providers) => state.install_providers(providers),
+                Err(error) => state.session_store_failed(error.to_string()),
+            },
+            Effect::SetProviderEnabled { provider, enabled } => {
+                if let Err(error) = sessions.set_provider_enabled(&provider, enabled) {
+                    state.session_store_failed(error.to_string());
+                }
+            }
             Effect::ResolveSession(id) => match sessions.find(&id) {
                 Ok(Some(record)) => pending.extend(state.begin_resume(record)),
                 Ok(None) => state.session_store_failed(format!("no session matches {id:?}")),
@@ -245,6 +343,7 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
             state.clear_text_selection();
             if state.model_picker.is_none()
                 && state.session_picker.is_none()
+                && state.provider_picker.is_none()
                 && !state.show_help
                 && state.approvals.is_empty()
             {
@@ -318,6 +417,25 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             }
             KeyCode::Down => {
                 state.session_picker_move(1);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        };
+    }
+
+    if state.provider_picker.is_some() {
+        return match key.code {
+            KeyCode::Esc => {
+                state.close_provider_picker();
+                Vec::new()
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => state.toggle_provider(),
+            KeyCode::Up => {
+                state.provider_picker_move(-1);
+                Vec::new()
+            }
+            KeyCode::Down => {
+                state.provider_picker_move(1);
                 Vec::new()
             }
             _ => Vec::new(),

@@ -10,7 +10,7 @@ use crate::{
     },
     editor::EditorState,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
-    session::SessionRecord,
+    session::{ProviderRecord, SessionRecord},
     transcript::{EntryKind, EntryStatus, Transcript},
 };
 
@@ -79,9 +79,30 @@ pub struct SessionPicker {
 }
 
 #[derive(Clone, Debug)]
+pub struct ProviderPicker {
+    pub providers: Vec<ProviderRecord>,
+    pub selected: usize,
+    pub loading: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderContext {
+    name: String,
+    capabilities: BackendCapabilities,
+    connection: ConnectionState,
+    provider_session_id: Option<String>,
+    session_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub enum Effect {
     Backend(BackendCommand),
     ListSessions,
+    ListProviders,
+    SetProviderEnabled {
+        provider: String,
+        enabled: bool,
+    },
     ResolveSession(String),
     PersistSession {
         provider: String,
@@ -109,6 +130,7 @@ pub struct AppState {
     pub backend_provider: String,
     pub backend_name: String,
     pub backend_capabilities: BackendCapabilities,
+    provider_contexts: HashMap<String, ProviderContext>,
     pub provider_session_id: Option<String>,
     pub session_id: Option<String>,
     pub active_turn: Option<ActiveTurn>,
@@ -120,6 +142,7 @@ pub struct AppState {
     pub selected_model: Option<String>,
     pub model_picker: Option<ModelPicker>,
     pub session_picker: Option<SessionPicker>,
+    pub provider_picker: Option<ProviderPicker>,
     pending_model_picker: bool,
     pub show_help: bool,
     pub text_selection: Option<TextSelection>,
@@ -172,12 +195,25 @@ impl AppState {
             format!("Starting {backend_name}…"),
             EntryStatus::Running,
         );
+        let provider = provider.into();
+        let mut provider_contexts = HashMap::new();
+        provider_contexts.insert(
+            provider.clone(),
+            ProviderContext {
+                name: backend_name.clone(),
+                capabilities: BackendCapabilities::default(),
+                connection: ConnectionState::Starting,
+                provider_session_id: None,
+                session_id: None,
+            },
+        );
         Self {
             connection: ConnectionState::Starting,
             workspace: workspace.into(),
-            backend_provider: provider.into(),
+            backend_provider: provider,
             backend_name: backend_name.clone(),
             backend_capabilities: BackendCapabilities::default(),
+            provider_contexts,
             provider_session_id: None,
             session_id: None,
             active_turn: None,
@@ -189,6 +225,7 @@ impl AppState {
             selected_model: initial_model.clone(),
             model_picker: None,
             session_picker: None,
+            provider_picker: None,
             pending_model_picker: false,
             show_help: false,
             text_selection: None,
@@ -239,6 +276,56 @@ impl AppState {
         self.status_message = format!("Session error: {}", message.into());
     }
 
+    pub fn install_providers(&mut self, providers: Vec<ProviderRecord>) {
+        let picker = self.provider_picker.get_or_insert(ProviderPicker {
+            providers: Vec::new(),
+            selected: 0,
+            loading: false,
+        });
+        picker.providers = providers;
+        picker.selected = 0;
+        picker.loading = false;
+    }
+
+    pub fn provider_picker_move(&mut self, delta: isize) {
+        let Some(picker) = &mut self.provider_picker else {
+            return;
+        };
+        if picker.providers.is_empty() {
+            return;
+        }
+        picker.selected =
+            (picker.selected as isize + delta).rem_euclid(picker.providers.len() as isize) as usize;
+    }
+
+    pub fn close_provider_picker(&mut self) {
+        self.provider_picker = None;
+        self.status_message = "Provider settings closed.".to_owned();
+    }
+
+    pub fn toggle_provider(&mut self) -> Vec<Effect> {
+        let Some(picker) = &mut self.provider_picker else {
+            return Vec::new();
+        };
+        let Some(provider) = picker.providers.get_mut(picker.selected) else {
+            return Vec::new();
+        };
+        provider.enabled = !provider.enabled;
+        self.status_message = format!(
+            "{} {}.",
+            provider.display_name,
+            if provider.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        vec![Effect::SetProviderEnabled {
+            provider: provider.provider.clone(),
+            enabled: provider.enabled,
+        }]
+    }
+
     pub fn session_persisted(&mut self, session: SessionRecord) {
         self.session_id = Some(session.id.clone());
         self.status_message = format!("Session {} started.", short_id(&session.id));
@@ -284,11 +371,7 @@ impl AppState {
             self.status_message = "That session belongs to a different workspace.".to_owned();
             return Vec::new();
         }
-        if session.provider != self.backend_provider {
-            self.status_message = format!(
-                "Session uses backend {}; restart Flock with the matching --backend selection.",
-                session.provider
-            );
+        if !self.activate_provider(&session.provider) {
             return Vec::new();
         }
         if !self.backend_capabilities.resume {
@@ -375,6 +458,16 @@ impl AppState {
         if command == "/new" {
             self.editor.clear();
             return self.new_session();
+        }
+        if command == "/providers" {
+            self.editor.clear();
+            self.provider_picker = Some(ProviderPicker {
+                providers: Vec::new(),
+                selected: 0,
+                loading: true,
+            });
+            self.status_message = "Loading providers…".to_owned();
+            return vec![Effect::ListProviders];
         }
         if command == "/reload" {
             self.editor.clear();
@@ -597,7 +690,11 @@ impl AppState {
         let selected = self
             .selected_model
             .as_ref()
-            .and_then(|selected| self.models.iter().position(|model| &model.id == selected))
+            .and_then(|selected| {
+                self.models
+                    .iter()
+                    .position(|model| &model.qualified_id() == selected)
+            })
             .unwrap_or(0);
         self.model_picker = Some(ModelPicker {
             filter: String::new(),
@@ -640,14 +737,19 @@ impl AppState {
             .model_picker
             .as_ref()
             .and_then(|picker| filtered.get(picker.selected))
-            .map(|model| model.id.clone());
+            .cloned()
+            .cloned();
         if let Some(selected) = selected {
+            if !self.activate_provider(&selected.provider) {
+                return Vec::new();
+            }
             let active = self.active_turn.is_some();
-            self.selected_model = Some(selected.clone());
+            let qualified = selected.qualified_id();
+            self.selected_model = Some(qualified.clone());
             self.status_message = if active {
-                format!("Next model: {selected}. The active turn is unchanged.")
+                format!("Next model: {qualified}. The active turn is unchanged.")
             } else {
-                format!("Selected model: {selected}.")
+                format!("Selected model: {qualified}.")
             };
             self.model_picker = None;
             if self.backend_capabilities.session_model_config
@@ -655,13 +757,13 @@ impl AppState {
             {
                 return vec![Effect::Backend(BackendCommand::SetSessionModel {
                     session_id,
-                    model: selected,
+                    model: selected.id,
                 })];
             }
             if let Some(session_id) = self.session_id.clone() {
                 return vec![Effect::UpdateSessionModel {
                     session_id,
-                    model: Some(selected),
+                    model: Some(qualified),
                 }];
             }
         }
@@ -676,9 +778,7 @@ impl AppState {
         self.models
             .iter()
             .filter(|model| {
-                filter.is_empty()
-                    || model.id.to_lowercase().contains(&filter)
-                    || model.display_name.to_lowercase().contains(&filter)
+                filter.is_empty() || model.qualified_id().to_lowercase().contains(&filter)
             })
             .collect()
     }
@@ -733,6 +833,122 @@ impl AppState {
             id: approval.id,
             decision,
         })]
+    }
+
+    pub fn handle_provider_backend(&mut self, provider: &str, event: BackendEvent) -> Vec<Effect> {
+        match &event {
+            BackendEvent::Ready(identity) => {
+                self.provider_contexts.insert(
+                    provider.to_owned(),
+                    ProviderContext {
+                        name: identity.display_name.clone(),
+                        capabilities: identity.capabilities.clone(),
+                        connection: ConnectionState::Ready {
+                            server: identity.display_name.clone(),
+                        },
+                        provider_session_id: self
+                            .provider_contexts
+                            .get(provider)
+                            .and_then(|context| context.provider_session_id.clone()),
+                        session_id: self
+                            .provider_contexts
+                            .get(provider)
+                            .and_then(|context| context.session_id.clone()),
+                    },
+                );
+            }
+            BackendEvent::Models(models) => {
+                let mut models = models.clone();
+                for model in &mut models {
+                    model.provider = provider.to_owned();
+                }
+                if !models.is_empty() {
+                    self.install_models(models.clone());
+                }
+                if self.pending_model_picker && !self.models.is_empty() {
+                    self.show_model_picker();
+                }
+                return vec![Effect::PersistModels {
+                    provider: provider.to_owned(),
+                    models,
+                }];
+            }
+            BackendEvent::SessionCreated {
+                provider_session_id,
+                ..
+            }
+            | BackendEvent::SessionResumed {
+                provider_session_id,
+                ..
+            }
+            | BackendEvent::SessionObserved {
+                provider_session_id,
+            } if provider != self.backend_provider => {
+                if let Some(context) = self.provider_contexts.get_mut(provider) {
+                    context.provider_session_id = Some(provider_session_id.clone());
+                }
+                return Vec::new();
+            }
+            BackendEvent::Warning(message) if provider != self.backend_provider => {
+                self.diagnostic_count += 1;
+                self.transcript.push(
+                    EntryKind::System,
+                    format!("{} WARNING", provider),
+                    message,
+                    EntryStatus::Complete,
+                );
+                self.status_message = message.clone();
+                return Vec::new();
+            }
+            _ => {}
+        }
+
+        if provider != self.backend_provider {
+            return Vec::new();
+        }
+        let effects = self.handle_backend(event);
+        self.sync_active_provider_context();
+        effects
+    }
+
+    fn sync_active_provider_context(&mut self) {
+        let context = self
+            .provider_contexts
+            .entry(self.backend_provider.clone())
+            .or_insert_with(|| ProviderContext {
+                name: self.backend_name.clone(),
+                capabilities: self.backend_capabilities.clone(),
+                connection: self.connection.clone(),
+                provider_session_id: None,
+                session_id: None,
+            });
+        context.name = self.backend_name.clone();
+        context.capabilities = self.backend_capabilities.clone();
+        context.connection = self.connection.clone();
+        context.provider_session_id = self.provider_session_id.clone();
+        context.session_id = self.session_id.clone();
+    }
+
+    fn activate_provider(&mut self, provider: &str) -> bool {
+        if provider == self.backend_provider {
+            return true;
+        }
+        if self.is_busy() {
+            self.status_message = "Cannot change provider while a turn is active.".to_owned();
+            return false;
+        }
+        self.sync_active_provider_context();
+        let Some(context) = self.provider_contexts.get(provider).cloned() else {
+            self.status_message = format!("Provider {provider} is not available.");
+            return false;
+        };
+        self.backend_provider = provider.to_owned();
+        self.backend_name = context.name;
+        self.backend_capabilities = context.capabilities;
+        self.connection = context.connection;
+        self.provider_session_id = context.provider_session_id;
+        self.session_id = context.session_id;
+        true
     }
 
     pub fn handle_backend(&mut self, event: BackendEvent) -> Vec<Effect> {
@@ -796,9 +1012,13 @@ impl AppState {
                 }
                 self.provider_session_id = Some(provider_session_id.clone());
                 self.creating_session = false;
-                if !model.is_empty() && self.selected_model.as_deref() != Some(model.as_str()) {
-                    self.selected_model = Some(model.clone());
-                    self.status_message = format!("{} selected model {model}.", self.backend_name);
+                if !model.is_empty() {
+                    let qualified = self.qualify_active_model(&model);
+                    if self.selected_model.as_deref() != Some(qualified.as_str()) {
+                        self.selected_model = Some(qualified.clone());
+                        self.status_message =
+                            format!("{} selected model {qualified}.", self.backend_name);
+                    }
                 }
                 if let Some(prompt) = self.pending_session_prompt.take() {
                     let mut effects = vec![Effect::PersistSession {
@@ -826,7 +1046,7 @@ impl AppState {
                 self.provider_session_id = Some(provider_session_id);
                 self.session_id = Some(session.id.clone());
                 if !model.is_empty() {
-                    self.selected_model = Some(model);
+                    self.selected_model = Some(self.qualify_active_model(&model));
                 }
                 self.install_history(history);
                 self.status_message = format!("Resumed session {}.", short_id(&session.id));
@@ -1049,7 +1269,7 @@ impl AppState {
             model: self
                 .backend_capabilities
                 .model_catalog
-                .then(|| self.selected_model.clone())
+                .then(|| self.selected_model_for_active_provider())
                 .flatten(),
         };
         self.transcript.upsert(
@@ -1347,32 +1567,66 @@ impl AppState {
         }
     }
 
+    fn selected_model_for_active_provider(&self) -> Option<String> {
+        self.selected_model.as_ref().and_then(|qualified| {
+            self.models
+                .iter()
+                .find(|model| {
+                    model.provider == self.backend_provider && model.qualified_id() == *qualified
+                })
+                .map(|model| model.id.clone())
+        })
+    }
+
+    fn qualify_active_model(&self, model: &str) -> String {
+        if model.contains('/') {
+            model.to_owned()
+        } else {
+            format!("{}/{}", self.backend_provider, model)
+        }
+    }
+
     fn install_models(&mut self, models: Vec<ModelInfo>) {
-        self.models = models;
+        let providers: std::collections::HashSet<_> =
+            models.iter().map(|model| model.provider.clone()).collect();
+        self.models
+            .retain(|model| !providers.contains(&model.provider));
+        self.models.extend(models);
+        self.models.sort_by_key(ModelInfo::qualified_id);
         if self.models.is_empty() {
             self.status_message = format!("{} returned an empty model catalog.", self.backend_name);
             self.pending_model_picker = false;
             return;
         }
 
-        if let Some(initial) = self.initial_model.take() {
-            if self.models.iter().any(|model| model.id == initial) {
-                self.selected_model = Some(initial);
-            } else {
-                let fallback = self.default_model();
-                self.selected_model = fallback.clone();
-                self.status_message = match fallback {
-                    Some(fallback) => {
-                        format!("Model {initial} is unavailable; using {fallback}.")
-                    }
-                    None => format!("Model {initial} is unavailable."),
-                };
+        if let Some(initial) = self.initial_model.clone() {
+            let initial_provider = initial.split_once('/').map(|(provider, _)| provider);
+            if initial_provider.is_none_or(|provider| providers.contains(provider)) {
+                self.initial_model = None;
+                if self
+                    .models
+                    .iter()
+                    .any(|model| model.qualified_id() == initial)
+                {
+                    self.selected_model = Some(initial);
+                } else {
+                    let fallback = self.default_model();
+                    self.selected_model = fallback.clone();
+                    self.status_message = match fallback {
+                        Some(fallback) => {
+                            format!("Model {initial} is unavailable; using {fallback}.")
+                        }
+                        None => format!("Model {initial} is unavailable."),
+                    };
+                }
             }
         } else if self.backend_capabilities.session_model_config
-            || self
-                .selected_model
-                .as_ref()
-                .is_none_or(|selected| !self.models.iter().any(|model| &model.id == selected))
+            || self.selected_model.as_ref().is_none_or(|selected| {
+                !self
+                    .models
+                    .iter()
+                    .any(|model| &model.qualified_id() == selected)
+            })
         {
             self.selected_model = self.default_model();
         }
@@ -1381,9 +1635,14 @@ impl AppState {
     fn default_model(&self) -> Option<String> {
         self.models
             .iter()
+            .filter(|model| model.provider == self.backend_provider)
             .find(|model| model.is_default)
-            .or_else(|| self.models.first())
-            .map(|model| model.id.clone())
+            .or_else(|| {
+                self.models
+                    .iter()
+                    .find(|model| model.provider == self.backend_provider)
+            })
+            .map(ModelInfo::qualified_id)
     }
 
     fn protocol_problem(&mut self, message: &str) -> Vec<Effect> {
@@ -1440,8 +1699,8 @@ mod tests {
     use crate::{
         backend::{
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
-            BackendIdentity, BackendOperation, CODEX_PROVIDER, ItemKind, ItemStatus, ModelInfo,
-            NormalizedItem, SessionHistoryItem, TurnOutcome,
+            BackendIdentity, BackendOperation, CODEX_PROVIDER, DEVIN_PROVIDER, ItemKind,
+            ItemStatus, ModelInfo, NormalizedItem, SessionHistoryItem, TurnOutcome,
         },
         session::SessionRecord,
     };
@@ -1468,9 +1727,8 @@ mod tests {
             },
         }));
         state.handle_backend(BackendEvent::Models(vec![ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
             id: "model-a".to_owned(),
-            display_name: "Model A".to_owned(),
-            description: String::new(),
             is_default: true,
         }]));
         state
@@ -1545,15 +1803,13 @@ mod tests {
         });
         state.handle_backend(BackendEvent::Models(vec![
             ModelInfo {
+                provider: DEVIN_PROVIDER.to_owned(),
                 id: "model-a".to_owned(),
-                display_name: "Model A".to_owned(),
-                description: String::new(),
                 is_default: true,
             },
             ModelInfo {
+                provider: DEVIN_PROVIDER.to_owned(),
                 id: "model-b".to_owned(),
-                display_name: "Model B".to_owned(),
-                description: String::new(),
                 is_default: false,
             },
         ]));
@@ -1579,7 +1835,7 @@ mod tests {
             [
                 Effect::PersistSession { provider_session_id, model, .. },
                 Effect::Backend(BackendCommand::StartTurn { .. })
-            ] if provider_session_id == "devin-session" && model.as_deref() == Some("model-b")
+            ] if provider_session_id == "devin-session" && model.as_deref() == Some("devin-acp/model-b")
         ));
     }
 
@@ -1957,9 +2213,8 @@ mod tests {
     fn model_switch_does_not_mutate_active_turn() {
         let mut state = ready_state();
         state.models.push(ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
             id: "model-b".to_owned(),
-            display_name: "Model B".to_owned(),
-            description: String::new(),
             is_default: false,
         });
         state.active_turn = Some(super::ActiveTurn {
@@ -1971,7 +2226,10 @@ mod tests {
         state.picker_move(1);
         let _ = state.picker_select();
 
-        assert_eq!(state.selected_model.as_deref(), Some("model-b"));
+        assert_eq!(
+            state.selected_model.as_deref(),
+            Some("openai-codex/model-b")
+        );
         assert_eq!(
             state
                 .active_turn
@@ -1979,5 +2237,54 @@ mod tests {
                 .and_then(|turn| turn.model.as_deref()),
             Some("model-a")
         );
+    }
+
+    #[test]
+    fn model_picker_merges_provider_qualified_catalogs_and_routes_selection() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        for (provider, name) in [(CODEX_PROVIDER, "Codex"), (DEVIN_PROVIDER, "Devin")] {
+            state.handle_provider_backend(
+                provider,
+                BackendEvent::Ready(BackendIdentity {
+                    provider: provider.to_owned(),
+                    display_name: name.to_owned(),
+                    version: None,
+                    capabilities: BackendCapabilities {
+                        model_catalog: true,
+                        ..BackendCapabilities::default()
+                    },
+                }),
+            );
+        }
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Models(vec![ModelInfo {
+                provider: String::new(),
+                id: "shared".to_owned(),
+                is_default: true,
+            }]),
+        );
+        state.handle_provider_backend(
+            DEVIN_PROVIDER,
+            BackendEvent::Models(vec![ModelInfo {
+                provider: String::new(),
+                id: "shared".to_owned(),
+                is_default: true,
+            }]),
+        );
+
+        let _ = state.open_model_picker();
+        assert_eq!(
+            state
+                .filtered_models()
+                .iter()
+                .map(|model| model.qualified_id())
+                .collect::<Vec<_>>(),
+            vec!["devin-acp/shared", "openai-codex/shared"]
+        );
+        state.picker_move(-1);
+        let _ = state.picker_select();
+        assert_eq!(state.backend_provider, DEVIN_PROVIDER);
+        assert_eq!(state.selected_model.as_deref(), Some("devin-acp/shared"));
     }
 }

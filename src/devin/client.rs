@@ -309,6 +309,11 @@ async fn run_supervisor(
             }
             line = stderr.recv() => {
                 if let Some(line) = line {
+                    if actionable_stderr_warning(&line) {
+                        let _ = events
+                            .send(BackendEvent::Warning(format!("Devin: {line}")))
+                            .await;
+                    }
                     last_stderr = Some(line);
                 }
             }
@@ -1132,7 +1137,7 @@ fn parse_model_options(result: &Value) -> Option<SessionModelOption> {
     if config_id.is_empty() {
         return None;
     }
-    let models = option
+    let mut models = option
         .get("options")
         .and_then(Value::as_array)
         .into_iter()
@@ -1143,17 +1148,19 @@ fn parse_model_options(result: &Value) -> Option<SessionModelOption> {
                 return None;
             }
             Some(ModelInfo {
-                display_name: model
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&id)
-                    .to_owned(),
-                description: string(model, "description"),
+                provider: DEVIN_PROVIDER.to_owned(),
                 is_default: id == current_value,
                 id,
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if !current_value.is_empty() && !models.iter().any(|model| model.id == current_value) {
+        models.push(ModelInfo {
+            provider: DEVIN_PROVIDER.to_owned(),
+            id: current_value.clone(),
+            is_default: true,
+        });
+    }
     Some(SessionModelOption {
         config_id,
         current_value,
@@ -1279,6 +1286,13 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+fn actionable_stderr_warning(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    line.contains("without credentials")
+        || line.contains("not authenticated")
+        || line.contains("authentication required")
+}
+
 fn approval_key(id: &Value) -> String {
     serde_json::to_string(id).unwrap_or_default()
 }
@@ -1289,7 +1303,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{BackendConfig, capability_supported, normalize_permission};
+    use super::{
+        BackendConfig, actionable_stderr_warning, capability_supported, normalize_permission,
+        parse_model_options,
+    };
     use crate::backend::ApprovalKind;
 
     #[test]
@@ -1305,6 +1322,33 @@ mod tests {
         assert!(!capability_supported(Some(&json!(null))));
         assert!(capability_supported(Some(&json!({}))));
         assert!(capability_supported(Some(&json!(true))));
+    }
+
+    #[test]
+    fn current_model_is_kept_when_acp_omits_model_options() {
+        let option = parse_model_options(&json!({
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "swe-1-6-fast",
+                "options": []
+            }]
+        }))
+        .expect("model option");
+        assert_eq!(option.models.len(), 1);
+        assert_eq!(option.models[0].qualified_id(), "devin-acp/swe-1-6-fast");
+        assert!(option.models[0].is_default);
+    }
+
+    #[test]
+    fn only_actionable_devin_stderr_warnings_reach_the_transcript() {
+        assert!(actionable_stderr_warning(
+            "WARN creating session without credentials"
+        ));
+        assert!(!actionable_stderr_warning(
+            "WARN MessageChain tree duplication: system prefix changed"
+        ));
     }
 
     #[test]

@@ -32,10 +32,15 @@ pub struct BackendIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInfo {
+    pub provider: String,
     pub id: String,
-    pub display_name: String,
-    pub description: String,
     pub is_default: bool,
+}
+
+impl ModelInfo {
+    pub fn qualified_id(&self) -> String {
+        format!("{}/{}", self.provider, self.id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,5 +314,15 @@ impl BackendHandle {
 
     pub async fn join(self) {
         let _ = self.task.await;
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        mpsc::Sender<BackendCommand>,
+        mpsc::Receiver<BackendEvent>,
+        JoinHandle<()>,
+    ) {
+        (self.commands, self.events, self.task)
     }
 }

@@ -24,6 +24,13 @@ pub struct SessionRecord {
     pub updated_at: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRecord {
+    pub provider: String,
+    pub display_name: String,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("could not determine Flock's application-data directory")]
@@ -58,6 +65,8 @@ pub trait SessionRepository: Send + Sync {
     fn update_model(&self, id: &str, model: Option<&str>) -> Result<(), SessionError>;
     fn list_models(&self, provider: &str) -> Result<Vec<ModelInfo>, SessionError>;
     fn replace_models(&self, provider: &str, models: &[ModelInfo]) -> Result<(), SessionError>;
+    fn list_providers(&self) -> Result<Vec<ProviderRecord>, SessionError>;
+    fn set_provider_enabled(&self, provider: &str, enabled: bool) -> Result<(), SessionError>;
 }
 
 pub struct SqliteSessionRepository {
@@ -94,15 +103,45 @@ impl SqliteSessionRepository {
              );
              CREATE INDEX IF NOT EXISTS sessions_workspace_updated
                ON sessions(workspace, updated_at DESC);
-             CREATE TABLE IF NOT EXISTS backend_models (
+             CREATE TABLE IF NOT EXISTS provider_models (
                provider TEXT NOT NULL,
                model_id TEXT NOT NULL,
-               display_name TEXT NOT NULL,
-               description TEXT NOT NULL,
                is_default INTEGER NOT NULL,
                cached_at INTEGER NOT NULL,
                PRIMARY KEY(provider, model_id)
+             );
+             CREATE TABLE IF NOT EXISTS providers (
+               provider TEXT PRIMARY KEY,
+               display_name TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
              );",
+        )?;
+        let has_legacy_models = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backend_models'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if has_legacy_models {
+            connection.execute_batch(
+                "INSERT OR IGNORE INTO provider_models
+                   (provider, model_id, is_default, cached_at)
+                 SELECT provider, model_id, is_default, cached_at FROM backend_models;
+                 DROP TABLE backend_models;",
+            )?;
+        }
+        connection.execute(
+            "INSERT OR IGNORE INTO providers (provider, display_name, enabled, updated_at)
+             VALUES (?1, ?2, 1, ?3)",
+            params![CODEX_PROVIDER, "Codex", unix_timestamp()],
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO providers (provider, display_name, enabled, updated_at)
+             VALUES (?1, ?2, 1, ?3)",
+            params![DEVIN_PROVIDER, "Devin", unix_timestamp()],
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -236,16 +275,16 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT model_id, display_name, description, is_default
-             FROM backend_models WHERE provider = ?1
-             ORDER BY is_default DESC, display_name COLLATE NOCASE",
+            "SELECT model_id, is_default
+             FROM provider_models WHERE provider = ?1
+             ORDER BY is_default DESC, model_id COLLATE NOCASE",
         )?;
+        let model_provider = provider.to_owned();
         let rows = statement.query_map([provider], |row| {
             Ok(ModelInfo {
+                provider: model_provider.clone(),
                 id: row.get(0)?,
-                display_name: row.get(1)?,
-                description: row.get(2)?,
-                is_default: row.get::<_, i64>(3)? != 0,
+                is_default: row.get::<_, i64>(1)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -257,26 +296,57 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM backend_models WHERE provider = ?1", [provider])?;
+        transaction.execute(
+            "DELETE FROM provider_models WHERE provider = ?1",
+            [provider],
+        )?;
         let now = unix_timestamp();
         {
             let mut statement = transaction.prepare(
-                "INSERT INTO backend_models
-                 (provider, model_id, display_name, description, is_default, cached_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO provider_models
+                 (provider, model_id, is_default, cached_at)
+                 VALUES (?1, ?2, ?3, ?4)",
             )?;
             for model in models {
                 statement.execute(params![
                     provider,
                     model.id,
-                    model.display_name,
-                    model.description,
                     i64::from(model.is_default),
                     now,
                 ])?;
             }
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    fn list_providers(&self) -> Result<Vec<ProviderRecord>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT provider, display_name, enabled FROM providers ORDER BY display_name COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ProviderRecord {
+                provider: row.get(0)?,
+                display_name: row.get(1)?,
+                enabled: row.get::<_, i64>(2)? != 0,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn set_provider_enabled(&self, provider: &str, enabled: bool) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "UPDATE providers SET enabled = ?1, updated_at = ?2 WHERE provider = ?3",
+            params![i64::from(enabled), unix_timestamp(), provider],
+        )?;
         Ok(())
     }
 }
@@ -316,9 +386,8 @@ mod tests {
         assert!(recent.iter().any(|record| record.id == second.id));
 
         let models = vec![ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
             id: "model-a".to_owned(),
-            display_name: "Model A".to_owned(),
-            description: "Cached model".to_owned(),
             is_default: true,
         }];
         store.update_model(&second.id, Some("model-a"))?;
@@ -330,6 +399,66 @@ mod tests {
         assert_eq!(store.list_models(CODEX_PROVIDER)?, models);
         store.replace_models(CODEX_PROVIDER, &[])?;
         assert!(store.list_models(CODEX_PROVIDER)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn persists_provider_enablement() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("providers.db"))?;
+        let providers = store.list_providers()?;
+        assert_eq!(providers.len(), 2);
+        assert!(providers.iter().all(|provider| provider.enabled));
+
+        store.set_provider_enabled(DEVIN_PROVIDER, false)?;
+        let devin = store
+            .list_providers()?
+            .into_iter()
+            .find(|provider| provider.provider == DEVIN_PROVIDER)
+            .expect("Devin provider");
+        assert!(!devin.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_legacy_model_metadata_to_slug_only_catalog() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("legacy-models.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE backend_models (
+               provider TEXT NOT NULL,
+               model_id TEXT NOT NULL,
+               display_name TEXT NOT NULL,
+               description TEXT NOT NULL,
+               is_default INTEGER NOT NULL,
+               cached_at INTEGER NOT NULL,
+               PRIMARY KEY(provider, model_id)
+             );
+             INSERT INTO backend_models VALUES
+               ('openai-codex', 'legacy-model', 'Old name', 'Old description', 1, 1);",
+        )?;
+        drop(connection);
+
+        let store = SqliteSessionRepository::open(&path)?;
+        assert_eq!(
+            store.list_models(CODEX_PROVIDER)?,
+            vec![ModelInfo {
+                provider: CODEX_PROVIDER.to_owned(),
+                id: "legacy-model".to_owned(),
+                is_default: true,
+            }]
+        );
+        let connection = store.connection.lock().expect("database mutex");
+        let legacy_exists = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backend_models'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        assert!(!legacy_exists);
         Ok(())
     }
 }

@@ -264,16 +264,7 @@ pub fn parse_models(result: &Value) -> Vec<ModelInfo> {
         .filter_map(|model| {
             let id = model.get("model")?.as_str()?.to_owned();
             Some(ModelInfo {
-                display_name: model
-                    .get("displayName")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&id)
-                    .to_owned(),
-                description: model
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
+                provider: crate::backend::CODEX_PROVIDER.to_owned(),
                 is_default: model
                     .get("isDefault")
                     .and_then(Value::as_bool)

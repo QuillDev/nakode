@@ -1,29 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use thiserror::Error;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum BackendChoice {
-    Codex,
-    Devin,
-}
-
-impl BackendChoice {
-    pub fn provider(self) -> &'static str {
-        match self {
-            Self::Codex => crate::backend::CODEX_PROVIDER,
-            Self::Devin => crate::backend::DEVIN_PROVIDER,
-        }
-    }
-
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Self::Codex => "Codex",
-            Self::Devin => "Devin",
-        }
-    }
-}
 
 /// Command-line and environment configuration for Flock.
 #[derive(Clone, Debug, Parser)]
@@ -33,23 +11,19 @@ impl BackendChoice {
     about = "A provider-neutral terminal layer for native agent backends"
 )]
 pub struct Config {
-    /// Agent backend to launch.
-    #[arg(long, env = "FLOCK_BACKEND", value_enum, default_value_t = BackendChoice::Codex)]
-    pub backend: BackendChoice,
-
-    /// Codex executable to launch when --backend codex is selected.
+    /// Codex executable used when the Codex provider is enabled.
     #[arg(long, env = "FLOCK_CODEX", default_value = "codex")]
     pub codex: PathBuf,
 
-    /// Devin executable to launch when --backend devin is selected.
+    /// Devin executable used when the Devin provider is enabled.
     #[arg(long, env = "FLOCK_DEVIN", default_value = "devin")]
     pub devin: PathBuf,
 
-    /// Workspace made available to the selected backend.
+    /// Workspace made available to enabled providers.
     #[arg(long, env = "FLOCK_WORKSPACE", default_value = ".")]
     pub workspace: PathBuf,
 
-    /// Initial model, when supported by the selected backend.
+    /// Initial provider-qualified model (`provider/model`).
     #[arg(long, env = "FLOCK_MODEL")]
     pub model: Option<String>,
 
@@ -74,6 +48,8 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("model must use the provider/model form: {0}")]
+    InvalidModel(String),
 }
 
 impl Config {
@@ -96,6 +72,13 @@ impl Config {
             .take()
             .map(|model| model.trim().to_owned())
             .filter(|model| !model.is_empty());
+        if let Some(model) = &self.model
+            && model
+                .split_once('/')
+                .is_none_or(|(provider, model)| provider.is_empty() || model.is_empty())
+        {
+            return Err(ConfigError::InvalidModel(model.clone()));
+        }
         self.resume = self
             .resume
             .take()
@@ -117,16 +100,26 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ConfigError> {
 mod tests {
     use clap::Parser;
 
-    use super::{BackendChoice, Config};
+    use super::Config;
 
     #[test]
-    fn selects_devin_without_changing_codex_default() {
-        let devin =
-            Config::try_parse_from(["flock", "--backend", "devin"]).expect("parse Devin backend");
-        assert_eq!(devin.backend, BackendChoice::Devin);
-        assert_eq!(devin.devin.to_string_lossy(), "devin");
+    fn backend_flag_is_not_part_of_the_cli() {
+        assert!(Config::try_parse_from(["flock", "--backend", "devin"]).is_err());
+        assert!(Config::try_parse_from(["flock"]).is_ok());
+    }
 
-        let default = Config::try_parse_from(["flock"]).expect("parse default backend");
-        assert_eq!(default.backend, BackendChoice::Codex);
+    #[test]
+    fn initial_model_requires_provider_qualification() {
+        assert!(Config::try_parse_from(["flock", "--model", "model-only"]).is_ok());
+        let invalid = Config::try_parse_from(["flock", "--model", "model-only"])
+            .expect("CLI parse")
+            .validated();
+        assert!(matches!(invalid, Err(super::ConfigError::InvalidModel(_))));
+        assert!(
+            Config::try_parse_from(["flock", "--model", "openai-codex/gpt-5"])
+                .expect("CLI parse")
+                .validated()
+                .is_ok()
+        );
     }
 }
