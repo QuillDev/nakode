@@ -6,7 +6,10 @@ use std::{
 
 use crossterm::{
     cursor,
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     style::ResetColor,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -36,6 +39,11 @@ impl TerminalSession {
             EnterAlternateScreen,
             EnableBracketedPaste,
             EnableMouseCapture,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            ),
             cursor::Hide
         ) {
             let _ = disable_raw_mode();
@@ -90,6 +98,7 @@ fn restore_terminal() -> io::Result<()> {
         output,
         DisableMouseCapture,
         DisableBracketedPaste,
+        PopKeyboardEnhancementFlags,
         ResetColor,
         cursor::Show,
         LeaveAlternateScreen

@@ -108,7 +108,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     let selectable_regions = if state.approvals.front().is_some() {
         vec![bordered_inner(centered(area, 76, 12))]
     } else if state.show_help {
-        vec![bordered_inner(centered(area, 72, 23))]
+        vec![bordered_inner(centered(area, 76, 24))]
     } else if state.session_picker.is_some() {
         vec![bordered_inner(centered(area, 78, 18))]
     } else if state.provider_picker.is_some() {
@@ -276,13 +276,8 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<Position> {
-    let busy_label = if state.is_busy() {
-        " Prompt · Enter queue · Ctrl+S steer "
-    } else {
-        " Prompt · Enter send "
-    };
     let block = overlay_block(
-        busy_label,
+        " Prompt ",
         if state.editor.is_blank() {
             BORDER
         } else {
@@ -382,47 +377,30 @@ fn render_command_completions(frame: &mut Frame<'_>, composer_area: Rect, state:
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let help = if state.active_turn.is_some() {
-        " Ctrl+Q queue  Ctrl+S steer  Ctrl+C cancel  F2 models  F1 help "
-    } else {
-        " Alt+Enter newline  Enter send  PgUp/PgDn scroll  F2 models  F1 help "
-    };
-    let help_width = u16::try_from(help.len()).unwrap_or(u16::MAX);
-    let status_width = area.width.saturating_sub(help_width);
-    let status_area = Rect::new(area.x, area.y, status_width, 1);
-    let help_area = Rect::new(
-        area.x.saturating_add(status_width),
-        area.y,
-        area.width.saturating_sub(status_width),
-        1,
-    );
     frame.render_widget(
         Paragraph::new(format!(" {}", state.status_message))
             .style(Style::default().fg(MUTED).bg(SURFACE)),
-        status_area,
-    );
-    frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(TEXT).bg(SURFACE)),
-        help_area,
+        area,
     );
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, 72, 23);
+    let popup = centered(area, 76, 24);
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::styled("Compose", Style::default().fg(ACCENT_BRIGHT).bold()),
-        Line::raw("  Enter / Ctrl+Enter   send, or queue while busy"),
-        Line::raw("  Alt+Enter / Shift+Enter / Ctrl+J   newline"),
+        Line::raw("  Enter       send while idle, steer during an active turn"),
+        Line::raw("  Alt+Enter   send while idle, queue during an active turn"),
+        Line::raw("  Shift+Enter / Ctrl+J   newline"),
         Line::default(),
         Line::styled("Active turn", Style::default().fg(ACCENT_BRIGHT).bold()),
         Line::raw("  Ctrl+Q   queue draft     Ctrl+S   steer now"),
         Line::raw("  Ctrl+C   interrupt       Ctrl+C again   exit"),
         Line::default(),
         Line::styled("Navigate", Style::default().fg(ACCENT_BRIGHT).bold()),
-        Line::raw("  PageUp/PageDown   transcript     Ctrl+L   latest"),
-        Line::raw("  F2   models       Alt+Up/Down   queue selection"),
-        Line::raw("  Alt+Delete   remove queued message"),
+        Line::raw("  Alt+←/→   previous/next word     Ctrl/Cmd+←/→   line edge"),
+        Line::raw("  Ctrl/Cmd+↑/↓   prompt edge       PageUp/PageDown   transcript"),
+        Line::raw("  Ctrl+L   latest   F2 models   Alt+↑/↓ queue   Alt+Delete remove"),
         Line::raw("  Mouse drag   select and auto-copy rendered text"),
         Line::default(),
         Line::styled("Sessions", Style::default().fg(ACCENT_BRIGHT).bold()),
@@ -431,7 +409,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  /providers manage enabled agent backends"),
         Line::raw("  /skill:name reference a skill anywhere in the prompt"),
         Line::default(),
-        Line::styled("F1 or Esc closes this help.", Style::default().fg(MUTED)),
+        Line::styled(
+            "Ctrl+?, F1, or Esc closes this help.",
+            Style::default().fg(MUTED),
+        ),
     ];
     let block = overlay_block(" Help ", ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -748,6 +729,7 @@ mod tests {
         assert!(rendered.contains("FLOCK"));
         assert!(rendered.contains("Transcript"));
         assert!(rendered.contains("Prompt"));
+        assert!(!rendered.contains("F1 help"));
 
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].bg, super::ACCENT);
@@ -776,7 +758,8 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Active turn"));
         assert!(rendered.contains("Ctrl+S"));
-        assert!(rendered.contains("F1 or Esc"));
+        assert!(rendered.contains("Ctrl+?"));
+        assert!(rendered.contains("F1"));
     }
 
     #[test]

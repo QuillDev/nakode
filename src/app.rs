@@ -389,8 +389,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    if let Some(effects) = handle_command_completion_key(state, key, control, alt, shift) {
+    let boundary = control || key.modifiers.contains(KeyModifiers::SUPER);
+    if let Some(effects) = handle_command_completion_key(state, key, boundary, alt, shift) {
         return effects;
+    }
+    if handle_editor_navigation(state, key.code, boundary, alt) {
+        return Vec::new();
     }
 
     match key.code {
@@ -428,41 +432,18 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.remove_selected_queue_item();
             Vec::new()
         }
-        KeyCode::Enter if alt || shift => {
+        KeyCode::Enter if shift => {
             state.editor.insert_newline();
             Vec::new()
         }
-        KeyCode::Enter => state.submit_editor(),
+        KeyCode::Enter if alt => state.enqueue_editor(),
+        KeyCode::Enter if !boundary => state.submit_or_steer_editor(),
         KeyCode::Backspace => {
             state.editor.backspace();
             Vec::new()
         }
         KeyCode::Delete => {
             state.editor.delete();
-            Vec::new()
-        }
-        KeyCode::Left => {
-            state.editor.move_left();
-            Vec::new()
-        }
-        KeyCode::Right => {
-            state.editor.move_right();
-            Vec::new()
-        }
-        KeyCode::Up => {
-            state.editor.move_up();
-            Vec::new()
-        }
-        KeyCode::Down => {
-            state.editor.move_down();
-            Vec::new()
-        }
-        KeyCode::Home => {
-            state.editor.move_home();
-            Vec::new()
-        }
-        KeyCode::End => {
-            state.editor.move_end();
             Vec::new()
         }
         KeyCode::Tab => {
@@ -481,10 +462,34 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
 }
 
+fn handle_editor_navigation(
+    state: &mut AppState,
+    key_code: KeyCode,
+    boundary: bool,
+    alt: bool,
+) -> bool {
+    match key_code {
+        KeyCode::Left if alt => state.editor.move_word_left(),
+        KeyCode::Right if alt => state.editor.move_word_right(),
+        KeyCode::Left if boundary => state.editor.move_home(),
+        KeyCode::Right if boundary => state.editor.move_end(),
+        KeyCode::Up if boundary => state.editor.move_document_start(),
+        KeyCode::Down if boundary => state.editor.move_document_end(),
+        KeyCode::Left => state.editor.move_left(),
+        KeyCode::Right => state.editor.move_right(),
+        KeyCode::Up if !alt => state.editor.move_up(),
+        KeyCode::Down if !alt => state.editor.move_down(),
+        KeyCode::Home => state.editor.move_home(),
+        KeyCode::End => state.editor.move_end(),
+        _ => return false,
+    }
+    true
+}
+
 fn handle_command_completion_key(
     state: &mut AppState,
     key: KeyEvent,
-    control: bool,
+    boundary: bool,
     alt: bool,
     shift: bool,
 ) -> Option<Vec<Effect>> {
@@ -493,10 +498,10 @@ fn handle_command_completion_key(
     }
 
     match key.code {
-        KeyCode::Up if !alt => state.move_command_completion(-1),
-        KeyCode::Down if !alt => state.move_command_completion(1),
-        KeyCode::Tab if !control && !alt => state.accept_command_completion(),
-        KeyCode::Enter if !control && !alt && !shift && !state.command_completion_is_exact() => {
+        KeyCode::Up if !boundary && !alt => state.move_command_completion(-1),
+        KeyCode::Down if !boundary && !alt => state.move_command_completion(1),
+        KeyCode::Tab if !boundary && !alt => state.accept_command_completion(),
+        KeyCode::Enter if !boundary && !alt && !shift && !state.command_completion_is_exact() => {
             state.accept_command_completion();
         }
         _ => return None,
@@ -515,13 +520,13 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
     }
 
     if state.show_help {
-        if matches!(key.code, KeyCode::Esc | KeyCode::F(1)) {
+        if key.code == KeyCode::Esc || is_help_key(key) {
             state.show_help = false;
         }
         return Some(Vec::new());
     }
 
-    if key.code == KeyCode::F(1) {
+    if is_help_key(key) {
         state.model_picker = None;
         state.session_picker = None;
         state.show_help = true;
@@ -595,6 +600,12 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
     None
 }
 
+fn is_help_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::F(1)
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('?' | '/' | '_')))
+}
+
 #[cfg(unix)]
 struct ShutdownSignals {
     interrupt: tokio::signal::unix::Signal,
@@ -644,7 +655,11 @@ mod tests {
     };
     use ratatui::{Terminal, backend::TestBackend};
 
-    use crate::{render, state::AppState};
+    use crate::{
+        backend::{CODEX_PROVIDER, CapabilitySupport},
+        render,
+        state::{ActiveTurn, AppState},
+    };
 
     #[test]
     fn f1_toggles_help_without_editing_the_draft() {
@@ -691,13 +706,90 @@ mod tests {
     }
 
     #[test]
-    fn alt_enter_inserts_a_newline() {
+    fn shift_enter_inserts_a_newline() {
         let mut state = AppState::new("/tmp/project", None, 100);
         state.editor.set_text("first");
-        super::handle_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        );
         state.editor.insert_str("second");
 
         assert_eq!(state.editor.text(), "first\nsecond");
+    }
+
+    #[test]
+    fn alt_enter_queues_during_an_active_turn() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.active_turn = Some(ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: None,
+            cancelling: false,
+        });
+        state.editor.set_text("later");
+
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+
+        assert!(state.editor.is_blank());
+        assert_eq!(
+            state.queue.front().map(|prompt| prompt.text.as_str()),
+            Some("later")
+        );
+    }
+
+    #[test]
+    fn enter_steers_during_an_active_turn() {
+        let mut state =
+            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+        state.backend_capabilities.steering = CapabilitySupport::Supported;
+        state.active_turn = Some(ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: None,
+            cancelling: false,
+        });
+        state.editor.set_text("focus here");
+
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert_eq!(state.editor.text(), "focus here");
+        assert_eq!(
+            state.status_message,
+            "The active provider session is unavailable."
+        );
+    }
+
+    #[test]
+    fn modified_arrows_navigate_words_and_boundaries() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("one two");
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        state.editor.insert_char('|');
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+        );
+        state.editor.insert_char('^');
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER),
+        );
+        state.editor.insert_char('$');
+
+        assert_eq!(state.editor.text(), "^one |two$");
+    }
+
+    #[test]
+    fn control_question_mark_toggles_help() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        let help_key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
+
+        super::handle_key(&mut state, help_key);
+        assert!(state.show_help);
+        super::handle_key(&mut state, help_key);
+        assert!(!state.show_help);
     }
 
     #[test]

@@ -182,6 +182,54 @@ impl EditorState {
         }
     }
 
+    pub fn move_word_left(&mut self) {
+        if self.column == 0 {
+            if self.row == 0 {
+                return;
+            }
+            self.row -= 1;
+            self.column = self.lines[self.row].chars().count();
+        }
+
+        let characters = self.lines[self.row].chars().collect::<Vec<_>>();
+        while self.column > 0 && characters[self.column - 1].is_whitespace() {
+            self.column -= 1;
+        }
+        let Some(class) = self
+            .column
+            .checked_sub(1)
+            .map(|index| character_class(characters[index]))
+        else {
+            return;
+        };
+        while self.column > 0 && character_class(characters[self.column - 1]) == class {
+            self.column -= 1;
+        }
+    }
+
+    pub fn move_word_right(&mut self) {
+        let line_len = self.lines[self.row].chars().count();
+        if self.column == line_len {
+            if self.row + 1 == self.lines.len() {
+                return;
+            }
+            self.row += 1;
+            self.column = 0;
+        }
+
+        let characters = self.lines[self.row].chars().collect::<Vec<_>>();
+        while self.column < characters.len() && characters[self.column].is_whitespace() {
+            self.column += 1;
+        }
+        let Some(character) = characters.get(self.column) else {
+            return;
+        };
+        let class = character_class(*character);
+        while self.column < characters.len() && character_class(characters[self.column]) == class {
+            self.column += 1;
+        }
+    }
+
     pub fn move_up(&mut self) {
         if self.row > 0 {
             self.row -= 1;
@@ -201,6 +249,16 @@ impl EditorState {
     }
 
     pub fn move_end(&mut self) {
+        self.column = self.lines[self.row].chars().count();
+    }
+
+    pub fn move_document_start(&mut self) {
+        self.row = 0;
+        self.column = 0;
+    }
+
+    pub fn move_document_end(&mut self) {
+        self.row = self.lines.len() - 1;
         self.column = self.lines[self.row].chars().count();
     }
 
@@ -270,6 +328,23 @@ fn character_width(character: char) -> usize {
         4
     } else {
         UnicodeWidthChar::width(character).unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CharacterClass {
+    Word,
+    Punctuation,
+    Whitespace,
+}
+
+fn character_class(character: char) -> CharacterClass {
+    if character.is_whitespace() {
+        CharacterClass::Whitespace
+    } else if character.is_alphanumeric() || character == '_' {
+        CharacterClass::Word
+    } else {
+        CharacterClass::Punctuation
     }
 }
 
@@ -367,5 +442,32 @@ mod tests {
 
         editor.replace_token_before_cursor("/skill:");
         assert_eq!(editor.text(), "please(/skill: later");
+    }
+
+    #[test]
+    fn moves_across_words_and_punctuation() {
+        let mut editor = EditorState::default();
+        editor.set_text("one two.three");
+
+        editor.move_word_left();
+        editor.insert_char('|');
+        assert_eq!(editor.text(), "one two.|three");
+
+        editor.move_document_start();
+        editor.move_word_right();
+        editor.insert_char('|');
+        assert_eq!(editor.text(), "one| two.|three");
+    }
+
+    #[test]
+    fn moves_to_prompt_boundaries() {
+        let mut editor = EditorState::default();
+        editor.set_text("first\nsecond");
+        editor.move_document_start();
+        editor.insert_char('^');
+        editor.move_document_end();
+        editor.insert_char('$');
+
+        assert_eq!(editor.text(), "^first\nsecond$");
     }
 }

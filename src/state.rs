@@ -196,14 +196,7 @@ impl AppState {
         backend_name: impl Into<String>,
     ) -> Self {
         let backend_name = backend_name.into();
-        let mut transcript = Transcript::new(scrollback);
-        transcript.upsert(
-            "flock:startup",
-            EntryKind::System,
-            "FLOCK",
-            format!("Starting {backend_name}…"),
-            EntryStatus::Running,
-        );
+        let transcript = Transcript::new(scrollback);
         let provider = provider.into();
         let mut provider_contexts = HashMap::new();
         provider_contexts.insert(
@@ -630,6 +623,15 @@ impl AppState {
         self.queue_selection = Some(self.queue.len() - 1);
         self.status_message = format!("Queued message {}.", self.queue.len());
         Vec::new()
+    }
+
+    pub fn submit_or_steer_editor(&mut self) -> Vec<Effect> {
+        let is_prompt_command = commands::parse_prompt_command(&self.editor.text()).is_some();
+        if self.active_turn.is_some() && !is_prompt_command {
+            self.steer_editor()
+        } else {
+            self.submit_editor()
+        }
     }
 
     pub fn steer_editor(&mut self) -> Vec<Effect> {
@@ -1116,13 +1118,6 @@ impl AppState {
         self.connection = ConnectionState::Ready {
             server: self.backend_name.clone(),
         };
-        self.transcript.upsert(
-            "flock:startup",
-            EntryKind::System,
-            "FLOCK",
-            format!("Connected to {}.", self.backend_name),
-            EntryStatus::Complete,
-        );
         self.set_status("Ready.");
         self.startup_resume
             .take()
@@ -2219,16 +2214,9 @@ mod tests {
     }
 
     #[test]
-    fn startup_entry_is_replaced_after_connection() {
+    fn successful_connection_does_not_add_transcript_noise() {
         let state = ready_state();
-        let startup = state
-            .transcript
-            .entries()
-            .iter()
-            .filter(|entry| entry.title == "FLOCK")
-            .collect::<Vec<_>>();
-        assert_eq!(startup.len(), 1);
-        assert!(startup[0].body.contains("Connected to codex-test"));
+        assert!(state.transcript.entries().is_empty());
     }
 
     #[test]

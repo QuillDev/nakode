@@ -62,13 +62,16 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     });
 
     thread::sleep(Duration::from_millis(750));
-    // Select the first transcript row (SGR mouse coordinates are 1-based).
+    session.writer().write_all(b"FLOCK")?;
+    session.writer().flush()?;
+    thread::sleep(Duration::from_millis(150));
+    // Select the composer text (SGR mouse coordinates are 1-based).
     // Send each event separately so Crossterm's async event stream observes the
     // press before interpreting the drag and release.
     for event in [
-        b"\x1b[<0;2;3M".as_slice(),
-        b"\x1b[<32;6;3M".as_slice(),
-        b"\x1b[<0;6;3m".as_slice(),
+        b"\x1b[<0;2;24M".as_slice(),
+        b"\x1b[<32;6;24M".as_slice(),
+        b"\x1b[<0;6;24m".as_slice(),
     ] {
         session.writer().write_all(event)?;
         session.writer().flush()?;
@@ -103,6 +106,10 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     assert!(
         output.contains("\u{1b}[?1049l"),
         "alternate screen was not left"
+    );
+    assert!(
+        output.contains("\u{1b}[>13u") && output.contains("\u{1b}[<1u"),
+        "enhanced keyboard reporting was not enabled and restored"
     );
     assert!(
         output.contains("\u{1b}]52;c;RkxPQ0s=\u{7}"),
