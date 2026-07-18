@@ -97,7 +97,7 @@ impl HandoffPackage {
     #[must_use]
     pub fn render_with_prompt(&self, prompt: &str) -> String {
         let mut rendered = String::new();
-        rendered.push_str("# Flock continuity handoff\n\n");
+        rendered.push_str("# Nako Agent continuity handoff\n\n");
         rendered.push_str(
             "You are continuing work from another provider-native agent session. Use the prior \
              visible dialogue below as conversation context. The source provider's hidden context \

@@ -1,8 +1,12 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    path::Path,
+};
 
-pub use crate::backend::ApprovalDecision;
+pub use crate::{backend::ApprovalDecision, session::SubagentStatus};
 
 use crate::{
+    agent::{AgentCatalog, AgentDefinition},
     backend::{
         ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent, BackendOperation,
         CODEX_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem,
@@ -12,9 +16,11 @@ use crate::{
     editor::EditorState,
     handoff::HandoffPackage,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
-    session::{ProviderRecord, SessionRecord},
+    session::{ProviderRecord, SessionRecord, SubagentRecord},
     transcript::{EntryKind, EntryStatus, Transcript},
 };
+
+const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionState {
@@ -97,6 +103,7 @@ pub struct ProviderPicker {
     pub providers: Vec<ProviderRecord>,
     pub selected: usize,
     pub loading: bool,
+    pub showing_details: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -108,9 +115,72 @@ struct ProviderContext {
     session_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubagentRun {
+    pub id: String,
+    pub agent: String,
+    pub provider: String,
+    pub provider_session_id: Option<String>,
+    pub objective: String,
+    pub status: SubagentStatus,
+    pub latest_activity: String,
+}
+
+#[derive(Debug)]
+struct SubagentChat {
+    transcript: Transcript,
+    scroll_from_bottom: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SubagentHitRegion {
+    run_id: String,
+    top_left: ScreenPoint,
+    bottom_right: ScreenPoint,
+}
+
+#[derive(Clone, Debug)]
+struct SubagentExecution {
+    run: SubagentRun,
+    definition: AgentDefinition,
+    request_id: u64,
+    task: String,
+    session_id: Option<String>,
+    response: String,
+    model_targets: Vec<AgentModelTarget>,
+    model_target_index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentModelTarget {
+    provider: String,
+    model: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRequest {
+    pub id: u64,
+    pub agent: String,
+    pub task: String,
+}
+
 #[derive(Clone, Debug)]
 pub enum Effect {
     Backend(BackendCommand),
+    SpawnSubagent {
+        run_id: String,
+        provider: String,
+    },
+    SubagentBackend {
+        run_id: String,
+        command: BackendCommand,
+    },
+    StopSubagent(String),
+    CompleteAgentRequest {
+        request_id: u64,
+        result: String,
+        success: bool,
+    },
     ListSessions,
     ListProviders,
     SetProviderEnabled {
@@ -129,6 +199,8 @@ pub enum Effect {
         provider: String,
         models: Vec<ModelInfo>,
     },
+    PersistSubagent(SubagentRecord),
+    LoadSubagents(String),
     UpdateSessionModel {
         session_id: String,
         model: Option<String>,
@@ -165,6 +237,10 @@ pub struct AppState {
     pub scroll_from_bottom: usize,
     pub status_message: String,
     pub diagnostic_count: usize,
+    pub nako_session_id: String,
+    nako_executable: String,
+    pub subagents: Vec<SubagentRun>,
+    pub subagent_modal: Option<String>,
     pub should_quit: bool,
     creating_session: Option<()>,
     pending_session_prompt: Option<OutgoingPrompt>,
@@ -174,10 +250,16 @@ pub struct AppState {
     resuming_session: Option<SessionRecord>,
     startup_resume: Option<String>,
     item_turns: HashMap<String, String>,
+    subagent_result_items: HashSet<String>,
     initial_model: Option<String>,
     next_local_id: u64,
     screen_snapshot: Option<ScreenSnapshot>,
     pending_clipboard: Option<String>,
+    agents: AgentCatalog,
+    subagent_executions: HashMap<String, SubagentExecution>,
+    subagent_chats: HashMap<String, SubagentChat>,
+    subagent_hit_regions: Vec<SubagentHitRegion>,
+    transcript_limit: usize,
 }
 
 impl AppState {
@@ -248,6 +330,10 @@ impl AppState {
             scroll_from_bottom: 0,
             status_message: format!("Connecting to {backend_name}…"),
             diagnostic_count: 0,
+            nako_session_id: uuid::Uuid::now_v7().to_string(),
+            nako_executable: "nako-agent".to_owned(),
+            subagents: Vec::new(),
+            subagent_modal: None,
             should_quit: false,
             creating_session: None,
             pending_session_prompt: None,
@@ -257,10 +343,111 @@ impl AppState {
             resuming_session: None,
             startup_resume: None,
             item_turns: HashMap::new(),
+            subagent_result_items: HashSet::new(),
             initial_model,
             next_local_id: 1,
             screen_snapshot: None,
             pending_clipboard: None,
+            agents: AgentCatalog::default(),
+            subagent_executions: HashMap::new(),
+            subagent_chats: HashMap::new(),
+            subagent_hit_regions: Vec::new(),
+            transcript_limit: scrollback,
+        }
+    }
+
+    pub fn install_agents(&mut self, agents: AgentCatalog) {
+        self.agents = agents;
+    }
+
+    pub fn set_nako_executable(&mut self, executable: &Path) {
+        self.nako_executable = executable.to_string_lossy().into_owned();
+    }
+
+    #[must_use]
+    pub fn has_running_subagents(&self) -> bool {
+        self.subagents.iter().any(|run| {
+            matches!(
+                run.status,
+                SubagentStatus::Starting | SubagentStatus::Working
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn selected_subagent_summary(&self) -> Option<(String, String)> {
+        let run_id = self.subagent_modal.as_deref()?;
+        let run = self.subagents.iter().find(|run| run.id == run_id)?;
+        Some((run.agent.clone(), run.objective.clone()))
+    }
+
+    pub fn selected_subagent_transcript_mut(&mut self) -> Option<(&mut Transcript, &mut usize)> {
+        let run_id = self.subagent_modal.as_deref()?;
+        let chat = self.subagent_chats.get_mut(run_id)?;
+        Some((&mut chat.transcript, &mut chat.scroll_from_bottom))
+    }
+
+    pub fn set_subagent_hit_regions(&mut self, regions: Vec<(String, ScreenPoint, ScreenPoint)>) {
+        self.subagent_hit_regions = regions
+            .into_iter()
+            .map(|(run_id, top_left, bottom_right)| SubagentHitRegion {
+                run_id,
+                top_left,
+                bottom_right,
+            })
+            .collect();
+    }
+
+    pub fn open_subagent_at(&mut self, point: ScreenPoint) -> bool {
+        let Some(run_id) = self
+            .subagent_hit_regions
+            .iter()
+            .find(|region| {
+                point.column >= region.top_left.column
+                    && point.column < region.bottom_right.column
+                    && point.row >= region.top_left.row
+                    && point.row < region.bottom_right.row
+            })
+            .map(|region| region.run_id.clone())
+        else {
+            return false;
+        };
+        self.subagent_modal = Some(run_id);
+        self.clear_text_selection();
+        true
+    }
+
+    pub fn close_subagent_modal(&mut self) {
+        self.subagent_modal = None;
+        self.clear_text_selection();
+    }
+
+    pub fn scroll_subagent_modal(&mut self, delta: isize) {
+        let Some((_, scroll)) = self.selected_subagent_transcript_mut() else {
+            return;
+        };
+        *scroll = scroll.saturating_add_signed(delta);
+    }
+
+    pub fn scroll_active_chat(&mut self, delta: isize) {
+        if self.subagent_modal.is_some() {
+            self.scroll_subagent_modal(delta);
+        } else {
+            self.scroll_from_bottom = self.scroll_from_bottom.saturating_add_signed(delta);
+        }
+    }
+
+    pub fn reset_subagent_scroll(&mut self) {
+        if let Some((_, scroll)) = self.selected_subagent_transcript_mut() {
+            *scroll = 0;
+        }
+    }
+
+    pub fn reset_active_chat_scroll(&mut self) {
+        if self.subagent_modal.is_some() {
+            self.reset_subagent_scroll();
+        } else {
+            self.scroll_from_bottom = 0;
         }
     }
 
@@ -284,6 +471,51 @@ impl AppState {
         };
     }
 
+    pub fn install_subagents(&mut self, records: Vec<SubagentRecord>) {
+        self.subagents.clear();
+        self.subagent_executions.clear();
+        self.subagent_chats.clear();
+        self.subagent_hit_regions.clear();
+        self.subagent_modal = None;
+        for record in records {
+            let mut status = record.status;
+            let mut latest_activity = record.latest_activity;
+            if matches!(status, SubagentStatus::Starting | SubagentStatus::Working) {
+                status = SubagentStatus::Interrupted;
+                "Interrupted when the previous client exited".clone_into(&mut latest_activity);
+            }
+            let mut transcript = Transcript::new(self.transcript_limit);
+            for entry in record.transcript {
+                if let Some(key) = entry.key {
+                    transcript.upsert(key, entry.kind, entry.title, entry.body, entry.status);
+                } else {
+                    transcript.push(entry.kind, entry.title, entry.body, entry.status);
+                }
+            }
+            if status == SubagentStatus::Interrupted {
+                transcript.finish_running(EntryStatus::Interrupted);
+            }
+            let run = SubagentRun {
+                id: record.id.clone(),
+                agent: record.agent,
+                provider: record.provider,
+                provider_session_id: record.provider_session_id,
+                objective: record.objective,
+                status,
+                latest_activity,
+            };
+            self.subagents.push(run.clone());
+            self.sync_inline_subagent(&run);
+            self.subagent_chats.insert(
+                record.id,
+                SubagentChat {
+                    transcript,
+                    scroll_from_bottom: 0,
+                },
+            );
+        }
+    }
+
     pub fn session_store_failed(&mut self, message: impl Into<String>) {
         if let Some(picker) = &mut self.session_picker {
             picker.loading = false;
@@ -297,6 +529,7 @@ impl AppState {
             providers: Vec::new(),
             selected: 0,
             loading: false,
+            showing_details: false,
         });
         picker.providers = providers;
         picker.selected = 0;
@@ -311,6 +544,46 @@ impl AppState {
             return;
         }
         picker.selected = offset_index(picker.selected, picker.providers.len(), delta);
+    }
+
+    pub fn open_provider_details(&mut self) {
+        let Some(picker) = &mut self.provider_picker else {
+            return;
+        };
+        if picker.providers.get(picker.selected).is_some() {
+            picker.showing_details = true;
+        }
+    }
+
+    pub fn close_provider_details(&mut self) -> bool {
+        let Some(picker) = &mut self.provider_picker else {
+            return false;
+        };
+        if !picker.showing_details {
+            return false;
+        }
+        picker.showing_details = false;
+        true
+    }
+
+    #[must_use]
+    pub fn provider_capabilities(&self, provider: &str) -> Option<&BackendCapabilities> {
+        if provider == self.backend_provider {
+            return Some(&self.backend_capabilities);
+        }
+        self.provider_contexts
+            .get(provider)
+            .map(|context| &context.capabilities)
+    }
+
+    #[must_use]
+    pub fn provider_connection(&self, provider: &str) -> Option<&ConnectionState> {
+        if provider == self.backend_provider {
+            return Some(&self.connection);
+        }
+        self.provider_contexts
+            .get(provider)
+            .map(|context| &context.connection)
     }
 
     pub fn close_provider_picker(&mut self) {
@@ -461,6 +734,7 @@ impl AppState {
         self.creating_session.is_some()
             || self.starting_turn.is_some()
             || self.active_turn.is_some()
+            || self.has_running_subagents()
     }
 
     #[must_use]
@@ -533,6 +807,7 @@ impl AppState {
                         providers: Vec::new(),
                         selected: 0,
                         loading: true,
+                        showing_details: false,
                     });
                     self.set_status("Loading providers…");
                     return vec![Effect::ListProviders];
@@ -604,13 +879,19 @@ impl AppState {
         self.pending_handoff = None;
         self.resuming_session = None;
         self.item_turns.clear();
+        self.subagent_result_items.clear();
         self.approvals.clear();
         self.queue.clear();
         self.queue_selection = None;
+        self.subagents.clear();
+        self.subagent_executions.clear();
+        self.subagent_chats.clear();
+        self.subagent_hit_regions.clear();
+        self.subagent_modal = None;
         self.transcript.clear();
         self.transcript.push(
             EntryKind::System,
-            "FLOCK",
+            "NAKO AGENT",
             "New session. Send a message to begin.",
             EntryStatus::Complete,
         );
@@ -694,31 +975,43 @@ impl AppState {
     }
 
     pub fn cancel_or_quit(&mut self) -> Vec<Effect> {
+        let (interrupted_subagents, mut effects) = self.interrupt_subagents();
         let Some(active) = self.active_turn.as_mut() else {
+            if interrupted_subagents > 0 {
+                self.status_message =
+                    format!("Interrupted {interrupted_subagents} running subagent(s).");
+                return effects;
+            }
             self.should_quit = true;
             return vec![Effect::Backend(BackendCommand::Shutdown), Effect::Quit];
         };
         if !self.backend_capabilities.interruption.is_supported() {
             self.status_message = format!("{} does not support interruption.", self.backend_name);
-            return Vec::new();
+            return effects;
         }
         if active.cancelling {
             self.should_quit = true;
-            return vec![Effect::Backend(BackendCommand::Shutdown), Effect::Quit];
+            effects.extend([Effect::Backend(BackendCommand::Shutdown), Effect::Quit]);
+            return effects;
         }
         let Some(provider_session_id) = self.provider_session_id.clone() else {
             self.set_status("Cannot cancel: the provider session id is unavailable.");
-            return Vec::new();
+            return effects;
         };
 
         active.cancelling = true;
-        self.status_message.clear();
-        self.status_message
-            .push_str("Cancelling… Press Ctrl+C again to exit Flock.");
-        vec![Effect::Backend(BackendCommand::InterruptTurn {
+        self.status_message = if interrupted_subagents == 0 {
+            "Interrupting active turn… Press Ctrl+C again to exit Nako Agent.".to_owned()
+        } else {
+            format!(
+                "Interrupting active turn and {interrupted_subagents} subagent(s)… Press Ctrl+C again to exit Nako Agent."
+            )
+        };
+        effects.push(Effect::Backend(BackendCommand::InterruptTurn {
             session_id: provider_session_id,
             turn_id: active.id.clone(),
-        })]
+        }));
+        effects
     }
 
     pub fn request_quit(&mut self) -> Vec<Effect> {
@@ -1275,8 +1568,12 @@ impl AppState {
             self.selected_model = Some(self.qualify_active_model(model));
         }
         self.install_history(history);
+        self.install_subagents(Vec::new());
         self.status_message = format!("Resumed session {}.", short_id(&session.id));
-        vec![Effect::TouchSession(session.id)]
+        vec![
+            Effect::TouchSession(session.id.clone()),
+            Effect::LoadSubagents(session.id),
+        ]
     }
 
     fn observe_turn_artifact(
@@ -1450,6 +1747,7 @@ impl AppState {
             self.status_message = format!("Creating a {} session…", self.backend_name);
             vec![Effect::Backend(BackendCommand::StartSession {
                 model: prompt.model,
+                instructions: Some(self.nako_system_instructions()),
             })]
         }
     }
@@ -1519,6 +1817,7 @@ impl AppState {
             .collect::<Vec<_>>();
         for item_id in item_ids {
             self.transcript.set_status(&item_id, final_item_status);
+            self.subagent_result_items.remove(&item_id);
         }
         self.transcript
             .set_status(&format!("turn:{turn_id}:diff"), final_item_status);
@@ -1581,8 +1880,12 @@ impl AppState {
     fn install_history(&mut self, history: Vec<SessionHistoryItem>) {
         self.transcript.clear();
         self.item_turns.clear();
+        self.subagent_result_items.clear();
         for history_item in history {
             let item = history_item.item;
+            if hides_subagent_item(&item) {
+                continue;
+            }
             self.item_turns
                 .insert(item.id.clone(), history_item.turn_id);
             self.transcript.upsert(
@@ -1596,7 +1899,7 @@ impl AppState {
         if self.transcript.entries().is_empty() {
             self.transcript.push(
                 EntryKind::System,
-                "FLOCK",
+                "NAKO AGENT",
                 "Resumed session has no visible history.",
                 EntryStatus::Complete,
             );
@@ -1608,7 +1911,19 @@ impl AppState {
         if item.kind == ItemKind::User || !self.turn_is_current(&turn_id) {
             return;
         }
+        let hides_subagent_result = item.kind == ItemKind::Tool
+            && (self.subagent_result_items.contains(&item.id)
+                || is_subagent_invocation(&item.title)
+                || is_subagent_invocation(&item.body)
+                || item.body.contains("[Subagent Result]"));
+        if hides_subagent_result {
+            self.subagent_result_items.insert(item.id.clone());
+        }
         self.item_turns.insert(item.id.clone(), turn_id);
+        if hides_subagent_result {
+            self.transcript.remove(&item.id);
+            return;
+        }
         let status = if completed {
             entry_status(item.status)
         } else {
@@ -1632,6 +1947,13 @@ impl AppState {
             return;
         }
         self.item_turns.insert(item_id.clone(), turn_id);
+        if self.subagent_result_items.contains(&item_id)
+            || (kind == DeltaKind::Tool && delta.contains("[Subagent Result]"))
+        {
+            self.subagent_result_items.insert(item_id.clone());
+            self.transcript.remove(&item_id);
+            return;
+        }
         let (entry_kind, title) = match kind {
             DeltaKind::Assistant => (EntryKind::Assistant, "ASSISTANT"),
             DeltaKind::Plan => (EntryKind::Reasoning, "PLAN"),
@@ -1718,6 +2040,616 @@ impl AppState {
             self.status_message
                 .push_str(" The original text remains in the transcript.");
         }
+    }
+
+    pub fn invoke_agent(&mut self, request: &AgentRequest) -> Vec<Effect> {
+        if self
+            .subagents
+            .iter()
+            .filter(|run| {
+                matches!(
+                    run.status,
+                    SubagentStatus::Starting | SubagentStatus::Working
+                )
+            })
+            .count()
+            >= MAX_CONCURRENT_SUBAGENTS
+        {
+            return vec![Effect::CompleteAgentRequest {
+                request_id: request.id,
+                result: format!(
+                    "The concurrent subagent limit ({MAX_CONCURRENT_SUBAGENTS}) is already in use. Wait for a running subagent to finish."
+                ),
+                success: false,
+            }];
+        }
+        let agent_slug = request.agent.as_str();
+        let task = request.task.trim();
+        let Some(definition) = self.agents.find(agent_slug).cloned() else {
+            return vec![Effect::CompleteAgentRequest {
+                request_id: request.id,
+                result: format!("Unknown predefined agent {agent_slug:?}."),
+                success: false,
+            }];
+        };
+        if task.is_empty() {
+            return vec![Effect::CompleteAgentRequest {
+                request_id: request.id,
+                result: "Agent invocation requires a non-empty task.".to_owned(),
+                success: false,
+            }];
+        }
+
+        let run_id = self.next_id("agent");
+        let model_targets = agent_model_targets(&definition, &self.backend_provider);
+        let provider = model_targets[0].provider.clone();
+        let run = SubagentRun {
+            id: run_id.clone(),
+            agent: definition.slug.clone(),
+            provider: provider.clone(),
+            provider_session_id: None,
+            objective: task.to_owned(),
+            status: SubagentStatus::Starting,
+            latest_activity: "Starting provider…".to_owned(),
+        };
+        self.subagents.push(run.clone());
+        self.sync_inline_subagent(&run);
+        let mut transcript = Transcript::new(self.transcript_limit);
+        transcript.push(
+            EntryKind::User,
+            "PARENT",
+            definition.initial_prompt(task),
+            EntryStatus::Complete,
+        );
+        self.subagent_chats.insert(
+            run_id.clone(),
+            SubagentChat {
+                transcript,
+                scroll_from_bottom: 0,
+            },
+        );
+        self.subagent_executions.insert(
+            run_id.clone(),
+            SubagentExecution {
+                run,
+                definition,
+                request_id: request.id,
+                task: task.to_owned(),
+                session_id: None,
+                response: String::new(),
+                model_targets,
+                model_target_index: 0,
+            },
+        );
+        self.status_message = format!("Spawned subagent {agent_slug} as {run_id}.");
+        let mut effects = vec![Effect::SpawnSubagent {
+            run_id: run_id.clone(),
+            provider,
+        }];
+        if let Some(effect) = self.persist_subagent_effect(&run_id) {
+            effects.push(effect);
+        }
+        effects
+    }
+
+    fn nako_system_instructions(&self) -> String {
+        let executable = shell_quote(&self.nako_executable);
+        let agents = self
+            .agents
+            .definitions()
+            .iter()
+            .map(|agent| {
+                format!(
+                    "- {}: {}\n  Command: {} agent {} --session-id={} --task '<bounded task>'",
+                    agent.slug,
+                    agent.description.trim(),
+                    executable,
+                    agent.slug,
+                    self.nako_session_id,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let model = self.selected_model.as_ref().map_or_else(
+            || format!("{}/provider-default", self.backend_provider),
+            |model| format!("{}/{}", self.backend_provider, model),
+        );
+        format!(
+            "[Nako Agent System Instructions]\nYou are operating inside Nako Agent.\nSession ID: {}\nModel: {}\nProvider: {}\nNako Agent invocation is available through the native shell. It is a Nako Agent control-plane command, not a provider tool.\nAvailable agents:\n{}\nTo delegate a concrete bounded task, execute the matching absolute-path command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed above. Use only these Nako Agent commands for delegation; do not use provider-native subagent or collaboration features because Nako Agent cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one command per task concurrently using the provider's native shell facilities. Keep each objective distinct and bounded. Each command returns its own agent result on stdout when that child finishes; incorporate all relevant results into your response.\n[/Nako Agent System Instructions]",
+            self.nako_session_id,
+            model,
+            self.backend_provider,
+            if agents.is_empty() { "- none" } else { &agents },
+        )
+    }
+
+    pub fn subagent_launch_failed(&mut self, run_id: &str, message: String) -> Vec<Effect> {
+        let mut effects = self.retry_subagent_or_finish(run_id, message);
+        if let Some(effect) = self.persist_subagent_effect(run_id) {
+            effects.push(effect);
+        }
+        effects
+    }
+
+    pub fn handle_subagent_backend(&mut self, run_id: &str, event: BackendEvent) -> Vec<Effect> {
+        if !self.subagent_executions.contains_key(run_id) {
+            return Vec::new();
+        }
+        let persistence_boundary = is_subagent_persistence_boundary(&event);
+        let mut effects = match event {
+            BackendEvent::Ready(_) => self.start_subagent_session(run_id),
+            BackendEvent::SessionCreated {
+                provider_session_id,
+                ..
+            } => self.start_subagent_turn(run_id, provider_session_id),
+            BackendEvent::ItemDelta {
+                item_id,
+                kind,
+                delta,
+                ..
+            } => self.handle_subagent_delta(run_id, &item_id, kind, &delta),
+            BackendEvent::ItemStarted { item, .. } | BackendEvent::ItemCompleted { item, .. } => {
+                self.record_subagent_item(run_id, &item);
+                self.observe_subagent_item(run_id, item);
+                Vec::new()
+            }
+            BackendEvent::TurnDiff { turn_id, diff } => {
+                self.record_subagent_artifact(
+                    run_id,
+                    format!("turn:{turn_id}:diff"),
+                    EntryKind::Diff,
+                    "DIFF",
+                    diff,
+                );
+                Vec::new()
+            }
+            BackendEvent::TurnPlan { turn_id, plan } => {
+                self.record_subagent_artifact(
+                    run_id,
+                    format!("turn:{turn_id}:plan"),
+                    EntryKind::System,
+                    "PLAN",
+                    plan,
+                );
+                Vec::new()
+            }
+            BackendEvent::ApprovalRequested(approval) => vec![Effect::SubagentBackend {
+                run_id: run_id.to_owned(),
+                command: BackendCommand::ResolveApproval {
+                    id: approval.id,
+                    decision: ApprovalDecision::AcceptForSession,
+                },
+            }],
+            BackendEvent::TurnCompleted { outcome, error, .. } => {
+                self.complete_subagent_turn(run_id, outcome, error)
+            }
+            BackendEvent::RequestFailed {
+                operation: BackendOperation::StartSession,
+                message,
+                ..
+            }
+            | BackendEvent::Disconnected { reason: message } => {
+                self.retry_subagent_or_finish(run_id, message)
+            }
+            BackendEvent::RequestFailed { message, .. }
+            | BackendEvent::TurnError {
+                message,
+                will_retry: false,
+                ..
+            } => self.fail_subagent(run_id, message),
+            BackendEvent::TurnError {
+                message,
+                will_retry: true,
+                ..
+            } => {
+                self.record_subagent_message(run_id, EntryKind::Warning, "RETRYING", &message);
+                Vec::new()
+            }
+            BackendEvent::Warning(message) | BackendEvent::ProtocolDiagnostic(message) => {
+                self.record_subagent_message(run_id, EntryKind::Warning, "WARNING", &message);
+                let Some(execution) = self.subagent_executions.get_mut(run_id) else {
+                    return Vec::new();
+                };
+                execution.run.latest_activity = summarize_activity(&message, "Provider warning");
+                self.sync_subagent(run_id);
+                Vec::new()
+            }
+            BackendEvent::Models(_)
+            | BackendEvent::SessionResumed { .. }
+            | BackendEvent::SessionUnsubscribed
+            | BackendEvent::SessionObserved { .. }
+            | BackendEvent::TurnAccepted { .. }
+            | BackendEvent::TurnStarted { .. }
+            | BackendEvent::ApprovalResolved { .. }
+            | BackendEvent::SteerAccepted { .. }
+            | BackendEvent::InterruptAccepted
+            | BackendEvent::ModelRerouted { .. }
+            | BackendEvent::SessionClosed { .. } => Vec::new(),
+        };
+        if persistence_boundary && let Some(effect) = self.persist_subagent_effect(run_id) {
+            effects.push(effect);
+        }
+        effects
+    }
+
+    fn handle_subagent_delta(
+        &mut self,
+        run_id: &str,
+        item_id: &str,
+        kind: DeltaKind,
+        delta: &str,
+    ) -> Vec<Effect> {
+        self.record_subagent_delta(run_id, item_id, kind, delta);
+        let Some(execution) = self.subagent_executions.get_mut(run_id) else {
+            return Vec::new();
+        };
+        if kind == DeltaKind::Assistant {
+            execution.response.push_str(delta);
+            execution.run.latest_activity = summarize_activity(delta, "Responding…");
+        } else if kind == DeltaKind::Tool {
+            execution.run.latest_activity = summarize_activity(delta, "Using a tool…");
+        }
+        self.sync_subagent(run_id);
+        Vec::new()
+    }
+
+    fn complete_subagent_turn(
+        &mut self,
+        run_id: &str,
+        outcome: TurnOutcome,
+        error: Option<String>,
+    ) -> Vec<Effect> {
+        let status = match outcome {
+            TurnOutcome::Completed => EntryStatus::Complete,
+            TurnOutcome::Interrupted => EntryStatus::Interrupted,
+            TurnOutcome::Failed => EntryStatus::Failed,
+        };
+        self.finish_subagent_transcript(run_id, status);
+        match outcome {
+            TurnOutcome::Completed => self.finish_subagent(run_id, Ok(())),
+            TurnOutcome::Interrupted | TurnOutcome::Failed => self.finish_subagent(
+                run_id,
+                Err(error.unwrap_or_else(|| "Subagent turn failed.".to_owned())),
+            ),
+        }
+    }
+
+    fn retry_subagent_or_finish(&mut self, run_id: &str, message: String) -> Vec<Effect> {
+        let fallback = {
+            let Some(execution) = self.subagent_executions.get_mut(run_id) else {
+                return Vec::new();
+            };
+            let next_index = execution.model_target_index.saturating_add(1);
+            let Some(target) = execution.model_targets.get(next_index).cloned() else {
+                return self.finish_subagent(run_id, Err(message));
+            };
+            execution.model_target_index = next_index;
+            target.provider.clone_into(&mut execution.run.provider);
+            execution.run.provider_session_id = None;
+            execution.run.status = SubagentStatus::Starting;
+            execution.run.latest_activity = format!(
+                "Retrying with {} after: {}",
+                agent_model_target_label(&target),
+                summarize_activity(&message, "provider failure")
+            );
+            execution.session_id = None;
+            execution.response.clear();
+            target
+        };
+        self.record_subagent_message(
+            run_id,
+            EntryKind::Warning,
+            "FALLBACK",
+            &format!(
+                "The previous model target failed: {message}\nRetrying with {}.",
+                agent_model_target_label(&fallback)
+            ),
+        );
+        self.sync_subagent(run_id);
+        vec![
+            Effect::StopSubagent(run_id.to_owned()),
+            Effect::SpawnSubagent {
+                run_id: run_id.to_owned(),
+                provider: fallback.provider,
+            },
+        ]
+    }
+
+    fn fail_subagent(&mut self, run_id: &str, message: String) -> Vec<Effect> {
+        self.record_subagent_message(run_id, EntryKind::Error, "ERROR", &message);
+        self.finish_subagent_transcript(run_id, EntryStatus::Failed);
+        self.finish_subagent(run_id, Err(message))
+    }
+
+    fn start_subagent_session(&mut self, run_id: &str) -> Vec<Effect> {
+        let Some(execution) = self.subagent_executions.get_mut(run_id) else {
+            return Vec::new();
+        };
+        execution.run.status = SubagentStatus::Starting;
+        "Creating native session…".clone_into(&mut execution.run.latest_activity);
+        let model = execution.model_targets[execution.model_target_index]
+            .model
+            .clone();
+        let instructions = Some(execution.definition.system_prompt.clone());
+        self.sync_subagent(run_id);
+        vec![Effect::SubagentBackend {
+            run_id: run_id.to_owned(),
+            command: BackendCommand::StartSession {
+                model,
+                instructions,
+            },
+        }]
+    }
+
+    fn start_subagent_turn(&mut self, run_id: &str, provider_session_id: String) -> Vec<Effect> {
+        let Some(execution) = self.subagent_executions.get_mut(run_id) else {
+            return Vec::new();
+        };
+        execution.session_id = Some(provider_session_id.clone());
+        execution.run.provider_session_id = Some(provider_session_id.clone());
+        execution.run.status = SubagentStatus::Working;
+        "Working…".clone_into(&mut execution.run.latest_activity);
+        let prompt = format!(
+            "# Agent role instructions\n\n{}\n\n{}",
+            execution.definition.system_prompt.trim(),
+            execution.definition.initial_prompt(&execution.task)
+        );
+        let model = execution.model_targets[execution.model_target_index]
+            .model
+            .clone();
+        self.sync_subagent(run_id);
+        vec![Effect::SubagentBackend {
+            run_id: run_id.to_owned(),
+            command: BackendCommand::StartTurn {
+                session_id: provider_session_id,
+                client_id: format!("{run_id}-prompt"),
+                prompt,
+                model,
+            },
+        }]
+    }
+
+    fn record_subagent_delta(&mut self, run_id: &str, item_id: &str, kind: DeltaKind, delta: &str) {
+        let Some(chat) = self.subagent_chats.get_mut(run_id) else {
+            return;
+        };
+        let (entry_kind, title) = match kind {
+            DeltaKind::Assistant => (EntryKind::Assistant, "ASSISTANT"),
+            DeltaKind::Reasoning => (EntryKind::Reasoning, "REASONING"),
+            DeltaKind::Tool => (EntryKind::Tool, "TOOL"),
+            DeltaKind::Plan => (EntryKind::System, "PLAN"),
+        };
+        chat.transcript
+            .append_delta(item_id, entry_kind, title, delta);
+    }
+
+    fn record_subagent_item(&mut self, run_id: &str, item: &NormalizedItem) {
+        let Some(chat) = self.subagent_chats.get_mut(run_id) else {
+            return;
+        };
+        chat.transcript.upsert(
+            item.id.clone(),
+            entry_kind(item.kind),
+            item.title.clone(),
+            item.body.clone(),
+            entry_status(item.status),
+        );
+    }
+
+    fn record_subagent_artifact(
+        &mut self,
+        run_id: &str,
+        key: String,
+        kind: EntryKind,
+        title: &str,
+        body: String,
+    ) {
+        let Some(chat) = self.subagent_chats.get_mut(run_id) else {
+            return;
+        };
+        chat.transcript
+            .upsert(key, kind, title, body, EntryStatus::Running);
+    }
+
+    fn record_subagent_message(&mut self, run_id: &str, kind: EntryKind, title: &str, body: &str) {
+        let Some(chat) = self.subagent_chats.get_mut(run_id) else {
+            return;
+        };
+        chat.transcript
+            .push(kind, title, body, EntryStatus::Complete);
+    }
+
+    fn finish_subagent_transcript(&mut self, run_id: &str, status: EntryStatus) {
+        if let Some(chat) = self.subagent_chats.get_mut(run_id) {
+            chat.transcript.finish_running(status);
+        }
+    }
+
+    fn observe_subagent_item(&mut self, run_id: &str, item: NormalizedItem) {
+        let Some(execution) = self.subagent_executions.get_mut(run_id) else {
+            return;
+        };
+        match item.kind {
+            ItemKind::Assistant if !item.body.is_empty() => {
+                execution.response = item.body;
+                "Finishing response…".clone_into(&mut execution.run.latest_activity);
+            }
+            ItemKind::Tool | ItemKind::Diff => {
+                execution.run.latest_activity = if item.body.trim().is_empty() {
+                    item.title
+                } else {
+                    summarize_activity(&item.body, &item.title)
+                };
+            }
+            ItemKind::User | ItemKind::Reasoning | ItemKind::System | ItemKind::Assistant => {}
+        }
+        self.sync_subagent(run_id);
+    }
+
+    fn sync_subagent(&mut self, run_id: &str) {
+        let Some(run) = self
+            .subagent_executions
+            .get(run_id)
+            .map(|execution| execution.run.clone())
+        else {
+            return;
+        };
+        if let Some(displayed) = self
+            .subagents
+            .iter_mut()
+            .find(|displayed| displayed.id == run_id)
+        {
+            displayed.clone_from(&run);
+        }
+        self.sync_inline_subagent(&run);
+    }
+
+    fn interrupt_subagents(&mut self) -> (usize, Vec<Effect>) {
+        let run_ids = self
+            .subagent_executions
+            .iter()
+            .filter(|(_, execution)| {
+                matches!(
+                    execution.run.status,
+                    SubagentStatus::Starting | SubagentStatus::Working
+                )
+            })
+            .map(|(run_id, _)| run_id.clone())
+            .collect::<Vec<_>>();
+        let mut effects = Vec::with_capacity(run_ids.len() * 2);
+        for run_id in &run_ids {
+            let Some(mut execution) = self.subagent_executions.remove(run_id) else {
+                continue;
+            };
+            execution.run.status = SubagentStatus::Interrupted;
+            "Interrupted by parent".clone_into(&mut execution.run.latest_activity);
+            if let Some(displayed) = self.subagents.iter_mut().find(|run| run.id == *run_id) {
+                displayed.clone_from(&execution.run);
+            }
+            self.sync_inline_subagent(&execution.run);
+            let result = format!(
+                "[Subagent Result] [{}] [{}]\nInterrupted by the parent agent.",
+                execution.run.id, execution.run.agent
+            );
+            if let Some(chat) = self.subagent_chats.get_mut(run_id) {
+                chat.transcript.push(
+                    EntryKind::System,
+                    "INTERRUPTED",
+                    "Interrupted by the parent agent.",
+                    EntryStatus::Interrupted,
+                );
+                chat.transcript.finish_running(EntryStatus::Interrupted);
+            }
+            if let Some(effect) = self.persist_subagent_effect(run_id) {
+                effects.push(effect);
+            }
+            effects.push(Effect::CompleteAgentRequest {
+                request_id: execution.request_id,
+                result,
+                success: false,
+            });
+            effects.push(Effect::StopSubagent(run_id.clone()));
+        }
+        (run_ids.len(), effects)
+    }
+
+    fn finish_subagent(&mut self, run_id: &str, outcome: Result<(), String>) -> Vec<Effect> {
+        let Some(mut execution) = self.subagent_executions.remove(run_id) else {
+            return Vec::new();
+        };
+        let (success, body) = match outcome {
+            Ok(()) if !execution.response.trim().is_empty() => {
+                execution.run.status = SubagentStatus::Completed;
+                "Completed".clone_into(&mut execution.run.latest_activity);
+                (true, execution.response.trim().to_owned())
+            }
+            Ok(()) => {
+                execution.run.status = SubagentStatus::Failed;
+                "Returned no response".clone_into(&mut execution.run.latest_activity);
+                if let Some(chat) = self.subagent_chats.get_mut(run_id) {
+                    chat.transcript.push(
+                        EntryKind::Error,
+                        "ERROR",
+                        "Subagent returned no assistant response.",
+                        EntryStatus::Failed,
+                    );
+                    chat.transcript.finish_running(EntryStatus::Failed);
+                }
+                (false, "Subagent returned no assistant response.".to_owned())
+            }
+            Err(message) => {
+                execution.run.status = SubagentStatus::Failed;
+                execution.run.latest_activity = summarize_activity(&message, "Failed");
+                if let Some(chat) = self.subagent_chats.get_mut(run_id) {
+                    if !chat
+                        .transcript
+                        .entries()
+                        .iter()
+                        .any(|entry| entry.kind == EntryKind::Error && entry.body == message)
+                    {
+                        chat.transcript.push(
+                            EntryKind::Error,
+                            "ERROR",
+                            message.clone(),
+                            EntryStatus::Failed,
+                        );
+                    }
+                    chat.transcript.finish_running(EntryStatus::Failed);
+                }
+                (false, message)
+            }
+        };
+        if let Some(displayed) = self.subagents.iter_mut().find(|run| run.id == run_id) {
+            displayed.clone_from(&execution.run);
+        }
+        self.sync_inline_subagent(&execution.run);
+        let result = format!(
+            "[Subagent Result] [{}] [{}]\n{}",
+            execution.run.id, execution.run.agent, body
+        );
+        vec![
+            Effect::CompleteAgentRequest {
+                request_id: execution.request_id,
+                result,
+                success,
+            },
+            Effect::StopSubagent(run_id.to_owned()),
+        ]
+    }
+
+    fn persist_subagent_effect(&self, run_id: &str) -> Option<Effect> {
+        let parent_session_id = self.session_id.clone()?;
+        let run = self.subagents.iter().find(|run| run.id == run_id)?;
+        let chat = self.subagent_chats.get(run_id)?;
+        Some(Effect::PersistSubagent(SubagentRecord {
+            parent_session_id,
+            id: run.id.clone(),
+            agent: run.agent.clone(),
+            provider: run.provider.clone(),
+            provider_session_id: run.provider_session_id.clone(),
+            objective: run.objective.clone(),
+            status: run.status,
+            latest_activity: run.latest_activity.clone(),
+            transcript: chat.transcript.entries().to_vec(),
+        }))
+    }
+
+    fn sync_inline_subagent(&mut self, run: &SubagentRun) {
+        let running = matches!(
+            run.status,
+            SubagentStatus::Starting | SubagentStatus::Working
+        );
+        self.transcript.upsert(
+            format!("subagent:{}", run.id),
+            EntryKind::System,
+            if running { "pending" } else { "completed" },
+            run.objective.clone(),
+            if running {
+                EntryStatus::Running
+            } else {
+                EntryStatus::Complete
+            },
+        );
     }
 
     fn selected_model_for_active_provider(&self) -> Option<String> {
@@ -1820,7 +2752,7 @@ impl AppState {
     }
 
     fn next_id(&mut self, kind: &str) -> String {
-        let id = format!("flock-{kind}-{:06}", self.next_local_id);
+        let id = format!("nako-{kind}-{:06}", self.next_local_id);
         self.next_local_id = self.next_local_id.wrapping_add(1);
         id
     }
@@ -1860,18 +2792,117 @@ fn entry_status(status: ItemStatus) -> EntryStatus {
     }
 }
 
+fn summarize_activity(text: &str, fallback: &str) -> String {
+    let summary = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(fallback);
+    summary.chars().take(120).collect()
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn agent_model_targets(
+    definition: &AgentDefinition,
+    parent_provider: &str,
+) -> Vec<AgentModelTarget> {
+    let mut targets = Vec::with_capacity(definition.fallback_models.len().saturating_add(1));
+    if let Some(model) = definition.model.as_deref() {
+        push_agent_model_target(&mut targets, model);
+    } else {
+        targets.push(AgentModelTarget {
+            provider: parent_provider.to_owned(),
+            model: None,
+        });
+    }
+    for model in &definition.fallback_models {
+        push_agent_model_target(&mut targets, model);
+    }
+    targets
+}
+
+fn push_agent_model_target(targets: &mut Vec<AgentModelTarget>, qualified_model: &str) {
+    let Some((provider, model)) = qualified_model.split_once('/') else {
+        return;
+    };
+    let target = AgentModelTarget {
+        provider: provider.to_owned(),
+        model: Some(model.to_owned()),
+    };
+    if !targets.contains(&target) {
+        targets.push(target);
+    }
+}
+
+fn agent_model_target_label(target: &AgentModelTarget) -> String {
+    target.model.as_ref().map_or_else(
+        || format!("{}/provider-default", target.provider),
+        |model| format!("{}/{model}", target.provider),
+    )
+}
+
+fn is_subagent_invocation(text: &str) -> bool {
+    text.contains("nako-agent") && text.contains(" agent ")
+}
+
+fn hides_subagent_item(item: &NormalizedItem) -> bool {
+    item.kind == ItemKind::Tool
+        && (is_subagent_invocation(&item.title)
+            || is_subagent_invocation(&item.body)
+            || item.body.contains("[Subagent Result]"))
+}
+
+fn is_subagent_persistence_boundary(event: &BackendEvent) -> bool {
+    matches!(
+        event,
+        BackendEvent::SessionCreated { .. }
+            | BackendEvent::ItemCompleted { .. }
+            | BackendEvent::TurnDiff { .. }
+            | BackendEvent::TurnPlan { .. }
+            | BackendEvent::TurnCompleted { .. }
+            | BackendEvent::RequestFailed { .. }
+            | BackendEvent::Disconnected { .. }
+            | BackendEvent::TurnError { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, fs, path::Path};
+
     use crate::{
+        agent::AgentCatalog,
         backend::{
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
             BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, DEVIN_PROVIDER,
-            ItemKind, ItemStatus, ModelInfo, NormalizedItem, SessionHistoryItem, TurnOutcome,
+            DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem, SessionHistoryItem,
+            TurnOutcome,
         },
-        session::SessionRecord,
+        session::{SessionRecord, SubagentRecord},
+        transcript::{EntryKind, EntryStatus, TranscriptEntry},
     };
+    use tempfile::tempdir;
 
-    use super::{AppState, ApprovalDecision, Effect};
+    use super::{AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus};
+
+    fn explorer_catalog() -> AgentCatalog {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("explorer.toml"),
+            r#"
+slug = "explorer"
+description = "Explores code context"
+system_prompt = "Explore carefully and report concrete context."
+first_message = "Inspect the delegated question."
+model = "openai-codex/model-a"
+"#,
+        )
+        .expect("agent definition");
+        AgentCatalog::load(directory.path()).expect("agent catalog")
+    }
 
     fn ready_state() -> AppState {
         let mut state = AppState::new("/tmp/project", None, 100);
@@ -2023,7 +3054,7 @@ mod tests {
     fn queue_drains_fifo_after_terminal_turn_event() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
-        state.session_id = Some("flock-session-1".to_owned());
+        state.session_id = Some("nako-session-1".to_owned());
         state.editor.set_text("first");
         let first = state.submit_editor();
         assert!(matches!(first.as_slice(), [Effect::Backend(_)]));
@@ -2168,7 +3199,7 @@ mod tests {
     fn start_turn_timeout_does_not_launch_the_next_queued_prompt() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
-        state.session_id = Some("flock-session-1".to_owned());
+        state.session_id = Some("nako-session-1".to_owned());
         state.editor.set_text("first");
         state.submit_editor();
         state.editor.set_text("second");
@@ -2306,6 +3337,41 @@ mod tests {
     }
 
     #[test]
+    fn parent_transcript_hides_raw_subagent_command_results() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("parent-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "parent-turn".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        state.handle_backend(BackendEvent::ItemStarted {
+            turn_id: "parent-turn".to_owned(),
+            item: NormalizedItem {
+                id: "agent-command".to_owned(),
+                kind: ItemKind::Tool,
+                title: "bash".to_owned(),
+                body: "'/opt/nako-agent' agent explorer --session-id=session-1".to_owned(),
+                status: ItemStatus::Running,
+            },
+        });
+        state.handle_backend(BackendEvent::ItemDelta {
+            turn_id: "parent-turn".to_owned(),
+            item_id: "agent-command".to_owned(),
+            kind: DeltaKind::Tool,
+            delta: "[Subagent Result] [run-1] [explorer]\nsecret report".to_owned(),
+        });
+
+        assert!(
+            state
+                .transcript
+                .entries()
+                .iter()
+                .all(|entry| entry.key.as_deref() != Some("agent-command"))
+        );
+    }
+
+    #[test]
     fn slash_commands_are_not_sent_as_prompts() {
         let mut state = ready_state();
         state.editor.set_text("/resume");
@@ -2362,10 +3428,49 @@ mod tests {
             }],
         });
 
-        assert!(matches!(effects.as_slice(), [Effect::TouchSession(id)] if id == &session.id));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::TouchSession(touched), Effect::LoadSubagents(loaded)]
+                if touched == &session.id && loaded == &session.id
+        ));
         assert_eq!(state.session_id.as_deref(), Some(session.id.as_str()));
         assert_eq!(state.provider_session_id.as_deref(), Some("thread-resumed"));
         assert_eq!(state.transcript.entries()[0].body, "hello");
+    }
+
+    #[test]
+    fn persisted_subagents_restore_their_clickable_chat_projection() {
+        let mut state = ready_state();
+        state.session_id = Some("parent-session".to_owned());
+        state.install_subagents(vec![SubagentRecord {
+            parent_session_id: "parent-session".to_owned(),
+            id: "agent-1".to_owned(),
+            agent: "explorer".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: Some("child-session".to_owned()),
+            objective: "Map persistence".to_owned(),
+            status: SubagentStatus::Completed,
+            latest_activity: "Completed".to_owned(),
+            transcript: vec![TranscriptEntry {
+                key: Some("assistant-1".to_owned()),
+                kind: EntryKind::Assistant,
+                title: "ASSISTANT".to_owned(),
+                body: "The session store owns orchestration metadata.".to_owned(),
+                status: EntryStatus::Complete,
+            }],
+        }]);
+
+        assert_eq!(state.subagents.len(), 1);
+        assert_eq!(state.subagents[0].objective, "Map persistence");
+        state.subagent_modal = Some("agent-1".to_owned());
+        let (transcript, scroll) = state
+            .selected_subagent_transcript_mut()
+            .expect("restored subagent chat");
+        assert_eq!(*scroll, 0);
+        assert_eq!(
+            transcript.entries()[0].body,
+            "The session store owns orchestration metadata."
+        );
     }
 
     #[test]
@@ -2517,7 +3622,7 @@ mod tests {
         };
 
         assert_eq!(title, "What is my name?");
-        assert!(prompt.contains("# Flock continuity handoff"));
+        assert!(prompt.contains("# Nako Agent continuity handoff"));
         assert!(prompt.contains("My name is Quill."));
         assert!(prompt.contains("Nice to meet you."));
         assert!(prompt.ends_with("What is my name?"));
@@ -2529,5 +3634,464 @@ mod tests {
             .find(|entry| entry.kind == crate::transcript::EntryKind::User)
             .expect("displayed user prompt");
         assert_eq!(displayed_user.body, "What is my name?");
+    }
+
+    fn begin_mocked_subagent(state: &mut AppState) -> String {
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 42,
+            agent: "explorer".to_owned(),
+            task: "Map auth".to_owned(),
+        });
+        let [Effect::SpawnSubagent { run_id, provider }] = effects.as_slice() else {
+            panic!("expected a subagent launch");
+        };
+        assert_eq!(provider, CODEX_PROVIDER);
+        let run_id = run_id.clone();
+        assert!(state.has_running_subagents());
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SubagentBackend {
+                command: BackendCommand::StartSession {
+                    instructions: Some(instructions),
+                    ..
+                },
+                ..
+            }] if instructions.contains("Explore carefully")
+        ));
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "child-session".to_owned(),
+                model: "model-a".to_owned(),
+            },
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SubagentBackend {
+                command: BackendCommand::StartTurn { prompt, .. },
+                ..
+            }] if prompt.contains("Inspect the delegated question") && prompt.contains("Map auth")
+        ));
+        run_id
+    }
+
+    #[test]
+    fn new_session_receives_nako_identity_and_agent_instructions() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        state.set_nako_executable(Path::new("/opt/nako/bin/nako-agent"));
+        state.selected_model = Some("model-a".to_owned());
+        state.editor.set_text("Start work");
+
+        let effects = state.submit_editor();
+        let [
+            Effect::Backend(BackendCommand::StartSession {
+                instructions: Some(instructions),
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected session creation with Nako Agent instructions");
+        };
+
+        assert!(instructions.starts_with("[Nako Agent System Instructions]"));
+        assert!(instructions.contains(&format!("Session ID: {}", state.nako_session_id)));
+        assert!(instructions.contains("Model: openai-codex/model-a"));
+        assert!(instructions.contains("Provider: openai-codex"));
+        assert!(instructions.contains("- explorer: Explores code context"));
+        assert!(instructions.contains(&format!(
+            "'/opt/nako/bin/nako-agent' agent explorer --session-id={}",
+            state.nako_session_id
+        )));
+        assert!(instructions.contains("execute the matching absolute-path command exactly"));
+        assert!(instructions.contains("Up to 4 subagents may run concurrently"));
+        assert!(instructions.contains("launch one command per task concurrently"));
+        assert!(instructions.contains("do not use provider-native subagent"));
+        assert!(instructions.ends_with("[/Nako Agent System Instructions]"));
+    }
+
+    #[test]
+    fn bounded_fan_out_accepts_four_independent_subagents() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        let mut run_ids = HashSet::new();
+
+        for request_id in 1..=super::MAX_CONCURRENT_SUBAGENTS {
+            let effects = state.invoke_agent(&AgentRequest {
+                id: u64::try_from(request_id).expect("bounded request id"),
+                agent: "explorer".to_owned(),
+                task: format!("Independent investigation {request_id}"),
+            });
+            let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
+                panic!("fan-out request should launch a child");
+            };
+            assert!(run_ids.insert(run_id.clone()));
+        }
+
+        assert_eq!(state.subagents.len(), super::MAX_CONCURRENT_SUBAGENTS);
+        assert!(state.has_running_subagents());
+        let rejected = state.invoke_agent(&AgentRequest {
+            id: 99,
+            agent: "explorer".to_owned(),
+            task: "One investigation too many".to_owned(),
+        });
+        assert!(matches!(
+            rejected.as_slice(),
+            [Effect::CompleteAgentRequest {
+                success: false,
+                result,
+                ..
+            }] if result.contains("concurrent subagent limit (4)")
+        ));
+    }
+
+    #[test]
+    fn built_in_explorer_routes_to_devin_lightning() {
+        let mut state = ready_state();
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 1,
+            agent: "explorer".to_owned(),
+            task: "Map authentication".to_owned(),
+        });
+        let [Effect::SpawnSubagent { run_id, provider }] = effects.as_slice() else {
+            panic!("expected explorer launch");
+        };
+        assert_eq!(provider, DEVIN_PROVIDER);
+
+        let effects = state.handle_subagent_backend(
+            run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: DEVIN_PROVIDER.to_owned(),
+                display_name: "Devin".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SubagentBackend {
+                command: BackendCommand::StartSession {
+                    model: Some(model),
+                    ..
+                },
+                ..
+            }] if model == "swe-1-7-lightning"
+        ));
+    }
+
+    #[test]
+    fn built_in_explorer_falls_back_to_codex_luna() {
+        let mut state = ready_state();
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 1,
+            agent: "explorer".to_owned(),
+            task: "Map authentication".to_owned(),
+        });
+        let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
+            panic!("expected explorer launch");
+        };
+        let run_id = run_id.clone();
+
+        let retry = state.subagent_launch_failed(&run_id, "Devin is unavailable".to_owned());
+        assert!(matches!(
+            retry.as_slice(),
+            [
+                Effect::StopSubagent(stopped),
+                Effect::SpawnSubagent { run_id: spawned, provider }
+            ] if stopped == &run_id && spawned == &run_id && provider == CODEX_PROVIDER
+        ));
+        assert_eq!(state.subagents[0].provider, CODEX_PROVIDER);
+        assert!(state.subagents[0].latest_activity.contains("gpt-5.6-luna"));
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SubagentBackend {
+                command: BackendCommand::StartSession {
+                    model: Some(model),
+                    ..
+                },
+                ..
+            }] if model == "gpt-5.6-luna"
+        ));
+    }
+
+    #[test]
+    fn explorer_falls_back_when_native_session_creation_fails() {
+        let mut state = ready_state();
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 1,
+            agent: "explorer".to_owned(),
+            task: "Map authentication".to_owned(),
+        });
+        let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
+            panic!("expected explorer launch");
+        };
+        let run_id = run_id.clone();
+        let _ = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: DEVIN_PROVIDER.to_owned(),
+                display_name: "Devin".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+
+        let retry = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::RequestFailed {
+                operation: BackendOperation::StartSession,
+                code: -1,
+                message: "model unavailable".to_owned(),
+            },
+        );
+        assert!(matches!(
+            retry.as_slice(),
+            [
+                Effect::StopSubagent(stopped),
+                Effect::SpawnSubagent { provider, .. }
+            ] if stopped == &run_id && provider == CODEX_PROVIDER
+        ));
+        let child_chat = state.subagent_chats.get(&run_id).expect("child chat");
+        assert!(child_chat.transcript.entries().iter().any(|entry| {
+            entry.title == "FALLBACK"
+                && entry.body.contains("model unavailable")
+                && entry.body.contains("openai-codex/gpt-5.6-luna")
+        }));
+    }
+
+    #[test]
+    fn subagent_invocation_persists_under_the_logical_parent_session() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        state.session_id = Some("logical-parent".to_owned());
+
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 42,
+            agent: "explorer".to_owned(),
+            task: "Map persistence".to_owned(),
+        });
+
+        let [
+            Effect::SpawnSubagent { run_id, .. },
+            Effect::PersistSubagent(record),
+        ] = effects.as_slice()
+        else {
+            panic!("expected child launch and durable orchestration projection");
+        };
+        assert_eq!(&record.parent_session_id, "logical-parent");
+        assert_eq!(&record.id, run_id);
+        assert_eq!(record.objective, "Map persistence");
+        assert_eq!(record.transcript.len(), 1);
+    }
+
+    #[test]
+    fn mocked_subagent_lifecycle_returns_a_parseable_result_to_the_parent() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        state.provider_session_id = Some("parent-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "parent-turn".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        let run_id = begin_mocked_subagent(&mut state);
+
+        let approval_effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::ApprovalRequested(ApprovalRequest {
+                id: serde_json::json!("child-approval"),
+                method: "approval".to_owned(),
+                kind: ApprovalKind::Command,
+                title: "command".to_owned(),
+                detail: "test".to_owned(),
+            }),
+        );
+        assert!(matches!(
+            approval_effects.as_slice(),
+            [Effect::SubagentBackend {
+                command: BackendCommand::ResolveApproval {
+                    decision: ApprovalDecision::AcceptForSession,
+                    ..
+                },
+                ..
+            }]
+        ));
+
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::ItemStarted {
+                turn_id: "child-turn".to_owned(),
+                item: NormalizedItem {
+                    id: "tool".to_owned(),
+                    kind: ItemKind::Tool,
+                    title: "cargo test".to_owned(),
+                    body: "tests passed".to_owned(),
+                    status: ItemStatus::Complete,
+                },
+            },
+        );
+        assert!(state.subagents[0].latest_activity.contains("tests passed"));
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::ItemDelta {
+                turn_id: "child-turn".to_owned(),
+                item_id: "answer".to_owned(),
+                kind: DeltaKind::Assistant,
+                delta: "No findings.".to_owned(),
+            },
+        );
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::TurnCompleted {
+                turn_id: "child-turn".to_owned(),
+                outcome: TurnOutcome::Completed,
+                error: None,
+            },
+        );
+        let [
+            Effect::CompleteAgentRequest {
+                result, success, ..
+            },
+            Effect::StopSubagent(stopped_run),
+        ] = effects.as_slice()
+        else {
+            panic!("expected parent result and child shutdown");
+        };
+        assert!(*success);
+        assert!(result.starts_with(&format!("[Subagent Result] [{run_id}] [explorer]")));
+        assert!(result.contains("No findings."));
+        assert_eq!(stopped_run, &run_id);
+        assert_eq!(state.subagents[0].status, SubagentStatus::Completed);
+        assert!(!state.has_running_subagents());
+        assert!(
+            !state
+                .transcript
+                .entries()
+                .iter()
+                .any(|entry| entry.body.contains("[Subagent Result]"))
+        );
+        let child_chat = state.subagent_chats.get(&run_id).expect("child chat");
+        assert!(child_chat.transcript.entries().iter().any(|entry| {
+            entry.kind == crate::transcript::EntryKind::Assistant && entry.body == "No findings."
+        }));
+    }
+
+    #[test]
+    fn interrupt_stops_a_subagent_when_the_parent_has_no_active_turn() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        let run_id = begin_mocked_subagent(&mut state);
+
+        let effects = state.cancel_or_quit();
+
+        let [
+            Effect::CompleteAgentRequest {
+                result,
+                success: false,
+                ..
+            },
+            Effect::StopSubagent(stopped_run),
+        ] = effects.as_slice()
+        else {
+            panic!("expected interrupted result and immediate child shutdown");
+        };
+        assert_eq!(stopped_run, &run_id);
+        assert!(result.contains("Interrupted by the parent agent"));
+        assert_eq!(state.subagents[0].status, SubagentStatus::Interrupted);
+        assert!(!state.has_running_subagents());
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn interrupt_stops_the_parent_turn_and_all_subagents_together() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        state.provider_session_id = Some("parent-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "parent-turn".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        let run_id = begin_mocked_subagent(&mut state);
+
+        let effects = state.cancel_or_quit();
+
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::CompleteAgentRequest { success: false, .. },
+                Effect::StopSubagent(stopped_run),
+                Effect::Backend(BackendCommand::InterruptTurn {
+                    session_id,
+                    turn_id,
+                }),
+            ] if stopped_run == &run_id
+                && session_id == "parent-session"
+                && turn_id == "parent-turn"
+        ));
+        assert!(
+            state
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| turn.cancelling)
+        );
+        assert_eq!(state.subagents[0].status, SubagentStatus::Interrupted);
+        assert!(!state.has_running_subagents());
+        assert!(state.status_message.contains("active turn and 1 subagent"));
+    }
+
+    #[test]
+    fn provider_menu_opens_details_before_toggling_state() {
+        let mut state = ready_state();
+        state.editor.set_text("/providers");
+        assert!(matches!(
+            state.submit_editor().as_slice(),
+            [Effect::ListProviders]
+        ));
+        state.install_providers(vec![crate::session::ProviderRecord {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            enabled: true,
+        }]);
+
+        state.open_provider_details();
+        assert!(
+            state
+                .provider_picker
+                .as_ref()
+                .is_some_and(|picker| picker.showing_details)
+        );
+        assert!(
+            state
+                .provider_capabilities(CODEX_PROVIDER)
+                .is_some_and(|capabilities| capabilities.resume.is_supported())
+        );
+        assert!(matches!(
+            state.toggle_provider().as_slice(),
+            [Effect::SetProviderEnabled { provider, enabled: false }]
+                if provider == CODEX_PROVIDER
+        ));
+        assert!(state.close_provider_details());
+        assert!(!state.close_provider_details());
     }
 }

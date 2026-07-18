@@ -11,17 +11,17 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, Command},
     sync::mpsc,
-    time::{Instant, interval, timeout},
+    time::{Instant, interval},
 };
 
 use crate::backend::{
-    ApprovalDecision, BackendCapabilities, BackendCommand, BackendError, BackendEvent,
-    BackendHandle, BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport,
+    BackendCapabilities, BackendCommand, BackendError, BackendEvent, BackendHandle,
+    BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport,
 };
 
 use super::protocol::{
-    RpcError, RpcMessage, normalize_notification, normalize_server_request, notification,
-    parse_message, parse_models, parse_session_history, request, response,
+    RpcError, RpcMessage, normalize_notification, notification, parse_message, parse_models,
+    parse_session_history, request, response,
 };
 
 const COMMAND_CAPACITY: usize = 128;
@@ -40,7 +40,12 @@ impl BackendConfig {
     pub fn codex(program: PathBuf, workspace: PathBuf) -> Self {
         Self {
             program,
-            args: vec!["app-server".into(), "--stdio".into()],
+            args: vec![
+                "app-server".into(),
+                "--stdio".into(),
+                "--disable".into(),
+                "multi_agent".into(),
+            ],
             workspace,
         }
     }
@@ -106,8 +111,8 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
         "initialize",
         &json!({
             "clientInfo": {
-                "name": "flock",
-                "title": "Flock",
+                "name": "nako-agent",
+                "title": "Nako Agent",
                 "version": env!("CARGO_PKG_VERSION"),
             },
             "capabilities": {
@@ -172,7 +177,6 @@ async fn run_supervisor(input: SupervisorInput) {
     } = input;
     let mut initialized = false;
     let mut deferred_commands = VecDeque::new();
-    let mut pending_approvals = HashMap::new();
     let mut timeout_tick = interval(Duration::from_secs(1));
     let mut last_stderr = None;
     let mut requested_shutdown = false;
@@ -198,7 +202,6 @@ async fn run_supervisor(input: SupervisorInput) {
                     &mut pending,
                     &mut next_id,
                     &workspace,
-                    &mut pending_approvals,
                 ).await {
                     let _ = events.send(BackendEvent::Disconnected {
                         reason: format!("failed to write to Codex: {error}"),
@@ -219,14 +222,13 @@ async fn run_supervisor(input: SupervisorInput) {
                                     &mut pending,
                                     &mut next_id,
                                     &mut initialized,
-                                    &mut pending_approvals,
                                 ).await.is_err() {
                                     break;
                                 }
                                 if initialized
                                     && drain_deferred_commands(
                                         &mut deferred_commands, &mut stdin, &mut pending,
-                                        &mut next_id, &workspace, &mut pending_approvals, &events,
+                                        &mut next_id, &workspace, &events,
                                     ).await.is_err()
                                 {
                                     break 'supervisor;
@@ -279,20 +281,10 @@ async fn drain_deferred_commands(
     pending: &mut HashMap<u64, PendingRequest>,
     next_id: &mut u64,
     workspace: &std::path::Path,
-    pending_approvals: &mut HashMap<String, String>,
     events: &mpsc::Sender<BackendEvent>,
 ) -> Result<(), ()> {
     while let Some(command) = commands.pop_front() {
-        if let Err(error) = handle_command(
-            command,
-            stdin,
-            pending,
-            next_id,
-            workspace,
-            pending_approvals,
-        )
-        .await
-        {
+        if let Err(error) = handle_command(command, stdin, pending, next_id, workspace).await {
             let _ = events
                 .send(BackendEvent::Disconnected {
                     reason: format!("failed to write to Codex: {error}"),
@@ -340,10 +332,8 @@ async fn finish(
 ) {
     drop(stdin);
     if requested_shutdown {
-        if timeout(Duration::from_secs(2), child.wait()).await.is_err() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     } else {
         let status = child.wait().await.ok();
         let mut reason = match status {
@@ -391,32 +381,11 @@ async fn handle_command(
     pending: &mut HashMap<u64, PendingRequest>,
     next_id: &mut u64,
     workspace: &std::path::Path,
-    pending_approvals: &mut HashMap<String, String>,
 ) -> std::io::Result<()> {
     match command {
-        BackendCommand::ResolveApproval { id, decision } => {
-            let method = pending_approvals
-                .remove(&approval_key(&id))
-                .unwrap_or_default();
-            let legacy = matches!(
-                method.as_str(),
-                "execCommandApproval" | "applyPatchApproval"
-            );
-            let wire_decision = match (legacy, decision) {
-                (true, ApprovalDecision::AcceptOnce) => "approved",
-                (true, ApprovalDecision::AcceptForSession) => "approved_for_session",
-                (true, ApprovalDecision::Decline) => "denied",
-                (false, ApprovalDecision::AcceptOnce) => "accept",
-                (false, ApprovalDecision::AcceptForSession) => "acceptForSession",
-                (false, ApprovalDecision::Decline) => "decline",
-            };
-            return write_json(
-                stdin,
-                &response(&id, Ok(json!({"decision": wire_decision}))),
-            )
-            .await;
-        }
-        BackendCommand::SetSessionModel { .. } | BackendCommand::Shutdown => return Ok(()),
+        BackendCommand::SetSessionModel { .. }
+        | BackendCommand::ResolveApproval { .. }
+        | BackendCommand::Shutdown => return Ok(()),
         _ => {}
     }
 
@@ -434,10 +403,13 @@ fn command_request(
             "model/list",
             json!({"limit": 100}),
         ),
-        BackendCommand::StartSession { model } => (
+        BackendCommand::StartSession {
+            model,
+            instructions,
+        } => (
             BackendOperation::StartSession,
             "thread/start",
-            with_optional_model(json!({"cwd": workspace.to_string_lossy()}), model),
+            thread_start_params(workspace, model, instructions),
         ),
         BackendCommand::ResumeSession {
             provider_session_id,
@@ -447,6 +419,8 @@ fn command_request(
             json!({
                 "threadId": provider_session_id,
                 "cwd": workspace.to_string_lossy(),
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
             }),
         ),
         BackendCommand::UnsubscribeSession {
@@ -517,16 +491,20 @@ async fn process_message(
     pending: &mut HashMap<u64, PendingRequest>,
     next_id: &mut u64,
     initialized: &mut bool,
-    pending_approvals: &mut HashMap<String, String>,
 ) -> Result<(), ()> {
     if let Some(method) = message.method {
         let params = message.params.unwrap_or(Value::Null);
         if let Some(id) = message.id {
             if is_approval_method(&method) {
-                pending_approvals.insert(approval_key(&id), method.clone());
-                let approval = normalize_server_request(id, method, &params);
-                events
-                    .send(BackendEvent::ApprovalRequested(approval))
+                let decision = if matches!(
+                    method.as_str(),
+                    "execCommandApproval" | "applyPatchApproval"
+                ) {
+                    "approved"
+                } else {
+                    "accept"
+                };
+                write_json(stdin, &response(&id, Ok(json!({"decision": decision}))))
                     .await
                     .map_err(|_| ())?;
             } else {
@@ -536,7 +514,7 @@ async fn process_message(
                         &id,
                         Err(RpcError {
                             code: -32601,
-                            message: format!("Flock does not support server request {method}"),
+                            message: format!("Nako Agent does not support server request {method}"),
                             data: None,
                         }),
                     ),
@@ -726,10 +704,6 @@ async fn initialize_response(
     .map_err(|_| ())
 }
 
-fn approval_key(id: &Value) -> String {
-    serde_json::to_string(id).unwrap_or_default()
-}
-
 fn is_approval_method(method: &str) -> bool {
     matches!(
         method,
@@ -784,6 +758,20 @@ fn with_optional_model(mut params: Value, model: Option<String>) -> Value {
     params
 }
 
+fn thread_start_params(
+    workspace: &std::path::Path,
+    model: Option<String>,
+    instructions: Option<String>,
+) -> Value {
+    let mut params = with_optional_model(json!({"cwd": workspace.to_string_lossy()}), model);
+    if let Some(instructions) = instructions {
+        params["developerInstructions"] = Value::String(instructions);
+    }
+    params["approvalPolicy"] = Value::String("never".to_owned());
+    params["sandbox"] = Value::String("danger-full-access".to_owned());
+    params
+}
+
 fn nested_result_string(value: &Value, path: &[&str]) -> String {
     let mut current = value;
     for component in path {
@@ -793,4 +781,24 @@ fn nested_result_string(value: &Value, path: &[&str]) -> String {
         current = next;
     }
     current.as_str().unwrap_or_default().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::BackendConfig;
+
+    #[test]
+    fn nako_codex_process_disables_native_multi_agent_tools() {
+        let config =
+            BackendConfig::codex(PathBuf::from("codex"), PathBuf::from("/tmp/nako-workspace"));
+        let args = config
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args, ["app-server", "--stdio", "--disable", "multi_agent"]);
+    }
 }

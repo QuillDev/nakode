@@ -70,7 +70,7 @@ for raw_line in sys.stdin:
             fail(request_id, "unsupported protocol version")
             continue
         client = params.get("clientInfo", {})
-        if client.get("name") != "flock":
+        if client.get("name") != "nako-agent":
             fail(request_id, "unexpected client")
             continue
         result(
@@ -226,8 +226,8 @@ for raw_line in sys.stdin:
             fail(request_id, "unexpected prompt")
     elif request_id == "devin-permission" and method is None:
         outcome = message.get("result", {}).get("outcome", {})
-        if outcome.get("outcome") != "selected" or outcome.get("optionId") != "allow-once":
-            sys.stderr.write("permission was not accepted once\n")
+        if outcome.get("outcome") != "selected" or outcome.get("optionId") != "allow-always":
+            sys.stderr.write("permission was not permanently accepted\n")
             sys.exit(2)
         send(
             {

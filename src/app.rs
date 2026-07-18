@@ -8,9 +8,11 @@ use thiserror::Error;
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 
 use crate::{
+    agent::{AgentCatalog, AgentCatalogError},
     backend::{BackendCommand, BackendError, BackendEvent, BackendHandle},
     clipboard, codex,
     config::Config,
+    control::{AgentResponse, ControlError, ControlServer, IncomingInvocation},
     devin, render,
     selection::ScreenPoint,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
@@ -28,13 +30,28 @@ pub enum AppError {
     Session(#[from] SessionError),
     #[error("no enabled provider could be started: {0}")]
     NoProviders(String),
+    #[error(transparent)]
+    Agents(#[from] AgentCatalogError),
+    #[error(transparent)]
+    Control(#[from] ControlError),
+    #[error("failed to locate the running Nako Agent executable: {0}")]
+    CurrentExecutable(io::Error),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BackendSource {
+    Primary(String),
+    Subagent(String),
 }
 
 struct BackendRegistry {
     commands: HashMap<String, mpsc::Sender<BackendCommand>>,
-    events: mpsc::Receiver<(String, BackendEvent)>,
+    subagent_commands: HashMap<String, mpsc::Sender<BackendCommand>>,
+    events: mpsc::Receiver<(BackendSource, BackendEvent)>,
+    event_tx: mpsc::Sender<(BackendSource, BackendEvent)>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     failures: Vec<String>,
+    config: Config,
 }
 
 impl BackendRegistry {
@@ -42,9 +59,12 @@ impl BackendRegistry {
         let (event_tx, events) = mpsc::channel(512);
         let mut registry = Self {
             commands: HashMap::new(),
+            subagent_commands: HashMap::new(),
             events,
+            event_tx: event_tx.clone(),
             tasks: Vec::new(),
             failures: Vec::new(),
+            config: config.clone(),
         };
         for provider in providers.iter().filter(|provider| provider.enabled) {
             let result = match provider.provider.as_str() {
@@ -70,7 +90,7 @@ impl BackendRegistry {
                 }
             };
             match result {
-                Ok(handle) => registry.insert(provider.provider.clone(), handle, event_tx.clone()),
+                Ok(handle) => registry.insert_primary(provider.provider.clone(), handle),
                 Err(error) => registry.failures.push(error.to_string()),
             }
         }
@@ -78,22 +98,67 @@ impl BackendRegistry {
         registry
     }
 
-    fn insert(
-        &mut self,
-        provider: String,
-        handle: BackendHandle,
-        event_tx: mpsc::Sender<(String, BackendEvent)>,
-    ) {
+    fn insert_primary(&mut self, provider: String, handle: BackendHandle) {
         let (commands, mut events, task) = handle.into_parts();
         self.commands.insert(provider.clone(), commands);
         self.tasks.push(task);
+        let event_tx = self.event_tx.clone();
         self.tasks.push(tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                if event_tx.send((provider.clone(), event)).await.is_err() {
+                if event_tx
+                    .send((BackendSource::Primary(provider.clone()), event))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
         }));
+    }
+
+    async fn spawn_subagent(&mut self, run_id: String, provider: &str) -> Result<(), BackendError> {
+        if !self.commands.contains_key(provider) {
+            return Err(BackendError::ProviderUnavailable {
+                provider: provider.to_owned(),
+            });
+        }
+        let handle = match provider {
+            crate::backend::CODEX_PROVIDER => {
+                codex::spawn(codex::BackendConfig::codex(
+                    self.config.codex.clone(),
+                    self.config.workspace.clone(),
+                ))
+                .await?
+            }
+            crate::backend::DEVIN_PROVIDER => {
+                devin::spawn(devin::BackendConfig::devin(
+                    self.config.devin.clone(),
+                    self.config.workspace.clone(),
+                ))
+                .await?
+            }
+            _ => {
+                return Err(BackendError::UnsupportedProvider {
+                    provider: provider.to_owned(),
+                });
+            }
+        };
+        let (commands, mut events, task) = handle.into_parts();
+        self.subagent_commands.insert(run_id.clone(), commands);
+        self.tasks.push(task);
+        let event_tx = self.event_tx.clone();
+        self.tasks.push(tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if event_tx
+                    .send((BackendSource::Subagent(run_id.clone()), event))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+        Ok(())
     }
 
     async fn send(&self, provider: &str, command: BackendCommand) -> bool {
@@ -103,8 +168,24 @@ impl BackendRegistry {
         commands.send(command).await.is_ok()
     }
 
+    async fn send_subagent(&self, run_id: &str, command: BackendCommand) -> bool {
+        let Some(commands) = self.subagent_commands.get(run_id) else {
+            return false;
+        };
+        commands.send(command).await.is_ok()
+    }
+
+    async fn stop_subagent(&mut self, run_id: &str) {
+        if let Some(commands) = self.subagent_commands.remove(run_id) {
+            let _ = commands.send(BackendCommand::Shutdown).await;
+        }
+    }
+
     async fn shutdown(self) {
         for commands in self.commands.values() {
+            let _ = commands.send(BackendCommand::Shutdown).await;
+        }
+        for commands in self.subagent_commands.values() {
             let _ = commands.send(BackendCommand::Shutdown).await;
         }
         for task in self.tasks {
@@ -120,28 +201,43 @@ impl BackendRegistry {
 /// Returns an error when provider startup, persistence, signal handling, or
 /// terminal ownership fails.
 pub async fn run(config: Config) -> Result<(), AppError> {
+    let nako_executable = std::env::current_exe().map_err(AppError::CurrentExecutable)?;
     let mut signals = ShutdownSignals::install()?;
     let sessions = SqliteSessionRepository::open_default()?;
     let providers = sessions.list_providers()?;
+    let agents = AgentCatalog::load(&config.agents)?;
+    let control_path = crate::control::socket_path(&config.workspace);
+    if let Some(parent) = control_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ControlError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
     let mut backends = BackendRegistry::spawn(&config, &providers).await;
     let active_provider = if backends
         .commands
         .contains_key(crate::backend::CODEX_PROVIDER)
     {
-        crate::backend::CODEX_PROVIDER
+        crate::backend::CODEX_PROVIDER.to_owned()
+    } else if let Some(provider) = backends.commands.keys().next() {
+        provider.clone()
     } else {
-        backends
-            .commands
-            .keys()
-            .next()
-            .map(String::as_str)
-            .ok_or_else(|| AppError::NoProviders(backends.failures.join("; ")))?
-    }
-    .to_owned();
+        let failures = backends.failures.join("; ");
+        backends.shutdown().await;
+        return Err(AppError::NoProviders(failures));
+    };
+    let mut control = match ControlServer::bind(&control_path).await {
+        Ok(control) => control,
+        Err(error) => {
+            backends.shutdown().await;
+            return Err(AppError::Control(error));
+        }
+    };
     let mut terminal = match TerminalSession::enter() {
         Ok(terminal) => terminal,
         Err(error) => {
             backends.shutdown().await;
+            control.shutdown(&control_path);
             return Err(AppError::Terminal(error));
         }
     };
@@ -156,6 +252,8 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         &active_provider,
         active_name,
     );
+    state.install_agents(agents);
+    state.set_nako_executable(&nako_executable);
     for provider in backends.commands.keys() {
         match sessions.list_models(provider) {
             Ok(models) => state.install_cached_models(models),
@@ -172,12 +270,14 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         &mut state,
         &mut backends,
         &sessions,
+        &mut control,
         &mut signals,
     )
     .await;
 
     let restore_result = terminal.restore();
     backends.shutdown().await;
+    control.shutdown(&control_path);
 
     loop_result?;
     restore_result.map_err(AppError::Terminal)
@@ -188,6 +288,7 @@ async fn run_loop(
     state: &mut AppState,
     backends: &mut BackendRegistry,
     sessions: &dyn SessionRepository,
+    control: &mut ControlServer,
     signals: &mut ShutdownSignals,
 ) -> io::Result<()> {
     let mut input = EventStream::new();
@@ -195,6 +296,7 @@ async fn run_loop(
     render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut backend_open = true;
     let mut dirty = true;
+    let mut agent_requests = HashMap::<u64, IncomingInvocation>::new();
 
     loop {
         tokio::select! {
@@ -203,7 +305,7 @@ async fn run_loop(
                     Some(Ok(event)) => {
                         let effects = handle_terminal_event(state, event);
                         flush_pending_clipboard(terminal, state);
-                        if apply_effects(state, effects, backends, sessions).await {
+                        if apply_effects(state, effects, backends, sessions, &mut agent_requests).await {
                             break;
                         }
                         dirty = true;
@@ -216,9 +318,12 @@ async fn run_loop(
                 }
             }
             backend_event = backends.events.recv(), if backend_open => {
-                if let Some((provider, event)) = backend_event {
-                    let effects = state.handle_provider_backend(&provider, event);
-                    if apply_effects(state, effects, backends, sessions).await {
+                if let Some((source, event)) = backend_event {
+                    let effects = match source {
+                        BackendSource::Primary(provider) => state.handle_provider_backend(&provider, event),
+                        BackendSource::Subagent(run_id) => state.handle_subagent_backend(&run_id, event),
+                    };
+                    if apply_effects(state, effects, backends, sessions, &mut agent_requests).await {
                         break;
                     }
                     dirty = true;
@@ -228,12 +333,26 @@ async fn run_loop(
                     dirty = true;
                 }
             }
+            request = control.requests.recv() => {
+                if let Some(request) = request {
+                    if request.invocation.session_id == state.nako_session_id {
+                        let id = request.id;
+                        let invocation = crate::state::AgentRequest { id, agent: request.invocation.agent.clone(), task: request.invocation.task.clone() };
+                        agent_requests.insert(id, request);
+                        let effects = state.invoke_agent(&invocation);
+                        if apply_effects(state, effects, backends, sessions, &mut agent_requests).await { break; }
+                    } else {
+                        request.respond(AgentResponse { success: false, result: "Nako Agent session id does not match this TUI.".to_owned() });
+                    }
+                    dirty = true;
+                }
+            }
             () = signals.recv() => {
                 state.should_quit = true;
                 break;
             }
             _ = render_tick.tick() => {
-                if dirty {
+                if dirty || state.has_running_subagents() {
                     terminal.draw(|frame| render::draw(frame, state))?;
                     dirty = false;
                 }
@@ -251,8 +370,9 @@ async fn run_loop(
 async fn apply_effects(
     state: &mut AppState,
     effects: Vec<Effect>,
-    backends: &BackendRegistry,
+    backends: &mut BackendRegistry,
     sessions: &dyn SessionRepository,
+    agent_requests: &mut HashMap<u64, IncomingInvocation>,
 ) -> bool {
     let mut quit = false;
     let mut pending = std::collections::VecDeque::from(effects);
@@ -267,6 +387,29 @@ async fn apply_effects(
                             reason: "backend command channel closed".to_owned(),
                         },
                     );
+                }
+            }
+            Effect::SpawnSubagent { run_id, provider } => {
+                if let Err(error) = backends.spawn_subagent(run_id.clone(), &provider).await {
+                    pending.extend(state.subagent_launch_failed(&run_id, error.to_string()));
+                }
+            }
+            Effect::SubagentBackend { run_id, command } => {
+                if !backends.send_subagent(&run_id, command).await {
+                    pending.extend(state.subagent_launch_failed(
+                        &run_id,
+                        "subagent command channel closed".to_owned(),
+                    ));
+                }
+            }
+            Effect::StopSubagent(run_id) => backends.stop_subagent(&run_id).await,
+            Effect::CompleteAgentRequest {
+                request_id,
+                result,
+                success,
+            } => {
+                if let Some(request) = agent_requests.remove(&request_id) {
+                    request.respond(AgentResponse { success, result });
                 }
             }
             Effect::ListSessions => match sessions.list_recent(&state.workspace, 100) {
@@ -308,6 +451,10 @@ async fn apply_effects(
                     state.session_store_failed(error.to_string());
                 }
             }
+            Effect::PersistSubagent(record) => persist_subagent(state, sessions, &record),
+            Effect::LoadSubagents(parent_session_id) => {
+                load_subagents(state, sessions, &parent_session_id);
+            }
             Effect::UpdateSessionModel { session_id, model } => {
                 if let Err(error) = sessions.update_model(&session_id, model.as_deref()) {
                     state.session_store_failed(error.to_string());
@@ -322,6 +469,23 @@ async fn apply_effects(
         }
     }
     quit
+}
+
+fn persist_subagent(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    record: &crate::session::SubagentRecord,
+) {
+    if let Err(error) = sessions.save_subagent(record) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
+fn load_subagents(state: &mut AppState, sessions: &dyn SessionRepository, parent_session_id: &str) {
+    match sessions.list_subagents(parent_session_id) {
+        Ok(records) => state.install_subagents(records),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
 }
 
 fn flush_pending_clipboard(terminal: &mut Tui, state: &mut AppState) {
@@ -357,16 +521,21 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
         Event::Mouse(mouse) => {
             let point = ScreenPoint::new(mouse.column, mouse.row);
             match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => state.begin_text_selection(point),
+                MouseEventKind::Down(MouseButton::Left)
+                    if state.subagent_modal.is_some() || !state.open_subagent_at(point) =>
+                {
+                    state.begin_text_selection(point);
+                }
+                MouseEventKind::Down(MouseButton::Left) => {}
                 MouseEventKind::Drag(MouseButton::Left) => state.update_text_selection(point),
                 MouseEventKind::Up(MouseButton::Left) => state.finish_text_selection(point),
                 MouseEventKind::ScrollUp => {
                     state.clear_text_selection();
-                    state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(3);
+                    state.scroll_active_chat(3);
                 }
                 MouseEventKind::ScrollDown => {
                     state.clear_text_selection();
-                    state.scroll_from_bottom = state.scroll_from_bottom.saturating_sub(3);
+                    state.scroll_active_chat(-3);
                 }
                 MouseEventKind::Down(_) => state.clear_text_selection(),
                 _ => {}
@@ -403,7 +572,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('q') if control => state.enqueue_editor(),
         KeyCode::Char('s') if control => state.steer_editor(),
         KeyCode::Char('l') if control => {
-            state.scroll_from_bottom = 0;
+            state.reset_active_chat_scroll();
             state.set_status("Jumped to the latest output.");
             Vec::new()
         }
@@ -413,11 +582,11 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::F(2) => state.open_model_picker(),
         KeyCode::PageUp => {
-            state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(10);
+            state.scroll_active_chat(10);
             Vec::new()
         }
         KeyCode::PageDown => {
-            state.scroll_from_bottom = state.scroll_from_bottom.saturating_sub(10);
+            state.scroll_active_chat(-10);
             Vec::new()
         }
         KeyCode::Up if alt => {
@@ -527,6 +696,10 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
         });
     }
 
+    if state.subagent_modal.is_some() {
+        return Some(handle_subagent_modal_key(state, key));
+    }
+
     if state.show_help {
         if key.code == KeyCode::Esc || is_help_key(key) {
             state.show_help = false;
@@ -561,17 +734,27 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
     }
 
     if state.provider_picker.is_some() {
+        let showing_details = state
+            .provider_picker
+            .as_ref()
+            .is_some_and(|picker| picker.showing_details);
         return Some(match key.code {
             KeyCode::Esc => {
-                state.close_provider_picker();
+                if !state.close_provider_details() {
+                    state.close_provider_picker();
+                }
                 Vec::new()
             }
-            KeyCode::Enter | KeyCode::Char(' ') => state.toggle_provider(),
-            KeyCode::Up => {
+            KeyCode::Enter | KeyCode::Char(' ') if showing_details => state.toggle_provider(),
+            KeyCode::Enter => {
+                state.open_provider_details();
+                Vec::new()
+            }
+            KeyCode::Up if !showing_details => {
                 state.provider_picker_move(-1);
                 Vec::new()
             }
-            KeyCode::Down => {
+            KeyCode::Down if !showing_details => {
                 state.provider_picker_move(1);
                 Vec::new()
             }
@@ -606,6 +789,19 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
         return Some(Vec::new());
     }
     None
+}
+
+fn handle_subagent_modal_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('c') if control => return state.cancel_or_quit(),
+        KeyCode::Char('l') if control => state.reset_active_chat_scroll(),
+        KeyCode::PageUp => state.scroll_active_chat(10),
+        KeyCode::PageDown => state.scroll_active_chat(-10),
+        KeyCode::Esc => state.close_subagent_modal(),
+        _ => {}
+    }
+    Vec::new()
 }
 
 fn is_help_key(key: KeyEvent) -> bool {
@@ -666,7 +862,9 @@ mod tests {
     use crate::{
         backend::{CODEX_PROVIDER, CapabilitySupport},
         render,
-        state::{ActiveTurn, AppState},
+        session::ProviderRecord,
+        state::{ActiveTurn, AgentRequest, AppState},
+        transcript::{EntryKind, EntryStatus},
     };
 
     #[test]
@@ -710,7 +908,120 @@ mod tests {
             );
         }
 
-        assert_eq!(state.take_pending_clipboard().as_deref(), Some("FLOCK"));
+        assert_eq!(state.take_pending_clipboard().as_deref(), Some("NAKO"));
+    }
+
+    #[test]
+    fn clicking_a_subagent_row_opens_and_escape_closes_its_chat() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.invoke_agent(&AgentRequest {
+            id: 1,
+            agent: "explorer".to_owned(),
+            task: "Map authentication".to_owned(),
+        });
+        terminal
+            .draw(|frame| render::draw(frame, &mut state))
+            .expect("render subagent row");
+        let objective_row = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .position(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains("Map authentication")
+            })
+            .expect("inline objective row");
+
+        super::handle_terminal_event(
+            &mut state,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: u16::try_from(objective_row).expect("test row fits in terminal"),
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert!(state.subagent_modal.is_some());
+
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.subagent_modal.is_none());
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_whichever_chat_is_open() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.invoke_agent(&AgentRequest {
+            id: 1,
+            agent: "explorer".to_owned(),
+            task: "Map authentication".to_owned(),
+        });
+        state.subagent_modal = Some(state.subagents[0].id.clone());
+        let (transcript, _) = state
+            .selected_subagent_transcript_mut()
+            .expect("selected subagent transcript");
+        transcript.push(
+            EntryKind::Assistant,
+            "ASSISTANT",
+            (0..80)
+                .map(|line| format!("report line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            EntryStatus::Complete,
+        );
+        terminal
+            .draw(|frame| render::draw(frame, &mut state))
+            .expect("render long subagent chat");
+
+        super::handle_terminal_event(
+            &mut state,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 50,
+                row: 12,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        terminal
+            .draw(|frame| render::draw(frame, &mut state))
+            .expect("render scrolled subagent chat");
+        let (_, child_scroll) = state
+            .selected_subagent_transcript_mut()
+            .expect("selected subagent transcript");
+        assert_eq!(*child_scroll, 3);
+        assert_eq!(state.scroll_from_bottom, 0);
+
+        super::handle_terminal_event(
+            &mut state,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 50,
+                row: 12,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        let (_, child_scroll) = state
+            .selected_subagent_transcript_mut()
+            .expect("selected subagent transcript");
+        assert_eq!(*child_scroll, 0);
+
+        state.close_subagent_modal();
+        super::handle_terminal_event(
+            &mut state,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 50,
+                row: 12,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert_eq!(state.scroll_from_bottom, 3);
     }
 
     #[test]
@@ -831,5 +1142,47 @@ mod tests {
         state.editor.set_text("please(/sk");
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(state.editor.text(), "please(/skill:");
+    }
+
+    #[test]
+    fn provider_menu_enters_details_and_escape_returns_to_the_list() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("/providers");
+        let _ = state.submit_editor();
+        state.install_providers(vec![ProviderRecord {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            enabled: true,
+        }]);
+
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(
+            state
+                .provider_picker
+                .as_ref()
+                .is_some_and(|picker| picker.showing_details)
+        );
+        let effects = super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [crate::state::Effect::SetProviderEnabled { enabled: false, .. }]
+        ));
+
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.provider_picker.is_some());
+        assert!(
+            !state
+                .provider_picker
+                .as_ref()
+                .is_some_and(|picker| picker.showing_details)
+        );
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.provider_picker.is_none());
     }
 }

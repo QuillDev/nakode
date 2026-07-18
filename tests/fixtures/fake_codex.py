@@ -55,7 +55,7 @@ for raw_line in sys.stdin:
         params = message.get("params", {})
         capabilities = params.get("capabilities", {})
         client = params.get("clientInfo", {})
-        if client.get("name") != "flock" or not capabilities.get("experimentalApi"):
+        if client.get("name") != "nako-agent" or not capabilities.get("experimentalApi"):
             fail(request_id, "invalid initialization")
             continue
         if init_gate:
@@ -101,15 +101,19 @@ for raw_line in sys.stdin:
         )
     elif method == "thread/start":
         params = message.get("params", {})
-        if (
+        normal_fields_invalid = (
             not params.get("cwd")
             or params.get("model") != "fixture-model"
-            or "dynamicTools" in params
-            or "developerInstructions" in params
             or "config" in params
             or "environments" in params
             or "selectedCapabilityRoots" in params
-        ):
+        )
+        ordinary_fields_invalid = (
+            "dynamicTools" in params
+            or params.get("approvalPolicy") != "never"
+            or params.get("sandbox") != "danger-full-access"
+        )
+        if normal_fields_invalid or ordinary_fields_invalid:
             fail(request_id, "thread/start fields do not match")
             continue
         send(
@@ -127,6 +131,8 @@ for raw_line in sys.stdin:
         if (
             params.get("threadId") != thread_id
             or not params.get("cwd")
+            or params.get("approvalPolicy") != "never"
+            or params.get("sandbox") != "danger-full-access"
             or "dynamicTools" in params
             or "developerInstructions" in params
             or "config" in params

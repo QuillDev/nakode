@@ -249,6 +249,7 @@ pub enum BackendEvent {
 pub enum BackendCommand {
     StartSession {
         model: Option<String>,
+        instructions: Option<String>,
     },
     ResumeSession {
         provider_session_id: String,
@@ -288,6 +289,10 @@ pub enum BackendCommand {
 
 #[derive(Debug, Error)]
 pub enum BackendError {
+    #[error("unsupported provider {provider}")]
+    UnsupportedProvider { provider: String },
+    #[error("provider {provider} is not enabled for new work")]
+    ProviderUnavailable { provider: String },
     #[error("failed to launch {backend} at {program}: {source}")]
     Spawn {
         backend: &'static str,

@@ -14,7 +14,7 @@ use crate::{
     transcript::{LineTone, ProjectedLine},
 };
 
-// Flock shares the opaque pink-on-black visual language used across Quill's apps.
+// Nako Agent shares the opaque pink-on-black visual language used across Quill's apps.
 // Pink communicates interaction and focus; green, amber, and red are reserved for
 // semantic state so the interface remains calm and immediately scannable.
 const BACKGROUND: Color = Color::Rgb(10, 10, 13);
@@ -86,7 +86,8 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         || state.show_help
         || state.session_picker.is_some()
         || state.provider_picker.is_some()
-        || state.model_picker.is_some();
+        || state.model_picker.is_some()
+        || state.subagent_modal.is_some();
     if !has_modal {
         render_command_completions(frame, regions[3], state);
     }
@@ -101,6 +102,8 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         render_provider_picker(frame, area, state);
     } else if state.model_picker.is_some() {
         render_model_picker(frame, area, state);
+    } else if state.subagent_modal.is_some() {
+        render_subagent_modal(frame, area, state);
     } else if let Some(position) = cursor {
         frame.set_cursor_position(position);
     }
@@ -112,9 +115,11 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     } else if state.session_picker.is_some() {
         vec![bordered_inner(centered(area, 78, 18))]
     } else if state.provider_picker.is_some() {
-        vec![bordered_inner(centered(area, 64, 14))]
+        vec![bordered_inner(provider_picker_popup(area, state))]
     } else if state.model_picker.is_some() {
         vec![bordered_inner(centered(area, 72, 18))]
+    } else if state.subagent_modal.is_some() {
+        vec![bordered_inner(subagent_modal_popup(area))]
     } else {
         let mut selectable = vec![bordered_inner(regions[1]), bordered_inner(regions[3])];
         if queue_height > 0 {
@@ -123,6 +128,18 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         selectable
     };
     capture_and_highlight_selection(frame, state, area, selectable_regions);
+}
+
+fn provider_picker_popup(area: Rect, state: &AppState) -> Rect {
+    if state
+        .provider_picker
+        .as_ref()
+        .is_some_and(|picker| picker.showing_details)
+    {
+        centered(area, 72, 22)
+    } else {
+        centered(area, 68, 14)
+    }
 }
 
 fn capture_and_highlight_selection(
@@ -178,7 +195,7 @@ fn rect_contains(area: Rect, point: ScreenPoint) -> bool {
 
 fn render_header(frame: &mut Frame<'_>, area: Rect) {
     let line = Line::from(Span::styled(
-        " FLOCK ",
+        " NAKO AGENT ",
         Style::default().bg(ACCENT).fg(BACKGROUND).bold(),
     ));
     frame.render_widget(
@@ -188,17 +205,49 @@ fn render_header(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
-    let block = panel_block(Line::default());
+    let hit_regions = render_transcript_view(
+        frame,
+        area,
+        &mut state.transcript,
+        &mut state.scroll_from_bottom,
+        Line::default(),
+    );
+    state.set_subagent_hit_regions(hit_regions);
+}
+
+fn render_transcript_view(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    transcript: &mut crate::transcript::Transcript,
+    scroll_from_bottom: &mut usize,
+    title: Line<'static>,
+) -> Vec<(String, ScreenPoint, ScreenPoint)> {
+    let block = panel_block(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let width = usize::from(inner.width.max(1));
     let height = usize::from(inner.height);
-    let max_scroll = state.transcript.max_scroll(width, height);
-    state.scroll_from_bottom = state.scroll_from_bottom.min(max_scroll);
-    let visible = state
-        .transcript
-        .visible(width, height, state.scroll_from_bottom);
+    let max_scroll = transcript.max_scroll(width, height);
+    *scroll_from_bottom = (*scroll_from_bottom).min(max_scroll);
+    let visible = transcript.visible(width, height, *scroll_from_bottom);
+
+    let hit_regions = visible
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, line)| {
+            let run_id = line.source_key.as_deref()?.strip_prefix("subagent:")?;
+            let row = inner
+                .y
+                .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+            Some((
+                run_id.to_owned(),
+                ScreenPoint::new(inner.x, row),
+                ScreenPoint::new(inner.right(), row.saturating_add(1)),
+            ))
+        })
+        .collect();
 
     let lines = visible
         .lines
@@ -206,6 +255,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         .map(transcript_line)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    hit_regions
 }
 
 fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -233,6 +283,46 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .collect::<Vec<_>>();
     let block = panel_block(" Queue · Alt+↑/↓ select · Alt+Delete remove ");
     frame.render_widget(List::new(items).block(block), area);
+}
+
+fn truncate_objective(objective: &str, width: usize) -> String {
+    let objective = objective.lines().next().unwrap_or_default().trim();
+    let characters = objective.chars().count();
+    if characters <= width {
+        return objective.to_owned();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut truncated = objective.chars().take(width - 1).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn subagent_modal_popup(area: Rect) -> Rect {
+    centered(area, 92, area.height.saturating_sub(4))
+}
+
+fn render_subagent_modal(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    let Some((agent, objective)) = state.selected_subagent_summary() else {
+        state.close_subagent_modal();
+        return;
+    };
+    let popup = subagent_modal_popup(area);
+    frame.render_widget(Clear, popup);
+    let title = Line::from(vec![
+        Span::styled(
+            format!(" {agent} "),
+            Style::default().fg(ACCENT_BRIGHT).bold(),
+        ),
+        Span::styled(
+            format!("· {} · Esc close ", truncate_objective(&objective, 52)),
+            Style::default().fg(MUTED),
+        ),
+    ]);
+    if let Some((transcript, scroll)) = state.selected_subagent_transcript_mut() {
+        let _ = render_transcript_view(frame, popup, transcript, scroll, title);
+    }
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<Position> {
@@ -355,7 +445,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::default(),
         Line::styled("Active turn", Style::default().fg(ACCENT_BRIGHT).bold()),
         Line::raw("  Ctrl+Q   queue draft     Ctrl+S   steer now"),
-        Line::raw("  Ctrl+C   interrupt       Ctrl+C again   exit"),
+        Line::raw("  Ctrl+C   interrupt turn + subagents    Ctrl+C again   exit"),
         Line::default(),
         Line::styled("Navigate", Style::default().fg(ACCENT_BRIGHT).bold()),
         Line::raw("  Alt+←/→   previous/next word     Ctrl/Cmd+←/→   line edge"),
@@ -380,12 +470,16 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let popup = centered(area, 64, 14);
-    frame.render_widget(Clear, popup);
     let picker = state.provider_picker.as_ref().expect("picker checked");
+    if picker.showing_details {
+        render_provider_details(frame, area, state, picker);
+        return;
+    }
+    let popup = centered(area, 68, 14);
+    frame.render_widget(Clear, popup);
     let mut lines = vec![
         Line::styled(
-            "↑/↓ select · Enter or Space toggle · Esc close",
+            "↑/↓ select · Enter details · Esc close",
             Style::default().fg(MUTED),
         ),
         Line::default(),
@@ -441,6 +535,89 @@ fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
     let block = overlay_block(" Providers ", ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn render_provider_details(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    picker: &crate::state::ProviderPicker,
+) {
+    let popup = centered(area, 72, 22);
+    frame.render_widget(Clear, popup);
+    let Some(provider) = picker.providers.get(picker.selected) else {
+        return;
+    };
+    let enabled = if provider.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let state_color = if provider.enabled { SUCCESS } else { MUTED };
+    let connection = state
+        .provider_connection(&provider.provider)
+        .map_or("not running", crate::state::ConnectionState::label);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("State      ", Style::default().fg(MUTED)),
+            Span::styled(enabled, Style::default().fg(state_color).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled("Connection ", Style::default().fg(MUTED)),
+            Span::styled(connection, Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("Slug       ", Style::default().fg(MUTED)),
+            Span::styled(&provider.provider, Style::default().fg(TEXT)),
+        ]),
+        Line::default(),
+        Line::styled("Capabilities", Style::default().fg(ACCENT_BRIGHT).bold()),
+    ];
+    if let Some(capabilities) = state.provider_capabilities(&provider.provider) {
+        for (name, support) in capability_rows(capabilities) {
+            let supported = support.is_supported();
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {name:<22}"), Style::default().fg(MUTED)),
+                Span::styled(
+                    if supported {
+                        "supported"
+                    } else {
+                        "unsupported"
+                    },
+                    Style::default().fg(if supported { SUCCESS } else { MUTED }),
+                ),
+            ]));
+        }
+    } else {
+        lines.push(Line::styled(
+            "  Unavailable until this provider is started.",
+            Style::default().fg(MUTED),
+        ));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "Enter or Space enable/disable · Esc providers",
+        Style::default().fg(MUTED),
+    ));
+    let block = overlay_block(format!(" {} ", provider.display_name), ACCENT);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn capability_rows(
+    capabilities: &crate::backend::BackendCapabilities,
+) -> [(&'static str, crate::backend::CapabilitySupport); 10] {
+    [
+        ("Resume", capabilities.resume),
+        ("Steering", capabilities.steering),
+        ("Interruption", capabilities.interruption),
+        ("Model catalog", capabilities.model_catalog),
+        ("Models need session", capabilities.models_require_session),
+        ("Session model config", capabilities.session_model_config),
+        ("Approvals", capabilities.approvals),
+        ("Native tools", capabilities.native_tools),
+        ("MCP", capabilities.mcp),
+        ("Close session", capabilities.close_session),
+    ]
 }
 
 fn render_approval(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalRequest) {
@@ -613,15 +790,30 @@ fn transcript_line(line: ProjectedLine) -> Line<'static> {
         LineTone::User => ACCENT_BRIGHT,
         LineTone::Steering => ACCENT_DEEP,
         LineTone::Tool | LineTone::Warning => WARNING,
-        LineTone::DiffAdd => SUCCESS,
+        LineTone::DiffAdd | LineTone::SubagentComplete => SUCCESS,
         LineTone::Error | LineTone::DiffRemove => DANGER,
+        LineTone::SubagentPending => ACCENT,
         LineTone::Assistant | LineTone::Body | LineTone::Code | LineTone::DiffHeader => TEXT,
     };
     let mut style = Style::default().fg(color);
     if line.bold {
         style = style.add_modifier(Modifier::BOLD);
     }
-    Line::styled(line.text, style)
+    let text = if line.tone == LineTone::SubagentPending {
+        line.text.replacen('⠋', subagent_spinner(), 1)
+    } else {
+        line.text
+    };
+    Line::styled(text, style)
+}
+
+fn subagent_spinner() -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() / 100);
+    let frame = usize::try_from(tick % FRAMES.len() as u128).unwrap_or(0);
+    FRAMES[frame]
 }
 
 fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
@@ -645,8 +837,12 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use crate::{
-        backend::{BackendCapabilities, BackendEvent, BackendIdentity, CODEX_PROVIDER},
-        state::AppState,
+        backend::{
+            BackendCapabilities, BackendEvent, BackendIdentity, CODEX_PROVIDER, CapabilitySupport,
+            DEVIN_PROVIDER,
+        },
+        session::ProviderRecord,
+        state::{AgentRequest, AppState, Effect},
     };
 
     #[test]
@@ -663,7 +859,7 @@ mod tests {
 
         terminal
             .draw(|frame| super::draw(frame, &mut state))
-            .expect("render Flock view");
+            .expect("render Nako Agent view");
 
         let rendered = terminal
             .backend()
@@ -672,7 +868,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("FLOCK"));
+        assert!(rendered.contains("NAKO AGENT"));
         assert!(rendered.contains("Prompt"));
         assert!(!rendered.contains("Transcript"));
         assert!(!rendered.contains("fixture-model"));
@@ -684,6 +880,177 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, super::BACKGROUND);
         assert_eq!(buffer[(0, 1)].symbol(), "╭");
         assert_eq!(buffer[(0, 1)].fg, super::BORDER);
+    }
+
+    #[test]
+    fn subagent_renders_inline_with_pending_status_and_truncated_objective() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.invoke_agent(&AgentRequest {
+            id: 1,
+            agent: "explorer".to_owned(),
+            task: "Map the authentication flow and identify every relevant boundary".to_owned(),
+        });
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render subagent");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(!rendered.contains("Subagents · click to inspect"));
+        assert!(rendered.contains("pending"));
+        assert!(rendered.contains("Map the authentication flow"));
+        assert!(!rendered.contains("Starting provider"));
+    }
+
+    #[test]
+    fn completed_subagent_remains_available_inline() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 1,
+            agent: "explorer".to_owned(),
+            task: "Inspect persistence boundaries".to_owned(),
+        });
+        let Effect::SpawnSubagent { run_id, .. } = &effects[0] else {
+            panic!("expected subagent launch");
+        };
+        state.handle_subagent_backend(
+            run_id,
+            BackendEvent::TurnCompleted {
+                turn_id: "child-turn".to_owned(),
+                outcome: crate::backend::TurnOutcome::Completed,
+                error: None,
+            },
+        );
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render completed subagent");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(rendered.contains("completed"));
+        assert!(rendered.contains("Inspect persistence boundaries"));
+        assert!(!rendered.contains("pending"));
+    }
+
+    #[test]
+    fn clicking_a_subagent_opens_its_reused_transcript_view() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.invoke_agent(&AgentRequest {
+            id: 1,
+            agent: "explorer".to_owned(),
+            task: "Map authentication".to_owned(),
+        });
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render inline subagent");
+        let objective_row = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .position(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains("Map authentication")
+            })
+            .expect("inline objective row");
+        assert!(state.open_subagent_at(crate::selection::ScreenPoint::new(
+            2,
+            u16::try_from(objective_row).expect("test row fits in terminal")
+        )));
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render subagent transcript modal");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(rendered.contains("explorer"));
+        assert!(rendered.contains("Map authentication"));
+        assert!(rendered.contains("PARENT"));
+        assert!(rendered.contains("Delegated task"));
+    }
+
+    #[test]
+    fn provider_menu_shows_state_and_live_capability_details() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.handle_backend(BackendEvent::Ready(BackendIdentity {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            version: None,
+            capabilities: BackendCapabilities {
+                resume: CapabilitySupport::Supported,
+                ..BackendCapabilities::default()
+            },
+        }));
+        state.editor.set_text("/providers");
+        let _ = state.submit_editor();
+        state.install_providers(vec![
+            ProviderRecord {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                enabled: true,
+            },
+            ProviderRecord {
+                provider: DEVIN_PROVIDER.to_owned(),
+                display_name: "Devin".to_owned(),
+                enabled: false,
+            },
+        ]);
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render provider list");
+        let list = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(list.contains("Codex  enabled"));
+        assert!(list.contains("Devin  disabled"));
+
+        state.open_provider_details();
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render provider details");
+        let details = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(details.contains("Capabilities"));
+        assert!(details.contains("Resume"));
+        assert!(details.contains("supported"));
     }
 
     #[test]

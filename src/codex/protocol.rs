@@ -113,7 +113,11 @@ pub fn normalize_notification(method: &str, params: &Value) -> Option<BackendEve
         }
         "item/started" | "item/completed" => {
             let turn_id = string(params, "turnId");
-            let item = normalize_item(params.get("item")?);
+            let raw_item = params.get("item")?;
+            if is_internal_provider_item(raw_item) {
+                return None;
+            }
+            let item = normalize_item(raw_item);
             if method == "item/started" {
                 Some(BackendEvent::ItemStarted { turn_id, item })
             } else {
@@ -207,7 +211,7 @@ pub fn normalize_server_request(id: Value, method: String, params: &Value) -> Ap
         _ => (
             ApprovalKind::Other,
             "Unsupported server request".to_owned(),
-            format!("{method}\n\nThis Flock build cannot answer this request type."),
+            format!("{method}\n\nThis Nako Agent build cannot answer this request type."),
         ),
     };
 
@@ -257,12 +261,17 @@ pub fn parse_session_history(result: &Value) -> Vec<SessionHistoryItem> {
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
+                .filter(|item| !is_internal_provider_item(item))
                 .map(move |item| SessionHistoryItem {
                     turn_id: turn_id.clone(),
                     item: normalize_item(item),
                 })
         })
         .collect()
+}
+
+fn is_internal_provider_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("subAgentActivity")
 }
 
 pub fn parse_models(result: &Value) -> Vec<ModelInfo> {
@@ -687,6 +696,7 @@ mod tests {
                     "id": "turn-1",
                     "items": [
                         {"type": "userMessage", "id": "user-1", "content": [{"type": "text", "text": "hello"}]},
+                        {"type": "subAgentActivity", "id": "activity-1", "kind": "started", "agentPath": "/root/explorer"},
                         {"type": "agentMessage", "id": "agent-1", "text": "hi"}
                     ]
                 }]
@@ -697,6 +707,25 @@ mod tests {
         assert_eq!(history[0].turn_id, "turn-1");
         assert_eq!(history[0].item.kind, ItemKind::User);
         assert_eq!(history[1].item.body, "hi");
+    }
+
+    #[test]
+    fn internal_subagent_activity_does_not_become_a_transcript_item() {
+        let event = normalize_notification(
+            "item/started",
+            &json!({
+                "turnId": "turn-1",
+                "item": {
+                    "type": "subAgentActivity",
+                    "id": "activity-1",
+                    "kind": "started",
+                    "agentPath": "/root/system_inventory",
+                    "agentThreadId": "thread-child"
+                }
+            }),
+        );
+
+        assert_eq!(event, None);
     }
 
     #[test]

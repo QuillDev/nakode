@@ -11,14 +11,13 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, Command},
     sync::mpsc,
-    time::{Instant, interval, timeout},
+    time::{Instant, interval},
 };
 
 use crate::backend::{
-    ApprovalDecision, ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand,
-    BackendError, BackendEvent, BackendHandle, BackendIdentity, BackendOperation,
-    CapabilitySupport, DEVIN_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem,
-    SessionHistoryItem, TurnOutcome,
+    BackendCapabilities, BackendCommand, BackendError, BackendEvent, BackendHandle,
+    BackendIdentity, BackendOperation, CapabilitySupport, DEVIN_PROVIDER, DeltaKind, ItemKind,
+    ItemStatus, ModelInfo, NormalizedItem, SessionHistoryItem, TurnOutcome,
 };
 
 const COMMAND_CAPACITY: usize = 128;
@@ -37,7 +36,7 @@ impl BackendConfig {
     pub fn devin(program: PathBuf, workspace: PathBuf) -> Self {
         Self {
             program,
-            args: vec!["acp".into()],
+            args: vec!["--permission-mode".into(), "dangerous".into(), "acp".into()],
             workspace,
         }
     }
@@ -86,7 +85,6 @@ struct AcpRuntime {
     active_turns: HashMap<String, String>,
     replay: HashMap<String, Vec<SessionHistoryItem>>,
     model_options: HashMap<String, SessionModelOption>,
-    permissions: HashMap<String, PermissionOptions>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,13 +123,6 @@ struct SessionModelOption {
     config_id: String,
     current_value: String,
     models: Vec<ModelInfo>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct PermissionOptions {
-    accept_once: Option<String>,
-    accept_always: Option<String>,
-    decline: Option<String>,
 }
 
 /// Starts a Devin ACP adapter.
@@ -187,8 +178,8 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
             "protocolVersion": 1,
             "clientCapabilities": {},
             "clientInfo": {
-                "name": "flock",
-                "title": "Flock",
+                "name": "nako-agent",
+                "title": "Nako Agent",
                 "version": env!("CARGO_PKG_VERSION"),
             },
         }),
@@ -253,7 +244,6 @@ async fn run_supervisor(input: SupervisorInput) {
         active_turns: HashMap::new(),
         replay: HashMap::new(),
         model_options: HashMap::new(),
-        permissions: HashMap::new(),
     };
     let mut timeout_tick = interval(Duration::from_secs(1));
     let mut last_error = None;
@@ -414,10 +404,8 @@ async fn finish(
 ) {
     drop(stdin);
     if shutdown {
-        if timeout(Duration::from_secs(2), child.wait()).await.is_err() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     } else {
         let status = child.wait().await.ok();
         let mut reason = status.map_or_else(
@@ -456,11 +444,13 @@ async fn handle_command(
         pending,
         next_id,
         capabilities,
-        permissions,
         ..
     } = runtime;
     match command {
-        BackendCommand::StartSession { model } => {
+        BackendCommand::StartSession {
+            model,
+            instructions: _,
+        } => {
             send_request(
                 stdin,
                 pending,
@@ -526,20 +516,7 @@ async fn handle_command(
             let _ = events.send(BackendEvent::InterruptAccepted).await;
             Ok(())
         }
-        BackendCommand::ResolveApproval { id, decision } => {
-            let options = permissions.remove(&approval_key(&id)).unwrap_or_default();
-            let selected = match decision {
-                ApprovalDecision::AcceptOnce => options.accept_once,
-                ApprovalDecision::AcceptForSession => options.accept_always.or(options.accept_once),
-                ApprovalDecision::Decline => options.decline,
-            };
-            let result = selected.map_or_else(
-                || json!({"outcome": {"outcome": "cancelled"}}),
-                |option_id| json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
-            );
-            write_json(stdin, &response(&id, &result)).await
-        }
-        BackendCommand::Shutdown => Ok(()),
+        BackendCommand::ResolveApproval { .. } | BackendCommand::Shutdown => Ok(()),
     }
 }
 
@@ -719,13 +696,11 @@ async fn process_method(
     let params = message.get("params").cloned().unwrap_or(Value::Null);
     if let Some(id) = message.get("id").cloned() {
         if method == "session/request_permission" {
-            let approval = normalize_permission(id, &params, &mut runtime.permissions);
-            events
-                .send(BackendEvent::ApprovalRequested(approval))
+            write_json(stdin, &response(&id, &permission_acceptance(&params)))
                 .await
                 .map_err(|_| ())?;
         } else {
-            let message = format!("Flock does not support ACP client method {method}");
+            let message = format!("Nako Agent does not support ACP client method {method}");
             write_json(stdin, &error_response(&id, -32601, &message))
                 .await
                 .map_err(|_| ())?;
@@ -1237,12 +1212,9 @@ async fn normalize_update(
     Ok(())
 }
 
-fn normalize_permission(
-    id: Value,
-    params: &Value,
-    permissions: &mut HashMap<String, PermissionOptions>,
-) -> ApprovalRequest {
-    let mut choices = PermissionOptions::default();
+fn permission_acceptance(params: &Value) -> Value {
+    let mut accept_once = None;
+    let mut accept_always = None;
     for option in params
         .get("options")
         .and_then(Value::as_array)
@@ -1251,34 +1223,15 @@ fn normalize_permission(
     {
         let option_id = string(option, "optionId");
         match string(option, "kind").as_str() {
-            "allow_once" => choices.accept_once = Some(option_id),
-            "allow_always" => choices.accept_always = Some(option_id),
-            "reject_once" | "reject_always" if choices.decline.is_none() => {
-                choices.decline = Some(option_id);
-            }
+            "allow_once" => accept_once = Some(option_id),
+            "allow_always" => accept_always = Some(option_id),
             _ => {}
         }
     }
-    permissions.insert(approval_key(&id), choices);
-    let tool = params.get("toolCall").unwrap_or(&Value::Null);
-    let kind = match string(tool, "kind").as_str() {
-        "execute" => ApprovalKind::Command,
-        "edit" | "delete" | "move" => ApprovalKind::FileChange,
-        _ => ApprovalKind::Other,
-    };
-    ApprovalRequest {
-        id,
-        method: "session/request_permission".to_owned(),
-        kind,
-        title: tool
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("Devin tool request")
-            .to_owned(),
-        detail: tool
-            .get("rawInput")
-            .map_or_else(|| string(tool, "toolCallId"), pretty),
-    }
+    accept_always.or(accept_once).map_or_else(
+        || json!({"outcome": {"outcome": "cancelled"}}),
+        |option_id| json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+    )
 }
 
 fn tool_item(update: &Value, completed: bool) -> NormalizedItem {
@@ -1486,10 +1439,6 @@ fn string(value: &Value, field: &str) -> String {
         .to_owned()
 }
 
-fn pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-}
-
 fn actionable_stderr_warning(line: &str) -> bool {
     let line = line.to_ascii_lowercase();
     line.contains("without credentials")
@@ -1497,27 +1446,22 @@ fn actionable_stderr_warning(line: &str) -> bool {
         || line.contains("authentication required")
 }
 
-fn approval_key(id: &Value) -> String {
-    serde_json::to_string(id).unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::path::PathBuf;
 
     use serde_json::json;
 
     use super::{
-        BackendConfig, actionable_stderr_warning, capability_supported, normalize_permission,
-        parse_model_options,
+        BackendConfig, actionable_stderr_warning, capability_supported, parse_model_options,
+        permission_acceptance,
     };
-    use crate::backend::ApprovalKind;
 
     #[test]
-    fn default_launch_uses_the_acp_subcommand() {
+    fn default_launch_uses_dangerous_permission_mode_with_acp() {
         let config = BackendConfig::devin(PathBuf::from("devin"), PathBuf::from("/tmp"));
         assert_eq!(config.program, PathBuf::from("devin"));
-        assert_eq!(config.args, vec!["acp"]);
+        assert_eq!(config.args, vec!["--permission-mode", "dangerous", "acp"]);
     }
 
     #[test]
@@ -1556,24 +1500,21 @@ mod tests {
     }
 
     #[test]
-    fn permission_kind_is_normalized_from_the_tool() {
-        let mut permissions = HashMap::new();
-        let approval = normalize_permission(
-            json!("permission-1"),
-            &json!({
-                "toolCall": {
-                    "toolCallId": "tool-1",
-                    "kind": "edit",
-                    "title": "Edit file"
-                },
-                "options": [{
-                    "optionId": "allow-once",
-                    "name": "Allow",
-                    "kind": "allow_once"
-                }]
-            }),
-            &mut permissions,
+    fn permission_requests_prefer_permanent_acceptance() {
+        let acceptance = permission_acceptance(&json!({
+            "options": [{
+                "optionId": "allow-once",
+                "name": "Allow",
+                "kind": "allow_once"
+            }, {
+                "optionId": "allow-always",
+                "name": "Always allow",
+                "kind": "allow_always"
+            }]
+        }));
+        assert_eq!(
+            acceptance,
+            json!({"outcome": {"outcome": "selected", "optionId": "allow-always"}})
         );
-        assert_eq!(approval.kind, ApprovalKind::FileChange);
     }
 }

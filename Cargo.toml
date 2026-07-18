@@ -1,5 +1,5 @@
 [package]
-name = "flock"
+name = "nako-agent"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
@@ -35,12 +35,14 @@ tokio = { version = "1.52", features = [
   "fs",
   "io-util",
   "macros",
+  "net",
   "process",
   "rt-multi-thread",
   "signal",
   "sync",
   "time",
 ] }
+toml = "0.9"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v7"] }
 

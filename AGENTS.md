@@ -1,8 +1,8 @@
-# Flock architecture decisions
+# Nako Agent architecture decisions
 
 ## Authority and direction
 
-This file records the de-facto product direction for Flock. Future work must
+This file records the de-facto product direction for Nako Agent. Future work must
 follow these decisions unless the user explicitly replaces them.
 
 The detailed rationale, diagrams, target data model, and migration sequence are
@@ -15,13 +15,13 @@ conflicts with this direction is migration work, not precedent to preserve.
 
 ## Product boundary
 
-Flock is a provider-neutral agent orchestration and continuity layer. It is not
+Nako Agent is a provider-neutral agent orchestration and continuity layer. It is not
 another coding-agent runtime and must not replace the execution environment of
 agents such as Codex.
 
 The governing rule is:
 
-> Agents own execution and native context. Flock owns coordination, identity,
+> Agents own execution and native context. Nako Agent owns coordination, identity,
 > shared knowledge, and provenance.
 
 ### Agents own
@@ -32,31 +32,31 @@ The governing rule is:
 - Provider-specific capabilities such as subagents, MCP, browser tools, or
   structured output
 
-### Flock owns
+### Nako Agent owns
 
-- Logical Flock sessions spanning one or more native agent sessions
+- Logical Nako Agent sessions spanning one or more native agent sessions
 - Provider-neutral task, run, role, artifact, and handoff identities
 - Delegation, review, bounded fan-out, synthesis, cancellation, and status
 - Shared skills and their provider-specific materialization
 - Shared memory, provenance, scopes, confidence, and supersession
 - Session discovery, coordination metadata, audit history, and TUI state
 
-Flock must not maintain general-purpose `bash`, `edit`, browser, or equivalent
+Nako Agent must not maintain general-purpose `bash`, `edit`, browser, or equivalent
 coding tools as part of the target architecture. Providers should expose their
-native tools and security models. Flock may expose narrowly scoped control-plane
+native tools and security models. Nako Agent may expose narrowly scoped control-plane
 operations for memory, artifacts, and orchestration through MCP, a CLI, or a
 native provider interface. These are not replacements for coding tools.
 
 ## Session model
 
-A Flock session is a logical body of work, not an alias for one provider
-thread. One Flock session may contain many native agent sessions with different
+A Nako Agent session is a logical body of work, not an alias for one provider
+thread. One Nako Agent session may contain many native agent sessions with different
 providers and roles.
 
 - Provider-native sessions remain authoritative for their own model context.
 - Provider session IDs are opaque adapter data.
-- Flock stores its own logical identity and coordination metadata in SQLite.
-- Flock must not use private provider files or indexes as its primary database.
+- Nako Agent stores its own logical identity and coordination metadata in SQLite.
+- Nako Agent must not use private provider files or indexes as its primary database.
 - Resume the same native session when its context matters.
 - Move work between agents with an explicit handoff package; never claim that
   hidden model context was translated between providers.
@@ -68,14 +68,14 @@ source references, role, budget, and delegation policy.
 The target relationship is:
 
 ```text
-FlockSession 1 ── N AgentSession 1 ── N AgentTurn
+NakoSession 1 ── N AgentSession 1 ── N AgentTurn
        │                 │
        ├── tasks         ├── artifacts
        ├── runs          └── handoffs
        └── memories
 ```
 
-The current `SessionRecord` mapping one Flock ID to one provider session is
+The current `SessionRecord` mapping one Nako Agent ID to one provider session is
 useful groundwork but is not the final data model.
 
 ## Backend adapters
@@ -83,12 +83,12 @@ useful groundwork but is not the final data model.
 Codex is the first adapter, not the application model. New providers must be
 addable without changing shared session, task, memory, skill, or UI semantics.
 
-All enabled providers participate in the runtime by default. Flock must not
+All enabled providers participate in the runtime by default. Nako Agent must not
 have a global backend selector: backend choice belongs to a model, agent
 session, task, or orchestration run. Model identities are always canonical,
 provider-qualified slugs in the form `provider-slug/model-slug`; model search,
 persistence, handoffs, and user-facing selection use that same form. A single
-logical Flock session may use models from multiple providers, including for
+logical Nako Agent session may use models from multiple providers, including for
 delegated workers and reviewers.
 
 Backend contracts should expose lifecycle operations plus a capability
@@ -106,6 +106,13 @@ subagents.
 - Treat provider enablement as a persisted registry preference. A disabled
   provider is unavailable for new work; it is not replaced by a process-wide
   `--backend` mode.
+
+Nako Agent-launched sessions run unattended by default. Each adapter must use
+the provider's native strongest non-interactive permission mode rather than
+emulating permissions in shared code. Codex uses `approvalPolicy: never` with
+`danger-full-access`; Devin uses its `dangerous` permission mode. Unexpected
+provider approval requests must be accepted inside the adapter and must not
+interrupt the TUI. Apply the equivalent native mode when adding a provider.
 
 Do not disable useful native provider capabilities merely to create a lowest
 common denominator across backends. Safety policy may still restrict a
@@ -132,10 +139,10 @@ reviewers must not recursively spawn agents unless an explicit nested
 orchestrator role grants a bounded allowance. Keep one writer for a shared
 workspace unless isolation is deliberate.
 
-Provider-native subagents may implement a Flock delegation only when the
+Provider-native subagents may implement a Nako Agent delegation only when the
 adapter can attribute and supervise the child work, or when the run is clearly
 recorded as opaque. Do not confuse a provider's subagent feature with permission
-to expose Flock's orchestration API recursively.
+to expose Nako Agent's orchestration API recursively.
 
 ## Skills
 
@@ -156,11 +163,11 @@ service or interface that performs persistent operations.
 
 ## Memory
 
-Memory is a Flock-owned service with multiple access surfaces:
+Memory is a Nako Agent-owned service with multiple access surfaces:
 
 - Internal Rust API for the orchestrator
 - MCP interface when a backend supports it reliably
-- `flock memory` CLI fallback for agents with shell access
+- `nako-agent memory` CLI fallback for agents with shell access
 - A portable memory skill that teaches usage policy
 
 MCP supplies structured capability; the skill supplies behavior. Neither alone
@@ -181,10 +188,10 @@ The initial memory operations should be small and semantic: `search`,
 
 ## Persistence
 
-SQLite remains the Flock-owned metadata store. The target model should separate
+SQLite remains the Nako Agent-owned metadata store. The target model should separate
 at least:
 
-- `flock_sessions`
+- `nako_sessions`
 - `agent_sessions`
 - `agent_turns`
 - `orchestration_runs`
@@ -195,13 +202,13 @@ at least:
 - `skill_installations`
 
 Provider-native history remains authoritative for provider execution context.
-Flock persistence owns discovery, relationships, shared state, and provenance.
+Nako Agent persistence owns discovery, relationships, shared state, and provenance.
 
 ## Migration order
 
 1. Define provider-neutral backend events, capabilities, logical sessions,
    agent roles, and native-session records.
-2. Introduce explicit handoff packages and many-native-sessions-per-Flock-
+2. Introduce explicit handoff packages and many-native-sessions-per-Nako-Agent-
    session persistence.
 3. Build the memory service and internal API, then CLI and MCP surfaces.
 4. Package memory policy as the first portable cross-provider skill.

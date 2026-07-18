@@ -1,9 +1,9 @@
 use std::{error::Error, ffi::OsString, io, path::PathBuf, time::Duration};
 
-use flock::{
+use nako_agent::{
     backend::{
-        ApprovalDecision, ApprovalKind, BackendCommand, BackendEvent, BackendHandle,
-        BackendOperation, DEVIN_PROVIDER, DeltaKind, TurnOutcome,
+        BackendCommand, BackendEvent, BackendHandle, BackendOperation, DEVIN_PROVIDER, DeltaKind,
+        TurnOutcome,
     },
     devin::{self, BackendConfig},
 };
@@ -122,15 +122,8 @@ async fn verify_successful_turn(backend: &mut BackendHandle, session_id: &str) -
                 assert_eq!(item.id, "devin-tool");
                 saw_tool = true;
             }
-            BackendEvent::ApprovalRequested(approval) => {
-                assert_eq!(approval.kind, ApprovalKind::Command);
-                backend
-                    .commands
-                    .send(BackendCommand::ResolveApproval {
-                        id: approval.id,
-                        decision: ApprovalDecision::AcceptOnce,
-                    })
-                    .await?;
+            BackendEvent::ApprovalRequested(_) => {
+                panic!("Devin approvals must be accepted inside the adapter")
             }
             BackendEvent::ItemCompleted { item, .. } => {
                 assert_eq!(item.body, "tests passed");
@@ -281,6 +274,7 @@ async fn cached_model_selection_is_applied_before_first_prompt() -> TestResult {
         .commands
         .send(BackendCommand::StartSession {
             model: Some("devin-second-model".to_owned()),
+            instructions: None,
         })
         .await?;
     match next_event(&mut backend).await? {

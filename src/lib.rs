@@ -1,9 +1,11 @@
+pub mod agent;
 pub mod app;
 pub mod backend;
 pub mod clipboard;
 pub mod codex;
 pub mod commands;
 pub mod config;
+pub mod control;
 pub mod devin;
 pub mod editor;
 pub mod handoff;

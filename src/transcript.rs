@@ -47,6 +47,8 @@ pub enum LineTone {
     Error,
     Body,
     Code,
+    SubagentPending,
+    SubagentComplete,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +56,7 @@ pub struct ProjectedLine {
     pub text: String,
     pub tone: LineTone,
     pub bold: bool,
+    pub source_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,6 +181,28 @@ impl Transcript {
         }
     }
 
+    pub fn remove(&mut self, key: &str) {
+        let Some(index) = self.item_indices.get(key).copied() else {
+            return;
+        };
+        self.entries.remove(index);
+        self.reindex();
+        self.changed();
+    }
+
+    pub fn finish_running(&mut self, status: EntryStatus) {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if entry.status == EntryStatus::Running {
+                entry.status = status;
+                changed = true;
+            }
+        }
+        if changed {
+            self.changed();
+        }
+    }
+
     pub fn visible(
         &mut self,
         width: usize,
@@ -233,6 +258,7 @@ impl Transcript {
                 text: "Start by typing a request below.".to_owned(),
                 tone: LineTone::Muted,
                 bold: false,
+                source_key: None,
             });
         }
 
@@ -243,6 +269,34 @@ impl Transcript {
 }
 
 fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<ProjectedLine>) {
+    if entry
+        .key
+        .as_deref()
+        .is_some_and(|key| key.starts_with("subagent:"))
+    {
+        let pending = entry.status == EntryStatus::Running;
+        let status = if pending {
+            "⠋ pending"
+        } else {
+            "✓ completed"
+        };
+        let objective_width = width.saturating_sub(14);
+        let objective = entry.body.lines().next().unwrap_or_default().trim();
+        output.push(ProjectedLine {
+            text: format!(
+                " {status:<11} {}",
+                truncate_display(objective, objective_width)
+            ),
+            tone: if pending {
+                LineTone::SubagentPending
+            } else {
+                LineTone::SubagentComplete
+            },
+            bold: false,
+            source_key: entry.key.clone(),
+        });
+        return;
+    }
     let status = match entry.status {
         EntryStatus::Running => "  · running",
         EntryStatus::Failed => "  · failed",
@@ -254,6 +308,7 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
         text: truncate_display(&header, width),
         tone: header_tone(entry.kind),
         bold: true,
+        source_key: entry.key.clone(),
     });
 
     let body_width = width.saturating_sub(2).max(1);
@@ -262,6 +317,7 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
             text: "  …".to_owned(),
             tone: LineTone::Muted,
             bold: false,
+            source_key: entry.key.clone(),
         });
     } else {
         let mut in_code_block = false;
@@ -277,6 +333,7 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
                     text: format!("  {line}"),
                     tone,
                     bold: trimmed.starts_with('#'),
+                    source_key: entry.key.clone(),
                 });
             }
         }
@@ -286,6 +343,7 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
         text: String::new(),
         tone: LineTone::Body,
         bold: false,
+        source_key: entry.key.clone(),
     });
 }
 
@@ -376,7 +434,7 @@ fn display_width(character: char) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryKind, EntryStatus, Transcript};
+    use super::{EntryKind, EntryStatus, LineTone, Transcript};
 
     #[test]
     fn deltas_are_keyed_and_completion_replaces_stream() {
@@ -426,5 +484,38 @@ mod tests {
 
         let visible = transcript.visible(80, 10, 0);
         assert!(visible.lines.iter().any(|line| line.text.contains("�[31m")));
+    }
+
+    #[test]
+    fn subagent_entries_project_as_one_clickable_inline_row() {
+        let mut transcript = Transcript::new(100);
+        transcript.upsert(
+            "subagent:agent-1",
+            EntryKind::System,
+            "pending",
+            "Map authentication",
+            EntryStatus::Running,
+        );
+
+        let pending = transcript.visible(80, 10, 0);
+        assert_eq!(pending.lines.len(), 1);
+        assert_eq!(pending.lines[0].tone, LineTone::SubagentPending);
+        assert_eq!(
+            pending.lines[0].source_key.as_deref(),
+            Some("subagent:agent-1")
+        );
+        assert!(pending.lines[0].text.contains("Map authentication"));
+
+        transcript.upsert(
+            "subagent:agent-1",
+            EntryKind::System,
+            "completed",
+            "Map authentication",
+            EntryStatus::Complete,
+        );
+        let completed = transcript.visible(80, 10, 0);
+        assert_eq!(completed.lines.len(), 1);
+        assert_eq!(completed.lines[0].tone, LineTone::SubagentComplete);
+        assert!(completed.lines[0].text.contains("completed"));
     }
 }

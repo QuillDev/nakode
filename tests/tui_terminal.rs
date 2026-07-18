@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use flock::pty::PtySession;
+use nako_agent::pty::PtySession;
 use portable_pty::PtySize;
 
 #[test]
@@ -29,14 +29,14 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     fs::set_permissions(&wrapper, permissions)?;
 
     let mut session = PtySession::spawn(
-        env!("CARGO_BIN_EXE_flock"),
+        env!("CARGO_BIN_EXE_nako-agent"),
         [
             OsString::from("--codex"),
             wrapper.into_os_string(),
             OsString::from("--workspace"),
-            manifest.clone().into_os_string(),
+            temp.path().as_os_str().to_owned(),
         ],
-        &manifest,
+        temp.path(),
         PtySize {
             rows: 28,
             cols: 100,
@@ -62,7 +62,7 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     });
 
     thread::sleep(Duration::from_millis(750));
-    session.writer().write_all(b"FLOCK")?;
+    session.writer().write_all(b"NAKO")?;
     session.writer().flush()?;
     thread::sleep(Duration::from_millis(150));
     // Select the composer text (SGR mouse coordinates are 1-based).
@@ -96,7 +96,7 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     let output = reader_thread
         .join()
         .map_err(|_| io::Error::other("PTY reader thread panicked"))??;
-    assert!(exited, "Flock did not exit after Ctrl+D");
+    assert!(exited, "Nako Agent did not exit after Ctrl+D");
 
     let output = String::from_utf8_lossy(&output);
     assert!(
@@ -112,7 +112,7 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
         "enhanced keyboard reporting was not enabled and restored"
     );
     assert!(
-        output.contains("\u{1b}]52;c;RkxPQ0s=\u{7}"),
+        output.contains("\u{1b}]52;c;TkFLTw==\u{7}"),
         "mouse selection was not copied with OSC 52"
     );
     assert!(output.contains("\u{1b}[?25h"), "cursor was not restored");

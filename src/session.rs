@@ -9,8 +9,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::backend::ModelInfo;
 pub use crate::backend::{CODEX_PROVIDER, DEVIN_PROVIDER};
+use crate::{
+    backend::ModelInfo,
+    transcript::{EntryKind, EntryStatus, TranscriptEntry},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
@@ -31,9 +34,57 @@ pub struct ProviderRecord {
     pub enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubagentStatus {
+    Starting,
+    Working,
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+impl SubagentStatus {
+    const fn database_value(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Working => "working",
+            Self::Completed => "completed",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, SessionError> {
+        match value {
+            "starting" => Ok(Self::Starting),
+            "working" => Ok(Self::Working),
+            "completed" => Ok(Self::Completed),
+            "interrupted" => Ok(Self::Interrupted),
+            "failed" => Ok(Self::Failed),
+            _ => Err(SessionError::InvalidStoredValue {
+                field: "orchestration_runs.status",
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubagentRecord {
+    pub parent_session_id: String,
+    pub id: String,
+    pub agent: String,
+    pub provider: String,
+    pub provider_session_id: Option<String>,
+    pub objective: String,
+    pub status: SubagentStatus,
+    pub latest_activity: String,
+    pub transcript: Vec<TranscriptEntry>,
+}
+
 #[derive(Debug, Error)]
 pub enum SessionError {
-    #[error("could not determine Flock's application-data directory")]
+    #[error("could not determine Nako Agent's application-data directory")]
     MissingDataDirectory,
     #[error("failed to create session database directory {path}: {source}")]
     CreateDirectory {
@@ -44,6 +95,8 @@ pub enum SessionError {
     Database(#[from] rusqlite::Error),
     #[error("session {0:?} is ambiguous; use a longer id")]
     Ambiguous(String),
+    #[error("invalid persisted value for {field}: {value:?}")]
+    InvalidStoredValue { field: &'static str, value: String },
 }
 
 pub trait SessionRepository: Send + Sync {
@@ -103,6 +156,16 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when persistence cannot be updated.
     fn set_provider_enabled(&self, provider: &str, enabled: bool) -> Result<(), SessionError>;
+    /// Saves the current durable projection of a sub-agent run and its transcript.
+    ///
+    /// # Errors
+    /// Returns an error when the transaction cannot be committed.
+    fn save_subagent(&self, record: &SubagentRecord) -> Result<(), SessionError>;
+    /// Lists the sub-agent runs associated with a logical parent session.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried or contains invalid data.
+    fn list_subagents(&self, parent_session_id: &str) -> Result<Vec<SubagentRecord>, SessionError>;
 }
 
 pub struct SqliteSessionRepository {
@@ -110,20 +173,29 @@ pub struct SqliteSessionRepository {
 }
 
 impl SqliteSessionRepository {
-    /// Opens the repository in Flock's platform-specific data directory.
+    /// Opens the repository in Nako Agent's platform-specific data directory.
     ///
     /// # Errors
     ///
     /// Returns an error when the data directory or database cannot be opened.
     pub fn open_default() -> Result<Self, SessionError> {
-        let project =
-            ProjectDirs::from("dev", "flock", "Flock").ok_or(SessionError::MissingDataDirectory)?;
+        let project = ProjectDirs::from("dev", "nako-agent", "Nako Agent")
+            .ok_or(SessionError::MissingDataDirectory)?;
+        let new_database = project.data_local_dir().join("sessions.sqlite3");
+        let legacy_database = ProjectDirs::from("dev", "flock", "Flock")
+            .map(|legacy| legacy.data_local_dir().join("sessions.sqlite3"));
+        if !new_database.exists()
+            && let Some(legacy_database) = legacy_database
+            && legacy_database.exists()
+        {
+            return Self::open(legacy_database);
+        }
         let directory = project.data_local_dir();
         std::fs::create_dir_all(directory).map_err(|source| SessionError::CreateDirectory {
             path: directory.display().to_string(),
             source,
         })?;
-        Self::open(directory.join("sessions.sqlite3"))
+        Self::open(new_database)
     }
 
     /// Opens or creates a repository at `path` and applies its schema.
@@ -161,6 +233,34 @@ impl SqliteSessionRepository {
                display_name TEXT NOT NULL,
                enabled INTEGER NOT NULL,
                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS orchestration_runs (
+               parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+               id TEXT NOT NULL,
+               agent_slug TEXT NOT NULL,
+               provider TEXT NOT NULL,
+               provider_session_id TEXT,
+               objective TEXT NOT NULL,
+               status TEXT NOT NULL,
+               latest_activity TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(parent_session_id, id)
+             );
+             CREATE INDEX IF NOT EXISTS orchestration_runs_parent_created
+               ON orchestration_runs(parent_session_id, created_at, id);
+             CREATE TABLE IF NOT EXISTS agent_turns (
+               parent_session_id TEXT NOT NULL,
+               run_id TEXT NOT NULL,
+               sequence INTEGER NOT NULL,
+               item_key TEXT,
+               kind TEXT NOT NULL,
+               title TEXT NOT NULL,
+               body TEXT NOT NULL,
+               status TEXT NOT NULL,
+               PRIMARY KEY(parent_session_id, run_id, sequence),
+               FOREIGN KEY(parent_session_id, run_id)
+                 REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
              );",
         )?;
         let has_legacy_models = connection
@@ -396,6 +496,197 @@ impl SessionRepository for SqliteSessionRepository {
         )?;
         Ok(())
     }
+
+    fn save_subagent(&self, record: &SubagentRecord) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let now = unix_timestamp();
+        transaction.execute(
+            "INSERT INTO orchestration_runs
+               (parent_session_id, id, agent_slug, provider, provider_session_id, objective,
+                status, latest_activity, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             ON CONFLICT(parent_session_id, id) DO UPDATE SET
+               agent_slug = excluded.agent_slug,
+               provider = excluded.provider,
+               provider_session_id = excluded.provider_session_id,
+               objective = excluded.objective,
+               status = excluded.status,
+               latest_activity = excluded.latest_activity,
+               updated_at = excluded.updated_at",
+            params![
+                record.parent_session_id,
+                record.id,
+                record.agent,
+                record.provider,
+                record.provider_session_id,
+                record.objective,
+                record.status.database_value(),
+                record.latest_activity,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_turns WHERE parent_session_id = ?1 AND run_id = ?2",
+            params![record.parent_session_id, record.id],
+        )?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO agent_turns
+                   (parent_session_id, run_id, sequence, item_key, kind, title, body, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for (sequence, entry) in record.transcript.iter().enumerate() {
+                let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
+                statement.execute(params![
+                    record.parent_session_id,
+                    record.id,
+                    sequence,
+                    entry.key,
+                    entry_kind_value(entry.kind),
+                    entry.title,
+                    entry.body,
+                    entry_status_value(entry.status),
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn list_subagents(&self, parent_session_id: &str) -> Result<Vec<SubagentRecord>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, agent_slug, provider, provider_session_id, objective, status,
+                    latest_activity
+             FROM orchestration_runs
+             WHERE parent_session_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map([parent_session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let stored_runs = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut records = Vec::with_capacity(stored_runs.len());
+        for (id, agent, provider, provider_session_id, objective, status, latest_activity) in
+            stored_runs
+        {
+            let transcript = load_subagent_transcript(&connection, parent_session_id, &id)?;
+            records.push(SubagentRecord {
+                parent_session_id: parent_session_id.to_owned(),
+                id,
+                agent,
+                provider,
+                provider_session_id,
+                objective,
+                status: SubagentStatus::from_database(&status)?,
+                latest_activity,
+                transcript,
+            });
+        }
+        Ok(records)
+    }
+}
+
+fn load_subagent_transcript(
+    connection: &Connection,
+    parent_session_id: &str,
+    run_id: &str,
+) -> Result<Vec<TranscriptEntry>, SessionError> {
+    let mut statement = connection.prepare(
+        "SELECT item_key, kind, title, body, status
+         FROM agent_turns
+         WHERE parent_session_id = ?1 AND run_id = ?2
+         ORDER BY sequence",
+    )?;
+    let rows = statement.query_map(params![parent_session_id, run_id], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (key, kind, title, body, status) = row?;
+        Ok(TranscriptEntry {
+            key,
+            kind: entry_kind_from_value(&kind)?,
+            title,
+            body,
+            status: entry_status_from_value(&status)?,
+        })
+    })
+    .collect()
+}
+
+const fn entry_kind_value(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::System => "system",
+        EntryKind::User => "user",
+        EntryKind::Assistant => "assistant",
+        EntryKind::Steering => "steering",
+        EntryKind::Reasoning => "reasoning",
+        EntryKind::Tool => "tool",
+        EntryKind::Diff => "diff",
+        EntryKind::Warning => "warning",
+        EntryKind::Error => "error",
+    }
+}
+
+fn entry_kind_from_value(value: &str) -> Result<EntryKind, SessionError> {
+    match value {
+        "system" => Ok(EntryKind::System),
+        "user" => Ok(EntryKind::User),
+        "assistant" => Ok(EntryKind::Assistant),
+        "steering" => Ok(EntryKind::Steering),
+        "reasoning" => Ok(EntryKind::Reasoning),
+        "tool" => Ok(EntryKind::Tool),
+        "diff" => Ok(EntryKind::Diff),
+        "warning" => Ok(EntryKind::Warning),
+        "error" => Ok(EntryKind::Error),
+        _ => Err(SessionError::InvalidStoredValue {
+            field: "agent_turns.kind",
+            value: value.to_owned(),
+        }),
+    }
+}
+
+const fn entry_status_value(status: EntryStatus) -> &'static str {
+    match status {
+        EntryStatus::Running => "running",
+        EntryStatus::Complete => "complete",
+        EntryStatus::Failed => "failed",
+        EntryStatus::Interrupted => "interrupted",
+    }
+}
+
+fn entry_status_from_value(value: &str) -> Result<EntryStatus, SessionError> {
+    match value {
+        "running" => Ok(EntryStatus::Running),
+        "complete" => Ok(EntryStatus::Complete),
+        "failed" => Ok(EntryStatus::Failed),
+        "interrupted" => Ok(EntryStatus::Interrupted),
+        _ => Err(SessionError::InvalidStoredValue {
+            field: "agent_turns.status",
+            value: value.to_owned(),
+        }),
+    }
 }
 
 fn unix_timestamp() -> i64 {
@@ -466,6 +757,55 @@ mod tests {
             .find(|provider| provider.provider == DEVIN_PROVIDER)
             .expect("Devin provider");
         assert!(!devin.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn persists_subagent_run_and_transcript_projection() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("subagents.db"))?;
+        let parent = store.create(
+            CODEX_PROVIDER,
+            "parent-provider-session",
+            "/tmp/project",
+            "Parent work",
+            Some("model-a"),
+        )?;
+        let record = SubagentRecord {
+            parent_session_id: parent.id.clone(),
+            id: "agent-1".to_owned(),
+            agent: "explorer".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: Some("child-provider-session".to_owned()),
+            objective: "Map persistence".to_owned(),
+            status: SubagentStatus::Completed,
+            latest_activity: "Completed".to_owned(),
+            transcript: vec![
+                TranscriptEntry {
+                    key: None,
+                    kind: EntryKind::User,
+                    title: "PARENT".to_owned(),
+                    body: "Delegated task: Map persistence".to_owned(),
+                    status: EntryStatus::Complete,
+                },
+                TranscriptEntry {
+                    key: Some("assistant-1".to_owned()),
+                    kind: EntryKind::Assistant,
+                    title: "ASSISTANT".to_owned(),
+                    body: "Persistence report".to_owned(),
+                    status: EntryStatus::Complete,
+                },
+            ],
+        };
+
+        store.save_subagent(&record)?;
+        assert_eq!(store.list_subagents(&parent.id)?, vec![record.clone()]);
+
+        let mut updated = record;
+        updated.latest_activity = "Reviewed".to_owned();
+        updated.transcript[1].body = "Updated persistence report".to_owned();
+        store.save_subagent(&updated)?;
+        assert_eq!(store.list_subagents(&parent.id)?, vec![updated]);
         Ok(())
     }
 

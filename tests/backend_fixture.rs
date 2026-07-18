@@ -3,10 +3,8 @@ use std::{error::Error, ffi::OsString, io, path::PathBuf, time::Duration};
 #[cfg(unix)]
 use std::{fs::OpenOptions, io::Write, process::Command};
 
-use flock::{
-    backend::{
-        ApprovalDecision, ApprovalKind, BackendCommand, BackendEvent, BackendHandle, DeltaKind,
-    },
+use nako_agent::{
+    backend::{BackendCommand, BackendEvent, BackendHandle, DeltaKind},
     codex::{self, BackendConfig},
 };
 use tokio::time::timeout;
@@ -54,6 +52,7 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
         .commands
         .send(BackendCommand::StartSession {
             model: Some("fixture-model".to_owned()),
+            instructions: None,
         })
         .await?;
 
@@ -79,6 +78,15 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
             client_id: "client-fixture".to_owned(),
             prompt: "hello fixture".to_owned(),
             model: Some("fixture-model".to_owned()),
+        })
+        .await?;
+    backend
+        .commands
+        .send(BackendCommand::SteerTurn {
+            session_id: "thread-fixture".to_owned(),
+            turn_id: "turn-fixture".to_owned(),
+            client_id: "steer-fixture".to_owned(),
+            prompt: "steer fixture".to_owned(),
         })
         .await?;
 
@@ -127,25 +135,8 @@ async fn observe_codex_turn(
                 assert_eq!(turn_id, "turn-fixture");
                 final_text = Some(item.body);
             }
-            BackendEvent::ApprovalRequested(approval) => {
-                assert_eq!(approval.kind, ApprovalKind::Command);
-                assert!(approval.detail.contains("cargo test"));
-                backend
-                    .commands
-                    .send(BackendCommand::SteerTurn {
-                        session_id: "thread-fixture".to_owned(),
-                        turn_id: "turn-fixture".to_owned(),
-                        client_id: "steer-fixture".to_owned(),
-                        prompt: "steer fixture".to_owned(),
-                    })
-                    .await?;
-                backend
-                    .commands
-                    .send(BackendCommand::ResolveApproval {
-                        id: approval.id,
-                        decision: ApprovalDecision::AcceptOnce,
-                    })
-                    .await?;
+            BackendEvent::ApprovalRequested(_) => {
+                panic!("Codex approvals must be accepted inside the adapter")
             }
             BackendEvent::SteerAccepted { turn_id } => {
                 assert_eq!(turn_id, "turn-fixture");
@@ -244,6 +235,7 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
         .commands
         .send(BackendCommand::StartSession {
             model: Some("fixture-model".to_owned()),
+            instructions: None,
         })
         .await?;
     let mut gate_writer = OpenOptions::new().write(true).open(&gate)?;
