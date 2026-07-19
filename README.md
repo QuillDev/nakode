@@ -154,9 +154,11 @@ from any directory.
 - Restores raw mode, alternate screen, cursor, mouse capture, colors, and
   bracketed paste on normal exit, panic, `SIGINT`, `SIGTERM`, and `SIGHUP`.
 
-Markdown rendering is intentionally lightweight today. Headings, code blocks,
-and diffs receive semantic styling. Rich Markdown, additional backend adapters,
-configurable keymaps, and embedded provider/process panes are later work.
+Assistant responses render GitHub-flavored Markdown in the transcript, including
+headings, emphasis, links, block quotes, ordered and unordered lists, task
+checkboxes, tables, inline code, and fenced code blocks. Fenced blocks use their
+language tag for syntax highlighting. Tool output and diffs retain their
+provider-neutral semantic coloring.
 
 ## Portable tools
 

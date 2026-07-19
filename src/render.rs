@@ -11,7 +11,7 @@ use crate::{
     commands,
     selection::{ScreenPoint, ScreenSnapshot},
     state::AppState,
-    transcript::{LineTone, ProjectedLine},
+    transcript::{LineTone, MarkdownModifier, MarkdownSpan, MarkdownTone, ProjectedLine},
 };
 
 // Nako Agent shares the opaque pink-on-black visual language used across Quill's apps.
@@ -1216,12 +1216,50 @@ fn transcript_line(line: ProjectedLine) -> Line<'static> {
     if line.bold {
         style = style.add_modifier(Modifier::BOLD);
     }
-    let text = if line.tone == LineTone::SubagentPending {
-        line.text.replacen('⠋', subagent_spinner(), 1)
+    if line.spans.is_empty() {
+        let text = if line.tone == LineTone::SubagentPending {
+            line.text.replacen('⠋', subagent_spinner(), 1)
+        } else {
+            line.text
+        };
+        Line::styled(text, style)
     } else {
-        line.text
-    };
-    Line::styled(text, style)
+        Line::from(
+            line.spans
+                .into_iter()
+                .map(|span| markdown_span(span, style))
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+fn markdown_span(span: MarkdownSpan, mut style: Style) -> Span<'static> {
+    if let Some(tone) = span.style.tone {
+        let color = match tone {
+            MarkdownTone::Accent | MarkdownTone::Link => ACCENT_BRIGHT,
+            MarkdownTone::Muted => MUTED,
+            MarkdownTone::Success => SUCCESS,
+            MarkdownTone::Warning => WARNING,
+            MarkdownTone::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+        };
+        style = style.fg(color);
+    }
+    if span.style.modifiers.contains(MarkdownModifier::Bold) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if span.style.modifiers.contains(MarkdownModifier::Italic) {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if span.style.modifiers.contains(MarkdownModifier::Underlined) {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if span.style.modifiers.contains(MarkdownModifier::CrossedOut) {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if span.style.code {
+        style = style.bg(SURFACE_RAISED);
+    }
+    Span::styled(span.text, style)
 }
 
 fn subagent_spinner() -> &'static str {
@@ -1260,6 +1298,9 @@ mod tests {
         },
         session::ProviderRecord,
         state::{AgentRequest, AppState, Effect},
+        transcript::{
+            LineTone, MarkdownModifier, MarkdownSpan, MarkdownStyle, MarkdownTone, ProjectedLine,
+        },
     };
 
     #[test]
@@ -1297,6 +1338,57 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, super::BACKGROUND);
         assert_eq!(buffer[(0, 1)].symbol(), "╭");
         assert_eq!(buffer[(0, 1)].fg, super::BORDER);
+    }
+
+    #[test]
+    fn markdown_spans_map_to_terminal_colors_and_modifiers() {
+        let mut markdown_style = MarkdownStyle {
+            tone: Some(MarkdownTone::Rgb(12, 34, 56)),
+            code: true,
+            ..MarkdownStyle::default()
+        };
+        for modifier in [
+            MarkdownModifier::Bold,
+            MarkdownModifier::Italic,
+            MarkdownModifier::Underlined,
+            MarkdownModifier::CrossedOut,
+        ] {
+            markdown_style.modifiers.insert(modifier);
+        }
+        let line = super::transcript_line(ProjectedLine {
+            text: "formatted".to_owned(),
+            spans: vec![MarkdownSpan {
+                text: "formatted".to_owned(),
+                style: markdown_style,
+            }],
+            tone: LineTone::Body,
+            bold: false,
+            source_key: None,
+        });
+
+        let span = &line.spans[0];
+        assert_eq!(span.style.fg, Some(ratatui::style::Color::Rgb(12, 34, 56)));
+        assert_eq!(span.style.bg, Some(super::SURFACE_RAISED));
+        assert!(
+            span.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert!(
+            span.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::ITALIC)
+        );
+        assert!(
+            span.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+        assert!(
+            span.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::CROSSED_OUT)
+        );
     }
 
     #[test]

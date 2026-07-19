@@ -2,6 +2,11 @@ use std::collections::HashMap;
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::markdown::render_markdown;
+pub use crate::markdown::{
+    MarkdownModifier, MarkdownModifiers, MarkdownSpan, MarkdownStyle, MarkdownTone,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
     System,
@@ -54,6 +59,7 @@ pub enum LineTone {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectedLine {
     pub text: String,
+    pub spans: Vec<MarkdownSpan>,
     pub tone: LineTone,
     pub bold: bool,
     pub source_key: Option<String>,
@@ -256,6 +262,7 @@ impl Transcript {
         if projected.is_empty() {
             projected.push(ProjectedLine {
                 text: "Start by typing a request below.".to_owned(),
+                spans: Vec::new(),
                 tone: LineTone::Muted,
                 bold: false,
                 source_key: None,
@@ -287,6 +294,7 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
                 " {status:<11} {}",
                 truncate_display(objective, objective_width)
             ),
+            spans: Vec::new(),
             tone: if pending {
                 LineTone::SubagentPending
             } else {
@@ -306,6 +314,7 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
     let header = format!("{}{}", entry.title, status);
     output.push(ProjectedLine {
         text: truncate_display(&header, width),
+        spans: Vec::new(),
         tone: header_tone(entry.kind),
         bold: true,
         source_key: entry.key.clone(),
@@ -315,10 +324,21 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
     if entry.body.is_empty() && entry.status == EntryStatus::Running {
         output.push(ProjectedLine {
             text: "  …".to_owned(),
+            spans: Vec::new(),
             tone: LineTone::Muted,
             bold: false,
             source_key: entry.key.clone(),
         });
+    } else if entry.kind == EntryKind::Assistant {
+        for line in render_markdown(&entry.body, width) {
+            output.push(ProjectedLine {
+                text: line.text,
+                spans: line.spans,
+                tone: LineTone::Body,
+                bold: false,
+                source_key: entry.key.clone(),
+            });
+        }
     } else {
         let mut in_code_block = false;
         for raw_line in entry.body.split('\n') {
@@ -331,6 +351,7 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
             for line in wrapped {
                 output.push(ProjectedLine {
                     text: format!("  {line}"),
+                    spans: Vec::new(),
                     tone,
                     bold: trimmed.starts_with('#'),
                     source_key: entry.key.clone(),
@@ -341,6 +362,7 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
 
     output.push(ProjectedLine {
         text: String::new(),
+        spans: Vec::new(),
         tone: LineTone::Body,
         bold: false,
         source_key: entry.key.clone(),
@@ -434,7 +456,7 @@ fn display_width(character: char) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryKind, EntryStatus, LineTone, Transcript};
+    use super::{EntryKind, EntryStatus, LineTone, MarkdownModifier, MarkdownTone, Transcript};
 
     #[test]
     fn deltas_are_keyed_and_completion_replaces_stream() {
@@ -470,6 +492,40 @@ mod tests {
         let older = transcript.visible(80, 3, 2);
         assert!(bottom.first_line > older.first_line);
         assert_eq!(bottom.lines.len(), 3);
+    }
+
+    #[test]
+    fn assistant_markdown_is_projected_as_styled_content() {
+        let mut transcript = Transcript::new(100);
+        transcript.push(
+            EntryKind::Assistant,
+            "ASSISTANT",
+            "## Result\n\nUse **bold** and `code`.",
+            EntryStatus::Complete,
+        );
+
+        let visible = transcript.visible(80, 20, 0);
+        let body = visible
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("▍ Result"));
+        assert!(!body.contains("## Result"));
+        assert!(!body.contains("**bold**"));
+        assert!(visible.lines.iter().flat_map(|line| &line.spans).any(
+            |span| span.text == "bold" && span.style.modifiers.contains(MarkdownModifier::Bold)
+        ));
+        assert!(
+            visible
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text == "code"
+                    && span.style.code
+                    && span.style.tone == Some(MarkdownTone::Warning))
+        );
     }
 
     #[test]
