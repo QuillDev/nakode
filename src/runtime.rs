@@ -12,8 +12,6 @@ use crate::backend::{
 };
 use crate::tools::ToolRegistry;
 
-const MAX_TOOL_ROUNDS: usize = 64;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ConversationItem {
     User {
@@ -132,7 +130,7 @@ impl AgentRuntime {
             .await
             .map_err(|_| "backend event receiver closed".to_owned())?;
 
-        for round in 0..MAX_TOOL_ROUNDS {
+        loop {
             if cancellation.is_cancelled() {
                 return Err("turn interrupted".to_owned());
             }
@@ -192,11 +190,7 @@ impl AgentRuntime {
                 &cancellation,
             )
             .await?;
-            if round + 1 == MAX_TOOL_ROUNDS {
-                return Err(format!("tool loop exceeded {MAX_TOOL_ROUNDS} rounds"));
-            }
         }
-        unreachable!("bounded tool loop returns from its final iteration")
     }
 
     async fn execute_tool_calls(
@@ -486,13 +480,79 @@ impl RuntimeSessionStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    use super::{QuestionBroker, RuntimeSession, RuntimeSessionStore};
+    use serde_json::json;
+
+    use super::{
+        AgentRuntime, InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest,
+        QuestionBroker, RuntimeSession, RuntimeSessionStore, ToolCall,
+    };
     use crate::backend::{BackendEvent, QuestionOption, QuestionRequest};
     use crate::session::SqliteSessionRepository;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
+
+    struct RepeatingToolProvider {
+        calls: AtomicUsize,
+        tool_rounds: usize,
+    }
+
+    impl InferenceProvider for RepeatingToolProvider {
+        fn infer(
+            &self,
+            _request: InferenceRequest,
+            _events: mpsc::Sender<super::InferenceEvent>,
+            _cancellation: CancellationToken,
+        ) -> InferenceFuture<'_> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if call < self.tool_rounds {
+                    Ok(InferenceOutput {
+                        tool_calls: vec![ToolCall {
+                            id: format!("call-{call}"),
+                            name: "todo".to_owned(),
+                            arguments: json!({"op": "view"}),
+                        }],
+                        ..InferenceOutput::default()
+                    })
+                } else {
+                    Ok(InferenceOutput {
+                        text: "finished".to_owned(),
+                        ..InferenceOutput::default()
+                    })
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_can_continue_beyond_the_legacy_tool_round_limit() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(RepeatingToolProvider {
+            calls: AtomicUsize::new(0),
+            tool_rounds: 65,
+        });
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider.clone());
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        let (events, _receiver) = mpsc::channel(512);
+
+        runtime
+            .run_turn(
+                &mut session,
+                "turn-1",
+                "Keep working.".to_owned(),
+                &events,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn completes after more than 64 tool rounds");
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 66);
+    }
 
     #[test]
     fn native_sessions_survive_provider_restarts() {

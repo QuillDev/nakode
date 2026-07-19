@@ -154,10 +154,10 @@ from any directory.
 - Restores raw mode, alternate screen, cursor, mouse capture, colors, and
   bracketed paste on normal exit, panic, `SIGINT`, `SIGTERM`, and `SIGHUP`.
 
-Assistant responses render GitHub-flavored Markdown in the transcript, including
-headings, emphasis, links, block quotes, ordered and unordered lists, task
-checkboxes, tables, inline code, and fenced code blocks. Fenced blocks use their
-language tag for syntax highlighting. Tool output and diffs retain their
+Agent responses and reasoning render GitHub-flavored Markdown in the transcript,
+including headings, emphasis, links, block quotes, ordered and unordered lists,
+task checkboxes, tables, inline code, and fenced code blocks. Fenced blocks use
+their language tag for syntax highlighting. Tool output and diffs retain their
 provider-neutral semantic coloring.
 
 ## Portable tools

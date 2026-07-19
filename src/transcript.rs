@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use unicode_width::UnicodeWidthChar;
 
@@ -329,12 +329,17 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
             bold: false,
             source_key: entry.key.clone(),
         });
-    } else if entry.kind == EntryKind::Assistant {
-        for line in render_markdown(&entry.body, width) {
+    } else if matches!(entry.kind, EntryKind::Assistant | EntryKind::Reasoning) {
+        let tone = if entry.kind == EntryKind::Reasoning {
+            LineTone::Reasoning
+        } else {
+            LineTone::Body
+        };
+        for line in render_markdown(&markdown_source(entry), width) {
             output.push(ProjectedLine {
                 text: line.text,
                 spans: line.spans,
-                tone: LineTone::Body,
+                tone,
                 bold: false,
                 source_key: entry.key.clone(),
             });
@@ -367,6 +372,14 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
         bold: false,
         source_key: entry.key.clone(),
     });
+}
+
+fn markdown_source(entry: &TranscriptEntry) -> Cow<'_, str> {
+    if entry.kind == EntryKind::Reasoning && entry.body.contains("****") {
+        Cow::Owned(entry.body.replace("****", "**\n**"))
+    } else {
+        Cow::Borrowed(&entry.body)
+    }
 }
 
 fn header_tone(kind: EntryKind) -> LineTone {
@@ -526,6 +539,31 @@ mod tests {
                     && span.style.code
                     && span.style.tone == Some(MarkdownTone::Warning))
         );
+    }
+
+    #[test]
+    fn reasoning_markdown_is_styled_and_adjacent_summaries_are_separated() {
+        let mut transcript = Transcript::new(100);
+        transcript.push(
+            EntryKind::Reasoning,
+            "REASONING",
+            "**Verifying cleanliness****Planning commit creation****Validating result**",
+            EntryStatus::Complete,
+        );
+
+        let visible = transcript.visible(80, 20, 0);
+        let reasoning = visible
+            .lines
+            .iter()
+            .filter(|line| line.tone == LineTone::Reasoning && !line.spans.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning.len(), 3);
+        assert!(reasoning.iter().all(|line| !line.text.contains("**")));
+        assert!(reasoning.iter().all(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.modifiers.contains(MarkdownModifier::Bold))
+        }));
     }
 
     #[test]
