@@ -122,6 +122,10 @@ including tmux passthrough. The terminal must permit clipboard writes. Pasted
 control sequences are treated as text, and streamed tool output is rendered as
 sanitized data rather than executed terminal control.
 
+After a persisted session exits, Nako Agent prints a ready-to-run command
+containing the workspace and logical session ID so the session can be resumed
+from any directory.
+
 ## Current behavior
 
 - Initializes every enabled provider and records each declared capability set.

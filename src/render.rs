@@ -304,7 +304,12 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn todo_panel_height(state: &AppState) -> u16 {
-    if state.todo_phases.is_empty() {
+    let has_in_progress_task = state
+        .todo_phases
+        .iter()
+        .flat_map(|phase| &phase.tasks)
+        .any(|task| task.status == TodoStatus::InProgress);
+    if !has_in_progress_task {
         return 0;
     }
     let content_lines = state
@@ -1328,6 +1333,42 @@ mod tests {
         assert!(rendered.contains("Implementation"));
         assert!(rendered.contains("Project todo events"));
         assert!(rendered.contains("Render the active plan"));
+    }
+
+    #[test]
+    fn inactive_todos_do_not_render_as_a_persistent_panel() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.todo_phases = vec![TodoPhase {
+            name: "Finished work".to_owned(),
+            tasks: vec![
+                TodoItem {
+                    content: "Completed task".to_owned(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "Pending task".to_owned(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+        }];
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render without inactive todo panel");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(!rendered.contains("Todos"));
+        assert!(!rendered.contains("Finished work"));
+        assert!(!rendered.contains("Completed task"));
+        assert!(!rendered.contains("Pending task"));
     }
 
     #[test]

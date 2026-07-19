@@ -1,4 +1,9 @@
-use std::{collections::HashMap, io, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
@@ -356,7 +361,55 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     control.shutdown(&control_path);
 
     loop_result?;
-    restore_result.map_err(AppError::Terminal)
+    restore_result.map_err(AppError::Terminal)?;
+
+    print_resume_hint(&nako_executable, &state).map_err(AppError::Terminal)
+}
+
+fn print_resume_hint(executable: &Path, state: &AppState) -> io::Result<()> {
+    write_resume_hint(
+        &mut io::stdout().lock(),
+        executable,
+        Path::new(&state.workspace),
+        state.session_id.as_deref(),
+    )
+}
+
+fn write_resume_hint(
+    output: &mut impl Write,
+    executable: &Path,
+    workspace: &Path,
+    session_id: Option<&str>,
+) -> io::Result<()> {
+    let Some(session_id) = session_id else {
+        return Ok(());
+    };
+    writeln!(output, "\nResume this session with:")?;
+    writeln!(
+        output,
+        "  {} --workspace {} --resume {session_id}",
+        quote_command_argument(executable),
+        quote_command_argument(workspace),
+    )
+}
+
+fn quote_command_argument(argument: &Path) -> String {
+    let argument = argument.to_string_lossy();
+    if argument
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "_@%+=:,./-".contains(character))
+    {
+        return argument.into_owned();
+    }
+
+    #[cfg(unix)]
+    {
+        format!("'{}'", argument.replace('\'', "'\\''"))
+    }
+    #[cfg(not(unix))]
+    {
+        format!("\"{}\"", argument.replace('"', "\\\""))
+    }
 }
 
 async fn run_loop(
@@ -1310,6 +1363,39 @@ mod tests {
         state::{ActiveTurn, AgentRequest, AppState},
         transcript::{EntryKind, EntryStatus},
     };
+
+    #[test]
+    fn exit_hint_includes_executable_workspace_and_full_session_id() {
+        let mut output = Vec::new();
+        super::write_resume_hint(
+            &mut output,
+            std::path::Path::new("/opt/Nako Agent/nako-agent"),
+            std::path::Path::new("/tmp/user's project"),
+            Some("019f7bf1-3a18-7793-b9d6-206a1aa7ac0c"),
+        )
+        .expect("write resume hint");
+
+        let output = String::from_utf8(output).expect("hint is UTF-8");
+        assert!(output.contains("Resume this session with:"));
+        assert!(output.contains("--workspace"));
+        assert!(output.contains("--resume 019f7bf1-3a18-7793-b9d6-206a1aa7ac0c"));
+        assert!(output.contains("Nako Agent/nako-agent"));
+        assert!(output.contains("user"));
+    }
+
+    #[test]
+    fn exit_hint_is_omitted_before_a_session_is_persisted() {
+        let mut output = Vec::new();
+        super::write_resume_hint(
+            &mut output,
+            std::path::Path::new("nako-agent"),
+            std::path::Path::new("/tmp/project"),
+            None,
+        )
+        .expect("skip resume hint");
+
+        assert!(output.is_empty());
+    }
 
     #[test]
     fn f1_toggles_help_without_editing_the_draft() {
