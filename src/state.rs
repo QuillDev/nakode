@@ -272,6 +272,13 @@ struct SubagentHitRegion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ToolOutputHitRegion {
+    key: String,
+    top_left: ScreenPoint,
+    bottom_right: ScreenPoint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct OAuthLinkHitRegion {
     url: String,
     top_left: ScreenPoint,
@@ -420,6 +427,7 @@ pub struct AppState {
     subagent_executions: HashMap<String, SubagentExecution>,
     subagent_chats: HashMap<String, SubagentChat>,
     subagent_hit_regions: Vec<SubagentHitRegion>,
+    tool_output_hit_regions: Vec<ToolOutputHitRegion>,
     oauth_link_hit_region: Option<OAuthLinkHitRegion>,
     transcript_limit: usize,
 }
@@ -519,6 +527,7 @@ impl AppState {
             subagent_executions: HashMap::new(),
             subagent_chats: HashMap::new(),
             subagent_hit_regions: Vec::new(),
+            tool_output_hit_regions: Vec::new(),
             oauth_link_hit_region: None,
             transcript_limit: scrollback,
         }
@@ -714,6 +723,53 @@ impl AppState {
             .collect();
     }
 
+    pub fn set_tool_output_hit_regions(
+        &mut self,
+        regions: Vec<(String, ScreenPoint, ScreenPoint)>,
+    ) {
+        self.tool_output_hit_regions = regions
+            .into_iter()
+            .map(|(key, top_left, bottom_right)| ToolOutputHitRegion {
+                key,
+                top_left,
+                bottom_right,
+            })
+            .collect();
+    }
+
+    pub fn toggle_tool_output_at(&mut self, point: ScreenPoint) -> bool {
+        let Some(key) = self
+            .tool_output_hit_regions
+            .iter()
+            .find(|region| {
+                point.column >= region.top_left.column
+                    && point.column < region.bottom_right.column
+                    && point.row >= region.top_left.row
+                    && point.row < region.bottom_right.row
+            })
+            .map(|region| region.key.clone())
+        else {
+            return false;
+        };
+        let expanded = if let Some(run_id) = self.subagent_modal.as_deref() {
+            self.subagent_chats
+                .get_mut(run_id)
+                .and_then(|chat| chat.transcript.toggle_tool_output(&key))
+        } else {
+            self.transcript.toggle_tool_output(&key)
+        };
+        let Some(expanded) = expanded else {
+            return false;
+        };
+        self.clear_text_selection();
+        self.set_status(if expanded {
+            "Expanded tool output."
+        } else {
+            "Collapsed tool output."
+        });
+        true
+    }
+
     pub fn open_subagent_at(&mut self, point: ScreenPoint) -> bool {
         let Some(run_id) = self
             .subagent_hit_regions
@@ -856,6 +912,7 @@ impl AppState {
                 "Interrupted when the previous client exited".clone_into(&mut latest_activity);
             }
             let mut transcript = Transcript::new(self.transcript_limit);
+            transcript.set_stream_label(record.agent.clone());
             for entry in record.transcript {
                 if let Some(key) = entry.key {
                     transcript.upsert(key, entry.kind, entry.title, entry.body, entry.status);
@@ -2352,6 +2409,7 @@ impl AppState {
             .pending_session_prompt
             .take()
             .or_else(|| self.starting_turn.take());
+        self.transcript.set_stream_active(false);
         self.provider_session_id = None;
         self.active_turn = None;
         self.creating_session = None;
@@ -2368,6 +2426,7 @@ impl AppState {
             .pending_session_prompt
             .take()
             .or_else(|| self.starting_turn.take());
+        self.transcript.set_stream_active(false);
         self.connection = ConnectionState::Disconnected(reason.clone());
         self.active_turn = None;
         self.creating_session = None;
@@ -2412,6 +2471,7 @@ impl AppState {
             &prompt.text,
             EntryStatus::Complete,
         );
+        self.transcript.set_stream_active(true);
         self.scroll_from_bottom = 0;
 
         if let Some(provider_session_id) = self.provider_session_id.clone() {
@@ -2514,6 +2574,7 @@ impl AppState {
 
         self.active_turn = None;
         self.starting_turn = None;
+        self.transcript.set_stream_active(false);
         if self
             .pending_steer
             .as_ref()
@@ -2717,6 +2778,7 @@ impl AppState {
     }
 
     fn restore_failed_prompt(&mut self, prompt: &OutgoingPrompt) {
+        self.transcript.set_stream_active(false);
         self.transcript
             .set_status(&format!("user:{}", prompt.id), EntryStatus::Failed);
         self.pending_handoff.clone_from(&prompt.handoff);
@@ -2782,6 +2844,8 @@ impl AppState {
         self.subagents.push(run.clone());
         self.sync_inline_subagent(&run);
         let mut transcript = Transcript::new(self.transcript_limit);
+        transcript.set_stream_label(definition.slug.clone());
+        transcript.set_stream_active(true);
         transcript.push(
             EntryKind::User,
             "PARENT",
@@ -3895,6 +3959,46 @@ model = "openai-codex/model-a"
 
         assert!(!state.is_busy());
         assert_eq!(state.status_message, "prompt failed");
+    }
+
+    #[test]
+    fn prompt_lifecycle_drives_the_nako_stream_spinner() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("thread-1".to_owned());
+        state.editor.set_text("inspect the project");
+        state.submit_editor();
+
+        let active = state.transcript.visible(80, 10, 0);
+        assert!(
+            active
+                .lines
+                .iter()
+                .any(|line| line.tone == crate::transcript::LineTone::AgentPending)
+        );
+
+        state.handle_backend(BackendEvent::TurnStarted {
+            turn_id: "turn-1".to_owned(),
+        });
+        state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Completed,
+            error: None,
+        });
+
+        let complete = state.transcript.visible(80, 10, 0);
+        assert!(
+            complete
+                .lines
+                .iter()
+                .any(|line| line.text == "Nako"
+                    && line.tone == crate::transcript::LineTone::Assistant)
+        );
+        assert!(
+            !complete
+                .lines
+                .iter()
+                .any(|line| line.tone == crate::transcript::LineTone::AgentPending)
+        );
     }
 
     #[test]

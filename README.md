@@ -88,7 +88,11 @@ never exported to child provider processes. Models are referenced uniformly as
 unified catalog, and model selection routes new work to that provider. Both
 model catalogs are discovered through their authenticated native transports
 and cached in SQLite. Direct in-process turns currently support interruption;
-turn steering remains explicitly unsupported.
+turn steering remains explicitly unsupported. OpenAI model requests retry
+transient connection failures, rate limits, lock conflicts, timeouts, and server
+errors up to three times with cancellation-aware exponential backoff. A response
+is never retried after visible text or reasoning has streamed, avoiding duplicate
+transcript content and tool calls.
 
 ## Controls
 
@@ -153,12 +157,21 @@ from any directory.
   terminal redraws to roughly 30 FPS.
 - Restores raw mode, alternate screen, cursor, mouse capture, colors, and
   bracketed paste on normal exit, panic, `SIGINT`, `SIGTERM`, and `SIGHUP`.
+- Emits a terminal BEL when the primary turn finishes so supported terminals can
+  provide an audible or visual completion notification.
 
 Agent responses and reasoning render GitHub-flavored Markdown in the transcript,
 including headings, emphasis, links, block quotes, ordered and unordered lists,
 task checkboxes, tables, inline code, and fenced code blocks. Fenced blocks use
 their language tag for syntax highlighting. Tool output and diffs retain their
-provider-neutral semantic coloring.
+provider-neutral semantic coloring. Each turn renders as a `User` prompt followed
+by one `Nako` activity stream containing reasoning, tool calls, tool output, and
+the final response. The Nako header shows an animated spinner while the turn is
+active. Per-item kind headers and opaque tool-call IDs are omitted, while
+meaningful tool names and action summaries remain visible. Every tool result is
+collapsed to one row by default, such as `▸ read src/state.rs` or
+`▸ bash cargo test`. The complete result remains available to the model and
+session history; click the tool row to expand it and the footer to collapse it.
 
 ## Portable tools
 

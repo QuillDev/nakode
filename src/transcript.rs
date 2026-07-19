@@ -1,8 +1,12 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use unicode_width::UnicodeWidthChar;
 
 use crate::markdown::render_markdown;
+
 pub use crate::markdown::{
     MarkdownModifier, MarkdownModifiers, MarkdownSpan, MarkdownStyle, MarkdownTone,
 };
@@ -42,6 +46,7 @@ pub enum LineTone {
     Muted,
     User,
     Assistant,
+    AgentPending,
     Steering,
     Reasoning,
     Tool,
@@ -81,6 +86,9 @@ pub struct Transcript {
     cache_width: usize,
     cache_revision: u64,
     cache: Vec<ProjectedLine>,
+    stream_active: bool,
+    stream_label: String,
+    expanded_tools: HashSet<String>,
 }
 
 impl Transcript {
@@ -94,6 +102,9 @@ impl Transcript {
             cache_width: 0,
             cache_revision: 0,
             cache: Vec::new(),
+            stream_active: false,
+            stream_label: "Nako".to_owned(),
+            expanded_tools: HashSet::new(),
         }
     }
 
@@ -105,7 +116,42 @@ impl Transcript {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.item_indices.clear();
+        self.expanded_tools.clear();
+        self.stream_active = false;
         self.changed();
+    }
+
+    pub fn set_stream_active(&mut self, active: bool) {
+        if self.stream_active != active {
+            self.stream_active = active;
+            self.changed();
+        }
+    }
+
+    pub fn set_stream_label(&mut self, label: impl Into<String>) {
+        let label = label.into();
+        if self.stream_label != label {
+            self.stream_label = label;
+            self.changed();
+        }
+    }
+
+    pub fn toggle_tool_output(&mut self, key: &str) -> Option<bool> {
+        let is_tool = self
+            .item_indices
+            .get(key)
+            .is_some_and(|index| self.entries[*index].kind == EntryKind::Tool);
+        if !is_tool {
+            return None;
+        }
+        let expanded = if self.expanded_tools.remove(key) {
+            false
+        } else {
+            self.expanded_tools.insert(key.to_owned());
+            true
+        };
+        self.changed();
+        Some(expanded)
     }
 
     pub fn push(
@@ -192,6 +238,7 @@ impl Transcript {
             return;
         };
         self.entries.remove(index);
+        self.expanded_tools.remove(key);
         self.reindex();
         self.changed();
     }
@@ -204,7 +251,8 @@ impl Transcript {
                 changed = true;
             }
         }
-        if changed {
+        if changed || self.stream_active {
+            self.stream_active = false;
             self.changed();
         }
     }
@@ -248,6 +296,11 @@ impl Transcript {
                 self.item_indices.insert(key.clone(), index);
             }
         }
+        self.expanded_tools.retain(|key| {
+            self.item_indices
+                .get(key)
+                .is_some_and(|index| self.entries[*index].kind == EntryKind::Tool)
+        });
     }
 
     fn rebuild_cache(&mut self, width: usize) {
@@ -255,9 +308,57 @@ impl Transcript {
             return;
         }
 
+        let last_user_index = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.kind == EntryKind::User);
         let mut projected = Vec::new();
-        for entry in &self.entries {
-            project_entry(entry, width, &mut projected);
+        let mut stream_header_shown = false;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.kind == EntryKind::User {
+                stream_header_shown = false;
+            }
+            if is_agent_stream(entry) && !stream_header_shown {
+                let active =
+                    self.stream_active && last_user_index.is_none_or(|last_user| index > last_user);
+                project_stream_header(
+                    &self.stream_label,
+                    active,
+                    entry.key.clone(),
+                    &mut projected,
+                );
+                stream_header_shown = true;
+            }
+
+            let line_count = projected.len();
+            let expanded = entry
+                .key
+                .as_ref()
+                .is_some_and(|key| self.expanded_tools.contains(key));
+            project_entry(entry, width, expanded, &mut projected);
+            let next = self.entries.get(index + 1);
+            if projected.len() > line_count
+                && next.is_some_and(|next| needs_gap_between(entry, next))
+                && projected.last().is_some_and(|line| !line.text.is_empty())
+            {
+                projected.push(blank_line(entry.key.clone()));
+            }
+        }
+        let waiting_after_user = self.entries.last().is_some_and(|entry| {
+            entry.kind == EntryKind::User && entry.status == EntryStatus::Complete
+        });
+        if !stream_header_shown && (self.stream_active || waiting_after_user) {
+            if projected.last().is_some_and(|line| !line.text.is_empty()) {
+                projected.push(blank_line(
+                    self.entries.last().and_then(|entry| entry.key.clone()),
+                ));
+            }
+            project_stream_header(
+                &self.stream_label,
+                self.stream_active,
+                self.entries.last().and_then(|entry| entry.key.clone()),
+                &mut projected,
+            );
         }
         if projected.is_empty() {
             projected.push(ProjectedLine {
@@ -275,60 +376,191 @@ impl Transcript {
     }
 }
 
-fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<ProjectedLine>) {
-    if entry
+fn project_stream_header(
+    label: &str,
+    active: bool,
+    source_key: Option<String>,
+    output: &mut Vec<ProjectedLine>,
+) {
+    output.push(ProjectedLine {
+        text: if active {
+            format!("⠋ {label}")
+        } else {
+            label.to_owned()
+        },
+        spans: Vec::new(),
+        tone: if active {
+            LineTone::AgentPending
+        } else {
+            LineTone::Assistant
+        },
+        bold: true,
+        source_key,
+    });
+}
+
+fn is_agent_stream(entry: &TranscriptEntry) -> bool {
+    !is_subagent(entry)
+        && matches!(
+            entry.kind,
+            EntryKind::Assistant
+                | EntryKind::Reasoning
+                | EntryKind::Tool
+                | EntryKind::Diff
+                | EntryKind::Warning
+                | EntryKind::Error
+        )
+}
+
+fn project_entry(
+    entry: &TranscriptEntry,
+    width: usize,
+    expanded: bool,
+    output: &mut Vec<ProjectedLine>,
+) {
+    if is_subagent(entry) {
+        project_subagent(entry, width, output);
+        return;
+    }
+    project_header(entry, width, expanded, output);
+    project_body(entry, width, expanded, output);
+}
+
+fn is_subagent(entry: &TranscriptEntry) -> bool {
+    entry
         .key
         .as_deref()
         .is_some_and(|key| key.starts_with("subagent:"))
-    {
-        let pending = entry.status == EntryStatus::Running;
-        let status = if pending {
-            "⠋ pending"
-        } else {
-            "✓ completed"
-        };
-        let objective_width = width.saturating_sub(14);
-        let objective = entry.body.lines().next().unwrap_or_default().trim();
-        output.push(ProjectedLine {
-            text: format!(
-                " {status:<11} {}",
-                truncate_display(objective, objective_width)
-            ),
-            spans: Vec::new(),
-            tone: if pending {
-                LineTone::SubagentPending
-            } else {
-                LineTone::SubagentComplete
-            },
-            bold: false,
-            source_key: entry.key.clone(),
-        });
-        return;
-    }
-    let status = match entry.status {
-        EntryStatus::Running => "  · running",
-        EntryStatus::Failed => "  · failed",
-        EntryStatus::Interrupted => "  · interrupted",
-        EntryStatus::Complete => "",
+}
+
+fn project_subagent(entry: &TranscriptEntry, width: usize, output: &mut Vec<ProjectedLine>) {
+    let pending = entry.status == EntryStatus::Running;
+    let status = if pending {
+        "⠋ pending"
+    } else {
+        "✓ completed"
     };
-    let header = format!("{}{}", entry.title, status);
+    let objective_width = width.saturating_sub(14);
+    let objective = entry.body.lines().next().unwrap_or_default().trim();
     output.push(ProjectedLine {
-        text: truncate_display(&header, width),
+        text: format!(
+            " {status:<11} {}",
+            truncate_display(objective, objective_width)
+        ),
         spans: Vec::new(),
-        tone: header_tone(entry.kind),
-        bold: true,
+        tone: if pending {
+            LineTone::SubagentPending
+        } else {
+            LineTone::SubagentComplete
+        },
+        bold: false,
         source_key: entry.key.clone(),
     });
+}
 
+fn project_header(
+    entry: &TranscriptEntry,
+    width: usize,
+    expanded: bool,
+    output: &mut Vec<ProjectedLine>,
+) {
+    let status = status_suffix(entry.status);
+    let header = match entry.kind {
+        EntryKind::User => Some((
+            format!("{}{status}", user_label(entry)),
+            LineTone::User,
+            true,
+        )),
+        EntryKind::Assistant | EntryKind::Reasoning => {
+            if matches!(entry.status, EntryStatus::Failed | EntryStatus::Interrupted) {
+                Some((format!("  · response{status}"), LineTone::Error, false))
+            } else {
+                None
+            }
+        }
+        EntryKind::Tool => Some(tool_header(entry, status, expanded)),
+        _ => Some((
+            format!("{}{}", entry.title, status),
+            header_tone(entry.kind),
+            true,
+        )),
+    };
+    let Some((text, tone, bold)) = header else {
+        return;
+    };
+    output.push(ProjectedLine {
+        text: truncate_display(&text, width),
+        spans: Vec::new(),
+        tone,
+        bold,
+        source_key: entry.key.clone(),
+    });
+}
+
+fn user_label(entry: &TranscriptEntry) -> &'static str {
+    if entry
+        .title
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("parent"))
+    {
+        "Parent"
+    } else {
+        "User"
+    }
+}
+
+fn tool_header(entry: &TranscriptEntry, status: &str, expanded: bool) -> (String, LineTone, bool) {
+    let title = entry.title.trim();
+    let normalized = title.to_ascii_lowercase();
+    let generic = normalized == "tool output"
+        || normalized == "tool result"
+        || normalized.starts_with("tool result · call_");
+    let label = if generic || title.is_empty() {
+        "tool".to_owned()
+    } else {
+        title.replace(" · ", " ")
+    };
+    let icon = if entry.status == EntryStatus::Running {
+        "⠋"
+    } else if entry.key.is_none() {
+        "•"
+    } else if expanded {
+        "▾"
+    } else {
+        "▸"
+    };
+    (format!("{icon} {label}{status}"), LineTone::Tool, false)
+}
+
+const fn status_suffix(status: EntryStatus) -> &'static str {
+    match status {
+        EntryStatus::Running => " · running",
+        EntryStatus::Failed => " · failed",
+        EntryStatus::Interrupted => " · interrupted",
+        EntryStatus::Complete => "",
+    }
+}
+
+fn project_body(
+    entry: &TranscriptEntry,
+    width: usize,
+    expanded: bool,
+    output: &mut Vec<ProjectedLine>,
+) {
     let body_width = width.saturating_sub(2).max(1);
-    if entry.body.is_empty() && entry.status == EntryStatus::Running {
-        output.push(ProjectedLine {
-            text: "  …".to_owned(),
-            spans: Vec::new(),
-            tone: LineTone::Muted,
-            bold: false,
-            source_key: entry.key.clone(),
-        });
+    if entry.kind == EntryKind::Tool && !expanded {
+        return;
+    }
+    if entry.body.is_empty() {
+        if entry.status == EntryStatus::Running {
+            output.push(ProjectedLine {
+                text: "  …".to_owned(),
+                spans: Vec::new(),
+                tone: LineTone::Muted,
+                bold: false,
+                source_key: entry.key.clone(),
+            });
+        }
     } else if matches!(entry.kind, EntryKind::Assistant | EntryKind::Reasoning) {
         let tone = if entry.kind == EntryKind::Reasoning {
             LineTone::Reasoning
@@ -345,33 +577,75 @@ fn project_entry(entry: &TranscriptEntry, width: usize, output: &mut Vec<Project
             });
         }
     } else {
-        let mut in_code_block = false;
-        for raw_line in entry.body.split('\n') {
-            let trimmed = raw_line.trim_start();
-            if trimmed.starts_with("```") {
-                in_code_block = !in_code_block;
-            }
-            let tone = body_tone(entry.kind, trimmed, in_code_block);
-            let wrapped = wrap_display(raw_line, body_width);
-            for line in wrapped {
-                output.push(ProjectedLine {
-                    text: format!("  {line}"),
-                    spans: Vec::new(),
-                    tone,
-                    bold: trimmed.starts_with('#'),
-                    source_key: entry.key.clone(),
-                });
-            }
+        let body = if entry.kind == EntryKind::Tool {
+            expanded_tool_output(entry)
+        } else {
+            Cow::Borrowed(entry.body.as_str())
+        };
+        project_plain_body(entry, &body, body_width, output);
+    }
+}
+
+fn expanded_tool_output(entry: &TranscriptEntry) -> Cow<'_, str> {
+    if entry.key.is_some() {
+        Cow::Owned(format!(
+            "{}\n… full output · click to collapse",
+            entry.body.trim_end_matches('\n')
+        ))
+    } else {
+        Cow::Borrowed(&entry.body)
+    }
+}
+
+pub(crate) fn is_tool_toggle_marker(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with('▸')
+        || line.starts_with('▾')
+        || (line.starts_with('…') && line.ends_with("click to collapse"))
+}
+
+fn project_plain_body(
+    entry: &TranscriptEntry,
+    body: &str,
+    body_width: usize,
+    output: &mut Vec<ProjectedLine>,
+) {
+    let mut in_code_block = false;
+    for raw_line in body.trim_end_matches('\n').split('\n') {
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+        }
+        let tone = body_tone(entry.kind, trimmed, in_code_block);
+        let wrapped = wrap_display(raw_line, body_width);
+        for line in wrapped {
+            output.push(ProjectedLine {
+                text: format!("  {line}"),
+                spans: Vec::new(),
+                tone,
+                bold: trimmed.starts_with('#'),
+                source_key: entry.key.clone(),
+            });
         }
     }
+}
 
-    output.push(ProjectedLine {
+fn needs_gap_between(current: &TranscriptEntry, next: &TranscriptEntry) -> bool {
+    if is_subagent(current) || is_subagent(next) {
+        return false;
+    }
+    let is_activity = |entry: &TranscriptEntry| is_agent_stream(entry);
+    !is_activity(current) || !is_activity(next)
+}
+
+fn blank_line(source_key: Option<String>) -> ProjectedLine {
+    ProjectedLine {
         text: String::new(),
         spans: Vec::new(),
         tone: LineTone::Body,
         bold: false,
-        source_key: entry.key.clone(),
-    });
+        source_key,
+    }
 }
 
 fn markdown_source(entry: &TranscriptEntry) -> Cow<'_, str> {
@@ -397,7 +671,9 @@ fn header_tone(kind: EntryKind) -> LineTone {
 }
 
 fn body_tone(kind: EntryKind, line: &str, in_code_block: bool) -> LineTone {
-    if kind == EntryKind::Diff || line.starts_with("diff --git") || line.starts_with("@@") {
+    if is_tool_toggle_marker(line) {
+        LineTone::Muted
+    } else if kind == EntryKind::Diff || line.starts_with("diff --git") || line.starts_with("@@") {
         if line.starts_with('+') && !line.starts_with("+++") {
             LineTone::DiffAdd
         } else if line.starts_with('-') && !line.starts_with("---") {
@@ -508,6 +784,252 @@ mod tests {
     }
 
     #[test]
+    fn agent_activity_projects_as_one_compact_stream() {
+        let mut transcript = Transcript::new(100);
+        transcript.push(
+            EntryKind::User,
+            "You",
+            "Commit the changes.",
+            EntryStatus::Complete,
+        );
+        transcript.push(
+            EntryKind::Reasoning,
+            "Reasoning",
+            "**Planning the commit**",
+            EntryStatus::Complete,
+        );
+        transcript.upsert(
+            "tool-generic",
+            EntryKind::Tool,
+            "Tool result · call_opaque",
+            "tree-object\n",
+            EntryStatus::Complete,
+        );
+        transcript.upsert(
+            "tool-commit",
+            EntryKind::Tool,
+            "bash · git commit",
+            "[main abc123] commit\n",
+            EntryStatus::Complete,
+        );
+        transcript.push(
+            EntryKind::Reasoning,
+            "Reasoning",
+            "**Verifying status**",
+            EntryStatus::Complete,
+        );
+        transcript.push(
+            EntryKind::Assistant,
+            "Assistant",
+            "Committed successfully.",
+            EntryStatus::Complete,
+        );
+
+        let visible = transcript.visible(100, 30, 0);
+        let text = visible
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(text.contains(&"User"));
+        assert_eq!(text.iter().filter(|line| **line == "Nako").count(), 1);
+        assert!(!text.contains(&"Reasoning"));
+        assert!(!text.contains(&"Assistant"));
+        assert!(!text.iter().any(|line| line.contains("call_opaque")));
+        assert!(text.contains(&"▸ bash git commit"));
+
+        let activity_start = text
+            .iter()
+            .position(|line| line.contains("Planning the commit"))
+            .expect("reasoning starts the activity stream");
+        let activity_end = text
+            .iter()
+            .position(|line| line.contains("Verifying status"))
+            .expect("reasoning ends the activity stream");
+        assert!(
+            text[activity_start..=activity_end]
+                .iter()
+                .all(|line| !line.is_empty())
+        );
+        assert_eq!(text.last(), Some(&"  Committed successfully."));
+    }
+
+    #[test]
+    fn tool_output_is_hidden_until_expanded() {
+        let mut transcript = Transcript::new(100);
+        let output = std::iter::once("running 159 tests".to_owned())
+            .chain((0..159).map(|index| format!("test suite::case_{index} ... ok")))
+            .chain(std::iter::once(
+                "test result: ok. 159 passed; 0 failed".to_owned(),
+            ))
+            .collect::<Vec<_>>()
+            .join("\n");
+        transcript.upsert(
+            "tool-1",
+            EntryKind::Tool,
+            "bash · cargo test",
+            &output,
+            EntryStatus::Complete,
+        );
+
+        let collapsed = transcript.visible(100, 30, 0);
+        let collapsed_text = collapsed
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed_text.contains("▸ bash cargo test"));
+        assert!(!collapsed_text.contains("running 159 tests"));
+        assert!(!collapsed_text.contains("test result: ok. 159 passed; 0 failed"));
+        assert!(!collapsed_text.contains("case_80"));
+        assert_eq!(transcript.entries()[0].body, output);
+
+        assert_eq!(transcript.toggle_tool_output("tool-1"), Some(true));
+        let expanded = transcript.visible(100, 300, 0);
+        let expanded_text = expanded
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded_text.contains("case_80"));
+        assert!(expanded_text.contains("full output · click to collapse"));
+        assert_eq!(transcript.toggle_tool_output("tool-1"), Some(false));
+    }
+
+    #[test]
+    fn short_tool_output_is_also_collapsed_by_default() {
+        let mut transcript = Transcript::new(100);
+        transcript.upsert(
+            "tool-1",
+            EntryKind::Tool,
+            "bash · git status",
+            "clean\nready",
+            EntryStatus::Complete,
+        );
+
+        let visible = transcript.visible(80, 20, 0);
+        let text = visible
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("▸ bash git status"));
+        assert!(!text.contains("clean"));
+        assert!(!text.contains("ready"));
+
+        assert_eq!(transcript.toggle_tool_output("tool-1"), Some(true));
+        let expanded = transcript.visible(80, 20, 0);
+        let expanded_text = expanded
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded_text.contains("clean\n  ready"));
+        assert!(expanded_text.contains("click to collapse"));
+    }
+
+    #[test]
+    fn failed_tool_output_is_collapsed_but_status_remains_visible() {
+        let mut transcript = Transcript::new(100);
+        let output = (0..40)
+            .map(|index| {
+                if index == 39 {
+                    "fatal: final actionable error".to_owned()
+                } else {
+                    format!("diagnostic line {index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        transcript.upsert(
+            "tool-1",
+            EntryKind::Tool,
+            "bash · cargo test",
+            output,
+            EntryStatus::Failed,
+        );
+
+        let visible = transcript.visible(100, 30, 0);
+        let text = visible
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("▸ bash cargo test · failed"));
+        assert!(!text.contains("fatal: final actionable error"));
+
+        assert_eq!(transcript.toggle_tool_output("tool-1"), Some(true));
+        let expanded = transcript.visible(100, 60, 0);
+        let expanded_text = expanded
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded_text.contains("fatal: final actionable error"));
+    }
+
+    #[test]
+    fn active_turn_shows_one_nako_spinner_before_items_arrive() {
+        let mut transcript = Transcript::new(100);
+        transcript.push(
+            EntryKind::User,
+            "YOU · msg-1",
+            "Investigate the issue.",
+            EntryStatus::Complete,
+        );
+        transcript.set_stream_active(true);
+
+        let waiting = transcript.visible(80, 10, 0);
+        assert_eq!(
+            waiting
+                .lines
+                .iter()
+                .filter(|line| line.tone == LineTone::AgentPending)
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["⠋ Nako"]
+        );
+
+        transcript.append_delta(
+            "reasoning-1",
+            EntryKind::Reasoning,
+            "Reasoning",
+            "**Checking the code**",
+        );
+        let streaming = transcript.visible(80, 10, 0);
+        assert_eq!(
+            streaming
+                .lines
+                .iter()
+                .filter(|line| line.text.contains("Nako"))
+                .count(),
+            1
+        );
+
+        transcript.set_stream_active(false);
+        transcript.set_status("reasoning-1", EntryStatus::Complete);
+        let complete = transcript.visible(80, 10, 0);
+        assert!(
+            complete
+                .lines
+                .iter()
+                .any(|line| line.text == "Nako" && line.tone == LineTone::Assistant)
+        );
+        assert!(
+            !complete
+                .lines
+                .iter()
+                .any(|line| line.tone == LineTone::AgentPending)
+        );
+    }
+
+    #[test]
     fn assistant_markdown_is_projected_as_styled_content() {
         let mut transcript = Transcript::new(100);
         transcript.push(
@@ -569,13 +1091,15 @@ mod tests {
     #[test]
     fn control_sequences_are_rendered_as_data() {
         let mut transcript = Transcript::new(100);
-        transcript.push(
+        transcript.upsert(
+            "tool-1",
             EntryKind::Tool,
             "tool",
             "ok\u{1b}[31m",
             EntryStatus::Complete,
         );
 
+        assert_eq!(transcript.toggle_tool_output("tool-1"), Some(true));
         let visible = transcript.visible(80, 10, 0);
         assert!(visible.lines.iter().any(|line| line.text.contains("�[31m")));
     }

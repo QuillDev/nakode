@@ -28,6 +28,8 @@ pub enum ConversationItem {
     },
     ToolResult {
         call_id: String,
+        #[serde(default)]
+        title: Option<String>,
         output: String,
         failed: bool,
     },
@@ -206,6 +208,7 @@ impl AgentRuntime {
             let Some(tool) = self.tools.find(&tool_call.name) else {
                 session.history.push(ConversationItem::ToolResult {
                     call_id: tool_call.id,
+                    title: Some(format!("{} · unavailable", tool_call.name)),
                     output: format!("unknown tool {}", tool_call.name),
                     failed: true,
                 });
@@ -250,7 +253,7 @@ impl AgentRuntime {
                     item: NormalizedItem {
                         id: item_id,
                         kind: ItemKind::Tool,
-                        title,
+                        title: title.clone(),
                         body: body.clone(),
                         status: if failed {
                             ItemStatus::Failed
@@ -263,6 +266,7 @@ impl AgentRuntime {
                 .map_err(|_| "backend event receiver closed".to_owned())?;
             session.history.push(ConversationItem::ToolResult {
                 call_id: tool_call.id,
+                title: Some(title),
                 output: body,
                 failed,
             });
@@ -393,15 +397,16 @@ fn normalize_history_item(
             items
         }
         ConversationItem::ToolResult {
-            call_id,
+            title,
             output,
             failed,
+            ..
         } => vec![SessionHistoryItem {
             turn_id: turn_id.clone(),
             item: NormalizedItem {
                 id: item_id("tool"),
                 kind: ItemKind::Tool,
-                title: format!("Tool result · {call_id}"),
+                title: title.clone().unwrap_or_else(|| "Tool result".to_owned()),
                 body: output.clone(),
                 status: if *failed {
                     ItemStatus::Failed
@@ -491,7 +496,7 @@ mod tests {
         AgentRuntime, InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest,
         QuestionBroker, RuntimeSession, RuntimeSessionStore, ToolCall,
     };
-    use crate::backend::{BackendEvent, QuestionOption, QuestionRequest};
+    use crate::backend::{BackendEvent, ItemKind, QuestionOption, QuestionRequest};
     use crate::session::SqliteSessionRepository;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -552,6 +557,32 @@ mod tests {
             .expect("turn completes after more than 64 tool rounds");
 
         assert_eq!(provider.calls.load(Ordering::SeqCst), 66);
+        let tool_items = session
+            .normalized_history()
+            .into_iter()
+            .filter(|history| history.item.kind == ItemKind::Tool)
+            .collect::<Vec<_>>();
+        assert_eq!(tool_items.len(), 65);
+        assert!(
+            tool_items
+                .iter()
+                .all(|history| history.item.title == "todo · view")
+        );
+    }
+
+    #[test]
+    fn legacy_tool_history_omits_opaque_call_ids_when_resumed() {
+        let tool_result: super::ConversationItem = serde_json::from_str(
+            r#"{"ToolResult":{"call_id":"call_opaque","output":"ok","failed":false}}"#,
+        )
+        .expect("deserialize legacy tool result");
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        session.history.push(tool_result);
+
+        let history = session.normalized_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].item.title, "Tool result");
+        assert!(!history[0].item.title.contains("call_opaque"));
     }
 
     #[test]

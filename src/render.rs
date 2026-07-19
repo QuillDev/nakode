@@ -11,7 +11,10 @@ use crate::{
     commands,
     selection::{ScreenPoint, ScreenSnapshot},
     state::AppState,
-    transcript::{LineTone, MarkdownModifier, MarkdownSpan, MarkdownTone, ProjectedLine},
+    transcript::{
+        LineTone, MarkdownModifier, MarkdownSpan, MarkdownTone, ProjectedLine,
+        is_tool_toggle_marker,
+    },
 };
 
 // Nako Agent shares the opaque pink-on-black visual language used across Quill's apps.
@@ -222,6 +225,11 @@ fn render_header(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+struct TranscriptHitRegions {
+    subagents: Vec<(String, ScreenPoint, ScreenPoint)>,
+    tool_outputs: Vec<(String, ScreenPoint, ScreenPoint)>,
+}
+
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let hit_regions = render_transcript_view(
         frame,
@@ -230,7 +238,8 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         &mut state.scroll_from_bottom,
         Line::default(),
     );
-    state.set_subagent_hit_regions(hit_regions);
+    state.set_subagent_hit_regions(hit_regions.subagents);
+    state.set_tool_output_hit_regions(hit_regions.tool_outputs);
 }
 
 fn render_transcript_view(
@@ -239,7 +248,7 @@ fn render_transcript_view(
     transcript: &mut crate::transcript::Transcript,
     scroll_from_bottom: &mut usize,
     title: Line<'static>,
-) -> Vec<(String, ScreenPoint, ScreenPoint)> {
+) -> TranscriptHitRegions {
     let block = panel_block(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -250,7 +259,7 @@ fn render_transcript_view(
     *scroll_from_bottom = (*scroll_from_bottom).min(max_scroll);
     let visible = transcript.visible(width, height, *scroll_from_bottom);
 
-    let hit_regions = visible
+    let subagents = visible
         .lines
         .iter()
         .enumerate()
@@ -266,6 +275,25 @@ fn render_transcript_view(
             ))
         })
         .collect();
+    let tool_outputs = visible
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, line)| {
+            if !is_tool_toggle_marker(&line.text) {
+                return None;
+            }
+            let key = line.source_key.clone()?;
+            let row = inner
+                .y
+                .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+            Some((
+                key,
+                ScreenPoint::new(inner.x, row),
+                ScreenPoint::new(inner.right(), row.saturating_add(1)),
+            ))
+        })
+        .collect();
 
     let lines = visible
         .lines
@@ -273,7 +301,10 @@ fn render_transcript_view(
         .map(transcript_line)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-    hit_regions
+    TranscriptHitRegions {
+        subagents,
+        tool_outputs,
+    }
 }
 
 fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -405,9 +436,13 @@ fn render_subagent_modal(frame: &mut Frame<'_>, area: Rect, state: &mut AppState
             Style::default().fg(MUTED),
         ),
     ]);
-    if let Some((transcript, scroll)) = state.selected_subagent_transcript_mut() {
-        let _ = render_transcript_view(frame, popup, transcript, scroll, title);
-    }
+    let tool_outputs = if let Some((transcript, scroll)) = state.selected_subagent_transcript_mut()
+    {
+        render_transcript_view(frame, popup, transcript, scroll, title).tool_outputs
+    } else {
+        Vec::new()
+    };
+    state.set_tool_output_hit_regions(tool_outputs);
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<Position> {
@@ -1204,7 +1239,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn transcript_line(line: ProjectedLine) -> Line<'static> {
     let color = match line.tone {
         LineTone::Muted | LineTone::Reasoning => MUTED,
-        LineTone::User => ACCENT_BRIGHT,
+        LineTone::User | LineTone::AgentPending => ACCENT_BRIGHT,
         LineTone::Steering => ACCENT_DEEP,
         LineTone::Tool | LineTone::Warning => WARNING,
         LineTone::DiffAdd | LineTone::SubagentComplete => SUCCESS,
@@ -1217,8 +1252,13 @@ fn transcript_line(line: ProjectedLine) -> Line<'static> {
         style = style.add_modifier(Modifier::BOLD);
     }
     if line.spans.is_empty() {
-        let text = if line.tone == LineTone::SubagentPending {
-            line.text.replacen('⠋', subagent_spinner(), 1)
+        let animated_tool = line.tone == LineTone::Tool && line.text.starts_with('⠋');
+        let text = if animated_tool
+            || matches!(
+                line.tone,
+                LineTone::AgentPending | LineTone::SubagentPending
+            ) {
+            line.text.replacen('⠋', spinner_frame(), 1)
         } else {
             line.text
         };
@@ -1262,7 +1302,7 @@ fn markdown_span(span: MarkdownSpan, mut style: Style) -> Span<'static> {
     Span::styled(span.text, style)
 }
 
-fn subagent_spinner() -> &'static str {
+fn spinner_frame() -> &'static str {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let tick = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1572,7 +1612,7 @@ mod tests {
 
         assert!(rendered.contains("explorer"));
         assert!(rendered.contains("Map authentication"));
-        assert!(rendered.contains("PARENT"));
+        assert!(rendered.contains("Parent"));
         assert!(rendered.contains("Delegated task"));
     }
 

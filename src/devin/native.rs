@@ -730,6 +730,7 @@ fn conversation_prompts(
             call_id,
             output,
             failed,
+            ..
         } => vec![protocol::ChatMessagePrompt {
             message_id,
             source: 4,

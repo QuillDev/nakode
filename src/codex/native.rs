@@ -32,6 +32,8 @@ const DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const MAX_DEVICE_POLLS: usize = 120;
+const MAX_INFERENCE_ATTEMPTS: usize = 4;
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
@@ -98,6 +100,31 @@ struct CodexCredential {
     email: Option<String>,
 }
 
+#[derive(Debug)]
+struct InferenceAttemptError {
+    message: String,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+impl InferenceAttemptError {
+    fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            retry_after: None,
+        }
+    }
+
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            retry_after: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct CodexProvider {
     client: Client,
@@ -125,6 +152,45 @@ impl CodexProvider {
     ) -> Result<InferenceOutput, String> {
         let body = codex_request_body(&request);
         let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
+        for attempt in 0..MAX_INFERENCE_ATTEMPTS {
+            if cancellation.is_cancelled() {
+                return Err("turn interrupted".to_owned());
+            }
+            match self
+                .infer_attempt(
+                    &url,
+                    &body,
+                    &request.session_id,
+                    events.clone(),
+                    cancellation.clone(),
+                )
+                .await
+            {
+                Ok(output) => return Ok(output),
+                Err(error) if error.retryable && attempt + 1 < MAX_INFERENCE_ATTEMPTS => {
+                    let delay = error
+                        .retry_after
+                        .unwrap_or_else(|| retry_delay(attempt))
+                        .min(MAX_RETRY_DELAY);
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = cancellation.cancelled() => return Err("turn interrupted".to_owned()),
+                    }
+                }
+                Err(error) => return Err(error.message),
+            }
+        }
+        unreachable!("the bounded inference retry loop returns on its final attempt")
+    }
+
+    async fn infer_attempt(
+        &self,
+        url: &str,
+        body: &Value,
+        session_id: &str,
+        events: mpsc::Sender<InferenceEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<InferenceOutput, InferenceAttemptError> {
         let response = self
             .client
             .post(url)
@@ -133,18 +199,31 @@ impl CodexProvider {
             .header("OpenAI-Beta", "responses=experimental")
             .header("originator", "nako-agent")
             .header("version", CODEX_CLIENT_VERSION)
-            .header("conversation_id", &request.session_id)
-            .header("session_id", &request.session_id)
+            .header("conversation_id", session_id)
+            .header("session_id", session_id)
             .header("x-client-request-id", Uuid::now_v7().to_string())
             .header("accept", "text/event-stream")
-            .json(&body)
+            .json(body)
             .send()
             .await
-            .map_err(|error| format!("Codex request failed: {error}"))?;
+            .map_err(|error| {
+                let message = format!("Codex request failed: {error}");
+                if error.is_connect() || error.is_timeout() || error.is_request() {
+                    InferenceAttemptError::transient(message)
+                } else {
+                    InferenceAttemptError::terminal(message)
+                }
+            })?;
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = retry_after(response.headers());
             let detail = response.text().await.unwrap_or_default();
-            return Err(format!("Codex returned {status}: {detail}"));
+            let message = format!("Codex returned {status}: {detail}");
+            return Err(InferenceAttemptError {
+                message,
+                retryable: retryable_status(status),
+                retry_after,
+            });
         }
         parse_codex_sse(response, events, cancellation).await
     }
@@ -680,21 +759,76 @@ fn conversation_input(item: &ConversationItem) -> Vec<Value> {
     }
 }
 
+fn retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::CONFLICT | StatusCode::TOO_MANY_REQUESTS
+    ) || status.is_server_error()
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+fn retry_delay(attempt: usize) -> Duration {
+    #[cfg(test)]
+    {
+        let _ = attempt;
+        Duration::from_millis(1)
+    }
+    #[cfg(not(test))]
+    {
+        let exponent = u32::try_from(attempt).unwrap_or(u32::MAX).min(4);
+        Duration::from_millis(500_u64.saturating_mul(2_u64.saturating_pow(exponent)))
+    }
+}
+
+fn retryable_stream_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "server error",
+        "internal error",
+        "temporar",
+        "overload",
+        "rate limit",
+        "try again",
+        "timeout",
+        "timed out",
+        "connection",
+        "unavailable",
+    ]
+    .iter()
+    .any(|fragment| message.contains(fragment))
+}
+
 async fn parse_codex_sse(
     response: reqwest::Response,
     events: mpsc::Sender<InferenceEvent>,
     cancellation: CancellationToken,
-) -> Result<InferenceOutput, String> {
+) -> Result<InferenceOutput, InferenceAttemptError> {
     let mut stream = response.bytes_stream();
     let mut pending = String::new();
     let mut output = InferenceOutput::default();
     loop {
         let chunk = tokio::select! {
             chunk = stream.next() => chunk,
-            () = cancellation.cancelled() => return Err("turn interrupted".to_owned()),
+            () = cancellation.cancelled() => {
+                return Err(InferenceAttemptError::terminal("turn interrupted"));
+            },
         };
         let Some(chunk) = chunk else { break };
-        let chunk = chunk.map_err(|error| format!("Codex stream failed: {error}"))?;
+        let chunk = chunk.map_err(|error| {
+            let message = format!("Codex stream failed: {error}");
+            if output.text.is_empty() && output.reasoning.is_empty() {
+                InferenceAttemptError::transient(message)
+            } else {
+                InferenceAttemptError::terminal(message)
+            }
+        })?;
         pending.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(boundary) = pending.find('\n') {
             let line = pending[..boundary].trim_end_matches('\r').to_owned();
@@ -705,9 +839,19 @@ async fn parse_codex_sse(
             if data == "[DONE]" {
                 continue;
             }
-            let event: Value = serde_json::from_str(data)
-                .map_err(|error| format!("invalid Codex event: {error}"))?;
-            apply_codex_event(&event, &events, &mut output).await?;
+            let event: Value = serde_json::from_str(data).map_err(|error| {
+                InferenceAttemptError::terminal(format!("invalid Codex event: {error}"))
+            })?;
+            if let Err(message) = apply_codex_event(&event, &events, &mut output).await {
+                let retryable = output.text.is_empty()
+                    && output.reasoning.is_empty()
+                    && retryable_stream_message(&message);
+                return Err(InferenceAttemptError {
+                    message,
+                    retryable,
+                    retry_after: None,
+                });
+            }
         }
     }
     Ok(output)
@@ -1077,6 +1221,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retries_transient_model_failures_before_streaming_output() {
+        let transient_stream = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"temporary server error\"}}}\n",
+            "data: [DONE]\n"
+        );
+        let success_stream = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"response-1\"}}\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n",
+            "data: [DONE]\n"
+        );
+        let (base_url, server) = serve_sequence(vec![
+            (500, "text/plain", "server unavailable"),
+            (200, "text/event-stream", transient_stream),
+            (200, "text/event-stream", success_stream),
+        ])
+        .await;
+        let provider = CodexProvider {
+            client: Client::new(),
+            base_url,
+            credential: test_credential(),
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+
+        let output = provider
+            .infer_response(test_request(), event_tx, CancellationToken::new())
+            .await
+            .expect("transient failures are retried");
+        let requests = server.await.expect("mock server task");
+
+        assert_eq!(requests.len(), 3);
+        assert_eq!(output.text, "recovered");
+        assert!(
+            matches!(event_rx.recv().await, Some(InferenceEvent::TextDelta(delta)) if delta == "recovered")
+        );
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_non_transient_model_failures() {
+        let (base_url, server) = serve_sequence(vec![(
+            400,
+            "application/json",
+            r#"{"error":"bad request"}"#,
+        )])
+        .await;
+        let provider = CodexProvider {
+            client: Client::new(),
+            base_url,
+            credential: test_credential(),
+        };
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        let error = provider
+            .infer_response(test_request(), event_tx, CancellationToken::new())
+            .await
+            .expect_err("bad requests are terminal");
+        let requests = server.await.expect("mock server task");
+
+        assert_eq!(requests.len(), 1);
+        assert!(error.contains("400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_after_streaming_visible_output() {
+        let partial_stream = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"temporary server error\"}}}\n"
+        );
+        let (base_url, server) =
+            serve_sequence(vec![(200, "text/event-stream", partial_stream)]).await;
+        let provider = CodexProvider {
+            client: Client::new(),
+            base_url,
+            credential: test_credential(),
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+
+        let error = provider
+            .infer_response(test_request(), event_tx, CancellationToken::new())
+            .await
+            .expect_err("a visible partial stream must not be duplicated");
+        let requests = server.await.expect("mock server task");
+
+        assert_eq!(requests.len(), 1);
+        assert!(error.contains("temporary server error"));
+        assert!(
+            matches!(event_rx.recv().await, Some(InferenceEvent::TextDelta(delta)) if delta == "partial")
+        );
+    }
+
     #[test]
     fn extracts_namespaced_chatgpt_claims_from_oauth_tokens() {
         let claims = json!({
@@ -1142,6 +1377,42 @@ mod tests {
         let body = codex_request_body(&test_request());
 
         assert_eq!(body["store"], false);
+    }
+
+    async fn serve_sequence(
+        responses: Vec<(u16, &'static str, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock server address");
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for (status, content_type, body) in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut request = vec![0; 16 * 1024];
+                let read = socket.read(&mut request).await.expect("read request");
+                request.truncate(read);
+                requests.push(String::from_utf8(request).expect("UTF-8 request"));
+                let reason = if status >= 500 {
+                    "Server Error"
+                } else if status >= 400 {
+                    "Bad Request"
+                } else {
+                    "OK"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            requests
+        });
+        (format!("http://{address}"), task)
     }
 
     async fn serve_once(

@@ -91,6 +91,16 @@ impl Drop for TerminalSession {
     }
 }
 
+/// Emits the terminal bell notification.
+///
+/// # Errors
+///
+/// Returns an error when the terminal output cannot be written or flushed.
+pub fn ring_bell(output: &mut impl Write) -> io::Result<()> {
+    output.write_all(b"\x07")?;
+    output.flush()
+}
+
 fn restore_terminal() -> io::Result<()> {
     let raw_result = disable_raw_mode();
     let mut output = stdout();
@@ -116,4 +126,14 @@ fn install_panic_hook() {
             previous(info);
         }));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn terminal_bell_is_a_single_bel_character() {
+        let mut output = Vec::new();
+        super::ring_bell(&mut output).expect("write terminal bell");
+        assert_eq!(output, b"\x07");
+    }
 }

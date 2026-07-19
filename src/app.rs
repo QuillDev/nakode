@@ -448,10 +448,14 @@ async fn run_loop(
             }
             backend_event = backends.events.recv(), if backend_open => {
                 if let Some((source, event)) = backend_event {
+                    let should_chime = should_chime_for_backend_event(&source, &event);
                     let effects = match source {
                         BackendSource::Primary(provider) => state.handle_provider_backend(&provider, event),
                         BackendSource::Subagent(run_id) => state.handle_subagent_backend(&run_id, event),
                     };
+                    if should_chime {
+                        crate::terminal::ring_bell(terminal.backend_mut())?;
+                    }
                     if apply_effects(state, effects, backends, sessions, &mut agent_requests).await {
                         break;
                     }
@@ -481,7 +485,7 @@ async fn run_loop(
                 break;
             }
             _ = render_tick.tick() => {
-                if dirty || state.has_running_subagents() {
+                if dirty || state.is_busy() {
                     terminal.draw(|frame| render::draw(frame, state))?;
                     dirty = false;
                 }
@@ -494,6 +498,11 @@ async fn run_loop(
     }
 
     Ok(())
+}
+
+fn should_chime_for_backend_event(source: &BackendSource, event: &BackendEvent) -> bool {
+    matches!(source, BackendSource::Primary(_))
+        && matches!(event, BackendEvent::TurnCompleted { .. })
 }
 
 async fn apply_effects(
@@ -935,6 +944,9 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
                 state.clear_text_selection();
                 return vec![Effect::OpenUrl(url)];
             }
+            if action == controls::MouseAction::PrimaryDown && state.toggle_tool_output_at(point) {
+                return Vec::new();
+            }
             match action {
                 controls::MouseAction::PrimaryDown
                     if state.subagent_modal.is_some() || !state.open_subagent_at(point) =>
@@ -1357,12 +1369,35 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use crate::{
-        backend::{CODEX_PROVIDER, CapabilitySupport},
+        backend::{BackendEvent, CODEX_PROVIDER, CapabilitySupport, TurnOutcome},
         render,
         session::ProviderRecord,
         state::{ActiveTurn, AgentRequest, AppState},
         transcript::{EntryKind, EntryStatus},
     };
+
+    #[test]
+    fn only_primary_turn_completion_requests_a_chime() {
+        let completed = BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Completed,
+            error: None,
+        };
+        assert!(super::should_chime_for_backend_event(
+            &super::BackendSource::Primary(CODEX_PROVIDER.to_owned()),
+            &completed,
+        ));
+        assert!(!super::should_chime_for_backend_event(
+            &super::BackendSource::Subagent("agent-1".to_owned()),
+            &completed,
+        ));
+        assert!(!super::should_chime_for_backend_event(
+            &super::BackendSource::Primary(CODEX_PROVIDER.to_owned()),
+            &BackendEvent::TurnStarted {
+                turn_id: "turn-1".to_owned(),
+            },
+        ));
+    }
 
     #[test]
     fn exit_hint_includes_executable_workspace_and_full_session_id() {
@@ -1439,6 +1474,62 @@ mod tests {
         }
 
         assert_eq!(state.take_pending_clipboard().as_deref(), Some("NAKO"));
+    }
+
+    #[test]
+    fn clicking_a_tool_row_expands_and_collapses_its_output() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        let output = (0..40)
+            .map(|index| format!("test case_{index} ... ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.transcript.upsert(
+            "tool-1",
+            EntryKind::Tool,
+            "bash · cargo test",
+            output,
+            EntryStatus::Complete,
+        );
+        terminal
+            .draw(|frame| render::draw(frame, &mut state))
+            .expect("render collapsed tool output");
+        let marker_row = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .position(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains("▸ bash cargo test")
+            })
+            .expect("collapsed tool row");
+
+        super::handle_terminal_event(
+            &mut state,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: u16::try_from(marker_row).expect("test row fits"),
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert_eq!(state.status_message, "Expanded tool output.");
+
+        terminal
+            .draw(|frame| render::draw(frame, &mut state))
+            .expect("render expanded tool output");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("click to collapse"));
     }
 
     #[test]
