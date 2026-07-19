@@ -1,8 +1,6 @@
-use std::{collections::HashMap, io, time::Duration};
+use std::{collections::HashMap, io, path::PathBuf, time::Duration};
 
-use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
-};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use thiserror::Error;
 use tokio::{sync::mpsc, time::MissedTickBehavior};
@@ -13,6 +11,7 @@ use crate::{
     clipboard, codex,
     config::Config,
     control::{AgentResponse, ControlError, ControlServer, IncomingInvocation},
+    controls::{self, ControlAction, ControlContext},
     devin, render,
     selection::ScreenPoint,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
@@ -28,8 +27,6 @@ pub enum AppError {
     Terminal(#[from] io::Error),
     #[error(transparent)]
     Session(#[from] SessionError),
-    #[error("no enabled provider could be started: {0}")]
-    NoProviders(String),
     #[error(transparent)]
     Agents(#[from] AgentCatalogError),
     #[error(transparent)]
@@ -47,55 +44,95 @@ enum BackendSource {
 struct BackendRegistry {
     commands: HashMap<String, mpsc::Sender<BackendCommand>>,
     subagent_commands: HashMap<String, mpsc::Sender<BackendCommand>>,
+    subagent_providers: HashMap<String, String>,
     events: mpsc::Receiver<(BackendSource, BackendEvent)>,
     event_tx: mpsc::Sender<(BackendSource, BackendEvent)>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    failures: Vec<String>,
+    failures: Vec<(String, String)>,
     config: Config,
+    session_database: PathBuf,
+    provider_credentials: HashMap<String, serde_json::Value>,
 }
 
 impl BackendRegistry {
-    async fn spawn(config: &Config, providers: &[ProviderRecord]) -> Self {
+    async fn spawn(
+        config: &Config,
+        providers: &[ProviderRecord],
+        session_database: PathBuf,
+    ) -> Self {
         let (event_tx, events) = mpsc::channel(512);
         let mut registry = Self {
             commands: HashMap::new(),
             subagent_commands: HashMap::new(),
+            subagent_providers: HashMap::new(),
             events,
             event_tx: event_tx.clone(),
             tasks: Vec::new(),
             failures: Vec::new(),
             config: config.clone(),
+            session_database,
+            provider_credentials: providers
+                .iter()
+                .filter_map(|provider| {
+                    provider
+                        .credential
+                        .as_ref()
+                        .map(|credential| (provider.provider.clone(), credential.metadata.clone()))
+                })
+                .collect(),
         };
         for provider in providers.iter().filter(|provider| provider.enabled) {
-            let result = match provider.provider.as_str() {
-                crate::backend::CODEX_PROVIDER => {
-                    codex::spawn(codex::BackendConfig::codex(
-                        config.codex.clone(),
-                        config.workspace.clone(),
-                    ))
-                    .await
-                }
-                crate::backend::DEVIN_PROVIDER => {
-                    devin::spawn(devin::BackendConfig::devin(
-                        config.devin.clone(),
-                        config.workspace.clone(),
-                    ))
-                    .await
-                }
-                unknown => {
-                    registry
-                        .failures
-                        .push(format!("unknown enabled provider {unknown}"));
-                    continue;
-                }
-            };
-            match result {
-                Ok(handle) => registry.insert_primary(provider.provider.clone(), handle),
-                Err(error) => registry.failures.push(error.to_string()),
+            if let Err(error) = registry.start_provider(&provider.provider).await {
+                registry
+                    .failures
+                    .push((provider.provider.clone(), error.to_string()));
             }
         }
         drop(event_tx);
         registry
+    }
+
+    async fn start_provider(&mut self, provider: &str) -> Result<(), BackendError> {
+        if self.commands.contains_key(provider) {
+            return Ok(());
+        }
+        let handle = match provider {
+            crate::backend::CODEX_PROVIDER => {
+                let credential = self.provider_credentials.get(provider).cloned();
+                codex::spawn(
+                    codex::BackendConfig::native(self.config.workspace.clone())
+                        .with_credential(credential)
+                        .with_session_database(self.session_database.clone()),
+                )
+                .await?
+            }
+            crate::backend::DEVIN_PROVIDER => {
+                let credential = self.provider_credentials.get(provider).cloned();
+                devin::spawn(
+                    devin::BackendConfig::native(self.config.workspace.clone())
+                        .with_credential(credential)
+                        .with_session_database(self.session_database.clone()),
+                )
+                .await?
+            }
+            _ => {
+                return Err(BackendError::UnsupportedProvider {
+                    provider: provider.to_owned(),
+                });
+            }
+        };
+        self.insert_primary(provider.to_owned(), handle);
+        Ok(())
+    }
+
+    async fn stop_provider(&mut self, provider: &str) {
+        if let Some(commands) = self.commands.remove(provider) {
+            let _ = commands.send(BackendCommand::Shutdown).await;
+        }
+    }
+
+    fn set_provider_credential(&mut self, provider: String, metadata: serde_json::Value) {
+        self.provider_credentials.insert(provider, metadata);
     }
 
     fn insert_primary(&mut self, provider: String, handle: BackendHandle) {
@@ -124,17 +161,21 @@ impl BackendRegistry {
         }
         let handle = match provider {
             crate::backend::CODEX_PROVIDER => {
-                codex::spawn(codex::BackendConfig::codex(
-                    self.config.codex.clone(),
-                    self.config.workspace.clone(),
-                ))
+                let credential = self.provider_credentials.get(provider).cloned();
+                codex::spawn(
+                    codex::BackendConfig::native(self.config.workspace.clone())
+                        .with_credential(credential)
+                        .with_session_database(self.session_database.clone()),
+                )
                 .await?
             }
             crate::backend::DEVIN_PROVIDER => {
-                devin::spawn(devin::BackendConfig::devin(
-                    self.config.devin.clone(),
-                    self.config.workspace.clone(),
-                ))
+                let credential = self.provider_credentials.get(provider).cloned();
+                devin::spawn(
+                    devin::BackendConfig::native(self.config.workspace.clone())
+                        .with_credential(credential)
+                        .with_session_database(self.session_database.clone()),
+                )
                 .await?
             }
             _ => {
@@ -145,6 +186,8 @@ impl BackendRegistry {
         };
         let (commands, mut events, task) = handle.into_parts();
         self.subagent_commands.insert(run_id.clone(), commands);
+        self.subagent_providers
+            .insert(run_id.clone(), provider.to_owned());
         self.tasks.push(task);
         let event_tx = self.event_tx.clone();
         self.tasks.push(tokio::spawn(async move {
@@ -176,9 +219,25 @@ impl BackendRegistry {
     }
 
     async fn stop_subagent(&mut self, run_id: &str) {
+        self.subagent_providers.remove(run_id);
         if let Some(commands) = self.subagent_commands.remove(run_id) {
             let _ = commands.send(BackendCommand::Shutdown).await;
         }
+    }
+
+    async fn clear_provider_credential(&mut self, provider: &str) -> io::Result<()> {
+        self.stop_provider(provider).await;
+        let run_ids = self
+            .subagent_providers
+            .iter()
+            .filter(|(_, run_provider)| run_provider.as_str() == provider)
+            .map(|(run_id, _)| run_id.clone())
+            .collect::<Vec<_>>();
+        for run_id in run_ids {
+            self.stop_subagent(&run_id).await;
+        }
+        self.provider_credentials.remove(provider);
+        Ok(())
     }
 
     async fn shutdown(self) {
@@ -204,6 +263,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let nako_executable = std::env::current_exe().map_err(AppError::CurrentExecutable)?;
     let mut signals = ShutdownSignals::install()?;
     let sessions = SqliteSessionRepository::open_default()?;
+    let session_database = sessions.database_path().to_path_buf();
     let providers = sessions.list_providers()?;
     let agents = AgentCatalog::load(&config.agents)?;
     let control_path = crate::control::socket_path(&config.workspace);
@@ -213,7 +273,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             source,
         })?;
     }
-    let mut backends = BackendRegistry::spawn(&config, &providers).await;
+    let mut backends = BackendRegistry::spawn(&config, &providers, session_database).await;
     let active_provider = if backends
         .commands
         .contains_key(crate::backend::CODEX_PROVIDER)
@@ -222,9 +282,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     } else if let Some(provider) = backends.commands.keys().next() {
         provider.clone()
     } else {
-        let failures = backends.failures.join("; ");
-        backends.shutdown().await;
-        return Err(AppError::NoProviders(failures));
+        String::new()
     };
     let mut control = match ControlServer::bind(&control_path).await {
         Ok(control) => control,
@@ -241,18 +299,36 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             return Err(AppError::Terminal(error));
         }
     };
-    let active_name = providers
-        .iter()
-        .find(|p| p.provider == active_provider)
-        .map_or(active_provider.as_str(), |p| p.display_name.as_str());
-    let mut state = AppState::new_for_backend(
-        config.workspace.to_string_lossy(),
-        config.model,
-        config.scrollback,
-        &active_provider,
-        active_name,
-    );
+    let mut state = if active_provider.is_empty() {
+        AppState::new_unconfigured(
+            config.workspace.to_string_lossy(),
+            config.model,
+            config.scrollback,
+        )
+    } else {
+        let active_name = providers
+            .iter()
+            .find(|record| record.provider == active_provider)
+            .map_or(active_provider.as_str(), |record| {
+                record.display_name.as_str()
+            });
+        AppState::new_for_backend(
+            config.workspace.to_string_lossy(),
+            config.model,
+            config.scrollback,
+            &active_provider,
+            active_name,
+        )
+    };
     state.install_agents(agents);
+    state.set_agent_directory(config.agents.clone());
+    for (provider, error) in &backends.failures {
+        let display_name = providers
+            .iter()
+            .find(|record| record.provider == *provider)
+            .map_or(provider.as_str(), |record| record.display_name.as_str());
+        state.provider_start_failed(provider, display_name, error);
+    }
     state.set_nako_executable(&nako_executable);
     for provider in backends.commands.keys() {
         match sessions.list_models(provider) {
@@ -379,52 +455,53 @@ async fn apply_effects(
     while let Some(effect) = pending.pop_front() {
         match effect {
             Effect::Backend(command) => {
-                let provider = state.backend_provider.clone();
-                if !backends.send(&provider, command).await {
-                    state.handle_provider_backend(
-                        &provider,
-                        BackendEvent::Disconnected {
-                            reason: "backend command channel closed".to_owned(),
-                        },
-                    );
-                }
+                send_backend_command(state, backends, command).await;
             }
             Effect::SpawnSubagent { run_id, provider } => {
-                if let Err(error) = backends.spawn_subagent(run_id.clone(), &provider).await {
-                    pending.extend(state.subagent_launch_failed(&run_id, error.to_string()));
-                }
+                spawn_subagent(state, backends, &mut pending, &run_id, &provider).await;
             }
             Effect::SubagentBackend { run_id, command } => {
-                if !backends.send_subagent(&run_id, command).await {
-                    pending.extend(state.subagent_launch_failed(
-                        &run_id,
-                        "subagent command channel closed".to_owned(),
-                    ));
-                }
+                send_subagent_command(state, backends, &mut pending, &run_id, command).await;
             }
             Effect::StopSubagent(run_id) => backends.stop_subagent(&run_id).await,
             Effect::CompleteAgentRequest {
                 request_id,
                 result,
                 success,
-            } => {
-                if let Some(request) = agent_requests.remove(&request_id) {
-                    request.respond(AgentResponse { success, result });
-                }
-            }
-            Effect::ListSessions => match sessions.list_recent(&state.workspace, 100) {
-                Ok(records) => state.install_sessions(records),
-                Err(error) => state.session_store_failed(error.to_string()),
-            },
-            Effect::ListProviders => match sessions.list_providers() {
-                Ok(providers) => state.install_providers(providers),
-                Err(error) => state.session_store_failed(error.to_string()),
-            },
+            } => complete_agent_request(agent_requests, request_id, result, success),
+            Effect::ListSessions => list_sessions(state, sessions),
+            Effect::ListProviders => install_provider_records(state, sessions),
             Effect::SetProviderEnabled { provider, enabled } => {
-                if let Err(error) = sessions.set_provider_enabled(&provider, enabled) {
-                    state.session_store_failed(error.to_string());
-                }
+                apply_provider_enablement(state, backends, sessions, &provider, enabled).await;
             }
+            Effect::AuthenticateProvider(provider) => {
+                authenticate_provider(state, backends, &provider).await;
+            }
+            Effect::SaveProviderCredential {
+                provider,
+                kind,
+                metadata,
+            } => {
+                save_provider_credential_effect(
+                    state,
+                    backends,
+                    sessions,
+                    &mut pending,
+                    provider,
+                    kind,
+                    metadata,
+                )
+                .await;
+            }
+            Effect::ClearProviderCredential(provider) => {
+                clear_provider_credential(state, backends, sessions, &provider).await;
+            }
+            Effect::OpenUrl(url) => open_url(state, &url),
+            Effect::SaveAgent {
+                definition,
+                previous_slug,
+            } => save_agent_definition(state, &definition, previous_slug.as_deref()),
+            Effect::DeleteAgent(slug) => delete_agent_definition(state, &slug),
             Effect::ResolveSession(id) => match sessions.find(&id) {
                 Ok(Some(record)) => pending.extend(state.begin_resume(record)),
                 Ok(None) => state.session_store_failed(format!("no session matches {id:?}")),
@@ -447,9 +524,10 @@ async fn apply_effects(
                 Err(error) => state.session_store_failed(error.to_string()),
             },
             Effect::PersistModels { provider, models } => {
-                if let Err(error) = sessions.replace_models(&provider, &models) {
-                    state.session_store_failed(error.to_string());
-                }
+                persist_models(state, sessions, &provider, &models);
+            }
+            Effect::SetDefaultModel { provider, model } => {
+                set_default_model(state, sessions, &provider, &model);
             }
             Effect::PersistSubagent(record) => persist_subagent(state, sessions, &record),
             Effect::LoadSubagents(parent_session_id) => {
@@ -469,6 +547,276 @@ async fn apply_effects(
         }
     }
     quit
+}
+
+fn persist_models(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    provider: &str,
+    models: &[crate::backend::ModelInfo],
+) {
+    if let Err(error) = sessions.replace_models(provider, models) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    match sessions.list_models(provider) {
+        Ok(models) => state.install_persisted_model_preferences(models),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
+}
+
+fn set_default_model(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    provider: &str,
+    model: &str,
+) {
+    if let Err(error) = sessions.set_default_model(provider, model) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
+async fn save_provider_credential_effect(
+    state: &mut AppState,
+    backends: &mut BackendRegistry,
+    sessions: &dyn SessionRepository,
+    pending: &mut std::collections::VecDeque<Effect>,
+    provider: String,
+    kind: String,
+    metadata: serde_json::Value,
+) {
+    persist_provider_credential(
+        state,
+        backends,
+        sessions,
+        pending,
+        ProviderCredentialInput {
+            provider,
+            kind,
+            metadata,
+        },
+    )
+    .await;
+}
+
+fn open_url(state: &mut AppState, url: &str) {
+    match open::that(url) {
+        Ok(()) => state.set_status("Opened the authentication page in your browser."),
+        Err(error) => {
+            state.set_status(&format!("Could not open the authentication page: {error}"));
+        }
+    }
+}
+
+fn install_provider_records(state: &mut AppState, sessions: &dyn SessionRepository) {
+    match sessions.list_providers() {
+        Ok(providers) => state.install_providers(providers),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
+}
+
+fn list_sessions(state: &mut AppState, sessions: &dyn SessionRepository) {
+    match sessions.list_recent(&state.workspace, 100) {
+        Ok(records) => state.install_sessions(records),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
+}
+
+fn complete_agent_request(
+    agent_requests: &mut HashMap<u64, IncomingInvocation>,
+    request_id: u64,
+    result: String,
+    success: bool,
+) {
+    if let Some(request) = agent_requests.remove(&request_id) {
+        request.respond(AgentResponse { success, result });
+    }
+}
+
+async fn send_backend_command(
+    state: &mut AppState,
+    backends: &BackendRegistry,
+    command: BackendCommand,
+) {
+    let provider = state.backend_provider.clone();
+    if !backends.send(&provider, command).await {
+        state.handle_provider_backend(
+            &provider,
+            BackendEvent::Disconnected {
+                reason: "backend command channel closed".to_owned(),
+            },
+        );
+    }
+}
+
+async fn spawn_subagent(
+    state: &mut AppState,
+    backends: &mut BackendRegistry,
+    pending: &mut std::collections::VecDeque<Effect>,
+    run_id: &str,
+    provider: &str,
+) {
+    if let Err(error) = backends.spawn_subagent(run_id.to_owned(), provider).await {
+        pending.extend(state.subagent_launch_failed(run_id, error.to_string()));
+    }
+}
+
+async fn send_subagent_command(
+    state: &mut AppState,
+    backends: &BackendRegistry,
+    pending: &mut std::collections::VecDeque<Effect>,
+    run_id: &str,
+    command: BackendCommand,
+) {
+    if !backends.send_subagent(run_id, command).await {
+        pending.extend(
+            state.subagent_launch_failed(run_id, "subagent command channel closed".to_owned()),
+        );
+    }
+}
+
+async fn authenticate_provider(
+    state: &mut AppState,
+    backends: &mut BackendRegistry,
+    provider: &str,
+) {
+    if let Err(error) = backends.start_provider(provider).await {
+        state.provider_authentication_failed(provider, &error.to_string());
+    } else if !backends
+        .send(provider, BackendCommand::BeginAuthentication)
+        .await
+    {
+        state.provider_authentication_failed(provider, "provider authentication channel closed");
+    }
+}
+
+struct ProviderCredentialInput {
+    provider: String,
+    kind: String,
+    metadata: serde_json::Value,
+}
+
+async fn persist_provider_credential(
+    state: &mut AppState,
+    backends: &mut BackendRegistry,
+    sessions: &dyn SessionRepository,
+    pending: &mut std::collections::VecDeque<Effect>,
+    credential: ProviderCredentialInput,
+) {
+    if let Err(error) = sessions.save_provider_credential(
+        &credential.provider,
+        &credential.kind,
+        &credential.metadata,
+    ) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    backends.set_provider_credential(credential.provider.clone(), credential.metadata.clone());
+    backends.stop_provider(&credential.provider).await;
+    match sessions.list_providers() {
+        Ok(providers) => state.install_providers(providers),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
+    pending.push_back(Effect::SetProviderEnabled {
+        provider: credential.provider,
+        enabled: true,
+    });
+}
+
+async fn clear_provider_credential(
+    state: &mut AppState,
+    backends: &mut BackendRegistry,
+    sessions: &dyn SessionRepository,
+    provider: &str,
+) {
+    if let Err(error) = backends.clear_provider_credential(provider).await {
+        state.session_store_failed(format!("could not clear {provider} credentials: {error}"));
+        return;
+    }
+    if let Err(error) = sessions.delete_provider_credential(provider) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    match sessions.list_providers() {
+        Ok(providers) => state.install_providers(providers),
+        Err(error) => {
+            state.session_store_failed(error.to_string());
+            return;
+        }
+    }
+    state.provider_logged_out(provider);
+}
+
+async fn apply_provider_enablement(
+    state: &mut AppState,
+    backends: &mut BackendRegistry,
+    sessions: &dyn SessionRepository,
+    provider: &str,
+    enabled: bool,
+) {
+    if let Err(error) = sessions.set_provider_enabled(provider, enabled) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    match sessions.list_providers() {
+        Ok(providers) => state.install_providers(providers),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
+    if !enabled {
+        backends.stop_provider(provider).await;
+        state.provider_disabled(provider);
+        return;
+    }
+
+    let display_name = state.provider_display_name(provider);
+    state.provider_starting(provider, &display_name);
+    if let Err(error) = backends.start_provider(provider).await {
+        state.provider_start_failed(provider, &display_name, &error.to_string());
+        return;
+    }
+    match sessions.list_models(provider) {
+        Ok(models) => state.install_cached_models(models),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
+    let _ = backends
+        .send(provider, BackendCommand::Reload { session_id: None })
+        .await;
+}
+
+fn save_agent_definition(
+    state: &mut AppState,
+    definition: &crate::agent::AgentDefinition,
+    previous_slug: Option<&str>,
+) {
+    let directory = state.agent_directory().to_path_buf();
+    let result = AgentCatalog::load(&directory).and_then(|catalog| {
+        catalog.save(&directory, definition, previous_slug)?;
+        AgentCatalog::load(&directory)
+    });
+    install_changed_agent_catalog(state, result, "Agent archetype saved.");
+}
+
+fn delete_agent_definition(state: &mut AppState, slug: &str) {
+    let directory = state.agent_directory().to_path_buf();
+    let result = AgentCatalog::load(&directory).and_then(|catalog| {
+        catalog.delete(&directory, slug)?;
+        AgentCatalog::load(&directory)
+    });
+    install_changed_agent_catalog(state, result, "Agent archetype deleted.");
+}
+
+fn install_changed_agent_catalog(
+    state: &mut AppState,
+    result: Result<AgentCatalog, AgentCatalogError>,
+    success_message: &str,
+) {
+    match result {
+        Ok(catalog) => {
+            state.install_agents(catalog);
+            state.set_status(success_message);
+        }
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
 }
 
 fn persist_subagent(
@@ -507,9 +855,16 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
         }
         Event::Paste(text) => {
             state.clear_text_selection();
-            if state.model_picker.is_none()
+            if state
+                .agent_picker
+                .as_ref()
+                .is_some_and(|picker| picker.editor.is_some())
+            {
+                state.agent_editor_insert_str(&text);
+            } else if state.model_picker.is_none()
                 && state.session_picker.is_none()
                 && state.provider_picker.is_none()
+                && state.agent_picker.is_none()
                 && !state.show_help
                 && state.approvals.is_empty()
             {
@@ -520,25 +875,31 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
         }
         Event::Mouse(mouse) => {
             let point = ScreenPoint::new(mouse.column, mouse.row);
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left)
+            let action = controls::resolve_mouse(mouse.kind);
+            if action == controls::MouseAction::PrimaryDown
+                && let Some(url) = state.oauth_url_at(point)
+            {
+                state.clear_text_selection();
+                return vec![Effect::OpenUrl(url)];
+            }
+            match action {
+                controls::MouseAction::PrimaryDown
                     if state.subagent_modal.is_some() || !state.open_subagent_at(point) =>
                 {
                     state.begin_text_selection(point);
                 }
-                MouseEventKind::Down(MouseButton::Left) => {}
-                MouseEventKind::Drag(MouseButton::Left) => state.update_text_selection(point),
-                MouseEventKind::Up(MouseButton::Left) => state.finish_text_selection(point),
-                MouseEventKind::ScrollUp => {
+                controls::MouseAction::PrimaryDown | controls::MouseAction::Ignore => {}
+                controls::MouseAction::PrimaryDrag => state.update_text_selection(point),
+                controls::MouseAction::PrimaryUp => state.finish_text_selection(point),
+                controls::MouseAction::ScrollUp => {
                     state.clear_text_selection();
                     state.scroll_active_chat(3);
                 }
-                MouseEventKind::ScrollDown => {
+                controls::MouseAction::ScrollDown => {
                     state.clear_text_selection();
                     state.scroll_active_chat(-3);
                 }
-                MouseEventKind::Down(_) => state.clear_text_selection(),
-                _ => {}
+                controls::MouseAction::ClearSelection => state.clear_text_selection(),
             }
             Vec::new()
         }
@@ -555,130 +916,109 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         return effects;
     }
 
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let boundary = control || key.modifiers.contains(KeyModifiers::SUPER);
-    if let Some(effects) = handle_command_completion_key(state, key, boundary, alt, shift) {
+    if let Some(effects) = handle_command_completion_key(state, key) {
         return effects;
     }
-    if handle_editor_navigation(state, key.code, boundary, alt) {
+    if handle_editor_navigation(state, key) {
         return Vec::new();
     }
 
-    match key.code {
-        KeyCode::Char('c') if control => state.cancel_or_quit(),
-        KeyCode::Char('d') if control => state.request_quit(),
-        KeyCode::Char('q') if control => state.enqueue_editor(),
-        KeyCode::Char('s') if control => state.steer_editor(),
-        KeyCode::Char('l') if control => {
+    match controls::resolve(ControlContext::Global, key) {
+        Some(ControlAction::CancelOrQuit) => state.cancel_or_quit(),
+        Some(ControlAction::Quit) => state.request_quit(),
+        Some(ControlAction::QueueDraft) => state.enqueue_editor(),
+        Some(ControlAction::Steer) => state.steer_editor(),
+        Some(ControlAction::Latest) => {
             state.reset_active_chat_scroll();
             state.set_status("Jumped to the latest output.");
             Vec::new()
         }
-        KeyCode::Char('j') if control => {
+        Some(ControlAction::Newline) => {
             state.editor.insert_newline();
             Vec::new()
         }
-        KeyCode::F(2) => state.open_model_picker(),
-        KeyCode::PageUp => {
+        Some(ControlAction::OpenModelPicker) => state.open_model_picker(),
+        Some(ControlAction::ScrollUp) => {
             state.scroll_active_chat(10);
             Vec::new()
         }
-        KeyCode::PageDown => {
+        Some(ControlAction::ScrollDown) => {
             state.scroll_active_chat(-10);
             Vec::new()
         }
-        KeyCode::Up if alt => {
+        Some(ControlAction::QueuePrevious) => {
             state.move_queue_selection(-1);
             Vec::new()
         }
-        KeyCode::Down if alt => {
+        Some(ControlAction::QueueNext) => {
             state.move_queue_selection(1);
             Vec::new()
         }
-        KeyCode::Delete if alt => {
+        Some(ControlAction::QueueRemove) => {
             state.remove_selected_queue_item();
             Vec::new()
         }
-        KeyCode::Enter if shift => {
-            state.editor.insert_newline();
-            Vec::new()
-        }
-        KeyCode::Enter if alt => state.enqueue_editor(),
-        KeyCode::Enter if !boundary => state.submit_or_steer_editor(),
-        KeyCode::Backspace if alt => {
+        Some(ControlAction::Submit) => state.submit_or_steer_editor(),
+        Some(ControlAction::BackspaceWord) => {
             state.editor.delete_word_backward();
             Vec::new()
         }
-        KeyCode::Backspace if boundary => {
+        Some(ControlAction::BackspaceLine) => {
             state.editor.delete_to_line_start();
             Vec::new()
         }
-        KeyCode::Backspace => {
+        Some(ControlAction::Backspace) => {
             state.editor.backspace();
             Vec::new()
         }
-        KeyCode::Delete => {
+        Some(ControlAction::Delete) => {
             state.editor.delete();
             Vec::new()
         }
-        KeyCode::Tab => {
+        Some(ControlAction::InsertTab) => {
             state.editor.insert_char('\t');
             Vec::new()
         }
-        KeyCode::Char(character)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER) =>
-        {
-            state.editor.insert_char(character);
+        None => {
+            if let KeyCode::Char(character) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER)
+            {
+                state.editor.insert_char(character);
+            }
             Vec::new()
         }
-        _ => Vec::new(),
+        Some(_) => Vec::new(),
     }
 }
 
-fn handle_editor_navigation(
-    state: &mut AppState,
-    key_code: KeyCode,
-    boundary: bool,
-    alt: bool,
-) -> bool {
-    match key_code {
-        KeyCode::Left if alt => state.editor.move_word_left(),
-        KeyCode::Right if alt => state.editor.move_word_right(),
-        KeyCode::Left if boundary => state.editor.move_home(),
-        KeyCode::Right if boundary => state.editor.move_end(),
-        KeyCode::Up if boundary => state.editor.move_document_start(),
-        KeyCode::Down if boundary => state.editor.move_document_end(),
-        KeyCode::Left => state.editor.move_left(),
-        KeyCode::Right => state.editor.move_right(),
-        KeyCode::Up if !alt => state.editor.move_up(),
-        KeyCode::Down if !alt => state.editor.move_down(),
-        KeyCode::Home => state.editor.move_home(),
-        KeyCode::End => state.editor.move_end(),
+fn handle_editor_navigation(state: &mut AppState, key: KeyEvent) -> bool {
+    match controls::resolve(ControlContext::Navigation, key) {
+        Some(ControlAction::MoveWordLeft) => state.editor.move_word_left(),
+        Some(ControlAction::MoveWordRight) => state.editor.move_word_right(),
+        Some(ControlAction::MoveLineStart) => state.editor.move_home(),
+        Some(ControlAction::MoveLineEnd) => state.editor.move_end(),
+        Some(ControlAction::MoveDocumentStart) => state.editor.move_document_start(),
+        Some(ControlAction::MoveDocumentEnd) => state.editor.move_document_end(),
+        Some(ControlAction::MoveLeft) => state.editor.move_left(),
+        Some(ControlAction::MoveRight) => state.editor.move_right(),
+        Some(ControlAction::MoveUp) => state.editor.move_up(),
+        Some(ControlAction::MoveDown) => state.editor.move_down(),
         _ => return false,
     }
     true
 }
 
-fn handle_command_completion_key(
-    state: &mut AppState,
-    key: KeyEvent,
-    boundary: bool,
-    alt: bool,
-    shift: bool,
-) -> Option<Vec<Effect>> {
+fn handle_command_completion_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> {
     if state.command_completions().is_empty() {
         return None;
     }
 
-    match key.code {
-        KeyCode::Up if !boundary && !alt => state.move_command_completion(-1),
-        KeyCode::Down if !boundary && !alt => state.move_command_completion(1),
-        KeyCode::Tab if !boundary && !alt => state.accept_command_completion(),
-        KeyCode::Enter if !boundary && !alt && !shift && !state.command_completion_is_exact() => {
+    match controls::resolve(ControlContext::CommandCompletion, key) {
+        Some(ControlAction::CompletionPrevious) => state.move_command_completion(-1),
+        Some(ControlAction::CompletionNext) => state.move_command_completion(1),
+        Some(ControlAction::CompletionAccept) if !state.command_completion_is_exact() => {
             state.accept_command_completion();
         }
         _ => return None,
@@ -687,11 +1027,20 @@ fn handle_command_completion_key(
 }
 
 fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> {
+    if !state.questions.is_empty() {
+        return Some(handle_question_key(state, key));
+    }
     if !state.approvals.is_empty() {
-        return Some(match key.code {
-            KeyCode::Char('y') => state.resolve_approval(ApprovalDecision::AcceptOnce),
-            KeyCode::Char('a') => state.resolve_approval(ApprovalDecision::AcceptForSession),
-            KeyCode::Char('n') | KeyCode::Esc => state.resolve_approval(ApprovalDecision::Decline),
+        return Some(match controls::resolve(ControlContext::Approval, key) {
+            Some(ControlAction::ApprovalOnce) => {
+                state.resolve_approval(ApprovalDecision::AcceptOnce)
+            }
+            Some(ControlAction::ApprovalSession) => {
+                state.resolve_approval(ApprovalDecision::AcceptForSession)
+            }
+            Some(ControlAction::ApprovalDecline) => {
+                state.resolve_approval(ApprovalDecision::Decline)
+            }
             _ => Vec::new(),
         });
     }
@@ -701,113 +1050,208 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
     }
 
     if state.show_help {
-        if key.code == KeyCode::Esc || is_help_key(key) {
+        if controls::resolve(ControlContext::Help, key).is_some() {
             state.show_help = false;
         }
         return Some(Vec::new());
     }
 
-    if is_help_key(key) {
+    if controls::resolve(ControlContext::Global, key) == Some(ControlAction::ToggleHelp) {
         state.model_picker = None;
         state.session_picker = None;
+        state.agent_picker = None;
         state.show_help = true;
         return Some(Vec::new());
     }
 
+    if state.agent_picker.is_some() {
+        return Some(handle_agent_picker_key(state, key));
+    }
+
     if state.session_picker.is_some() {
-        return Some(match key.code {
-            KeyCode::Esc => {
-                state.close_session_picker();
-                Vec::new()
-            }
-            KeyCode::Enter => state.select_session(),
-            KeyCode::Up => {
-                state.session_picker_move(-1);
-                Vec::new()
-            }
-            KeyCode::Down => {
-                state.session_picker_move(1);
-                Vec::new()
-            }
-            _ => Vec::new(),
-        });
+        return Some(
+            match controls::resolve(ControlContext::SessionPicker, key) {
+                Some(ControlAction::Close) => {
+                    state.close_session_picker();
+                    Vec::new()
+                }
+                Some(ControlAction::Select) => state.select_session(),
+                Some(ControlAction::Previous) => {
+                    state.session_picker_move(-1);
+                    Vec::new()
+                }
+                Some(ControlAction::Next) => {
+                    state.session_picker_move(1);
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            },
+        );
     }
 
     if state.provider_picker.is_some() {
-        let showing_details = state
-            .provider_picker
-            .as_ref()
-            .is_some_and(|picker| picker.showing_details);
-        return Some(match key.code {
-            KeyCode::Esc => {
-                if !state.close_provider_details() {
-                    state.close_provider_picker();
-                }
-                Vec::new()
-            }
-            KeyCode::Enter | KeyCode::Char(' ') if showing_details => state.toggle_provider(),
-            KeyCode::Enter => {
-                state.open_provider_details();
-                Vec::new()
-            }
-            KeyCode::Up if !showing_details => {
-                state.provider_picker_move(-1);
-                Vec::new()
-            }
-            KeyCode::Down if !showing_details => {
-                state.provider_picker_move(1);
-                Vec::new()
-            }
-            _ => Vec::new(),
-        });
+        return Some(handle_provider_picker_key(state, key));
     }
 
     if state.model_picker.is_some() {
-        if key.code == KeyCode::Enter {
-            return Some(state.picker_select());
-        }
-        match key.code {
-            KeyCode::Esc => state.close_model_picker(),
-            KeyCode::Up => state.picker_move(-1),
-            KeyCode::Down => state.picker_move(1),
-            KeyCode::Backspace => state.picker_backspace(),
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        match controls::resolve(ControlContext::ModelPicker, key) {
+            Some(ControlAction::Select) => return Some(state.picker_select()),
+            Some(ControlAction::Close) => state.close_model_picker(),
+            Some(ControlAction::Previous) => state.picker_move(-1),
+            Some(ControlAction::Next) => state.picker_move(1),
+            Some(ControlAction::Backspace) => state.picker_backspace(),
+            Some(ControlAction::Clear) => {
                 if let Some(picker) = &mut state.model_picker {
                     picker.filter.clear();
                     picker.selected = 0;
                 }
             }
-            KeyCode::Char(character)
-                if !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER,
-                ) =>
-            {
-                state.picker_insert(character);
+            None => {
+                if let KeyCode::Char(character) = key.code
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER,
+                    )
+                {
+                    state.picker_insert(character);
+                }
             }
-            _ => {}
+            Some(_) => {}
         }
         return Some(Vec::new());
     }
     None
 }
 
-fn handle_subagent_modal_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Char('c') if control => return state.cancel_or_quit(),
-        KeyCode::Char('l') if control => state.reset_active_chat_scroll(),
-        KeyCode::PageUp => state.scroll_active_chat(10),
-        KeyCode::PageDown => state.scroll_active_chat(-10),
-        KeyCode::Esc => state.close_subagent_modal(),
+fn handle_question_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    match controls::resolve(ControlContext::Question, key) {
+        Some(ControlAction::QuestionPrevious) => {
+            state.move_question_selection(-1);
+            Vec::new()
+        }
+        Some(ControlAction::QuestionNext) => {
+            state.move_question_selection(1);
+            Vec::new()
+        }
+        Some(ControlAction::QuestionToggle) => {
+            state.toggle_question_selection();
+            Vec::new()
+        }
+        Some(ControlAction::QuestionConfirm) => state.resolve_question(),
+        Some(ControlAction::QuestionQuickSelect) => {
+            let KeyCode::Char(character) = key.code else {
+                return Vec::new();
+            };
+            let selected = usize::try_from(character.to_digit(10).unwrap_or(1))
+                .unwrap_or(1)
+                .saturating_sub(1);
+            if let Some(question) = state.questions.front_mut() {
+                question.selected = selected.min(question.request.options.len().saturating_sub(1));
+            }
+            if state
+                .questions
+                .front()
+                .is_some_and(|question| question.request.multi)
+            {
+                state.toggle_question_selection();
+                Vec::new()
+            } else {
+                state.resolve_question()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn handle_provider_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    let showing_details = state
+        .provider_picker
+        .as_ref()
+        .is_some_and(|picker| picker.showing_details);
+    let context = if showing_details {
+        ControlContext::ProviderDetails
+    } else {
+        ControlContext::ProviderList
+    };
+    match controls::resolve(context, key) {
+        Some(ControlAction::Close) => {
+            if !state.close_provider_details() {
+                state.close_provider_picker();
+            }
+            Vec::new()
+        }
+        Some(ControlAction::OpenUrl) => state.open_provider_authentication_url(),
+        Some(ControlAction::CopyUrl) => state.copy_provider_authentication_url(),
+        Some(ControlAction::Logout) => state.logout_provider(),
+        Some(ControlAction::Toggle) => state.toggle_provider(),
+        Some(ControlAction::Open) => {
+            state.open_provider_details();
+            Vec::new()
+        }
+        Some(ControlAction::Previous) => {
+            state.provider_picker_move(-1);
+            Vec::new()
+        }
+        Some(ControlAction::Next) => {
+            state.provider_picker_move(1);
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn handle_agent_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    let editing = state
+        .agent_picker
+        .as_ref()
+        .is_some_and(|picker| picker.editor.is_some());
+    if editing {
+        return handle_agent_editor_key(state, key);
+    }
+    match controls::resolve(ControlContext::AgentList, key) {
+        Some(ControlAction::Close) => state.close_agent_picker(),
+        Some(ControlAction::Open) => state.edit_selected_agent(),
+        Some(ControlAction::Create) => state.create_agent(),
+        Some(ControlAction::Delete) => return state.delete_selected_agent(),
+        Some(ControlAction::Previous) => state.agent_picker_move(-1),
+        Some(ControlAction::Next) => state.agent_picker_move(1),
         _ => {}
     }
     Vec::new()
 }
 
-fn is_help_key(key: KeyEvent) -> bool {
-    key.code == KeyCode::F(1)
-        || (key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('?' | '/' | '_')))
+fn handle_agent_editor_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    match controls::resolve(ControlContext::AgentEditor, key) {
+        Some(ControlAction::Previous) => state.agent_editor_move(-1),
+        Some(ControlAction::Close) => {
+            state.cancel_agent_edit();
+        }
+        Some(ControlAction::Save) => return state.save_agent_edit(),
+        Some(ControlAction::Next) => state.agent_editor_move(1),
+        Some(ControlAction::Backspace) => state.agent_editor_backspace(),
+        None => {
+            if let KeyCode::Char(character) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER)
+            {
+                state.agent_editor_insert(character);
+            }
+        }
+        Some(_) => {}
+    }
+    Vec::new()
+}
+
+fn handle_subagent_modal_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    match controls::resolve(ControlContext::Subagent, key) {
+        Some(ControlAction::CancelOrQuit) => return state.cancel_or_quit(),
+        Some(ControlAction::Latest) => state.reset_active_chat_scroll(),
+        Some(ControlAction::ScrollUp) => state.scroll_active_chat(10),
+        Some(ControlAction::ScrollDown) => state.scroll_active_chat(-10),
+        Some(ControlAction::Close) => state.close_subagent_modal(),
+        _ => {}
+    }
+    Vec::new()
 }
 
 #[cfg(unix)]
@@ -950,6 +1394,73 @@ mod tests {
 
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(state.subagent_modal.is_none());
+    }
+
+    #[test]
+    fn clicking_an_oauth_link_requests_the_system_browser() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.set_oauth_link_hit_region(Some((
+            "https://app.example.test/auth".to_owned(),
+            crate::selection::ScreenPoint::new(10, 5),
+            crate::selection::ScreenPoint::new(70, 6),
+        )));
+
+        let effects = super::handle_terminal_event(
+            &mut state,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 20,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+
+        assert!(matches!(
+            effects.as_slice(),
+            [crate::state::Effect::OpenUrl(url)] if url == "https://app.example.test/auth"
+        ));
+    }
+
+    #[test]
+    fn provider_authentication_hotkeys_open_and_copy_the_full_url() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("/providers");
+        let _ = state.submit_editor();
+        state.install_providers(vec![ProviderRecord {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            enabled: false,
+            credential: None,
+        }]);
+        state.open_provider_details();
+        state
+            .provider_picker
+            .as_mut()
+            .expect("provider picker")
+            .authentication = Some(crate::state::ProviderAuthentication::Challenge {
+            verification_url: "https://app.example.test/full/oauth/url".to_owned(),
+            user_code: String::new(),
+        });
+
+        let open = super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            open.as_slice(),
+            [crate::state::Effect::OpenUrl(url)]
+                if url == "https://app.example.test/full/oauth/url"
+        ));
+
+        let copy = super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        assert!(copy.is_empty());
+        assert_eq!(
+            state.take_pending_clipboard().as_deref(),
+            Some("https://app.example.test/full/oauth/url")
+        );
     }
 
     #[test]
@@ -1153,6 +1664,12 @@ mod tests {
             provider: CODEX_PROVIDER.to_owned(),
             display_name: "Codex".to_owned(),
             enabled: true,
+            credential: Some(crate::session::ProviderCredentialRecord {
+                provider: CODEX_PROVIDER.to_owned(),
+                kind: "chatgpt_device_code".to_owned(),
+                metadata: serde_json::json!({}),
+                updated_at: 1,
+            }),
         }]);
 
         super::handle_key(
@@ -1172,6 +1689,15 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [crate::state::Effect::SetProviderEnabled { enabled: false, .. }]
+        ));
+        let logout = super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            logout.as_slice(),
+            [crate::state::Effect::ClearProviderCredential(provider)]
+                if provider == CODEX_PROVIDER
         ));
 
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));

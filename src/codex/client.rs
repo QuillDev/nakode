@@ -33,6 +33,7 @@ pub struct BackendConfig {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub workspace: PathBuf,
+    pub credential_home: Option<PathBuf>,
 }
 
 impl BackendConfig {
@@ -47,7 +48,14 @@ impl BackendConfig {
                 "multi_agent".into(),
             ],
             workspace,
+            credential_home: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_credential_home(mut self, credential_home: PathBuf) -> Self {
+        self.credential_home = Some(credential_home);
+        self
     }
 }
 
@@ -64,9 +72,12 @@ struct PendingRequest {
 /// Returns an error when the child process cannot be spawned or its standard
 /// streams are unavailable.
 pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError> {
-    let mut child = Command::new(&config.program)
-        .args(&config.args)
-        .current_dir(&config.workspace)
+    let mut command = Command::new(&config.program);
+    command.args(&config.args).current_dir(&config.workspace);
+    if let Some(credential_home) = &config.credential_home {
+        command.env("CODEX_HOME", credential_home);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -364,7 +375,8 @@ async fn finish(
 fn requires_initialization(command: &BackendCommand) -> bool {
     matches!(
         command,
-        BackendCommand::StartSession { .. }
+        BackendCommand::BeginAuthentication
+            | BackendCommand::StartSession { .. }
             | BackendCommand::ResumeSession { .. }
             | BackendCommand::UnsubscribeSession { .. }
             | BackendCommand::StartTurn { .. }
@@ -385,6 +397,7 @@ async fn handle_command(
     match command {
         BackendCommand::SetSessionModel { .. }
         | BackendCommand::ResolveApproval { .. }
+        | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::Shutdown => return Ok(()),
         _ => {}
     }
@@ -478,8 +491,14 @@ fn command_request(
             "turn/interrupt",
             json!({"threadId": session_id, "turnId": turn_id}),
         ),
+        BackendCommand::BeginAuthentication => (
+            BackendOperation::Authenticate,
+            "account/login/start",
+            json!({"type": "chatgptDeviceCode"}),
+        ),
         BackendCommand::SetSessionModel { .. }
         | BackendCommand::ResolveApproval { .. }
+        | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::Shutdown => unreachable!(),
     }
 }
@@ -493,38 +512,14 @@ async fn process_message(
     initialized: &mut bool,
 ) -> Result<(), ()> {
     if let Some(method) = message.method {
-        let params = message.params.unwrap_or(Value::Null);
-        if let Some(id) = message.id {
-            if is_approval_method(&method) {
-                let decision = if matches!(
-                    method.as_str(),
-                    "execCommandApproval" | "applyPatchApproval"
-                ) {
-                    "approved"
-                } else {
-                    "accept"
-                };
-                write_json(stdin, &response(&id, Ok(json!({"decision": decision}))))
-                    .await
-                    .map_err(|_| ())?;
-            } else {
-                write_json(
-                    stdin,
-                    &response(
-                        &id,
-                        Err(RpcError {
-                            code: -32601,
-                            message: format!("Nako Agent does not support server request {method}"),
-                            data: None,
-                        }),
-                    ),
-                )
-                .await
-                .map_err(|_| ())?;
-            }
-        } else if let Some(event) = normalize_notification(&method, &params) {
-            events.send(event).await.map_err(|_| ())?;
-        }
+        process_incoming_method(
+            &method,
+            message.params.unwrap_or(Value::Null),
+            message.id,
+            stdin,
+            events,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -572,6 +567,69 @@ async fn process_message(
     .await
 }
 
+async fn process_incoming_method(
+    method: &str,
+    params: Value,
+    id: Option<Value>,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), ()> {
+    if let Some(id) = id {
+        let response_value = if is_approval_method(method) {
+            let decision = if matches!(method, "execCommandApproval" | "applyPatchApproval") {
+                "approved"
+            } else {
+                "accept"
+            };
+            response(&id, Ok(json!({"decision": decision})))
+        } else {
+            response(
+                &id,
+                Err(RpcError {
+                    code: -32601,
+                    message: format!("Nako Agent does not support server request {method}"),
+                    data: None,
+                }),
+            )
+        };
+        return write_json(stdin, &response_value).await.map_err(|_| ());
+    }
+    let event = if method == "account/login/completed" {
+        Some(authentication_completed_event(&params))
+    } else {
+        normalize_notification(method, &params)
+    };
+    if let Some(event) = event {
+        events.send(event).await.map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+fn authentication_completed_event(params: &Value) -> BackendEvent {
+    if params
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return BackendEvent::AuthenticationCompleted {
+            kind: "chatgpt_device_code".to_owned(),
+            metadata: json!({
+                "credential_store": "codex_managed",
+                "login_id": params.get("loginId").cloned().unwrap_or(Value::Null),
+            }),
+        };
+    }
+    BackendEvent::RequestFailed {
+        operation: BackendOperation::Authenticate,
+        code: -32000,
+        message: params
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Codex device authentication failed")
+            .to_owned(),
+    }
+}
+
 async fn process_response(
     operation: BackendOperation,
     result: Value,
@@ -584,6 +642,28 @@ async fn process_response(
     match operation {
         BackendOperation::Initialize => {
             initialize_response(&result, stdin, events, pending, next_id, initialized).await?;
+        }
+        BackendOperation::Authenticate => {
+            events
+                .send(BackendEvent::AuthenticationChallenge {
+                    login_id: result
+                        .get("loginId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    verification_url: result
+                        .get("verificationUrl")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    user_code: result
+                        .get("userCode")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                })
+                .await
+                .map_err(|_| ())?;
         }
         BackendOperation::ModelList | BackendOperation::Reload => {
             events

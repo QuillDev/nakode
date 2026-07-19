@@ -13,14 +13,6 @@ use thiserror::Error;
 pub struct Config {
     #[command(subcommand)]
     pub command: Option<NakoAgentCommand>,
-    /// Codex executable used when the Codex provider is enabled.
-    #[arg(long, env = "NAKO_AGENT_CODEX", default_value = "codex")]
-    pub codex: PathBuf,
-
-    /// Devin executable used when the Devin provider is enabled.
-    #[arg(long, env = "NAKO_AGENT_DEVIN", default_value = "devin")]
-    pub devin: PathBuf,
-
     /// Workspace made available to enabled providers.
     #[arg(long, env = "NAKO_AGENT_WORKSPACE", default_value = ".")]
     pub workspace: PathBuf,

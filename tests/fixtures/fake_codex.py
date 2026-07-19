@@ -99,6 +99,31 @@ for raw_line in sys.stdin:
                 },
             }
         )
+    elif method == "account/login/start":
+        if message.get("params", {}).get("type") != "chatgptDeviceCode":
+            fail(request_id, "expected device code authentication")
+            continue
+        send(
+            {
+                "id": request_id,
+                "result": {
+                    "type": "chatgptDeviceCode",
+                    "loginId": "login-fixture",
+                    "verificationUrl": "https://example.test/device",
+                    "userCode": "NAKO-CODE",
+                },
+            }
+        )
+        send(
+            {
+                "method": "account/login/completed",
+                "params": {
+                    "loginId": "login-fixture",
+                    "success": True,
+                    "error": None,
+                },
+            }
+        )
     elif method == "thread/start":
         params = message.get("params", {})
         normal_fields_invalid = (

@@ -1,9 +1,8 @@
 # Nako Agent
 
 Nako Agent is evolving into a provider-neutral agent orchestration and continuity
-layer. The current experimental TUI can supervise either the locally installed,
-authenticated OpenAI Codex CLI or Devin CLI while the shared session, backend,
-memory, skill, and orchestration boundaries are developed.
+layer. The experimental TUI now runs its portable agent loop and coding tools
+in-process, with direct authenticated transports for OpenAI Codex and Devin.
 
 The binding product direction is recorded in [`AGENTS.md`](AGENTS.md). Codex is
 the first adapter, not Nako Agent's application model.
@@ -17,8 +16,10 @@ the first adapter, not Nako Agent's application model.
   cancellation, and redraw pacing
 - **portable-pty** — isolated boundary for interactive provider/process panes
 - **SQLite** — Nako Agent-owned, cross-provider session metadata and discovery
-- **Codex app-server** — native Codex adapter using newline-delimited JSON-RPC
-- **Devin ACP** — native Devin CLI adapter using ACP v1 JSON-RPC over stdio
+- **Direct OpenAI transport** — device authentication, model discovery, and
+  streamed Responses events
+- **Direct Devin transport** — PKCE authentication, protobuf/Connect model
+  discovery, and streamed chat events
 
 Backend contracts, provider adapters, app reducer, session store, and renderer
 are separate modules. Provider wire values are normalized before they reach UI
@@ -27,36 +28,34 @@ other optional behavior.
 
 ## Architecture direction
 
-Agents own execution, native tools, approvals, authentication, and provider
-context. Nako Agent owns logical work identity, coordination, handoffs, shared
-skills, memory, artifacts, and provenance.
+Nako Agent's target distribution is one self-contained executable. Its portable
+runtime owns the local agent loop, tools, approvals, and coordination;
+in-process provider adapters own authentication, inference transport, model
+discovery, and provider response state. External harness adapters are optional
+compatibility paths rather than required provider implementations.
 
 A logical Nako Agent session will contain multiple provider-native agent sessions.
 Cross-agent continuation will use explicit handoff packages rather than claim
-that private model context can be translated between providers. Nako Agent does not
-provide coding tools; each backend retains its native tool and approval model.
+that private model context can be translated between providers.
 
 ## Requirements
 
-- Rust 1.88 or newer
-- At least one supported provider installed and authenticated:
-  - `codex` for the Codex provider
-  - `devin` for the Devin provider
 - A real interactive terminal
 
-This build has been exercised against `codex-cli 0.144.5`. The app-server API
-is experimental, so regenerate and compare schemas after Codex upgrades:
-
-```sh
-codex app-server generate-json-schema --experimental --out /tmp/codex-schema
-codex app-server generate-ts --experimental --out /tmp/codex-ts
-```
+No provider harness or language runtime must be installed separately. The
+optional `eval` tool reports a clear error when its requested language runtime
+is not installed. Legacy Codex app-server and Devin ACP adapters remain
+isolated compatibility code for fixture coverage; normal startup and provider
+setup do not invoke them.
 
 ## Run
 
 ```sh
 # Development build
 ./dev.sh --workspace /path/to/project
+
+# Development build with isolated, disposable Nako Agent state
+./dev.sh --clean --workspace /path/to/project
 
 # Start every enabled provider
 cargo run --release -- --workspace /path/to/project
@@ -65,8 +64,6 @@ cargo run --release -- --workspace /path/to/project
 Options:
 
 ```text
---codex <PATH>       Codex executable (or NAKO_AGENT_CODEX)
---devin <PATH>       Devin executable (or NAKO_AGENT_DEVIN)
 --workspace <PATH>   Working directory (or NAKO_AGENT_WORKSPACE)
 --model <MODEL>      Initial provider/model (or NAKO_AGENT_MODEL)
 --resume <ID>        Resume a Nako Agent session by ID or prefix (or NAKO_AGENT_RESUME)
@@ -74,13 +71,24 @@ Options:
 --agents <PATH>      Agent-definition directory (or NAKO_AGENT_AGENTS)
 ```
 
-Nako Agent starts every enabled provider and uses each provider's existing
-authentication without storing credentials. Models are referenced uniformly as
+Every interactive `dev.sh` run gracefully stops a development instance already
+serving the same workspace before starting its replacement. Adding `--clean`
+gives that replacement a fresh provider registry, session database, and agent
+catalog without deleting the normal development installation. The isolated
+state, including its provider credential stores, is removed when the process
+exits. Run the script as your desktop user, not through `sudo`, so browser
+integration and user credentials remain available.
+
+Providers are configured explicitly from `/providers`. Codex setup uses its
+device-code flow and refreshes OAuth tokens directly. Devin setup uses its
+browser-based PKCE flow with a localhost callback. Credentials and native
+session state are stored in Nako Agent's user-private SQLite database; they are
+never exported to child provider processes. Models are referenced uniformly as
 `provider-slug/model-slug`, such as `openai-codex/gpt-5`; F2 searches this
-unified catalog, and model selection routes new work to that provider. Devin
-model choices come from each ACP session's model-category `configOptions`;
-Nako Agent caches the discovered list in SQLite and applies changes through
-`session/set_config_option`. ACP does not define turn steering.
+unified catalog, and model selection routes new work to that provider. Both
+model catalogs are discovered through their authenticated native transports
+and cached in SQLite. Direct in-process turns currently support interruption;
+turn steering remains explicitly unsupported.
 
 ## Controls
 
@@ -96,7 +104,10 @@ Nako Agent caches the discovered list in SQLite and applies changes through
 | `/resume` | Open the recent-session picker for this workspace |
 | `/resume ID` | Resume a saved session by Nako Agent ID or unique prefix |
 | `/new` | Unsubscribe from the current backend session and start fresh |
+| `/models` | Choose and persist a provider's default model for future sessions |
+| `/switch` | Switch the model for only the current session |
 | `/providers` | Open the provider registry and enable or disable adapters |
+| `/agents` | View, create, edit, or delete delegated agent archetypes |
 | `/reload` | Refresh backend metadata and model choices; updates the cache |
 | `PageUp` / `PageDown` | Scroll transcript |
 | `Ctrl+L` | Jump to latest output |
@@ -114,8 +125,8 @@ sanitized data rather than executed terminal control.
 ## Current behavior
 
 - Initializes every enabled provider and records each declared capability set.
-- Persists the provider registry; Codex and Devin are enabled by default and
-  can be toggled from `/providers`.
+- Persists the provider registry. A clean installation enables nothing; the
+  user explicitly starts each provider from `/providers`.
 - Loads and caches provider-qualified model catalogs from enabled providers.
 - Discovers provider model catalogs at startup; providers that require a native
   session for discovery create one through their native adapter.
@@ -143,22 +154,22 @@ Markdown rendering is intentionally lightweight today. Headings, code blocks,
 and diffs receive semantic styling. Rich Markdown, additional backend adapters,
 configurable keymaps, and embedded provider/process panes are later work.
 
-## Provider-owned tools
+## Portable tools
 
-Nako Agent does not advertise or execute general-purpose coding tools. The Codex
-and Devin adapters start and resume native provider sessions without a
-Nako Agent-owned tool registry or a restricted lowest-common-denominator
-environment. Native tools, sandboxing, permissions, and approvals remain the
-backend's responsibility.
-
-Nako Agent may later expose narrowly scoped control-plane operations for memory,
-artifacts, skills, and orchestration. Those operations are not replacements for
-provider coding tools.
+The in-process runtime registers the same dynamic function-tool schemas with
+both direct providers. Its base set is `read`, `write`, `edit`, `bash`, `glob`,
+`grep`, `eval`, `ask`, and `todo`; `task` and `hub` are intentionally excluded.
+Local paths follow shell conventions relative to the workspace, process tools
+are bounded and cancellable, `ask` supports structured related questions in the
+TUI, eval kernels retain per-language state, and phased todos persist with the
+provider session. Optional compatibility adapters continue to use their
+provider-owned tool and permission semantics.
 
 ## Predefined agents
 
-Place TOML definitions in `.nako-agent/agents/` under the workspace, or select a
-different directory with `--agents`. Each filename may be chosen freely; the
+Use `/agents` to manage definitions, or place TOML files in
+`.nako-agent/agents/` under the workspace (select another directory with
+`--agents`). Each filename may be chosen freely; the
 slug is the stable agent identity:
 
 ```toml
@@ -170,10 +181,11 @@ model = "openai-codex/gpt-5" # optional; otherwise use the parent's provider
 fallback_models = ["devin-acp/swe-1-7-lightning"] # optional, tried in order
 ```
 
-Nako Agent includes one provider-neutral default: the read-only `explorer` gathers
-relevant context and returns a concise, detailed report to its parent agent. A
-workspace `explorer` definition overrides the built-in definition. Additional
-slugs extend the catalog only when the workspace defines them explicitly.
+Nako Agent ships `config/default-agents.toml` as its initial preset catalog. Agent
+identities, prompts, primary models, and fallback models are loaded from that
+configuration rather than constructed in Rust. Once the workspace agent
+directory exists it becomes authoritative, so deleting a preset remains
+deleted after restart.
 
 Nako Agent adds a `[Nako Agent System Instructions]` block to new native sessions. It
 identifies the logical Nako Agent session, active provider and model, lists the
@@ -188,7 +200,7 @@ The command connects to the workspace control service over
 the logical session, launches a separate provider-native child session, and
 allows up to four read-only explorer children to run concurrently. Each child
 has an independently bounded objective, native provider session, lifecycle,
-transcript, and result channel. The built-in explorer uses
+transcript, and result channel. The preset explorer configuration uses
 `devin-acp/swe-1-7-lightning` by default and falls back to
 `openai-codex/gpt-5.6-luna` if Devin cannot launch or create the native child
 session. A workspace agent definition may override the ordered model
@@ -198,7 +210,7 @@ hosts the service, while a long-lived Nako Agent daemon can take ownership of th
 same protocol as orchestration and multi-client continuity mature.
 
 All provider sessions run unattended. Codex uses `approvalPolicy: never` with
-a `danger-full-access` sandbox, while Devin launches ACP with
+a `danger-full-access` sandbox, while Devin launches its native ACP server with
 `--permission-mode dangerous`. Unexpected permission requests are accepted
 inside the provider adapter rather than interrupting the TUI. The parent chat
 shows a compact inline status and truncated objective where each child is
@@ -229,9 +241,10 @@ provider-tagged events ──────────────┘            
                                                    └─> provider-routed commands
 
 enabled-provider registry
-├── codex app-server <─ JSONL stdio ─> Codex adapter
-└──     devin acp   <─ ACP stdio ───> Devin adapter
-provider processes <─ PTY I/O ───> dedicated portable-pty boundary
+├── OpenAI Codex <─ HTTPS/SSE ───────> direct adapter
+└── Devin        <─ HTTPS/Connect ──> direct adapter
+                         │
+                         └─> shared local agent loop and supervised tools
 ```
 
 The target relationship is:
@@ -241,17 +254,22 @@ Nako Agent control plane
 ├── logical sessions, tasks, runs, handoffs, artifacts, memory
 ├── portable skills materialized through backend adapters
 └── provider adapters
-    ├── Codex native session, context, tools, and approvals
-    ├── Devin native session, context, tools, and permissions
+    ├── Codex inference transport and provider context
+    ├── Devin inference transport and provider context
     └── future native agent sessions
 ```
 
 Important files:
 
 - `src/backend.rs` — provider-neutral commands, events, capabilities, and handle
-- `src/codex/client.rs` — Codex child supervision and JSON-RPC correlation
+- `src/controls.rs` — authoritative keyboard, mouse, slash-command, and help registry
+- `src/runtime.rs` — portable agent loop, tool contracts, and native session state
+- `src/tools/` — portable tool registry and supervised base-tool implementations
+- `src/codex/native.rs` — direct Codex OAuth, discovery, and Responses transport
+- `src/codex/client.rs` — optional Codex app-server compatibility adapter
 - `src/codex/protocol.rs` — schema-tolerant Codex normalization
-- `src/devin/client.rs` — Devin ACP child supervision and normalization
+- `src/devin/native.rs` — direct Devin protobuf/Connect transport
+- `src/devin/client.rs` — optional Devin ACP compatibility adapter and OAuth flow
 - `src/state.rs` — queue, steer, cancel, model, approval, and transcript
   transitions
 - `src/transcript.rs` — logical entries, projection cache, wrapping, and

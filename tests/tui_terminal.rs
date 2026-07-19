@@ -3,10 +3,7 @@
 use std::{
     error::Error,
     ffi::OsString,
-    fs,
     io::{self, Read},
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
     thread,
     time::Duration,
 };
@@ -16,23 +13,11 @@ use portable_pty::PtySize;
 
 #[test]
 fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let fixture = manifest.join("tests/fixtures/fake_codex.py");
     let temp = tempfile::tempdir()?;
-    let wrapper = temp.path().join("codex-fixture");
-    fs::write(
-        &wrapper,
-        format!("#!/bin/sh\nexec python3 '{}'\n", fixture.display()),
-    )?;
-    let mut permissions = fs::metadata(&wrapper)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&wrapper, permissions)?;
 
     let mut session = PtySession::spawn(
         env!("CARGO_BIN_EXE_nako-agent"),
         [
-            OsString::from("--codex"),
-            wrapper.into_os_string(),
             OsString::from("--workspace"),
             temp.path().as_os_str().to_owned(),
         ],

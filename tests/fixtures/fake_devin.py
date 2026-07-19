@@ -83,7 +83,7 @@ for raw_line in sys.stdin:
                     "mcpCapabilities": {"http": True},
                 },
                 "agentInfo": {
-                    "name": "devin",
+                    "name": "oh-my-pi",
                     "title": "Fake Devin",
                     "version": "1.0.0-fixture",
                 },

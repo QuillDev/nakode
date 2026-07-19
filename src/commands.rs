@@ -1,54 +1,17 @@
 use std::ops::Range;
 
-pub const SKILL_PREFIX: &str = "/skill:";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CommandPlacement {
-    PromptStart,
-    Anywhere,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CommandSpec {
-    pub invocation: &'static str,
-    pub description: &'static str,
-    pub placement: CommandPlacement,
-}
-
-pub const COMMANDS: [CommandSpec; 5] = [
-    CommandSpec {
-        invocation: "/new",
-        description: "start a fresh session",
-        placement: CommandPlacement::PromptStart,
-    },
-    CommandSpec {
-        invocation: "/providers",
-        description: "manage enabled agent backends",
-        placement: CommandPlacement::PromptStart,
-    },
-    CommandSpec {
-        invocation: "/reload",
-        description: "refresh backend metadata and models",
-        placement: CommandPlacement::PromptStart,
-    },
-    CommandSpec {
-        invocation: "/resume",
-        description: "choose or name a session to resume",
-        placement: CommandPlacement::PromptStart,
-    },
-    CommandSpec {
-        invocation: SKILL_PREFIX,
-        description: "reference a skill anywhere in the prompt",
-        placement: CommandPlacement::Anywhere,
-    },
-];
+pub use crate::controls::{CommandPlacement, SKILL_PREFIX, SlashControl as CommandSpec};
+use crate::controls::{SlashAction, slash_controls};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParsedPromptCommand<'a> {
+    Agents,
+    Models,
     New,
     Providers,
     Reload,
     Resume(Option<&'a str>),
+    Switch,
 }
 
 #[must_use]
@@ -57,7 +20,7 @@ pub fn matching(prefix: &str, at_prompt_start: bool) -> Vec<&'static CommandSpec
         return Vec::new();
     }
 
-    COMMANDS
+    slash_controls()
         .iter()
         .filter(|command| {
             (at_prompt_start || command.placement == CommandPlacement::Anywhere)
@@ -69,17 +32,26 @@ pub fn matching(prefix: &str, at_prompt_start: bool) -> Vec<&'static CommandSpec
 #[must_use]
 pub fn parse_prompt_command(input: &str) -> Option<ParsedPromptCommand<'_>> {
     let command = input.trim_end();
-    match command {
-        "/new" => Some(ParsedPromptCommand::New),
-        "/providers" => Some(ParsedPromptCommand::Providers),
-        "/reload" => Some(ParsedPromptCommand::Reload),
-        "/resume" => Some(ParsedPromptCommand::Resume(None)),
-        _ => command
-            .strip_prefix("/resume ")
-            .map(str::trim)
-            .filter(|session| !session.is_empty())
-            .map(|session| ParsedPromptCommand::Resume(Some(session))),
+    if let Some(control) = slash_controls()
+        .iter()
+        .find(|control| control.invocation == command)
+    {
+        return match control.action {
+            SlashAction::Agents => Some(ParsedPromptCommand::Agents),
+            SlashAction::Models => Some(ParsedPromptCommand::Models),
+            SlashAction::New => Some(ParsedPromptCommand::New),
+            SlashAction::Providers => Some(ParsedPromptCommand::Providers),
+            SlashAction::Reload => Some(ParsedPromptCommand::Reload),
+            SlashAction::Resume => Some(ParsedPromptCommand::Resume(None)),
+            SlashAction::Switch => Some(ParsedPromptCommand::Switch),
+            SlashAction::Skill => None,
+        };
     }
+    command
+        .strip_prefix("/resume ")
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+        .map(|session| ParsedPromptCommand::Resume(Some(session)))
 }
 
 #[must_use]
@@ -87,7 +59,7 @@ pub fn highlighted_ranges(line: &str, first_prompt_line: bool) -> Vec<Range<usiz
     let mut ranges = Vec::new();
     let first_token_end = line.find(char::is_whitespace).unwrap_or(line.len());
     if first_prompt_line
-        && COMMANDS.iter().any(|command| {
+        && slash_controls().iter().any(|command| {
             command.placement == CommandPlacement::PromptStart
                 && command.invocation == &line[..first_token_end]
         })
@@ -128,8 +100,20 @@ mod tests {
     #[test]
     fn parser_recognizes_commands_with_and_without_arguments() {
         assert_eq!(
+            super::parse_prompt_command("/agents"),
+            Some(ParsedPromptCommand::Agents)
+        );
+        assert_eq!(
             super::parse_prompt_command("/new"),
             Some(ParsedPromptCommand::New)
+        );
+        assert_eq!(
+            super::parse_prompt_command("/models"),
+            Some(ParsedPromptCommand::Models)
+        );
+        assert_eq!(
+            super::parse_prompt_command("/switch"),
+            Some(ParsedPromptCommand::Switch)
         );
         assert_eq!(
             super::parse_prompt_command("/resume session-1"),

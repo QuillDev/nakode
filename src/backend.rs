@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -123,6 +124,55 @@ pub struct ApprovalRequest {
     pub detail: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuestionRequest {
+    pub id: String,
+    pub title: String,
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+    pub multi: bool,
+    pub recommended: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TodoPhase {
+    pub name: String,
+    pub tasks: Vec<TodoItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Abandoned,
+}
+
+impl TodoStatus {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in progress",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionHistoryItem {
     pub turn_id: String,
@@ -132,6 +182,7 @@ pub struct SessionHistoryItem {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendOperation {
     Initialize,
+    Authenticate,
     ModelList,
     Reload,
     SetSessionModel,
@@ -148,6 +199,7 @@ impl BackendOperation {
     pub fn label(self) -> &'static str {
         match self {
             Self::Initialize => "initialize backend",
+            Self::Authenticate => "authenticate provider",
             Self::ModelList => "list models",
             Self::Reload => "reload backend metadata",
             Self::SetSessionModel => "set session model",
@@ -164,6 +216,15 @@ impl BackendOperation {
 #[derive(Clone, Debug, PartialEq)]
 pub enum BackendEvent {
     Ready(BackendIdentity),
+    AuthenticationChallenge {
+        login_id: String,
+        verification_url: String,
+        user_code: String,
+    },
+    AuthenticationCompleted {
+        kind: String,
+        metadata: Value,
+    },
     Models(Vec<ModelInfo>),
     SessionCreated {
         provider_session_id: String,
@@ -173,6 +234,9 @@ pub enum BackendEvent {
         provider_session_id: String,
         model: String,
         history: Vec<SessionHistoryItem>,
+    },
+    TodoUpdated {
+        phases: Vec<TodoPhase>,
     },
     SessionUnsubscribed,
     SessionObserved {
@@ -212,6 +276,7 @@ pub enum BackendEvent {
         plan: String,
     },
     ApprovalRequested(ApprovalRequest),
+    QuestionRequested(QuestionRequest),
     ApprovalResolved {
         request_id: Value,
     },
@@ -247,6 +312,7 @@ pub enum BackendEvent {
 /// Provider-neutral commands understood by an agent backend adapter.
 #[derive(Clone, Debug)]
 pub enum BackendCommand {
+    BeginAuthentication,
     StartSession {
         model: Option<String>,
         instructions: Option<String>,
@@ -284,6 +350,10 @@ pub enum BackendCommand {
         id: Value,
         decision: ApprovalDecision,
     },
+    ResolveQuestion {
+        id: String,
+        answer: String,
+    },
     Shutdown,
 }
 
@@ -311,6 +381,15 @@ pub enum BackendError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to prepare {provider} credential store at {path}: {source}")]
+    CredentialStore {
+        provider: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("stored credential for {provider} is invalid: {detail}")]
+    InvalidCredential { provider: String, detail: String },
 }
 
 /// Running provider adapter with a uniform command/event boundary.

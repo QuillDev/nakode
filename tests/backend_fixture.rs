@@ -5,7 +5,7 @@ use std::{fs::OpenOptions, io::Write, process::Command};
 
 use nako_agent::{
     backend::{BackendCommand, BackendEvent, BackendHandle, DeltaKind},
-    codex::{self, BackendConfig},
+    codex::{self, CompatibilityBackendConfig as BackendConfig},
 };
 use tokio::time::timeout;
 
@@ -19,8 +19,9 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
         program: PathBuf::from("python3"),
         args: vec![OsString::from(fixture)],
         workspace: manifest,
+        credential_home: None,
     };
-    let mut backend = codex::spawn(config).await?;
+    let mut backend = codex::spawn_compatibility(config).await?;
 
     let mut ready = false;
     let mut models = false;
@@ -100,6 +101,50 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
     Ok(())
 }
 
+#[tokio::test]
+async fn codex_client_completes_device_authentication() -> TestResult {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture = manifest.join("tests/fixtures/fake_codex.py");
+    let config = BackendConfig {
+        program: PathBuf::from("python3"),
+        args: vec![OsString::from(fixture)],
+        workspace: manifest,
+        credential_home: None,
+    };
+    let mut backend = codex::spawn_compatibility(config).await?;
+
+    while !matches!(next_event(&mut backend).await?, BackendEvent::Ready(_)) {}
+    backend
+        .commands
+        .send(BackendCommand::BeginAuthentication)
+        .await?;
+
+    let challenge = next_matching_event(&mut backend, |event| {
+        matches!(event, BackendEvent::AuthenticationChallenge { .. })
+    })
+    .await?;
+    assert!(matches!(
+        challenge,
+        BackendEvent::AuthenticationChallenge {
+            verification_url,
+            user_code,
+            ..
+        } if verification_url == "https://example.test/device" && user_code == "NAKO-CODE"
+    ));
+    let completed = next_matching_event(&mut backend, |event| {
+        matches!(event, BackendEvent::AuthenticationCompleted { .. })
+    })
+    .await?;
+    assert!(matches!(
+        completed,
+        BackendEvent::AuthenticationCompleted { kind, metadata }
+            if kind == "chatgpt_device_code"
+                && metadata["credential_store"] == "codex_managed"
+    ));
+    backend.commands.send(BackendCommand::Shutdown).await?;
+    Ok(())
+}
+
 async fn observe_codex_turn(
     backend: &mut BackendHandle,
 ) -> TestResult<(String, Option<String>, bool)> {
@@ -161,8 +206,9 @@ async fn codex_client_resumes_history_and_unsubscribes() -> TestResult {
         program: PathBuf::from("python3"),
         args: vec![OsString::from(fixture)],
         workspace: manifest,
+        credential_home: None,
     };
-    let mut backend = codex::spawn(config).await?;
+    let mut backend = codex::spawn_compatibility(config).await?;
 
     let mut ready = false;
     let mut models = false;
@@ -228,8 +274,9 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
             gate.clone().into_os_string(),
         ],
         workspace: manifest,
+        credential_home: None,
     };
-    let mut backend = codex::spawn(config).await?;
+    let mut backend = codex::spawn_compatibility(config).await?;
 
     backend
         .commands
@@ -269,4 +316,16 @@ async fn next_event(backend: &mut BackendHandle) -> TestResult<BackendEvent> {
     event.ok_or_else(|| {
         io::Error::new(io::ErrorKind::UnexpectedEof, "Codex fixture stream ended").into()
     })
+}
+
+async fn next_matching_event(
+    backend: &mut BackendHandle,
+    predicate: impl Fn(&BackendEvent) -> bool,
+) -> TestResult<BackendEvent> {
+    loop {
+        let event = next_event(backend).await?;
+        if predicate(&event) {
+            return Ok(event);
+        }
+    }
 }

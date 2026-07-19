@@ -1,0 +1,7 @@
+[[providers]]
+slug = "openai-codex"
+display_name = "Codex"
+
+[[providers]]
+slug = "devin-acp"
+display_name = "Devin"

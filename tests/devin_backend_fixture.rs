@@ -5,7 +5,7 @@ use nako_agent::{
         BackendCommand, BackendEvent, BackendHandle, BackendOperation, DEVIN_PROVIDER, DeltaKind,
         TurnOutcome,
     },
-    devin::{self, BackendConfig},
+    devin::{self, CompatibilityBackendConfig as BackendConfig},
 };
 use tokio::time::timeout;
 
@@ -27,11 +27,11 @@ async fn devin_acp_streams_turn_tools_permissions_and_resume_history() -> TestRe
 async fn spawn_fixture() -> TestResult<BackendHandle> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixture = manifest.join("tests/fixtures/fake_devin.py");
-    devin::spawn(BackendConfig {
-        program: PathBuf::from("python3"),
-        args: vec![OsString::from(fixture)],
-        workspace: manifest,
-    })
+    devin::spawn_compatibility(BackendConfig::for_command(
+        PathBuf::from("python3"),
+        vec![OsString::from(fixture)],
+        manifest,
+    ))
     .await
     .map_err(Into::into)
 }
@@ -259,11 +259,11 @@ async fn verify_resume_and_cancellation(
 async fn cached_model_selection_is_applied_before_first_prompt() -> TestResult {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixture = manifest.join("tests/fixtures/fake_devin.py");
-    let mut backend = devin::spawn(BackendConfig {
-        program: PathBuf::from("python3"),
-        args: vec![OsString::from(fixture)],
-        workspace: manifest,
-    })
+    let mut backend = devin::spawn_compatibility(BackendConfig::for_command(
+        PathBuf::from("python3"),
+        vec![OsString::from(fixture)],
+        manifest,
+    ))
     .await?;
     assert!(matches!(
         next_event(&mut backend).await?,

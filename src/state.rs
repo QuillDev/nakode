@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 pub use crate::{backend::ApprovalDecision, session::SubagentStatus};
@@ -10,7 +10,7 @@ use crate::{
     backend::{
         ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent, BackendOperation,
         CODEX_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem,
-        SessionHistoryItem, TurnOutcome,
+        QuestionRequest, SessionHistoryItem, TodoPhase, TurnOutcome,
     },
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
@@ -89,6 +89,20 @@ struct PendingSteer {
 pub struct ModelPicker {
     pub filter: String,
     pub selected: usize,
+    pub scope: ModelSelectionScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelSelectionScope {
+    Default,
+    Session,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuestionPrompt {
+    pub request: QuestionRequest,
+    pub selected: usize,
+    pub selections: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +118,124 @@ pub struct ProviderPicker {
     pub selected: usize,
     pub loading: bool,
     pub showing_details: bool,
+    pub authentication: Option<ProviderAuthentication>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderAuthentication {
+    Starting,
+    Challenge {
+        verification_url: String,
+        user_code: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentEditorField {
+    Slug,
+    Description,
+    SystemPrompt,
+    FirstMessage,
+    Model,
+    FallbackModels,
+}
+
+impl AgentEditorField {
+    pub const ALL: [Self; 6] = [
+        Self::Slug,
+        Self::Description,
+        Self::SystemPrompt,
+        Self::FirstMessage,
+        Self::Model,
+        Self::FallbackModels,
+    ];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Slug => "Slug",
+            Self::Description => "Description",
+            Self::SystemPrompt => "System prompt",
+            Self::FirstMessage => "First message",
+            Self::Model => "Model",
+            Self::FallbackModels => "Fallbacks",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentEditor {
+    pub original_slug: Option<String>,
+    pub field: AgentEditorField,
+    pub slug: String,
+    pub description: String,
+    pub system_prompt: String,
+    pub first_message: String,
+    pub model: String,
+    pub fallback_models: String,
+}
+
+impl AgentEditor {
+    fn new() -> Self {
+        Self {
+            original_slug: None,
+            field: AgentEditorField::Slug,
+            slug: String::new(),
+            description: String::new(),
+            system_prompt: String::new(),
+            first_message: String::new(),
+            model: String::new(),
+            fallback_models: String::new(),
+        }
+    }
+
+    fn from_definition(definition: &AgentDefinition) -> Self {
+        Self {
+            original_slug: Some(definition.slug.clone()),
+            field: AgentEditorField::Slug,
+            slug: definition.slug.clone(),
+            description: definition.description.clone(),
+            system_prompt: definition.system_prompt.clone(),
+            first_message: definition.first_message.clone(),
+            model: definition.model.clone().unwrap_or_default(),
+            fallback_models: definition.fallback_models.join(", "),
+        }
+    }
+
+    fn value_mut(&mut self) -> &mut String {
+        match self.field {
+            AgentEditorField::Slug => &mut self.slug,
+            AgentEditorField::Description => &mut self.description,
+            AgentEditorField::SystemPrompt => &mut self.system_prompt,
+            AgentEditorField::FirstMessage => &mut self.first_message,
+            AgentEditorField::Model => &mut self.model,
+            AgentEditorField::FallbackModels => &mut self.fallback_models,
+        }
+    }
+
+    fn definition(&self) -> AgentDefinition {
+        AgentDefinition {
+            slug: self.slug.trim().to_owned(),
+            description: self.description.trim().to_owned(),
+            system_prompt: self.system_prompt.trim().to_owned(),
+            first_message: self.first_message.trim().to_owned(),
+            model: (!self.model.trim().is_empty()).then(|| self.model.trim().to_owned()),
+            fallback_models: self
+                .fallback_models
+                .split(',')
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentPicker {
+    pub agents: Vec<AgentDefinition>,
+    pub selected: usize,
+    pub editor: Option<AgentEditor>,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +267,13 @@ struct SubagentChat {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SubagentHitRegion {
     run_id: String,
+    top_left: ScreenPoint,
+    bottom_right: ScreenPoint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OAuthLinkHitRegion {
+    url: String,
     top_left: ScreenPoint,
     bottom_right: ScreenPoint,
 }
@@ -187,6 +326,19 @@ pub enum Effect {
         provider: String,
         enabled: bool,
     },
+    AuthenticateProvider(String),
+    SaveProviderCredential {
+        provider: String,
+        kind: String,
+        metadata: serde_json::Value,
+    },
+    ClearProviderCredential(String),
+    OpenUrl(String),
+    SaveAgent {
+        definition: AgentDefinition,
+        previous_slug: Option<String>,
+    },
+    DeleteAgent(String),
     ResolveSession(String),
     PersistSession {
         provider: String,
@@ -198,6 +350,10 @@ pub enum Effect {
     PersistModels {
         provider: String,
         models: Vec<ModelInfo>,
+    },
+    SetDefaultModel {
+        provider: String,
+        model: String,
     },
     PersistSubagent(SubagentRecord),
     LoadSubagents(String),
@@ -226,14 +382,18 @@ pub struct AppState {
     pub queue_selection: Option<usize>,
     pub models: Vec<ModelInfo>,
     pub selected_model: Option<String>,
+    session_model_override: bool,
     pub model_picker: Option<ModelPicker>,
     pub session_picker: Option<SessionPicker>,
     pub provider_picker: Option<ProviderPicker>,
+    pub agent_picker: Option<AgentPicker>,
     command_completion_selection: usize,
-    pending_model_picker: Option<()>,
+    pending_model_picker: Option<ModelSelectionScope>,
     pub show_help: bool,
     pub text_selection: Option<TextSelection>,
     pub approvals: VecDeque<ApprovalRequest>,
+    pub questions: VecDeque<QuestionPrompt>,
+    pub todo_phases: Vec<TodoPhase>,
     pub scroll_from_bottom: usize,
     pub status_message: String,
     pub diagnostic_count: usize,
@@ -256,9 +416,11 @@ pub struct AppState {
     screen_snapshot: Option<ScreenSnapshot>,
     pending_clipboard: Option<String>,
     agents: AgentCatalog,
+    agent_directory: PathBuf,
     subagent_executions: HashMap<String, SubagentExecution>,
     subagent_chats: HashMap<String, SubagentChat>,
     subagent_hit_regions: Vec<SubagentHitRegion>,
+    oauth_link_hit_region: Option<OAuthLinkHitRegion>,
     transcript_limit: usize,
 }
 
@@ -319,14 +481,18 @@ impl AppState {
             queue_selection: None,
             models: Vec::new(),
             selected_model: initial_model.clone(),
+            session_model_override: initial_model.is_some(),
             model_picker: None,
             session_picker: None,
             provider_picker: None,
+            agent_picker: None,
             command_completion_selection: 0,
             pending_model_picker: None,
             show_help: false,
             text_selection: None,
             approvals: VecDeque::new(),
+            questions: VecDeque::new(),
+            todo_phases: Vec::new(),
             scroll_from_bottom: 0,
             status_message: format!("Connecting to {backend_name}…"),
             diagnostic_count: 0,
@@ -349,15 +515,165 @@ impl AppState {
             screen_snapshot: None,
             pending_clipboard: None,
             agents: AgentCatalog::default(),
+            agent_directory: PathBuf::from(".nako-agent/agents"),
             subagent_executions: HashMap::new(),
             subagent_chats: HashMap::new(),
             subagent_hit_regions: Vec::new(),
+            oauth_link_hit_region: None,
             transcript_limit: scrollback,
         }
     }
 
+    pub fn new_unconfigured(
+        workspace: impl Into<String>,
+        initial_model: Option<String>,
+        scrollback: usize,
+    ) -> Self {
+        let mut state = Self::new_for_backend(
+            workspace,
+            initial_model,
+            scrollback,
+            String::new(),
+            "No provider",
+        );
+        state.provider_contexts.clear();
+        state.connection = ConnectionState::Disconnected("no provider enabled".to_owned());
+        state.backend_provider.clear();
+        "No provider is enabled. Open /providers to configure one."
+            .clone_into(&mut state.status_message);
+        state
+    }
+
     pub fn install_agents(&mut self, agents: AgentCatalog) {
         self.agents = agents;
+        if let Some(picker) = &mut self.agent_picker {
+            picker.agents = self.agents.definitions().to_vec();
+            picker.selected = picker.selected.min(picker.agents.len().saturating_sub(1));
+            picker.editor = None;
+        }
+    }
+
+    pub fn set_agent_directory(&mut self, directory: PathBuf) {
+        self.agent_directory = directory;
+    }
+
+    #[must_use]
+    pub fn agent_directory(&self) -> &Path {
+        &self.agent_directory
+    }
+
+    pub fn open_agent_picker(&mut self) {
+        self.agent_picker = Some(AgentPicker {
+            agents: self.agents.definitions().to_vec(),
+            selected: 0,
+            editor: None,
+        });
+        self.set_status("Agent archetypes opened.");
+    }
+
+    pub fn close_agent_picker(&mut self) {
+        self.agent_picker = None;
+        self.set_status("Agent settings closed.");
+    }
+
+    pub fn agent_picker_move(&mut self, delta: isize) {
+        let Some(picker) = &mut self.agent_picker else {
+            return;
+        };
+        if !picker.agents.is_empty() && picker.editor.is_none() {
+            picker.selected = offset_index(picker.selected, picker.agents.len(), delta);
+        }
+    }
+
+    pub fn edit_selected_agent(&mut self) {
+        let Some(picker) = &mut self.agent_picker else {
+            return;
+        };
+        if let Some(definition) = picker.agents.get(picker.selected) {
+            picker.editor = Some(AgentEditor::from_definition(definition));
+        }
+    }
+
+    pub fn create_agent(&mut self) {
+        if let Some(picker) = &mut self.agent_picker {
+            picker.editor = Some(AgentEditor::new());
+        }
+    }
+
+    pub fn cancel_agent_edit(&mut self) -> bool {
+        let Some(picker) = &mut self.agent_picker else {
+            return false;
+        };
+        picker.editor.take().is_some()
+    }
+
+    pub fn agent_editor_move(&mut self, delta: isize) {
+        let Some(editor) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+        else {
+            return;
+        };
+        let index = AgentEditorField::ALL
+            .iter()
+            .position(|field| *field == editor.field)
+            .unwrap_or_default();
+        editor.field =
+            AgentEditorField::ALL[offset_index(index, AgentEditorField::ALL.len(), delta)];
+    }
+
+    pub fn agent_editor_insert(&mut self, character: char) {
+        if let Some(editor) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+        {
+            editor.value_mut().push(character);
+        }
+    }
+
+    pub fn agent_editor_insert_str(&mut self, text: &str) {
+        if let Some(editor) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+        {
+            editor.value_mut().push_str(text);
+        }
+    }
+
+    pub fn agent_editor_backspace(&mut self) {
+        if let Some(editor) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+        {
+            editor.value_mut().pop();
+        }
+    }
+
+    pub fn save_agent_edit(&mut self) -> Vec<Effect> {
+        let Some(editor) = self
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+        else {
+            return Vec::new();
+        };
+        vec![Effect::SaveAgent {
+            definition: editor.definition(),
+            previous_slug: editor.original_slug.clone(),
+        }]
+    }
+
+    pub fn delete_selected_agent(&mut self) -> Vec<Effect> {
+        self.agent_picker
+            .as_ref()
+            .and_then(|picker| picker.agents.get(picker.selected))
+            .map_or_else(Vec::new, |agent| {
+                vec![Effect::DeleteAgent(agent.slug.clone())]
+            })
     }
 
     pub fn set_nako_executable(&mut self, executable: &Path) {
@@ -415,6 +731,61 @@ impl AppState {
         self.subagent_modal = Some(run_id);
         self.clear_text_selection();
         true
+    }
+
+    pub fn set_oauth_link_hit_region(
+        &mut self,
+        region: Option<(String, ScreenPoint, ScreenPoint)>,
+    ) {
+        self.oauth_link_hit_region =
+            region.map(|(url, top_left, bottom_right)| OAuthLinkHitRegion {
+                url,
+                top_left,
+                bottom_right,
+            });
+    }
+
+    #[must_use]
+    pub fn oauth_url_at(&self, point: ScreenPoint) -> Option<String> {
+        self.oauth_link_hit_region
+            .as_ref()
+            .filter(|region| {
+                point.column >= region.top_left.column
+                    && point.column < region.bottom_right.column
+                    && point.row >= region.top_left.row
+                    && point.row < region.bottom_right.row
+            })
+            .map(|region| region.url.clone())
+    }
+
+    pub fn open_provider_authentication_url(&mut self) -> Vec<Effect> {
+        let Some(url) = self.provider_authentication_url().map(str::to_owned) else {
+            self.set_status("No provider authentication URL is available.");
+            return Vec::new();
+        };
+        vec![Effect::OpenUrl(url)]
+    }
+
+    pub fn copy_provider_authentication_url(&mut self) -> Vec<Effect> {
+        let Some(url) = self.provider_authentication_url().map(str::to_owned) else {
+            self.set_status("No provider authentication URL is available.");
+            return Vec::new();
+        };
+        self.pending_clipboard = Some(url);
+        Vec::new()
+    }
+
+    fn provider_authentication_url(&self) -> Option<&str> {
+        let picker = self.provider_picker.as_ref()?;
+        if !picker.showing_details {
+            return None;
+        }
+        match picker.authentication.as_ref()? {
+            ProviderAuthentication::Challenge {
+                verification_url, ..
+            } => Some(verification_url),
+            ProviderAuthentication::Starting => None,
+        }
     }
 
     pub fn close_subagent_modal(&mut self) {
@@ -530,6 +901,7 @@ impl AppState {
             selected: 0,
             loading: false,
             showing_details: false,
+            authentication: None,
         });
         picker.providers = providers;
         picker.selected = 0;
@@ -586,6 +958,19 @@ impl AppState {
             .map(|context| &context.connection)
     }
 
+    #[must_use]
+    pub fn provider_display_name(&self, provider: &str) -> String {
+        self.provider_picker
+            .as_ref()
+            .and_then(|picker| {
+                picker
+                    .providers
+                    .iter()
+                    .find(|record| record.provider == provider)
+            })
+            .map_or_else(|| provider.to_owned(), |record| record.display_name.clone())
+    }
+
     pub fn close_provider_picker(&mut self) {
         self.provider_picker = None;
         self.set_status("Provider settings closed.");
@@ -598,6 +983,11 @@ impl AppState {
         let Some(provider) = picker.providers.get_mut(picker.selected) else {
             return Vec::new();
         };
+        if provider.credential.is_none() {
+            picker.authentication = Some(ProviderAuthentication::Starting);
+            self.status_message = format!("Starting {} authentication…", provider.display_name);
+            return vec![Effect::AuthenticateProvider(provider.provider.clone())];
+        }
         provider.enabled = !provider.enabled;
         self.status_message = format!(
             "{} {}.",
@@ -612,6 +1002,123 @@ impl AppState {
             provider: provider.provider.clone(),
             enabled: provider.enabled,
         }]
+    }
+
+    pub fn logout_provider(&mut self) -> Vec<Effect> {
+        let Some(picker) = &mut self.provider_picker else {
+            return Vec::new();
+        };
+        let Some(provider) = picker.providers.get(picker.selected) else {
+            return Vec::new();
+        };
+        if provider.credential.is_none() {
+            self.set_status("This provider has no credentials to clear.");
+            return Vec::new();
+        }
+        self.status_message = format!("Logging out of {}…", provider.display_name);
+        vec![Effect::ClearProviderCredential(provider.provider.clone())]
+    }
+
+    pub fn provider_logged_out(&mut self, provider: &str) {
+        if let Some(picker) = &mut self.provider_picker {
+            picker.authentication = None;
+        }
+        self.provider_contexts.remove(provider);
+        if provider == self.backend_provider {
+            self.connection = ConnectionState::Disconnected("logged out".to_owned());
+        }
+        self.set_status(&format!(
+            "Logged out of {}.",
+            self.provider_display_name(provider)
+        ));
+    }
+
+    pub fn provider_authentication_failed(&mut self, provider: &str, message: &str) {
+        if let Some(picker) = &mut self.provider_picker {
+            picker.authentication = None;
+        }
+        self.provider_contexts.remove(provider);
+        self.set_status(&format!("Authentication failed for {provider}: {message}"));
+    }
+
+    fn provider_is_authenticating(&self, provider: &str) -> bool {
+        self.provider_picker.as_ref().is_some_and(|picker| {
+            picker.authentication.is_some()
+                && picker
+                    .providers
+                    .get(picker.selected)
+                    .is_some_and(|record| record.provider == provider)
+        })
+    }
+
+    pub fn provider_starting(&mut self, provider: &str, display_name: &str) {
+        self.provider_contexts.insert(
+            provider.to_owned(),
+            ProviderContext {
+                name: display_name.to_owned(),
+                capabilities: BackendCapabilities::default(),
+                connection: ConnectionState::Starting,
+                provider_session_id: None,
+                session_id: None,
+            },
+        );
+        if self.backend_provider.is_empty() {
+            provider.clone_into(&mut self.backend_provider);
+            display_name.clone_into(&mut self.backend_name);
+            self.connection = ConnectionState::Starting;
+        }
+        self.set_status(&format!("Connecting to {display_name}…"));
+    }
+
+    pub fn provider_start_failed(&mut self, provider: &str, display_name: &str, message: &str) {
+        self.provider_contexts.insert(
+            provider.to_owned(),
+            ProviderContext {
+                name: display_name.to_owned(),
+                capabilities: BackendCapabilities::default(),
+                connection: ConnectionState::Failed(message.to_owned()),
+                provider_session_id: None,
+                session_id: None,
+            },
+        );
+        if provider == self.backend_provider {
+            self.connection = ConnectionState::Failed(message.to_owned());
+        }
+        self.set_status(&format!("Could not start {provider}: {message}"));
+    }
+
+    pub fn provider_disabled(&mut self, provider: &str) {
+        self.provider_contexts.remove(provider);
+        let model_prefix = format!("{provider}/");
+        self.models
+            .retain(|model| model.provider != provider && !model.id.starts_with(&model_prefix));
+        if self
+            .selected_model
+            .as_deref()
+            .is_some_and(|model| model.starts_with(&model_prefix))
+        {
+            self.selected_model = None;
+        }
+        if provider != self.backend_provider {
+            return;
+        }
+        if let Some((next_provider, context)) = self.provider_contexts.iter().next() {
+            self.backend_provider.clone_from(next_provider);
+            self.backend_name.clone_from(&context.name);
+            self.backend_capabilities = context.capabilities.clone();
+            self.connection = context.connection.clone();
+            self.provider_session_id
+                .clone_from(&context.provider_session_id);
+            self.session_id.clone_from(&context.session_id);
+        } else {
+            self.backend_provider.clear();
+            "No provider".clone_into(&mut self.backend_name);
+            self.backend_capabilities = BackendCapabilities::default();
+            self.connection = ConnectionState::Disconnected("no provider enabled".to_owned());
+            self.provider_session_id = None;
+            self.session_id = None;
+            self.set_status("No provider is enabled. Open /providers to configure one.");
+        }
     }
 
     pub fn session_persisted(&mut self, session: &SessionRecord) {
@@ -789,14 +1296,18 @@ impl AppState {
             self.set_status("Write a message before sending.");
             return Vec::new();
         }
-        if !self.connection.is_ready() {
-            self.set_status("The backend is not ready; the draft was preserved.");
-            return Vec::new();
-        }
-
         let editor_text = self.editor.text();
         if let Some(command) = commands::parse_prompt_command(&editor_text) {
             match command {
+                ParsedPromptCommand::Agents => {
+                    self.editor.clear();
+                    self.open_agent_picker();
+                    return Vec::new();
+                }
+                ParsedPromptCommand::Models => {
+                    self.editor.clear();
+                    return self.open_default_model_picker();
+                }
                 ParsedPromptCommand::New => {
                     self.editor.clear();
                     return self.new_session();
@@ -808,6 +1319,7 @@ impl AppState {
                         selected: 0,
                         loading: true,
                         showing_details: false,
+                        authentication: None,
                     });
                     self.set_status("Loading providers…");
                     return vec![Effect::ListProviders];
@@ -834,7 +1346,16 @@ impl AppState {
                     self.set_status("Loading sessions…");
                     return vec![Effect::ListSessions];
                 }
+                ParsedPromptCommand::Switch => {
+                    self.editor.clear();
+                    return self.open_model_picker();
+                }
             }
+        }
+
+        if !self.connection.is_ready() {
+            self.set_status("The backend is not ready; the draft was preserved.");
+            return Vec::new();
         }
 
         if self.is_busy() {
@@ -871,6 +1392,8 @@ impl AppState {
         }
         let previous = self.provider_session_id.take();
         self.session_id = None;
+        self.session_model_override = false;
+        self.selected_model = self.default_model();
         self.active_turn = None;
         self.creating_session = None;
         self.pending_session_prompt = None;
@@ -1032,7 +1555,21 @@ impl AppState {
         self.status_message = format!("Loaded cached {} models.", self.backend_name);
     }
 
+    pub fn install_persisted_model_preferences(&mut self, models: Vec<ModelInfo>) {
+        if !models.is_empty() {
+            self.install_models(models);
+        }
+    }
+
     pub fn open_model_picker(&mut self) -> Vec<Effect> {
+        self.open_model_picker_for(ModelSelectionScope::Session)
+    }
+
+    pub fn open_default_model_picker(&mut self) -> Vec<Effect> {
+        self.open_model_picker_for(ModelSelectionScope::Default)
+    }
+
+    fn open_model_picker_for(&mut self, scope: ModelSelectionScope) -> Vec<Effect> {
         if self.pending_model_picker.is_some()
             || (self.creating_session.is_some() && self.provider_session_id.is_none())
         {
@@ -1040,14 +1577,14 @@ impl AppState {
             return Vec::new();
         }
         if !self.models.is_empty() {
-            self.show_model_picker();
+            self.show_model_picker(scope);
             return Vec::new();
         }
         if !self.backend_capabilities.model_catalog.is_supported() {
             self.status_message = format!("{} does not expose model selection.", self.backend_name);
             return Vec::new();
         }
-        self.pending_model_picker = Some(());
+        self.pending_model_picker = Some(scope);
         self.status_message = format!("Loading {} models…", self.backend_name);
         if self
             .backend_capabilities
@@ -1062,7 +1599,7 @@ impl AppState {
         })]
     }
 
-    fn show_model_picker(&mut self) {
+    fn show_model_picker(&mut self, scope: ModelSelectionScope) {
         let selected = self
             .selected_model
             .as_ref()
@@ -1075,6 +1612,7 @@ impl AppState {
         self.model_picker = Some(ModelPicker {
             filter: String::new(),
             selected,
+            scope,
         });
         self.pending_model_picker = None;
     }
@@ -1116,6 +1654,10 @@ impl AppState {
             .copied()
             .cloned();
         if let Some(selected) = selected {
+            let scope = self
+                .model_picker
+                .as_ref()
+                .map_or(ModelSelectionScope::Session, |picker| picker.scope);
             let provider_changed = selected.provider != self.backend_provider;
             let source_provider = self.backend_provider.clone();
             let source_name = self.backend_name.clone();
@@ -1154,31 +1696,48 @@ impl AppState {
             let active = self.active_turn.is_some();
             let qualified = selected.qualified_id();
             self.selected_model = Some(qualified.clone());
+            self.session_model_override = scope == ModelSelectionScope::Session;
+            if scope == ModelSelectionScope::Default {
+                for model in &mut self.models {
+                    if model.provider == selected.provider {
+                        model.is_default = model.id == selected.id;
+                    }
+                }
+            }
             self.status_message = if provider_changed && self.pending_handoff.is_some() {
                 format!("Selected {qualified}. The next message includes a continuity handoff.")
             } else if active {
                 format!("Next model: {qualified}. The active turn is unchanged.")
+            } else if scope == ModelSelectionScope::Default {
+                format!("Default model: {qualified}.")
             } else {
                 format!("Selected model: {qualified}.")
             };
             self.model_picker = None;
+            let mut effects = Vec::new();
+            if scope == ModelSelectionScope::Default {
+                effects.push(Effect::SetDefaultModel {
+                    provider: selected.provider.clone(),
+                    model: selected.id.clone(),
+                });
+            }
             if self
                 .backend_capabilities
                 .session_model_config
                 .is_supported()
                 && let Some(session_id) = self.provider_session_id.clone()
             {
-                return vec![Effect::Backend(BackendCommand::SetSessionModel {
+                effects.push(Effect::Backend(BackendCommand::SetSessionModel {
                     session_id,
                     model: selected.id,
-                })];
-            }
-            if let Some(session_id) = self.session_id.clone() {
-                return vec![Effect::UpdateSessionModel {
+                }));
+            } else if let Some(session_id) = self.session_id.clone() {
+                effects.push(Effect::UpdateSessionModel {
                     session_id,
                     model: Some(qualified),
-                }];
+                });
             }
+            return effects;
         }
         Vec::new()
     }
@@ -1248,7 +1807,60 @@ impl AppState {
         })]
     }
 
+    pub fn move_question_selection(&mut self, delta: isize) {
+        if let Some(question) = self.questions.front_mut() {
+            question.selected =
+                offset_index(question.selected, question.request.options.len(), delta);
+        }
+    }
+
+    pub fn toggle_question_selection(&mut self) {
+        let Some(question) = self.questions.front_mut() else {
+            return;
+        };
+        if question.request.multi
+            && let Some(selected) = question.selections.get_mut(question.selected)
+        {
+            *selected = !*selected;
+        }
+    }
+
+    pub fn resolve_question(&mut self) -> Vec<Effect> {
+        let Some(question) = self.questions.pop_front() else {
+            return Vec::new();
+        };
+        let answers = if question.request.multi {
+            question
+                .request
+                .options
+                .iter()
+                .zip(question.selections)
+                .filter(|(_, selected)| *selected)
+                .map(|(option, _)| option.label.clone())
+                .collect::<Vec<_>>()
+        } else {
+            question
+                .request
+                .options
+                .get(question.selected)
+                .map(|option| vec![option.label.clone()])
+                .unwrap_or_default()
+        };
+        if answers.is_empty() {
+            return Vec::new();
+        }
+        let answer = serde_json::to_string(&answers).unwrap_or_else(|_| answers.join(", "));
+        self.status_message = format!("Answered: {}", answers.join(", "));
+        vec![Effect::Backend(BackendCommand::ResolveQuestion {
+            id: question.request.id,
+            answer,
+        })]
+    }
+
     pub fn handle_provider_backend(&mut self, provider: &str, event: BackendEvent) -> Vec<Effect> {
+        if let Some(effects) = self.handle_provider_authentication(provider, &event) {
+            return effects;
+        }
         match &event {
             BackendEvent::Ready(identity) => {
                 self.provider_contexts.insert(
@@ -1269,6 +1881,14 @@ impl AppState {
                             .and_then(|context| context.session_id.clone()),
                     },
                 );
+                if self.backend_provider.is_empty() && !self.provider_is_authenticating(provider) {
+                    provider.clone_into(&mut self.backend_provider);
+                    self.backend_name.clone_from(&identity.display_name);
+                    self.backend_capabilities = identity.capabilities.clone();
+                    self.connection = ConnectionState::Ready {
+                        server: identity.display_name.clone(),
+                    };
+                }
             }
             BackendEvent::Models(models) => {
                 let mut models = models.clone();
@@ -1278,8 +1898,10 @@ impl AppState {
                 if !models.is_empty() {
                     self.install_models(models.clone());
                 }
-                if self.pending_model_picker.is_some() && !self.models.is_empty() {
-                    self.show_model_picker();
+                if let Some(scope) = self.pending_model_picker
+                    && !self.models.is_empty()
+                {
+                    self.show_model_picker(scope);
                 }
                 return vec![Effect::PersistModels {
                     provider: provider.to_owned(),
@@ -1322,6 +1944,49 @@ impl AppState {
         let effects = self.handle_backend(event);
         self.sync_active_provider_context();
         effects
+    }
+
+    fn handle_provider_authentication(
+        &mut self,
+        provider: &str,
+        event: &BackendEvent,
+    ) -> Option<Vec<Effect>> {
+        match event {
+            BackendEvent::AuthenticationChallenge {
+                verification_url,
+                user_code,
+                ..
+            } => {
+                if let Some(picker) = &mut self.provider_picker {
+                    picker.authentication = Some(ProviderAuthentication::Challenge {
+                        verification_url: verification_url.clone(),
+                        user_code: user_code.clone(),
+                    });
+                }
+                self.set_status("Complete the provider device authentication in your browser.");
+                Some(Vec::new())
+            }
+            BackendEvent::AuthenticationCompleted { kind, metadata } => {
+                if let Some(picker) = &mut self.provider_picker {
+                    picker.authentication = None;
+                }
+                self.set_status("Provider authentication completed.");
+                Some(vec![Effect::SaveProviderCredential {
+                    provider: provider.to_owned(),
+                    kind: kind.clone(),
+                    metadata: metadata.clone(),
+                }])
+            }
+            BackendEvent::RequestFailed {
+                operation: BackendOperation::Authenticate,
+                message,
+                ..
+            } => {
+                self.provider_authentication_failed(provider, message);
+                Some(Vec::new())
+            }
+            _ => None,
+        }
     }
 
     fn sync_active_provider_context(&mut self) {
@@ -1374,6 +2039,7 @@ impl AppState {
                 provider_session_id,
                 model,
             } => {
+                self.todo_phases.clear();
                 return self.handle_session_created(provider_session_id, &model);
             }
             BackendEvent::SessionResumed {
@@ -1381,9 +2047,13 @@ impl AppState {
                 model,
                 history,
             } => {
+                self.todo_phases.clear();
                 return self.handle_session_resumed(provider_session_id, &model, history);
             }
-            BackendEvent::SessionUnsubscribed => {}
+            BackendEvent::TodoUpdated { phases } => self.todo_phases = phases,
+            BackendEvent::AuthenticationChallenge { .. }
+            | BackendEvent::AuthenticationCompleted { .. }
+            | BackendEvent::SessionUnsubscribed => {}
             BackendEvent::SessionObserved {
                 provider_session_id,
             } => self.observe_session(provider_session_id),
@@ -1420,6 +2090,7 @@ impl AppState {
                 self.status_message = format!("Approval required: {}", approval.title);
                 self.approvals.push_back(approval);
             }
+            BackendEvent::QuestionRequested(request) => self.handle_question_request(request),
             BackendEvent::ApprovalResolved { request_id } => {
                 self.resolve_external_approval(&request_id);
             }
@@ -1472,6 +2143,20 @@ impl AppState {
         }
     }
 
+    fn handle_question_request(&mut self, request: QuestionRequest) {
+        self.status_message = format!("Question: {}", request.title);
+        let selected = request
+            .recommended
+            .unwrap_or_default()
+            .min(request.options.len().saturating_sub(1));
+        let selections = vec![false; request.options.len()];
+        self.questions.push_back(QuestionPrompt {
+            request,
+            selected,
+            selections,
+        });
+    }
+
     fn resolve_external_approval(&mut self, request_id: &serde_json::Value) {
         if let Some(index) = self
             .approvals
@@ -1505,8 +2190,8 @@ impl AppState {
         }
         let cached = models.clone();
         self.install_models(models);
-        if self.pending_model_picker.is_some() {
-            self.show_model_picker();
+        if let Some(scope) = self.pending_model_picker {
+            self.show_model_picker(scope);
         }
         let mut effects = vec![Effect::PersistModels {
             provider: self.backend_provider.clone(),
@@ -1566,6 +2251,7 @@ impl AppState {
         self.session_id = Some(session.id.clone());
         if !model.is_empty() {
             self.selected_model = Some(self.qualify_active_model(model));
+            self.session_model_override = true;
         }
         self.install_history(history);
         self.install_subagents(Vec::new());
@@ -1983,7 +2669,8 @@ impl AppState {
             BackendOperation::Initialize => {
                 self.connection = ConnectionState::Failed(message);
             }
-            BackendOperation::ModelList
+            BackendOperation::Authenticate
+            | BackendOperation::ModelList
             | BackendOperation::SetSessionModel
             | BackendOperation::UnsubscribeSession => {}
             BackendOperation::Reload => {
@@ -2176,7 +2863,15 @@ impl AppState {
             return Vec::new();
         }
         let persistence_boundary = is_subagent_persistence_boundary(&event);
-        let mut effects = match event {
+        let mut effects = self.reduce_subagent_backend(run_id, event);
+        if persistence_boundary && let Some(effect) = self.persist_subagent_effect(run_id) {
+            effects.push(effect);
+        }
+        effects
+    }
+
+    fn reduce_subagent_backend(&mut self, run_id: &str, event: BackendEvent) -> Vec<Effect> {
+        match event {
             BackendEvent::Ready(_) => self.start_subagent_session(run_id),
             BackendEvent::SessionCreated {
                 provider_session_id,
@@ -2220,6 +2915,13 @@ impl AppState {
                     decision: ApprovalDecision::AcceptForSession,
                 },
             }],
+            BackendEvent::QuestionRequested(request) => vec![Effect::SubagentBackend {
+                run_id: run_id.to_owned(),
+                command: BackendCommand::ResolveQuestion {
+                    id: request.id,
+                    answer: "No interactive user is attached to this subagent; continue with best judgment.".to_owned(),
+                },
+            }],
             BackendEvent::TurnCompleted { outcome, error, .. } => {
                 self.complete_subagent_turn(run_id, outcome, error)
             }
@@ -2255,7 +2957,10 @@ impl AppState {
                 Vec::new()
             }
             BackendEvent::Models(_)
+            | BackendEvent::AuthenticationChallenge { .. }
+            | BackendEvent::AuthenticationCompleted { .. }
             | BackendEvent::SessionResumed { .. }
+            | BackendEvent::TodoUpdated { .. }
             | BackendEvent::SessionUnsubscribed
             | BackendEvent::SessionObserved { .. }
             | BackendEvent::TurnAccepted { .. }
@@ -2265,11 +2970,7 @@ impl AppState {
             | BackendEvent::InterruptAccepted
             | BackendEvent::ModelRerouted { .. }
             | BackendEvent::SessionClosed { .. } => Vec::new(),
-        };
-        if persistence_boundary && let Some(effect) = self.persist_subagent_effect(run_id) {
-            effects.push(effect);
         }
-        effects
     }
 
     fn handle_subagent_delta(
@@ -2705,17 +3406,18 @@ impl AppState {
                     };
                 }
             }
-        } else if self
-            .backend_capabilities
-            .session_model_config
-            .is_supported()
-            || self.selected_model.as_ref().is_none_or(|selected| {
-                !self
-                    .models
-                    .iter()
-                    .any(|model| &model.qualified_id() == selected)
-            })
+        } else if self.selected_model.as_ref().is_none_or(|selected| {
+            !self
+                .models
+                .iter()
+                .any(|model| &model.qualified_id() == selected)
+        }) || (!self.session_model_override
+            && self
+                .backend_capabilities
+                .session_model_config
+                .is_supported())
         {
+            self.session_model_override = false;
             self.selected_model = self.default_model();
         }
     }
@@ -2878,8 +3580,8 @@ mod tests {
         backend::{
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
             BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, DEVIN_PROVIDER,
-            DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem, SessionHistoryItem,
-            TurnOutcome,
+            DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem, QuestionOption,
+            QuestionRequest, SessionHistoryItem, TodoItem, TodoPhase, TodoStatus, TurnOutcome,
         },
         session::{SessionRecord, SubagentRecord},
         transcript::{EntryKind, EntryStatus, TranscriptEntry},
@@ -3297,6 +3999,68 @@ model = "openai-codex/model-a"
     }
 
     #[test]
+    fn tool_questions_are_queued_and_resolved_through_backend_commands() {
+        let mut state = ready_state();
+        state.handle_backend(BackendEvent::QuestionRequested(QuestionRequest {
+            id: "question-1".to_owned(),
+            title: "Direction".to_owned(),
+            question: "Which path?".to_owned(),
+            options: vec![
+                QuestionOption {
+                    label: "Direct".to_owned(),
+                    description: None,
+                },
+                QuestionOption {
+                    label: "Flexible".to_owned(),
+                    description: None,
+                },
+            ],
+            multi: false,
+            recommended: None,
+        }));
+
+        state.move_question_selection(1);
+        assert!(matches!(
+            state.resolve_question().as_slice(),
+            [Effect::Backend(BackendCommand::ResolveQuestion { id, answer })]
+                if id == "question-1" && answer == "[\"Flexible\"]"
+        ));
+        assert!(state.questions.is_empty());
+    }
+
+    #[test]
+    fn multi_select_tool_questions_preserve_recommendations_and_descriptions() {
+        let mut state = ready_state();
+        state.handle_backend(BackendEvent::QuestionRequested(QuestionRequest {
+            id: "question-2".to_owned(),
+            title: "Targets".to_owned(),
+            question: "Which targets?".to_owned(),
+            options: vec![
+                QuestionOption {
+                    label: "Library".to_owned(),
+                    description: Some("Core implementation".to_owned()),
+                },
+                QuestionOption {
+                    label: "CLI".to_owned(),
+                    description: Some("Command-line surface".to_owned()),
+                },
+            ],
+            multi: true,
+            recommended: Some(1),
+        }));
+
+        assert_eq!(state.questions.front().expect("question").selected, 1);
+        state.toggle_question_selection();
+        state.move_question_selection(-1);
+        state.toggle_question_selection();
+        assert!(matches!(
+            state.resolve_question().as_slice(),
+            [Effect::Backend(BackendCommand::ResolveQuestion { answer, .. })]
+                if answer == "[\"Library\",\"CLI\"]"
+        ));
+    }
+
+    #[test]
     fn successful_connection_does_not_add_transcript_noise() {
         let state = ready_state();
         assert!(state.transcript.entries().is_empty());
@@ -3396,6 +4160,45 @@ model = "openai-codex/model-a"
     }
 
     #[test]
+    fn configuration_commands_work_without_an_enabled_provider() {
+        let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
+
+        state.editor.set_text("/providers");
+        assert!(matches!(
+            state.submit_editor().as_slice(),
+            [Effect::ListProviders]
+        ));
+
+        state.close_provider_picker();
+        state.editor.set_text("/agents");
+        assert!(state.submit_editor().is_empty());
+        assert!(state.agent_picker.is_some());
+    }
+
+    #[test]
+    fn provider_lifecycle_can_move_from_unconfigured_to_ready_and_back() {
+        let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
+        state.provider_starting(CODEX_PROVIDER, "Codex");
+        assert_eq!(state.backend_provider, CODEX_PROVIDER);
+        assert!(matches!(state.connection, super::ConnectionState::Starting));
+
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        assert!(state.connection.is_ready());
+
+        state.provider_disabled(CODEX_PROVIDER);
+        assert!(state.backend_provider.is_empty());
+        assert!(!state.connection.is_ready());
+    }
+
+    #[test]
     fn resumed_session_rebuilds_transcript_and_touches_metadata() {
         let mut state = ready_state();
         let session = SessionRecord {
@@ -3436,6 +4239,29 @@ model = "openai-codex/model-a"
         assert_eq!(state.session_id.as_deref(), Some(session.id.as_str()));
         assert_eq!(state.provider_session_id.as_deref(), Some("thread-resumed"));
         assert_eq!(state.transcript.entries()[0].body, "hello");
+    }
+
+    #[test]
+    fn todo_updates_replace_the_visible_session_projection() {
+        let mut state = ready_state();
+        let phases = vec![TodoPhase {
+            name: "Build".to_owned(),
+            tasks: vec![TodoItem {
+                content: "Render todos".to_owned(),
+                status: TodoStatus::InProgress,
+            }],
+        }];
+
+        state.handle_backend(BackendEvent::TodoUpdated {
+            phases: phases.clone(),
+        });
+        assert_eq!(state.todo_phases, phases);
+
+        state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "new-native-session".to_owned(),
+            model: "model-a".to_owned(),
+        });
+        assert!(state.todo_phases.is_empty());
     }
 
     #[test]
@@ -3500,6 +4326,66 @@ model = "openai-codex/model-a"
                 .as_ref()
                 .and_then(|turn| turn.model.as_deref()),
             Some("model-a")
+        );
+    }
+
+    #[test]
+    fn models_command_persists_the_default_for_new_sessions() {
+        let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "model-b".to_owned(),
+            is_default: false,
+        });
+        state.editor.set_text("/models");
+
+        assert!(state.submit_editor().is_empty());
+        assert_eq!(
+            state.model_picker.as_ref().map(|picker| picker.scope),
+            Some(super::ModelSelectionScope::Default)
+        );
+        state.picker_move(1);
+        assert!(matches!(
+            state.picker_select().as_slice(),
+            [Effect::SetDefaultModel { provider, model }]
+                if provider == CODEX_PROVIDER && model == "model-b"
+        ));
+
+        state.editor.set_text("/new");
+        let _ = state.submit_editor();
+        assert_eq!(
+            state.selected_model.as_deref(),
+            Some("openai-codex/model-b")
+        );
+    }
+
+    #[test]
+    fn switch_command_applies_only_to_the_current_session() {
+        let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "model-b".to_owned(),
+            is_default: false,
+        });
+        state.editor.set_text("/switch");
+
+        assert!(state.submit_editor().is_empty());
+        assert_eq!(
+            state.model_picker.as_ref().map(|picker| picker.scope),
+            Some(super::ModelSelectionScope::Session)
+        );
+        state.picker_move(1);
+        assert!(state.picker_select().is_empty());
+        assert_eq!(
+            state.selected_model.as_deref(),
+            Some("openai-codex/model-b")
+        );
+
+        state.editor.set_text("/new");
+        let _ = state.submit_editor();
+        assert_eq!(
+            state.selected_model.as_deref(),
+            Some("openai-codex/model-a")
         );
     }
 
@@ -3756,7 +4642,7 @@ model = "openai-codex/model-a"
     }
 
     #[test]
-    fn built_in_explorer_routes_to_devin_lightning() {
+    fn configured_explorer_routes_to_devin_lightning() {
         let mut state = ready_state();
         let effects = state.invoke_agent(&AgentRequest {
             id: 1,
@@ -3790,7 +4676,7 @@ model = "openai-codex/model-a"
     }
 
     #[test]
-    fn built_in_explorer_falls_back_to_codex_luna() {
+    fn configured_explorer_falls_back_to_codex_luna() {
         let mut state = ready_state();
         let effects = state.invoke_agent(&AgentRequest {
             id: 1,
@@ -4072,6 +4958,12 @@ model = "openai-codex/model-a"
             provider: CODEX_PROVIDER.to_owned(),
             display_name: "Codex".to_owned(),
             enabled: true,
+            credential: Some(crate::session::ProviderCredentialRecord {
+                provider: CODEX_PROVIDER.to_owned(),
+                kind: "chatgpt_device_code".to_owned(),
+                metadata: serde_json::json!({}),
+                updated_at: 1,
+            }),
         }]);
 
         state.open_provider_details();
@@ -4093,5 +4985,48 @@ model = "openai-codex/model-a"
         ));
         assert!(state.close_provider_details());
         assert!(!state.close_provider_details());
+    }
+
+    #[test]
+    fn unconfigured_provider_starts_authentication_before_enablement() {
+        let mut state = ready_state();
+        state.editor.set_text("/providers");
+        let _ = state.submit_editor();
+        state.install_providers(vec![crate::session::ProviderRecord {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            enabled: false,
+            credential: None,
+        }]);
+        state.open_provider_details();
+
+        assert!(matches!(
+            state.toggle_provider().as_slice(),
+            [Effect::AuthenticateProvider(provider)] if provider == CODEX_PROVIDER
+        ));
+        assert!(matches!(
+            state
+                .provider_picker
+                .as_ref()
+                .and_then(|picker| picker.authentication.as_ref()),
+            Some(super::ProviderAuthentication::Starting)
+        ));
+
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::AuthenticationChallenge {
+                login_id: "login-1".to_owned(),
+                verification_url: "https://example.test/device".to_owned(),
+                user_code: "NAKO-CODE".to_owned(),
+            },
+        );
+        assert!(matches!(
+            state
+                .provider_picker
+                .as_ref()
+                .and_then(|picker| picker.authentication.as_ref()),
+            Some(super::ProviderAuthentication::Challenge { user_code, .. })
+                if user_code == "NAKO-CODE"
+        ));
     }
 }

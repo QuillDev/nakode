@@ -3,11 +3,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
 use crate::{
-    backend::ApprovalRequest,
+    backend::{ApprovalRequest, TodoStatus},
     commands,
     selection::{ScreenPoint, ScreenSnapshot},
     state::AppState,
@@ -63,11 +63,13 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
             .saturating_add(2)
             .min(5)
     };
+    let todo_height = todo_panel_height(state);
     let regions = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(4),
+            Constraint::Length(todo_height),
             Constraint::Length(queue_height),
             Constraint::Length(5),
             Constraint::Length(1),
@@ -76,23 +78,30 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
 
     render_header(frame, regions[0]);
     render_transcript(frame, regions[1], state);
-    if queue_height > 0 {
-        render_queue(frame, regions[2], state);
+    if todo_height > 0 {
+        render_todos(frame, regions[2], state);
     }
-    let cursor = render_composer(frame, regions[3], state);
-    render_footer(frame, regions[4], state);
+    if queue_height > 0 {
+        render_queue(frame, regions[3], state);
+    }
+    let cursor = render_composer(frame, regions[4], state);
+    render_footer(frame, regions[5], state);
 
-    let has_modal = state.approvals.front().is_some()
+    let has_modal = state.questions.front().is_some()
+        || state.approvals.front().is_some()
         || state.show_help
         || state.session_picker.is_some()
         || state.provider_picker.is_some()
+        || state.agent_picker.is_some()
         || state.model_picker.is_some()
         || state.subagent_modal.is_some();
     if !has_modal {
-        render_command_completions(frame, regions[3], state);
+        render_command_completions(frame, regions[4], state);
     }
 
-    if let Some(approval) = state.approvals.front() {
+    if let Some(question) = state.questions.front() {
+        render_question(frame, area, question);
+    } else if let Some(approval) = state.approvals.front() {
         render_approval(frame, area, approval);
     } else if state.show_help {
         render_help(frame, area);
@@ -100,6 +109,8 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         render_session_picker(frame, area, state);
     } else if state.provider_picker.is_some() {
         render_provider_picker(frame, area, state);
+    } else if state.agent_picker.is_some() {
+        render_agent_picker(frame, area, state);
     } else if state.model_picker.is_some() {
         render_model_picker(frame, area, state);
     } else if state.subagent_modal.is_some() {
@@ -108,22 +119,29 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         frame.set_cursor_position(position);
     }
 
-    let selectable_regions = if state.approvals.front().is_some() {
+    let selectable_regions = if state.questions.front().is_some() {
+        vec![bordered_inner(centered(area, 76, 16))]
+    } else if state.approvals.front().is_some() {
         vec![bordered_inner(centered(area, 76, 12))]
     } else if state.show_help {
-        vec![bordered_inner(centered(area, 76, 25))]
+        vec![bordered_inner(centered(area, 76, 26))]
     } else if state.session_picker.is_some() {
         vec![bordered_inner(centered(area, 78, 18))]
     } else if state.provider_picker.is_some() {
         vec![bordered_inner(provider_picker_popup(area, state))]
+    } else if state.agent_picker.is_some() {
+        vec![bordered_inner(centered(area, 82, 24))]
     } else if state.model_picker.is_some() {
         vec![bordered_inner(centered(area, 72, 18))]
     } else if state.subagent_modal.is_some() {
         vec![bordered_inner(subagent_modal_popup(area))]
     } else {
-        let mut selectable = vec![bordered_inner(regions[1]), bordered_inner(regions[3])];
-        if queue_height > 0 {
+        let mut selectable = vec![bordered_inner(regions[1]), bordered_inner(regions[4])];
+        if todo_height > 0 {
             selectable.push(bordered_inner(regions[2]));
+        }
+        if queue_height > 0 {
+            selectable.push(bordered_inner(regions[3]));
         }
         selectable
     };
@@ -136,7 +154,7 @@ fn provider_picker_popup(area: Rect, state: &AppState) -> Rect {
         .as_ref()
         .is_some_and(|picker| picker.showing_details)
     {
-        centered(area, 72, 22)
+        centered(area, 72, 32)
     } else {
         centered(area, 68, 14)
     }
@@ -283,6 +301,68 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .collect::<Vec<_>>();
     let block = panel_block(" Queue · Alt+↑/↓ select · Alt+Delete remove ");
     frame.render_widget(List::new(items).block(block), area);
+}
+
+fn todo_panel_height(state: &AppState) -> u16 {
+    if state.todo_phases.is_empty() {
+        return 0;
+    }
+    let content_lines = state
+        .todo_phases
+        .iter()
+        .map(|phase| phase.tasks.len().saturating_add(1))
+        .sum::<usize>();
+    u16::try_from(content_lines)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(8)
+}
+
+fn render_todos(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let total = state
+        .todo_phases
+        .iter()
+        .map(|phase| phase.tasks.len())
+        .sum::<usize>();
+    let completed = state
+        .todo_phases
+        .iter()
+        .flat_map(|phase| &phase.tasks)
+        .filter(|task| task.status == TodoStatus::Completed)
+        .count();
+    let available_lines = usize::from(area.height.saturating_sub(2));
+    let mut lines = Vec::with_capacity(available_lines);
+    for phase in &state.todo_phases {
+        lines.push(Line::styled(
+            format!(" {}", phase.name),
+            Style::default().fg(ACCENT_BRIGHT).bold(),
+        ));
+        for task in &phase.tasks {
+            let (marker, color) = match task.status {
+                TodoStatus::Pending => ("○", MUTED),
+                TodoStatus::InProgress => ("◉", WARNING),
+                TodoStatus::Completed => ("✓", SUCCESS),
+                TodoStatus::Abandoned => ("−", MUTED),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {marker} "), Style::default().fg(color)),
+                Span::styled(task.content.clone(), Style::default().fg(color)),
+            ]));
+        }
+    }
+    if lines.len() > available_lines {
+        let hidden = lines
+            .len()
+            .saturating_sub(available_lines)
+            .saturating_add(1);
+        lines.truncate(available_lines.saturating_sub(1));
+        lines.push(Line::styled(
+            format!("  … {hidden} more"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    let title = format!(" Todos · {completed}/{total} ");
+    frame.render_widget(Paragraph::new(lines).block(panel_block(title)), area);
 }
 
 fn truncate_objective(objective: &str, width: usize) -> String {
@@ -435,44 +515,58 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, 76, 25);
+    let mut lines = Vec::new();
+    for group in ["General", "Compose", "Active turn", "Navigate"] {
+        let entries = crate::controls::help_entries()
+            .filter(|entry| entry.group == group)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            continue;
+        }
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::styled(
+            group,
+            Style::default().fg(ACCENT_BRIGHT).bold(),
+        ));
+        lines.extend(
+            entries
+                .into_iter()
+                .map(|entry| Line::raw(format!("  {:<22} {}", entry.keys, entry.description))),
+        );
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "Slash commands",
+        Style::default().fg(ACCENT_BRIGHT).bold(),
+    ));
+    lines.extend(crate::controls::slash_controls().iter().map(|control| {
+        Line::raw(format!(
+            "  {:<22} {}",
+            control.invocation, control.description
+        ))
+    }));
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "Esc, F1, or Ctrl+? closes this help.",
+        Style::default().fg(MUTED),
+    ));
+    let requested_height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let popup = centered(area, 76, requested_height.min(area.height));
     frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::styled("Compose", Style::default().fg(ACCENT_BRIGHT).bold()),
-        Line::raw("  Enter       send while idle, steer during an active turn"),
-        Line::raw("  Alt+Enter   send while idle, queue during an active turn"),
-        Line::raw("  Shift+Enter / Ctrl+J   newline"),
-        Line::default(),
-        Line::styled("Active turn", Style::default().fg(ACCENT_BRIGHT).bold()),
-        Line::raw("  Ctrl+Q   queue draft     Ctrl+S   steer now"),
-        Line::raw("  Ctrl+C   interrupt turn + subagents    Ctrl+C again   exit"),
-        Line::default(),
-        Line::styled("Navigate", Style::default().fg(ACCENT_BRIGHT).bold()),
-        Line::raw("  Alt+←/→   previous/next word     Ctrl/Cmd+←/→   line edge"),
-        Line::raw("  Ctrl/Cmd+↑/↓   prompt edge       PageUp/PageDown   transcript"),
-        Line::raw("  Alt+Backspace   previous word    Ctrl/Cmd+Backspace   line start"),
-        Line::raw("  Ctrl+L   latest   F2 models   Alt+↑/↓ queue   Alt+Delete remove"),
-        Line::raw("  Mouse drag   select and auto-copy rendered text"),
-        Line::default(),
-        Line::styled("Sessions", Style::default().fg(ACCENT_BRIGHT).bold()),
-        Line::raw("  /resume   picker    /resume ID   resume    /new   fresh"),
-        Line::raw("  /reload   refresh backend metadata and models"),
-        Line::raw("  /providers manage enabled agent backends"),
-        Line::raw("  /skill:name reference a skill anywhere in the prompt"),
-        Line::default(),
-        Line::styled(
-            "Ctrl+?, F1, or Esc closes this help.",
-            Style::default().fg(MUTED),
-        ),
-    ];
     let block = overlay_block(" Help ", ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    state.set_oauth_link_hit_region(None);
     let picker = state.provider_picker.as_ref().expect("picker checked");
     if picker.showing_details {
-        render_provider_details(frame, area, state, picker);
+        let picker = picker.clone();
+        render_provider_details(frame, area, state, &picker);
         return;
     }
     let popup = centered(area, 68, 14);
@@ -498,7 +592,9 @@ fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         for (index, provider) in picker.providers.iter().enumerate() {
             let selected = index == picker.selected;
             let marker = if selected { "› " } else { "  " };
-            let state_label = if provider.enabled {
+            let state_label = if provider.credential.is_none() {
+                "setup required"
+            } else if provider.enabled {
                 "enabled"
             } else {
                 "disabled"
@@ -522,7 +618,13 @@ fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     Span::raw("  "),
                     Span::styled(
                         state_label,
-                        Style::default().fg(if provider.enabled { SUCCESS } else { MUTED }),
+                        Style::default().fg(if provider.enabled {
+                            SUCCESS
+                        } else if provider.credential.is_none() {
+                            WARNING
+                        } else {
+                            MUTED
+                        }),
                     ),
                 ])
                 .style(Style::default().bg(if selected {
@@ -537,13 +639,129 @@ fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let popup = centered(area, 82, 24);
+    frame.render_widget(Clear, popup);
+    let picker = state.agent_picker.as_ref().expect("picker checked");
+    let lines = if let Some(editor) = &picker.editor {
+        agent_editor_lines(editor)
+    } else {
+        agent_list_lines(picker)
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(overlay_block(" Agents ", ACCENT)),
+        popup,
+    );
+}
+
+fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled(
+            "Tab/↑/↓ field · type or paste · Ctrl+S save · Esc cancel",
+            Style::default().fg(MUTED),
+        ),
+        Line::default(),
+    ];
+    let values = [
+        editor.slug.as_str(),
+        editor.description.as_str(),
+        editor.system_prompt.as_str(),
+        editor.first_message.as_str(),
+        editor.model.as_str(),
+        editor.fallback_models.as_str(),
+    ];
+    for (field, value) in crate::state::AgentEditorField::ALL.into_iter().zip(values) {
+        let selected = field == editor.field;
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<15}", field.label()),
+                    Style::default().fg(if selected { ACCENT_BRIGHT } else { MUTED }),
+                ),
+                Span::styled(
+                    truncate_objective(value, 58),
+                    Style::default().fg(TEXT).add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+            ])
+            .style(Style::default().bg(if selected {
+                SURFACE_RAISED
+            } else {
+                SURFACE
+            })),
+        );
+        lines.push(Line::default());
+    }
+    lines.push(Line::styled(
+        "Models use provider/model; separate fallbacks with commas.",
+        Style::default().fg(MUTED),
+    ));
+    lines
+}
+
+fn agent_list_lines(picker: &crate::state::AgentPicker) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled(
+            "↑/↓ select · Enter edit · n new · d delete · Esc close",
+            Style::default().fg(MUTED),
+        ),
+        Line::default(),
+    ];
+    if picker.agents.is_empty() {
+        lines.push(Line::styled(
+            "No agent archetypes configured. Press n to create one.",
+            Style::default().fg(MUTED),
+        ));
+    }
+    for (index, agent) in picker.agents.iter().enumerate() {
+        let selected = index == picker.selected;
+        lines.push(agent_list_row(agent, selected));
+        let models = std::iter::once(agent.model.as_deref().unwrap_or("inherit parent model"))
+            .chain(agent.fallback_models.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" → ");
+        lines.push(Line::styled(
+            format!("    {models}"),
+            Style::default().fg(if selected { ACCENT_DEEP } else { MUTED }),
+        ));
+    }
+    lines
+}
+
+fn agent_list_row(agent: &crate::agent::AgentDefinition, selected: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            if selected { "› " } else { "  " },
+            Style::default().fg(if selected { ACCENT } else { MUTED }),
+        ),
+        Span::styled(
+            format!("{:<18}", agent.slug),
+            Style::default()
+                .fg(if selected { TEXT } else { MUTED })
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        Span::styled(
+            truncate_objective(&agent.description, 38),
+            Style::default().fg(MUTED),
+        ),
+    ])
+    .style(Style::default().bg(if selected { SURFACE_RAISED } else { SURFACE }))
+}
+
 fn render_provider_details(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &AppState,
+    state: &mut AppState,
     picker: &crate::state::ProviderPicker,
 ) {
-    let popup = centered(area, 72, 22);
+    let popup = centered(area, 72, 32);
     frame.render_widget(Clear, popup);
     let Some(provider) = picker.providers.get(picker.selected) else {
         return;
@@ -570,6 +788,20 @@ fn render_provider_details(
             Span::styled("Slug       ", Style::default().fg(MUTED)),
             Span::styled(&provider.provider, Style::default().fg(TEXT)),
         ]),
+        Line::from(vec![
+            Span::styled("Credential ", Style::default().fg(MUTED)),
+            Span::styled(
+                provider
+                    .credential
+                    .as_ref()
+                    .map_or("not configured", |credential| credential.kind.as_str()),
+                Style::default().fg(if provider.credential.is_some() {
+                    SUCCESS
+                } else {
+                    WARNING
+                }),
+            ),
+        ]),
         Line::default(),
         Line::styled("Capabilities", Style::default().fg(ACCENT_BRIGHT).bold()),
     ];
@@ -594,13 +826,114 @@ fn render_provider_details(
             Style::default().fg(MUTED),
         ));
     }
+    let authentication_url_line = if let Some(authentication) = &picker.authentication {
+        let first_line = lines.len();
+        append_provider_authentication(&mut lines, authentication);
+        matches!(
+            authentication,
+            crate::state::ProviderAuthentication::Challenge { .. }
+        )
+        .then_some(first_line + 1)
+    } else {
+        None
+    };
+    append_provider_actions(&mut lines, provider.credential.is_some());
+    let block = overlay_block(format!(" {} ", provider.display_name), ACCENT);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+    register_oauth_link(
+        state,
+        popup,
+        authentication_url_line,
+        picker.authentication.as_ref(),
+    );
+}
+
+fn append_provider_actions(lines: &mut Vec<Line<'_>>, has_credential: bool) {
     lines.push(Line::default());
+    if has_credential {
+        lines.push(Line::styled(
+            "[l] Log out and clear credentials",
+            Style::default().fg(DANGER),
+        ));
+    }
     lines.push(Line::styled(
-        "Enter or Space enable/disable · Esc providers",
+        if has_credential {
+            "Enter or Space enable/disable · Esc providers"
+        } else {
+            "Enter or Space set up credentials · Esc providers"
+        },
         Style::default().fg(MUTED),
     ));
-    let block = overlay_block(format!(" {} ", provider.display_name), ACCENT);
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn register_oauth_link(
+    state: &mut AppState,
+    popup: Rect,
+    line: Option<usize>,
+    authentication: Option<&crate::state::ProviderAuthentication>,
+) {
+    let (
+        Some(line),
+        Some(crate::state::ProviderAuthentication::Challenge {
+            verification_url, ..
+        }),
+    ) = (line, authentication)
+    else {
+        return;
+    };
+    let row = popup
+        .y
+        .saturating_add(1)
+        .saturating_add(u16::try_from(line).unwrap_or(u16::MAX));
+    state.set_oauth_link_hit_region(Some((
+        verification_url.clone(),
+        ScreenPoint::new(popup.x.saturating_add(1), row),
+        ScreenPoint::new(popup.right().saturating_sub(1), row.saturating_add(1)),
+    )));
+}
+
+fn append_provider_authentication<'a>(
+    lines: &mut Vec<Line<'a>>,
+    authentication: &'a crate::state::ProviderAuthentication,
+) {
+    lines.push(Line::default());
+    match authentication {
+        crate::state::ProviderAuthentication::Starting => lines.push(Line::styled(
+            "Starting provider authentication…",
+            Style::default().fg(WARNING),
+        )),
+        crate::state::ProviderAuthentication::Challenge {
+            verification_url,
+            user_code,
+        } => {
+            lines.push(Line::styled(
+                "[o] Open in browser ↗  ·  [c] Copy URL",
+                Style::default()
+                    .fg(ACCENT_BRIGHT)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ));
+            lines.push(Line::from(vec![
+                Span::styled("URL ", Style::default().fg(MUTED)),
+                Span::styled(verification_url, Style::default().fg(TEXT)),
+            ]));
+            if user_code.is_empty() {
+                lines.push(Line::styled(
+                    "Complete sign-in in your browser; this screen will update automatically.",
+                    Style::default().fg(MUTED),
+                ));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("Code ", Style::default().fg(MUTED)),
+                    Span::styled(user_code, Style::default().fg(TEXT).bold()),
+                ]));
+            }
+        }
+    }
 }
 
 fn capability_rows(
@@ -634,6 +967,81 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalRequest
         Paragraph::new(text)
             .block(block)
             .wrap(ratatui::widgets::Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn render_question(frame: &mut Frame<'_>, area: Rect, prompt: &crate::state::QuestionPrompt) {
+    let description_count = prompt
+        .request
+        .options
+        .iter()
+        .filter(|option| option.description.is_some())
+        .count();
+    let height = u16::try_from(prompt.request.options.len() + description_count)
+        .unwrap_or(8)
+        .saturating_add(8)
+        .min(20);
+    let popup = centered(area, 76, height);
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![
+        Line::styled(&prompt.request.question, Style::default().fg(TEXT)),
+        Line::default(),
+    ];
+    for (index, option) in prompt.request.options.iter().enumerate() {
+        let selected = index == prompt.selected;
+        let checked = prompt.selections.get(index).copied().unwrap_or(false);
+        let marker = if prompt.request.multi {
+            if checked {
+                "✓"
+            } else if selected {
+                "›"
+            } else {
+                " "
+            }
+        } else if selected {
+            "›"
+        } else {
+            " "
+        };
+        let style = if selected {
+            Style::default().fg(ACCENT_BRIGHT).bold()
+        } else {
+            Style::default().fg(TEXT)
+        };
+        lines.push(Line::styled(
+            format!(
+                "{marker} {}. {}{}",
+                index + 1,
+                option.label,
+                if prompt.request.recommended == Some(index) {
+                    " (Recommended)"
+                } else {
+                    ""
+                }
+            ),
+            style,
+        ));
+        if let Some(description) = &option.description {
+            lines.push(Line::styled(
+                format!("     ↳ {description}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        if prompt.request.multi {
+            " ↑/↓ select · Space toggle · Enter confirm "
+        } else {
+            " ↑/↓ select · Enter choose · 1-8 quick select "
+        },
+        Style::default().fg(ACCENT),
+    ));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(overlay_block(format!(" {} ", prompt.request.title), ACCENT))
+            .wrap(Wrap { trim: false }),
         popup,
     );
 }
@@ -780,7 +1188,11 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Style::default().fg(MUTED),
     ));
 
-    let block = overlay_block(" Models ", ACCENT);
+    let title = match picker.scope {
+        crate::state::ModelSelectionScope::Default => " Default Model ",
+        crate::state::ModelSelectionScope::Session => " Switch Session Model ",
+    };
+    let block = overlay_block(title, ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -839,7 +1251,7 @@ mod tests {
     use crate::{
         backend::{
             BackendCapabilities, BackendEvent, BackendIdentity, CODEX_PROVIDER, CapabilitySupport,
-            DEVIN_PROVIDER,
+            DEVIN_PROVIDER, TodoItem, TodoPhase, TodoStatus,
         },
         session::ProviderRecord,
         state::{AgentRequest, AppState, Effect},
@@ -880,6 +1292,42 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, super::BACKGROUND);
         assert_eq!(buffer[(0, 1)].symbol(), "╭");
         assert_eq!(buffer[(0, 1)].fg, super::BORDER);
+    }
+
+    #[test]
+    fn active_todos_render_as_a_compact_persistent_panel() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.todo_phases = vec![TodoPhase {
+            name: "Implementation".to_owned(),
+            tasks: vec![
+                TodoItem {
+                    content: "Project todo events".to_owned(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "Render the active plan".to_owned(),
+                    status: TodoStatus::InProgress,
+                },
+            ],
+        }];
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render todo panel");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(rendered.contains("Todos · 1/2"));
+        assert!(rendered.contains("Implementation"));
+        assert!(rendered.contains("Project todo events"));
+        assert!(rendered.contains("Render the active plan"));
     }
 
     #[test]
@@ -1016,11 +1464,18 @@ mod tests {
                 provider: CODEX_PROVIDER.to_owned(),
                 display_name: "Codex".to_owned(),
                 enabled: true,
+                credential: Some(crate::session::ProviderCredentialRecord {
+                    provider: CODEX_PROVIDER.to_owned(),
+                    kind: "chatgpt_device_code".to_owned(),
+                    metadata: serde_json::json!({}),
+                    updated_at: 1,
+                }),
             },
             ProviderRecord {
                 provider: DEVIN_PROVIDER.to_owned(),
                 display_name: "Devin".to_owned(),
                 enabled: false,
+                credential: None,
             },
         ]);
 
@@ -1035,7 +1490,7 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(list.contains("Codex  enabled"));
-        assert!(list.contains("Devin  disabled"));
+        assert!(list.contains("Devin  setup required"));
 
         state.open_provider_details();
         terminal
@@ -1051,6 +1506,65 @@ mod tests {
         assert!(details.contains("Capabilities"));
         assert!(details.contains("Resume"));
         assert!(details.contains("supported"));
+        assert!(details.contains("[l] Log out and clear credentials"));
+    }
+
+    #[test]
+    fn provider_authentication_shows_full_url_and_click_target() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("/providers");
+        let _ = state.submit_editor();
+        state.install_providers(vec![ProviderRecord {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            enabled: false,
+            credential: None,
+        }]);
+        state.open_provider_details();
+
+        state
+            .provider_picker
+            .as_mut()
+            .expect("provider picker")
+            .authentication = Some(crate::state::ProviderAuthentication::Challenge {
+            verification_url: "https://app.example.test/auth/cli/continue".to_owned(),
+            user_code: String::new(),
+        });
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render provider authentication");
+        let authentication_row = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .position(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains("[o] Open in browser ↗")
+            })
+            .expect("authentication URL row");
+        let rendered_authentication = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered_authentication.contains("https://app.example.test/auth/cli/continue"));
+        assert!(rendered_authentication.contains("[c] Copy URL"));
+        assert_eq!(
+            state
+                .oauth_url_at(crate::selection::ScreenPoint::new(
+                    16,
+                    u16::try_from(authentication_row).expect("test row fits")
+                ))
+                .as_deref(),
+            Some("https://app.example.test/auth/cli/continue")
+        );
     }
 
     #[test]
@@ -1075,6 +1589,42 @@ mod tests {
         assert!(rendered.contains("Ctrl+S"));
         assert!(rendered.contains("Ctrl+?"));
         assert!(rendered.contains("F1"));
+    }
+
+    #[test]
+    fn agent_menu_shows_archetypes_and_all_editable_configuration_fields() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.open_agent_picker();
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render agent list");
+        let list = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(list.contains("explorer"));
+
+        state.edit_selected_agent();
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render agent editor");
+        let editor = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(editor.contains("System prompt"));
+        assert!(editor.contains("First message"));
+        assert!(editor.contains("Fallbacks"));
+        assert!(editor.contains("Ctrl+S save"));
     }
 
     #[test]

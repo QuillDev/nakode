@@ -1,18 +1,23 @@
 use std::{
     collections::{HashMap, VecDeque},
     ffi::OsString,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::Stdio,
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
     process::{ChildStdin, Command},
     sync::mpsc,
-    time::{Instant, interval},
+    time::{Instant, interval, timeout},
 };
+use uuid::Uuid;
 
 use crate::backend::{
     BackendCapabilities, BackendCommand, BackendError, BackendEvent, BackendHandle,
@@ -23,22 +28,60 @@ use crate::backend::{
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DEVIN_CALLBACK_PORT: u16 = 59_653;
+const DEVIN_CALLBACK_PATH: &str = "/callback";
+const DEVIN_WEBAPP_URL: &str = "https://app.devin.ai";
+const DEVIN_API_URL: &str = "https://api.devin.ai";
 
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub workspace: PathBuf,
+    pub environment: Vec<(OsString, OsString)>,
+    oauth: OAuthConfig,
+}
+
+#[derive(Clone, Debug)]
+struct OAuthConfig {
+    webapp_url: String,
+    api_url: String,
+    callback_port: u16,
 }
 
 impl BackendConfig {
     #[must_use]
     pub fn devin(program: PathBuf, workspace: PathBuf) -> Self {
+        Self::for_command(
+            program,
+            vec!["--permission-mode".into(), "dangerous".into(), "acp".into()],
+            workspace,
+        )
+    }
+
+    #[must_use]
+    pub fn for_command(program: PathBuf, args: Vec<OsString>, workspace: PathBuf) -> Self {
         Self {
             program,
-            args: vec!["--permission-mode".into(), "dangerous".into(), "acp".into()],
+            args,
             workspace,
+            environment: Vec::new(),
+            oauth: OAuthConfig {
+                webapp_url: DEVIN_WEBAPP_URL.to_owned(),
+                api_url: DEVIN_API_URL.to_owned(),
+                callback_port: DEVIN_CALLBACK_PORT,
+            },
         }
+    }
+
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<&str>) -> Self {
+        if let Some(api_key) = api_key {
+            self.environment
+                .push(("DEVIN_API_KEY".into(), api_key.into()));
+        }
+        self
     }
 }
 
@@ -125,7 +168,7 @@ struct SessionModelOption {
     models: Vec<ModelInfo>,
 }
 
-/// Starts a Devin ACP adapter.
+/// Starts the native Devin agent through its ACP server.
 ///
 /// # Errors
 ///
@@ -134,6 +177,7 @@ struct SessionModelOption {
 pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError> {
     let mut child = Command::new(&config.program)
         .args(&config.args)
+        .envs(config.environment.iter().cloned())
         .current_dir(&config.workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -209,6 +253,7 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
         stderr: stderr_rx,
         pending,
         workspace: config.workspace,
+        oauth: config.oauth,
     }));
     Ok(BackendHandle::new(command_tx, event_rx, task))
 }
@@ -222,6 +267,7 @@ struct SupervisorInput {
     stderr: mpsc::Receiver<String>,
     pending: HashMap<u64, PendingRequest>,
     workspace: PathBuf,
+    oauth: OAuthConfig,
 }
 
 async fn run_supervisor(input: SupervisorInput) {
@@ -234,6 +280,7 @@ async fn run_supervisor(input: SupervisorInput) {
         mut stderr,
         pending,
         workspace,
+        oauth,
     } = input;
     let mut deferred = VecDeque::new();
     let mut runtime = AcpRuntime {
@@ -269,6 +316,7 @@ async fn run_supervisor(input: SupervisorInput) {
                     &mut stdin,
                     &events,
                     &workspace,
+                    &oauth,
                     &mut runtime,
                 ).await {
                     let _ = events.send(BackendEvent::Disconnected {
@@ -292,7 +340,8 @@ async fn run_supervisor(input: SupervisorInput) {
                             }
                             if runtime.initialized
                                 && drain_deferred(
-                                    &mut deferred, &mut stdin, &events, &workspace, &mut runtime,
+                                    &mut deferred, &mut stdin, &events, &workspace, &oauth,
+                                    &mut runtime,
                                 ).await.is_err()
                             {
                                 break 'supervisor;
@@ -324,10 +373,12 @@ async fn drain_deferred(
     stdin: &mut ChildStdin,
     events: &mpsc::Sender<BackendEvent>,
     workspace: &std::path::Path,
+    oauth: &OAuthConfig,
     runtime: &mut AcpRuntime,
 ) -> Result<(), ()> {
     while let Some(command) = commands.pop_front() {
-        if let Err(error) = handle_command(command, stdin, events, workspace, runtime).await {
+        if let Err(error) = handle_command(command, stdin, events, workspace, oauth, runtime).await
+        {
             let _ = events
                 .send(BackendEvent::Disconnected {
                     reason: format!("failed to write to Devin ACP: {error}"),
@@ -438,6 +489,7 @@ async fn handle_command(
     stdin: &mut ChildStdin,
     events: &mpsc::Sender<BackendEvent>,
     workspace: &std::path::Path,
+    oauth: &OAuthConfig,
     runtime: &mut AcpRuntime,
 ) -> std::io::Result<()> {
     let AcpRuntime {
@@ -447,6 +499,10 @@ async fn handle_command(
         ..
     } = runtime;
     match command {
+        BackendCommand::BeginAuthentication => {
+            tokio::spawn(authenticate_devin(oauth.clone(), events.clone()));
+            Ok(())
+        }
         BackendCommand::StartSession {
             model,
             instructions: _,
@@ -516,7 +572,9 @@ async fn handle_command(
             let _ = events.send(BackendEvent::InterruptAccepted).await;
             Ok(())
         }
-        BackendCommand::ResolveApproval { .. } | BackendCommand::Shutdown => Ok(()),
+        BackendCommand::ResolveApproval { .. }
+        | BackendCommand::ResolveQuestion { .. }
+        | BackendCommand::Shutdown => Ok(()),
     }
 }
 
@@ -537,6 +595,16 @@ async fn set_session_model(
             .await;
         return Ok(());
     };
+    if !option.models.iter().any(|candidate| candidate.id == model) {
+        let _ = events
+            .send(BackendEvent::RequestFailed {
+                operation: BackendOperation::SetSessionModel,
+                code: -32602,
+                message: format!("Devin did not advertise model {model}"),
+            })
+            .await;
+        return Ok(());
+    }
     send_model_request(
         stdin,
         &mut runtime.pending,
@@ -1296,17 +1364,15 @@ fn parse_model_options(result: &Value) -> Option<SessionModelOption> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|model| {
+        .map(|model| {
             let id = string(model, "value");
-            if id.is_empty() {
-                return None;
-            }
-            Some(ModelInfo {
+            ModelInfo {
                 provider: DEVIN_PROVIDER.to_owned(),
                 is_default: id == current_value,
                 id,
-            })
+            }
         })
+        .filter(|model| !model.id.is_empty())
         .collect::<Vec<_>>();
     if !current_value.is_empty() && !models.iter().any(|model| model.id == current_value) {
         models.push(ModelInfo {
@@ -1446,22 +1512,355 @@ fn actionable_stderr_warning(line: &str) -> bool {
         || line.contains("authentication required")
 }
 
+async fn authenticate_devin(config: OAuthConfig, events: mpsc::Sender<BackendEvent>) {
+    if let Err(message) = run_devin_oauth(&config, &events).await {
+        let _ = events
+            .send(BackendEvent::RequestFailed {
+                operation: BackendOperation::Authenticate,
+                code: -32003,
+                message,
+            })
+            .await;
+    }
+}
+
+pub(super) async fn authenticate_native(events: mpsc::Sender<BackendEvent>) {
+    authenticate_devin(
+        OAuthConfig {
+            webapp_url: DEVIN_WEBAPP_URL.to_owned(),
+            api_url: DEVIN_API_URL.to_owned(),
+            callback_port: DEVIN_CALLBACK_PORT,
+        },
+        events,
+    )
+    .await;
+}
+
+async fn run_devin_oauth(
+    config: &OAuthConfig,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), String> {
+    let listener = bind_callback_listener(config.callback_port).await?;
+    let callback_address = listener
+        .local_addr()
+        .map_err(|error| format!("failed to inspect Devin OAuth callback listener: {error}"))?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}{DEVIN_CALLBACK_PATH}",
+        callback_address.port()
+    );
+    let state = Uuid::now_v7().to_string();
+    let verifier = pkce_verifier();
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let authentication_url =
+        devin_authentication_url(&config.webapp_url, &redirect_uri, &state, &challenge)?;
+
+    events
+        .send(BackendEvent::AuthenticationChallenge {
+            login_id: state.clone(),
+            verification_url: authentication_url,
+            user_code: String::new(),
+        })
+        .await
+        .map_err(|_| "provider authentication channel closed".to_owned())?;
+
+    let authorization_code = timeout(
+        AUTHENTICATION_TIMEOUT,
+        receive_authorization_code(&listener, &state),
+    )
+    .await
+    .map_err(|_| "Devin authentication timed out after 10 minutes".to_owned())??;
+    let token = exchange_devin_token(&config.api_url, &authorization_code, &verifier).await?;
+    let expires_at = jwt_expiry(&token);
+    events
+        .send(BackendEvent::AuthenticationCompleted {
+            kind: "oauth_pkce".to_owned(),
+            metadata: json!({
+                "token": token,
+                "expires_at": expires_at,
+                "api_endpoint": config.api_url,
+            }),
+        })
+        .await
+        .map_err(|_| "provider authentication channel closed".to_owned())
+}
+
+async fn bind_callback_listener(preferred_port: u16) -> Result<TcpListener, String> {
+    let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), preferred_port);
+    match TcpListener::bind(preferred).await {
+        Ok(listener) => Ok(listener),
+        Err(_) => TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .map_err(|error| format!("failed to bind Devin OAuth callback listener: {error}")),
+    }
+}
+
+fn pkce_verifier() -> String {
+    format!(
+        "{}{}{}",
+        Uuid::now_v7().simple(),
+        Uuid::now_v7().simple(),
+        Uuid::now_v7().simple()
+    )
+}
+
+fn devin_authentication_url(
+    webapp_url: &str,
+    redirect_uri: &str,
+    state: &str,
+    challenge: &str,
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(webapp_url)
+        .map_err(|error| format!("invalid Devin web application URL: {error}"))?;
+    url.set_path("/auth/cli/continue");
+    url.set_query(None);
+    url.query_pairs_mut()
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("state", state)
+        .append_pair("prompt", "select_account")
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256");
+    Ok(url.into())
+}
+
+async fn receive_authorization_code(
+    listener: &TcpListener,
+    expected_state: &str,
+) -> Result<String, String> {
+    loop {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("failed to accept Devin OAuth callback: {error}"))?;
+        match parse_callback(&mut stream, expected_state).await {
+            Ok(code) => {
+                respond_to_callback(
+                    &mut stream,
+                    "200 OK",
+                    "Devin authentication complete. You can return to Nako Agent.",
+                )
+                .await;
+                return Ok(code);
+            }
+            Err(error) => {
+                respond_to_callback(&mut stream, "400 Bad Request", &error).await;
+            }
+        }
+    }
+}
+
+async fn parse_callback(stream: &mut TcpStream, expected_state: &str) -> Result<String, String> {
+    let mut request = vec![0_u8; 8_192];
+    let bytes_read = stream
+        .read(&mut request)
+        .await
+        .map_err(|error| format!("failed to read Devin OAuth callback: {error}"))?;
+    let request = std::str::from_utf8(&request[..bytes_read])
+        .map_err(|_| "Devin OAuth callback was not valid UTF-8".to_owned())?;
+    let request_target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| "Devin OAuth callback did not contain a request target".to_owned())?;
+    let url = reqwest::Url::parse(&format!("http://localhost{request_target}"))
+        .map_err(|error| format!("invalid Devin OAuth callback URL: {error}"))?;
+    if url.path() != DEVIN_CALLBACK_PATH {
+        return Err("Unexpected Devin OAuth callback path".to_owned());
+    }
+    let parameters = url.query_pairs().collect::<HashMap<_, _>>();
+    let returned_state = parameters
+        .get("state")
+        .ok_or_else(|| "Devin OAuth callback did not contain state".to_owned())?;
+    if returned_state != expected_state {
+        return Err("Devin OAuth callback state did not match".to_owned());
+    }
+    parameters
+        .get("code")
+        .filter(|code| !code.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "Devin OAuth callback did not contain an authorization code".to_owned())
+}
+
+async fn respond_to_callback(stream: &mut TcpStream, status: &str, message: &str) {
+    let body = format!("<html><body><p>{message}</p></body></html>");
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+async fn exchange_devin_token(
+    api_url: &str,
+    authorization_code: &str,
+    verifier: &str,
+) -> Result<String, String> {
+    let endpoint = format!("{}/auth/cli/token", api_url.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&json!({
+            "code": authorization_code,
+            "code_verifier": verifier,
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Devin CLI token exchange failed: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Devin CLI token exchange failed: {status} {}",
+            detail.trim()
+        ));
+    }
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("invalid Devin CLI token response: {error}"))?;
+    payload
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "Devin CLI token exchange returned an empty token".to_owned())
+}
+
+fn jwt_expiry(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    serde_json::from_slice::<Value>(&decoded)
+        .ok()?
+        .get("exp")?
+        .as_u64()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
+    use base64::Engine as _;
     use serde_json::json;
-
-    use super::{
-        BackendConfig, actionable_stderr_warning, capability_supported, parse_model_options,
-        permission_acceptance,
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
     };
 
+    use super::{
+        BackendConfig, OAuthConfig, actionable_stderr_warning, capability_supported,
+        parse_model_options, permission_acceptance, run_devin_oauth,
+    };
+    use crate::backend::BackendEvent;
+
     #[test]
-    fn default_launch_uses_dangerous_permission_mode_with_acp() {
+    fn default_launch_uses_devin_dangerous_permission_mode() {
         let config = BackendConfig::devin(PathBuf::from("devin"), PathBuf::from("/tmp"));
         assert_eq!(config.program, PathBuf::from("devin"));
         assert_eq!(config.args, vec!["--permission-mode", "dangerous", "acp"]);
+    }
+
+    #[test]
+    fn api_key_is_only_added_to_the_devin_child_environment() {
+        let config = BackendConfig::devin(PathBuf::from("devin"), PathBuf::from("/tmp"))
+            .with_api_key(Some("secret-token"));
+        assert_eq!(
+            config.environment,
+            vec![("DEVIN_API_KEY".into(), "secret-token".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_uses_pkce_callback_and_exchanges_the_authorization_code() {
+        let token_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind token fixture");
+        let token_address = token_listener.local_addr().expect("token fixture address");
+        let token_server = tokio::spawn(async move {
+            let (mut connection, _) = token_listener.accept().await.expect("accept token request");
+            let mut request = vec![0_u8; 8_192];
+            let bytes_read = connection
+                .read(&mut request)
+                .await
+                .expect("read token request");
+            let request = String::from_utf8_lossy(&request[..bytes_read]);
+            assert!(request.starts_with("POST /auth/cli/token HTTP/1.1"));
+            assert!(request.contains("\"code\":\"fixture-code\""));
+            assert!(request.contains("\"code_verifier\":"));
+            let payload =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":2000000000}"#);
+            let body = format!(r#"{{"token":"header.{payload}.signature"}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            connection
+                .write_all(response.as_bytes())
+                .await
+                .expect("write token response");
+        });
+        let config = OAuthConfig {
+            webapp_url: "https://app.example.test".to_owned(),
+            api_url: format!("http://{token_address}"),
+            callback_port: 0,
+        };
+        let (events, mut event_rx) = mpsc::channel(4);
+        let oauth = tokio::spawn(async move { run_devin_oauth(&config, &events).await });
+
+        let challenge = event_rx.recv().await.expect("authentication challenge");
+        let (verification_url, state, redirect_uri) = match challenge {
+            BackendEvent::AuthenticationChallenge {
+                verification_url,
+                login_id,
+                user_code,
+            } => {
+                assert!(user_code.is_empty());
+                let url = reqwest::Url::parse(&verification_url).expect("authentication URL");
+                let parameters = url
+                    .query_pairs()
+                    .collect::<std::collections::HashMap<_, _>>();
+                assert_eq!(
+                    parameters.get("state").map(AsRef::as_ref),
+                    Some(login_id.as_str())
+                );
+                assert_eq!(
+                    parameters.get("code_challenge_method").map(AsRef::as_ref),
+                    Some("S256")
+                );
+                let redirect_uri = parameters
+                    .get("redirect_uri")
+                    .expect("redirect URI")
+                    .to_string();
+                (verification_url, login_id, redirect_uri)
+            }
+            event => panic!("unexpected authentication event: {event:?}"),
+        };
+        assert!(verification_url.starts_with("https://app.example.test/auth/cli/continue?"));
+        let redirect = reqwest::Url::parse(&redirect_uri).expect("redirect URL");
+        let mut callback = TcpStream::connect((
+            redirect.host_str().expect("redirect host"),
+            redirect.port().expect("redirect port"),
+        ))
+        .await
+        .expect("connect callback");
+        callback
+            .write_all(
+                format!(
+                    "GET /callback?code=fixture-code&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write callback");
+
+        oauth.await.expect("OAuth task").expect("OAuth succeeds");
+        token_server.await.expect("token server");
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(BackendEvent::AuthenticationCompleted { kind, metadata })
+                if kind == "oauth_pkce"
+                    && metadata["token"] == "header.eyJleHAiOjIwMDAwMDAwMDB9.signature"
+                    && metadata["expires_at"] == 2_000_000_000_u64
+        ));
     }
 
     #[test]

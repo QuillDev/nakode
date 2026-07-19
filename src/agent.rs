@@ -1,9 +1,18 @@
 use std::{collections::HashSet, fs, path::Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+const DEFAULT_AGENT_CONFIG_PATH: &str = "config/default-agents.toml";
+const DEFAULT_AGENT_CONFIG: &str = include_str!("../config/default-agents.toml");
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DefaultAgentConfig {
+    agents: Vec<AgentDefinition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDefinition {
     pub slug: String,
@@ -55,6 +64,26 @@ pub enum AgentCatalogError {
         path: String,
         source: std::io::Error,
     },
+    #[error("failed to create agent directory {path}: {source}")]
+    CreateDirectory {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("failed to write agent definition {path}: {source}")]
+    WriteDefinition {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("failed to remove agent definition {path}: {source}")]
+    RemoveDefinition {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("failed to serialize agent {slug:?}: {source}")]
+    SerializeDefinition {
+        slug: String,
+        source: toml::ser::Error,
+    },
     #[error("invalid agent definition {path}: {source}")]
     ParseDefinition {
         path: String,
@@ -77,9 +106,7 @@ pub struct AgentCatalog {
 
 impl Default for AgentCatalog {
     fn default() -> Self {
-        Self {
-            definitions: built_in_definitions(),
-        }
+        Self::from_default_config().expect("shipped default agent configuration must be valid")
     }
 }
 
@@ -113,9 +140,8 @@ impl AgentCatalog {
         }
         paths.sort();
 
-        let mut definitions = built_in_definitions();
-        definitions.reserve(paths.len());
-        let mut custom_slugs = HashSet::new();
+        let mut definitions = Vec::with_capacity(paths.len());
+        let mut slugs = HashSet::new();
         for path in paths {
             let display_path = path.display().to_string();
             let source =
@@ -130,19 +156,12 @@ impl AgentCatalog {
                 }
             })?;
             validate(&definition, &display_path)?;
-            if !custom_slugs.insert(definition.slug.clone()) {
+            if !slugs.insert(definition.slug.clone()) {
                 return Err(AgentCatalogError::DuplicateSlug {
                     slug: definition.slug,
                 });
             }
-            if let Some(existing) = definitions
-                .iter_mut()
-                .find(|existing| existing.slug == definition.slug)
-            {
-                *existing = definition;
-            } else {
-                definitions.push(definition);
-            }
+            definitions.push(definition);
         }
         Ok(Self { definitions })
     }
@@ -158,17 +177,111 @@ impl AgentCatalog {
             .iter()
             .find(|definition| definition.slug == slug)
     }
+
+    /// Persists `definition` into an authoritative workspace catalog.
+    ///
+    /// If the catalog has not been customized yet, shipped definitions are
+    /// materialized first so editing one archetype does not discard the rest.
+    ///
+    /// # Errors
+    /// Returns an error when validation, serialization, or filesystem access fails.
+    pub fn save(
+        &self,
+        directory: &Path,
+        definition: &AgentDefinition,
+        previous_slug: Option<&str>,
+    ) -> Result<(), AgentCatalogError> {
+        validate(definition, &directory.display().to_string())?;
+        if self.definitions.iter().any(|existing| {
+            existing.slug == definition.slug
+                && previous_slug.is_none_or(|previous| previous != existing.slug)
+        }) {
+            return Err(AgentCatalogError::DuplicateSlug {
+                slug: definition.slug.clone(),
+            });
+        }
+        self.materialize_if_missing(directory)?;
+        if let Some(previous_slug) = previous_slug.filter(|slug| *slug != definition.slug) {
+            remove_if_present(&definition_path(directory, previous_slug))?;
+        }
+        write_definition(directory, definition)
+    }
+
+    /// Removes an archetype from the authoritative workspace catalog.
+    ///
+    /// # Errors
+    /// Returns an error when the catalog cannot be materialized or the file removed.
+    pub fn delete(&self, directory: &Path, slug: &str) -> Result<(), AgentCatalogError> {
+        self.materialize_if_missing(directory)?;
+        remove_if_present(&definition_path(directory, slug))
+    }
+
+    fn materialize_if_missing(&self, directory: &Path) -> Result<(), AgentCatalogError> {
+        if directory.exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(directory).map_err(|source| AgentCatalogError::CreateDirectory {
+            path: directory.display().to_string(),
+            source,
+        })?;
+        for definition in &self.definitions {
+            write_definition(directory, definition)?;
+        }
+        Ok(())
+    }
+
+    fn from_default_config() -> Result<Self, AgentCatalogError> {
+        let config =
+            toml::from_str::<DefaultAgentConfig>(DEFAULT_AGENT_CONFIG).map_err(|source| {
+                AgentCatalogError::ParseDefinition {
+                    path: DEFAULT_AGENT_CONFIG_PATH.to_owned(),
+                    source,
+                }
+            })?;
+        let mut slugs = HashSet::new();
+        for definition in &config.agents {
+            validate(definition, DEFAULT_AGENT_CONFIG_PATH)?;
+            if !slugs.insert(definition.slug.clone()) {
+                return Err(AgentCatalogError::DuplicateSlug {
+                    slug: definition.slug.clone(),
+                });
+            }
+        }
+        Ok(Self {
+            definitions: config.agents,
+        })
+    }
 }
 
-fn built_in_definitions() -> Vec<AgentDefinition> {
-    vec![AgentDefinition {
-        slug: "explorer".to_owned(),
-        description: "Gathers relevant context and returns a concise, detailed report".to_owned(),
-        system_prompt: "You are Nako Agent's read-only explorer. Investigate only the delegated question using the provider's native search and inspection tools. Gather the context the parent agent needs, including relevant architecture, behavior, constraints, code locations, and unresolved uncertainty. Do not modify files, implement changes, or delegate to other agents. Return a concise but detailed evidence-backed report with precise file locations where applicable. Separate established facts from inferences and identify anything you could not verify.".to_owned(),
-        first_message: "Explore the delegated question and return the relevant context as a concise, detailed report for the parent agent.".to_owned(),
-        model: Some("devin-acp/swe-1-7-lightning".to_owned()),
-        fallback_models: vec!["openai-codex/gpt-5.6-luna".to_owned()],
-    }]
+fn definition_path(directory: &Path, slug: &str) -> std::path::PathBuf {
+    directory.join(format!("{slug}.toml"))
+}
+
+fn write_definition(
+    directory: &Path,
+    definition: &AgentDefinition,
+) -> Result<(), AgentCatalogError> {
+    let source = toml::to_string_pretty(definition).map_err(|source| {
+        AgentCatalogError::SerializeDefinition {
+            slug: definition.slug.clone(),
+            source,
+        }
+    })?;
+    let path = definition_path(directory, &definition.slug);
+    fs::write(&path, source).map_err(|source| AgentCatalogError::WriteDefinition {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+fn remove_if_present(path: &Path) -> Result<(), AgentCatalogError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(path).map_err(|source| AgentCatalogError::RemoveDefinition {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalogError> {
@@ -214,7 +327,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::AgentCatalog;
+    use super::{AgentCatalog, AgentDefinition};
 
     #[test]
     fn loads_and_resolves_agent_definitions() {
@@ -253,12 +366,12 @@ first_message = "Inspect the requested context."
     }
 
     #[test]
-    fn missing_directory_uses_only_the_explorer_agent() {
+    fn missing_directory_uses_the_shipped_agent_configuration() {
         let directory = tempdir().expect("temp directory");
         let catalog = AgentCatalog::load(&directory.path().join("missing")).expect("catalog");
 
         assert_eq!(catalog.definitions().len(), 1);
-        let explorer = catalog.find("explorer").expect("built-in explorer");
+        let explorer = catalog.find("explorer").expect("configured explorer");
         assert_eq!(explorer.provider("openai-codex"), "devin-acp");
         assert_eq!(
             explorer.provider_model().as_deref(),
@@ -268,7 +381,7 @@ first_message = "Inspect the requested context."
     }
 
     #[test]
-    fn workspace_definition_overrides_a_built_in_agent() {
+    fn workspace_definition_overrides_a_shipped_agent() {
         let directory = tempdir().expect("temp directory");
         fs::write(
             directory.path().join("explorer.toml"),
@@ -292,5 +405,46 @@ first_message = "Explore the migration."
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn deleting_a_shipped_agent_materializes_an_authoritative_empty_catalog() {
+        let parent = tempdir().expect("temp directory");
+        let directory = parent.path().join("agents");
+        let catalog = AgentCatalog::load(&directory).expect("default catalog");
+
+        catalog
+            .delete(&directory, "explorer")
+            .expect("delete explorer");
+
+        assert!(
+            AgentCatalog::load(&directory)
+                .expect("configured catalog")
+                .definitions()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn saves_a_custom_agent_without_discarding_initial_presets() {
+        let parent = tempdir().expect("temp directory");
+        let directory = parent.path().join("agents");
+        let catalog = AgentCatalog::load(&directory).expect("default catalog");
+        let definition = AgentDefinition {
+            slug: "reviewer".to_owned(),
+            description: "Reviews a bounded change".to_owned(),
+            system_prompt: "Review carefully.".to_owned(),
+            first_message: "Review the requested artifact.".to_owned(),
+            model: Some("openai-codex/gpt-5".to_owned()),
+            fallback_models: vec!["devin-acp/swe-1-7-lightning".to_owned()],
+        };
+
+        catalog
+            .save(&directory, &definition, None)
+            .expect("save reviewer");
+
+        let loaded = AgentCatalog::load(&directory).expect("configured catalog");
+        assert_eq!(loaded.find("reviewer"), Some(&definition));
+        assert!(loaded.find("explorer").is_some());
     }
 }

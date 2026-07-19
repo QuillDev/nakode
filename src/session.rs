@@ -1,11 +1,12 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -14,6 +15,22 @@ use crate::{
     backend::ModelInfo,
     transcript::{EntryKind, EntryStatus, TranscriptEntry},
 };
+
+const PROVIDER_CATALOG_PATH: &str = "config/providers.toml";
+const PROVIDER_CATALOG: &str = include_str!("../config/providers.toml");
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderCatalog {
+    providers: Vec<ProviderCatalogEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderCatalogEntry {
+    slug: String,
+    display_name: String,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
@@ -32,6 +49,15 @@ pub struct ProviderRecord {
     pub provider: String,
     pub display_name: String,
     pub enabled: bool,
+    pub credential: Option<ProviderCredentialRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCredentialRecord {
+    pub provider: String,
+    pub kind: String,
+    pub metadata: serde_json::Value,
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,12 +117,24 @@ pub enum SessionError {
         path: String,
         source: std::io::Error,
     },
+    #[error("failed to protect credential-bearing session storage {path}: {source}")]
+    ProtectStorage {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("session database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("session {0:?} is ambiguous; use a longer id")]
     Ambiguous(String),
     #[error("invalid persisted value for {field}: {value:?}")]
     InvalidStoredValue { field: &'static str, value: String },
+    #[error("provider {0} has no configured credentials")]
+    MissingProviderCredential(String),
+    #[error("invalid provider catalog {path}: {source}")]
+    InvalidProviderCatalog {
+        path: &'static str,
+        source: toml::de::Error,
+    },
 }
 
 pub trait SessionRepository: Send + Sync {
@@ -146,6 +184,11 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when the transaction cannot be committed.
     fn replace_models(&self, provider: &str, models: &[ModelInfo]) -> Result<(), SessionError>;
+    /// Sets the model used by default for new sessions on a provider.
+    ///
+    /// # Errors
+    /// Returns an error when the preference cannot be persisted.
+    fn set_default_model(&self, provider: &str, model: &str) -> Result<(), SessionError>;
     /// Lists configured providers.
     ///
     /// # Errors
@@ -156,6 +199,21 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when persistence cannot be updated.
     fn set_provider_enabled(&self, provider: &str, enabled: bool) -> Result<(), SessionError>;
+    /// Saves provider credential metadata and its native-store reference.
+    ///
+    /// # Errors
+    /// Returns an error when the credential record cannot be persisted.
+    fn save_provider_credential(
+        &self,
+        provider: &str,
+        kind: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<(), SessionError>;
+    /// Removes a provider credential record.
+    ///
+    /// # Errors
+    /// Returns an error when the credential record cannot be removed.
+    fn delete_provider_credential(&self, provider: &str) -> Result<(), SessionError>;
     /// Saves the current durable projection of a sub-agent run and its transcript.
     ///
     /// # Errors
@@ -170,18 +228,28 @@ pub trait SessionRepository: Send + Sync {
 
 pub struct SqliteSessionRepository {
     connection: Mutex<Connection>,
+    path: PathBuf,
 }
 
 impl SqliteSessionRepository {
+    /// Returns Nako Agent's platform-specific application data directory.
+    ///
+    /// # Errors
+    /// Returns an error when the platform does not expose an application data directory.
+    pub fn default_data_directory() -> Result<PathBuf, SessionError> {
+        ProjectDirs::from("dev", "nako-agent", "Nako Agent")
+            .map(|project| project.data_local_dir().to_path_buf())
+            .ok_or(SessionError::MissingDataDirectory)
+    }
+
     /// Opens the repository in Nako Agent's platform-specific data directory.
     ///
     /// # Errors
     ///
     /// Returns an error when the data directory or database cannot be opened.
     pub fn open_default() -> Result<Self, SessionError> {
-        let project = ProjectDirs::from("dev", "nako-agent", "Nako Agent")
-            .ok_or(SessionError::MissingDataDirectory)?;
-        let new_database = project.data_local_dir().join("sessions.sqlite3");
+        let directory = Self::default_data_directory()?;
+        let new_database = directory.join("sessions.sqlite3");
         let legacy_database = ProjectDirs::from("dev", "flock", "Flock")
             .map(|legacy| legacy.data_local_dir().join("sessions.sqlite3"));
         if !new_database.exists()
@@ -190,11 +258,11 @@ impl SqliteSessionRepository {
         {
             return Self::open(legacy_database);
         }
-        let directory = project.data_local_dir();
-        std::fs::create_dir_all(directory).map_err(|source| SessionError::CreateDirectory {
+        std::fs::create_dir_all(&directory).map_err(|source| SessionError::CreateDirectory {
             path: directory.display().to_string(),
             source,
         })?;
+        protect_path(&directory, 0o700)?;
         Self::open(new_database)
     }
 
@@ -204,7 +272,9 @@ impl SqliteSessionRepository {
     ///
     /// Returns an error when the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
+        let path = path.as_ref();
         let connection = Connection::open(path)?;
+        protect_path(path, 0o600)?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
@@ -228,11 +298,28 @@ impl SqliteSessionRepository {
                cached_at INTEGER NOT NULL,
                PRIMARY KEY(provider, model_id)
              );
+             CREATE TABLE IF NOT EXISTS provider_model_preferences (
+               provider TEXT PRIMARY KEY,
+               model_id TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS providers (
                provider TEXT PRIMARY KEY,
                display_name TEXT NOT NULL,
                enabled INTEGER NOT NULL,
                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS provider_credentials (
+               provider TEXT PRIMARY KEY REFERENCES providers(provider) ON DELETE CASCADE,
+               credential_kind TEXT NOT NULL,
+               credential_json TEXT NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS native_runtime_sessions (
+               provider TEXT NOT NULL,
+               session_id TEXT NOT NULL,
+               session_json TEXT NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(provider, session_id)
              );
              CREATE TABLE IF NOT EXISTS orchestration_runs (
                parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -279,19 +366,16 @@ impl SqliteSessionRepository {
                  DROP TABLE backend_models;",
             )?;
         }
-        connection.execute(
-            "INSERT OR IGNORE INTO providers (provider, display_name, enabled, updated_at)
-             VALUES (?1, ?2, 1, ?3)",
-            params![CODEX_PROVIDER, "Codex", unix_timestamp()],
-        )?;
-        connection.execute(
-            "INSERT OR IGNORE INTO providers (provider, display_name, enabled, updated_at)
-             VALUES (?1, ?2, 1, ?3)",
-            params![DEVIN_PROVIDER, "Devin", unix_timestamp()],
-        )?;
+        seed_provider_catalog(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
+            path: path.to_path_buf(),
         })
+    }
+
+    #[must_use]
+    pub fn database_path(&self) -> &Path {
+        &self.path
     }
 
     fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
@@ -306,6 +390,47 @@ impl SqliteSessionRepository {
             updated_at: row.get(7)?,
         })
     }
+}
+
+#[cfg(unix)]
+fn protect_path(path: &Path, mode: u32) -> Result<(), SessionError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|source| {
+        SessionError::ProtectStorage {
+            path: path.display().to_string(),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn protect_path(_path: &Path, _mode: u32) -> Result<(), SessionError> {
+    Ok(())
+}
+
+fn seed_provider_catalog(connection: &Connection) -> Result<(), SessionError> {
+    let provider_catalog =
+        toml::from_str::<ProviderCatalog>(PROVIDER_CATALOG).map_err(|source| {
+            SessionError::InvalidProviderCatalog {
+                path: PROVIDER_CATALOG_PATH,
+                source,
+            }
+        })?;
+    for provider in provider_catalog.providers {
+        connection.execute(
+            "INSERT OR IGNORE INTO providers (provider, display_name, enabled, updated_at)
+             VALUES (?1, ?2, 0, ?3)",
+            params![provider.slug, provider.display_name, unix_timestamp()],
+        )?;
+    }
+    connection.execute(
+        "UPDATE providers SET enabled = 0
+         WHERE enabled = 1
+           AND provider NOT IN (SELECT provider FROM provider_credentials)",
+        [],
+    )?;
+    Ok(())
 }
 
 impl SessionRepository for SqliteSessionRepository {
@@ -443,6 +568,14 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let transaction = connection.transaction()?;
+        let preferred = transaction
+            .query_row(
+                "SELECT model_id FROM provider_model_preferences WHERE provider = ?1",
+                [provider],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .filter(|preferred| models.iter().any(|model| model.id == *preferred));
         transaction.execute(
             "DELETE FROM provider_models WHERE provider = ?1",
             [provider],
@@ -458,11 +591,37 @@ impl SessionRepository for SqliteSessionRepository {
                 statement.execute(params![
                     provider,
                     model.id,
-                    i64::from(model.is_default),
+                    i64::from(
+                        preferred
+                            .as_ref()
+                            .map_or(model.is_default, |preferred| preferred == &model.id)
+                    ),
                     now,
                 ])?;
             }
         }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn set_default_model(&self, provider: &str, model: &str) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO provider_model_preferences (provider, model_id)
+             VALUES (?1, ?2)
+             ON CONFLICT(provider) DO UPDATE SET model_id = excluded.model_id",
+            params![provider, model],
+        )?;
+        transaction.execute(
+            "UPDATE provider_models
+             SET is_default = CASE WHEN model_id = ?1 THEN 1 ELSE 0 END
+             WHERE provider = ?2",
+            params![model, provider],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -473,13 +632,36 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT provider, display_name, enabled FROM providers ORDER BY display_name COLLATE NOCASE",
+            "SELECT p.provider, p.display_name, p.enabled,
+                    c.credential_kind, c.credential_json, c.updated_at
+             FROM providers p
+             LEFT JOIN provider_credentials c ON c.provider = p.provider
+             ORDER BY p.display_name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
+            let credential_kind = row.get::<_, Option<String>>(3)?;
             Ok(ProviderRecord {
                 provider: row.get(0)?,
                 display_name: row.get(1)?,
                 enabled: row.get::<_, i64>(2)? != 0,
+                credential: credential_kind
+                    .map(|kind| {
+                        let metadata_source = row.get::<_, String>(4)?;
+                        let metadata = serde_json::from_str(&metadata_source).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                        Ok::<ProviderCredentialRecord, rusqlite::Error>(ProviderCredentialRecord {
+                            provider: row.get(0)?,
+                            kind,
+                            metadata,
+                            updated_at: row.get(5)?,
+                        })
+                    })
+                    .transpose()?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -490,10 +672,63 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
+        if enabled {
+            let has_credential = connection
+                .query_row(
+                    "SELECT 1 FROM provider_credentials WHERE provider = ?1",
+                    params![provider],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !has_credential {
+                return Err(SessionError::MissingProviderCredential(provider.to_owned()));
+            }
+        }
         connection.execute(
             "UPDATE providers SET enabled = ?1, updated_at = ?2 WHERE provider = ?3",
             params![i64::from(enabled), unix_timestamp(), provider],
         )?;
+        Ok(())
+    }
+
+    fn save_provider_credential(
+        &self,
+        provider: &str,
+        kind: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<(), SessionError> {
+        self.connection
+            .lock()
+            .expect("session database mutex poisoned")
+            .execute(
+                "INSERT INTO provider_credentials
+                   (provider, credential_kind, credential_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(provider) DO UPDATE SET
+                   credential_kind = excluded.credential_kind,
+                   credential_json = excluded.credential_json,
+                   updated_at = excluded.updated_at",
+                params![provider, kind, metadata.to_string(), unix_timestamp()],
+            )?;
+        Ok(())
+    }
+
+    fn delete_provider_credential(&self, provider: &str) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE providers SET enabled = 0, updated_at = ?1 WHERE provider = ?2",
+            params![unix_timestamp(), provider],
+        )?;
+        transaction.execute(
+            "DELETE FROM provider_credentials WHERE provider = ?1",
+            params![provider],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -725,11 +960,18 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert!(recent.iter().any(|record| record.id == second.id));
 
-        let models = vec![ModelInfo {
-            provider: CODEX_PROVIDER.to_owned(),
-            id: "model-a".to_owned(),
-            is_default: true,
-        }];
+        let models = vec![
+            ModelInfo {
+                provider: CODEX_PROVIDER.to_owned(),
+                id: "model-a".to_owned(),
+                is_default: true,
+            },
+            ModelInfo {
+                provider: CODEX_PROVIDER.to_owned(),
+                id: "model-b".to_owned(),
+                is_default: false,
+            },
+        ];
         store.update_model(&second.id, Some("model-a"))?;
         assert_eq!(
             store.find(&second.id)?.and_then(|record| record.model),
@@ -737,6 +979,14 @@ mod tests {
         );
         store.replace_models(CODEX_PROVIDER, &models)?;
         assert_eq!(store.list_models(CODEX_PROVIDER)?, models);
+        store.set_default_model(CODEX_PROVIDER, "model-b")?;
+        let preferred = store.list_models(CODEX_PROVIDER)?;
+        assert_eq!(preferred[0].id, "model-b");
+        assert!(preferred[0].is_default);
+        assert_eq!(preferred[1].id, "model-a");
+        assert!(!preferred[1].is_default);
+        store.replace_models(CODEX_PROVIDER, &models)?;
+        assert_eq!(store.list_models(CODEX_PROVIDER)?, preferred);
         store.replace_models(CODEX_PROVIDER, &[])?;
         assert!(store.list_models(CODEX_PROVIDER)?.is_empty());
         Ok(())
@@ -748,7 +998,36 @@ mod tests {
         let store = SqliteSessionRepository::open(directory.path().join("providers.db"))?;
         let providers = store.list_providers()?;
         assert_eq!(providers.len(), 2);
-        assert!(providers.iter().all(|provider| provider.enabled));
+        assert!(providers.iter().all(|provider| !provider.enabled));
+
+        assert!(matches!(
+            store.set_provider_enabled(CODEX_PROVIDER, true),
+            Err(SessionError::MissingProviderCredential(provider)) if provider == CODEX_PROVIDER
+        ));
+        let metadata = serde_json::json!({
+            "credential_store": "codex_managed",
+            "account": "fixture",
+        });
+        store.save_provider_credential(CODEX_PROVIDER, "chatgpt_device_code", &metadata)?;
+        store.set_provider_enabled(CODEX_PROVIDER, true)?;
+        let codex = store
+            .list_providers()?
+            .into_iter()
+            .find(|provider| provider.provider == CODEX_PROVIDER)
+            .expect("Codex provider");
+        assert!(codex.enabled);
+        assert_eq!(
+            codex.credential.map(|credential| credential.metadata),
+            Some(metadata)
+        );
+        store.delete_provider_credential(CODEX_PROVIDER)?;
+        let codex = store
+            .list_providers()?
+            .into_iter()
+            .find(|provider| provider.provider == CODEX_PROVIDER)
+            .expect("Codex provider");
+        assert!(!codex.enabled);
+        assert!(codex.credential.is_none());
 
         store.set_provider_enabled(DEVIN_PROVIDER, false)?;
         let devin = store
