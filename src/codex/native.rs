@@ -657,6 +657,8 @@ async fn start_session(
     let session = RuntimeSession::new(selected_id.clone(), instructions.unwrap_or_default())
         .with_context_window(selected.context_window);
     let session_id = session.id.clone();
+    let estimated_tokens = session.estimated_context_tokens();
+    let context_window = session.context_window;
     if let Some(store) = context.session_store
         && let Err(error) = store.save(&session)
     {
@@ -669,6 +671,13 @@ async fn start_session(
         .send(BackendEvent::SessionCreated {
             provider_session_id: session_id,
             model: selected_id,
+        })
+        .await;
+    let _ = context
+        .events
+        .send(BackendEvent::ContextUsageUpdated {
+            estimated_tokens,
+            context_window,
         })
         .await;
     let _ = context
@@ -710,6 +719,13 @@ async fn resume_session(provider_session_id: String, context: &mut CommandContex
                 provider_session_id,
                 model: session.model.clone(),
                 history: session.normalized_history(),
+            })
+            .await;
+        let _ = context
+            .events
+            .send(BackendEvent::ContextUsageUpdated {
+                estimated_tokens: session.estimated_context_tokens(),
+                context_window: session.context_window,
             })
             .await;
         let _ = context

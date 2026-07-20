@@ -54,9 +54,9 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     // Send each event separately so Crossterm's async event stream observes the
     // press before interpreting the drag and release.
     for event in [
-        b"\x1b[<0;2;24M".as_slice(),
-        b"\x1b[<32;8;24M".as_slice(),
-        b"\x1b[<0;8;24m".as_slice(),
+        b"\x1b[<0;2;25M".as_slice(),
+        b"\x1b[<32;8;25M".as_slice(),
+        b"\x1b[<0;8;25m".as_slice(),
     ] {
         session.writer().write_all(event)?;
         session.writer().flush()?;

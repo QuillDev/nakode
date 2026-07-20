@@ -165,6 +165,7 @@ impl AgentRuntime {
             })
             .await
             .map_err(|_| "backend event receiver closed".to_owned())?;
+        send_context_usage(session, backend_events).await?;
 
         let mut overflow_recovery_attempted = false;
         let mut inference_round = 0_u64;
@@ -226,6 +227,7 @@ impl AgentRuntime {
                 signature: output.signature,
                 provider_state: output.provider_state,
             });
+            send_context_usage(session, backend_events).await?;
             if output.tool_calls.is_empty() {
                 return Ok(());
             }
@@ -237,6 +239,7 @@ impl AgentRuntime {
                 &cancellation,
             )
             .await?;
+            send_context_usage(session, backend_events).await?;
         }
     }
 
@@ -366,6 +369,7 @@ impl AgentRuntime {
             .send(terminal_event)
             .await
             .map_err(|_| "backend event receiver closed".to_owned())?;
+        send_context_usage(session, backend_events).await?;
         result
     }
 
@@ -751,6 +755,19 @@ fn compaction_event_projection(
     )
 }
 
+async fn send_context_usage(
+    session: &RuntimeSession,
+    backend_events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), String> {
+    backend_events
+        .send(BackendEvent::ContextUsageUpdated {
+            estimated_tokens: session.estimated_context_tokens(),
+            context_window: session.context_window,
+        })
+        .await
+        .map_err(|_| "backend event receiver closed".to_owned())
+}
+
 fn estimate_history_tokens(history: &[ConversationItem]) -> usize {
     history.iter().map(estimate_item_tokens).sum()
 }
@@ -1076,10 +1093,18 @@ mod tests {
         drop(events);
 
         let mut item_order = Vec::new();
+        let mut context_updates = Vec::new();
         while let Some(event) = receiver.recv().await {
             let item_id = match event {
                 BackendEvent::ItemDelta { item_id, .. } => Some(item_id),
                 BackendEvent::ItemStarted { item, .. } => Some(item.id),
+                BackendEvent::ContextUsageUpdated {
+                    estimated_tokens,
+                    context_window,
+                } => {
+                    context_updates.push((estimated_tokens, context_window));
+                    None
+                }
                 _ => None,
             };
             if let Some(item_id) = item_id
@@ -1096,6 +1121,11 @@ mod tests {
                 "turn-1:tool:call-0",
                 "turn-1:assistant:1",
             ]
+        );
+        assert!(context_updates.len() >= 4);
+        assert_eq!(
+            context_updates.last(),
+            Some(&(session.estimated_context_tokens(), None))
         );
     }
 

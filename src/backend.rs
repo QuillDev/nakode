@@ -259,6 +259,10 @@ pub enum BackendEvent {
     TurnStarted {
         turn_id: String,
     },
+    ContextUsageUpdated {
+        estimated_tokens: usize,
+        context_window: Option<usize>,
+    },
     ContextCompactionStarted {
         compaction_id: String,
         turn_id: String,

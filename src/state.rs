@@ -54,6 +54,12 @@ pub struct ActiveTurn {
     pub cancelling: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextUsageState {
+    pub estimated_tokens: usize,
+    pub context_window: Option<usize>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextCompactionState {
     pub id: String,
@@ -254,6 +260,7 @@ struct ProviderContext {
     connection: ConnectionState,
     provider_session_id: Option<String>,
     session_id: Option<String>,
+    context_usage: Option<ContextUsageState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -392,6 +399,7 @@ pub struct AppState {
     pub provider_session_id: Option<String>,
     pub session_id: Option<String>,
     pub active_turn: Option<ActiveTurn>,
+    pub context_usage: Option<ContextUsageState>,
     pub context_compaction: Option<ContextCompactionState>,
     pub editor: EditorState,
     pub transcript: Transcript,
@@ -481,6 +489,7 @@ impl AppState {
                 connection: ConnectionState::Starting,
                 provider_session_id: None,
                 session_id: None,
+                context_usage: None,
             },
         );
         Self {
@@ -493,6 +502,7 @@ impl AppState {
             provider_session_id: None,
             session_id: None,
             active_turn: None,
+            context_usage: None,
             context_compaction: None,
             editor: EditorState::default(),
             transcript,
@@ -1094,6 +1104,9 @@ impl AppState {
         self.provider_contexts.remove(provider);
         if provider == self.backend_provider {
             self.connection = ConnectionState::Disconnected("logged out".to_owned());
+            self.provider_session_id = None;
+            self.session_id = None;
+            self.context_usage = None;
         }
         self.set_status(&format!(
             "Logged out of {}.",
@@ -1106,6 +1119,9 @@ impl AppState {
             picker.authentication = None;
         }
         self.provider_contexts.remove(provider);
+        if provider == self.backend_provider {
+            self.context_usage = None;
+        }
         self.set_status(&format!("Authentication failed for {provider}: {message}"));
     }
 
@@ -1128,12 +1144,14 @@ impl AppState {
                 connection: ConnectionState::Starting,
                 provider_session_id: None,
                 session_id: None,
+                context_usage: None,
             },
         );
         if self.backend_provider.is_empty() {
             provider.clone_into(&mut self.backend_provider);
             display_name.clone_into(&mut self.backend_name);
             self.connection = ConnectionState::Starting;
+            self.context_usage = None;
         }
         self.set_status(&format!("Connecting to {display_name}…"));
     }
@@ -1147,10 +1165,12 @@ impl AppState {
                 connection: ConnectionState::Failed(message.to_owned()),
                 provider_session_id: None,
                 session_id: None,
+                context_usage: None,
             },
         );
         if provider == self.backend_provider {
             self.connection = ConnectionState::Failed(message.to_owned());
+            self.context_usage = None;
         }
         self.set_status(&format!("Could not start {provider}: {message}"));
     }
@@ -1178,6 +1198,7 @@ impl AppState {
             self.provider_session_id
                 .clone_from(&context.provider_session_id);
             self.session_id.clone_from(&context.session_id);
+            self.context_usage = context.context_usage;
         } else {
             self.backend_provider.clear();
             "No provider".clone_into(&mut self.backend_name);
@@ -1185,6 +1206,7 @@ impl AppState {
             self.connection = ConnectionState::Disconnected("no provider enabled".to_owned());
             self.provider_session_id = None;
             self.session_id = None;
+            self.context_usage = None;
             self.set_status("No provider is enabled. Open /providers to configure one.");
         }
     }
@@ -1510,6 +1532,7 @@ impl AppState {
         self.session_model_override = false;
         self.selected_model = self.default_model();
         self.active_turn = None;
+        self.context_usage = None;
         self.context_compaction = None;
         self.creating_session = None;
         self.pending_session_prompt = None;
@@ -1818,6 +1841,7 @@ impl AppState {
             if provider_changed {
                 self.provider_session_id = None;
                 self.session_id = None;
+                self.context_usage = None;
                 self.pending_handoff = handoff.flatten();
                 self.sync_active_provider_context();
                 if self.pending_handoff.is_some() {
@@ -2015,6 +2039,10 @@ impl AppState {
                             .provider_contexts
                             .get(provider)
                             .and_then(|context| context.session_id.clone()),
+                        context_usage: self
+                            .provider_contexts
+                            .get(provider)
+                            .and_then(|context| context.context_usage),
                     },
                 );
                 if self.backend_provider.is_empty() && !self.provider_is_authenticating(provider) {
@@ -2056,8 +2084,18 @@ impl AppState {
                 provider_session_id,
             } if provider != self.backend_provider => {
                 if let Some(context) = self.provider_contexts.get_mut(provider) {
+                    if context.provider_session_id.as_deref() != Some(provider_session_id) {
+                        context.context_usage = None;
+                    }
                     context.provider_session_id = Some(provider_session_id.clone());
                 }
+                return Vec::new();
+            }
+            BackendEvent::ContextUsageUpdated {
+                estimated_tokens,
+                context_window,
+            } if provider != self.backend_provider => {
+                self.set_provider_context_usage(provider, *estimated_tokens, *context_window);
                 return Vec::new();
             }
             BackendEvent::Warning(message) if provider != self.backend_provider => {
@@ -2080,6 +2118,20 @@ impl AppState {
         let effects = self.handle_backend(event);
         self.sync_active_provider_context();
         effects
+    }
+
+    fn set_provider_context_usage(
+        &mut self,
+        provider: &str,
+        estimated_tokens: usize,
+        context_window: Option<usize>,
+    ) {
+        if let Some(context) = self.provider_contexts.get_mut(provider) {
+            context.context_usage = Some(ContextUsageState {
+                estimated_tokens,
+                context_window,
+            });
+        }
     }
 
     fn handle_provider_authentication(
@@ -2135,6 +2187,7 @@ impl AppState {
                 connection: self.connection.clone(),
                 provider_session_id: None,
                 session_id: None,
+                context_usage: None,
             });
         context.name.clone_from(&self.backend_name);
         context.capabilities = self.backend_capabilities.clone();
@@ -2143,6 +2196,7 @@ impl AppState {
             .provider_session_id
             .clone_from(&self.provider_session_id);
         context.session_id.clone_from(&self.session_id);
+        context.context_usage = self.context_usage;
     }
 
     fn activate_provider(&mut self, provider: &str) -> bool {
@@ -2164,6 +2218,7 @@ impl AppState {
         self.connection = context.connection;
         self.provider_session_id = context.provider_session_id;
         self.session_id = context.session_id;
+        self.context_usage = context.context_usage;
         true
     }
 
@@ -2193,6 +2248,7 @@ impl AppState {
             BackendEvent::TodoUpdated { phases } => self.todo_phases = phases,
             BackendEvent::AuthenticationChallenge { .. }
             | BackendEvent::AuthenticationCompleted { .. }
+            | BackendEvent::ContextUsageUpdated { .. }
             | BackendEvent::ContextCompactionStarted { .. }
             | BackendEvent::ContextCompactionCompleted { .. }
             | BackendEvent::ContextCompactionFailed { .. }
@@ -2272,6 +2328,16 @@ impl AppState {
         event: BackendEvent,
     ) -> Result<Vec<Effect>, BackendEvent> {
         match event {
+            BackendEvent::ContextUsageUpdated {
+                estimated_tokens,
+                context_window,
+            } => {
+                self.context_usage = Some(ContextUsageState {
+                    estimated_tokens,
+                    context_window,
+                });
+                Ok(Vec::new())
+            }
             BackendEvent::ContextCompactionStarted {
                 compaction_id,
                 turn_id,
@@ -2403,6 +2469,7 @@ impl AppState {
             return self.protocol_problem("session creation returned an empty provider id");
         }
         self.provider_session_id = Some(provider_session_id.clone());
+        self.context_usage = None;
         self.context_compaction = None;
         self.creating_session = None;
         if !model.is_empty() {
@@ -2440,6 +2507,7 @@ impl AppState {
         }
         self.provider_session_id = Some(provider_session_id);
         self.session_id = Some(session.id.clone());
+        self.context_usage = None;
         self.context_compaction = None;
         if !model.is_empty() {
             self.selected_model = Some(self.qualify_active_model(model));
@@ -2470,6 +2538,10 @@ impl AppState {
             self.diagnostic_count += 1;
             return;
         }
+        self.context_usage = Some(ContextUsageState {
+            estimated_tokens,
+            context_window,
+        });
         self.context_compaction = Some(ContextCompactionState {
             id: compaction_id.clone(),
             turn_id,
@@ -2512,10 +2584,19 @@ impl AppState {
             self.diagnostic_count += 1;
             return;
         }
+        let context_window = self
+            .context_compaction
+            .as_ref()
+            .and_then(|compaction| compaction.context_window)
+            .or_else(|| self.context_usage.and_then(|usage| usage.context_window));
         let compaction_reason = self
             .context_compaction
             .take()
             .map_or(CompactionReason::Proactive, |compaction| compaction.reason);
+        self.context_usage = Some(ContextUsageState {
+            estimated_tokens: estimated_tokens_after,
+            context_window,
+        });
         let (reason, title) = match compaction_reason {
             CompactionReason::Manual => (
                 "manual context compression was requested",
@@ -2672,6 +2753,7 @@ impl AppState {
         self.transcript.set_stream_active(false);
         self.provider_session_id = None;
         self.active_turn = None;
+        self.context_usage = None;
         self.context_compaction = None;
         self.creating_session = None;
         self.pending_steer = None;
@@ -3286,6 +3368,7 @@ impl AppState {
             | BackendEvent::SessionObserved { .. }
             | BackendEvent::TurnAccepted { .. }
             | BackendEvent::TurnStarted { .. }
+            | BackendEvent::ContextUsageUpdated { .. }
             | BackendEvent::ContextCompactionStarted { .. }
             | BackendEvent::ContextCompactionCompleted { .. }
             | BackendEvent::ContextCompactionFailed { .. }
@@ -4104,6 +4187,13 @@ model = "openai-codex/model-a"
             estimated_tokens: 42_000,
             context_window: Some(100_000),
         });
+        assert_eq!(
+            state.context_usage,
+            Some(super::ContextUsageState {
+                estimated_tokens: 42_000,
+                context_window: Some(100_000),
+            })
+        );
         let interrupt = state.cancel_or_quit();
         assert!(matches!(
             interrupt.as_slice(),
@@ -4122,6 +4212,13 @@ model = "openai-codex/model-a"
 
         assert!(!state.is_busy());
         assert_eq!(state.status_message, "Context compressed; ready.");
+        assert_eq!(
+            state.context_usage,
+            Some(super::ContextUsageState {
+                estimated_tokens: 12_000,
+                context_window: Some(100_000),
+            })
+        );
         assert!(state.transcript.entries().iter().any(|entry| {
             entry.key.as_deref() == Some(compaction_id.as_str())
                 && entry.title == "Context compressed"

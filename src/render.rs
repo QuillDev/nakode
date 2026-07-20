@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -32,6 +32,7 @@ const ACCENT_DEEP: Color = Color::Rgb(216, 69, 111);
 const SUCCESS: Color = Color::Rgb(74, 222, 128);
 const WARNING: Color = Color::Rgb(250, 204, 21);
 const DANGER: Color = Color::Rgb(248, 113, 113);
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn panel_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
     Block::default()
@@ -75,11 +76,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
             Constraint::Length(todo_height),
             Constraint::Length(queue_height),
             Constraint::Length(5),
-            Constraint::Length(1),
         ])
         .split(area);
 
-    render_header(frame, regions[0]);
+    render_header(frame, regions[0], state);
     render_transcript(frame, regions[1], state);
     if todo_height > 0 {
         render_todos(frame, regions[2], state);
@@ -88,7 +88,6 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         render_queue(frame, regions[3], state);
     }
     let cursor = render_composer(frame, regions[4], state);
-    render_footer(frame, regions[5], state);
 
     let has_modal = state.questions.front().is_some()
         || state.approvals.front().is_some()
@@ -214,14 +213,42 @@ fn rect_contains(area: Rect, point: ScreenPoint) -> bool {
         && point.row < area.bottom()
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect) {
-    let line = Line::from(Span::styled(
-        " NAKODE ",
-        Style::default().bg(ACCENT).fg(BACKGROUND).bold(),
-    ));
+fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(SURFACE)),
+        Paragraph::new(Line::default()).style(Style::default().bg(SURFACE)),
         area,
+    );
+
+    let brand_width = area.width.min(8);
+    let brand_area = Rect::new(area.x, area.y, brand_width, area.height);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " NAKODE ",
+            Style::default().bg(ACCENT).fg(BACKGROUND).bold(),
+        ))),
+        brand_area,
+    );
+
+    let (model, model_style) = state.selected_model.as_deref().map_or_else(
+        || ("No model selected", Style::default().fg(MUTED)),
+        |model| (model, Style::default().fg(ACCENT_BRIGHT).bold()),
+    );
+    let line = Line::from(vec![
+        Span::styled("MODEL ", Style::default().fg(MUTED)),
+        Span::styled(model, model_style),
+        Span::raw(" "),
+    ]);
+    let model_area = Rect::new(
+        area.x.saturating_add(brand_width),
+        area.y,
+        area.width.saturating_sub(brand_width),
+        area.height,
+    );
+    frame.render_widget(
+        Paragraph::new(line)
+            .alignment(Alignment::Right)
+            .style(Style::default().bg(SURFACE)),
+        model_area,
     );
 }
 
@@ -446,12 +473,28 @@ fn render_subagent_modal(frame: &mut Frame<'_>, area: Rect, state: &mut AppState
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<Position> {
+    let mut title = if state.is_busy() {
+        vec![
+            Span::raw(" "),
+            Span::styled(spinner_frame(), Style::default().fg(ACCENT_BRIGHT)),
+            Span::styled(" Nako ", Style::default().fg(TEXT).bold()),
+        ]
+    } else {
+        vec![Span::styled(" Nako ", Style::default().fg(TEXT).bold())]
+    };
+    if let Some(usage) = state.context_usage
+        && let Some(label) = context_usage_label(usage.estimated_tokens, usage.context_window)
+    {
+        let color = context_usage_color(usage.estimated_tokens, usage.context_window);
+        title.push(Span::styled("· ", Style::default().fg(MUTED)));
+        title.push(Span::styled(label, Style::default().fg(color)));
+    }
     let block = overlay_block(
-        " Prompt ",
-        if state.editor.is_blank() {
-            BORDER
-        } else {
+        Line::from(title),
+        if state.is_busy() || !state.editor.is_blank() {
             ACCENT
+        } else {
+            BORDER
         },
     );
     let inner = block.inner(area);
@@ -477,6 +520,52 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Optio
         inner.x.saturating_add(window.cursor_x),
         inner.y.saturating_add(window.cursor_y),
     ))
+}
+
+fn context_usage_label(estimated_tokens: usize, context_window: Option<usize>) -> Option<String> {
+    match context_window {
+        Some(context_window) => Some(format!(
+            "CTX ~{} / {} ",
+            compact_token_count(estimated_tokens),
+            compact_token_count(context_window)
+        )),
+        None if estimated_tokens > 0 => {
+            Some(format!("CTX ~{} ", compact_token_count(estimated_tokens)))
+        }
+        None => None,
+    }
+}
+
+fn context_usage_color(estimated_tokens: usize, context_window: Option<usize>) -> Color {
+    let Some(context_window) = context_window.filter(|window| *window > 0) else {
+        return MUTED;
+    };
+    if estimated_tokens >= context_window.saturating_mul(9) / 10 {
+        DANGER
+    } else if estimated_tokens >= context_window.saturating_mul(3) / 4 {
+        WARNING
+    } else {
+        MUTED
+    }
+}
+
+fn compact_token_count(tokens: usize) -> String {
+    fn scaled(tokens: usize, divisor: usize, suffix: char) -> String {
+        let tenths = tokens.saturating_mul(10).saturating_add(divisor / 2) / divisor;
+        if tenths.is_multiple_of(10) {
+            format!("{}{suffix}", tenths / 10)
+        } else {
+            format!("{}.{:01}{suffix}", tenths / 10, tenths % 10)
+        }
+    }
+
+    if tokens >= 1_000_000 {
+        scaled(tokens, 1_000_000, 'm')
+    } else if tokens >= 1_000 {
+        scaled(tokens, 1_000, 'k')
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn styled_composer_line(line: String, first_prompt_line: bool) -> Line<'static> {
@@ -544,14 +633,6 @@ fn render_command_completions(frame: &mut Frame<'_>, composer_area: Rect, state:
     });
     let block = overlay_block(" Commands · ↑/↓ select · Tab complete ", ACCENT);
     frame.render_widget(List::new(items).block(block), popup);
-}
-
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    frame.render_widget(
-        Paragraph::new(format!(" {}", state.status_message))
-            .style(Style::default().fg(MUTED).bg(SURFACE)),
-        area,
-    );
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
@@ -1304,12 +1385,11 @@ fn markdown_span(span: MarkdownSpan, mut style: Style) -> Span<'static> {
 }
 
 fn spinner_frame() -> &'static str {
-    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let tick = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() / 100);
-    let frame = usize::try_from(tick % FRAMES.len() as u128).unwrap_or(0);
-    FRAMES[frame]
+    let frame = usize::try_from(tick % SPINNER_FRAMES.len() as u128).unwrap_or(0);
+    SPINNER_FRAMES[frame]
 }
 
 fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
@@ -1338,7 +1418,7 @@ mod tests {
             DEVIN_PROVIDER, TodoItem, TodoPhase, TodoStatus,
         },
         session::ProviderRecord,
-        state::{AgentRequest, AppState, Effect},
+        state::{ActiveTurn, AgentRequest, AppState, ContextUsageState, Effect},
         transcript::{
             LineTone, MarkdownModifier, MarkdownSpan, MarkdownStyle, MarkdownTone, ProjectedLine,
         },
@@ -1368,9 +1448,11 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("NAKODE"));
-        assert!(rendered.contains("Prompt"));
+        assert!(rendered.contains("Nako"));
+        assert!(!rendered.contains("Prompt"));
+        assert!(!rendered.contains("Ready."));
         assert!(!rendered.contains("Transcript"));
-        assert!(!rendered.contains("fixture-model"));
+        assert!(rendered.contains("fixture-model"));
         assert!(!rendered.contains("queue 0"));
         assert!(!rendered.contains("F1 help"));
 
@@ -1379,6 +1461,100 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, super::BACKGROUND);
         assert_eq!(buffer[(0, 1)].symbol(), "╭");
         assert_eq!(buffer[(0, 1)].fg, super::BORDER);
+    }
+
+    #[test]
+    fn composer_title_animates_while_nako_is_processing() {
+        let backend = TestBackend::new(40, 5);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.active_turn = Some(ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: None,
+            cancelling: false,
+        });
+
+        terminal
+            .draw(|frame| {
+                super::render_composer(frame, frame.area(), &state);
+            })
+            .expect("render busy composer");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Nako"));
+        assert!(
+            super::SPINNER_FRAMES
+                .iter()
+                .any(|frame| rendered.contains(frame))
+        );
+    }
+
+    #[test]
+    fn composer_title_shows_estimated_context_usage() {
+        let backend = TestBackend::new(50, 5);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.context_usage = Some(ContextUsageState {
+            estimated_tokens: 12_345,
+            context_window: Some(258_400),
+        });
+
+        terminal
+            .draw(|frame| {
+                super::render_composer(frame, frame.area(), &state);
+            })
+            .expect("render composer context usage");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Nako · CTX ~12.3k / 258.4k"));
+    }
+
+    #[test]
+    fn context_usage_color_warns_near_the_window_limit() {
+        assert_eq!(
+            super::context_usage_color(74_999, Some(100_000)),
+            super::MUTED
+        );
+        assert_eq!(
+            super::context_usage_color(75_000, Some(100_000)),
+            super::WARNING
+        );
+        assert_eq!(
+            super::context_usage_color(90_000, Some(100_000)),
+            super::DANGER
+        );
+    }
+
+    #[test]
+    fn header_reports_when_no_model_is_selected() {
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let state = AppState::new("/tmp/project", None, 100);
+
+        terminal
+            .draw(|frame| super::render_header(frame, frame.area(), &state))
+            .expect("render Nakode header");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("MODEL No model selected"));
     }
 
     #[test]
