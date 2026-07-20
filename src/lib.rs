@@ -10,6 +10,7 @@ pub mod controls;
 pub mod devin;
 pub mod editor;
 pub mod handoff;
+mod herdr;
 mod markdown;
 pub mod pty;
 pub mod render;
