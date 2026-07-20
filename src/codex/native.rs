@@ -17,8 +17,8 @@ use crate::{
     },
     runtime::{
         AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
-        InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest, RuntimeSession,
-        RuntimeSessionStore, ToolCall,
+        InferenceFailure, InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest,
+        RuntimeSession, RuntimeSessionStore, ToolCall,
     },
 };
 
@@ -45,6 +45,7 @@ pub struct BackendConfig {
     auth_urls: AuthUrls,
     session_database: Option<PathBuf>,
     compaction_threshold_percent: usize,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +72,7 @@ impl BackendConfig {
             },
             session_database: None,
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+            reasoning_effort: Some("medium".to_owned()),
         }
     }
 
@@ -89,6 +91,12 @@ impl BackendConfig {
     #[must_use]
     pub fn with_compaction_threshold_percent(mut self, threshold_percent: usize) -> Self {
         self.compaction_threshold_percent = threshold_percent;
+        self
+    }
+
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, reasoning_effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(reasoning_effort.into());
         self
     }
 
@@ -164,12 +172,12 @@ impl CodexProvider {
         request: InferenceRequest,
         events: mpsc::Sender<InferenceEvent>,
         cancellation: CancellationToken,
-    ) -> Result<InferenceOutput, String> {
+    ) -> Result<InferenceOutput, InferenceFailure> {
         let body = codex_request_body(&request);
         let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
         for attempt in 0..MAX_INFERENCE_ATTEMPTS {
             if cancellation.is_cancelled() {
-                return Err("turn interrupted".to_owned());
+                return Err("turn interrupted".into());
             }
             match self
                 .infer_attempt(
@@ -181,7 +189,10 @@ impl CodexProvider {
                 )
                 .await
             {
-                Ok(output) => return Ok(output),
+                Ok(mut output) => {
+                    output.retry_count = attempt;
+                    return Ok(output);
+                }
                 Err(error) if error.retryable && attempt + 1 < MAX_INFERENCE_ATTEMPTS => {
                     let delay = error
                         .retry_after
@@ -189,10 +200,10 @@ impl CodexProvider {
                         .min(MAX_RETRY_DELAY);
                     tokio::select! {
                         () = tokio::time::sleep(delay) => {}
-                        () = cancellation.cancelled() => return Err("turn interrupted".to_owned()),
+                        () = cancellation.cancelled() => return Err("turn interrupted".into()),
                     }
                 }
-                Err(error) => return Err(error.message),
+                Err(error) => return Err(InferenceFailure::new(error.message, attempt)),
             }
         }
         unreachable!("the bounded inference retry loop returns on its final attempt")
@@ -655,7 +666,8 @@ async fn start_session(
     };
     let selected_id = selected.info.id.clone();
     let session = RuntimeSession::new(selected_id.clone(), instructions.unwrap_or_default())
-        .with_context_window(selected.context_window);
+        .with_context_window(selected.context_window)
+        .with_reasoning_effort(context.config.reasoning_effort.clone());
     let session_id = session.id.clone();
     let estimated_tokens = session.estimated_context_tokens();
     let context_window = session.context_window;
@@ -891,8 +903,11 @@ fn codex_request_body(request: &InferenceRequest) -> Value {
         "instructions": request.instructions,
         "tools": tools,
         "tool_choice": "auto",
-        "parallel_tool_calls": false,
-        "reasoning": {"effort": "high", "summary": "detailed"},
+        "parallel_tool_calls": true,
+        "reasoning": {
+            "effort": request.reasoning_effort.as_deref().unwrap_or("medium"),
+            "summary": "detailed"
+        },
         "include": ["reasoning.encrypted_content"],
         "stream": true,
         "store": false,
@@ -922,9 +937,13 @@ fn conversation_input(item: &ConversationItem) -> Vec<Value> {
             items
         }
         ConversationItem::ToolResult {
-            call_id, output, ..
+            call_id,
+            output,
+            model_output,
+            ..
         } => vec![json!({
-            "type": "function_call_output", "call_id": call_id, "output": output
+            "type": "function_call_output", "call_id": call_id,
+            "output": model_output.as_ref().unwrap_or(output)
         })],
         ConversationItem::Compaction { summary } => {
             vec![
@@ -1109,6 +1128,17 @@ async fn apply_codex_event(
             } else if item.get("type").and_then(Value::as_str) == Some("reasoning") {
                 output.provider_state.push(item.clone());
             }
+        }
+        "response.completed" => {
+            let usage = event.pointer("/response/usage").unwrap_or(&Value::Null);
+            output.usage.input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+            output.usage.output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+            output.usage.cached_input_tokens = usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(Value::as_u64);
+            output.usage.cache_write_tokens = usage
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .and_then(Value::as_u64);
         }
         "error" => {
             return Err(codex_error_message(event, "Codex stream error"));
@@ -1388,6 +1418,19 @@ mod tests {
         assert!(conversation_input(&event).is_empty());
     }
 
+    #[test]
+    fn codex_receives_bounded_model_tool_output() {
+        let input = conversation_input(&ConversationItem::ToolResult {
+            call_id: "call-1".to_owned(),
+            title: Some("read".to_owned()),
+            output: "full transcript output".to_owned(),
+            model_output: Some("bounded model output".to_owned()),
+            failed: false,
+        });
+
+        assert_eq!(input[0]["output"], "bounded model output");
+    }
+
     #[tokio::test]
     async fn discovers_models_over_the_native_transport() {
         let (base_url, server) = serve_once(
@@ -1512,6 +1555,7 @@ mod tests {
 
         assert_eq!(requests.len(), 3);
         assert_eq!(output.text, "recovered");
+        assert_eq!(output.retry_count, 2);
         assert!(
             matches!(event_rx.recv().await, Some(InferenceEvent::TextDelta(delta)) if delta == "recovered")
         );
@@ -1540,7 +1584,8 @@ mod tests {
         let requests = server.await.expect("mock server task");
 
         assert_eq!(requests.len(), 1);
-        assert!(error.contains("400 Bad Request"));
+        assert!(error.message.contains("400 Bad Request"));
+        assert_eq!(error.retry_count, 0);
     }
 
     #[tokio::test]
@@ -1565,10 +1610,37 @@ mod tests {
         let requests = server.await.expect("mock server task");
 
         assert_eq!(requests.len(), 1);
-        assert!(error.contains("temporary server error"));
+        assert!(error.message.contains("temporary server error"));
+        assert_eq!(error.retry_count, 0);
         assert!(
             matches!(event_rx.recv().await, Some(InferenceEvent::TextDelta(delta)) if delta == "partial")
         );
+    }
+
+    #[tokio::test]
+    async fn exhausted_transient_failures_report_every_retry() {
+        let (base_url, server) = serve_sequence(vec![
+            (500, "application/json", r#"{"error":"temporary"}"#),
+            (500, "application/json", r#"{"error":"temporary"}"#),
+            (500, "application/json", r#"{"error":"temporary"}"#),
+            (500, "application/json", r#"{"error":"temporary"}"#),
+        ])
+        .await;
+        let provider = CodexProvider {
+            client: Client::new(),
+            base_url,
+            credential: test_credential(),
+        };
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        let error = provider
+            .infer_response(test_request(), event_tx, CancellationToken::new())
+            .await
+            .expect_err("transient failures eventually stop retrying");
+        let requests = server.await.expect("mock server task");
+
+        assert_eq!(requests.len(), MAX_INFERENCE_ATTEMPTS);
+        assert_eq!(error.retry_count, MAX_INFERENCE_ATTEMPTS - 1);
     }
 
     #[tokio::test]
@@ -1662,6 +1734,48 @@ mod tests {
         assert_eq!(body["store"], false);
     }
 
+    #[test]
+    fn codex_requests_parallel_tools_and_the_configured_reasoning_effort() {
+        let mut request = test_request();
+        request.reasoning_effort = Some("low".to_owned());
+
+        let body = codex_request_body(&request);
+
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[tokio::test]
+    async fn completed_response_records_provider_token_and_cache_usage() {
+        let (events, _receiver) = mpsc::channel(1);
+        let mut output = InferenceOutput::default();
+
+        apply_codex_event(
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 1200,
+                        "output_tokens": 75,
+                        "input_tokens_details": {
+                            "cached_tokens": 900,
+                            "cache_write_tokens": 100
+                        }
+                    }
+                }
+            }),
+            &events,
+            &mut output,
+        )
+        .await
+        .expect("completed event");
+
+        assert_eq!(output.usage.input_tokens, Some(1_200));
+        assert_eq!(output.usage.output_tokens, Some(75));
+        assert_eq!(output.usage.cached_input_tokens, Some(900));
+        assert_eq!(output.usage.cache_write_tokens, Some(100));
+    }
+
     async fn serve_sequence(
         responses: Vec<(u16, &'static str, &'static str)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
@@ -1743,6 +1857,7 @@ mod tests {
                 text: "Hi".to_owned(),
             }],
             tools: Vec::new(),
+            reasoning_effort: None,
         }
     }
 }

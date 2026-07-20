@@ -154,13 +154,13 @@ fn set_task_status(
     content: &str,
     status: TodoStatus,
 ) -> Result<(), String> {
-    let task = phases
-        .iter_mut()
-        .flat_map(|phase| &mut phase.tasks)
-        .find(|task| task.content == content)
-        .ok_or_else(|| format!("todo task not found: {content}"))?;
-    task.status = status;
-    Ok(())
+    for phase in &mut *phases {
+        if let Some(task) = phase.tasks.iter_mut().find(|task| task.content == content) {
+            task.status = status;
+            return Ok(());
+        }
+    }
+    Err(missing_task_message(phases, content))
 }
 
 fn remove_target(phases: &mut Vec<TodoPhase>, arguments: &Value) -> Result<(), String> {
@@ -172,7 +172,7 @@ fn remove_target(phases: &mut Vec<TodoPhase>, arguments: &Value) -> Result<(), S
                 return Ok(());
             }
         }
-        return Err(format!("todo task not found: {content}"));
+        return Err(missing_task_message(phases, content));
     }
     if let Some(name) = arguments.get("phase").and_then(Value::as_str) {
         let before = phases.len();
@@ -183,6 +183,22 @@ fn remove_target(phases: &mut Vec<TodoPhase>, arguments: &Value) -> Result<(), S
     }
     phases.clear();
     Ok(())
+}
+
+fn missing_task_message(phases: &[TodoPhase], requested: &str) -> String {
+    let available = phases
+        .iter()
+        .flat_map(|phase| &phase.tasks)
+        .map(|task| format!("- {}", task.content))
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        format!("todo task not found: {requested}; the todo list is empty")
+    } else {
+        format!(
+            "todo task not found: {requested}\nUse one of these exact task values:\n{}",
+            available.join("\n")
+        )
+    }
 }
 
 fn phase_from_value(value: &Value, field: &str) -> Result<TodoPhase, String> {
@@ -270,7 +286,7 @@ fn render_phases(phases: &[TodoPhase]) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::apply_operation;
+    use super::{apply_operation, missing_task_message};
     use crate::backend::TodoStatus;
 
     #[test]
@@ -293,5 +309,22 @@ mod tests {
         .expect("complete todo");
         assert_eq!(phases[0].tasks[1].status, TodoStatus::InProgress);
         assert_eq!(phases[1].tasks[0].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn missing_tasks_report_valid_exact_values() {
+        let mut phases = Vec::new();
+        apply_operation(
+            &mut phases,
+            &json!({"op": "init", "list": [
+                {"phase": "Build", "items": ["Implement reader", "Run tests"]}
+            ]}),
+        )
+        .expect("initialize todos");
+
+        let message = missing_task_message(&phases, "implement reader");
+        assert!(message.contains("Use one of these exact task values"));
+        assert!(message.contains("- Implement reader"));
+        assert!(message.contains("- Run tests"));
     }
 }

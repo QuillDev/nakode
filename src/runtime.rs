@@ -1,4 +1,10 @@
-use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -11,9 +17,9 @@ use crate::backend::{
     BackendEvent, CompactionReason, DeltaKind, ItemKind, ItemStatus, NormalizedItem,
     SessionHistoryItem, TodoPhase,
 };
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolConcurrency, ToolRegistry, model_facing_output};
 
-const COMPACTION_RESERVE_TOKENS: usize = 16_384;
+const COMPACTION_RESERVE_TOKENS: usize = 32_768;
 const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
 pub const DEFAULT_COMPACTION_THRESHOLD_PERCENT: usize = 85;
 const COMPACTION_SERIALIZED_FIELD_LIMIT: usize = 2_000;
@@ -39,6 +45,8 @@ pub enum ConversationItem {
         #[serde(default)]
         title: Option<String>,
         output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_output: Option<String>,
         failed: bool,
     },
     Compaction {
@@ -61,6 +69,58 @@ pub struct RuntimeCompaction {
     pub compacted_history: Vec<ConversationItem>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct InferenceUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceMetric {
+    #[serde(default)]
+    pub kind: InferenceKind,
+    pub turn_id: String,
+    pub round: u64,
+    pub started_at_ms: u64,
+    pub duration_ms: u64,
+    pub estimated_input_tokens: usize,
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+    pub tool_call_count: usize,
+    pub retry_count: usize,
+    pub usage: InferenceUsage,
+    pub response_id: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceKind {
+    #[default]
+    Turn,
+    Compaction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolMetric {
+    pub turn_id: String,
+    pub call_id: String,
+    pub name: String,
+    pub started_at_ms: u64,
+    pub duration_ms: u64,
+    pub output_bytes: usize,
+    pub model_output_bytes: usize,
+    pub failed: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RuntimeTelemetry {
+    pub inference: Vec<InferenceMetric>,
+    pub tools: Vec<ToolMetric>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -75,6 +135,7 @@ pub struct InferenceRequest {
     pub instructions: String,
     pub history: Vec<ConversationItem>,
     pub tools: Vec<ToolDefinition>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -85,6 +146,36 @@ pub struct InferenceOutput {
     pub response_id: Option<String>,
     pub signature: Option<String>,
     pub provider_state: Vec<Value>,
+    pub usage: InferenceUsage,
+    pub retry_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct InferenceFailure {
+    pub message: String,
+    pub retry_count: usize,
+}
+
+impl InferenceFailure {
+    #[must_use]
+    pub fn new(message: impl Into<String>, retry_count: usize) -> Self {
+        Self {
+            message: message.into(),
+            retry_count,
+        }
+    }
+}
+
+impl From<String> for InferenceFailure {
+    fn from(message: String) -> Self {
+        Self::new(message, 0)
+    }
+}
+
+impl From<&str> for InferenceFailure {
+    fn from(message: &str) -> Self {
+        Self::new(message, 0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -102,7 +193,7 @@ pub struct ToolDefinition {
 }
 
 pub type InferenceFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<InferenceOutput, String>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<InferenceOutput, InferenceFailure>> + Send + 'a>>;
 
 pub trait InferenceProvider: Send + Sync {
     fn infer(
@@ -140,6 +231,12 @@ impl AgentRuntime {
         self
     }
 
+    #[cfg(test)]
+    fn with_tools(mut self, tools: ToolRegistry) -> Self {
+        self.tools = tools;
+        self
+    }
+
     pub async fn resolve_question(&self, id: &str, answer: String) -> bool {
         self.questions.resolve(id, answer).await
     }
@@ -174,8 +271,8 @@ impl AgentRuntime {
             if cancellation.is_cancelled() {
                 return Err("turn interrupted".to_owned());
             }
-            if session.should_compact(self.compaction_threshold_percent)
-                && self
+            if session.should_compact(self.compaction_threshold_percent) {
+                let compaction = self
                     .compact(
                         session,
                         turn_id,
@@ -184,11 +281,14 @@ impl AgentRuntime {
                         backend_events,
                         &cancellation,
                     )
-                    .await
-                    .is_err()
-            {
-                // The lifecycle event already reports the failure. Proactive compaction
-                // remains best-effort so inference can still proceed.
+                    .await;
+                if let Err(error) = compaction
+                    && session.exceeds_safe_request_budget()
+                {
+                    return Err(format!(
+                        "context compaction is required before inference: {error}"
+                    ));
+                }
             }
             let result = self
                 .infer_once(
@@ -220,7 +320,6 @@ impl AgentRuntime {
                 }
                 Err(error) => return Err(error),
             };
-            session.last_response_id.clone_from(&output.response_id);
             session.history.push(ConversationItem::Assistant {
                 text: output.text,
                 reasoning: output.reasoning,
@@ -246,7 +345,7 @@ impl AgentRuntime {
 
     async fn infer_once(
         &self,
-        session: &RuntimeSession,
+        session: &mut RuntimeSession,
         turn_id: &str,
         inference_round: u64,
         backend_events: &mpsc::Sender<BackendEvent>,
@@ -254,13 +353,18 @@ impl AgentRuntime {
     ) -> Result<Result<InferenceOutput, String>, String> {
         let (inference_tx, mut inference_rx) = mpsc::channel(256);
         let provider = Arc::clone(&self.provider);
+        let estimated_input_tokens = session.estimated_context_tokens();
+        let input_bytes = session.estimated_context_bytes();
         let request = InferenceRequest {
             session_id: session.id.clone(),
             model: session.model.clone(),
             instructions: session.instructions.clone(),
             history: session.history.clone(),
             tools: self.tools.definitions(),
+            reasoning_effort: session.reasoning_effort.clone(),
         };
+        let started_at_ms = unix_time_ms();
+        let started = Instant::now();
         let inference_cancellation = cancellation.clone();
         let inference = tokio::spawn(async move {
             provider
@@ -295,9 +399,44 @@ impl AgentRuntime {
                 .await
                 .map_err(|_| "backend event receiver closed".to_owned())?;
         }
-        inference
+        let result = inference
             .await
-            .map_err(|error| format!("inference task failed: {error}"))
+            .map_err(|error| format!("inference task failed: {error}"))?;
+        let (output_bytes, tool_call_count, retry_count, usage, response_id, error) = match &result
+        {
+            Ok(output) => (
+                inference_output_bytes(output),
+                output.tool_calls.len(),
+                output.retry_count,
+                output.usage.clone(),
+                output.response_id.clone(),
+                None,
+            ),
+            Err(error) => (
+                0,
+                0,
+                error.retry_count,
+                InferenceUsage::default(),
+                None,
+                Some(truncate_telemetry_error(&error.message)),
+            ),
+        };
+        session.telemetry.inference.push(InferenceMetric {
+            kind: InferenceKind::Turn,
+            turn_id: turn_id.to_owned(),
+            round: inference_round,
+            started_at_ms,
+            duration_ms: duration_ms(started.elapsed()),
+            estimated_input_tokens,
+            input_bytes,
+            output_bytes,
+            tool_call_count,
+            retry_count,
+            usage,
+            response_id,
+            error,
+        });
+        Ok(result.map_err(|error| error.message))
     }
 
     /// Compresses the current session context without waiting for an automatic threshold.
@@ -403,22 +542,59 @@ impl AgentRuntime {
             prompt.push_str(previous_summary);
             prompt.push_str("\n</previous-summary>");
         }
+        let input_bytes = prompt.len() + COMPACTION_INSTRUCTIONS.len();
         let request = InferenceRequest {
             session_id: format!("{}-compact-{}", session.id, session.compactions.len() + 1),
             model: session.model.clone(),
             instructions: COMPACTION_INSTRUCTIONS.to_owned(),
             history: vec![ConversationItem::User { text: prompt }],
             tools: Vec::new(),
+            reasoning_effort: session.reasoning_effort.clone(),
         };
+        let metric_turn_id = format!("compaction:{}", session.compactions.len() + 1);
+        let started_at_ms = unix_time_ms();
+        let started = Instant::now();
         let (events, mut event_rx) = mpsc::channel(256);
         let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
-        let output = self
+        let result = self
             .provider
             .infer(request, events, cancellation.clone())
-            .await?;
+            .await;
         drain
             .await
             .map_err(|error| format!("compaction event task failed: {error}"))?;
+        let (output_bytes, retry_count, usage, response_id, error) = match &result {
+            Ok(output) => (
+                inference_output_bytes(output),
+                output.retry_count,
+                output.usage.clone(),
+                output.response_id.clone(),
+                None,
+            ),
+            Err(error) => (
+                0,
+                error.retry_count,
+                InferenceUsage::default(),
+                None,
+                Some(truncate_telemetry_error(&error.message)),
+            ),
+        };
+        session.telemetry.inference.push(InferenceMetric {
+            kind: InferenceKind::Compaction,
+            turn_id: metric_turn_id,
+            round: session.compactions.len() as u64,
+            started_at_ms,
+            duration_ms: duration_ms(started.elapsed()),
+            estimated_input_tokens: input_bytes.div_ceil(4),
+            input_bytes,
+            output_bytes,
+            tool_call_count: 0,
+            retry_count,
+            usage,
+            response_id,
+            error,
+        });
+        let output = result.map_err(|error| error.message)?;
         let summary = output.text.trim().to_owned();
         if summary.is_empty() {
             return Err("provider returned an empty compaction summary".to_owned());
@@ -446,76 +622,251 @@ impl AgentRuntime {
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: &CancellationToken,
     ) -> Result<(), String> {
-        for tool_call in tool_calls {
-            let item_id = format!("{turn_id}:tool:{}", tool_call.id);
-            let Some(tool) = self.tools.find(&tool_call.name) else {
-                session.history.push(ConversationItem::ToolResult {
-                    call_id: tool_call.id,
-                    title: Some(format!("{} · unavailable", tool_call.name)),
-                    output: format!("unknown tool {}", tool_call.name),
-                    failed: true,
-                });
-                continue;
-            };
-            let title = format!(
-                "{} · {}",
-                tool_call.name,
-                tool.summarize(&tool_call.arguments)
-            );
-            backend_events
-                .send(BackendEvent::ItemStarted {
-                    turn_id: turn_id.to_owned(),
-                    item: NormalizedItem {
-                        id: item_id.clone(),
-                        kind: ItemKind::Tool,
-                        title: title.clone(),
-                        body: String::new(),
-                        status: ItemStatus::Running,
-                    },
-                })
-                .await
-                .map_err(|_| "backend event receiver closed".to_owned())?;
-            let result = tool
-                .execute(
-                    crate::tools::ToolContext {
-                        workspace: &self.workspace,
+        let mut pending = tool_calls.into_iter().peekable();
+        while let Some(tool_call) = pending.next() {
+            let is_read_only = self
+                .tools
+                .find(&tool_call.name)
+                .is_some_and(|tool| tool.concurrency() == ToolConcurrency::ReadOnly);
+            if !is_read_only {
+                let executed = self
+                    .execute_exclusive_tool(
                         session,
-                        backend_events,
                         turn_id,
-                        questions: &self.questions,
-                    },
-                    tool_call.arguments,
-                    cancellation,
-                )
-                .await;
-            let body = result.output;
-            let failed = result.failed;
-            backend_events
-                .send(BackendEvent::ItemCompleted {
-                    turn_id: turn_id.to_owned(),
-                    item: NormalizedItem {
-                        id: item_id,
-                        kind: ItemKind::Tool,
-                        title: title.clone(),
-                        body: body.clone(),
-                        status: if failed {
-                            ItemStatus::Failed
-                        } else {
-                            ItemStatus::Complete
-                        },
-                    },
-                })
-                .await
-                .map_err(|_| "backend event receiver closed".to_owned())?;
-            session.history.push(ConversationItem::ToolResult {
-                call_id: tool_call.id,
-                title: Some(title),
-                output: body,
-                failed,
-            });
+                        tool_call,
+                        backend_events,
+                        cancellation,
+                    )
+                    .await?;
+                record_tool_result(session, executed, turn_id, backend_events).await?;
+                continue;
+            }
+
+            let mut batch = vec![tool_call];
+            while pending.peek().is_some_and(|call| {
+                self.tools
+                    .find(&call.name)
+                    .is_some_and(|tool| tool.concurrency() == ToolConcurrency::ReadOnly)
+            }) {
+                batch.push(pending.next().expect("peeked read-only tool call"));
+            }
+            let executions = futures_util::future::join_all(batch.into_iter().map(|call| {
+                self.execute_read_only_tool(turn_id, call, backend_events, cancellation)
+            }))
+            .await;
+            for executed in executions {
+                record_tool_result(session, executed?, turn_id, backend_events).await?;
+            }
         }
         Ok(())
     }
+
+    async fn execute_exclusive_tool(
+        &self,
+        session: &mut RuntimeSession,
+        turn_id: &str,
+        tool_call: ToolCall,
+        backend_events: &mpsc::Sender<BackendEvent>,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutedTool, String> {
+        let Some(tool) = self.tools.find(&tool_call.name).cloned() else {
+            return Ok(ExecutedTool::unavailable(turn_id, &tool_call));
+        };
+        let title = tool_title(&tool_call, tool.as_ref());
+        send_tool_started(turn_id, &tool_call.id, &title, backend_events).await?;
+        let started_at_ms = unix_time_ms();
+        let started = Instant::now();
+        let result = tool
+            .execute(
+                crate::tools::ToolContext {
+                    workspace: &self.workspace,
+                    session,
+                    backend_events,
+                    turn_id,
+                    questions: &self.questions,
+                },
+                tool_call.arguments,
+                cancellation,
+            )
+            .await;
+        Ok(ExecutedTool::new(
+            tool_call.id,
+            tool_call.name,
+            title,
+            result.output,
+            result.failed,
+            started_at_ms,
+            duration_ms(started.elapsed()),
+        ))
+    }
+
+    async fn execute_read_only_tool(
+        &self,
+        turn_id: &str,
+        tool_call: ToolCall,
+        backend_events: &mpsc::Sender<BackendEvent>,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutedTool, String> {
+        let tool = self
+            .tools
+            .find(&tool_call.name)
+            .cloned()
+            .expect("read-only calls were checked before batching");
+        let title = tool_title(&tool_call, tool.as_ref());
+        send_tool_started(turn_id, &tool_call.id, &title, backend_events).await?;
+        let started_at_ms = unix_time_ms();
+        let started = Instant::now();
+        let mut isolated_session = RuntimeSession::new(String::new(), String::new());
+        let result = tool
+            .execute(
+                crate::tools::ToolContext {
+                    workspace: &self.workspace,
+                    session: &mut isolated_session,
+                    backend_events,
+                    turn_id,
+                    questions: &self.questions,
+                },
+                tool_call.arguments,
+                cancellation,
+            )
+            .await;
+        Ok(ExecutedTool::new(
+            tool_call.id,
+            tool_call.name,
+            title,
+            result.output,
+            result.failed,
+            started_at_ms,
+            duration_ms(started.elapsed()),
+        ))
+    }
+}
+
+struct ExecutedTool {
+    call_id: String,
+    name: String,
+    item_id: String,
+    title: String,
+    output: String,
+    model_output: String,
+    failed: bool,
+    started_at_ms: u64,
+    duration_ms: u64,
+}
+
+impl ExecutedTool {
+    fn new(
+        call_id: String,
+        name: String,
+        title: String,
+        output: String,
+        failed: bool,
+        started_at_ms: u64,
+        duration_ms: u64,
+    ) -> Self {
+        let model_output = model_facing_output(&output);
+        Self {
+            item_id: String::new(),
+            call_id,
+            name,
+            title,
+            output,
+            model_output,
+            failed,
+            started_at_ms,
+            duration_ms,
+        }
+    }
+
+    fn unavailable(turn_id: &str, tool_call: &ToolCall) -> Self {
+        let output = format!("unknown tool {}", tool_call.name);
+        let mut executed = Self::new(
+            tool_call.id.clone(),
+            tool_call.name.clone(),
+            format!("{} · unavailable", tool_call.name),
+            output,
+            true,
+            unix_time_ms(),
+            0,
+        );
+        executed.item_id = format!("{turn_id}:tool:{}", tool_call.id);
+        executed
+    }
+}
+
+fn tool_title(tool_call: &ToolCall, tool: &dyn crate::tools::Tool) -> String {
+    format!(
+        "{} · {}",
+        tool_call.name,
+        tool.summarize(&tool_call.arguments)
+    )
+}
+
+async fn send_tool_started(
+    turn_id: &str,
+    call_id: &str,
+    title: &str,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), String> {
+    events
+        .send(BackendEvent::ItemStarted {
+            turn_id: turn_id.to_owned(),
+            item: NormalizedItem {
+                id: format!("{turn_id}:tool:{call_id}"),
+                kind: ItemKind::Tool,
+                title: title.to_owned(),
+                body: String::new(),
+                status: ItemStatus::Running,
+            },
+        })
+        .await
+        .map_err(|_| "backend event receiver closed".to_owned())
+}
+
+async fn record_tool_result(
+    session: &mut RuntimeSession,
+    mut executed: ExecutedTool,
+    turn_id: &str,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), String> {
+    if executed.item_id.is_empty() {
+        executed.item_id = format!("{turn_id}:tool:{}", executed.call_id);
+    }
+    events
+        .send(BackendEvent::ItemCompleted {
+            turn_id: turn_id.to_owned(),
+            item: NormalizedItem {
+                id: executed.item_id,
+                kind: ItemKind::Tool,
+                title: executed.title.clone(),
+                body: executed.output.clone(),
+                status: if executed.failed {
+                    ItemStatus::Failed
+                } else {
+                    ItemStatus::Complete
+                },
+            },
+        })
+        .await
+        .map_err(|_| "backend event receiver closed".to_owned())?;
+    session.telemetry.tools.push(ToolMetric {
+        turn_id: turn_id.to_owned(),
+        call_id: executed.call_id.clone(),
+        name: executed.name,
+        started_at_ms: executed.started_at_ms,
+        duration_ms: executed.duration_ms,
+        output_bytes: executed.output.len(),
+        model_output_bytes: executed.model_output.len(),
+        failed: executed.failed,
+    });
+    session.history.push(ConversationItem::ToolResult {
+        call_id: executed.call_id,
+        title: Some(executed.title),
+        output: executed.output,
+        model_output: Some(executed.model_output),
+        failed: executed.failed,
+    });
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -524,13 +875,16 @@ pub struct RuntimeSession {
     pub model: String,
     pub instructions: String,
     pub history: Vec<ConversationItem>,
-    pub last_response_id: Option<String>,
     #[serde(default)]
     pub context_window: Option<usize>,
     #[serde(default)]
     pub compactions: Vec<RuntimeCompaction>,
     #[serde(default)]
     pub todos: Vec<TodoPhase>,
+    #[serde(default)]
+    pub telemetry: RuntimeTelemetry,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 impl RuntimeSession {
@@ -541,10 +895,11 @@ impl RuntimeSession {
             model,
             instructions,
             history: Vec::new(),
-            last_response_id: None,
             context_window: None,
             compactions: Vec::new(),
             todos: Vec::new(),
+            telemetry: RuntimeTelemetry::default(),
+            reasoning_effort: None,
         }
     }
 
@@ -555,8 +910,19 @@ impl RuntimeSession {
     }
 
     #[must_use]
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    #[must_use]
     pub fn estimated_context_tokens(&self) -> usize {
-        estimate_history_tokens(&self.history).saturating_add(self.instructions.len().div_ceil(4))
+        self.estimated_context_bytes().div_ceil(4)
+    }
+
+    #[must_use]
+    pub fn estimated_context_bytes(&self) -> usize {
+        estimate_history_bytes(&self.history).saturating_add(self.instructions.len())
     }
 
     fn should_compact(&self, threshold_percent: usize) -> bool {
@@ -564,6 +930,13 @@ impl RuntimeSession {
             let percentage_threshold = context_window.saturating_mul(threshold_percent) / 100;
             let reserve_threshold = context_window.saturating_sub(COMPACTION_RESERVE_TOKENS);
             self.estimated_context_tokens() > percentage_threshold.min(reserve_threshold)
+        })
+    }
+
+    fn exceeds_safe_request_budget(&self) -> bool {
+        self.context_window.is_some_and(|context_window| {
+            self.estimated_context_tokens()
+                > context_window.saturating_sub(COMPACTION_RESERVE_TOKENS)
         })
     }
 
@@ -774,12 +1147,55 @@ async fn send_context_usage(
         .map_err(|_| "backend event receiver closed".to_owned())
 }
 
-fn estimate_history_tokens(history: &[ConversationItem]) -> usize {
-    history.iter().map(estimate_item_tokens).sum()
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn inference_output_bytes(output: &InferenceOutput) -> usize {
+    output.text.len()
+        + output.reasoning.len()
+        + output
+            .tool_calls
+            .iter()
+            .map(|call| call.name.len() + call.arguments.to_string().len())
+            .sum::<usize>()
+        + output
+            .provider_state
+            .iter()
+            .map(|state| state.to_string().len())
+            .sum::<usize>()
+}
+
+fn truncate_telemetry_error(error: &str) -> String {
+    const MAX_ERROR_CHARS: usize = 1_000;
+    if error.chars().count() <= MAX_ERROR_CHARS {
+        return error.to_owned();
+    }
+    format!(
+        "{}… [truncated]",
+        error.chars().take(MAX_ERROR_CHARS).collect::<String>()
+    )
+}
+
+fn estimate_history_bytes(history: &[ConversationItem]) -> usize {
+    history.iter().map(estimate_item_bytes).sum()
 }
 
 fn estimate_item_tokens(item: &ConversationItem) -> usize {
-    let chars = match item {
+    estimate_item_bytes(item).div_ceil(4)
+}
+
+fn estimate_item_bytes(item: &ConversationItem) -> usize {
+    match item {
         ConversationItem::User { text } => text.len(),
         ConversationItem::Assistant {
             text,
@@ -799,11 +1215,14 @@ fn estimate_item_tokens(item: &ConversationItem) -> usize {
                     .map(|state| state.to_string().len())
                     .sum::<usize>()
         }
-        ConversationItem::ToolResult { output, .. } => output.len(),
+        ConversationItem::ToolResult {
+            output,
+            model_output,
+            ..
+        } => model_output.as_deref().unwrap_or(output).len(),
         ConversationItem::Compaction { summary } => summary.len(),
         ConversationItem::CompactionEvent { .. } => 0,
-    };
-    chars.div_ceil(4)
+    }
 }
 
 fn compaction_cut_index(history: &[ConversationItem]) -> Option<usize> {
@@ -832,7 +1251,9 @@ fn compaction_cut_index(history: &[ConversationItem]) -> Option<usize> {
             return valid_cut_points
                 .iter()
                 .copied()
-                .find(|candidate| *candidate >= index);
+                .rev()
+                .find(|candidate| *candidate <= index)
+                .or_else(|| valid_cut_points.first().copied());
         }
     }
     valid_cut_points.first().copied()
@@ -867,10 +1288,15 @@ fn serialize_compaction_history(history: &[ConversationItem]) -> String {
                     calls
                 )
             }
-            ConversationItem::ToolResult { title, output, .. } => format!(
+            ConversationItem::ToolResult {
+                title,
+                output,
+                model_output,
+                ..
+            } => format!(
                 "[Tool result: {}]: {}",
                 title.as_deref().unwrap_or("tool"),
-                truncate_for_compaction(output)
+                truncate_for_compaction(model_output.as_deref().unwrap_or(output))
             ),
             ConversationItem::Compaction { summary } => {
                 format!("[Previous context checkpoint]: {summary}")
@@ -1010,6 +1436,10 @@ mod tests {
         BackendEvent, CompactionReason, ItemKind, QuestionOption, QuestionRequest,
     };
     use crate::session::SqliteSessionRepository;
+    use crate::tools::{
+        Tool, ToolConcurrency, ToolContext, ToolFuture as RuntimeToolFuture, ToolRegistry,
+        ToolResult,
+    };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -1026,6 +1456,105 @@ mod tests {
         requests: Mutex<Vec<InferenceRequest>>,
         normal_calls: AtomicUsize,
         overflow_once: bool,
+    }
+
+    struct BatchedProvider {
+        calls: AtomicUsize,
+    }
+
+    struct ParallelProbeTool {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    struct FailedCompactionProvider {
+        requests: AtomicUsize,
+    }
+
+    impl Tool for ParallelProbeTool {
+        fn definition(&self) -> super::ToolDefinition {
+            super::ToolDefinition {
+                name: "parallel_probe",
+                description: "Test read-only concurrency.",
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        fn summarize(&self, _arguments: &serde_json::Value) -> String {
+            "probe".to_owned()
+        }
+
+        fn concurrency(&self) -> ToolConcurrency {
+            ToolConcurrency::ReadOnly
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _context: ToolContext<'a>,
+            _arguments: serde_json::Value,
+            _cancellation: &'a CancellationToken,
+        ) -> RuntimeToolFuture<'a> {
+            Box::pin(async move {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                ToolResult::success("ok")
+            })
+        }
+    }
+
+    impl InferenceProvider for BatchedProvider {
+        fn infer(
+            &self,
+            _request: InferenceRequest,
+            _events: mpsc::Sender<InferenceEvent>,
+            _cancellation: CancellationToken,
+        ) -> InferenceFuture<'_> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(if call == 0 {
+                    InferenceOutput {
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "probe-1".to_owned(),
+                                name: "parallel_probe".to_owned(),
+                                arguments: json!({}),
+                            },
+                            ToolCall {
+                                id: "probe-2".to_owned(),
+                                name: "parallel_probe".to_owned(),
+                                arguments: json!({}),
+                            },
+                        ],
+                        ..InferenceOutput::default()
+                    }
+                } else {
+                    InferenceOutput {
+                        text: "done".to_owned(),
+                        ..InferenceOutput::default()
+                    }
+                })
+            })
+        }
+    }
+
+    impl InferenceProvider for FailedCompactionProvider {
+        fn infer(
+            &self,
+            request: InferenceRequest,
+            _events: mpsc::Sender<InferenceEvent>,
+            _cancellation: CancellationToken,
+        ) -> InferenceFuture<'_> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if request.tools.is_empty() {
+                    Err("compaction service unavailable".into())
+                } else {
+                    panic!("normal inference must not run above the safe request budget")
+                }
+            })
+        }
     }
 
     impl CompactionProvider {
@@ -1133,6 +1662,48 @@ mod tests {
             context_updates.last(),
             Some(&(session.estimated_context_tokens(), None))
         );
+        assert_eq!(session.telemetry.inference.len(), 2);
+        assert_eq!(session.telemetry.tools.len(), 1);
+        assert_eq!(session.telemetry.inference[0].tool_call_count, 1);
+        assert_eq!(session.telemetry.tools[0].name, "todo");
+    }
+
+    #[tokio::test]
+    async fn independent_read_only_tool_calls_execute_concurrently_and_stay_ordered() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(BatchedProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let probe = Arc::new(ParallelProbeTool {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let tools = ToolRegistry::testing(vec![probe.clone()]);
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider).with_tools(tools);
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        let (events, _receiver) = mpsc::channel(32);
+
+        runtime
+            .run_turn(
+                &mut session,
+                "turn-batch",
+                "Inspect both inputs.".to_owned(),
+                &events,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("batched turn");
+
+        assert_eq!(probe.max_active.load(Ordering::SeqCst), 2);
+        let call_ids = session
+            .history
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids, ["probe-1", "probe-2"]);
     }
 
     impl InferenceProvider for CompactionProvider {
@@ -1157,7 +1728,7 @@ mod tests {
                         ..InferenceOutput::default()
                     })
                 } else if self.overflow_once && normal_call == 0 {
-                    Err("context_length_exceeded: input exceeds the context window".to_owned())
+                    Err("context_length_exceeded: input exceeds the context window".into())
                 } else {
                     Ok(InferenceOutput {
                         text: "finished".to_owned(),
@@ -1299,6 +1870,85 @@ mod tests {
                 ..
             } if estimated_tokens_after < estimated_tokens_before
         )));
+        assert!(session.telemetry.inference.iter().any(|metric| {
+            metric.kind == super::InferenceKind::Compaction && metric.error.is_none()
+        }));
+    }
+
+    #[test]
+    fn compaction_keeps_the_assistant_call_that_owns_a_large_tool_result_tail() {
+        let history = vec![
+            ConversationItem::User {
+                text: "inspect".to_owned(),
+            },
+            ConversationItem::Assistant {
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "large-read".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({"path": "large.txt"}),
+                }],
+                signature: None,
+                provider_state: Vec::new(),
+            },
+            ConversationItem::ToolResult {
+                call_id: "large-read".to_owned(),
+                title: Some("read · large.txt".to_owned()),
+                output: "x".repeat(128 * 1024),
+                model_output: Some("x".repeat(32 * 1024)),
+                failed: false,
+            },
+        ];
+
+        assert_eq!(super::compaction_cut_index(&history), Some(1));
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_never_proceeds_above_the_safe_request_budget() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(FailedCompactionProvider {
+            requests: AtomicUsize::new(0),
+        });
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider.clone());
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned())
+            .with_context_window(Some(50_000));
+        session.history = vec![
+            ConversationItem::User {
+                text: "old request ".repeat(3_500),
+            },
+            ConversationItem::Assistant {
+                text: "old answer ".repeat(3_500),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                signature: None,
+                provider_state: Vec::new(),
+            },
+            ConversationItem::User {
+                text: "recent context ".repeat(500),
+            },
+        ];
+        assert!(session.estimated_context_tokens() < 42_500);
+        assert!(session.should_compact(super::DEFAULT_COMPACTION_THRESHOLD_PERCENT));
+        assert!(session.exceeds_safe_request_budget());
+        let (events, _receiver) = mpsc::channel(32);
+
+        let error = runtime
+            .run_turn(
+                &mut session,
+                "turn-no-overflow",
+                "continue".to_owned(),
+                &events,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unsafe inference is rejected");
+
+        assert!(error.contains("context compaction is required before inference"));
+        assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+        assert!(session.telemetry.inference.iter().any(|metric| {
+            metric.kind == super::InferenceKind::Compaction && metric.error.is_some()
+        }));
     }
 
     #[tokio::test]
@@ -1422,12 +2072,39 @@ mod tests {
     }
 
     #[test]
+    fn full_tool_output_is_visible_but_only_the_bounded_projection_counts_as_context() {
+        let mut session = RuntimeSession::new("test-model".to_owned(), String::new());
+        session.history.push(ConversationItem::ToolResult {
+            call_id: "call-1".to_owned(),
+            title: Some("read · large.txt".to_owned()),
+            output: "full".repeat(30_000),
+            model_output: Some("bounded".repeat(1_000)),
+            failed: false,
+        });
+
+        let history = session.normalized_history();
+        assert_eq!(history[0].item.body.len(), 120_000);
+        assert_eq!(session.estimated_context_tokens(), 1_750);
+    }
+
+    #[test]
     fn native_sessions_survive_provider_restarts() {
         let directory = tempfile::tempdir().expect("session directory");
         let database = directory.path().join("sessions.sqlite3");
         let _repository = SqliteSessionRepository::open(&database).expect("session repository");
         let store = RuntimeSessionStore::new(database, "test-provider");
-        let mut session = RuntimeSession::new("test-model".to_owned(), "Be concise.".to_owned());
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Be concise.".to_owned())
+            .with_reasoning_effort(Some("low".to_owned()));
+        session.telemetry.tools.push(super::ToolMetric {
+            turn_id: "turn-1".to_owned(),
+            call_id: "call-1".to_owned(),
+            name: "read".to_owned(),
+            started_at_ms: 10,
+            duration_ms: 20,
+            output_bytes: 40_000,
+            model_output_bytes: 32_000,
+            failed: false,
+        });
         session.history.push(ConversationItem::CompactionEvent {
             id: "compaction-1".to_owned(),
             turn_id: "turn-1".to_owned(),
@@ -1445,6 +2122,9 @@ mod tests {
 
         assert_eq!(restored.id, session.id);
         assert_eq!(restored.model, "test-model");
+        assert_eq!(restored.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(restored.telemetry.tools.len(), 1);
+        assert_eq!(restored.telemetry.tools[0].output_bytes, 40_000);
         let history = restored.normalized_history();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].item.id, "compaction-1");

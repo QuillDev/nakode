@@ -92,15 +92,21 @@ async fn edit_file(
         let replace_all = edit.get("all").and_then(Value::as_bool).unwrap_or(false);
         let occurrences = contents.matches(old_text).count();
         if occurrences == 0 {
+            let hint = edit_match_hint(&contents, old_text);
             return Err(format!(
-                "edit {} did not find its old_text in {}",
+                "edit {} did not find its old_text in {}{hint}",
                 index + 1,
                 path.display()
             ));
         }
         if occurrences > 1 && !replace_all {
+            let lines = exact_match_lines(&contents, old_text)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(format!(
-                "edit {} matched {occurrences} locations in {}; add more context or set all=true",
+                "edit {} matched {occurrences} locations in {} at lines {lines}; add more context or set all=true",
                 index + 1,
                 path.display()
             ));
@@ -120,4 +126,59 @@ async fn edit_file(
         edits.len(),
         path.display()
     ))
+}
+
+fn exact_match_lines(contents: &str, old_text: &str) -> Vec<usize> {
+    contents
+        .match_indices(old_text)
+        .take(8)
+        .map(|(byte_index, _)| {
+            contents[..byte_index]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1
+        })
+        .collect()
+}
+
+fn edit_match_hint(contents: &str, old_text: &str) -> String {
+    let Some(anchor) = old_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+    else {
+        return "; old_text is empty after trimming".to_owned();
+    };
+    let lines = contents
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(anchor))
+        .take(8)
+        .map(|(index, _)| index + 1)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        "; re-read the surrounding range before retrying".to_owned()
+    } else {
+        format!("; the first old_text line appears near lines {lines:?}; re-read those ranges")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{edit_match_hint, exact_match_lines};
+
+    #[test]
+    fn duplicate_matches_report_their_source_lines() {
+        let contents = "same\nother\nsame\n";
+        assert_eq!(exact_match_lines(contents, "same"), [1, 3]);
+    }
+
+    #[test]
+    fn near_match_hint_points_to_the_anchor_line() {
+        let contents = "alpha\nbeta changed\ngamma\n";
+        let hint = edit_match_hint(contents, "beta changed\nmissing tail");
+        assert!(hint.contains("lines [2]"));
+        assert!(hint.contains("re-read"));
+    }
 }

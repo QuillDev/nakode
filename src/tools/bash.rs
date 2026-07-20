@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::OsString, io::Read, time::Duration};
+use std::{borrow::Cow, collections::HashMap, ffi::OsString, io::Read, time::Duration};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Tool, ToolContext, ToolFuture, ToolResult, optional_u64,
+    Tool, ToolContext, ToolFuture, ToolResult,
+    hypa::{RewriteDecision, rewrite_command},
+    optional_u64,
     process::{ProcessRequest, ProcessResult, run_process},
     required_string, resolve_workspace_path,
 };
@@ -18,7 +20,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash",
-            description: "Run a command or short pipeline with merged output. Use cwd instead of cd, env for values needing shell escaping, and pty only for real terminal semantics. Use grep/glob/read instead of shell search or directory listing.",
+            description: "Run a command or short pipeline with merged output. When Hypa is installed, eligible non-PTY commands are automatically rewritten for deterministic output compression. Use cwd instead of cd, env for values needing shell escaping, and pty only for real terminal semantics. Use grep/glob/read instead of shell search or directory listing.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -65,7 +67,7 @@ async fn run_shell(
     arguments: &Value,
     cancellation: &CancellationToken,
 ) -> Result<ToolResult, String> {
-    let command = required_string(arguments, "command")?;
+    let requested_command = required_string(arguments, "command")?;
     let requested_timeout = optional_u64(arguments, "timeout", 120)?.min(3_600);
     let timeout = (requested_timeout > 0).then(|| Duration::from_secs(requested_timeout));
     let run_directory = arguments.get("cwd").and_then(Value::as_str).map_or_else(
@@ -77,7 +79,26 @@ async fn run_shell(
         .get("pty")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (program, shell_arguments) = shell_command(command);
+    let command = if use_pty {
+        Cow::Borrowed(requested_command)
+    } else {
+        match rewrite_command(
+            &run_directory,
+            requested_command,
+            &environment,
+            cancellation,
+        )
+        .await
+        {
+            RewriteDecision::Command(command) => Cow::Owned(command),
+            RewriteDecision::Passthrough => Cow::Borrowed(requested_command),
+            RewriteDecision::Blocked(reason) => return Ok(ToolResult::failure(reason)),
+            RewriteDecision::Interrupted => {
+                return Ok(ToolResult::failure("command interrupted"));
+            }
+        }
+    };
+    let (program, shell_arguments) = shell_command(&command);
     let result = if use_pty {
         run_pty_process(
             program,

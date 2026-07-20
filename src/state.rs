@@ -3038,7 +3038,14 @@ impl AppState {
             }
         }
 
-        self.drain_queue()
+        let mut effects = self
+            .session_id
+            .clone()
+            .map(Effect::TouchSession)
+            .into_iter()
+            .collect::<Vec<_>>();
+        effects.extend(self.drain_queue());
+        effects
     }
 
     fn drain_queue(&mut self) -> Vec<Effect> {
@@ -4575,7 +4582,10 @@ model = "openai-codex/model-a"
             error: None,
         });
         assert_eq!(state.queue.len(), 1);
-        assert!(matches!(effects.as_slice(), [Effect::Backend(_)]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::TouchSession(id), Effect::Backend(_)] if id == "nakode-session-1"
+        ));
     }
 
     #[test]
@@ -4676,6 +4686,7 @@ model = "openai-codex/model-a"
     fn backend_prompt_failure_completion_clears_active_turn() {
         let mut state = ready_state();
         state.provider_session_id = Some("session-1".to_owned());
+        state.session_id = Some("nakode-session-1".to_owned());
         state.editor.set_text("fail prompt");
         state.submit_editor();
         state.handle_backend(BackendEvent::TurnAccepted {
@@ -4686,7 +4697,7 @@ model = "openai-codex/model-a"
             code: -32602,
             message: "prompt failed".to_owned(),
         });
-        state.handle_backend(BackendEvent::TurnCompleted {
+        let effects = state.handle_backend(BackendEvent::TurnCompleted {
             turn_id: "turn-failed".to_owned(),
             outcome: TurnOutcome::Failed,
             error: Some("prompt failed".to_owned()),
@@ -4694,6 +4705,10 @@ model = "openai-codex/model-a"
 
         assert!(!state.is_busy());
         assert_eq!(state.status_message, "prompt failed");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::TouchSession(id)] if id == "nakode-session-1"
+        ));
     }
 
     #[test]
@@ -4759,7 +4774,10 @@ model = "openai-codex/model-a"
             outcome: TurnOutcome::Completed,
             error: None,
         });
-        assert!(matches!(effects.as_slice(), [Effect::Backend(_)]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::TouchSession(id), Effect::Backend(_)] if id == "nakode-session-1"
+        ));
     }
 
     #[test]

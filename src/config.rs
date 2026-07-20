@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 
 /// Command-line and environment configuration for Nakode.
@@ -38,9 +38,43 @@ pub struct Config {
     )]
     pub compaction_threshold_percent: u8,
 
+    /// Reasoning effort requested from `OpenAI` models.
+    #[arg(
+        long,
+        env = "NAKODE_OPENAI_REASONING_EFFORT",
+        value_enum,
+        default_value_t = OpenAiReasoningEffort::Medium
+    )]
+    pub openai_reasoning_effort: OpenAiReasoningEffort,
+
     /// Directory containing predefined TOML agent definitions.
     #[arg(long, env = "NAKODE_AGENTS", default_value = ".nakode/agents")]
     pub agents: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum OpenAiReasoningEffort {
+    None,
+    Low,
+    #[default]
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl OpenAiReasoningEffort {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -53,6 +87,19 @@ pub enum NakodeCommand {
         #[arg(long, default_value = "Complete your predefined assignment.")]
         task: String,
     },
+    /// Manage the shared user-level control service.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum ServiceAction {
+    /// Run the control service in the foreground.
+    Run,
+    /// Stop the running control service. Active TUIs reconnect automatically.
+    Shutdown,
 }
 
 #[derive(Debug, Error)]
@@ -175,7 +222,7 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ConfigError> {
 mod tests {
     use clap::Parser;
 
-    use super::{Config, NakodeCommand};
+    use super::{Config, NakodeCommand, OpenAiReasoningEffort, ServiceAction};
 
     #[test]
     fn backend_flag_is_not_part_of_the_cli() {
@@ -194,6 +241,21 @@ mod tests {
         assert!(Config::try_parse_from(["nakode", "--compaction-threshold-percent", "0"]).is_err());
         assert!(
             Config::try_parse_from(["nakode", "--compaction-threshold-percent", "101"]).is_err()
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_effort_defaults_to_medium_and_accepts_explicit_levels() {
+        let default = Config::try_parse_from(["nakode"]).expect("default config");
+        assert_eq!(
+            default.openai_reasoning_effort,
+            OpenAiReasoningEffort::Medium
+        );
+        let low = Config::try_parse_from(["nakode", "--openai-reasoning-effort", "low"])
+            .expect("low effort");
+        assert_eq!(low.openai_reasoning_effort, OpenAiReasoningEffort::Low);
+        assert!(
+            Config::try_parse_from(["nakode", "--openai-reasoning-effort", "extreme"]).is_err()
         );
     }
 
@@ -225,6 +287,7 @@ mod tests {
         .expect("CLI parse")
         .validated()
         .expect("validated config");
+        let legacy = legacy.canonicalize().expect("canonical legacy directory");
 
         assert_eq!(config.agents, legacy);
     }
@@ -249,5 +312,24 @@ mod tests {
             }) if agent_slug == "reviewer" && session_id == "session-7" && task == "Review auth"
         ));
         assert!(Config::try_parse_from(["nakode", "agent", "explorer"]).is_err());
+    }
+
+    #[test]
+    fn service_commands_parse_explicit_actions() {
+        let run = Config::try_parse_from(["nakode", "service", "run"]).expect("service run");
+        assert!(matches!(
+            run.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Run
+            })
+        ));
+        let shutdown =
+            Config::try_parse_from(["nakode", "service", "shutdown"]).expect("service shutdown");
+        assert!(matches!(
+            shutdown.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Shutdown
+            })
+        ));
     }
 }

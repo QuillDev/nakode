@@ -6,7 +6,9 @@ use regex::RegexBuilder;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{Tool, ToolContext, ToolFuture, ToolResult, required_string, truncate_output};
+use super::{
+    Tool, ToolConcurrency, ToolContext, ToolFuture, ToolResult, required_string, truncate_output,
+};
 use crate::runtime::ToolDefinition;
 
 pub struct GrepTool;
@@ -37,6 +39,10 @@ impl Tool for GrepTool {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned()
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ReadOnly
     }
 
     fn execute<'a>(

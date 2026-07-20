@@ -4,6 +4,7 @@ mod edit;
 mod eval;
 mod glob;
 mod grep;
+mod hypa;
 mod process;
 mod read;
 mod todo;
@@ -20,7 +21,14 @@ use crate::{
     runtime::{QuestionBroker, RuntimeSession, ToolDefinition},
 };
 
-pub const MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
+pub const MAX_MODEL_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolConcurrency {
+    ReadOnly,
+    Exclusive,
+}
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
 
@@ -59,6 +67,9 @@ impl ToolResult {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     fn summarize(&self, arguments: &Value) -> String;
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
     fn execute<'a>(
         &'a self,
         context: ToolContext<'a>,
@@ -100,6 +111,11 @@ impl ToolRegistry {
         self.tools
             .iter()
             .find(|tool| tool.definition().name == name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing(tools: Vec<Arc<dyn Tool>>) -> Self {
+        Self { tools }
     }
 }
 
@@ -170,13 +186,46 @@ pub fn truncate_output(mut bytes: Vec<u8>) -> String {
     output
 }
 
+#[must_use]
+pub fn model_facing_output(output: &str) -> String {
+    if output.len() <= MAX_MODEL_TOOL_OUTPUT_BYTES {
+        return output.to_owned();
+    }
+    let notice = format!(
+        "\n[model context truncated; full {}-byte output remains in the transcript]\n",
+        output.len()
+    );
+    let content_budget = MAX_MODEL_TOOL_OUTPUT_BYTES.saturating_sub(notice.len());
+    let tail_bytes = content_budget / 4;
+    let head_end = floor_char_boundary(output, content_budget - tail_bytes);
+    let tail_start = ceil_char_boundary(output, output.len() - tail_bytes);
+    format!("{}{}{}", &output[..head_end], notice, &output[tail_start..])
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    while !value.is_char_boundary(index) {
+        index = index.saturating_sub(1);
+    }
+    index
+}
+
+fn ceil_char_boundary(value: &str, mut index: usize) -> usize {
+    while !value.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    use super::{ToolContext, ToolRegistry, ToolResult, resolve_workspace_path};
+    use super::{
+        MAX_MODEL_TOOL_OUTPUT_BYTES, ToolContext, ToolRegistry, ToolResult, model_facing_output,
+        resolve_workspace_path,
+    };
     use crate::runtime::{QuestionBroker, RuntimeSession};
 
     #[test]
@@ -242,6 +291,18 @@ mod tests {
             resolve_workspace_path(root, "/etc/passwd").expect("absolute path"),
             std::path::PathBuf::from("/etc/passwd")
         );
+    }
+
+    #[test]
+    fn model_output_keeps_bounded_head_and_tail_while_the_transcript_stays_full() {
+        let output = format!("HEAD{}TAIL", "x".repeat(MAX_MODEL_TOOL_OUTPUT_BYTES * 2));
+        let model_output = model_facing_output(&output);
+
+        assert!(model_output.len() <= MAX_MODEL_TOOL_OUTPUT_BYTES);
+        assert!(model_output.len() < output.len());
+        assert!(model_output.starts_with("HEAD"));
+        assert!(model_output.ends_with("TAIL"));
+        assert!(model_output.contains("full 65544-byte output remains in the transcript"));
     }
 
     #[tokio::test]
@@ -329,6 +390,97 @@ mod tests {
             .await;
         assert!(!pty.failed, "{}", pty.output);
         assert!(pty.output.contains("pty-ok"), "{}", pty.output);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_automatically_uses_hypa_when_it_is_on_path() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = install_fake_hypa(
+            directory.path(),
+            "#!/bin/sh\nprintf '%s' '{\"outcome\":\"GenericWrapper\",\"command\":\"printf hypa-rewritten\"}'\n",
+        );
+
+        let mut harness = ToolHarness {
+            registry: ToolRegistry::base(),
+            workspace: directory.path(),
+            session: RuntimeSession::new("test-model".to_owned(), String::new()),
+            events: mpsc::channel(8).0,
+            questions: QuestionBroker::default(),
+            cancellation: CancellationToken::new(),
+        };
+        let result = harness
+            .execute(
+                "bash",
+                json!({
+                    "command": "printf original",
+                    "env": {"PATH": path},
+                    "timeout": 5
+                }),
+            )
+            .await;
+
+        assert!(!result.failed, "{}", result.output);
+        assert_eq!(result.output, "hypa-rewritten");
+
+        let pty = harness
+            .execute(
+                "bash",
+                json!({
+                    "command": "printf pty-original",
+                    "env": {"PATH": path},
+                    "pty": true,
+                    "timeout": 5
+                }),
+            )
+            .await;
+        assert!(!pty.failed, "{}", pty.output);
+        assert!(pty.output.contains("pty-original"), "{}", pty.output);
+        assert!(!pty.output.contains("hypa-rewritten"), "{}", pty.output);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_falls_back_when_hypa_rewrite_fails() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = install_fake_hypa(directory.path(), "#!/bin/sh\nexit 9\n");
+        let mut harness = ToolHarness {
+            registry: ToolRegistry::base(),
+            workspace: directory.path(),
+            session: RuntimeSession::new("test-model".to_owned(), String::new()),
+            events: mpsc::channel(8).0,
+            questions: QuestionBroker::default(),
+            cancellation: CancellationToken::new(),
+        };
+        let result = harness
+            .execute(
+                "bash",
+                json!({
+                    "command": "printf original",
+                    "env": {"PATH": path},
+                    "timeout": 5
+                }),
+            )
+            .await;
+
+        assert!(!result.failed, "{}", result.output);
+        assert_eq!(result.output, "original");
+    }
+
+    #[cfg(unix)]
+    fn install_fake_hypa(workspace: &std::path::Path, contents: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin_directory = workspace.join("bin");
+        std::fs::create_dir(&bin_directory).expect("bin directory");
+        let hypa = bin_directory.join("hypa");
+        std::fs::write(&hypa, contents).expect("fake hypa");
+        let mut permissions = std::fs::metadata(&hypa)
+            .expect("fake hypa metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hypa, permissions).expect("fake hypa permissions");
+        format!("{}:/usr/bin:/bin", bin_directory.display())
     }
 
     struct ToolHarness<'a> {
