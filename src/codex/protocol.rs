@@ -126,9 +126,8 @@ pub fn normalize_notification(method: &str, params: &Value) -> Option<BackendEve
         }
         "item/agentMessage/delta" => Some(delta_event(params, DeltaKind::Assistant, "delta")),
         "item/plan/delta" => Some(delta_event(params, DeltaKind::Plan, "delta")),
-        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-            Some(delta_event(params, DeltaKind::Reasoning, "delta"))
-        }
+        "item/reasoning/summaryTextDelta" => Some(reasoning_summary_delta(params)),
+        "item/reasoning/textDelta" => Some(delta_event(params, DeltaKind::Reasoning, "delta")),
         "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
             Some(delta_event(params, DeltaKind::Tool, "delta"))
         }
@@ -420,6 +419,15 @@ fn normalize_tool_item(item_type: &str, id: String, item: &Value) -> NormalizedI
     }
 }
 
+fn reasoning_summary_delta(params: &Value) -> BackendEvent {
+    let index = params
+        .get("summaryIndex")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .unwrap_or_default();
+    delta_event(params, DeltaKind::ReasoningSummary { index }, "delta")
+}
+
 fn delta_event(params: &Value, kind: DeltaKind, field: &str) -> BackendEvent {
     BackendEvent::ItemDelta {
         turn_id: string(params, "turnId"),
@@ -592,6 +600,33 @@ mod tests {
                 delta: "hello".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn distinguishes_reasoning_summaries_from_reasoning_traces() {
+        let params = json!({
+            "turnId": "turn-1",
+            "itemId": "reasoning-1",
+            "summaryIndex": 3,
+            "delta": "Planning the implementation",
+        });
+        let summary = normalize_notification("item/reasoning/summaryTextDelta", &params);
+        let trace = normalize_notification("item/reasoning/textDelta", &params);
+
+        assert!(matches!(
+            summary,
+            Some(BackendEvent::ItemDelta {
+                kind: DeltaKind::ReasoningSummary { index: 3 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            trace,
+            Some(BackendEvent::ItemDelta {
+                kind: DeltaKind::Reasoning,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -7,6 +7,9 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::markdown::render_markdown;
 
+const RECENT_TOOL_CALL_LIMIT: usize = 5;
+pub(crate) const TOOL_HISTORY_TOGGLE_KEY: &str = "nakode:tool-history-toggle";
+
 pub use crate::markdown::{
     MarkdownModifier, MarkdownModifiers, MarkdownSpan, MarkdownStyle, MarkdownTone,
 };
@@ -89,6 +92,7 @@ pub struct Transcript {
     stream_active: bool,
     stream_label: String,
     expanded_tools: HashSet<String>,
+    show_all_tools: bool,
 }
 
 impl Transcript {
@@ -105,6 +109,7 @@ impl Transcript {
             stream_active: false,
             stream_label: "Nakode".to_owned(),
             expanded_tools: HashSet::new(),
+            show_all_tools: false,
         }
     }
 
@@ -117,6 +122,7 @@ impl Transcript {
         self.entries.clear();
         self.item_indices.clear();
         self.expanded_tools.clear();
+        self.show_all_tools = false;
         self.stream_active = false;
         self.changed();
     }
@@ -152,6 +158,20 @@ impl Transcript {
         };
         self.changed();
         Some(expanded)
+    }
+
+    pub fn toggle_tool_history(&mut self) -> Option<bool> {
+        let tool_count = self
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Tool)
+            .count();
+        if tool_count <= RECENT_TOOL_CALL_LIMIT {
+            return None;
+        }
+        self.show_all_tools = !self.show_all_tools;
+        self.changed();
+        Some(self.show_all_tools)
     }
 
     pub fn push(
@@ -312,11 +332,32 @@ impl Transcript {
             .entries
             .iter()
             .rposition(|entry| entry.kind == EntryKind::User);
+        let tool_count = self
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Tool)
+            .count();
+        let hidden_tool_count = tool_count.saturating_sub(RECENT_TOOL_CALL_LIMIT);
+        let recent_tools_start = (hidden_tool_count > 0).then(|| {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.kind == EntryKind::Tool)
+                .nth(hidden_tool_count)
+                .map(|(index, _)| index)
+                .expect("a hidden tool count implies a retained tool")
+        });
         let mut projected = Vec::new();
         let mut stream_header_shown = false;
         for (index, entry) in self.entries.iter().enumerate() {
             if entry.kind == EntryKind::User {
                 stream_header_shown = false;
+            }
+            let hidden_tool = !self.show_all_tools
+                && entry.kind == EntryKind::Tool
+                && recent_tools_start.is_some_and(|start| index < start);
+            if hidden_tool {
+                continue;
             }
             if is_agent_stream(entry) && !stream_header_shown {
                 let active =
@@ -331,6 +372,14 @@ impl Transcript {
             }
 
             let line_count = projected.len();
+            if recent_tools_start == Some(index) {
+                project_tool_history_toggle(
+                    hidden_tool_count,
+                    self.show_all_tools,
+                    width,
+                    &mut projected,
+                );
+            }
             let expanded = entry
                 .key
                 .as_ref()
@@ -374,6 +423,27 @@ impl Transcript {
         self.cache_width = width;
         self.cache_revision = self.revision;
     }
+}
+
+fn project_tool_history_toggle(
+    hidden_count: usize,
+    expanded: bool,
+    width: usize,
+    output: &mut Vec<ProjectedLine>,
+) {
+    let label = if expanded {
+        format!("▾ all tool calls shown · click to show latest {RECENT_TOOL_CALL_LIMIT}")
+    } else {
+        let noun = if hidden_count == 1 { "call" } else { "calls" };
+        format!("▸ {hidden_count} earlier tool {noun} hidden · click to show all")
+    };
+    output.push(ProjectedLine {
+        text: truncate_display(&label, width),
+        spans: Vec::new(),
+        tone: LineTone::Muted,
+        bold: false,
+        source_key: Some(TOOL_HISTORY_TOGGLE_KEY.to_owned()),
+    });
 }
 
 fn project_stream_header(
@@ -745,7 +815,10 @@ fn display_width(character: char) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryKind, EntryStatus, LineTone, MarkdownModifier, MarkdownTone, Transcript};
+    use super::{
+        EntryKind, EntryStatus, LineTone, MarkdownModifier, MarkdownTone, TOOL_HISTORY_TOGGLE_KEY,
+        Transcript,
+    };
 
     #[test]
     fn deltas_are_keyed_and_completion_replaces_stream() {
@@ -852,6 +925,62 @@ mod tests {
                 .all(|line| !line.is_empty())
         );
         assert_eq!(text.last(), Some(&"  Committed successfully."));
+    }
+
+    #[test]
+    fn only_the_five_most_recent_tool_calls_are_shown_until_expanded() {
+        let mut transcript = Transcript::new(100);
+        for index in 1..=7 {
+            transcript.upsert(
+                format!("tool-{index}"),
+                EntryKind::Tool,
+                format!("bash · command {index}"),
+                format!("output {index}"),
+                EntryStatus::Complete,
+            );
+        }
+
+        let collapsed = transcript.visible(100, 30, 0);
+        let collapsed_text = collapsed
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed_text.contains("2 earlier tool calls hidden · click to show all"));
+        assert!(!collapsed_text.contains("command 1"));
+        assert!(!collapsed_text.contains("command 2"));
+        for index in 3..=7 {
+            assert!(collapsed_text.contains(&format!("command {index}")));
+        }
+
+        assert_eq!(transcript.toggle_tool_history(), Some(true));
+        let expanded = transcript.visible(100, 30, 0);
+        let expanded_text = expanded
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded_text.contains("all tool calls shown · click to show latest 5"));
+        for index in 1..=7 {
+            assert!(expanded_text.contains(&format!("command {index}")));
+        }
+        assert!(
+            expanded
+                .lines
+                .iter()
+                .any(|line| { line.source_key.as_deref() == Some(TOOL_HISTORY_TOGGLE_KEY) })
+        );
+
+        assert_eq!(transcript.toggle_tool_history(), Some(false));
+        let collapsed_again = transcript.visible(100, 30, 0);
+        assert!(
+            collapsed_again
+                .lines
+                .iter()
+                .all(|line| !line.text.contains("command 1"))
+        );
     }
 
     #[test]

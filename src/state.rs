@@ -17,7 +17,7 @@ use crate::{
     handoff::HandoffPackage,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
     session::{ProviderRecord, SessionRecord, SubagentRecord},
-    transcript::{EntryKind, EntryStatus, Transcript},
+    transcript::{EntryKind, EntryStatus, TOOL_HISTORY_TOGGLE_KEY, Transcript},
 };
 
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
@@ -274,10 +274,81 @@ pub struct SubagentRun {
     pub latest_activity: String,
 }
 
+#[derive(Debug, Default)]
+struct ReasoningSummaryTracker {
+    turns: HashMap<String, ReasoningSummaryTurn>,
+}
+
+#[derive(Debug, Default)]
+struct ReasoningSummaryTurn {
+    latest_item: Option<String>,
+    streams: HashMap<String, ReasoningSummaryStream>,
+}
+
+#[derive(Debug)]
+struct ReasoningSummaryStream {
+    index: usize,
+    text: String,
+}
+
+struct ReasoningSummaryUpdate {
+    replaced_item: Option<String>,
+    text: String,
+}
+
+impl ReasoningSummaryTracker {
+    fn append_delta(
+        &mut self,
+        turn_id: &str,
+        item_id: &str,
+        index: usize,
+        delta: &str,
+    ) -> ReasoningSummaryUpdate {
+        let turn = self.turns.entry(turn_id.to_owned()).or_default();
+        let replaced_item = turn
+            .latest_item
+            .replace(item_id.to_owned())
+            .filter(|previous| previous != item_id);
+        let stream =
+            turn.streams
+                .entry(item_id.to_owned())
+                .or_insert_with(|| ReasoningSummaryStream {
+                    index,
+                    text: String::new(),
+                });
+        if stream.index != index {
+            stream.index = index;
+            stream.text.clear();
+        }
+        stream.text.push_str(delta);
+        ReasoningSummaryUpdate {
+            replaced_item,
+            text: latest_reasoning_summary(&stream.text).to_owned(),
+        }
+    }
+
+    fn contains(&self, turn_id: &str, item_id: &str) -> bool {
+        self.turns
+            .get(turn_id)
+            .is_some_and(|turn| turn.streams.contains_key(item_id))
+    }
+
+    fn is_superseded(&self, turn_id: &str, item_id: &str) -> bool {
+        self.turns.get(turn_id).is_some_and(|turn| {
+            turn.streams.contains_key(item_id) && turn.latest_item.as_deref() != Some(item_id)
+        })
+    }
+
+    fn remove_turn(&mut self, turn_id: &str) {
+        self.turns.remove(turn_id);
+    }
+}
+
 #[derive(Debug)]
 struct SubagentChat {
     transcript: Transcript,
     scroll_from_bottom: usize,
+    reasoning_summaries: ReasoningSummaryTracker,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -288,7 +359,7 @@ struct SubagentHitRegion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ToolOutputHitRegion {
+struct ToolToggleHitRegion {
     key: String,
     top_left: ScreenPoint,
     bottom_right: ScreenPoint,
@@ -435,6 +506,7 @@ pub struct AppState {
     resuming_session: Option<SessionRecord>,
     startup_resume: Option<String>,
     item_turns: HashMap<String, String>,
+    reasoning_summaries: ReasoningSummaryTracker,
     subagent_result_items: HashSet<String>,
     initial_model: Option<String>,
     next_local_id: u64,
@@ -445,7 +517,7 @@ pub struct AppState {
     subagent_executions: HashMap<String, SubagentExecution>,
     subagent_chats: HashMap<String, SubagentChat>,
     subagent_hit_regions: Vec<SubagentHitRegion>,
-    tool_output_hit_regions: Vec<ToolOutputHitRegion>,
+    tool_toggle_hit_regions: Vec<ToolToggleHitRegion>,
     oauth_link_hit_region: Option<OAuthLinkHitRegion>,
     transcript_limit: usize,
 }
@@ -538,6 +610,7 @@ impl AppState {
             resuming_session: None,
             startup_resume: None,
             item_turns: HashMap::new(),
+            reasoning_summaries: ReasoningSummaryTracker::default(),
             subagent_result_items: HashSet::new(),
             initial_model,
             next_local_id: 1,
@@ -548,7 +621,7 @@ impl AppState {
             subagent_executions: HashMap::new(),
             subagent_chats: HashMap::new(),
             subagent_hit_regions: Vec::new(),
-            tool_output_hit_regions: Vec::new(),
+            tool_toggle_hit_regions: Vec::new(),
             oauth_link_hit_region: None,
             transcript_limit: scrollback,
         }
@@ -744,13 +817,13 @@ impl AppState {
             .collect();
     }
 
-    pub fn set_tool_output_hit_regions(
+    pub fn set_tool_toggle_hit_regions(
         &mut self,
         regions: Vec<(String, ScreenPoint, ScreenPoint)>,
     ) {
-        self.tool_output_hit_regions = regions
+        self.tool_toggle_hit_regions = regions
             .into_iter()
-            .map(|(key, top_left, bottom_right)| ToolOutputHitRegion {
+            .map(|(key, top_left, bottom_right)| ToolToggleHitRegion {
                 key,
                 top_left,
                 bottom_right,
@@ -758,9 +831,9 @@ impl AppState {
             .collect();
     }
 
-    pub fn toggle_tool_output_at(&mut self, point: ScreenPoint) -> bool {
+    pub fn toggle_tool_at(&mut self, point: ScreenPoint) -> bool {
         let Some(key) = self
-            .tool_output_hit_regions
+            .tool_toggle_hit_regions
             .iter()
             .find(|region| {
                 point.column >= region.top_left.column
@@ -772,21 +845,29 @@ impl AppState {
         else {
             return false;
         };
-        let expanded = if let Some(run_id) = self.subagent_modal.as_deref() {
-            self.subagent_chats
-                .get_mut(run_id)
-                .and_then(|chat| chat.transcript.toggle_tool_output(&key))
+        let toggles_history = key == TOOL_HISTORY_TOGGLE_KEY;
+        let transcript = if let Some(run_id) = self.subagent_modal.as_deref() {
+            let Some(chat) = self.subagent_chats.get_mut(run_id) else {
+                return false;
+            };
+            &mut chat.transcript
         } else {
-            self.transcript.toggle_tool_output(&key)
+            &mut self.transcript
+        };
+        let expanded = if toggles_history {
+            transcript.toggle_tool_history()
+        } else {
+            transcript.toggle_tool_output(&key)
         };
         let Some(expanded) = expanded else {
             return false;
         };
         self.clear_text_selection();
-        self.set_status(if expanded {
-            "Expanded tool output."
-        } else {
-            "Collapsed tool output."
+        self.set_status(match (toggles_history, expanded) {
+            (true, true) => "Showing all tool calls.",
+            (true, false) => "Showing the latest 5 tool calls.",
+            (false, true) => "Expanded tool output.",
+            (false, false) => "Collapsed tool output.",
         });
         true
     }
@@ -960,6 +1041,7 @@ impl AppState {
                 SubagentChat {
                     transcript,
                     scroll_from_bottom: 0,
+                    reasoning_summaries: ReasoningSummaryTracker::default(),
                 },
             );
         }
@@ -1541,6 +1623,7 @@ impl AppState {
         self.pending_handoff = None;
         self.resuming_session = None;
         self.item_turns.clear();
+        self.reasoning_summaries = ReasoningSummaryTracker::default();
         self.subagent_result_items.clear();
         self.approvals.clear();
         self.queue.clear();
@@ -2268,17 +2351,17 @@ impl AppState {
                 error,
             } => return self.complete_turn(&turn_id, outcome, error),
             BackendEvent::ItemStarted { turn_id, item } => {
-                self.observe_item(turn_id, item, false);
+                self.observe_item(&turn_id, item, false);
             }
             BackendEvent::ItemCompleted { turn_id, item } => {
-                self.observe_item(turn_id, item, true);
+                self.observe_item(&turn_id, item, true);
             }
             BackendEvent::ItemDelta {
                 turn_id,
                 item_id,
                 kind,
                 delta,
-            } => self.observe_delta(turn_id, item_id, kind, &delta),
+            } => self.observe_delta(&turn_id, item_id, kind, &delta),
             BackendEvent::TurnDiff { turn_id, diff } => {
                 self.observe_turn_artifact(&turn_id, diff, EntryKind::Diff, "TURN DIFF", "diff");
             }
@@ -2909,6 +2992,7 @@ impl AppState {
             self.transcript.set_status(&item_id, final_item_status);
             self.subagent_result_items.remove(&item_id);
         }
+        self.reasoning_summaries.remove_turn(turn_id);
         self.transcript
             .set_status(&format!("turn:{turn_id}:diff"), final_item_status);
         self.transcript
@@ -2972,6 +3056,7 @@ impl AppState {
     fn install_history(&mut self, history: Vec<SessionHistoryItem>) {
         self.transcript.clear();
         self.item_turns.clear();
+        self.reasoning_summaries = ReasoningSummaryTracker::default();
         self.subagent_result_items.clear();
         for history_item in history {
             let item = history_item.item;
@@ -2999,8 +3084,8 @@ impl AppState {
         self.scroll_from_bottom = 0;
     }
 
-    fn observe_item(&mut self, turn_id: String, item: NormalizedItem, completed: bool) {
-        if item.kind == ItemKind::User || !self.turn_is_current(&turn_id) {
+    fn observe_item(&mut self, turn_id: &str, item: NormalizedItem, completed: bool) {
+        if item.kind == ItemKind::User || !self.turn_is_current(turn_id) {
             return;
         }
         let hides_subagent_result = item.kind == ItemKind::Tool
@@ -3011,7 +3096,13 @@ impl AppState {
         if hides_subagent_result {
             self.subagent_result_items.insert(item.id.clone());
         }
-        self.item_turns.insert(item.id.clone(), turn_id);
+        self.item_turns.insert(item.id.clone(), turn_id.to_owned());
+        if item.kind == ItemKind::Reasoning
+            && self.reasoning_summaries.is_superseded(turn_id, &item.id)
+        {
+            self.transcript.remove(&item.id);
+            return;
+        }
         if hides_subagent_result {
             self.transcript.remove(&item.id);
             return;
@@ -3021,24 +3112,21 @@ impl AppState {
         } else {
             EntryStatus::Running
         };
-        self.transcript.upsert(
-            item.id,
-            entry_kind(item.kind),
-            item.title,
-            item.body,
-            status,
-        );
-        if self.scroll_from_bottom == 0 {
-            self.scroll_from_bottom = 0;
-        }
+        let body = if self.reasoning_summaries.contains(turn_id, &item.id) {
+            latest_reasoning_summary(&item.body).to_owned()
+        } else {
+            item.body
+        };
+        self.transcript
+            .upsert(item.id, entry_kind(item.kind), item.title, body, status);
     }
 
-    fn observe_delta(&mut self, turn_id: String, item_id: String, kind: DeltaKind, delta: &str) {
-        if !self.turn_is_current(&turn_id) {
+    fn observe_delta(&mut self, turn_id: &str, item_id: String, kind: DeltaKind, delta: &str) {
+        if !self.turn_is_current(turn_id) {
             self.diagnostic_count += 1;
             return;
         }
-        self.item_turns.insert(item_id.clone(), turn_id);
+        self.item_turns.insert(item_id.clone(), turn_id.to_owned());
         if self.subagent_result_items.contains(&item_id)
             || (kind == DeltaKind::Tool && delta.contains("[Subagent Result]"))
         {
@@ -3047,6 +3135,17 @@ impl AppState {
             return;
         }
         let (entry_kind, title) = match kind {
+            DeltaKind::ReasoningSummary { index } => {
+                record_reasoning_summary_delta(
+                    &mut self.transcript,
+                    &mut self.reasoning_summaries,
+                    turn_id,
+                    &item_id,
+                    index,
+                    delta,
+                );
+                return;
+            }
             DeltaKind::Assistant => (EntryKind::Assistant, "ASSISTANT"),
             DeltaKind::Plan => (EntryKind::Reasoning, "PLAN"),
             DeltaKind::Reasoning => (EntryKind::Reasoning, "REASONING"),
@@ -3208,6 +3307,7 @@ impl AppState {
             SubagentChat {
                 transcript,
                 scroll_from_bottom: 0,
+                reasoning_summaries: ReasoningSummaryTracker::default(),
             },
         );
         self.subagent_executions.insert(
@@ -3301,13 +3401,14 @@ impl AppState {
                 ..
             } => self.start_subagent_turn(run_id, provider_session_id),
             BackendEvent::ItemDelta {
+                turn_id,
                 item_id,
                 kind,
                 delta,
-                ..
-            } => self.handle_subagent_delta(run_id, &item_id, kind, &delta),
-            BackendEvent::ItemStarted { item, .. } | BackendEvent::ItemCompleted { item, .. } => {
-                self.record_subagent_item(run_id, &item);
+            } => self.handle_subagent_delta(run_id, &turn_id, &item_id, kind, &delta),
+            BackendEvent::ItemStarted { turn_id, item }
+            | BackendEvent::ItemCompleted { turn_id, item } => {
+                self.record_subagent_item(run_id, &turn_id, &item);
                 self.observe_subagent_item(run_id, item);
                 Vec::new()
             }
@@ -3442,11 +3543,12 @@ impl AppState {
     fn handle_subagent_delta(
         &mut self,
         run_id: &str,
+        turn_id: &str,
         item_id: &str,
         kind: DeltaKind,
         delta: &str,
     ) -> Vec<Effect> {
-        self.record_subagent_delta(run_id, item_id, kind, delta);
+        self.record_subagent_delta(run_id, turn_id, item_id, kind, delta);
         let Some(execution) = self.subagent_executions.get_mut(run_id) else {
             return Vec::new();
         };
@@ -3576,11 +3678,29 @@ impl AppState {
         }]
     }
 
-    fn record_subagent_delta(&mut self, run_id: &str, item_id: &str, kind: DeltaKind, delta: &str) {
+    fn record_subagent_delta(
+        &mut self,
+        run_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        kind: DeltaKind,
+        delta: &str,
+    ) {
         let Some(chat) = self.subagent_chats.get_mut(run_id) else {
             return;
         };
         let (entry_kind, title) = match kind {
+            DeltaKind::ReasoningSummary { index } => {
+                record_reasoning_summary_delta(
+                    &mut chat.transcript,
+                    &mut chat.reasoning_summaries,
+                    turn_id,
+                    item_id,
+                    index,
+                    delta,
+                );
+                return;
+            }
             DeltaKind::Assistant => (EntryKind::Assistant, "ASSISTANT"),
             DeltaKind::Reasoning => (EntryKind::Reasoning, "REASONING"),
             DeltaKind::Tool => (EntryKind::Tool, "TOOL"),
@@ -3590,15 +3710,26 @@ impl AppState {
             .append_delta(item_id, entry_kind, title, delta);
     }
 
-    fn record_subagent_item(&mut self, run_id: &str, item: &NormalizedItem) {
+    fn record_subagent_item(&mut self, run_id: &str, turn_id: &str, item: &NormalizedItem) {
         let Some(chat) = self.subagent_chats.get_mut(run_id) else {
             return;
+        };
+        if item.kind == ItemKind::Reasoning
+            && chat.reasoning_summaries.is_superseded(turn_id, &item.id)
+        {
+            chat.transcript.remove(&item.id);
+            return;
+        }
+        let body = if chat.reasoning_summaries.contains(turn_id, &item.id) {
+            latest_reasoning_summary(&item.body).to_owned()
+        } else {
+            item.body.clone()
         };
         chat.transcript.upsert(
             item.id.clone(),
             entry_kind(item.kind),
             item.title.clone(),
-            item.body.clone(),
+            body,
             entry_status(item.status),
         );
     }
@@ -3958,6 +4089,35 @@ fn entry_status(status: ItemStatus) -> EntryStatus {
         ItemStatus::Failed => EntryStatus::Failed,
         ItemStatus::Declined => EntryStatus::Interrupted,
     }
+}
+
+fn record_reasoning_summary_delta(
+    transcript: &mut Transcript,
+    summaries: &mut ReasoningSummaryTracker,
+    turn_id: &str,
+    item_id: &str,
+    index: usize,
+    delta: &str,
+) {
+    let update = summaries.append_delta(turn_id, item_id, index, delta);
+    if let Some(replaced_item) = update.replaced_item {
+        transcript.remove(&replaced_item);
+    }
+    transcript.upsert(
+        item_id,
+        EntryKind::Reasoning,
+        "REASONING",
+        update.text,
+        EntryStatus::Running,
+    );
+}
+
+fn latest_reasoning_summary(text: &str) -> &str {
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or_default()
 }
 
 fn summarize_activity(text: &str, fallback: &str) -> String {
@@ -4739,6 +4899,93 @@ model = "openai-codex/model-a"
     fn successful_connection_does_not_add_transcript_noise() {
         let state = ready_state();
         assert!(state.transcript.entries().is_empty());
+    }
+
+    #[test]
+    fn reasoning_summaries_shift_in_place_while_reasoning_traces_are_preserved() {
+        let mut state = ready_state();
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+
+        for (item_id, kind, delta) in [
+            ("trace-1", DeltaKind::Reasoning, "Detailed trace"),
+            (
+                "summary-1",
+                DeltaKind::ReasoningSummary { index: 0 },
+                "Planning transcript changes",
+            ),
+            (
+                "summary-2",
+                DeltaKind::ReasoningSummary { index: 0 },
+                "Implementing transcript changes",
+            ),
+            (
+                "summary-2",
+                DeltaKind::ReasoningSummary { index: 0 },
+                " safely",
+            ),
+            (
+                "summary-2",
+                DeltaKind::ReasoningSummary { index: 1 },
+                "Running focused tests",
+            ),
+        ] {
+            state.handle_backend(BackendEvent::ItemDelta {
+                turn_id: "turn-1".to_owned(),
+                item_id: item_id.to_owned(),
+                kind,
+                delta: delta.to_owned(),
+            });
+        }
+
+        let entries = state.transcript.entries();
+        assert!(entries.iter().any(|entry| {
+            entry.key.as_deref() == Some("trace-1") && entry.body == "Detailed trace"
+        }));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.key.as_deref() != Some("summary-1"))
+        );
+        assert!(entries.iter().any(|entry| {
+            entry.key.as_deref() == Some("summary-2") && entry.body == "Running focused tests"
+        }));
+
+        state.handle_backend(BackendEvent::ItemCompleted {
+            turn_id: "turn-1".to_owned(),
+            item: NormalizedItem {
+                id: "summary-2".to_owned(),
+                kind: ItemKind::Reasoning,
+                title: "REASONING".to_owned(),
+                body: "Implementing transcript changes\nRunning focused tests\nVerifying results"
+                    .to_owned(),
+                status: ItemStatus::Complete,
+            },
+        });
+        assert!(state.transcript.entries().iter().any(|entry| {
+            entry.key.as_deref() == Some("summary-2") && entry.body == "Verifying results"
+        }));
+
+        state.handle_backend(BackendEvent::ItemCompleted {
+            turn_id: "turn-1".to_owned(),
+            item: NormalizedItem {
+                id: "summary-1".to_owned(),
+                kind: ItemKind::Reasoning,
+                title: "REASONING".to_owned(),
+                body: "Planning transcript changes".to_owned(),
+                status: ItemStatus::Complete,
+            },
+        });
+        assert!(
+            state
+                .transcript
+                .entries()
+                .iter()
+                .all(|entry| entry.key.as_deref() != Some("summary-1"))
+        );
     }
 
     #[test]

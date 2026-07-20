@@ -76,6 +76,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
             Constraint::Length(todo_height),
             Constraint::Length(queue_height),
             Constraint::Length(5),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -88,6 +89,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         render_queue(frame, regions[3], state);
     }
     let cursor = render_composer(frame, regions[4], state);
+    render_prompt_metadata(frame, regions[5], state);
 
     let has_modal = state.questions.front().is_some()
         || state.approvals.front().is_some()
@@ -254,7 +256,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 struct TranscriptHitRegions {
     subagents: Vec<(String, ScreenPoint, ScreenPoint)>,
-    tool_outputs: Vec<(String, ScreenPoint, ScreenPoint)>,
+    tool_toggles: Vec<(String, ScreenPoint, ScreenPoint)>,
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
@@ -266,7 +268,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         Line::default(),
     );
     state.set_subagent_hit_regions(hit_regions.subagents);
-    state.set_tool_output_hit_regions(hit_regions.tool_outputs);
+    state.set_tool_toggle_hit_regions(hit_regions.tool_toggles);
 }
 
 fn render_transcript_view(
@@ -302,7 +304,7 @@ fn render_transcript_view(
             ))
         })
         .collect();
-    let tool_outputs = visible
+    let tool_toggles = visible
         .lines
         .iter()
         .enumerate()
@@ -330,7 +332,7 @@ fn render_transcript_view(
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     TranscriptHitRegions {
         subagents,
-        tool_outputs,
+        tool_toggles,
     }
 }
 
@@ -463,13 +465,13 @@ fn render_subagent_modal(frame: &mut Frame<'_>, area: Rect, state: &mut AppState
             Style::default().fg(MUTED),
         ),
     ]);
-    let tool_outputs = if let Some((transcript, scroll)) = state.selected_subagent_transcript_mut()
+    let tool_toggles = if let Some((transcript, scroll)) = state.selected_subagent_transcript_mut()
     {
-        render_transcript_view(frame, popup, transcript, scroll, title).tool_outputs
+        render_transcript_view(frame, popup, transcript, scroll, title).tool_toggles
     } else {
         Vec::new()
     };
-    state.set_tool_output_hit_regions(tool_outputs);
+    state.set_tool_toggle_hit_regions(tool_toggles);
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<Position> {
@@ -633,6 +635,20 @@ fn render_command_completions(frame: &mut Frame<'_>, composer_area: Rect, state:
     });
     let block = overlay_block(" Commands · ↑/↓ select · Tab complete ", ACCENT);
     frame.render_widget(List::new(items).block(block), popup);
+}
+
+fn render_prompt_metadata(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let model = state.selected_model.as_deref().unwrap_or("default");
+    let line = Line::from(vec![
+        Span::styled(" Model: ", Style::default().fg(MUTED)),
+        Span::styled(model, Style::default().fg(TEXT)),
+        Span::styled(" · Directory: ", Style::default().fg(MUTED)),
+        Span::styled(state.workspace.as_str(), Style::default().fg(TEXT)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(SURFACE)),
+        area,
+    );
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
@@ -1452,7 +1468,8 @@ mod tests {
         assert!(!rendered.contains("Prompt"));
         assert!(!rendered.contains("Ready."));
         assert!(!rendered.contains("Transcript"));
-        assert!(rendered.contains("fixture-model"));
+        assert!(rendered.contains("Model: fixture-model"));
+        assert!(rendered.contains("Directory: /tmp/project"));
         assert!(!rendered.contains("queue 0"));
         assert!(!rendered.contains("F1 help"));
 

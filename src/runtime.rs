@@ -91,6 +91,7 @@ pub struct InferenceOutput {
 pub enum InferenceEvent {
     TextDelta(String),
     ReasoningDelta(String),
+    ReasoningSummaryDelta { delta: String, index: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -276,6 +277,11 @@ impl AgentRuntime {
                 InferenceEvent::ReasoningDelta(delta) => (
                     format!("{turn_id}:reasoning:{inference_round}"),
                     DeltaKind::Reasoning,
+                    delta,
+                ),
+                InferenceEvent::ReasoningSummaryDelta { delta, index } => (
+                    format!("{turn_id}:reasoning-summary:{inference_round}"),
+                    DeltaKind::ReasoningSummary { index },
                     delta,
                 ),
             };

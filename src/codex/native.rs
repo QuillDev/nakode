@@ -1058,7 +1058,24 @@ async fn apply_codex_event(
                     .map_err(|_| "inference event receiver closed".to_owned())?;
             }
         }
-        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+        "response.reasoning_summary_text.delta" => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                output.reasoning.push_str(delta);
+                let index = event
+                    .get("summary_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .unwrap_or_default();
+                events
+                    .send(InferenceEvent::ReasoningSummaryDelta {
+                        delta: delta.to_owned(),
+                        index,
+                    })
+                    .await
+                    .map_err(|_| "inference event receiver closed".to_owned())?;
+            }
+        }
+        "response.reasoning_text.delta" => {
             if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                 output.reasoning.push_str(delta);
                 events
@@ -1422,6 +1439,45 @@ mod tests {
         assert!(
             matches!(event_rx.recv().await, Some(InferenceEvent::TextDelta(delta)) if delta == "hello")
         );
+    }
+
+    #[tokio::test]
+    async fn distinguishes_summary_updates_from_reasoning_trace_deltas() {
+        let (events, mut receiver) = mpsc::channel(2);
+        let mut output = InferenceOutput::default();
+
+        apply_codex_event(
+            &json!({
+                "type": "response.reasoning_summary_text.delta",
+                "summary_index": 2,
+                "delta": "Planning the implementation",
+            }),
+            &events,
+            &mut output,
+        )
+        .await
+        .expect("reasoning summary event");
+        apply_codex_event(
+            &json!({
+                "type": "response.reasoning_text.delta",
+                "delta": "private trace",
+            }),
+            &events,
+            &mut output,
+        )
+        .await
+        .expect("reasoning trace event");
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(InferenceEvent::ReasoningSummaryDelta { delta, index: 2 })
+                if delta == "Planning the implementation"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(InferenceEvent::ReasoningDelta(delta)) if delta == "private trace"
+        ));
+        assert_eq!(output.reasoning, "Planning the implementationprivate trace");
     }
 
     #[tokio::test]

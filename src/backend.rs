@@ -92,6 +92,7 @@ pub enum DeltaKind {
     Assistant,
     Plan,
     Reasoning,
+    ReasoningSummary { index: usize },
     Tool,
 }
 

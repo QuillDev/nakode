@@ -956,7 +956,7 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
                 state.clear_text_selection();
                 return vec![Effect::OpenUrl(url)];
             }
-            if action == controls::MouseAction::PrimaryDown && state.toggle_tool_output_at(point) {
+            if action == controls::MouseAction::PrimaryDown && state.toggle_tool_at(point) {
                 return Vec::new();
             }
             match action {
@@ -1542,6 +1542,61 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("click to collapse"));
+    }
+
+    #[test]
+    fn clicking_the_tool_history_row_shows_all_tool_calls() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        for index in 1..=7 {
+            state.transcript.upsert(
+                format!("tool-{index}"),
+                EntryKind::Tool,
+                format!("bash · command {index}"),
+                format!("output {index}"),
+                EntryStatus::Complete,
+            );
+        }
+        terminal
+            .draw(|frame| render::draw(frame, &mut state))
+            .expect("render limited tool history");
+        let marker_row = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .position(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains("earlier tool calls hidden")
+            })
+            .expect("tool history toggle row");
+
+        super::handle_terminal_event(
+            &mut state,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: u16::try_from(marker_row).expect("test row fits"),
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert_eq!(state.status_message, "Showing all tool calls.");
+
+        terminal
+            .draw(|frame| render::draw(frame, &mut state))
+            .expect("render all tool calls");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("command 1"));
+        assert!(rendered.contains("all tool calls shown"));
     }
 
     #[test]
