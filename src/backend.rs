@@ -31,6 +31,7 @@ pub struct BackendCapabilities {
     pub model_catalog: CapabilitySupport,
     pub models_require_session: CapabilitySupport,
     pub session_model_config: CapabilitySupport,
+    pub context_compaction: CapabilitySupport,
     pub approvals: CapabilitySupport,
     pub native_tools: CapabilitySupport,
     pub mcp: CapabilitySupport,
@@ -104,6 +105,7 @@ pub enum TurnOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionReason {
+    Manual,
     Proactive,
     ContextOverflow,
 }
@@ -196,6 +198,7 @@ pub enum BackendOperation {
     StartSession,
     ResumeSession,
     UnsubscribeSession,
+    CompactSession,
     StartTurn,
     SteerTurn,
     InterruptTurn,
@@ -213,6 +216,7 @@ impl BackendOperation {
             Self::StartSession => "start session",
             Self::ResumeSession => "resume session",
             Self::UnsubscribeSession => "close session",
+            Self::CompactSession => "compact session context",
             Self::StartTurn => "start turn",
             Self::SteerTurn => "steer turn",
             Self::InterruptTurn => "interrupt turn",
@@ -363,6 +367,10 @@ pub enum BackendCommand {
     InterruptTurn {
         session_id: String,
         turn_id: String,
+    },
+    CompactSession {
+        session_id: String,
+        compaction_id: String,
     },
     SetSessionModel {
         session_id: String,

@@ -469,6 +469,7 @@ pub enum CommandPlacement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlashAction {
     Agents,
+    Compress,
     Models,
     New,
     Providers,
@@ -493,6 +494,12 @@ const SLASH_CONTROLS: &[SlashControl] = &[
         action: SlashAction::Agents,
         invocation: "/agents",
         description: "manage delegated agent archetypes",
+        placement: CommandPlacement::PromptStart,
+    },
+    SlashControl {
+        action: SlashAction::Compress,
+        invocation: "/compress",
+        description: "compress the current chat context now",
         placement: CommandPlacement::PromptStart,
     },
     SlashControl {

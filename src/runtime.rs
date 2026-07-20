@@ -176,6 +176,7 @@ impl AgentRuntime {
                     .compact(
                         session,
                         turn_id,
+                        Uuid::now_v7().to_string(),
                         CompactionReason::Proactive,
                         backend_events,
                         &cancellation,
@@ -196,6 +197,7 @@ impl AgentRuntime {
                     self.compact(
                         session,
                         turn_id,
+                        Uuid::now_v7().to_string(),
                         CompactionReason::ContextOverflow,
                         backend_events,
                         &cancellation,
@@ -276,15 +278,39 @@ impl AgentRuntime {
             .map_err(|error| format!("inference task failed: {error}"))
     }
 
+    /// Compresses the current session context without waiting for an automatic threshold.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when there is not enough history, inference fails, cancellation is
+    /// requested, or lifecycle events cannot be delivered.
+    pub async fn force_compact(
+        &self,
+        session: &mut RuntimeSession,
+        compaction_id: &str,
+        backend_events: &mpsc::Sender<BackendEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<(), String> {
+        self.compact(
+            session,
+            compaction_id,
+            compaction_id.to_owned(),
+            CompactionReason::Manual,
+            backend_events,
+            &cancellation,
+        )
+        .await
+    }
+
     async fn compact(
         &self,
         session: &mut RuntimeSession,
         turn_id: &str,
+        compaction_id: String,
         reason: CompactionReason,
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: &CancellationToken,
     ) -> Result<(), String> {
-        let compaction_id = Uuid::now_v7().to_string();
         let estimated_tokens_before = session.estimated_context_tokens();
         backend_events
             .send(BackendEvent::ContextCompactionStarted {
@@ -678,19 +704,33 @@ fn compaction_event_projection(
     error: Option<&str>,
 ) -> (&'static str, String, ItemStatus) {
     if let Some(error) = error {
+        let title = if reason == CompactionReason::Manual {
+            "Context compression failed"
+        } else {
+            "Context compaction failed"
+        };
         return (
-            "Context compaction failed",
+            title,
             format!("Could not compact context: {error}"),
             ItemStatus::Failed,
         );
     }
-    let reason = match reason {
-        CompactionReason::Proactive => "the proactive context threshold was reached",
-        CompactionReason::ContextOverflow => "the provider reported a context limit",
+    let (title, reason) = match reason {
+        CompactionReason::Manual => (
+            "Context compressed",
+            "manual context compression was requested",
+        ),
+        CompactionReason::Proactive => (
+            "Context compacted",
+            "the proactive context threshold was reached",
+        ),
+        CompactionReason::ContextOverflow => {
+            ("Context compacted", "the provider reported a context limit")
+        }
     };
     let after = estimated_tokens_after.unwrap_or(estimated_tokens_before);
     (
-        "Context compacted",
+        title,
         format!(
             "Reduced estimated context from {estimated_tokens_before} to {after} tokens because {reason}."
         ),
@@ -1120,6 +1160,47 @@ mod tests {
                 estimated_tokens_after,
                 ..
             } if estimated_tokens_after < estimated_tokens_before
+        )));
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_bypasses_the_automatic_threshold() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(CompactionProvider::new(false));
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider.clone());
+        let mut session = large_session(None);
+        let (events, mut receiver) = mpsc::channel(16);
+
+        runtime
+            .force_compact(
+                &mut session,
+                "manual-compaction",
+                &events,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("manual compaction succeeds without a context window");
+
+        assert_eq!(session.compactions.len(), 1);
+        let requests = provider.requests.lock().expect("request mutex");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools.is_empty());
+        drop(requests);
+        drop(events);
+        let emitted = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(emitted.iter().any(|event| matches!(
+            event,
+            BackendEvent::ContextCompactionStarted {
+                compaction_id,
+                turn_id,
+                reason: CompactionReason::Manual,
+                ..
+            } if compaction_id == "manual-compaction" && turn_id == "manual-compaction"
+        )));
+        assert!(emitted.iter().any(|event| matches!(
+            event,
+            BackendEvent::ContextCompactionCompleted { compaction_id, .. }
+                if compaction_id == "manual-compaction"
         )));
     }
 

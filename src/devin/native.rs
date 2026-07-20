@@ -225,16 +225,26 @@ async fn run_supervisor(
                 if let Some(store) = &session_store
                     && let Err(error) = store.save(&completed.session)
                 {
-                    request_failed(&events, BackendOperation::StartTurn, error).await;
+                    let operation = match completed.kind {
+                        CompletedWorkKind::Turn => BackendOperation::StartTurn,
+                        CompletedWorkKind::Compaction => BackendOperation::CompactSession,
+                    };
+                    request_failed(&events, operation, error).await;
                 }
                 sessions.insert(completed.session.id.clone(), completed.session);
                 if active.as_ref().is_some_and(|turn| turn.turn_id == completed.turn_id) { active = None; }
-                let (outcome, error) = match completed.result {
-                    Ok(()) => (TurnOutcome::Completed, None),
-                    Err(error) if error == "turn interrupted" => (TurnOutcome::Interrupted, None),
-                    Err(error) => (TurnOutcome::Failed, Some(error)),
-                };
-                let _ = events.send(BackendEvent::TurnCompleted { turn_id: completed.turn_id, outcome, error }).await;
+                if completed.kind == CompletedWorkKind::Turn {
+                    let (outcome, error) = match completed.result {
+                        Ok(()) => (TurnOutcome::Completed, None),
+                        Err(error) if error == "turn interrupted" => (TurnOutcome::Interrupted, None),
+                        Err(error) => (TurnOutcome::Failed, Some(error)),
+                    };
+                    let _ = events.send(BackendEvent::TurnCompleted {
+                        turn_id: completed.turn_id,
+                        outcome,
+                        error,
+                    }).await;
+                }
             }
         }
     }
@@ -245,10 +255,17 @@ struct ActiveTurn {
     cancellation: CancellationToken,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletedWorkKind {
+    Turn,
+    Compaction,
+}
+
 struct CompletedTurn {
     turn_id: String,
     session: RuntimeSession,
     result: Result<(), String>,
+    kind: CompletedWorkKind,
 }
 
 struct CommandContext<'a> {
@@ -303,6 +320,10 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             context.sessions.remove(&provider_session_id);
             let _ = context.events.send(BackendEvent::SessionUnsubscribed).await;
         }
+        BackendCommand::CompactSession {
+            session_id,
+            compaction_id,
+        } => compact_session(session_id, compaction_id, context).await,
         BackendCommand::SetSessionModel { session_id, model } => {
             if let Some(session) = context.sessions.get_mut(&session_id) {
                 if session.model != model {
@@ -409,6 +430,61 @@ async fn resume_session(provider_session_id: String, context: &mut CommandContex
     }
 }
 
+async fn compact_session(
+    session_id: String,
+    compaction_id: String,
+    context: &mut CommandContext<'_>,
+) {
+    let Some(runtime) = context.runtime else {
+        request_failed(
+            context.events,
+            BackendOperation::CompactSession,
+            "Devin API key is not configured",
+        )
+        .await;
+        return;
+    };
+    if context.active.is_some() {
+        request_failed(
+            context.events,
+            BackendOperation::CompactSession,
+            "another turn is active",
+        )
+        .await;
+        return;
+    }
+    let Some(mut session) = context.sessions.remove(&session_id) else {
+        request_failed(
+            context.events,
+            BackendOperation::CompactSession,
+            "unknown native session",
+        )
+        .await;
+        return;
+    };
+    let cancellation = CancellationToken::new();
+    *context.active = Some(ActiveTurn {
+        turn_id: compaction_id.clone(),
+        cancellation: cancellation.clone(),
+    });
+    let completed = context.completed.clone();
+    let events = context.events.clone();
+    let runtime = runtime.clone();
+    tokio::spawn(async move {
+        let result = runtime
+            .force_compact(&mut session, &compaction_id, &events, cancellation)
+            .await;
+        let _ = completed
+            .send(CompletedTurn {
+                turn_id: compaction_id,
+                session,
+                result,
+                kind: CompletedWorkKind::Compaction,
+            })
+            .await;
+    });
+}
+
 async fn start_turn(
     session_id: String,
     client_id: String,
@@ -482,6 +558,7 @@ async fn start_turn(
                 turn_id: client_id,
                 session,
                 result,
+                kind: CompletedWorkKind::Turn,
             })
             .await;
     });
@@ -557,6 +634,7 @@ fn native_capabilities() -> BackendCapabilities {
         model_catalog: CapabilitySupport::Supported,
         models_require_session: CapabilitySupport::Unsupported,
         session_model_config: CapabilitySupport::Supported,
+        context_compaction: CapabilitySupport::Supported,
         approvals: CapabilitySupport::Unsupported,
         native_tools: CapabilitySupport::Supported,
         mcp: CapabilitySupport::Unsupported,

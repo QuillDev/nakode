@@ -213,6 +213,7 @@ async fn run_supervisor(input: SupervisorInput) {
                     &mut pending,
                     &mut next_id,
                     &workspace,
+                    &events,
                 ).await {
                     let _ = events.send(BackendEvent::Disconnected {
                         reason: format!("failed to write to Codex: {error}"),
@@ -295,7 +296,9 @@ async fn drain_deferred_commands(
     events: &mpsc::Sender<BackendEvent>,
 ) -> Result<(), ()> {
     while let Some(command) = commands.pop_front() {
-        if let Err(error) = handle_command(command, stdin, pending, next_id, workspace).await {
+        if let Err(error) =
+            handle_command(command, stdin, pending, next_id, workspace, events).await
+        {
             let _ = events
                 .send(BackendEvent::Disconnected {
                     reason: format!("failed to write to Codex: {error}"),
@@ -393,7 +396,20 @@ async fn handle_command(
     pending: &mut HashMap<u64, PendingRequest>,
     next_id: &mut u64,
     workspace: &std::path::Path,
+    events: &mpsc::Sender<BackendEvent>,
 ) -> std::io::Result<()> {
+    if matches!(&command, BackendCommand::CompactSession { .. }) {
+        let _ = events
+            .send(BackendEvent::RequestFailed {
+                operation: BackendOperation::CompactSession,
+                code: -32601,
+                message:
+                    "the Codex compatibility adapter does not support manual context compression"
+                        .to_owned(),
+            })
+            .await;
+        return Ok(());
+    }
     match command {
         BackendCommand::SetSessionModel { .. }
         | BackendCommand::ResolveApproval { .. }
@@ -497,6 +513,7 @@ fn command_request(
             json!({"type": "chatgptDeviceCode"}),
         ),
         BackendCommand::SetSessionModel { .. }
+        | BackendCommand::CompactSession { .. }
         | BackendCommand::ResolveApproval { .. }
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::Shutdown => unreachable!(),
@@ -671,7 +688,7 @@ async fn process_response(
                 .await
                 .map_err(|_| ())?;
         }
-        BackendOperation::SetSessionModel => {}
+        BackendOperation::SetSessionModel | BackendOperation::CompactSession => {}
         BackendOperation::StartSession => {
             events
                 .send(BackendEvent::SessionCreated {
@@ -764,6 +781,7 @@ async fn initialize_response(
                 model_catalog: CapabilitySupport::Supported,
                 models_require_session: CapabilitySupport::Unsupported,
                 session_model_config: CapabilitySupport::Unsupported,
+                context_compaction: CapabilitySupport::Unsupported,
                 approvals: CapabilitySupport::Supported,
                 native_tools: CapabilitySupport::Supported,
                 mcp: CapabilitySupport::Supported,

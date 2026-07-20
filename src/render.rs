@@ -978,7 +978,7 @@ fn append_provider_authentication<'a>(
 
 fn capability_rows(
     capabilities: &crate::backend::BackendCapabilities,
-) -> [(&'static str, crate::backend::CapabilitySupport); 10] {
+) -> [(&'static str, crate::backend::CapabilitySupport); 11] {
     [
         ("Resume", capabilities.resume),
         ("Steering", capabilities.steering),
@@ -986,6 +986,7 @@ fn capability_rows(
         ("Model catalog", capabilities.model_catalog),
         ("Models need session", capabilities.models_require_session),
         ("Session model config", capabilities.session_model_config),
+        ("Context compression", capabilities.context_compaction),
         ("Approvals", capabilities.approvals),
         ("Native tools", capabilities.native_tools),
         ("MCP", capabilities.mcp),

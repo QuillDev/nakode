@@ -1309,6 +1309,7 @@ impl AppState {
         self.creating_session.is_some()
             || self.starting_turn.is_some()
             || self.active_turn.is_some()
+            || self.context_compaction.is_some()
             || self.has_running_subagents()
     }
 
@@ -1372,6 +1373,10 @@ impl AppState {
                     self.open_agent_picker();
                     return Vec::new();
                 }
+                ParsedPromptCommand::Compress => {
+                    self.editor.clear();
+                    return self.compress_session_context();
+                }
                 ParsedPromptCommand::Models => {
                     self.editor.clear();
                     return self.open_default_model_picker();
@@ -1432,6 +1437,48 @@ impl AppState {
             let prompt = self.take_editor_prompt();
             self.begin_prompt(prompt)
         }
+    }
+
+    fn compress_session_context(&mut self) -> Vec<Effect> {
+        if !self.connection.is_ready() {
+            self.set_status("The backend is not ready; context cannot be compressed.");
+            return Vec::new();
+        }
+        if self.is_busy() {
+            self.set_status("Cannot compress context while the chat is busy.");
+            return Vec::new();
+        }
+        if !self.backend_capabilities.context_compaction.is_supported() {
+            self.status_message = format!(
+                "{} does not support manual context compression.",
+                self.backend_name
+            );
+            return Vec::new();
+        }
+        let Some(session_id) = self.provider_session_id.clone() else {
+            self.set_status("Send a message before compressing this chat.");
+            return Vec::new();
+        };
+        let compaction_id = uuid::Uuid::now_v7().to_string();
+        self.context_compaction = Some(ContextCompactionState {
+            id: compaction_id.clone(),
+            turn_id: compaction_id.clone(),
+            reason: CompactionReason::Manual,
+            estimated_tokens: 0,
+            context_window: None,
+        });
+        self.transcript.upsert(
+            compaction_id.clone(),
+            EntryKind::System,
+            "Compressing context",
+            "Preparing a continuity checkpoint for the current chat.",
+            EntryStatus::Running,
+        );
+        self.set_status("Compressing the current chat context…");
+        vec![Effect::Backend(BackendCommand::CompactSession {
+            session_id,
+            compaction_id,
+        })]
     }
 
     fn reload_backend(&mut self) -> Vec<Effect> {
@@ -1568,6 +1615,26 @@ impl AppState {
 
     pub fn cancel_or_quit(&mut self) -> Vec<Effect> {
         let (interrupted_subagents, mut effects) = self.interrupt_subagents();
+        if self.active_turn.is_none()
+            && let Some(compaction) = self.context_compaction.as_ref()
+        {
+            if !self.backend_capabilities.interruption.is_supported() {
+                self.status_message =
+                    format!("{} does not support interruption.", self.backend_name);
+                return effects;
+            }
+            let Some(provider_session_id) = self.provider_session_id.clone() else {
+                self.set_status("Cannot cancel: the provider session id is unavailable.");
+                return effects;
+            };
+            let turn_id = compaction.turn_id.clone();
+            self.set_status("Interrupting context compression…");
+            effects.push(Effect::Backend(BackendCommand::InterruptTurn {
+                session_id: provider_session_id,
+                turn_id,
+            }));
+            return effects;
+        }
         let Some(active) = self.active_turn.as_mut() else {
             if interrupted_subagents > 0 {
                 self.status_message =
@@ -2395,7 +2462,11 @@ impl AppState {
         estimated_tokens: usize,
         context_window: Option<usize>,
     ) {
-        if !self.turn_is_current(&turn_id) {
+        let expected_manual_compaction = reason == CompactionReason::Manual
+            && self.context_compaction.as_ref().is_some_and(|compaction| {
+                compaction.id == compaction_id && compaction.turn_id == turn_id
+            });
+        if !self.turn_is_current(&turn_id) && !expected_manual_compaction {
             self.diagnostic_count += 1;
             return;
         }
@@ -2406,9 +2477,10 @@ impl AppState {
             estimated_tokens,
             context_window,
         });
-        let reason_label = match reason {
-            CompactionReason::Proactive => "proactive threshold reached",
-            CompactionReason::ContextOverflow => "context limit reached",
+        let (reason_label, title) = match reason {
+            CompactionReason::Manual => ("manual compression was requested", "Compressing context"),
+            CompactionReason::Proactive => ("proactive threshold reached", "Compacting context"),
+            CompactionReason::ContextOverflow => ("context limit reached", "Compacting context"),
         };
         let body = context_window.map_or_else(
             || format!("Reducing approximately {estimated_tokens} tokens because the {reason_label}."),
@@ -2421,7 +2493,7 @@ impl AppState {
         self.transcript.upsert(
             compaction_id,
             EntryKind::System,
-            "Compacting context",
+            title,
             body,
             EntryStatus::Running,
         );
@@ -2440,23 +2512,35 @@ impl AppState {
             self.diagnostic_count += 1;
             return;
         }
-        let reason = self
+        let compaction_reason = self
             .context_compaction
             .take()
             .map_or(CompactionReason::Proactive, |compaction| compaction.reason);
-        let reason = match reason {
-            CompactionReason::Proactive => "the proactive context threshold was reached",
-            CompactionReason::ContextOverflow => "the provider reported a context limit",
+        let (reason, title) = match compaction_reason {
+            CompactionReason::Manual => (
+                "manual context compression was requested",
+                "Context compressed",
+            ),
+            CompactionReason::Proactive => (
+                "the proactive context threshold was reached",
+                "Context compacted",
+            ),
+            CompactionReason::ContextOverflow => {
+                ("the provider reported a context limit", "Context compacted")
+            }
         };
         self.transcript.upsert(
             compaction_id,
             EntryKind::System,
-            "Context compacted",
+            title,
             format!(
                 "Reduced estimated context from {estimated_tokens_before} to {estimated_tokens_after} tokens because {reason}."
             ),
             EntryStatus::Complete,
         );
+        if compaction_reason == CompactionReason::Manual {
+            self.set_status("Context compressed; ready.");
+        }
     }
 
     fn context_compaction_failed(&mut self, compaction_id: &str, turn_id: &str, message: &str) {
@@ -2466,15 +2550,33 @@ impl AppState {
             self.diagnostic_count += 1;
             return;
         }
+        let manual = self
+            .context_compaction
+            .as_ref()
+            .is_some_and(|compaction| compaction.reason == CompactionReason::Manual);
         self.context_compaction = None;
         self.diagnostic_count += 1;
+        let (title, body) = if manual {
+            (
+                "Context compression failed",
+                format!("Could not compress context: {message}"),
+            )
+        } else {
+            (
+                "Context compaction failed",
+                format!("Could not compact context: {message}"),
+            )
+        };
         self.transcript.upsert(
             compaction_id,
             EntryKind::Warning,
-            "Context compaction failed",
-            format!("Could not compact context: {message}"),
+            title,
+            body,
             EntryStatus::Failed,
         );
+        if manual {
+            self.status_message = format!("Context compression failed: {message}");
+        }
     }
 
     fn observe_turn_artifact(
@@ -2895,6 +2997,12 @@ impl AppState {
             | BackendOperation::ModelList
             | BackendOperation::SetSessionModel
             | BackendOperation::UnsubscribeSession => {}
+            BackendOperation::CompactSession => {
+                if let Some(compaction) = self.context_compaction.take() {
+                    self.transcript
+                        .set_status(&compaction.id, EntryStatus::Failed);
+                }
+            }
             BackendOperation::Reload => {
                 self.creating_session = None;
                 self.pending_model_picker = None;
@@ -3898,6 +4006,7 @@ model = "openai-codex/model-a"
                 model_catalog: CapabilitySupport::Supported,
                 models_require_session: CapabilitySupport::Unsupported,
                 session_model_config: CapabilitySupport::Unsupported,
+                context_compaction: CapabilitySupport::Supported,
                 approvals: CapabilitySupport::Supported,
                 native_tools: CapabilitySupport::Supported,
                 mcp: CapabilitySupport::Supported,
@@ -3943,6 +4052,81 @@ model = "openai-codex/model-a"
         assert!(state.steer_editor().is_empty());
         assert_eq!(state.editor.text(), "steer");
         assert!(state.status_message.contains("does not support steering"));
+
+        state.active_turn = None;
+        state.editor.set_text("/compress");
+        assert!(state.submit_editor().is_empty());
+        assert!(
+            state
+                .status_message
+                .contains("does not support manual context compression")
+        );
+    }
+
+    #[test]
+    fn compress_command_requests_manual_compaction_for_the_current_chat() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("native-session".to_owned());
+        state.editor.set_text("/compress");
+
+        let effects = state.submit_editor();
+
+        let [
+            Effect::Backend(BackendCommand::CompactSession {
+                session_id,
+                compaction_id,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected one manual compaction effect");
+        };
+        assert_eq!(session_id, "native-session");
+        let compaction_id = compaction_id.clone();
+        let pending = state
+            .context_compaction
+            .as_ref()
+            .expect("pending manual compaction");
+        assert_eq!(pending.id, compaction_id);
+        assert_eq!(pending.turn_id, compaction_id);
+        assert_eq!(pending.reason, CompactionReason::Manual);
+        assert!(state.is_busy());
+        assert!(state.editor.text().is_empty());
+        assert!(state.transcript.entries().iter().any(|entry| {
+            entry.key.as_deref() == Some(compaction_id.as_str())
+                && entry.title == "Compressing context"
+                && entry.status == EntryStatus::Running
+        }));
+
+        state.handle_backend(BackendEvent::ContextCompactionStarted {
+            compaction_id: compaction_id.clone(),
+            turn_id: compaction_id.clone(),
+            reason: CompactionReason::Manual,
+            estimated_tokens: 42_000,
+            context_window: Some(100_000),
+        });
+        let interrupt = state.cancel_or_quit();
+        assert!(matches!(
+            interrupt.as_slice(),
+            [Effect::Backend(BackendCommand::InterruptTurn {
+                session_id,
+                turn_id,
+            })] if session_id == "native-session" && turn_id == &compaction_id
+        ));
+
+        state.handle_backend(BackendEvent::ContextCompactionCompleted {
+            compaction_id: compaction_id.clone(),
+            turn_id: compaction_id.clone(),
+            estimated_tokens_before: 42_000,
+            estimated_tokens_after: 12_000,
+        });
+
+        assert!(!state.is_busy());
+        assert_eq!(state.status_message, "Context compressed; ready.");
+        assert!(state.transcript.entries().iter().any(|entry| {
+            entry.key.as_deref() == Some(compaction_id.as_str())
+                && entry.title == "Context compressed"
+                && entry.status == EntryStatus::Complete
+        }));
     }
 
     #[test]

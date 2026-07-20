@@ -106,6 +106,7 @@ impl AcpCapabilities {
             model_catalog: CapabilitySupport::Supported,
             models_require_session: CapabilitySupport::Supported,
             session_model_config: CapabilitySupport::Supported,
+            context_compaction: CapabilitySupport::Unsupported,
             approvals: CapabilitySupport::Supported,
             native_tools: CapabilitySupport::Supported,
             mcp: self.mcp.map_or(CapabilitySupport::Unsupported, |()| {
@@ -570,6 +571,16 @@ async fn handle_command(
             )
             .await?;
             let _ = events.send(BackendEvent::InterruptAccepted).await;
+            Ok(())
+        }
+        BackendCommand::CompactSession { .. } => {
+            let _ = events
+                .send(BackendEvent::RequestFailed {
+                    operation: BackendOperation::CompactSession,
+                    code: -32601,
+                    message: "ACP does not define manual context compression".to_owned(),
+                })
+                .await;
             Ok(())
         }
         BackendCommand::ResolveApproval { .. }

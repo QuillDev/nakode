@@ -114,6 +114,7 @@ transcript content and tool calls.
 | `/resume` | Open the recent-session picker for this workspace |
 | `/resume ID` | Resume a saved session by Nakode ID or unique prefix |
 | `/new` | Unsubscribe from the current backend session and start fresh |
+| `/compress` | Immediately compress the current in-process chat context into a continuity checkpoint |
 | `/models` | Choose and persist a provider's default model for future sessions |
 | `/switch` | Switch the model for only the current session |
 | `/providers` | Open the provider registry and enable or disable adapters |
@@ -148,7 +149,9 @@ from any directory.
 - Runs sequential turns in one active provider session at a time.
 - Compacts in-process session context before the model window is exhausted,
   preserving a structured continuity checkpoint and a recent raw-history tail.
-  A detected context-overflow error triggers one compact-and-retry recovery.
+  `/compress` forces the same operation for the current idle chat without
+  waiting for the automatic threshold. A detected context-overflow error
+  triggers one compact-and-retry recovery.
   Compaction lifecycle entries appear in the chat and are restored from the
   persisted session without exposing checkpoint contents to the transcript.
 - Stores provider-neutral session metadata in SQLite and supports `--resume`,
