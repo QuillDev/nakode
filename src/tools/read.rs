@@ -2,8 +2,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Tool, ToolContext, ToolFuture, ToolResult, required_string, resolve_workspace_path,
-    truncate_output,
+    Tool, ToolConcurrency, ToolContext, ToolFuture, ToolResult, required_string,
+    resolve_workspace_path, truncate_output,
 };
 use crate::runtime::ToolDefinition;
 
@@ -13,11 +13,11 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read",
-            description: "Read local files and directories through one path. Append :N, :N-M, :N+K, :N-, comma-separated ranges, or :raw to select file content. Parallelize independent reads and re-read only the ranges named by a truncation notice.",
+            description: "Read local files and directories through one path or a semicolon-delimited list. Append :N, :N-M, :N+K, :N-, comma-separated ranges, or :raw to select file content. Parallelize independent reads and re-read only the ranges named by a truncation notice.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Local path with optional inline selector"}
+                    "path": {"type": "string", "description": "Local path, optional inline selector, or semicolon-delimited list"}
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -33,6 +33,10 @@ impl Tool for ReadTool {
             .to_owned()
     }
 
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ReadOnly
+    }
+
     fn execute<'a>(
         &'a self,
         context: ToolContext<'a>,
@@ -43,26 +47,10 @@ impl Tool for ReadTool {
             if cancellation.is_cancelled() {
                 return ToolResult::failure("read interrupted");
             }
-            let result = async {
-                let supplied = required_string(&arguments, "path")?;
-                let (path, selector) = resolve_read_target(context.workspace, supplied).await?;
-                let metadata = tokio::fs::metadata(&path)
-                    .await
-                    .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
-                if metadata.is_dir() {
-                    return list_directory(&path).await;
-                }
-                let contents = tokio::fs::read(&path)
-                    .await
-                    .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-                if contents.contains(&0) {
-                    return Err(format!("{} appears to be binary", path.display()));
-                }
-                let text = String::from_utf8(contents)
-                    .map_err(|_| format!("{} is not valid UTF-8", path.display()))?;
-                Ok(render_text(&text, selector))
-            }
-            .await;
+            let result = match required_string(&arguments, "path") {
+                Ok(supplied) => read_targets(context.workspace, supplied).await,
+                Err(error) => Err(error),
+            };
             match result {
                 Ok(output) => ToolResult::success(output),
                 Err(error) => ToolResult::failure(error),
@@ -71,7 +59,48 @@ impl Tool for ReadTool {
     }
 }
 
-const DEFAULT_MAX_LINES: usize = 2_000;
+async fn read_targets(workspace: &std::path::Path, supplied: &str) -> Result<String, String> {
+    let targets = supplied
+        .split(';')
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Err("read path must contain at least one target".to_owned());
+    }
+    if targets.len() == 1 {
+        return read_target(workspace, targets[0]).await;
+    }
+    let results =
+        futures_util::future::join_all(targets.iter().map(|target| read_target(workspace, target)))
+            .await;
+    let mut rendered = Vec::with_capacity(results.len());
+    for (target, result) in targets.into_iter().zip(results) {
+        rendered.push(format!("# {target}\n{}", result?));
+    }
+    Ok(truncate_output(rendered.join("\n\n").into_bytes()))
+}
+
+async fn read_target(workspace: &std::path::Path, supplied: &str) -> Result<String, String> {
+    let (path, selector) = resolve_read_target(workspace, supplied).await?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+    if metadata.is_dir() {
+        return list_directory(&path).await;
+    }
+    let contents = tokio::fs::read(&path)
+        .await
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    if contents.contains(&0) {
+        return Err(format!("{} appears to be binary", path.display()));
+    }
+    let text = String::from_utf8(contents)
+        .map_err(|_| format!("{} is not valid UTF-8", path.display()))?;
+    Ok(render_text(&text, selector))
+}
+
+const DEFAULT_MAX_LINES: usize = 400;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ReadSelector {
@@ -193,7 +222,7 @@ async fn list_directory(path: &std::path::Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadSelector, parse_selector, render_text};
+    use super::{DEFAULT_MAX_LINES, ReadSelector, parse_selector, read_targets, render_text};
 
     #[test]
     fn selectors_use_one_based_inclusive_omp_forms() {
@@ -212,5 +241,33 @@ mod tests {
             ),
             "2|two\n3|three"
         );
+    }
+
+    #[test]
+    fn default_reads_are_bounded_to_four_hundred_lines() {
+        let text = (1..=500)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered = render_text(&text, ReadSelector::Default);
+
+        assert_eq!(DEFAULT_MAX_LINES, 400);
+        assert!(rendered.contains("400|line 400"));
+        assert!(!rendered.contains("401|line 401"));
+        assert!(rendered.contains("Showing lines 1-400 of 500"));
+    }
+
+    #[tokio::test]
+    async fn semicolon_delimited_reads_return_each_named_target() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(directory.path().join("one.txt"), "one\n").expect("write one");
+        std::fs::write(directory.path().join("two.txt"), "two\n").expect("write two");
+
+        let output = read_targets(directory.path(), "one.txt;two.txt")
+            .await
+            .expect("multi read");
+
+        assert!(output.contains("# one.txt\n1|one"));
+        assert!(output.contains("# two.txt\n1|two"));
     }
 }

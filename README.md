@@ -48,6 +48,42 @@ is not installed. Legacy Codex app-server and Devin ACP adapters remain
 isolated compatibility code for fixture coverage; normal startup and provider
 setup do not invoke them.
 
+## Install
+
+Install Nakode for the current user:
+
+```sh
+./install.sh
+```
+
+The default destination is `~/.local/bin/nakode`. If that directory is not in
+`PATH`, the script prints the shell configuration line to add. To install for
+all users instead, build as your normal user and let the script elevate only
+the final copy into `/usr/local/bin`:
+
+```sh
+./install.sh --system
+```
+
+A custom installation prefix is also supported with `./install.sh --prefix PATH`;
+the executable is placed in `PATH/bin`. The standard `PREFIX` environment
+variable can set the same default without an option. Update an installation by
+updating this checkout and rerunning the same install command:
+
+```sh
+git pull --ff-only
+./install.sh              # or: ./install.sh --system
+```
+
+The installer atomically replaces the executable and then stops any older
+shared control-service process. Open TUIs detect that restart, launch the newly
+installed service, and register themselves again automatically; otherwise the
+new service starts with the next TUI.
+
+Do not run the whole script through `sudo`; Nakode itself should also run as
+your desktop user so it can use browser authentication and user credentials.
+Run `./install.sh --help` for all installation options.
+
 ## Run
 
 ```sh
@@ -60,6 +96,11 @@ setup do not invoke them.
 # Start every enabled provider
 cargo run --release -- --workspace /path/to/project
 ```
+
+You can open multiple Nakode TUIs, including multiple TUIs for the same
+workspace. Each TUI owns its terminal and active provider sessions, while one
+user-level control service routes agent invocations to the correct TUI by its
+Nakode session ID.
 
 Options:
 
@@ -198,6 +239,15 @@ TUI, eval kernels retain per-language state, and phased todos persist with the
 provider session. Optional compatibility adapters continue to use their
 provider-owned tool and permission semantics.
 
+When [`hypa`](https://github.com/Hypabolic/Hypa) is installed on `PATH`, the
+`bash` tool automatically asks `hypa rewrite --json` to wrap eligible non-PTY
+commands with Hypa's deterministic output compression. Hypa passthrough
+decisions preserve the original command. A missing executable, rewrite timeout,
+or invalid response also falls back to the original command, while Hypa policy
+decisions that deny or require confirmation prevent unattended execution.
+Explicit PTY commands bypass rewriting so their terminal semantics remain
+intact.
+
 ## Predefined agents
 
 Use `/agents` to manage definitions, or place TOML files in
@@ -228,19 +278,19 @@ configured agents, and explains the provider-neutral invocation command:
 nakode agent explorer --session-id=<nakode-session-id> --task='Map the authentication flow'
 ```
 
-The command connects to the workspace control service over
-`.nakode/control.sock` and blocks until the agent finishes. The service validates
-the logical session, launches a separate provider-native child session, and
-allows up to four read-only explorer children to run concurrently. Each child
-has an independently bounded objective, native provider session, lifecycle,
+The command connects to Nakode's shared user-level control service and blocks
+until the agent finishes. Each TUI registers its Nakode session with that
+service through a private socket, so invocations are routed to the correct TUI
+even when several TUIs use the same workspace. The target TUI validates the
+logical session, launches a separate provider-native child session, and allows
+up to four read-only explorer children to run concurrently. Each child has an
+independently bounded objective, native provider session, lifecycle,
 transcript, and result channel. The preset explorer configuration uses
 `devin-acp/swe-1-7-lightning` by default and falls back to
 `openai-codex/gpt-5.6-luna` if Devin cannot launch or create the native child
 session. A workspace agent definition may override the ordered model
-candidates. This
-socket protocol is deliberately independent of the TUI; the TUI currently
-hosts the service, while a long-lived Nakode daemon can take ownership of the
-same protocol as orchestration and multi-client continuity mature.
+candidates. The shared service is a lightweight routing broker; provider
+adapters and active agent loops remain owned by their registered TUI.
 
 All provider sessions run unattended. Codex uses `approvalPolicy: never` with
 a `danger-full-access` sandbox, while Devin launches its native ACP server with

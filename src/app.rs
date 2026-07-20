@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::{self, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -57,7 +57,15 @@ struct BackendRegistry {
     config: Config,
     session_database: PathBuf,
     provider_credentials: HashMap<String, serde_json::Value>,
+    provider_cooldowns: HashMap<String, ProviderCooldown>,
 }
+
+struct ProviderCooldown {
+    until: Instant,
+    reason: String,
+}
+
+const PROVIDER_FATAL_ERROR_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 impl BackendRegistry {
     async fn spawn(
@@ -85,6 +93,7 @@ impl BackendRegistry {
                         .map(|credential| (provider.provider.clone(), credential.metadata.clone()))
                 })
                 .collect(),
+            provider_cooldowns: HashMap::new(),
         };
         for provider in providers.iter().filter(|provider| provider.enabled) {
             if let Err(error) = registry.start_provider(&provider.provider).await {
@@ -107,6 +116,7 @@ impl BackendRegistry {
                 codex::spawn(
                     codex::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_reasoning_effort(self.config.openai_reasoning_effort.as_str())
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
@@ -165,6 +175,13 @@ impl BackendRegistry {
     }
 
     async fn spawn_subagent(&mut self, run_id: String, provider: &str) -> Result<(), BackendError> {
+        if let Some(cooldown) = self.active_cooldown(provider) {
+            return Err(BackendError::ProviderCoolingDown {
+                provider: provider.to_owned(),
+                remaining_seconds: cooldown.0,
+                reason: cooldown.1,
+            });
+        }
         if !self.commands.contains_key(provider) {
             return Err(BackendError::ProviderUnavailable {
                 provider: provider.to_owned(),
@@ -176,6 +193,7 @@ impl BackendRegistry {
                 codex::spawn(
                     codex::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_reasoning_effort(self.config.openai_reasoning_effort.as_str())
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
@@ -219,6 +237,65 @@ impl BackendRegistry {
             }
         }));
         Ok(())
+    }
+
+    fn observe_provider_event(&mut self, source: &BackendSource, event: &BackendEvent) {
+        let provider = match source {
+            BackendSource::Primary(provider) => Some(provider.clone()),
+            BackendSource::Subagent(run_id) => self.subagent_providers.get(run_id).cloned(),
+        };
+        if matches!(
+            event,
+            BackendEvent::TurnCompleted {
+                outcome: crate::backend::TurnOutcome::Completed,
+                ..
+            }
+        ) {
+            if let Some(provider) = provider {
+                self.provider_cooldowns.remove(&provider);
+            }
+            return;
+        }
+        let (BackendEvent::TurnCompleted {
+            outcome: crate::backend::TurnOutcome::Failed,
+            error: Some(message),
+            ..
+        }
+        | BackendEvent::RequestFailed { message, .. }
+        | BackendEvent::Disconnected { reason: message }) = event
+        else {
+            return;
+        };
+        if !is_fatal_provider_error(message) {
+            return;
+        }
+        if let Some(provider) = provider {
+            self.provider_cooldowns.insert(
+                provider,
+                ProviderCooldown {
+                    until: Instant::now() + PROVIDER_FATAL_ERROR_COOLDOWN,
+                    reason: summarize_provider_error(message),
+                },
+            );
+        }
+    }
+
+    fn active_cooldown(&mut self, provider: &str) -> Option<(u64, String)> {
+        let now = Instant::now();
+        if self
+            .provider_cooldowns
+            .get(provider)
+            .is_some_and(|cooldown| cooldown.until <= now)
+        {
+            self.provider_cooldowns.remove(provider);
+            return None;
+        }
+        self.provider_cooldowns.get(provider).map(|cooldown| {
+            (
+                cooldown.until.saturating_duration_since(now).as_secs(),
+                cooldown.reason.clone(),
+            )
+        })
     }
 
     async fn send(&self, provider: &str, command: BackendCommand) -> bool {
@@ -283,13 +360,6 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let session_database = sessions.database_path().to_path_buf();
     let providers = sessions.list_providers()?;
     let agents = AgentCatalog::load(&config.agents)?;
-    let control_path = crate::control::socket_path(&config.workspace);
-    if let Some(parent) = control_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| ControlError::Io {
-            path: parent.display().to_string(),
-            source,
-        })?;
-    }
     let mut backends = BackendRegistry::spawn(&config, &providers, session_database).await;
     let active_provider = if backends
         .commands
@@ -300,21 +370,6 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         provider.clone()
     } else {
         String::new()
-    };
-    let mut control = match ControlServer::bind(&control_path).await {
-        Ok(control) => control,
-        Err(error) => {
-            backends.shutdown().await;
-            return Err(AppError::Control(error));
-        }
-    };
-    let mut terminal = match TerminalSession::enter() {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            backends.shutdown().await;
-            control.shutdown(&control_path);
-            return Err(AppError::Terminal(error));
-        }
     };
     let mut state = if active_provider.is_empty() {
         AppState::new_unconfigured(
@@ -358,6 +413,24 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     }
     state.set_startup_resume(config.resume);
 
+    let (control_path, mut control, registration) =
+        match start_tui_control(&nakode_executable, &state.nakode_session_id).await {
+            Ok(control) => control,
+            Err(error) => {
+                backends.shutdown().await;
+                return Err(AppError::Control(error));
+            }
+        };
+    let mut terminal = match TerminalSession::enter() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            backends.shutdown().await;
+            registration.shutdown().await;
+            control.shutdown(&control_path);
+            return Err(AppError::Terminal(error));
+        }
+    };
+
     let loop_result = run_loop(
         terminal.terminal_mut(),
         &mut state,
@@ -370,12 +443,28 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 
     let restore_result = terminal.restore();
     backends.shutdown().await;
+    registration.shutdown().await;
     control.shutdown(&control_path);
 
     loop_result?;
     restore_result.map_err(AppError::Terminal)?;
 
     print_resume_hint(&nakode_executable, &state).map_err(AppError::Terminal)
+}
+
+async fn start_tui_control(
+    executable: &Path,
+    session_id: &str,
+) -> Result<(PathBuf, ControlServer, crate::control::ControlRegistration), ControlError> {
+    let path = crate::control::tui_socket_path()?;
+    let control = ControlServer::bind(&path).await?;
+    match crate::control::ControlRegistration::start(executable, session_id, &path).await {
+        Ok(registration) => Ok((path, control, registration)),
+        Err(error) => {
+            control.shutdown(&path);
+            Err(error)
+        }
+    }
 }
 
 fn print_resume_hint(executable: &Path, state: &AppState) -> io::Result<()> {
@@ -460,6 +549,7 @@ async fn run_loop(
             }
             backend_event = backends.events.recv(), if backend_open => {
                 if let Some((source, event)) = backend_event {
+                    backends.observe_provider_event(&source, &event);
                     let should_chime = should_chime_for_backend_event(&source, &event);
                     let effects = match source {
                         BackendSource::Primary(provider) => state.handle_provider_backend(&provider, event),
@@ -510,6 +600,31 @@ async fn run_loop(
     }
 
     Ok(())
+}
+
+fn is_fatal_provider_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "quota has been exhausted",
+        "usage quota",
+        "resource_exhausted",
+        "invalid api key",
+        "invalid credential",
+        "authentication failed",
+        "unauthenticated",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
+}
+
+fn summarize_provider_error(message: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_CHARS {
+        compact
+    } else {
+        format!("{}…", compact.chars().take(MAX_CHARS).collect::<String>())
+    }
 }
 
 fn should_chime_for_backend_event(source: &BackendSource, event: &BackendEvent) -> bool {
@@ -1375,6 +1490,9 @@ impl ShutdownSignals {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use clap::Parser;
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -1387,6 +1505,70 @@ mod tests {
         state::{ActiveTurn, AgentRequest, AppState},
         transcript::{EntryKind, EntryStatus},
     };
+
+    #[test]
+    fn fatal_provider_quota_errors_open_a_cooldown_for_new_workers() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let config = crate::config::Config::try_parse_from([
+            "nakode",
+            "--workspace",
+            directory.path().to_str().expect("workspace path"),
+        ])
+        .expect("config")
+        .validated()
+        .expect("validated config");
+        let (event_tx, events) = tokio::sync::mpsc::channel(1);
+        let mut registry = super::BackendRegistry {
+            commands: HashMap::new(),
+            subagent_commands: HashMap::new(),
+            subagent_providers: HashMap::from([(
+                "run-1".to_owned(),
+                crate::backend::DEVIN_PROVIDER.to_owned(),
+            )]),
+            events,
+            event_tx,
+            tasks: Vec::new(),
+            failures: Vec::new(),
+            config,
+            session_database: directory.path().join("sessions.sqlite3"),
+            provider_credentials: HashMap::new(),
+            provider_cooldowns: HashMap::new(),
+        };
+
+        registry.observe_provider_event(
+            &super::BackendSource::Subagent("run-1".to_owned()),
+            &BackendEvent::TurnCompleted {
+                turn_id: "turn-1".to_owned(),
+                outcome: TurnOutcome::Failed,
+                error: Some("Your daily usage quota has been exhausted".to_owned()),
+            },
+        );
+
+        let cooldown = registry
+            .active_cooldown(crate::backend::DEVIN_PROVIDER)
+            .expect("provider cooldown");
+        assert!(cooldown.0 > 0);
+        assert!(cooldown.1.contains("quota has been exhausted"));
+        assert!(
+            registry
+                .active_cooldown(crate::backend::CODEX_PROVIDER)
+                .is_none()
+        );
+
+        registry.observe_provider_event(
+            &super::BackendSource::Subagent("run-1".to_owned()),
+            &BackendEvent::TurnCompleted {
+                turn_id: "turn-2".to_owned(),
+                outcome: TurnOutcome::Completed,
+                error: None,
+            },
+        );
+        assert!(
+            registry
+                .active_cooldown(crate::backend::DEVIN_PROVIDER)
+                .is_none()
+        );
+    }
 
     #[test]
     fn only_primary_turn_completion_requests_a_chime() {

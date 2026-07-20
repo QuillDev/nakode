@@ -23,8 +23,8 @@ use crate::{
     },
     runtime::{
         AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
-        InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest, RuntimeSession,
-        RuntimeSessionStore, ToolCall,
+        InferenceFailure, InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest,
+        RuntimeSession, RuntimeSessionStore, ToolCall,
     },
 };
 
@@ -110,7 +110,7 @@ impl DevinProvider {
         request: InferenceRequest,
         events: mpsc::Sender<InferenceEvent>,
         cancellation: CancellationToken,
-    ) -> Result<InferenceOutput, String> {
+    ) -> Result<InferenceOutput, InferenceFailure> {
         let auth = get_user_jwt(&self.client, &self.base_url, &self.api_key).await?;
         let base_url = if auth.custom_api_server_url.trim().is_empty() {
             self.base_url.as_str()
@@ -135,9 +135,11 @@ impl DevinProvider {
         if !response.status().is_success() {
             let status = response.status();
             let detail = response.text().await.unwrap_or_default();
-            return Err(format!("Devin returned {status}: {detail}"));
+            return Err(format!("Devin returned {status}: {detail}").into());
         }
-        parse_connect_stream(response, events, cancellation).await
+        parse_connect_stream(response, events, cancellation)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -843,7 +845,7 @@ fn build_chat_request(
             fim_eot_prob_threshold: 1.0,
         }),
         tools,
-        disable_parallel_tool_calls: true,
+        disable_parallel_tool_calls: false,
         tool_choice: Some(protocol::ChatToolChoice {
             choice: Some(protocol::chat_tool_choice::Choice::OptionName(
                 "auto".to_owned(),
@@ -895,12 +897,13 @@ fn conversation_prompts(
         ConversationItem::ToolResult {
             call_id,
             output,
+            model_output,
             failed,
             ..
         } => vec![protocol::ChatMessagePrompt {
             message_id,
             source: 4,
-            prompt: output.clone(),
+            prompt: model_output.as_ref().unwrap_or(output).clone(),
             tool_calls: Vec::new(),
             tool_call_id: call_id.clone(),
             tool_result_is_error: *failed,
@@ -1139,6 +1142,7 @@ mod tests {
         assert_eq!(frame[0], CONNECT_COMPRESSED);
         assert_eq!(length, frame.len() - 5);
         assert_eq!(restored.chat_model_uid, "swe-native");
+        assert!(!restored.disable_parallel_tool_calls);
         let tool_names = restored
             .tools
             .iter()
@@ -1169,6 +1173,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn devin_receives_bounded_model_tool_output() {
+        let prompts = conversation_prompts(
+            "session-1",
+            0,
+            &ConversationItem::ToolResult {
+                call_id: "call-1".to_owned(),
+                title: Some("read".to_owned()),
+                output: "full transcript output".to_owned(),
+                model_output: Some("bounded model output".to_owned()),
+                failed: false,
+            },
+        );
+
+        assert_eq!(prompts[0].prompt, "bounded model output");
+    }
+
     fn test_request() -> InferenceRequest {
         InferenceRequest {
             session_id: "session-1".to_owned(),
@@ -1178,6 +1199,7 @@ mod tests {
                 text: "Inspect.".to_owned(),
             }],
             tools: Vec::new(),
+            reasoning_effort: None,
         }
     }
 }

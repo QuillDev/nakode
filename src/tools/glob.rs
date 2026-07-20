@@ -5,7 +5,9 @@ use ignore::WalkBuilder;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{Tool, ToolContext, ToolFuture, ToolResult, optional_u64, truncate_output};
+use super::{
+    Tool, ToolConcurrency, ToolContext, ToolFuture, ToolResult, optional_u64, truncate_output,
+};
 use crate::runtime::ToolDefinition;
 
 pub struct GlobTool;
@@ -37,6 +39,10 @@ impl Tool for GlobTool {
             .to_owned()
     }
 
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ReadOnly
+    }
+
     fn execute<'a>(
         &'a self,
         context: ToolContext<'a>,
@@ -49,8 +55,8 @@ impl Tool for GlobTool {
                 .and_then(Value::as_str)
                 .unwrap_or(".")
                 .to_owned();
-            let limit = match optional_u64(&arguments, "limit", 2_000) {
-                Ok(limit) => usize::try_from(limit.clamp(1, 10_000)).unwrap_or(10_000),
+            let limit = match optional_u64(&arguments, "limit", 200) {
+                Ok(limit) => usize::try_from(limit.clamp(1, 200)).unwrap_or(200),
                 Err(error) => return ToolResult::failure(error),
             };
             let workspace = context.workspace.to_path_buf();

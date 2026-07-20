@@ -401,6 +401,14 @@ pub enum BackendError {
     UnsupportedProvider { provider: String },
     #[error("provider {provider} is not enabled for new work")]
     ProviderUnavailable { provider: String },
+    #[error(
+        "provider {provider} is temporarily unavailable for {remaining_seconds}s after: {reason}"
+    )]
+    ProviderCoolingDown {
+        provider: String,
+        remaining_seconds: u64,
+        reason: String,
+    },
     #[error("failed to launch {backend} at {program}: {source}")]
     Spawn {
         backend: &'static str,

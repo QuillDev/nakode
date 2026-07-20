@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use directories::ProjectDirs;
@@ -279,10 +279,11 @@ impl SqliteSessionRepository {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let path = path.as_ref();
         let connection = Connection::open(path)?;
+        configure_connection(&connection)?;
         protect_path(path, 0o600)?;
-        connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;
+        execute_batch_with_busy_retry(
+            &connection,
+            "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS sessions (
                id TEXT PRIMARY KEY,
                provider TEXT NOT NULL,
@@ -395,6 +396,41 @@ impl SqliteSessionRepository {
             updated_at: row.get(7)?,
         })
     }
+}
+
+fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
+    connection.busy_timeout(Duration::from_secs(5))?;
+    execute_batch_with_busy_retry(connection, "PRAGMA journal_mode = WAL;")
+}
+
+fn execute_batch_with_busy_retry(
+    connection: &Connection,
+    statements: &str,
+) -> rusqlite::Result<()> {
+    const ATTEMPTS: usize = 100;
+    const RETRY_DELAY: Duration = Duration::from_millis(25);
+
+    for attempt in 0..ATTEMPTS {
+        match connection.execute_batch(statements) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_database_busy(&error) && attempt + 1 < ATTEMPTS => {
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the final database initialization attempt always returns")
+}
+
+fn is_database_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(details, _)
+            if matches!(
+                details.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 #[cfg(unix)]
@@ -1133,5 +1169,27 @@ mod tests {
             .is_some();
         assert!(!legacy_exists);
         Ok(())
+    }
+
+    #[test]
+    fn concurrent_repository_initialization_waits_for_schema_lock() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("concurrent.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    SqliteSessionRepository::open(path).expect("concurrent repository open");
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        for handle in handles {
+            handle.join().expect("repository thread");
+        }
     }
 }

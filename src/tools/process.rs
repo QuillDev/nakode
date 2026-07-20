@@ -27,11 +27,37 @@ pub struct ProcessResult {
     pub interrupted: bool,
 }
 
+pub struct CapturedProcessResult {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub interrupted: bool,
+}
+
 pub async fn run_process(
     workspace: &Path,
     request: ProcessRequest<'_>,
     cancellation: &CancellationToken,
 ) -> Result<ProcessResult, String> {
+    let captured = capture_process(workspace, request, cancellation).await?;
+    let mut output = captured.stdout;
+    output.extend(captured.stderr);
+    Ok(ProcessResult {
+        output: truncate_output(output),
+        success: captured.success,
+        exit_code: captured.exit_code,
+        timed_out: captured.timed_out,
+        interrupted: captured.interrupted,
+    })
+}
+
+pub async fn capture_process(
+    workspace: &Path,
+    request: ProcessRequest<'_>,
+    cancellation: &CancellationToken,
+) -> Result<CapturedProcessResult, String> {
     let mut command = Command::new(request.program);
     command
         .args(request.arguments)
@@ -85,16 +111,15 @@ pub async fn run_process(
             child.wait().await.map_err(|error| format!("failed to reap timed-out process: {error}"))?
         }
     };
-    let mut output = stdout_task
+    let stdout = stdout_task
         .await
         .map_err(|error| format!("stdout reader failed: {error}"))??;
-    output.extend(
-        stderr_task
-            .await
-            .map_err(|error| format!("stderr reader failed: {error}"))??,
-    );
-    Ok(ProcessResult {
-        output: truncate_output(output),
+    let stderr = stderr_task
+        .await
+        .map_err(|error| format!("stderr reader failed: {error}"))??;
+    Ok(CapturedProcessResult {
+        stdout,
+        stderr,
         success: status.success() && !timed_out && !interrupted,
         exit_code: status.code(),
         timed_out,
