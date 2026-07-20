@@ -122,8 +122,8 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
         "initialize",
         &json!({
             "clientInfo": {
-                "name": "nako-agent",
-                "title": "Nako Agent",
+                "name": "nakode",
+                "title": "Nakode",
                 "version": env!("CARGO_PKG_VERSION"),
             },
             "capabilities": {
@@ -587,7 +587,7 @@ async fn process_incoming_method(
                 &id,
                 Err(RpcError {
                     code: -32601,
-                    message: format!("Nako Agent does not support server request {method}"),
+                    message: format!("Nakode does not support server request {method}"),
                     data: None,
                 }),
             )
@@ -870,9 +870,11 @@ mod tests {
     use super::BackendConfig;
 
     #[test]
-    fn nako_codex_process_disables_native_multi_agent_tools() {
-        let config =
-            BackendConfig::codex(PathBuf::from("codex"), PathBuf::from("/tmp/nako-workspace"));
+    fn nakode_codex_process_disables_native_multi_agent_tools() {
+        let config = BackendConfig::codex(
+            PathBuf::from("codex"),
+            PathBuf::from("/tmp/nakode-workspace"),
+        );
         let args = config
             .args
             .iter()

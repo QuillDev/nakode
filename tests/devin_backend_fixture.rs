@@ -1,6 +1,6 @@
 use std::{error::Error, ffi::OsString, io, path::PathBuf, time::Duration};
 
-use nako_agent::{
+use nakode::{
     backend::{
         BackendCommand, BackendEvent, BackendHandle, BackendOperation, DEVIN_PROVIDER, DeltaKind,
         TurnOutcome,

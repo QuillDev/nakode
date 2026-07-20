@@ -3,40 +3,49 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
-/// Command-line and environment configuration for Nako Agent.
+/// Command-line and environment configuration for Nakode.
 #[derive(Clone, Debug, Parser)]
 #[command(
-    name = "nako-agent",
+    name = "nakode",
     version,
     about = "A provider-neutral terminal layer for native agent backends"
 )]
 pub struct Config {
     #[command(subcommand)]
-    pub command: Option<NakoAgentCommand>,
+    pub command: Option<NakodeCommand>,
     /// Workspace made available to enabled providers.
-    #[arg(long, env = "NAKO_AGENT_WORKSPACE", default_value = ".")]
+    #[arg(long, env = "NAKODE_WORKSPACE", default_value = ".")]
     pub workspace: PathBuf,
 
     /// Initial provider-qualified model (`provider/model`).
-    #[arg(long, env = "NAKO_AGENT_MODEL")]
+    #[arg(long, env = "NAKODE_MODEL")]
     pub model: Option<String>,
 
-    /// Resume a saved Nako Agent session by id (unique prefixes are accepted).
-    #[arg(long, env = "NAKO_AGENT_RESUME")]
+    /// Resume a saved Nakode session by id (unique prefixes are accepted).
+    #[arg(long, env = "NAKODE_RESUME")]
     pub resume: Option<String>,
 
     /// Maximum number of logical transcript entries retained in memory.
-    #[arg(long, env = "NAKO_AGENT_SCROLLBACK", default_value_t = 2_000)]
+    #[arg(long, env = "NAKODE_SCROLLBACK", default_value_t = 2_000)]
     pub scrollback: usize,
 
+    /// Percentage of the model context window that triggers proactive compaction.
+    #[arg(
+        long,
+        env = "NAKODE_COMPACTION_THRESHOLD_PERCENT",
+        default_value_t = 85,
+        value_parser = clap::value_parser!(u8).range(1..=100)
+    )]
+    pub compaction_threshold_percent: u8,
+
     /// Directory containing predefined TOML agent definitions.
-    #[arg(long, env = "NAKO_AGENT_AGENTS", default_value = ".nako-agent/agents")]
+    #[arg(long, env = "NAKODE_AGENTS", default_value = ".nakode/agents")]
     pub agents: PathBuf,
 }
 
 #[derive(Clone, Debug, Subcommand)]
-pub enum NakoAgentCommand {
-    /// Invoke a predefined agent through the running Nako Agent control service.
+pub enum NakodeCommand {
+    /// Invoke a predefined agent through the running Nakode control service.
     Agent {
         agent_slug: String,
         #[arg(long)]
@@ -69,7 +78,43 @@ impl Config {
     ///
     /// Returns an error when the supplied configuration is invalid.
     pub fn load() -> Result<Self, ConfigError> {
-        Self::parse().validated()
+        let mut config = Self::parse();
+        config.apply_legacy_environment();
+        config.validated()
+    }
+
+    fn apply_legacy_environment(&mut self) {
+        if std::env::var_os("NAKODE_WORKSPACE").is_none()
+            && self.workspace == Path::new(".")
+            && let Some(workspace) = std::env::var_os("NAKO_AGENT_WORKSPACE")
+        {
+            self.workspace = workspace.into();
+        }
+        if std::env::var_os("NAKODE_MODEL").is_none()
+            && self.model.is_none()
+            && let Some(model) = std::env::var_os("NAKO_AGENT_MODEL")
+        {
+            self.model = Some(model.to_string_lossy().into_owned());
+        }
+        if std::env::var_os("NAKODE_RESUME").is_none()
+            && self.resume.is_none()
+            && let Some(resume) = std::env::var_os("NAKO_AGENT_RESUME")
+        {
+            self.resume = Some(resume.to_string_lossy().into_owned());
+        }
+        if std::env::var_os("NAKODE_SCROLLBACK").is_none()
+            && self.scrollback == 2_000
+            && let Some(scrollback) = std::env::var_os("NAKO_AGENT_SCROLLBACK")
+                .and_then(|value| value.to_string_lossy().parse().ok())
+        {
+            self.scrollback = scrollback;
+        }
+        if std::env::var_os("NAKODE_AGENTS").is_none()
+            && self.agents == Path::new(".nakode/agents")
+            && let Some(agents) = std::env::var_os("NAKO_AGENT_AGENTS")
+        {
+            self.agents = agents.into();
+        }
     }
 
     /// Validates and normalizes this configuration.
@@ -87,7 +132,14 @@ impl Config {
 
         self.workspace = canonicalize(&self.workspace)?;
         if self.agents.is_relative() {
-            self.agents = self.workspace.join(&self.agents);
+            let uses_default = self.agents == Path::new(".nakode/agents");
+            let configured = self.workspace.join(&self.agents);
+            let legacy = self.workspace.join(".nako-agent/agents");
+            self.agents = if uses_default && !configured.exists() && legacy.exists() {
+                legacy
+            } else {
+                configured
+            };
         }
         self.scrollback = self.scrollback.max(100);
         self.model = self
@@ -123,23 +175,37 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ConfigError> {
 mod tests {
     use clap::Parser;
 
-    use super::{Config, NakoAgentCommand};
+    use super::{Config, NakodeCommand};
 
     #[test]
     fn backend_flag_is_not_part_of_the_cli() {
-        assert!(Config::try_parse_from(["nako-agent", "--backend", "devin"]).is_err());
-        assert!(Config::try_parse_from(["nako-agent"]).is_ok());
+        assert!(Config::try_parse_from(["nakode", "--backend", "devin"]).is_err());
+        assert!(Config::try_parse_from(["nakode"]).is_ok());
+    }
+
+    #[test]
+    fn compaction_threshold_defaults_to_85_percent_and_is_bounded() {
+        let config = Config::try_parse_from(["nakode"]).expect("default config");
+        assert_eq!(config.compaction_threshold_percent, 85);
+        assert!(Config::try_parse_from(["nakode", "--compaction-threshold-percent", "1"]).is_ok());
+        assert!(
+            Config::try_parse_from(["nakode", "--compaction-threshold-percent", "100"]).is_ok()
+        );
+        assert!(Config::try_parse_from(["nakode", "--compaction-threshold-percent", "0"]).is_err());
+        assert!(
+            Config::try_parse_from(["nakode", "--compaction-threshold-percent", "101"]).is_err()
+        );
     }
 
     #[test]
     fn initial_model_requires_provider_qualification() {
-        assert!(Config::try_parse_from(["nako-agent", "--model", "model-only"]).is_ok());
-        let invalid = Config::try_parse_from(["nako-agent", "--model", "model-only"])
+        assert!(Config::try_parse_from(["nakode", "--model", "model-only"]).is_ok());
+        let invalid = Config::try_parse_from(["nakode", "--model", "model-only"])
             .expect("CLI parse")
             .validated();
         assert!(matches!(invalid, Err(super::ConfigError::InvalidModel(_))));
         assert!(
-            Config::try_parse_from(["nako-agent", "--model", "openai-codex/gpt-5"])
+            Config::try_parse_from(["nakode", "--model", "openai-codex/gpt-5"])
                 .expect("CLI parse")
                 .validated()
                 .is_ok()
@@ -147,9 +213,26 @@ mod tests {
     }
 
     #[test]
+    fn default_agent_directory_falls_back_to_the_legacy_location() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let legacy = workspace.path().join(".nako-agent/agents");
+        std::fs::create_dir_all(&legacy).expect("legacy agent directory");
+        let config = Config::try_parse_from([
+            "nakode",
+            "--workspace",
+            workspace.path().to_str().expect("UTF-8 workspace"),
+        ])
+        .expect("CLI parse")
+        .validated()
+        .expect("validated config");
+
+        assert_eq!(config.agents, legacy);
+    }
+
+    #[test]
     fn agent_command_requires_a_slug_and_session_id() {
         let config = Config::try_parse_from([
-            "nako-agent",
+            "nakode",
             "agent",
             "reviewer",
             "--session-id=session-7",
@@ -159,12 +242,12 @@ mod tests {
 
         assert!(matches!(
             config.command,
-            Some(NakoAgentCommand::Agent {
+            Some(NakodeCommand::Agent {
                 agent_slug,
                 session_id,
                 task,
             }) if agent_slug == "reviewer" && session_id == "session-7" && task == "Review auth"
         ));
-        assert!(Config::try_parse_from(["nako-agent", "agent", "explorer"]).is_err());
+        assert!(Config::try_parse_from(["nakode", "agent", "explorer"]).is_err());
     }
 }

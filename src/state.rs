@@ -9,8 +9,8 @@ use crate::{
     agent::{AgentCatalog, AgentDefinition},
     backend::{
         ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent, BackendOperation,
-        CODEX_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem,
-        QuestionRequest, SessionHistoryItem, TodoPhase, TurnOutcome,
+        CODEX_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus, ModelInfo,
+        NormalizedItem, QuestionRequest, SessionHistoryItem, TodoPhase, TurnOutcome,
     },
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
@@ -52,6 +52,15 @@ pub struct ActiveTurn {
     pub id: String,
     pub model: Option<String>,
     pub cancelling: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextCompactionState {
+    pub id: String,
+    pub turn_id: String,
+    pub reason: CompactionReason,
+    pub estimated_tokens: usize,
+    pub context_window: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -383,6 +392,7 @@ pub struct AppState {
     pub provider_session_id: Option<String>,
     pub session_id: Option<String>,
     pub active_turn: Option<ActiveTurn>,
+    pub context_compaction: Option<ContextCompactionState>,
     pub editor: EditorState,
     pub transcript: Transcript,
     pub queue: VecDeque<QueuedPrompt>,
@@ -404,8 +414,8 @@ pub struct AppState {
     pub scroll_from_bottom: usize,
     pub status_message: String,
     pub diagnostic_count: usize,
-    pub nako_session_id: String,
-    nako_executable: String,
+    pub nakode_session_id: String,
+    nakode_executable: String,
     pub subagents: Vec<SubagentRun>,
     pub subagent_modal: Option<String>,
     pub should_quit: bool,
@@ -483,6 +493,7 @@ impl AppState {
             provider_session_id: None,
             session_id: None,
             active_turn: None,
+            context_compaction: None,
             editor: EditorState::default(),
             transcript,
             queue: VecDeque::new(),
@@ -504,8 +515,8 @@ impl AppState {
             scroll_from_bottom: 0,
             status_message: format!("Connecting to {backend_name}…"),
             diagnostic_count: 0,
-            nako_session_id: uuid::Uuid::now_v7().to_string(),
-            nako_executable: "nako-agent".to_owned(),
+            nakode_session_id: uuid::Uuid::now_v7().to_string(),
+            nakode_executable: "nakode".to_owned(),
             subagents: Vec::new(),
             subagent_modal: None,
             should_quit: false,
@@ -523,7 +534,7 @@ impl AppState {
             screen_snapshot: None,
             pending_clipboard: None,
             agents: AgentCatalog::default(),
-            agent_directory: PathBuf::from(".nako-agent/agents"),
+            agent_directory: PathBuf::from(".nakode/agents"),
             subagent_executions: HashMap::new(),
             subagent_chats: HashMap::new(),
             subagent_hit_regions: Vec::new(),
@@ -685,8 +696,8 @@ impl AppState {
             })
     }
 
-    pub fn set_nako_executable(&mut self, executable: &Path) {
-        self.nako_executable = executable.to_string_lossy().into_owned();
+    pub fn set_nakode_executable(&mut self, executable: &Path) {
+        self.nakode_executable = executable.to_string_lossy().into_owned();
     }
 
     #[must_use]
@@ -1452,6 +1463,7 @@ impl AppState {
         self.session_model_override = false;
         self.selected_model = self.default_model();
         self.active_turn = None;
+        self.context_compaction = None;
         self.creating_session = None;
         self.pending_session_prompt = None;
         self.starting_turn = None;
@@ -1471,7 +1483,7 @@ impl AppState {
         self.transcript.clear();
         self.transcript.push(
             EntryKind::System,
-            "NAKO AGENT",
+            "NAKODE",
             "New session. Send a message to begin.",
             EntryStatus::Complete,
         );
@@ -1581,10 +1593,10 @@ impl AppState {
 
         active.cancelling = true;
         self.status_message = if interrupted_subagents == 0 {
-            "Interrupting active turn… Press Ctrl+C again to exit Nako Agent.".to_owned()
+            "Interrupting active turn… Press Ctrl+C again to exit Nakode.".to_owned()
         } else {
             format!(
-                "Interrupting active turn and {interrupted_subagents} subagent(s)… Press Ctrl+C again to exit Nako Agent."
+                "Interrupting active turn and {interrupted_subagents} subagent(s)… Press Ctrl+C again to exit Nakode."
             )
         };
         effects.push(Effect::Backend(BackendCommand::InterruptTurn {
@@ -2089,6 +2101,10 @@ impl AppState {
     }
 
     pub fn handle_backend(&mut self, event: BackendEvent) -> Vec<Effect> {
+        let event = match self.reduce_context_compaction_event(event) {
+            Ok(effects) => return effects,
+            Err(event) => event,
+        };
         match event {
             BackendEvent::Ready(identity) => return self.handle_ready(identity),
             BackendEvent::Models(models) => return self.handle_models(models),
@@ -2110,6 +2126,9 @@ impl AppState {
             BackendEvent::TodoUpdated { phases } => self.todo_phases = phases,
             BackendEvent::AuthenticationChallenge { .. }
             | BackendEvent::AuthenticationCompleted { .. }
+            | BackendEvent::ContextCompactionStarted { .. }
+            | BackendEvent::ContextCompactionCompleted { .. }
+            | BackendEvent::ContextCompactionFailed { .. }
             | BackendEvent::SessionUnsubscribed => {}
             BackendEvent::SessionObserved {
                 provider_session_id,
@@ -2179,6 +2198,53 @@ impl AppState {
             BackendEvent::Disconnected { reason } => self.handle_disconnected(reason),
         }
         Vec::new()
+    }
+
+    fn reduce_context_compaction_event(
+        &mut self,
+        event: BackendEvent,
+    ) -> Result<Vec<Effect>, BackendEvent> {
+        match event {
+            BackendEvent::ContextCompactionStarted {
+                compaction_id,
+                turn_id,
+                reason,
+                estimated_tokens,
+                context_window,
+            } => {
+                self.context_compaction_started(
+                    compaction_id,
+                    turn_id,
+                    reason,
+                    estimated_tokens,
+                    context_window,
+                );
+                Ok(Vec::new())
+            }
+            BackendEvent::ContextCompactionCompleted {
+                compaction_id,
+                turn_id,
+                estimated_tokens_before,
+                estimated_tokens_after,
+            } => {
+                self.context_compaction_completed(
+                    &compaction_id,
+                    &turn_id,
+                    estimated_tokens_before,
+                    estimated_tokens_after,
+                );
+                Ok(Vec::new())
+            }
+            BackendEvent::ContextCompactionFailed {
+                compaction_id,
+                turn_id,
+                message,
+            } => {
+                self.context_compaction_failed(&compaction_id, &turn_id, &message);
+                Ok(Vec::new())
+            }
+            event => Err(event),
+        }
     }
 
     fn handle_ready(&mut self, identity: crate::backend::BackendIdentity) -> Vec<Effect> {
@@ -2270,6 +2336,7 @@ impl AppState {
             return self.protocol_problem("session creation returned an empty provider id");
         }
         self.provider_session_id = Some(provider_session_id.clone());
+        self.context_compaction = None;
         self.creating_session = None;
         if !model.is_empty() {
             let qualified = self.qualify_active_model(model);
@@ -2306,6 +2373,7 @@ impl AppState {
         }
         self.provider_session_id = Some(provider_session_id);
         self.session_id = Some(session.id.clone());
+        self.context_compaction = None;
         if !model.is_empty() {
             self.selected_model = Some(self.qualify_active_model(model));
             self.session_model_override = true;
@@ -2317,6 +2385,96 @@ impl AppState {
             Effect::TouchSession(session.id.clone()),
             Effect::LoadSubagents(session.id),
         ]
+    }
+
+    fn context_compaction_started(
+        &mut self,
+        compaction_id: String,
+        turn_id: String,
+        reason: CompactionReason,
+        estimated_tokens: usize,
+        context_window: Option<usize>,
+    ) {
+        if !self.turn_is_current(&turn_id) {
+            self.diagnostic_count += 1;
+            return;
+        }
+        self.context_compaction = Some(ContextCompactionState {
+            id: compaction_id.clone(),
+            turn_id,
+            reason,
+            estimated_tokens,
+            context_window,
+        });
+        let reason_label = match reason {
+            CompactionReason::Proactive => "proactive threshold reached",
+            CompactionReason::ContextOverflow => "context limit reached",
+        };
+        let body = context_window.map_or_else(
+            || format!("Reducing approximately {estimated_tokens} tokens because the {reason_label}."),
+            |context_window| {
+                format!(
+                    "Reducing approximately {estimated_tokens} of {context_window} context tokens because the {reason_label}."
+                )
+            },
+        );
+        self.transcript.upsert(
+            compaction_id,
+            EntryKind::System,
+            "Compacting context",
+            body,
+            EntryStatus::Running,
+        );
+    }
+
+    fn context_compaction_completed(
+        &mut self,
+        compaction_id: &str,
+        turn_id: &str,
+        estimated_tokens_before: usize,
+        estimated_tokens_after: usize,
+    ) {
+        if self.context_compaction.as_ref().is_none_or(|compaction| {
+            compaction.turn_id != turn_id || compaction.id != compaction_id
+        }) {
+            self.diagnostic_count += 1;
+            return;
+        }
+        let reason = self
+            .context_compaction
+            .take()
+            .map_or(CompactionReason::Proactive, |compaction| compaction.reason);
+        let reason = match reason {
+            CompactionReason::Proactive => "the proactive context threshold was reached",
+            CompactionReason::ContextOverflow => "the provider reported a context limit",
+        };
+        self.transcript.upsert(
+            compaction_id,
+            EntryKind::System,
+            "Context compacted",
+            format!(
+                "Reduced estimated context from {estimated_tokens_before} to {estimated_tokens_after} tokens because {reason}."
+            ),
+            EntryStatus::Complete,
+        );
+    }
+
+    fn context_compaction_failed(&mut self, compaction_id: &str, turn_id: &str, message: &str) {
+        if self.context_compaction.as_ref().is_none_or(|compaction| {
+            compaction.turn_id != turn_id || compaction.id != compaction_id
+        }) {
+            self.diagnostic_count += 1;
+            return;
+        }
+        self.context_compaction = None;
+        self.diagnostic_count += 1;
+        self.transcript.upsert(
+            compaction_id,
+            EntryKind::Warning,
+            "Context compaction failed",
+            format!("Could not compact context: {message}"),
+            EntryStatus::Failed,
+        );
     }
 
     fn observe_turn_artifact(
@@ -2412,6 +2570,7 @@ impl AppState {
         self.transcript.set_stream_active(false);
         self.provider_session_id = None;
         self.active_turn = None;
+        self.context_compaction = None;
         self.creating_session = None;
         self.pending_steer = None;
         self.approvals.clear();
@@ -2429,6 +2588,7 @@ impl AppState {
         self.transcript.set_stream_active(false);
         self.connection = ConnectionState::Disconnected(reason.clone());
         self.active_turn = None;
+        self.context_compaction = None;
         self.creating_session = None;
         self.pending_steer = None;
         self.transcript.push(
@@ -2493,7 +2653,7 @@ impl AppState {
             self.status_message = format!("Creating a {} session…", self.backend_name);
             vec![Effect::Backend(BackendCommand::StartSession {
                 model: prompt.model,
-                instructions: Some(self.nako_system_instructions()),
+                instructions: Some(self.nakode_system_instructions()),
             })]
         }
     }
@@ -2573,6 +2733,7 @@ impl AppState {
             .retain(|_, item_turn_id| item_turn_id != turn_id);
 
         self.active_turn = None;
+        self.context_compaction = None;
         self.starting_turn = None;
         self.transcript.set_stream_active(false);
         if self
@@ -2646,7 +2807,7 @@ impl AppState {
         if self.transcript.entries().is_empty() {
             self.transcript.push(
                 EntryKind::System,
-                "NAKO AGENT",
+                "NAKODE",
                 "Resumed session has no visible history.",
                 EntryStatus::Complete,
             );
@@ -2883,8 +3044,8 @@ impl AppState {
         effects
     }
 
-    fn nako_system_instructions(&self) -> String {
-        let executable = shell_quote(&self.nako_executable);
+    fn nakode_system_instructions(&self) -> String {
+        let executable = shell_quote(&self.nakode_executable);
         let agents = self
             .agents
             .definitions()
@@ -2896,7 +3057,7 @@ impl AppState {
                     agent.description.trim(),
                     executable,
                     agent.slug,
-                    self.nako_session_id,
+                    self.nakode_session_id,
                 )
             })
             .collect::<Vec<_>>()
@@ -2906,8 +3067,8 @@ impl AppState {
             |model| format!("{}/{}", self.backend_provider, model),
         );
         format!(
-            "[Nako Agent System Instructions]\nYou are operating inside Nako Agent.\nSession ID: {}\nModel: {}\nProvider: {}\nNako Agent invocation is available through the native shell. It is a Nako Agent control-plane command, not a provider tool.\nAvailable agents:\n{}\nTo delegate a concrete bounded task, execute the matching absolute-path command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed above. Use only these Nako Agent commands for delegation; do not use provider-native subagent or collaboration features because Nako Agent cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one command per task concurrently using the provider's native shell facilities. Keep each objective distinct and bounded. Each command returns its own agent result on stdout when that child finishes; incorporate all relevant results into your response.\n[/Nako Agent System Instructions]",
-            self.nako_session_id,
+            "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode invocation is available through the native shell. It is a Nakode control-plane command, not a provider tool.\nAvailable agents:\n{}\nTo delegate a concrete bounded task, execute the matching absolute-path command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed above. Use only these Nakode commands for delegation; do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one command per task concurrently using the provider's native shell facilities. Keep each objective distinct and bounded. Each command returns its own agent result on stdout when that child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
+            self.nakode_session_id,
             model,
             self.backend_provider,
             if agents.is_empty() { "- none" } else { &agents },
@@ -2935,6 +3096,14 @@ impl AppState {
     }
 
     fn reduce_subagent_backend(&mut self, run_id: &str, event: BackendEvent) -> Vec<Effect> {
+        let event = match self.reduce_subagent_compaction_event(run_id, event) {
+            Ok(effects) => return effects,
+            Err(event) => event,
+        };
+        let event = match self.reduce_subagent_artifact_event(run_id, event) {
+            Ok(effects) => return effects,
+            Err(event) => event,
+        };
         match event {
             BackendEvent::Ready(_) => self.start_subagent_session(run_id),
             BackendEvent::SessionCreated {
@@ -2950,26 +3119,6 @@ impl AppState {
             BackendEvent::ItemStarted { item, .. } | BackendEvent::ItemCompleted { item, .. } => {
                 self.record_subagent_item(run_id, &item);
                 self.observe_subagent_item(run_id, item);
-                Vec::new()
-            }
-            BackendEvent::TurnDiff { turn_id, diff } => {
-                self.record_subagent_artifact(
-                    run_id,
-                    format!("turn:{turn_id}:diff"),
-                    EntryKind::Diff,
-                    "DIFF",
-                    diff,
-                );
-                Vec::new()
-            }
-            BackendEvent::TurnPlan { turn_id, plan } => {
-                self.record_subagent_artifact(
-                    run_id,
-                    format!("turn:{turn_id}:plan"),
-                    EntryKind::System,
-                    "PLAN",
-                    plan,
-                );
                 Vec::new()
             }
             BackendEvent::ApprovalRequested(approval) => vec![Effect::SubagentBackend {
@@ -3029,12 +3178,74 @@ impl AppState {
             | BackendEvent::SessionObserved { .. }
             | BackendEvent::TurnAccepted { .. }
             | BackendEvent::TurnStarted { .. }
+            | BackendEvent::ContextCompactionStarted { .. }
+            | BackendEvent::ContextCompactionCompleted { .. }
+            | BackendEvent::ContextCompactionFailed { .. }
+            | BackendEvent::TurnDiff { .. }
+            | BackendEvent::TurnPlan { .. }
             | BackendEvent::ApprovalResolved { .. }
             | BackendEvent::SteerAccepted { .. }
             | BackendEvent::InterruptAccepted
             | BackendEvent::ModelRerouted { .. }
             | BackendEvent::SessionClosed { .. } => Vec::new(),
         }
+    }
+
+    fn reduce_subagent_compaction_event(
+        &mut self,
+        run_id: &str,
+        event: BackendEvent,
+    ) -> Result<Vec<Effect>, BackendEvent> {
+        let activity = match event {
+            BackendEvent::ContextCompactionStarted { .. } => "Compacting context…".to_owned(),
+            BackendEvent::ContextCompactionCompleted {
+                estimated_tokens_before,
+                estimated_tokens_after,
+                ..
+            } => format!(
+                "Context compacted ({estimated_tokens_before} → {estimated_tokens_after} estimated tokens)"
+            ),
+            BackendEvent::ContextCompactionFailed { message, .. } => {
+                self.record_subagent_message(
+                    run_id,
+                    EntryKind::Warning,
+                    "COMPACTION FAILED",
+                    &message,
+                );
+                summarize_activity(&message, "Compaction failed")
+            }
+            event => return Err(event),
+        };
+        let Some(execution) = self.subagent_executions.get_mut(run_id) else {
+            return Ok(Vec::new());
+        };
+        activity.clone_into(&mut execution.run.latest_activity);
+        self.sync_subagent(run_id);
+        Ok(Vec::new())
+    }
+
+    fn reduce_subagent_artifact_event(
+        &mut self,
+        run_id: &str,
+        event: BackendEvent,
+    ) -> Result<Vec<Effect>, BackendEvent> {
+        let (id, kind, title, body) = match event {
+            BackendEvent::TurnDiff { turn_id, diff } => (
+                format!("turn:{turn_id}:diff"),
+                EntryKind::Diff,
+                "DIFF",
+                diff,
+            ),
+            BackendEvent::TurnPlan { turn_id, plan } => (
+                format!("turn:{turn_id}:plan"),
+                EntryKind::System,
+                "PLAN",
+                plan,
+            ),
+            event => return Err(event),
+        };
+        self.record_subagent_artifact(run_id, id, kind, title, body);
+        Ok(Vec::new())
     }
 
     fn handle_subagent_delta(
@@ -3518,7 +3729,7 @@ impl AppState {
     }
 
     fn next_id(&mut self, kind: &str) -> String {
-        let id = format!("nako-{kind}-{:06}", self.next_local_id);
+        let id = format!("nakode-{kind}-{:06}", self.next_local_id);
         self.next_local_id = self.next_local_id.wrapping_add(1);
         id
     }
@@ -3611,7 +3822,7 @@ fn agent_model_target_label(target: &AgentModelTarget) -> String {
 }
 
 fn is_subagent_invocation(text: &str) -> bool {
-    text.contains("nako-agent") && text.contains(" agent ")
+    text.contains("nakode") && text.contains(" agent ")
 }
 
 fn hides_subagent_item(item: &NormalizedItem) -> bool {
@@ -3625,6 +3836,9 @@ fn is_subagent_persistence_boundary(event: &BackendEvent) -> bool {
     matches!(
         event,
         BackendEvent::SessionCreated { .. }
+            | BackendEvent::ContextCompactionStarted { .. }
+            | BackendEvent::ContextCompactionCompleted { .. }
+            | BackendEvent::ContextCompactionFailed { .. }
             | BackendEvent::ItemCompleted { .. }
             | BackendEvent::TurnDiff { .. }
             | BackendEvent::TurnPlan { .. }
@@ -3643,9 +3857,10 @@ mod tests {
         agent::AgentCatalog,
         backend::{
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
-            BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, DEVIN_PROVIDER,
-            DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem, QuestionOption,
-            QuestionRequest, SessionHistoryItem, TodoItem, TodoPhase, TodoStatus, TurnOutcome,
+            BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, CompactionReason,
+            DEVIN_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem,
+            QuestionOption, QuestionRequest, SessionHistoryItem, TodoItem, TodoPhase, TodoStatus,
+            TurnOutcome,
         },
         session::{SessionRecord, SubagentRecord},
         transcript::{EntryKind, EntryStatus, TranscriptEntry},
@@ -3728,6 +3943,85 @@ model = "openai-codex/model-a"
         assert!(state.steer_editor().is_empty());
         assert_eq!(state.editor.text(), "steer");
         assert!(state.status_message.contains("does not support steering"));
+    }
+
+    #[test]
+    fn compaction_lifecycle_updates_ui_state_without_exposing_the_checkpoint() {
+        let mut state = ready_state();
+        state.handle_backend(BackendEvent::TurnStarted {
+            turn_id: "turn-compact".to_owned(),
+        });
+        state.handle_backend(BackendEvent::ContextCompactionStarted {
+            compaction_id: "compact-1".to_owned(),
+            turn_id: "turn-compact".to_owned(),
+            reason: CompactionReason::Proactive,
+            estimated_tokens: 220_000,
+            context_window: Some(258_400),
+        });
+
+        let compaction = state
+            .context_compaction
+            .as_ref()
+            .expect("active compaction state");
+        assert_eq!(compaction.reason, CompactionReason::Proactive);
+        assert_eq!(compaction.id, "compact-1");
+        let running = state
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.key.as_deref() == Some("compact-1"))
+            .expect("running compaction entry");
+        assert_eq!(running.title, "Compacting context");
+        assert_eq!(running.status, EntryStatus::Running);
+        assert!(running.body.contains("220000 of 258400"));
+
+        state.handle_backend(BackendEvent::ContextCompactionCompleted {
+            compaction_id: "compact-1".to_owned(),
+            turn_id: "turn-compact".to_owned(),
+            estimated_tokens_before: 220_000,
+            estimated_tokens_after: 24_000,
+        });
+
+        assert!(state.context_compaction.is_none());
+        let completed = state
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.key.as_deref() == Some("compact-1"))
+            .expect("completed compaction entry");
+        assert_eq!(completed.title, "Context compacted");
+        assert_eq!(completed.status, EntryStatus::Complete);
+        assert!(completed.body.contains("220000 to 24000"));
+        assert!(!state.status_message.contains("ompact"));
+    }
+
+    #[test]
+    fn compaction_failure_clears_ui_state_and_surfaces_a_warning() {
+        let mut state = ready_state();
+        state.handle_backend(BackendEvent::TurnStarted {
+            turn_id: "turn-compact".to_owned(),
+        });
+        state.handle_backend(BackendEvent::ContextCompactionStarted {
+            compaction_id: "compact-failed".to_owned(),
+            turn_id: "turn-compact".to_owned(),
+            reason: CompactionReason::ContextOverflow,
+            estimated_tokens: 300_000,
+            context_window: Some(258_400),
+        });
+        state.handle_backend(BackendEvent::ContextCompactionFailed {
+            compaction_id: "compact-failed".to_owned(),
+            turn_id: "turn-compact".to_owned(),
+            message: "summary request failed".to_owned(),
+        });
+
+        assert!(state.context_compaction.is_none());
+        assert!(state.transcript.entries().iter().any(|entry| {
+            entry.key.as_deref() == Some("compact-failed")
+                && entry.title == "Context compaction failed"
+                && entry.body.contains("summary request failed")
+                && entry.status == EntryStatus::Failed
+        }));
+        assert!(!state.status_message.contains("ompaction"));
     }
 
     #[test]
@@ -3820,7 +4114,7 @@ model = "openai-codex/model-a"
     fn queue_drains_fifo_after_terminal_turn_event() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
-        state.session_id = Some("nako-session-1".to_owned());
+        state.session_id = Some("nakode-session-1".to_owned());
         state.editor.set_text("first");
         let first = state.submit_editor();
         assert!(matches!(first.as_slice(), [Effect::Backend(_)]));
@@ -3962,7 +4256,7 @@ model = "openai-codex/model-a"
     }
 
     #[test]
-    fn prompt_lifecycle_drives_the_nako_stream_spinner() {
+    fn prompt_lifecycle_drives_the_nakode_stream_spinner() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
         state.editor.set_text("inspect the project");
@@ -3986,13 +4280,9 @@ model = "openai-codex/model-a"
         });
 
         let complete = state.transcript.visible(80, 10, 0);
-        assert!(
-            complete
-                .lines
-                .iter()
-                .any(|line| line.text == "Nako"
-                    && line.tone == crate::transcript::LineTone::Assistant)
-        );
+        assert!(complete.lines.iter().any(
+            |line| line.text == "Nakode" && line.tone == crate::transcript::LineTone::Assistant
+        ));
         assert!(
             !complete
                 .lines
@@ -4005,7 +4295,7 @@ model = "openai-codex/model-a"
     fn start_turn_timeout_does_not_launch_the_next_queued_prompt() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
-        state.session_id = Some("nako-session-1".to_owned());
+        state.session_id = Some("nakode-session-1".to_owned());
         state.editor.set_text("first");
         state.submit_editor();
         state.editor.set_text("second");
@@ -4219,7 +4509,7 @@ model = "openai-codex/model-a"
                 id: "agent-command".to_owned(),
                 kind: ItemKind::Tool,
                 title: "bash".to_owned(),
-                body: "'/opt/nako-agent' agent explorer --session-id=session-1".to_owned(),
+                body: "'/opt/nakode' agent explorer --session-id=session-1".to_owned(),
                 status: ItemStatus::Running,
             },
         });
@@ -4612,7 +4902,7 @@ model = "openai-codex/model-a"
         };
 
         assert_eq!(title, "What is my name?");
-        assert!(prompt.contains("# Nako Agent continuity handoff"));
+        assert!(prompt.contains("# Nakode continuity handoff"));
         assert!(prompt.contains("My name is Quill."));
         assert!(prompt.contains("Nice to meet you."));
         assert!(prompt.ends_with("What is my name?"));
@@ -4676,10 +4966,10 @@ model = "openai-codex/model-a"
     }
 
     #[test]
-    fn new_session_receives_nako_identity_and_agent_instructions() {
+    fn new_session_receives_nakode_identity_and_agent_instructions() {
         let mut state = ready_state();
         state.install_agents(explorer_catalog());
-        state.set_nako_executable(Path::new("/opt/nako/bin/nako-agent"));
+        state.set_nakode_executable(Path::new("/opt/nakode/bin/nakode"));
         state.selected_model = Some("model-a".to_owned());
         state.editor.set_text("Start work");
 
@@ -4691,23 +4981,23 @@ model = "openai-codex/model-a"
             }),
         ] = effects.as_slice()
         else {
-            panic!("expected session creation with Nako Agent instructions");
+            panic!("expected session creation with Nakode instructions");
         };
 
-        assert!(instructions.starts_with("[Nako Agent System Instructions]"));
-        assert!(instructions.contains(&format!("Session ID: {}", state.nako_session_id)));
+        assert!(instructions.starts_with("[Nakode System Instructions]"));
+        assert!(instructions.contains(&format!("Session ID: {}", state.nakode_session_id)));
         assert!(instructions.contains("Model: openai-codex/model-a"));
         assert!(instructions.contains("Provider: openai-codex"));
         assert!(instructions.contains("- explorer: Explores code context"));
         assert!(instructions.contains(&format!(
-            "'/opt/nako/bin/nako-agent' agent explorer --session-id={}",
-            state.nako_session_id
+            "'/opt/nakode/bin/nakode' agent explorer --session-id={}",
+            state.nakode_session_id
         )));
         assert!(instructions.contains("execute the matching absolute-path command exactly"));
         assert!(instructions.contains("Up to 4 subagents may run concurrently"));
         assert!(instructions.contains("launch one command per task concurrently"));
         assert!(instructions.contains("do not use provider-native subagent"));
-        assert!(instructions.ends_with("[/Nako Agent System Instructions]"));
+        assert!(instructions.ends_with("[/Nakode System Instructions]"));
     }
 
     #[test]
@@ -5121,7 +5411,7 @@ model = "openai-codex/model-a"
             BackendEvent::AuthenticationChallenge {
                 login_id: "login-1".to_owned(),
                 verification_url: "https://example.test/device".to_owned(),
-                user_code: "NAKO-CODE".to_owned(),
+                user_code: "NAKODE-CODE".to_owned(),
             },
         );
         assert!(matches!(
@@ -5130,7 +5420,7 @@ model = "openai-codex/model-a"
                 .as_ref()
                 .and_then(|picker| picker.authentication.as_ref()),
             Some(super::ProviderAuthentication::Challenge { user_code, .. })
-                if user_code == "NAKO-CODE"
+                if user_code == "NAKODE-CODE"
         ));
     }
 }

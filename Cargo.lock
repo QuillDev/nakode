@@ -1351,7 +1351,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nako-agent"
+name = "nakode"
 version = "0.1.0"
 dependencies = [
  "anyhow",

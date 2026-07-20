@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use nako_agent::pty::PtySession;
+use nakode::pty::PtySession;
 use portable_pty::PtySize;
 
 #[test]
@@ -16,7 +16,7 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
 
     let mut session = PtySession::spawn(
-        env!("CARGO_BIN_EXE_nako-agent"),
+        env!("CARGO_BIN_EXE_nakode"),
         [
             OsString::from("--workspace"),
             temp.path().as_os_str().to_owned(),
@@ -47,7 +47,7 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     });
 
     thread::sleep(Duration::from_millis(750));
-    session.writer().write_all(b"NAKO")?;
+    session.writer().write_all(b"NAKODE")?;
     session.writer().flush()?;
     thread::sleep(Duration::from_millis(150));
     // Select the composer text (SGR mouse coordinates are 1-based).
@@ -55,8 +55,8 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     // press before interpreting the drag and release.
     for event in [
         b"\x1b[<0;2;24M".as_slice(),
-        b"\x1b[<32;6;24M".as_slice(),
-        b"\x1b[<0;6;24m".as_slice(),
+        b"\x1b[<32;8;24M".as_slice(),
+        b"\x1b[<0;8;24m".as_slice(),
     ] {
         session.writer().write_all(event)?;
         session.writer().flush()?;
@@ -81,7 +81,7 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     let output = reader_thread
         .join()
         .map_err(|_| io::Error::other("PTY reader thread panicked"))??;
-    assert!(exited, "Nako Agent did not exit after Ctrl+D");
+    assert!(exited, "Nakode did not exit after Ctrl+D");
 
     let output = String::from_utf8_lossy(&output);
     assert!(
@@ -97,7 +97,7 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
         "enhanced keyboard reporting was not enabled and restored"
     );
     assert!(
-        output.contains("\u{1b}]52;c;TkFLTw==\u{7}"),
+        output.contains("\u{1b}]52;c;TkFLT0RF\u{7}"),
         "mouse selection was not copied with OSC 52"
     );
     assert!(output.contains("\u{1b}[?25h"), "cursor was not restored");

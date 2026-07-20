@@ -312,9 +312,9 @@ mod tests {
             .execute(
                 "bash",
                 json!({
-                    "command": "printf '%s:%s' \"$NAKO_VALUE\" \"$(basename \"$PWD\")\"",
+                    "command": "printf '%s:%s' \"$NAKODE_VALUE\" \"$(basename \"$PWD\")\"",
                     "cwd": "nested",
-                    "env": {"NAKO_VALUE": "works"},
+                    "env": {"NAKODE_VALUE": "works"},
                     "timeout": 5
                 }),
             )

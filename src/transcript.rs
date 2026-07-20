@@ -103,7 +103,7 @@ impl Transcript {
             cache_revision: 0,
             cache: Vec::new(),
             stream_active: false,
-            stream_label: "Nako".to_owned(),
+            stream_label: "Nakode".to_owned(),
             expanded_tools: HashSet::new(),
         }
     }
@@ -832,7 +832,7 @@ mod tests {
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
         assert!(text.contains(&"User"));
-        assert_eq!(text.iter().filter(|line| **line == "Nako").count(), 1);
+        assert_eq!(text.iter().filter(|line| **line == "Nakode").count(), 1);
         assert!(!text.contains(&"Reasoning"));
         assert!(!text.contains(&"Assistant"));
         assert!(!text.iter().any(|line| line.contains("call_opaque")));
@@ -975,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn active_turn_shows_one_nako_spinner_before_items_arrive() {
+    fn active_turn_shows_one_nakode_spinner_before_items_arrive() {
         let mut transcript = Transcript::new(100);
         transcript.push(
             EntryKind::User,
@@ -993,7 +993,7 @@ mod tests {
                 .filter(|line| line.tone == LineTone::AgentPending)
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>(),
-            vec!["⠋ Nako"]
+            vec!["⠋ Nakode"]
         );
 
         transcript.append_delta(
@@ -1007,7 +1007,7 @@ mod tests {
             streaming
                 .lines
                 .iter()
-                .filter(|line| line.text.contains("Nako"))
+                .filter(|line| line.text.contains("Nakode"))
                 .count(),
             1
         );
@@ -1019,7 +1019,7 @@ mod tests {
             complete
                 .lines
                 .iter()
-                .any(|line| line.text == "Nako" && line.tone == LineTone::Assistant)
+                .any(|line| line.text == "Nakode" && line.tone == LineTone::Assistant)
         );
         assert!(
             !complete

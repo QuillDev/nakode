@@ -222,8 +222,8 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
             "protocolVersion": 1,
             "clientCapabilities": {},
             "clientInfo": {
-                "name": "nako-agent",
-                "title": "Nako Agent",
+                "name": "nakode",
+                "title": "Nakode",
                 "version": env!("CARGO_PKG_VERSION"),
             },
         }),
@@ -768,7 +768,7 @@ async fn process_method(
                 .await
                 .map_err(|_| ())?;
         } else {
-            let message = format!("Nako Agent does not support ACP client method {method}");
+            let message = format!("Nakode does not support ACP client method {method}");
             write_json(stdin, &error_response(&id, -32601, &message))
                 .await
                 .map_err(|_| ())?;
@@ -1636,7 +1636,7 @@ async fn receive_authorization_code(
                 respond_to_callback(
                     &mut stream,
                     "200 OK",
-                    "Devin authentication complete. You can return to Nako Agent.",
+                    "Devin authentication complete. You can return to Nakode.",
                 )
                 .await;
                 return Ok(code);

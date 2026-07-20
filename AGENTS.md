@@ -1,8 +1,8 @@
-# Nako Agent product and engineering constitution
+# Nakode product and engineering constitution
 
 ## Authority and interpretation
 
-This file is the authoritative product constitution for Nako Agent. It defines
+This file is the authoritative product constitution for Nakode. It defines
 the product goal, ownership boundaries, architectural invariants, and coding
 standards. Work in this repository must follow it unless the user explicitly
 replaces a decision here.
@@ -15,17 +15,17 @@ debt, and do not present an unimplemented capability as available.
 
 ## Product boundary
 
-Nako Agent is a provider-neutral agent orchestration, continuity, and execution
+Nakode is a provider-neutral agent orchestration, continuity, and execution
 application. Its distributed executable must be self-contained: a user must be
-able to install Nako Agent, configure a supported provider, and run an agent
+able to install Nakode, configure a supported provider, and run an agent
 without installing Codex, Devin, OMP, Node.js, Python, or another agent harness.
 Optional tools such as language evaluators may use an external runtime when it
-is installed, but must report their absence locally and must not prevent Nako
+is installed, but must report their absence locally and must not prevent Nakode
 Agent or unrelated tools and providers from starting.
 
 The governing rule is:
 
-> Nako Agent owns its portable runtime and coordination plane. Providers own
+> Nakode owns its portable runtime and coordination plane. Providers own
 > inference semantics. Optional external harnesses own only the sessions that
 > explicitly select those compatibility adapters.
 
@@ -42,9 +42,9 @@ Provider protocol types and wire events must remain inside adapter modules.
 Adapters normalize their output before it reaches shared runtime or application
 state.
 
-### Nako Agent owns
+### Nakode owns
 
-- Logical Nako Agent sessions spanning one or more native agent sessions
+- Logical Nakode sessions spanning one or more native agent sessions
 - Provider-neutral task, run, role, artifact, and handoff identities
 - Delegation, review, bounded fan-out, synthesis, cancellation, and status
 - The portable agent loop and local coding-tool contracts
@@ -60,7 +60,7 @@ state.
 The portable runtime exposes clear provider-neutral tools rather than copying
 the private implementation of an existing harness. Provider-hosted tools may be
 used when their execution location and semantics match the task. Local
-workspace work must use Nako Agent's supervised local tools so it never
+workspace work must use Nakode's supervised local tools so it never
 silently executes in a provider-hosted filesystem.
 
 External executables may be supported by optional compatibility adapters. Such
@@ -70,17 +70,17 @@ starting.
 
 ## Session model
 
-A Nako Agent session is a logical body of work, not an alias for one provider
+A Nakode session is a logical body of work, not an alias for one provider
 thread. One logical session may contain many native agent sessions using
 different providers, models, and roles.
 
-- Nako Agent assigns and persists its own logical identities.
+- Nakode assigns and persists its own logical identities.
 - Provider session and response IDs are opaque adapter data.
 - In-process sessions persist the normalized history and provider state needed
-  to resume through Nako Agent.
+  to resume through Nakode.
 - Optional harness-backed sessions remain authoritative for their own hidden
   context only when that compatibility adapter is explicitly selected.
-- Nako Agent must not use private provider files or indexes as its primary
+- Nakode must not use private provider files or indexes as its primary
   database.
 - Resume the same native session when its context matters.
 - Move work between native sessions with an explicit handoff package. Never
@@ -93,14 +93,14 @@ references, role, budget, and delegation policy.
 The required relationship is:
 
 ```text
-NakoSession 1 ── N AgentSession 1 ── N AgentTurn
+NakodeSession 1 ── N AgentSession 1 ── N AgentTurn
        │                 │
        ├── tasks         ├── artifacts
        ├── runs          └── handoffs
        └── memories
 ```
 
-Do not model a Nako Agent session as a one-to-one alias for a provider session,
+Do not model a Nakode session as a one-to-one alias for a provider session,
 even when adapting a transitional persistence shape that does so.
 
 ## Provider adapters and models
@@ -140,7 +140,7 @@ approvals, structured output, and subagents.
   current-session override. Session-only choices must reset to the persisted
   default when a new session begins.
 
-Nako Agent-launched sessions run unattended by default. In-process sessions use
+Nakode-launched sessions run unattended by default. In-process sessions use
 the shared runtime's explicit permission and cancellation policy. Optional
 harness adapters use the harness's strongest non-interactive mode. Unexpected
 provider approval prompts must not block the TUI. Any safety restriction on a
@@ -185,10 +185,10 @@ reviewers must not recursively spawn agents unless an explicit nested
 orchestrator role grants a bounded allowance. Keep one writer for a shared
 workspace unless isolation is deliberate.
 
-Provider-native subagents may implement a Nako delegation only when the adapter
+Provider-native subagents may implement a Nakode delegation only when the adapter
 can attribute and supervise the child work, or when the run is clearly recorded
 as opaque. Do not confuse a provider's subagent feature with permission to
-expose Nako Agent's orchestration API recursively.
+expose Nakode's orchestration API recursively.
 
 ## Skills
 
@@ -211,11 +211,11 @@ constitute skill support.
 
 ## Memory
 
-Memory is a Nako-owned service with multiple access surfaces:
+Memory is a Nakode-owned service with multiple access surfaces:
 
 - Internal Rust API for the orchestrator
 - MCP interface when an adapter supports it reliably
-- `nako-agent memory` CLI fallback for agents with shell access
+- `nakode memory` CLI fallback for agents with shell access
 - A portable memory skill that teaches usage policy
 
 MCP supplies structured capability; the skill supplies behavior. Neither alone
@@ -236,10 +236,10 @@ Memory operations are small and semantic: `search`, `propose`, `store`, and
 
 ## Persistence
 
-SQLite is the Nako-owned metadata and in-process runtime store. The data model
+SQLite is the Nakode-owned metadata and in-process runtime store. The data model
 separates at least:
 
-- `nako_sessions`
+- `nakode_sessions`
 - `agent_sessions`
 - `agent_turns`
 - `orchestration_runs`
@@ -249,10 +249,10 @@ separates at least:
 - `memory_entries`
 - `skill_installations`
 
-Nako Agent persists provider response identifiers, normalized history, and
+Nakode persists provider response identifiers, normalized history, and
 provider state needed to resume in-process sessions. Optional harness-native
 history remains authoritative only for explicitly harness-backed sessions.
-Nako persistence owns discovery, relationships, shared state, preferences, and
+Nakode persistence owns discovery, relationships, shared state, preferences, and
 provenance.
 
 Schema changes must be forward migrations that preserve existing installations.
@@ -335,7 +335,7 @@ crashing the TUI.
 `dev.sh` owns the lifecycle of the interactive development instance for its
 resolved workspace:
 
-- Every interactive invocation stops the existing Nako Agent development
+- Every interactive invocation stops the existing Nakode development
   process for that workspace before starting its replacement.
 - Restart logic identifies the listener precisely and refuses to terminate an
   unexpected process.

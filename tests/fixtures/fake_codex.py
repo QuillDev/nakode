@@ -55,7 +55,7 @@ for raw_line in sys.stdin:
         params = message.get("params", {})
         capabilities = params.get("capabilities", {})
         client = params.get("clientInfo", {})
-        if client.get("name") != "nako-agent" or not capabilities.get("experimentalApi"):
+        if client.get("name") != "nakode" or not capabilities.get("experimentalApi"):
             fail(request_id, "invalid initialization")
             continue
         if init_gate:
@@ -110,7 +110,7 @@ for raw_line in sys.stdin:
                     "type": "chatgptDeviceCode",
                     "loginId": "login-fixture",
                     "verificationUrl": "https://example.test/device",
-                    "userCode": "NAKO-CODE",
+                    "userCode": "NAKODE-CODE",
                 },
             }
         )

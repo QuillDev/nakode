@@ -3,7 +3,7 @@ use std::{error::Error, ffi::OsString, io, path::PathBuf, time::Duration};
 #[cfg(unix)]
 use std::{fs::OpenOptions, io::Write, process::Command};
 
-use nako_agent::{
+use nakode::{
     backend::{BackendCommand, BackendEvent, BackendHandle, DeltaKind},
     codex::{self, CompatibilityBackendConfig as BackendConfig},
 };
@@ -129,7 +129,7 @@ async fn codex_client_completes_device_authentication() -> TestResult {
             verification_url,
             user_code,
             ..
-        } if verification_url == "https://example.test/device" && user_code == "NAKO-CODE"
+        } if verification_url == "https://example.test/device" && user_code == "NAKODE-CODE"
     ));
     let completed = next_matching_event(&mut backend, |event| {
         matches!(event, BackendEvent::AuthenticationCompleted { .. })

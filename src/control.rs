@@ -9,16 +9,16 @@ use tokio::{
 
 #[derive(Debug, Error)]
 pub enum ControlError {
-    #[error("Nako Agent control socket error at {path}: {source}")]
+    #[error("Nakode control socket error at {path}: {source}")]
     Io {
         path: String,
         source: std::io::Error,
     },
-    #[error("invalid Nako Agent control message: {0}")]
+    #[error("invalid Nakode control message: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("Nako Agent control service closed without a result")]
+    #[error("Nakode control service closed without a result")]
     MissingResponse,
-    #[error("a Nako Agent control service is already running at {0}")]
+    #[error("a Nakode control service is already running at {0}")]
     AlreadyRunning(String),
 }
 
@@ -172,12 +172,40 @@ pub async fn invoke(
 
 #[must_use]
 pub fn socket_path(workspace: &Path) -> PathBuf {
-    workspace.join(".nako-agent").join("control.sock")
+    workspace.join(".nakode").join("control.sock")
+}
+
+#[must_use]
+pub fn client_socket_path(workspace: &Path) -> PathBuf {
+    let current = socket_path(workspace);
+    if current.exists() {
+        return current;
+    }
+    let legacy = workspace.join(".nako-agent").join("control.sock");
+    if legacy.exists() { legacy } else { current }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentInvocation, AgentResponse, ControlError, ControlServer, invoke};
+    use super::{
+        AgentInvocation, AgentResponse, ControlError, ControlServer, client_socket_path, invoke,
+        socket_path,
+    };
+
+    #[test]
+    fn client_socket_falls_back_to_the_legacy_workspace_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let legacy = directory.path().join(".nako-agent/control.sock");
+        std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
+            .expect("legacy control directory");
+        std::fs::write(&legacy, []).expect("legacy socket placeholder");
+
+        assert_eq!(client_socket_path(directory.path()), legacy);
+        assert_eq!(
+            socket_path(directory.path()),
+            directory.path().join(".nakode/control.sock")
+        );
+    }
 
     #[tokio::test]
     async fn invocation_round_trips_through_the_control_service() {

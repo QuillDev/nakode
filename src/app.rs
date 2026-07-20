@@ -36,7 +36,7 @@ pub enum AppError {
     Agents(#[from] AgentCatalogError),
     #[error(transparent)]
     Control(#[from] ControlError),
-    #[error("failed to locate the running Nako Agent executable: {0}")]
+    #[error("failed to locate the running Nakode executable: {0}")]
     CurrentExecutable(io::Error),
 }
 
@@ -107,6 +107,9 @@ impl BackendRegistry {
                 codex::spawn(
                     codex::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_compaction_threshold_percent(usize::from(
+                            self.config.compaction_threshold_percent,
+                        ))
                         .with_session_database(self.session_database.clone()),
                 )
                 .await?
@@ -116,6 +119,9 @@ impl BackendRegistry {
                 devin::spawn(
                     devin::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_compaction_threshold_percent(usize::from(
+                            self.config.compaction_threshold_percent,
+                        ))
                         .with_session_database(self.session_database.clone()),
                 )
                 .await?
@@ -170,6 +176,9 @@ impl BackendRegistry {
                 codex::spawn(
                     codex::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_compaction_threshold_percent(usize::from(
+                            self.config.compaction_threshold_percent,
+                        ))
                         .with_session_database(self.session_database.clone()),
                 )
                 .await?
@@ -179,6 +188,9 @@ impl BackendRegistry {
                 devin::spawn(
                     devin::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_compaction_threshold_percent(usize::from(
+                            self.config.compaction_threshold_percent,
+                        ))
                         .with_session_database(self.session_database.clone()),
                 )
                 .await?
@@ -265,7 +277,7 @@ impl BackendRegistry {
 /// Returns an error when provider startup, persistence, signal handling, or
 /// terminal ownership fails.
 pub async fn run(config: Config) -> Result<(), AppError> {
-    let nako_executable = std::env::current_exe().map_err(AppError::CurrentExecutable)?;
+    let nakode_executable = std::env::current_exe().map_err(AppError::CurrentExecutable)?;
     let mut signals = ShutdownSignals::install()?;
     let sessions = SqliteSessionRepository::open_default()?;
     let session_database = sessions.database_path().to_path_buf();
@@ -334,7 +346,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             .map_or(provider.as_str(), |record| record.display_name.as_str());
         state.provider_start_failed(provider, display_name, error);
     }
-    state.set_nako_executable(&nako_executable);
+    state.set_nakode_executable(&nakode_executable);
     for provider in backends.commands.keys() {
         match sessions.list_models(provider) {
             Ok(models) => state.install_cached_models(models),
@@ -363,7 +375,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     loop_result?;
     restore_result.map_err(AppError::Terminal)?;
 
-    print_resume_hint(&nako_executable, &state).map_err(AppError::Terminal)
+    print_resume_hint(&nakode_executable, &state).map_err(AppError::Terminal)
 }
 
 fn print_resume_hint(executable: &Path, state: &AppState) -> io::Result<()> {
@@ -468,14 +480,14 @@ async fn run_loop(
             }
             request = control.requests.recv() => {
                 if let Some(request) = request {
-                    if request.invocation.session_id == state.nako_session_id {
+                    if request.invocation.session_id == state.nakode_session_id {
                         let id = request.id;
                         let invocation = crate::state::AgentRequest { id, agent: request.invocation.agent.clone(), task: request.invocation.task.clone() };
                         agent_requests.insert(id, request);
                         let effects = state.invoke_agent(&invocation);
                         if apply_effects(state, effects, backends, sessions, &mut agent_requests).await { break; }
                     } else {
-                        request.respond(AgentResponse { success: false, result: "Nako Agent session id does not match this TUI.".to_owned() });
+                        request.respond(AgentResponse { success: false, result: "Nakode session id does not match this TUI.".to_owned() });
                     }
                     dirty = true;
                 }
@@ -1404,7 +1416,7 @@ mod tests {
         let mut output = Vec::new();
         super::write_resume_hint(
             &mut output,
-            std::path::Path::new("/opt/Nako Agent/nako-agent"),
+            std::path::Path::new("/opt/Nakode/nakode"),
             std::path::Path::new("/tmp/user's project"),
             Some("019f7bf1-3a18-7793-b9d6-206a1aa7ac0c"),
         )
@@ -1414,7 +1426,7 @@ mod tests {
         assert!(output.contains("Resume this session with:"));
         assert!(output.contains("--workspace"));
         assert!(output.contains("--resume 019f7bf1-3a18-7793-b9d6-206a1aa7ac0c"));
-        assert!(output.contains("Nako Agent/nako-agent"));
+        assert!(output.contains("Nakode/nakode"));
         assert!(output.contains("user"));
     }
 
@@ -1423,7 +1435,7 @@ mod tests {
         let mut output = Vec::new();
         super::write_resume_hint(
             &mut output,
-            std::path::Path::new("nako-agent"),
+            std::path::Path::new("nakode"),
             std::path::Path::new("/tmp/project"),
             None,
         )
@@ -1460,7 +1472,7 @@ mod tests {
             let column = if matches!(kind, MouseEventKind::Down(_)) {
                 1
             } else {
-                5
+                6
             };
             super::handle_terminal_event(
                 &mut state,
@@ -1473,7 +1485,7 @@ mod tests {
             );
         }
 
-        assert_eq!(state.take_pending_clipboard().as_deref(), Some("NAKO"));
+        assert_eq!(state.take_pending_clipboard().as_deref(), Some("NAKODE"));
     }
 
     #[test]

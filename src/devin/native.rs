@@ -22,8 +22,9 @@ use crate::{
         TurnOutcome,
     },
     runtime::{
-        AgentRuntime, ConversationItem, InferenceEvent, InferenceFuture, InferenceOutput,
-        InferenceProvider, InferenceRequest, RuntimeSession, RuntimeSessionStore, ToolCall,
+        AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
+        InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest, RuntimeSession,
+        RuntimeSessionStore, ToolCall,
     },
 };
 
@@ -44,6 +45,7 @@ pub struct BackendConfig {
     pub base_url: String,
     client: Client,
     session_database: Option<PathBuf>,
+    compaction_threshold_percent: usize,
 }
 
 impl BackendConfig {
@@ -55,6 +57,7 @@ impl BackendConfig {
             base_url: DEVIN_BASE_URL.to_owned(),
             client: Client::new(),
             session_database: None,
+            compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
         }
     }
 
@@ -69,6 +72,12 @@ impl BackendConfig {
         self.session_database = Some(path);
         self
     }
+
+    #[must_use]
+    pub fn with_compaction_threshold_percent(mut self, threshold_percent: usize) -> Self {
+        self.compaction_threshold_percent = threshold_percent;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -76,6 +85,12 @@ struct DevinProvider {
     client: Client,
     base_url: String,
     api_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct DiscoveredModel {
+    info: ModelInfo,
+    context_window: Option<usize>,
 }
 
 impl InferenceProvider for DevinProvider {
@@ -174,7 +189,10 @@ async fn run_supervisor(
             api_key,
         }) as Arc<dyn InferenceProvider>
     });
-    let runtime = provider.map(|provider| AgentRuntime::new(config.workspace.clone(), provider));
+    let runtime = provider.map(|provider| {
+        AgentRuntime::new(config.workspace.clone(), provider)
+            .with_compaction_threshold_percent(config.compaction_threshold_percent)
+    });
     let session_store = config
         .session_database
         .clone()
@@ -252,7 +270,10 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::Reload { .. } => match context.api_key {
             Some(api_key) => match discover_models(context.config, api_key).await {
                 Ok(models) => {
-                    let _ = context.events.send(BackendEvent::Models(models)).await;
+                    let _ = context
+                        .events
+                        .send(BackendEvent::Models(model_infos(models)))
+                        .await;
                 }
                 Err(error) => request_failed(context.events, BackendOperation::Reload, error).await,
             },
@@ -284,6 +305,9 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         }
         BackendCommand::SetSessionModel { session_id, model } => {
             if let Some(session) = context.sessions.get_mut(&session_id) {
+                if session.model != model {
+                    session.context_window = None;
+                }
                 session.model = model;
                 if let Some(store) = context.session_store
                     && let Err(error) = store.save(session)
@@ -346,12 +370,18 @@ async fn resume_session(provider_session_id: String, context: &mut CommandContex
             return;
         }
     };
-    if let Some(session) = context
+    if let Some(mut session) = context
         .sessions
         .get(&provider_session_id)
         .cloned()
         .or(persisted)
     {
+        if session.context_window.is_none()
+            && let Some(api_key) = context.api_key
+        {
+            session.context_window =
+                discover_context_window(context.config, api_key, &session.model).await;
+        }
         context
             .sessions
             .insert(provider_session_id.clone(), session.clone());
@@ -414,7 +444,20 @@ async fn start_turn(
         return;
     };
     if let Some(model) = model {
+        if session.model != model {
+            session.context_window = None;
+        }
         session.model = model;
+    }
+    if session.context_window.is_none() {
+        session.context_window = discover_context_window(
+            context.config,
+            context
+                .api_key
+                .expect("authenticated runtime has an API key"),
+            &session.model,
+        )
+        .await;
     }
     let cancellation = CancellationToken::new();
     *context.active = Some(ActiveTurn {
@@ -466,14 +509,13 @@ async fn start_session(
         }
     };
     let selected = model
-        .filter(|requested| models.iter().any(|candidate| candidate.id == *requested))
-        .or_else(|| {
+        .and_then(|requested| {
             models
                 .iter()
-                .find(|model| model.is_default)
-                .map(|model| model.id.clone())
+                .find(|candidate| candidate.info.id == requested)
         })
-        .or_else(|| models.first().map(|model| model.id.clone()));
+        .or_else(|| models.iter().find(|model| model.info.is_default))
+        .or_else(|| models.first());
     let Some(selected) = selected else {
         request_failed(
             context.events,
@@ -483,7 +525,9 @@ async fn start_session(
         .await;
         return;
     };
-    let session = RuntimeSession::new(selected.clone(), instructions.unwrap_or_default());
+    let selected_id = selected.info.id.clone();
+    let session = RuntimeSession::new(selected_id.clone(), instructions.unwrap_or_default())
+        .with_context_window(selected.context_window);
     let session_id = session.id.clone();
     if let Some(store) = context.session_store
         && let Err(error) = store.save(&session)
@@ -496,10 +540,13 @@ async fn start_session(
         .events
         .send(BackendEvent::SessionCreated {
             provider_session_id: session_id,
-            model: selected,
+            model: selected_id,
         })
         .await;
-    let _ = context.events.send(BackendEvent::Models(models)).await;
+    let _ = context
+        .events
+        .send(BackendEvent::Models(model_infos(models)))
+        .await;
 }
 
 fn native_capabilities() -> BackendCapabilities {
@@ -531,7 +578,10 @@ async fn request_failed(
         .await;
 }
 
-async fn discover_models(config: &BackendConfig, api_key: &str) -> Result<Vec<ModelInfo>, String> {
+async fn discover_models(
+    config: &BackendConfig,
+    api_key: &str,
+) -> Result<Vec<DiscoveredModel>, String> {
     let request = protocol::GetCliModelConfigsRequest {
         metadata: Some(metadata(api_key, "")),
     };
@@ -550,12 +600,34 @@ async fn discover_models(config: &BackendConfig, api_key: &str) -> Result<Vec<Mo
         .client_model_configs
         .into_iter()
         .filter(|config| !config.disabled && !config.model_uid.trim().is_empty())
-        .map(|config| ModelInfo {
-            provider: DEVIN_PROVIDER.to_owned(),
-            is_default: default_id == Some(config.model_uid.as_str()),
-            id: config.model_uid,
+        .map(|config| DiscoveredModel {
+            context_window: usize::try_from(config.max_tokens)
+                .ok()
+                .filter(|tokens| *tokens > 0),
+            info: ModelInfo {
+                provider: DEVIN_PROVIDER.to_owned(),
+                is_default: default_id == Some(config.model_uid.as_str()),
+                id: config.model_uid,
+            },
         })
         .collect())
+}
+
+fn model_infos(models: Vec<DiscoveredModel>) -> Vec<ModelInfo> {
+    models.into_iter().map(|model| model.info).collect()
+}
+
+async fn discover_context_window(
+    config: &BackendConfig,
+    api_key: &str,
+    model: &str,
+) -> Option<usize> {
+    discover_models(config, api_key)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|candidate| candidate.info.id == model)
+        .and_then(|candidate| candidate.context_window)
 }
 
 async fn get_user_jwt(
@@ -741,6 +813,12 @@ fn conversation_prompts(
             thinking: String::new(),
             signature: String::new(),
         }],
+        ConversationItem::Compaction { summary } => vec![chat_prompt(
+            message_id,
+            1,
+            format!("Context checkpoint from earlier work:\n\n{summary}"),
+        )],
+        ConversationItem::CompactionEvent { .. } => Vec::new(),
     }
 }
 
@@ -887,12 +965,27 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn compaction_events_are_not_sent_to_devin_inference() {
+        let event = ConversationItem::CompactionEvent {
+            id: "compaction-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            reason: crate::backend::CompactionReason::Proactive,
+            estimated_tokens_before: 220_000,
+            estimated_tokens_after: Some(24_000),
+            error: None,
+        };
+
+        assert!(conversation_prompts("session-1", 0, &event).is_empty());
+    }
+
     #[tokio::test]
     async fn discovers_devin_models_over_direct_protobuf_rpc() {
         let payload = protocol::GetCliModelConfigsResponse {
             client_model_configs: vec![protocol::ClientModelConfig {
                 model_uid: "swe-native".to_owned(),
                 disabled: false,
+                max_tokens: 200_000,
                 ..Default::default()
             }],
             default_override_model_config: Some(protocol::DefaultOverrideModelConfig {
@@ -931,8 +1024,9 @@ mod tests {
         assert!(request.starts_with("POST /exa.api_server_pb.ApiServerService/GetCliModelConfigs"));
         assert!(request.contains("content-type: application/proto"));
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "swe-native");
-        assert!(models[0].is_default);
+        assert_eq!(models[0].info.id, "swe-native");
+        assert!(models[0].info.is_default);
+        assert_eq!(models[0].context_window, Some(200_000));
     }
 
     #[test]

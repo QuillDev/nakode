@@ -15,7 +15,7 @@ use super::{
 };
 use crate::runtime::ToolDefinition;
 
-const DONE_PREFIX: &str = "__NAKO_EVAL_DONE__";
+const DONE_PREFIX: &str = "__NAKODE_EVAL_DONE__";
 
 #[derive(Default)]
 pub struct EvalTool {
@@ -256,7 +256,7 @@ for request in sys.stdin:
     except BaseException:
         status = "error"
         traceback.print_exc()
-    print("__NAKO_EVAL_DONE__" + cell_id + "\t" + status, flush=True)
+    print("__NAKODE_EVAL_DONE__" + cell_id + "\t" + status, flush=True)
 "#;
 
 const JAVASCRIPT_KERNEL: &str = r#"
@@ -274,7 +274,7 @@ const input = readline.createInterface({ input: process.stdin, crlfDelay: Infini
       const value = vm.runInContext(code, context);
       if (value && typeof value.then === "function") await value;
     } catch (error) { status = "error"; console.error(error?.stack ?? String(error)); }
-    console.log("__NAKO_EVAL_DONE__" + id + "\t" + status);
+    console.log("__NAKODE_EVAL_DONE__" + id + "\t" + status);
   }
 })();
 "#;
@@ -293,7 +293,7 @@ while request = STDIN.gets
     status = "error"
     warn error.full_message
   end
-  puts "__NAKO_EVAL_DONE__#{id}\t#{status}"
+  puts "__NAKODE_EVAL_DONE__#{id}\t#{status}"
 end
 "#;
 
@@ -310,7 +310,7 @@ while !eof(stdin)
         status = "error"
         showerror(stdout, error, catch_backtrace()); println()
     end
-    println("__NAKO_EVAL_DONE__" * id * "\t" * status); flush(stdout)
+    println("__NAKODE_EVAL_DONE__" * id * "\t" * status); flush(stdout)
 end
 "#;
 

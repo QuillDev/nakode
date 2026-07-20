@@ -16,8 +16,9 @@ use crate::{
         TurnOutcome,
     },
     runtime::{
-        AgentRuntime, ConversationItem, InferenceEvent, InferenceFuture, InferenceOutput,
-        InferenceProvider, InferenceRequest, RuntimeSession, RuntimeSessionStore, ToolCall,
+        AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
+        InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest, RuntimeSession,
+        RuntimeSessionStore, ToolCall,
     },
 };
 
@@ -43,6 +44,7 @@ pub struct BackendConfig {
     client: Client,
     auth_urls: AuthUrls,
     session_database: Option<PathBuf>,
+    compaction_threshold_percent: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -68,6 +70,7 @@ impl BackendConfig {
                 token: TOKEN_URL.to_owned(),
             },
             session_database: None,
+            compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
         }
     }
 
@@ -80,6 +83,12 @@ impl BackendConfig {
     #[must_use]
     pub fn with_session_database(mut self, path: PathBuf) -> Self {
         self.session_database = Some(path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_compaction_threshold_percent(mut self, threshold_percent: usize) -> Self {
+        self.compaction_threshold_percent = threshold_percent;
         self
     }
 
@@ -130,6 +139,12 @@ struct CodexProvider {
     client: Client,
     base_url: String,
     credential: CodexCredential,
+}
+
+#[derive(Clone, Debug)]
+struct DiscoveredModel {
+    info: ModelInfo,
+    context_window: Option<usize>,
 }
 
 impl InferenceProvider for CodexProvider {
@@ -197,7 +212,7 @@ impl CodexProvider {
             .bearer_auth(&self.credential.access_token)
             .header("chatgpt-account-id", &self.credential.account_id)
             .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "nako-agent")
+            .header("originator", "nakode")
             .header("version", CODEX_CLIENT_VERSION)
             .header("conversation_id", session_id)
             .header("session_id", session_id)
@@ -273,7 +288,10 @@ async fn run_supervisor(
             credential,
         }) as Arc<dyn InferenceProvider>
     });
-    let runtime = provider.map(|provider| AgentRuntime::new(config.workspace.clone(), provider));
+    let runtime = provider.map(|provider| {
+        AgentRuntime::new(config.workspace.clone(), provider)
+            .with_compaction_threshold_percent(config.compaction_threshold_percent)
+    });
     let session_store = config
         .session_database
         .clone()
@@ -358,7 +376,10 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::Reload { .. } => match context.credential {
             Some(credential) => match discover_models(context.config, credential).await {
                 Ok(models) => {
-                    let _ = context.events.send(BackendEvent::Models(models)).await;
+                    let _ = context
+                        .events
+                        .send(BackendEvent::Models(model_infos(models)))
+                        .await;
                 }
                 Err(error) => request_failed(context.events, BackendOperation::Reload, error).await,
             },
@@ -390,6 +411,9 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         }
         BackendCommand::SetSessionModel { session_id, model } => {
             if let Some(session) = context.sessions.get_mut(&session_id) {
+                if session.model != model {
+                    session.context_window = None;
+                }
                 session.model = model;
                 if let Some(store) = context.session_store
                     && let Err(error) = store.save(session)
@@ -475,7 +499,20 @@ async fn start_turn(
         return;
     };
     if let Some(model) = model {
+        if session.model != model {
+            session.context_window = None;
+        }
         session.model = model;
+    }
+    if session.context_window.is_none() {
+        session.context_window = discover_context_window(
+            context.config,
+            context
+                .credential
+                .expect("authenticated runtime has a credential"),
+            &session.model,
+        )
+        .await;
     }
     let cancellation = CancellationToken::new();
     *context.active = Some(ActiveTurn {
@@ -527,14 +564,13 @@ async fn start_session(
         }
     };
     let selected = model
-        .filter(|requested| models.iter().any(|candidate| candidate.id == *requested))
-        .or_else(|| {
+        .and_then(|requested| {
             models
                 .iter()
-                .find(|model| model.is_default)
-                .map(|model| model.id.clone())
+                .find(|candidate| candidate.info.id == requested)
         })
-        .or_else(|| models.first().map(|model| model.id.clone()));
+        .or_else(|| models.iter().find(|model| model.info.is_default))
+        .or_else(|| models.first());
     let Some(selected) = selected else {
         request_failed(
             context.events,
@@ -544,7 +580,9 @@ async fn start_session(
         .await;
         return;
     };
-    let session = RuntimeSession::new(selected.clone(), instructions.unwrap_or_default());
+    let selected_id = selected.info.id.clone();
+    let session = RuntimeSession::new(selected_id.clone(), instructions.unwrap_or_default())
+        .with_context_window(selected.context_window);
     let session_id = session.id.clone();
     if let Some(store) = context.session_store
         && let Err(error) = store.save(&session)
@@ -557,10 +595,13 @@ async fn start_session(
         .events
         .send(BackendEvent::SessionCreated {
             provider_session_id: session_id,
-            model: selected,
+            model: selected_id,
         })
         .await;
-    let _ = context.events.send(BackendEvent::Models(models)).await;
+    let _ = context
+        .events
+        .send(BackendEvent::Models(model_infos(models)))
+        .await;
 }
 
 async fn resume_session(provider_session_id: String, context: &mut CommandContext<'_>) {
@@ -575,12 +616,18 @@ async fn resume_session(provider_session_id: String, context: &mut CommandContex
             return;
         }
     };
-    if let Some(session) = context
+    if let Some(mut session) = context
         .sessions
         .get(&provider_session_id)
         .cloned()
         .or(persisted)
     {
+        if session.context_window.is_none()
+            && let Some(credential) = context.credential
+        {
+            session.context_window =
+                discover_context_window(context.config, credential, &session.model).await;
+        }
         context
             .sessions
             .insert(provider_session_id.clone(), session.clone());
@@ -640,7 +687,7 @@ async fn request_failed(
 async fn discover_models(
     config: &BackendConfig,
     credential: &CodexCredential,
-) -> Result<Vec<ModelInfo>, String> {
+) -> Result<Vec<DiscoveredModel>, String> {
     for path in ["codex/models", "models"] {
         let url = format!("{}/{path}", config.base_url.trim_end_matches('/'));
         let response = config
@@ -650,7 +697,7 @@ async fn discover_models(
             .bearer_auth(&credential.access_token)
             .header("chatgpt-account-id", &credential.account_id)
             .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "nako-agent")
+            .header("originator", "nakode")
             .header("version", CODEX_CLIENT_VERSION)
             .send()
             .await
@@ -681,19 +728,52 @@ async fn discover_models(
                 if id.is_empty() {
                     return None;
                 }
-                Some(ModelInfo {
-                    provider: CODEX_PROVIDER.to_owned(),
-                    id: id.to_owned(),
-                    is_default: entry
-                        .get("is_default")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
+                let context_window = entry
+                    .get("context_window")
+                    .and_then(Value::as_u64)
+                    .and_then(|window| usize::try_from(window).ok())
+                    .map(|window| {
+                        let percent = entry
+                            .get("effective_context_window_percent")
+                            .and_then(Value::as_u64)
+                            .and_then(|percent| usize::try_from(percent).ok())
+                            .unwrap_or(100)
+                            .min(100);
+                        window.saturating_mul(percent) / 100
+                    });
+                Some(DiscoveredModel {
+                    info: ModelInfo {
+                        provider: CODEX_PROVIDER.to_owned(),
+                        id: id.to_owned(),
+                        is_default: entry
+                            .get("is_default")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    },
+                    context_window,
                 })
             })
             .collect::<Vec<_>>();
         return Ok(models);
     }
     Err("OpenAI did not expose a usable Codex model catalog".to_owned())
+}
+
+fn model_infos(models: Vec<DiscoveredModel>) -> Vec<ModelInfo> {
+    models.into_iter().map(|model| model.info).collect()
+}
+
+async fn discover_context_window(
+    config: &BackendConfig,
+    credential: &CodexCredential,
+    model: &str,
+) -> Option<usize> {
+    discover_models(config, credential)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|candidate| candidate.info.id == model)
+        .and_then(|candidate| candidate.context_window)
 }
 
 fn codex_request_body(request: &InferenceRequest) -> Value {
@@ -756,6 +836,12 @@ fn conversation_input(item: &ConversationItem) -> Vec<Value> {
         } => vec![json!({
             "type": "function_call_output", "call_id": call_id, "output": output
         })],
+        ConversationItem::Compaction { summary } => {
+            vec![
+                json!({"role": "user", "content": [{"type": "input_text", "text": format!("Context checkpoint from earlier work:\n\n{summary}")}]}),
+            ]
+        }
+        ConversationItem::CompactionEvent { .. } => Vec::new(),
     }
 }
 
@@ -918,22 +1004,34 @@ async fn apply_codex_event(
             }
         }
         "error" => {
-            return Err(event
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Codex stream error")
-                .to_owned());
+            return Err(codex_error_message(event, "Codex stream error"));
         }
         "response.failed" => {
-            return Err(event
-                .pointer("/response/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Codex response failed")
-                .to_owned());
+            return Err(codex_error_message(event, "Codex response failed"));
         }
         _ => {}
     }
     Ok(())
+}
+
+fn codex_error_message(event: &Value, fallback: &str) -> String {
+    let message = event
+        .get("message")
+        .or_else(|| event.pointer("/error/message"))
+        .or_else(|| event.pointer("/response/error/message"))
+        .or_else(|| event.get("error"))
+        .and_then(Value::as_str);
+    let code = event
+        .get("code")
+        .or_else(|| event.pointer("/error/code"))
+        .or_else(|| event.pointer("/response/error/code"))
+        .and_then(Value::as_str);
+    match (code, message) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (_, Some(message)) => message.to_owned(),
+        (Some(code), None) => code.to_owned(),
+        (None, None) => fallback.to_owned(),
+    }
 }
 
 async fn authenticate(config: BackendConfig, events: mpsc::Sender<BackendEvent>) {
@@ -1169,11 +1267,25 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn compaction_events_are_not_sent_to_codex_inference() {
+        let event = ConversationItem::CompactionEvent {
+            id: "compaction-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            reason: crate::backend::CompactionReason::Proactive,
+            estimated_tokens_before: 220_000,
+            estimated_tokens_after: Some(24_000),
+            error: None,
+        };
+
+        assert!(conversation_input(&event).is_empty());
+    }
+
     #[tokio::test]
     async fn discovers_models_over_the_native_transport() {
         let (base_url, server) = serve_once(
             "application/json",
-            r#"{"models":[{"slug":"gpt-native","is_default":true}]}"#,
+            r#"{"models":[{"slug":"gpt-native","is_default":true,"context_window":272000,"effective_context_window_percent":95}]}"#,
         )
         .await;
         let config = BackendConfig::native(PathBuf::from(".")).with_base_url(base_url);
@@ -1187,8 +1299,9 @@ mod tests {
         assert!(request.starts_with("GET /codex/models?client_version="));
         assert!(request.contains("authorization: Bearer access-token"));
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "gpt-native");
-        assert!(models[0].is_default);
+        assert_eq!(models[0].info.id, "gpt-native");
+        assert!(models[0].info.is_default);
+        assert_eq!(models[0].context_window, Some(258_400));
     }
 
     #[tokio::test]
@@ -1309,6 +1422,30 @@ mod tests {
         assert!(error.contains("temporary server error"));
         assert!(
             matches!(event_rx.recv().await, Some(InferenceEvent::TextDelta(delta)) if delta == "partial")
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_nested_stream_error_details() {
+        let (events, _receiver) = mpsc::channel(1);
+        let mut output = InferenceOutput::default();
+        let error = apply_codex_event(
+            &json!({
+                "type": "error",
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "Your input exceeds the context window of this model."
+                }
+            }),
+            &events,
+            &mut output,
+        )
+        .await
+        .expect_err("nested provider error is surfaced");
+
+        assert_eq!(
+            error,
+            "context_length_exceeded: Your input exceeds the context window of this model."
         );
     }
 

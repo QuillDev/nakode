@@ -101,6 +101,13 @@ pub enum TurnOutcome {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionReason {
+    Proactive,
+    ContextOverflow,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalKind {
     Command,
@@ -247,6 +254,24 @@ pub enum BackendEvent {
     },
     TurnStarted {
         turn_id: String,
+    },
+    ContextCompactionStarted {
+        compaction_id: String,
+        turn_id: String,
+        reason: CompactionReason,
+        estimated_tokens: usize,
+        context_window: Option<usize>,
+    },
+    ContextCompactionCompleted {
+        compaction_id: String,
+        turn_id: String,
+        estimated_tokens_before: usize,
+        estimated_tokens_after: usize,
+    },
+    ContextCompactionFailed {
+        compaction_id: String,
+        turn_id: String,
+        message: String,
     },
     TurnCompleted {
         turn_id: String,

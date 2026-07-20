@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-// Nako Agent shares the opaque pink-on-black visual language used across Quill's apps.
+// Nakode shares the opaque pink-on-black visual language used across Quill's apps.
 // Pink communicates interaction and focus; green, amber, and red are reserved for
 // semantic state so the interface remains calm and immediately scannable.
 const BACKGROUND: Color = Color::Rgb(10, 10, 13);
@@ -216,7 +216,7 @@ fn rect_contains(area: Rect, point: ScreenPoint) -> bool {
 
 fn render_header(frame: &mut Frame<'_>, area: Rect) {
     let line = Line::from(Span::styled(
-        " NAKO AGENT ",
+        " NAKODE ",
         Style::default().bg(ACCENT).fg(BACKGROUND).bold(),
     ));
     frame.render_widget(
@@ -1357,7 +1357,7 @@ mod tests {
 
         terminal
             .draw(|frame| super::draw(frame, &mut state))
-            .expect("render Nako Agent view");
+            .expect("render Nakode view");
 
         let rendered = terminal
             .backend()
@@ -1366,7 +1366,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("NAKO AGENT"));
+        assert!(rendered.contains("NAKODE"));
         assert!(rendered.contains("Prompt"));
         assert!(!rendered.contains("Transcript"));
         assert!(!rendered.contains("fixture-model"));

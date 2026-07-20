@@ -211,7 +211,7 @@ pub fn normalize_server_request(id: Value, method: String, params: &Value) -> Ap
         _ => (
             ApprovalKind::Other,
             "Unsupported server request".to_owned(),
-            format!("{method}\n\nThis Nako Agent build cannot answer this request type."),
+            format!("{method}\n\nThis Nakode build cannot answer this request type."),
         ),
     };
 

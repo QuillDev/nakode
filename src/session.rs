@@ -110,7 +110,7 @@ pub struct SubagentRecord {
 
 #[derive(Debug, Error)]
 pub enum SessionError {
-    #[error("could not determine Nako Agent's application-data directory")]
+    #[error("could not determine Nakode's application-data directory")]
     MissingDataDirectory,
     #[error("failed to create session database directory {path}: {source}")]
     CreateDirectory {
@@ -232,17 +232,17 @@ pub struct SqliteSessionRepository {
 }
 
 impl SqliteSessionRepository {
-    /// Returns Nako Agent's platform-specific application data directory.
+    /// Returns Nakode's platform-specific application data directory.
     ///
     /// # Errors
     /// Returns an error when the platform does not expose an application data directory.
     pub fn default_data_directory() -> Result<PathBuf, SessionError> {
-        ProjectDirs::from("dev", "nako-agent", "Nako Agent")
+        ProjectDirs::from("dev", "nakode", "Nakode")
             .map(|project| project.data_local_dir().to_path_buf())
             .ok_or(SessionError::MissingDataDirectory)
     }
 
-    /// Opens the repository in Nako Agent's platform-specific data directory.
+    /// Opens the repository in Nakode's platform-specific data directory.
     ///
     /// # Errors
     ///
@@ -250,11 +250,16 @@ impl SqliteSessionRepository {
     pub fn open_default() -> Result<Self, SessionError> {
         let directory = Self::default_data_directory()?;
         let new_database = directory.join("sessions.sqlite3");
-        let legacy_database = ProjectDirs::from("dev", "flock", "Flock")
-            .map(|legacy| legacy.data_local_dir().join("sessions.sqlite3"));
+        let legacy_database = [
+            ProjectDirs::from("dev", "nako-agent", "Nako Agent"),
+            ProjectDirs::from("dev", "flock", "Flock"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|legacy| legacy.data_local_dir().join("sessions.sqlite3"))
+        .find(|legacy| legacy.exists());
         if !new_database.exists()
             && let Some(legacy_database) = legacy_database
-            && legacy_database.exists()
         {
             return Self::open(legacy_database);
         }

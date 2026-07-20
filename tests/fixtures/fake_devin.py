@@ -70,7 +70,7 @@ for raw_line in sys.stdin:
             fail(request_id, "unsupported protocol version")
             continue
         client = params.get("clientInfo", {})
-        if client.get("name") != "nako-agent":
+        if client.get("name") != "nakode":
             fail(request_id, "unexpected client")
             continue
         result(

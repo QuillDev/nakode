@@ -1,27 +1,27 @@
-use nako_agent::{
+use nakode::{
     app,
-    config::{Config, NakoAgentCommand},
+    config::{Config, NakodeCommand},
     control,
 };
 
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("nako-agent: {error}");
+        eprintln!("nakode: {error}");
         std::process::exit(1);
     }
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
-    if let Some(NakoAgentCommand::Agent {
+    if let Some(NakodeCommand::Agent {
         agent_slug,
         session_id,
         task,
     }) = config.command.clone()
     {
         let response = control::invoke(
-            &control::socket_path(&config.workspace),
+            &control::client_socket_path(&config.workspace),
             &control::AgentInvocation {
                 agent: agent_slug,
                 session_id,

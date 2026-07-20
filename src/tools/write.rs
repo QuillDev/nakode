@@ -117,7 +117,7 @@ pub(super) async fn atomic_write(
     tokio::fs::create_dir_all(parent)
         .await
         .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-    let temporary = parent.join(format!(".nako-write-{}", Uuid::now_v7()));
+    let temporary = parent.join(format!(".nakode-write-{}", Uuid::now_v7()));
     let operation = async {
         let mut file = tokio::fs::OpenOptions::new()
             .create_new(true)

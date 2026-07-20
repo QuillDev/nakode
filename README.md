@@ -1,11 +1,11 @@
-# Nako Agent
+# Nakode
 
-Nako Agent is evolving into a provider-neutral agent orchestration and continuity
+Nakode is evolving into a provider-neutral agent orchestration and continuity
 layer. The experimental TUI now runs its portable agent loop and coding tools
 in-process, with direct authenticated transports for OpenAI Codex and Devin.
 
 The binding product direction is recorded in [`AGENTS.md`](AGENTS.md). Codex is
-the first adapter, not Nako Agent's application model.
+the first adapter, not Nakode's application model.
 
 ## Stack
 
@@ -15,7 +15,7 @@ the first adapter, not Nako Agent's application model.
 - **Tokio + bounded channels** — input/backend orchestration, streaming,
   cancellation, and redraw pacing
 - **portable-pty** — isolated boundary for interactive provider/process panes
-- **SQLite** — Nako Agent-owned, cross-provider session metadata and discovery
+- **SQLite** — Nakode-owned, cross-provider session metadata and discovery
 - **Direct OpenAI transport** — device authentication, model discovery, and
   streamed Responses events
 - **Direct Devin transport** — PKCE authentication, protobuf/Connect model
@@ -28,13 +28,13 @@ other optional behavior.
 
 ## Architecture direction
 
-Nako Agent's target distribution is one self-contained executable. Its portable
+Nakode's target distribution is one self-contained executable. Its portable
 runtime owns the local agent loop, tools, approvals, and coordination;
 in-process provider adapters own authentication, inference transport, model
 discovery, and provider response state. External harness adapters are optional
 compatibility paths rather than required provider implementations.
 
-A logical Nako Agent session will contain multiple provider-native agent sessions.
+A logical Nakode session will contain multiple provider-native agent sessions.
 Cross-agent continuation will use explicit handoff packages rather than claim
 that private model context can be translated between providers.
 
@@ -54,7 +54,7 @@ setup do not invoke them.
 # Development build
 ./dev.sh --workspace /path/to/project
 
-# Development build with isolated, disposable Nako Agent state
+# Development build with isolated, disposable Nakode state
 ./dev.sh --clean --workspace /path/to/project
 
 # Start every enabled provider
@@ -64,11 +64,13 @@ cargo run --release -- --workspace /path/to/project
 Options:
 
 ```text
---workspace <PATH>   Working directory (or NAKO_AGENT_WORKSPACE)
---model <MODEL>      Initial provider/model (or NAKO_AGENT_MODEL)
---resume <ID>        Resume a Nako Agent session by ID or prefix (or NAKO_AGENT_RESUME)
---scrollback <N>     Logical transcript entry limit (or NAKO_AGENT_SCROLLBACK)
---agents <PATH>      Agent-definition directory (or NAKO_AGENT_AGENTS)
+--workspace <PATH>   Working directory (or NAKODE_WORKSPACE)
+--model <MODEL>      Initial provider/model (or NAKODE_MODEL)
+--resume <ID>        Resume a Nakode session by ID or prefix (or NAKODE_RESUME)
+--scrollback <N>     Logical transcript entry limit (or NAKODE_SCROLLBACK)
+--compaction-threshold-percent <1-100>
+                     Context usage that triggers compaction (or NAKODE_COMPACTION_THRESHOLD_PERCENT; default 85)
+--agents <PATH>      Agent-definition directory (or NAKODE_AGENTS)
 ```
 
 Every interactive `dev.sh` run gracefully stops a development instance already
@@ -82,13 +84,17 @@ integration and user credentials remain available.
 Providers are configured explicitly from `/providers`. Codex setup uses its
 device-code flow and refreshes OAuth tokens directly. Devin setup uses its
 browser-based PKCE flow with a localhost callback. Credentials and native
-session state are stored in Nako Agent's user-private SQLite database; they are
+session state are stored in Nakode's user-private SQLite database; they are
 never exported to child provider processes. Models are referenced uniformly as
 `provider-slug/model-slug`, such as `openai-codex/gpt-5`; F2 searches this
 unified catalog, and model selection routes new work to that provider. Both
 model catalogs are discovered through their authenticated native transports
 and cached in SQLite. Direct in-process turns currently support interruption;
-turn steering remains explicitly unsupported. OpenAI model requests retry
+turn steering remains explicitly unsupported. Nakode continues to discover data
+from earlier Nako Agent installations, including the legacy application database,
+workspace agent directory, control socket, and `NAKO_AGENT_*` environment
+variables, so the rebrand does not discard existing sessions or configuration.
+OpenAI model requests retry
 transient connection failures, rate limits, lock conflicts, timeouts, and server
 errors up to three times with cancellation-aware exponential backoff. A response
 is never retried after visible text or reasoning has streamed, avoiding duplicate
@@ -106,7 +112,7 @@ transcript content and tool calls.
 | `F1` | Open or close the key reference |
 | `F2` | Open the model picker; changes apply to the next turn |
 | `/resume` | Open the recent-session picker for this workspace |
-| `/resume ID` | Resume a saved session by Nako Agent ID or unique prefix |
+| `/resume ID` | Resume a saved session by Nakode ID or unique prefix |
 | `/new` | Unsubscribe from the current backend session and start fresh |
 | `/models` | Choose and persist a provider's default model for future sessions |
 | `/switch` | Switch the model for only the current session |
@@ -126,7 +132,7 @@ including tmux passthrough. The terminal must permit clipboard writes. Pasted
 control sequences are treated as text, and streamed tool output is rendered as
 sanitized data rather than executed terminal control.
 
-After a persisted session exits, Nako Agent prints a ready-to-run command
+After a persisted session exits, Nakode prints a ready-to-run command
 containing the workspace and logical session ID so the session can be resumed
 from any directory.
 
@@ -140,6 +146,11 @@ from any directory.
   session for discovery create one through their native adapter.
 - Refreshes backend metadata and model caches with `/reload`.
 - Runs sequential turns in one active provider session at a time.
+- Compacts in-process session context before the model window is exhausted,
+  preserving a structured continuity checkpoint and a recent raw-history tail.
+  A detected context-overflow error triggers one compact-and-retry recovery.
+  Compaction lifecycle entries appear in the chat and are restored from the
+  persisted session without exposing checkpoint contents to the transcript.
 - Stores provider-neutral session metadata in SQLite and supports `--resume`,
   `/resume`, `/resume ID`, and `/new`; each provider remains authoritative for
   model context and reconstructed transcript history.
@@ -165,8 +176,8 @@ including headings, emphasis, links, block quotes, ordered and unordered lists,
 task checkboxes, tables, inline code, and fenced code blocks. Fenced blocks use
 their language tag for syntax highlighting. Tool output and diffs retain their
 provider-neutral semantic coloring. Each turn renders as a `User` prompt followed
-by one `Nako` activity stream containing reasoning, tool calls, tool output, and
-the final response. The Nako header shows an animated spinner while the turn is
+by one `Nakode` activity stream containing reasoning, tool calls, tool output, and
+the final response. The Nakode header shows an animated spinner while the turn is
 active. Per-item kind headers and opaque tool-call IDs are omitted, while
 meaningful tool names and action summaries remain visible. Every tool result is
 collapsed to one row by default, such as `▸ read src/state.rs` or
@@ -187,7 +198,7 @@ provider-owned tool and permission semantics.
 ## Predefined agents
 
 Use `/agents` to manage definitions, or place TOML files in
-`.nako-agent/agents/` under the workspace (select another directory with
+`.nakode/agents/` under the workspace (select another directory with
 `--agents`). Each filename may be chosen freely; the
 slug is the stable agent identity:
 
@@ -200,22 +211,22 @@ model = "openai-codex/gpt-5" # optional; otherwise use the parent's provider
 fallback_models = ["devin-acp/swe-1-7-lightning"] # optional, tried in order
 ```
 
-Nako Agent ships `config/default-agents.toml` as its initial preset catalog. Agent
+Nakode ships `config/default-agents.toml` as its initial preset catalog. Agent
 identities, prompts, primary models, and fallback models are loaded from that
 configuration rather than constructed in Rust. Once the workspace agent
 directory exists it becomes authoritative, so deleting a preset remains
 deleted after restart.
 
-Nako Agent adds a `[Nako Agent System Instructions]` block to new native sessions. It
-identifies the logical Nako Agent session, active provider and model, lists the
+Nakode adds a `[Nakode System Instructions]` block to new native sessions. It
+identifies the logical Nakode session, active provider and model, lists the
 configured agents, and explains the provider-neutral invocation command:
 
 ```text
-nako-agent agent explorer --session-id=<nako-session-id> --task='Map the authentication flow'
+nakode agent explorer --session-id=<nakode-session-id> --task='Map the authentication flow'
 ```
 
 The command connects to the workspace control service over
-`.nako-agent/control.sock` and blocks until the agent finishes. The service validates
+`.nakode/control.sock` and blocks until the agent finishes. The service validates
 the logical session, launches a separate provider-native child session, and
 allows up to four read-only explorer children to run concurrently. Each child
 has an independently bounded objective, native provider session, lifecycle,
@@ -225,7 +236,7 @@ transcript, and result channel. The preset explorer configuration uses
 session. A workspace agent definition may override the ordered model
 candidates. This
 socket protocol is deliberately independent of the TUI; the TUI currently
-hosts the service, while a long-lived Nako Agent daemon can take ownership of the
+hosts the service, while a long-lived Nakode daemon can take ownership of the
 same protocol as orchestration and multi-client continuity mature.
 
 All provider sessions run unattended. Codex uses `approvalPolicy: never` with
@@ -236,17 +247,17 @@ shows a compact inline status and truncated objective where each child is
 delegated without copying its raw result into the transcript. Click an inline
 child row to open its live session chat; that modal uses the same streaming
 transcript projection as the main chat.
-Nako Agent persists each orchestration run and its ordered child transcript in
+Nakode persists each orchestration run and its ordered child transcript in
 SQLite, so reopening the logical parent session restores the same inspectable
 sub-agent rows and chats.
 Completion is returned to the invoking parent process as:
 
 ```text
-[Subagent Result] [nako-agent-000001] [explorer]
+[Subagent Result] [nakode-000001] [explorer]
 ...agent response...
 ```
 
-Because invocation uses the Nako Agent CLI rather than a provider-specific dynamic
+Because invocation uses the Nakode CLI rather than a provider-specific dynamic
 tool, any parent model with native shell access can request an agent. An agent
 may target another enabled provider by setting its optional provider-qualified
 `model`.
@@ -269,7 +280,7 @@ enabled-provider registry
 The target relationship is:
 
 ```text
-Nako Agent control plane
+Nakode control plane
 ├── logical sessions, tasks, runs, handoffs, artifacts, memory
 ├── portable skills materialized through backend adapters
 └── provider adapters
