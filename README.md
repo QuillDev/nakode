@@ -80,3 +80,12 @@ nakode --workspace /path/to/project
 
 Then use `/providers` to connect a provider and `F2` to choose a model. Press
 `F1` at any time for the complete control reference.
+
+## Herdr integration
+
+Run Nakode inside a [Herdr](https://herdr.dev/) pane to expose its lifecycle in
+Herdr automatically. No Nakode or Herdr plugin is required. When `HERDR_ENV=1`
+and the pane identity is available, Nakode reports itself as `idle`, `working`,
+or `blocked`, includes its persisted logical session id when one exists, and
+releases its status authority on exit. Missing or failed Herdr reporting never
+prevents Nakode from starting or handling a turn.

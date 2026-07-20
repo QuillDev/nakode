@@ -430,6 +430,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             return Err(AppError::Terminal(error));
         }
     };
+    let mut herdr = crate::herdr::Reporter::from_environment();
 
     let loop_result = run_loop(
         terminal.terminal_mut(),
@@ -438,9 +439,13 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         &sessions,
         &mut control,
         &mut signals,
+        herdr.as_mut(),
     )
     .await;
 
+    if let Some(reporter) = herdr {
+        reporter.shutdown().await;
+    }
     let restore_result = terminal.restore();
     backends.shutdown().await;
     registration.shutdown().await;
@@ -520,6 +525,7 @@ async fn run_loop(
     sessions: &dyn SessionRepository,
     control: &mut ControlServer,
     signals: &mut ShutdownSignals,
+    mut herdr: Option<&mut crate::herdr::Reporter>,
 ) -> io::Result<()> {
     let mut input = EventStream::new();
     let mut render_tick = tokio::time::interval(Duration::from_millis(33));
@@ -527,6 +533,10 @@ async fn run_loop(
     let mut backend_open = true;
     let mut dirty = true;
     let mut agent_requests = HashMap::<u64, IncomingInvocation>::new();
+
+    if let Some(reporter) = &mut herdr {
+        reporter.sync(state);
+    }
 
     loop {
         tokio::select! {
@@ -592,6 +602,10 @@ async fn run_loop(
                     dirty = false;
                 }
             }
+        }
+
+        if let Some(reporter) = &mut herdr {
+            reporter.sync(state);
         }
 
         if state.should_quit {
