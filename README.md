@@ -1,375 +1,82 @@
 # Nakode
 
-Nakode is evolving into a provider-neutral agent orchestration and continuity
-layer. The experimental TUI now runs its portable agent loop and coding tools
-in-process, with direct authenticated transports for OpenAI Codex and Devin.
+Nakode is a provider-neutral terminal application for working with coding
+agents. It gives you one workspace and one consistent interface while allowing
+each session or delegated task to use the provider and model that fit it best.
 
-The binding product direction is recorded in [`AGENTS.md`](AGENTS.md). Codex is
-the first adapter, not Nakode's application model.
+Nakode is experimental and under active development.
 
-## Stack
+## What does it do?
 
-- **Ratatui** — immediate-mode rendering and custom cell layout
-- **Crossterm** — terminal input, raw mode, alternate screen, mouse, and
-  bracketed paste
-- **Tokio + bounded channels** — input/backend orchestration, streaming,
-  cancellation, and redraw pacing
-- **portable-pty** — isolated boundary for interactive provider/process panes
-- **SQLite** — Nakode-owned, cross-provider session metadata and discovery
-- **Direct OpenAI transport** — device authentication, model discovery, and
-  streamed Responses events
-- **Direct Devin transport** — PKCE authentication, protobuf/Connect model
-  discovery, and streamed chat events
+Nakode brings agentic coding work into a single terminal experience:
 
-Backend contracts, provider adapters, app reducer, session store, and renderer
-are separate modules. Provider wire values are normalized before they reach UI
-state. Capability snapshots control resume, steering, interruption, models, and
-other optional behavior.
+- Run coding agents against a local workspace.
+- Inspect and edit files, search code, run commands, and track task progress.
+- Stream responses, reasoning, plans, tool activity, and diffs as work happens.
+- Resume saved sessions and continue long-running work.
+- Queue follow-up prompts, interrupt active work, and switch models.
+- Delegate bounded investigations to independently tracked agents, including
+  parallel research across providers.
+- Carry work between providers with an explicit continuity handoff instead of
+  claiming that private model context can be transferred.
 
-## Architecture direction
+The longer-term direction is a provider-neutral orchestration and continuity
+layer where logical work can span multiple agents, models, and providers. That
+includes richer delegation and review workflows, portable skills, and durable
+project memory. These are product goals, not all current features.
 
-Nakode's target distribution is one self-contained executable. Its portable
-runtime owns the local agent loop, tools, approvals, and coordination;
-in-process provider adapters own authentication, inference transport, model
-discovery, and provider response state. External harness adapters are optional
-compatibility paths rather than required provider implementations.
+## Supported providers
 
-A logical Nakode session will contain multiple provider-native agent sessions.
-Cross-agent continuation will use explicit handoff packages rather than claim
-that private model context can be translated between providers.
+Nakode currently supports:
 
-## Requirements
+- **OpenAI Codex**
+- **Devin**
 
-- A real interactive terminal
+Providers are disabled on a fresh installation. Start Nakode, open
+`/providers`, and sign in to the providers you want to use. Press `F2` to browse
+and select from their available models.
 
-No provider harness or language runtime must be installed separately. The
-optional `eval` tool reports a clear error when its requested language runtime
-is not installed. Legacy Codex app-server and Devin ACP adapters remain
-isolated compatibility code for fixture coverage; normal startup and provider
-setup do not invoke them.
+Nakode does not require the separate Codex or Devin applications. Additional
+providers are planned, and no single provider defines Nakode's workflow or
+session model.
 
-## Install
+## Installation
 
-Install Nakode for the current user:
+### Homebrew on macOS
+
+Install Nakode from the official QuillDev tap:
 
 ```sh
+brew install quilldev/tap/nakode
+```
+
+Upgrade it later with:
+
+```sh
+brew upgrade nakode
+```
+
+### Build from source
+
+A source installation requires Rust 1.88 or newer:
+
+```sh
+git clone https://github.com/QuillDev/nakode.git
+cd nakode
 ./install.sh
 ```
 
-The default destination is `~/.local/bin/nakode`. If that directory is not in
-`PATH`, the script prints the shell configuration line to add. To install for
-all users instead, build as your normal user and let the script elevate only
-the final copy into `/usr/local/bin`:
+This installs `nakode` to `~/.local/bin`. Run `./install.sh --help` for system
+and custom-prefix options. Do not run Nakode or the entire installer through
+`sudo`; provider sign-in uses your normal desktop account.
+
+### Start Nakode
+
+Open a project workspace:
 
 ```sh
-./install.sh --system
+nakode --workspace /path/to/project
 ```
 
-A custom installation prefix is also supported with `./install.sh --prefix PATH`;
-the executable is placed in `PATH/bin`. The standard `PREFIX` environment
-variable can set the same default without an option. Update an installation by
-updating this checkout and rerunning the same install command:
-
-```sh
-git pull --ff-only
-./install.sh              # or: ./install.sh --system
-```
-
-The installer atomically replaces the executable and then stops any older
-shared control-service process. Open TUIs detect that restart, launch the newly
-installed service, and register themselves again automatically; otherwise the
-new service starts with the next TUI.
-
-Do not run the whole script through `sudo`; Nakode itself should also run as
-your desktop user so it can use browser authentication and user credentials.
-Run `./install.sh --help` for all installation options.
-
-## Run
-
-```sh
-# Development build
-./dev.sh --workspace /path/to/project
-
-# Development build with isolated, disposable Nakode state
-./dev.sh --clean --workspace /path/to/project
-
-# Start every enabled provider
-cargo run --release -- --workspace /path/to/project
-```
-
-You can open multiple Nakode TUIs, including multiple TUIs for the same
-workspace. Each TUI owns its terminal and active provider sessions, while one
-user-level control service routes agent invocations to the correct TUI by its
-Nakode session ID.
-
-Options:
-
-```text
---workspace <PATH>   Working directory (or NAKODE_WORKSPACE)
---model <MODEL>      Initial provider/model (or NAKODE_MODEL)
---resume <ID>        Resume a Nakode session by ID or prefix (or NAKODE_RESUME)
---scrollback <N>     Logical transcript entry limit (or NAKODE_SCROLLBACK)
---compaction-threshold-percent <1-100>
-                     Context usage that triggers compaction (or NAKODE_COMPACTION_THRESHOLD_PERCENT; default 85)
---agents <PATH>      Agent-definition directory (or NAKODE_AGENTS)
-```
-
-Every interactive `dev.sh` run gracefully stops a development instance already
-serving the same workspace before starting its replacement. Adding `--clean`
-gives that replacement a fresh provider registry, session database, and agent
-catalog without deleting the normal development installation. The isolated
-state, including its provider credential stores, is removed when the process
-exits. Run the script as your desktop user, not through `sudo`, so browser
-integration and user credentials remain available.
-
-Providers are configured explicitly from `/providers`. Codex setup uses its
-device-code flow and refreshes OAuth tokens directly. Devin setup uses its
-browser-based PKCE flow with a localhost callback. Credentials and native
-session state are stored in Nakode's user-private SQLite database; they are
-never exported to child provider processes. Models are referenced uniformly as
-`provider-slug/model-slug`, such as `openai-codex/gpt-5`; F2 searches this
-unified catalog, and model selection routes new work to that provider. Both
-model catalogs are discovered through their authenticated native transports
-and cached in SQLite. Direct in-process turns currently support interruption;
-turn steering remains explicitly unsupported. Nakode continues to discover data
-from earlier Nako Agent installations, including the legacy application database,
-workspace agent directory, control socket, and `NAKO_AGENT_*` environment
-variables, so the rebrand does not discard existing sessions or configuration.
-OpenAI model requests retry
-transient connection failures, rate limits, lock conflicts, timeouts, and server
-errors up to three times with cancellation-aware exponential backoff. A response
-is never retried after visible text or reasoning has streamed, avoiding duplicate
-transcript content and tool calls.
-
-## Controls
-
-| Key | Action |
-| --- | --- |
-| `Enter` / `Ctrl+Enter` | Send while idle; queue while a turn is active |
-| `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert a newline |
-| `Ctrl+Q` | Explicitly queue the draft |
-| `Ctrl+S` | Steer the active turn; the draft clears only after acceptance |
-| `Ctrl+C` | Interrupt the active turn and all subagents; press again while cancelling to exit |
-| `F1` | Open or close the key reference |
-| `F2` | Open the model picker; changes apply to the next turn |
-| `/resume` | Open the recent-session picker for this workspace |
-| `/resume ID` | Resume a saved session by Nakode ID or unique prefix |
-| `/new` | Unsubscribe from the current backend session and start fresh |
-| `/compress` | Immediately compress the current in-process chat context into a continuity checkpoint |
-| `/models` | Choose and persist a provider's default model for future sessions |
-| `/switch` | Switch the model for only the current session |
-| `/providers` | Open the provider registry and enable or disable adapters |
-| `/agents` | View, create, edit, or delete delegated agent archetypes |
-| `/reload` | Refresh backend metadata and model choices; updates the cache |
-| `PageUp` / `PageDown` | Scroll transcript |
-| `Ctrl+L` | Jump to latest output |
-| `Alt+Up` / `Alt+Down` | Select a queued message |
-| `Alt+Delete` | Remove the selected queued message |
-| `Ctrl+D` | Exit when no turn is active |
-| Mouse drag | Select rendered text and automatically copy it |
-| `y` / `a` / `n` | Accept once / accept for session / decline an approval |
-
-Mouse selections are copied through the terminal's OSC 52 clipboard protocol,
-including tmux passthrough. The terminal must permit clipboard writes. Pasted
-control sequences are treated as text, and streamed tool output is rendered as
-sanitized data rather than executed terminal control.
-
-After a persisted session exits, Nakode prints a ready-to-run command
-containing the workspace and logical session ID so the session can be resumed
-from any directory.
-
-## Current behavior
-
-- Initializes every enabled provider and records each declared capability set.
-- Persists the provider registry. A clean installation enables nothing; the
-  user explicitly starts each provider from `/providers`.
-- Loads and caches provider-qualified model catalogs from enabled providers.
-- Discovers provider model catalogs at startup; providers that require a native
-  session for discovery create one through their native adapter.
-- Refreshes backend metadata and model caches with `/reload`.
-- Runs sequential turns in one active provider session at a time.
-- Compacts in-process session context before the model window is exhausted,
-  preserving a structured continuity checkpoint and a recent raw-history tail.
-  `/compress` forces the same operation for the current idle chat without
-  waiting for the automatic threshold. A detected context-overflow error
-  triggers one compact-and-retry recovery.
-  Compaction lifecycle entries appear in the chat and are restored from the
-  persisted session without exposing checkpoint contents to the transcript.
-- Stores provider-neutral session metadata in SQLite and supports `--resume`,
-  `/resume`, `/resume ID`, and `/new`; each provider remains authoritative for
-  model context and reconstructed transcript history.
-- Streams assistant, reasoning, plan, command, MCP, file-change, and tool items
-  by protocol item ID.
-- Leaves coding tools, execution policy, and approvals to the provider selected
-  by each model/session.
-- Keeps queued prompts in app-owned FIFO state.
-- Keeps steering separate from queueing and handles completion races
-  deterministically.
-- Supports immediate turn interruption; provider approval requests are accepted by the adapter.
-- Highlights mouse-drag selections and copies them automatically to the local
-  terminal clipboard.
-- Processes every protocol delta through a bounded channel while coalescing
-  terminal redraws to roughly 30 FPS.
-- Restores raw mode, alternate screen, cursor, mouse capture, colors, and
-  bracketed paste on normal exit, panic, `SIGINT`, `SIGTERM`, and `SIGHUP`.
-- Emits a terminal BEL when the primary turn finishes so supported terminals can
-  provide an audible or visual completion notification.
-
-Agent responses and reasoning render GitHub-flavored Markdown in the transcript,
-including headings, emphasis, links, block quotes, ordered and unordered lists,
-task checkboxes, tables, inline code, and fenced code blocks. Fenced blocks use
-their language tag for syntax highlighting. Tool output and diffs retain their
-provider-neutral semantic coloring. Each turn renders as a `User` prompt followed
-by one `Nakode` activity stream containing reasoning, tool calls, tool output, and
-the final response. The Nakode header shows an animated spinner while the turn is
-active. Per-item kind headers and opaque tool-call IDs are omitted, while
-meaningful tool names and action summaries remain visible. Every tool result is
-collapsed to one row by default, such as `▸ read src/state.rs` or
-`▸ bash cargo test`. The complete result remains available to the model and
-session history; click the tool row to expand it and the footer to collapse it.
-
-## Portable tools
-
-The in-process runtime registers the same dynamic function-tool schemas with
-both direct providers. Its base set is `read`, `write`, `edit`, `bash`, `glob`,
-`grep`, `eval`, `ask`, and `todo`; `task` and `hub` are intentionally excluded.
-Local paths follow shell conventions relative to the workspace, process tools
-are bounded and cancellable, `ask` supports structured related questions in the
-TUI, eval kernels retain per-language state, and phased todos persist with the
-provider session. Optional compatibility adapters continue to use their
-provider-owned tool and permission semantics.
-
-When [`hypa`](https://github.com/Hypabolic/Hypa) is installed on `PATH`, the
-`bash` tool automatically asks `hypa rewrite --json` to wrap eligible non-PTY
-commands with Hypa's deterministic output compression. Hypa passthrough
-decisions preserve the original command. A missing executable, rewrite timeout,
-or invalid response also falls back to the original command, while Hypa policy
-decisions that deny or require confirmation prevent unattended execution.
-Explicit PTY commands bypass rewriting so their terminal semantics remain
-intact.
-
-## Predefined agents
-
-Use `/agents` to manage definitions, or place TOML files in
-`.nakode/agents/` under the workspace (select another directory with
-`--agents`). Each filename may be chosen freely; the
-slug is the stable agent identity:
-
-```toml
-slug = "explorer"
-description = "Gathers relevant context and returns a concise, detailed report"
-system_prompt = "Investigate without modifying files. Report evidence and uncertainty."
-first_message = "Explore the delegated question and report the context the parent needs."
-model = "openai-codex/gpt-5" # optional; otherwise use the parent's provider
-fallback_models = ["devin-acp/swe-1-7-lightning"] # optional, tried in order
-```
-
-Nakode ships `config/default-agents.toml` as its initial preset catalog. Agent
-identities, prompts, primary models, and fallback models are loaded from that
-configuration rather than constructed in Rust. Once the workspace agent
-directory exists it becomes authoritative, so deleting a preset remains
-deleted after restart.
-
-Nakode adds a `[Nakode System Instructions]` block to new native sessions. It
-identifies the logical Nakode session, active provider and model, lists the
-configured agents, and explains the provider-neutral invocation command:
-
-```text
-nakode agent explorer --session-id=<nakode-session-id> --task='Map the authentication flow'
-```
-
-The command connects to Nakode's shared user-level control service and blocks
-until the agent finishes. Each TUI registers its Nakode session with that
-service through a private socket, so invocations are routed to the correct TUI
-even when several TUIs use the same workspace. The target TUI validates the
-logical session, launches a separate provider-native child session, and allows
-up to four read-only explorer children to run concurrently. Each child has an
-independently bounded objective, native provider session, lifecycle,
-transcript, and result channel. The preset explorer configuration uses
-`devin-acp/swe-1-7-lightning` by default and falls back to
-`openai-codex/gpt-5.6-luna` if Devin cannot launch or create the native child
-session. A workspace agent definition may override the ordered model
-candidates. The shared service is a lightweight routing broker; provider
-adapters and active agent loops remain owned by their registered TUI.
-
-All provider sessions run unattended. Codex uses `approvalPolicy: never` with
-a `danger-full-access` sandbox, while Devin launches its native ACP server with
-`--permission-mode dangerous`. Unexpected permission requests are accepted
-inside the provider adapter rather than interrupting the TUI. The parent chat
-shows a compact inline status and truncated objective where each child is
-delegated without copying its raw result into the transcript. Click an inline
-child row to open its live session chat; that modal uses the same streaming
-transcript projection as the main chat.
-Nakode persists each orchestration run and its ordered child transcript in
-SQLite, so reopening the logical parent session restores the same inspectable
-sub-agent rows and chats.
-Completion is returned to the invoking parent process as:
-
-```text
-[Subagent Result] [nakode-000001] [explorer]
-...agent response...
-```
-
-Because invocation uses the Nakode CLI rather than a provider-specific dynamic
-tool, any parent model with native shell access can request an agent. An agent
-may target another enabled provider by setting its optional provider-qualified
-`model`.
-
-## Current implementation architecture
-
-```text
-CLI clients ─> workspace Unix socket ─┐
-Crossterm events ─────────────────├─> single AppState reducer ─> Ratatui projection
-provider-tagged events ──────────────┘            │
-                                                   └─> provider-routed commands
-
-enabled-provider registry
-├── OpenAI Codex <─ HTTPS/SSE ───────> direct adapter
-└── Devin        <─ HTTPS/Connect ──> direct adapter
-                         │
-                         └─> shared local agent loop and supervised tools
-```
-
-The target relationship is:
-
-```text
-Nakode control plane
-├── logical sessions, tasks, runs, handoffs, artifacts, memory
-├── portable skills materialized through backend adapters
-└── provider adapters
-    ├── Codex inference transport and provider context
-    ├── Devin inference transport and provider context
-    └── future native agent sessions
-```
-
-Important files:
-
-- `src/backend.rs` — provider-neutral commands, events, capabilities, and handle
-- `src/controls.rs` — authoritative keyboard, mouse, slash-command, and help registry
-- `src/runtime.rs` — portable agent loop, tool contracts, and native session state
-- `src/tools/` — portable tool registry and supervised base-tool implementations
-- `src/codex/native.rs` — direct Codex OAuth, discovery, and Responses transport
-- `src/codex/client.rs` — optional Codex app-server compatibility adapter
-- `src/codex/protocol.rs` — schema-tolerant Codex normalization
-- `src/devin/native.rs` — direct Devin protobuf/Connect transport
-- `src/devin/client.rs` — optional Devin ACP compatibility adapter and OAuth flow
-- `src/state.rs` — queue, steer, cancel, model, approval, and transcript
-  transitions
-- `src/transcript.rs` — logical entries, projection cache, wrapping, and
-  viewport slicing
-- `src/editor.rs` — app-owned multiline Unicode editor
-- `src/render.rs` — Ratatui layout and overlays
-- `src/terminal.rs` — terminal lifecycle and restoration
-- `src/pty.rs` — interactive subprocess boundary
-
-## Verify
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-```
-
-The test suite includes reducer race tests, exact protocol fixtures, a fake
-JSONL app-server, Ratatui `TestBackend` rendering, native PTY lifecycle, and a
-real PTY terminal-restoration smoke test.
+Then use `/providers` to connect a provider and `F2` to choose a model. Press
+`F1` at any time for the complete control reference.
