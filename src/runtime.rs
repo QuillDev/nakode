@@ -167,6 +167,7 @@ impl AgentRuntime {
             .map_err(|_| "backend event receiver closed".to_owned())?;
 
         let mut overflow_recovery_attempted = false;
+        let mut inference_round = 0_u64;
         loop {
             if cancellation.is_cancelled() {
                 return Err("turn interrupted".to_owned());
@@ -188,8 +189,15 @@ impl AgentRuntime {
                 // remains best-effort so inference can still proceed.
             }
             let result = self
-                .infer_once(session, turn_id, backend_events, &cancellation)
+                .infer_once(
+                    session,
+                    turn_id,
+                    inference_round,
+                    backend_events,
+                    &cancellation,
+                )
                 .await?;
+            inference_round += 1;
             let output = match result {
                 Ok(output) => output,
                 Err(error) if is_context_overflow(&error) && !overflow_recovery_attempted => {
@@ -236,6 +244,7 @@ impl AgentRuntime {
         &self,
         session: &RuntimeSession,
         turn_id: &str,
+        inference_round: u64,
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: &CancellationToken,
     ) -> Result<Result<InferenceOutput, String>, String> {
@@ -256,12 +265,16 @@ impl AgentRuntime {
         });
         while let Some(event) = inference_rx.recv().await {
             let (item_id, kind, delta) = match event {
-                InferenceEvent::TextDelta(delta) => {
-                    (format!("{turn_id}:assistant"), DeltaKind::Assistant, delta)
-                }
-                InferenceEvent::ReasoningDelta(delta) => {
-                    (format!("{turn_id}:reasoning"), DeltaKind::Reasoning, delta)
-                }
+                InferenceEvent::TextDelta(delta) => (
+                    format!("{turn_id}:assistant:{inference_round}"),
+                    DeltaKind::Assistant,
+                    delta,
+                ),
+                InferenceEvent::ReasoningDelta(delta) => (
+                    format!("{turn_id}:reasoning:{inference_round}"),
+                    DeltaKind::Reasoning,
+                    delta,
+                ),
             };
             backend_events
                 .send(BackendEvent::ItemDelta {
@@ -966,8 +979,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentRuntime, ConversationItem, InferenceFuture, InferenceOutput, InferenceProvider,
-        InferenceRequest, QuestionBroker, RuntimeSession, RuntimeSessionStore, ToolCall,
+        AgentRuntime, ConversationItem, InferenceEvent, InferenceFuture, InferenceOutput,
+        InferenceProvider, InferenceRequest, QuestionBroker, RuntimeSession, RuntimeSessionStore,
+        ToolCall,
     };
     use crate::backend::{
         BackendEvent, CompactionReason, ItemKind, QuestionOption, QuestionRequest,
@@ -979,6 +993,10 @@ mod tests {
     struct RepeatingToolProvider {
         calls: AtomicUsize,
         tool_rounds: usize,
+    }
+
+    struct StreamingToolProvider {
+        calls: AtomicUsize,
     }
 
     struct CompactionProvider {
@@ -995,6 +1013,90 @@ mod tests {
                 overflow_once,
             }
         }
+    }
+
+    impl InferenceProvider for StreamingToolProvider {
+        fn infer(
+            &self,
+            _request: InferenceRequest,
+            events: mpsc::Sender<InferenceEvent>,
+            _cancellation: CancellationToken,
+        ) -> InferenceFuture<'_> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let text = if call == 0 {
+                    "I will inspect first."
+                } else {
+                    "The work is complete."
+                };
+                events
+                    .send(InferenceEvent::TextDelta(text.to_owned()))
+                    .await
+                    .map_err(|_| "inference event receiver closed".to_owned())?;
+                Ok(if call == 0 {
+                    InferenceOutput {
+                        text: text.to_owned(),
+                        tool_calls: vec![ToolCall {
+                            id: "call-0".to_owned(),
+                            name: "todo".to_owned(),
+                            arguments: json!({"op": "view"}),
+                        }],
+                        ..InferenceOutput::default()
+                    }
+                } else {
+                    InferenceOutput {
+                        text: text.to_owned(),
+                        ..InferenceOutput::default()
+                    }
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_final_response_follows_tool_items() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(StreamingToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider);
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        let (events, mut receiver) = mpsc::channel(32);
+
+        runtime
+            .run_turn(
+                &mut session,
+                "turn-1",
+                "Inspect and finish.".to_owned(),
+                &events,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn completes");
+        drop(events);
+
+        let mut item_order = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            let item_id = match event {
+                BackendEvent::ItemDelta { item_id, .. } => Some(item_id),
+                BackendEvent::ItemStarted { item, .. } => Some(item.id),
+                _ => None,
+            };
+            if let Some(item_id) = item_id
+                && !item_order.contains(&item_id)
+            {
+                item_order.push(item_id);
+            }
+        }
+
+        assert_eq!(
+            item_order,
+            [
+                "turn-1:assistant:0",
+                "turn-1:tool:call-0",
+                "turn-1:assistant:1",
+            ]
+        );
     }
 
     impl InferenceProvider for CompactionProvider {
