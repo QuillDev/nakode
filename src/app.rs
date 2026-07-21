@@ -1193,7 +1193,8 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.remove_selected_queue_item();
             Vec::new()
         }
-        Some(ControlAction::Submit) => state.submit_or_steer_editor(),
+        Some(ControlAction::Submit) => state.submit_editor(),
+        Some(ControlAction::SteerOrSubmit) => state.submit_or_steer_editor(),
         Some(ControlAction::BackspaceWord) => {
             state.editor.delete_word_backward();
             Vec::new()
@@ -1567,7 +1568,7 @@ mod tests {
         backend::{BackendEvent, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, TurnOutcome},
         render,
         session::ProviderRecord,
-        state::{ActiveTurn, AgentRequest, AppState, Effect},
+        state::{ActiveTurn, AgentRequest, AppState, ConnectionState, Effect},
         transcript::{EntryKind, EntryStatus},
     };
 
@@ -2040,8 +2041,11 @@ mod tests {
     }
 
     #[test]
-    fn alt_enter_queues_during_an_active_turn() {
+    fn enter_queues_during_an_active_turn() {
         let mut state = AppState::new("/tmp/project", None, 100);
+        state.connection = ConnectionState::Ready {
+            server: "test".to_owned(),
+        };
         state.active_turn = Some(ActiveTurn {
             id: "turn-1".to_owned(),
             model: None,
@@ -2049,7 +2053,10 @@ mod tests {
         });
         state.editor.set_text("later");
 
-        super::handle_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
 
         assert!(state.editor.is_blank());
         assert_eq!(
@@ -2059,10 +2066,14 @@ mod tests {
     }
 
     #[test]
-    fn enter_steers_during_an_active_turn() {
+    fn alt_enter_steers_during_an_active_turn() {
         let mut state =
             AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+        state.connection = ConnectionState::Ready {
+            server: "test".to_owned(),
+        };
         state.backend_capabilities.steering = CapabilitySupport::Supported;
+        state.provider_session_id = Some("session-1".to_owned());
         state.active_turn = Some(ActiveTurn {
             id: "turn-1".to_owned(),
             model: None,
@@ -2070,16 +2081,19 @@ mod tests {
         });
         state.editor.set_text("focus here");
 
-        super::handle_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
+        let effects =
+            super::handle_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
 
         assert_eq!(state.editor.text(), "focus here");
-        assert_eq!(
-            state.status_message,
-            "The active provider session is unavailable."
-        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(crate::backend::BackendCommand::SteerTurn {
+                session_id,
+                turn_id,
+                prompt,
+                ..
+            })] if session_id == "session-1" && turn_id == "turn-1" && prompt == "focus here"
+        ));
     }
 
     #[test]
