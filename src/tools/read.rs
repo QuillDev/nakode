@@ -81,6 +81,8 @@ async fn read_targets(workspace: &std::path::Path, supplied: &str) -> Result<Str
     Ok(truncate_output(rendered.join("\n\n").into_bytes()))
 }
 
+const MAX_FILE_READ_BYTES: u64 = 8 * 1024 * 1024;
+
 async fn read_target(workspace: &std::path::Path, supplied: &str) -> Result<String, String> {
     let (path, selector) = resolve_read_target(workspace, supplied).await?;
     let metadata = tokio::fs::metadata(&path)
@@ -88,6 +90,13 @@ async fn read_target(workspace: &std::path::Path, supplied: &str) -> Result<Stri
         .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
     if metadata.is_dir() {
         return list_directory(&path).await;
+    }
+    if metadata.len() > MAX_FILE_READ_BYTES {
+        return Err(format!(
+            "{} is {} bytes; read is limited to {MAX_FILE_READ_BYTES} bytes",
+            path.display(),
+            metadata.len()
+        ));
     }
     let contents = tokio::fs::read(&path)
         .await
@@ -255,6 +264,20 @@ mod tests {
         assert!(rendered.contains("400|line 400"));
         assert!(!rendered.contains("401|line 401"));
         assert!(rendered.contains("Showing lines 1-400 of 500"));
+    }
+
+    #[tokio::test]
+    async fn oversized_files_are_rejected_before_loading() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("large.txt");
+        let file = std::fs::File::create(&path).expect("large fixture");
+        file.set_len(super::MAX_FILE_READ_BYTES + 1)
+            .expect("size fixture");
+
+        let error = read_targets(directory.path(), "large.txt")
+            .await
+            .expect_err("oversized file must fail");
+        assert!(error.contains("read is limited"));
     }
 
     #[tokio::test]

@@ -178,10 +178,8 @@ async fn run_pty_process(
             .master
             .try_clone_reader()
             .map_err(|error| format!("failed to capture PTY output: {error}"))?;
-        let output_reader = std::thread::spawn(move || {
-            let mut output = Vec::new();
-            reader.read_to_end(&mut output).map(|_| output)
-        });
+        let output_reader =
+            std::thread::spawn(move || read_bounded(&mut reader, super::MAX_TOOL_OUTPUT_BYTES));
         let started = std::time::Instant::now();
         let mut interrupted = false;
         let mut timed_out = false;
@@ -227,6 +225,19 @@ async fn run_pty_process(
     })
     .await
     .map_err(|error| format!("PTY worker failed: {error}"))?
+}
+
+fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::with_capacity(limit.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let remaining = limit.saturating_add(1).saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
 }
 
 fn parse_environment(arguments: &Value) -> Result<HashMap<String, String>, String> {
