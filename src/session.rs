@@ -14,6 +14,7 @@ pub use crate::backend::{CODEX_PROVIDER, DEVIN_PROVIDER};
 use crate::{
     backend::ModelInfo,
     transcript::{EntryKind, EntryStatus, TranscriptEntry},
+    web::{WebBackend, WebConfig},
 };
 
 const PROVIDER_CATALOG_PATH: &str = "config/providers.toml";
@@ -224,6 +225,16 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when persistence cannot be queried or contains invalid data.
     fn list_subagents(&self, parent_session_id: &str) -> Result<Vec<SubagentRecord>, SessionError>;
+    /// Loads optional web-browser add-on preferences.
+    ///
+    /// # Errors
+    /// Returns an error when preference storage cannot be read.
+    fn load_web_config(&self) -> Result<WebConfig, SessionError>;
+    /// Saves optional web-browser add-on preferences.
+    ///
+    /// # Errors
+    /// Returns an error when preference storage cannot be updated.
+    fn save_web_config(&self, config: &WebConfig) -> Result<(), SessionError>;
 }
 
 pub struct SqliteSessionRepository {
@@ -451,6 +462,13 @@ fn protect_path(_path: &Path, _mode: u32) -> Result<(), SessionError> {
 }
 
 fn seed_provider_catalog(connection: &Connection) -> Result<(), SessionError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS addon_web_settings (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           backend TEXT NOT NULL,
+           firecrawl_api_key TEXT NOT NULL
+         );",
+    )?;
     let provider_catalog =
         toml::from_str::<ProviderCatalog>(PROVIDER_CATALOG).map_err(|source| {
             SessionError::InvalidProviderCatalog {
@@ -876,6 +894,56 @@ impl SessionRepository for SqliteSessionRepository {
         }
         Ok(records)
     }
+
+    fn load_web_config(&self) -> Result<WebConfig, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let stored = connection
+            .query_row(
+                "SELECT backend, firecrawl_api_key FROM addon_web_settings WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((backend, firecrawl_api_key)) = stored else {
+            return Ok(WebConfig::default());
+        };
+        let backend = match backend.as_str() {
+            "disabled" => WebBackend::Disabled,
+            "agent-browser" => WebBackend::AgentBrowser,
+            "firecrawl" => WebBackend::Firecrawl,
+            _ => {
+                return Err(SessionError::InvalidStoredValue {
+                    field: "addon_web_settings.backend",
+                    value: backend,
+                });
+            }
+        };
+        Ok(WebConfig {
+            backend,
+            firecrawl_api_key,
+        })
+    }
+
+    fn save_web_config(&self, config: &WebConfig) -> Result<(), SessionError> {
+        let backend = match config.backend {
+            WebBackend::Disabled => "disabled",
+            WebBackend::AgentBrowser => "agent-browser",
+            WebBackend::Firecrawl => "firecrawl",
+        };
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "INSERT INTO addon_web_settings (singleton, backend, firecrawl_api_key) VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET backend = excluded.backend, firecrawl_api_key = excluded.firecrawl_api_key",
+            params![backend, config.firecrawl_api_key],
+        )?;
+        Ok(())
+    }
 }
 
 fn load_subagent_transcript(
@@ -977,6 +1045,21 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_addon_settings_are_optional_and_persisted() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        assert_eq!(store.load_web_config()?, WebConfig::default());
+
+        let configured = WebConfig {
+            backend: WebBackend::Firecrawl,
+            firecrawl_api_key: "secret".to_owned(),
+        };
+        store.save_web_config(&configured)?;
+        assert_eq!(store.load_web_config()?, configured);
+        Ok(())
+    }
 
     #[test]
     fn persists_and_orders_sessions() -> Result<(), SessionError> {

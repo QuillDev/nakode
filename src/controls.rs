@@ -15,6 +15,7 @@ pub enum ControlContext {
     ProviderCredential,
     AgentList,
     AgentEditor,
+    Settings,
     Subagent,
 }
 
@@ -386,6 +387,13 @@ const KEY_CONTROLS: &[KeyControl] = &[
     control!(AgentEditor, Next, KeyCode::Tab, None),
     control!(AgentEditor, Next, KeyCode::Down, Any),
     control!(AgentEditor, Backspace, KeyCode::Backspace, Any),
+    control!(Settings, Close, KeyCode::Esc, Any),
+    control!(Settings, Select, KeyCode::Enter, Any),
+    control!(Settings, Previous, KeyCode::Up, Any),
+    control!(Settings, Next, KeyCode::Down, Any),
+    control!(Settings, MoveLeft, KeyCode::Left, Any),
+    control!(Settings, MoveRight, KeyCode::Right, Any),
+    control!(Settings, Backspace, KeyCode::Backspace, Any),
     control!(Subagent, CancelOrQuit, KeyCode::Char('c'), Control),
     control!(Subagent, Latest, KeyCode::Char('l'), Control),
     control!(Subagent, ScrollUp, KeyCode::PageUp, Any),
@@ -475,6 +483,7 @@ pub enum CommandPlacement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlashAction {
     Agents,
+    Settings,
     Compress,
     Models,
     New,
@@ -500,6 +509,12 @@ const SLASH_CONTROLS: &[SlashControl] = &[
         action: SlashAction::Agents,
         invocation: "/agents",
         description: "manage delegated agent archetypes",
+        placement: CommandPlacement::PromptStart,
+    },
+    SlashControl {
+        action: SlashAction::Settings,
+        invocation: "/settings",
+        description: "search and manage Nakode settings",
         placement: CommandPlacement::PromptStart,
     },
     SlashControl {

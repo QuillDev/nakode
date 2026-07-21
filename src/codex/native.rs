@@ -46,6 +46,7 @@ pub struct BackendConfig {
     session_database: Option<PathBuf>,
     compaction_threshold_percent: usize,
     reasoning_effort: Option<String>,
+    web_config: Option<Arc<std::sync::RwLock<crate::web::WebConfig>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +74,7 @@ impl BackendConfig {
             session_database: None,
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             reasoning_effort: Some("medium".to_owned()),
+            web_config: None,
         }
     }
 
@@ -91,6 +93,15 @@ impl BackendConfig {
     #[must_use]
     pub fn with_compaction_threshold_percent(mut self, threshold_percent: usize) -> Self {
         self.compaction_threshold_percent = threshold_percent;
+        self
+    }
+
+    #[must_use]
+    pub fn with_web_config(
+        mut self,
+        config: Arc<std::sync::RwLock<crate::web::WebConfig>>,
+    ) -> Self {
+        self.web_config = Some(config);
         self
     }
 
@@ -300,8 +311,12 @@ async fn run_supervisor(
         }) as Arc<dyn InferenceProvider>
     });
     let runtime = provider.map(|provider| {
-        AgentRuntime::new(config.workspace.clone(), provider)
-            .with_compaction_threshold_percent(config.compaction_threshold_percent)
+        let mut runtime = AgentRuntime::new(config.workspace.clone(), provider)
+            .with_compaction_threshold_percent(config.compaction_threshold_percent);
+        if let Some(web_config) = &config.web_config {
+            runtime = runtime.with_web_config(Arc::clone(web_config));
+        }
+        runtime
     });
     let session_store = config
         .session_database
