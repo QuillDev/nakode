@@ -509,13 +509,8 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Optio
     let lines = window
         .lines
         .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            styled_composer_line(
-                line,
-                window.first_row + index == 0 && window.horizontal_offset == 0,
-            )
-        })
+        .zip(window.prompt_line_starts)
+        .map(|(line, first_prompt_line)| styled_composer_line(line, first_prompt_line))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     Some(Position::new(
