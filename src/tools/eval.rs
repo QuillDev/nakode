@@ -3,7 +3,7 @@ use std::{collections::HashMap, ffi::OsString, process::Stdio, time::Duration};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
 };
@@ -155,7 +155,7 @@ impl EvalLanguage {
 struct EvalKernel {
     child: Child,
     stdin: ChildStdin,
-    lines: Lines<BufReader<ChildStdout>>,
+    stdout: BufReader<ChildStdout>,
 }
 
 impl EvalKernel {
@@ -181,7 +181,7 @@ impl EvalKernel {
         Ok(Self {
             child,
             stdin,
-            lines: BufReader::new(stdout).lines(),
+            stdout: BufReader::new(stdout),
         })
     }
 
@@ -207,7 +207,7 @@ impl EvalKernel {
         let mut output = Vec::new();
         loop {
             let line = tokio::select! {
-                line = self.lines.next_line() => line.map_err(|error| format!("eval kernel output failed: {error}"))?,
+                line = read_bounded_line(&mut self.stdout, super::MAX_TOOL_OUTPUT_BYTES) => line.map_err(|error| format!("eval kernel output failed: {error}"))?,
                 () = cancellation.cancelled() => return Err("evaluation interrupted".to_owned()),
                 () = wait_for_deadline(deadline) => return Err("evaluation timed out".to_owned()),
             };
@@ -215,10 +215,10 @@ impl EvalKernel {
                 let status = self.child.wait().await.map_err(|error| error.to_string())?;
                 return Err(format!("eval kernel exited with {status}"));
             };
-            if line == success_marker {
+            if line == success_marker.as_bytes() {
                 return Ok(ToolResult::success(truncate_output(output)));
             }
-            if line == error_marker {
+            if line == error_marker.as_bytes() {
                 let output = truncate_output(output);
                 return Ok(ToolResult::failure(if output.is_empty() {
                     "evaluation failed".to_owned()
@@ -226,14 +226,46 @@ impl EvalKernel {
                     output
                 }));
             }
-            output.extend_from_slice(line.as_bytes());
-            output.push(b'\n');
+            let remaining = super::MAX_TOOL_OUTPUT_BYTES
+                .saturating_add(1)
+                .saturating_sub(output.len());
+            output.extend_from_slice(&line[..line.len().min(remaining)]);
+            if remaining > line.len() {
+                output.push(b'\n');
+            }
         }
     }
 
     async fn stop(&mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
+    }
+}
+
+async fn read_bounded_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    limit: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut retained = Vec::with_capacity(limit.min(8 * 1024));
+    let mut read_any = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(read_any.then_some(retained));
+        }
+        read_any = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let content = newline.map_or(available, |index| &available[..index]);
+        let remaining = limit.saturating_add(1).saturating_sub(retained.len());
+        retained.extend_from_slice(&content[..content.len().min(remaining)]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            if retained.last() == Some(&b'\r') {
+                retained.pop();
+            }
+            return Ok(Some(retained));
+        }
     }
 }
 

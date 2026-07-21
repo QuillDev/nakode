@@ -94,8 +94,8 @@ pub async fn capture_process(
         .stderr
         .take()
         .ok_or_else(|| "process stderr was not captured".to_owned())?;
-    let stdout_task = tokio::spawn(read_stream(stdout));
-    let stderr_task = tokio::spawn(read_stream(stderr));
+    let stdout_task = tokio::spawn(read_stream(stdout, super::MAX_TOOL_OUTPUT_BYTES));
+    let stderr_task = tokio::spawn(read_stream(stderr, super::MAX_TOOL_OUTPUT_BYTES));
     let mut timed_out = false;
     let mut interrupted = false;
     let status = tokio::select! {
@@ -170,11 +170,41 @@ fn terminate_process_tree(
         .map_err(|error| format!("failed to {operation} process: {error}"))
 }
 
-async fn read_stream(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    stream
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|error| format!("failed to read process output: {error}"))?;
-    Ok(bytes)
+async fn read_stream(
+    mut stream: impl tokio::io::AsyncRead + Unpin,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let mut retained = Vec::with_capacity(limit.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|error| format!("failed to read process output: {error}"))?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let remaining = limit.saturating_add(1).saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn stream_collection_drains_input_but_retains_only_the_limit_marker() {
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let write = tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'x'; 4_096])
+                .await
+                .expect("write fixture");
+        });
+        let retained = super::read_stream(reader, 128).await.expect("read fixture");
+        write.await.expect("writer task");
+        assert_eq!(retained.len(), 129);
+        assert!(retained.iter().all(|byte| *byte == b'x'));
+    }
 }
