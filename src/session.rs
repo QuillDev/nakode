@@ -13,6 +13,7 @@ use uuid::Uuid;
 pub use crate::backend::{CODEX_PROVIDER, DEVIN_PROVIDER};
 use crate::{
     backend::ModelInfo,
+    credential::CredentialMetadata,
     transcript::{EntryKind, EntryStatus, TranscriptEntry},
 };
 
@@ -49,15 +50,7 @@ pub struct ProviderRecord {
     pub provider: String,
     pub display_name: String,
     pub enabled: bool,
-    pub credential: Option<ProviderCredentialRecord>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProviderCredentialRecord {
-    pub provider: String,
-    pub kind: String,
-    pub metadata: serde_json::Value,
-    pub updated_at: i64,
+    pub credential: Option<CredentialMetadata>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,21 +192,6 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when persistence cannot be updated.
     fn set_provider_enabled(&self, provider: &str, enabled: bool) -> Result<(), SessionError>;
-    /// Saves provider credential metadata and its native-store reference.
-    ///
-    /// # Errors
-    /// Returns an error when the credential record cannot be persisted.
-    fn save_provider_credential(
-        &self,
-        provider: &str,
-        kind: &str,
-        metadata: &serde_json::Value,
-    ) -> Result<(), SessionError>;
-    /// Removes a provider credential record.
-    ///
-    /// # Errors
-    /// Returns an error when the credential record cannot be removed.
-    fn delete_provider_credential(&self, provider: &str) -> Result<(), SessionError>;
     /// Saves the current durable projection of a sub-agent run and its transcript.
     ///
     /// # Errors
@@ -674,35 +652,26 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT p.provider, p.display_name, p.enabled,
-                    c.credential_kind, c.credential_json, c.updated_at
+                    c.credential_kind, c.updated_at
              FROM providers p
              LEFT JOIN provider_credentials c ON c.provider = p.provider
              ORDER BY p.display_name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
+            let provider = row.get::<_, String>(0)?;
             let credential_kind = row.get::<_, Option<String>>(3)?;
+            let credential_updated_at = row.get::<_, Option<i64>>(4)?;
             Ok(ProviderRecord {
-                provider: row.get(0)?,
+                provider: provider.clone(),
                 display_name: row.get(1)?,
                 enabled: row.get::<_, i64>(2)? != 0,
                 credential: credential_kind
-                    .map(|kind| {
-                        let metadata_source = row.get::<_, String>(4)?;
-                        let metadata = serde_json::from_str(&metadata_source).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                4,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                        Ok::<ProviderCredentialRecord, rusqlite::Error>(ProviderCredentialRecord {
-                            provider: row.get(0)?,
-                            kind,
-                            metadata,
-                            updated_at: row.get(5)?,
-                        })
-                    })
-                    .transpose()?,
+                    .zip(credential_updated_at)
+                    .map(|(kind, updated_at)| CredentialMetadata {
+                        provider,
+                        kind,
+                        updated_at,
+                    }),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -713,63 +682,10 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        if enabled {
-            let has_credential = connection
-                .query_row(
-                    "SELECT 1 FROM provider_credentials WHERE provider = ?1",
-                    params![provider],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            if !has_credential {
-                return Err(SessionError::MissingProviderCredential(provider.to_owned()));
-            }
-        }
         connection.execute(
             "UPDATE providers SET enabled = ?1, updated_at = ?2 WHERE provider = ?3",
             params![i64::from(enabled), unix_timestamp(), provider],
         )?;
-        Ok(())
-    }
-
-    fn save_provider_credential(
-        &self,
-        provider: &str,
-        kind: &str,
-        metadata: &serde_json::Value,
-    ) -> Result<(), SessionError> {
-        self.connection
-            .lock()
-            .expect("session database mutex poisoned")
-            .execute(
-                "INSERT INTO provider_credentials
-                   (provider, credential_kind, credential_json, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(provider) DO UPDATE SET
-                   credential_kind = excluded.credential_kind,
-                   credential_json = excluded.credential_json,
-                   updated_at = excluded.updated_at",
-                params![provider, kind, metadata.to_string(), unix_timestamp()],
-            )?;
-        Ok(())
-    }
-
-    fn delete_provider_credential(&self, provider: &str) -> Result<(), SessionError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("session database mutex poisoned");
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "UPDATE providers SET enabled = 0, updated_at = ?1 WHERE provider = ?2",
-            params![unix_timestamp(), provider],
-        )?;
-        transaction.execute(
-            "DELETE FROM provider_credentials WHERE provider = ?1",
-            params![provider],
-        )?;
-        transaction.commit()?;
         Ok(())
     }
 
@@ -1036,20 +952,27 @@ mod tests {
     #[test]
     fn persists_provider_enablement() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = SqliteSessionRepository::open(directory.path().join("providers.db"))?;
+        let path = directory.path().join("providers.db");
+        let store = SqliteSessionRepository::open(&path)?;
+        let credentials =
+            crate::credential::SqliteCredentialStore::open(&path).expect("credential store");
         let providers = store.list_providers()?;
         assert_eq!(providers.len(), 3);
         assert!(providers.iter().all(|provider| !provider.enabled));
 
-        assert!(matches!(
-            store.set_provider_enabled(CODEX_PROVIDER, true),
-            Err(SessionError::MissingProviderCredential(provider)) if provider == CODEX_PROVIDER
-        ));
         let metadata = serde_json::json!({
             "credential_store": "codex_managed",
             "account": "fixture",
         });
-        store.save_provider_credential(CODEX_PROVIDER, "chatgpt_device_code", &metadata)?;
+        crate::credential::CredentialStore::put(
+            &credentials,
+            CODEX_PROVIDER,
+            &crate::credential::Credential {
+                kind: "chatgpt_device_code".to_owned(),
+                secret: crate::credential::SecretValue::new(metadata),
+            },
+        )
+        .expect("save credential");
         store.set_provider_enabled(CODEX_PROVIDER, true)?;
         let codex = store
             .list_providers()?
@@ -1058,10 +981,12 @@ mod tests {
             .expect("Codex provider");
         assert!(codex.enabled);
         assert_eq!(
-            codex.credential.map(|credential| credential.metadata),
-            Some(metadata)
+            codex.credential.map(|credential| credential.kind),
+            Some("chatgpt_device_code".to_owned())
         );
-        store.delete_provider_credential(CODEX_PROVIDER)?;
+        store.set_provider_enabled(CODEX_PROVIDER, false)?;
+        crate::credential::CredentialStore::delete(&credentials, CODEX_PROVIDER)
+            .expect("delete credential");
         let codex = store
             .list_providers()?
             .into_iter()

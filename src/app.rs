@@ -17,6 +17,9 @@ use crate::{
     config::Config,
     control::{AgentResponse, ControlError, ControlServer, IncomingInvocation},
     controls::{self, ControlAction, ControlContext},
+    credential::{
+        Credential, CredentialError, CredentialStore, SecretValue, SqliteCredentialStore,
+    },
     cursor, devin, render,
     selection::ScreenPoint,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
@@ -37,6 +40,8 @@ pub enum AppError {
     Agents(#[from] AgentCatalogError),
     #[error(transparent)]
     Skills(#[from] SkillCatalogError),
+    #[error(transparent)]
+    Credential(#[from] CredentialError),
     #[error(transparent)]
     Control(#[from] ControlError),
     #[error("failed to locate the running Nakode executable: {0}")]
@@ -63,6 +68,11 @@ struct BackendRegistry {
     provider_cooldowns: HashMap<String, ProviderCooldown>,
 }
 
+struct PersistenceServices<'a> {
+    sessions: &'a dyn SessionRepository,
+    credentials: &'a dyn CredentialStore,
+}
+
 struct ProviderCooldown {
     until: Instant,
     reason: String,
@@ -75,6 +85,7 @@ impl BackendRegistry {
         config: &Config,
         providers: &[ProviderRecord],
         session_database: PathBuf,
+        provider_credentials: HashMap<String, serde_json::Value>,
     ) -> Self {
         let (event_tx, events) = mpsc::channel(512);
         let mut registry = Self {
@@ -87,15 +98,7 @@ impl BackendRegistry {
             failures: Vec::new(),
             config: config.clone(),
             session_database,
-            provider_credentials: providers
-                .iter()
-                .filter_map(|provider| {
-                    provider
-                        .credential
-                        .as_ref()
-                        .map(|credential| (provider.provider.clone(), credential.metadata.clone()))
-                })
-                .collect(),
+            provider_credentials,
             provider_cooldowns: HashMap::new(),
         };
         for provider in providers.iter().filter(|provider| provider.enabled) {
@@ -377,51 +380,11 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let mut signals = ShutdownSignals::install()?;
     let sessions = SqliteSessionRepository::open_default()?;
     let session_database = sessions.database_path().to_path_buf();
-    let providers = sessions.list_providers()?;
+    let credentials = SqliteCredentialStore::open(&session_database)?;
+    let (providers, mut backends) = start_backends(&config, &sessions, &credentials).await?;
     let agents = AgentCatalog::load(&config.agents)?;
     let skills = SkillCatalog::load(&config.workspace)?;
-    let mut backends = BackendRegistry::spawn(&config, &providers, session_database).await;
-    let active_provider = if backends
-        .commands
-        .contains_key(crate::backend::CODEX_PROVIDER)
-    {
-        crate::backend::CODEX_PROVIDER.to_owned()
-    } else if let Some(provider) = backends.commands.keys().next() {
-        provider.clone()
-    } else {
-        String::new()
-    };
-    let mut state = if active_provider.is_empty() {
-        AppState::new_unconfigured(
-            config.workspace.to_string_lossy(),
-            config.model,
-            config.scrollback,
-        )
-    } else {
-        let active_name = providers
-            .iter()
-            .find(|record| record.provider == active_provider)
-            .map_or(active_provider.as_str(), |record| {
-                record.display_name.as_str()
-            });
-        AppState::new_for_backend(
-            config.workspace.to_string_lossy(),
-            config.model,
-            config.scrollback,
-            &active_provider,
-            active_name,
-        )
-    };
-    state.install_agents(agents);
-    state.install_skills(skills);
-    state.set_agent_directory(config.agents.clone());
-    for (provider, error) in &backends.failures {
-        let display_name = providers
-            .iter()
-            .find(|record| record.provider == *provider)
-            .map_or(provider.as_str(), |record| record.display_name.as_str());
-        state.provider_start_failed(provider, display_name, error);
-    }
+    let mut state = initial_state(&config, &providers, &backends, agents, skills);
     state.set_nakode_executable(&nakode_executable);
     for provider in backends.commands.keys() {
         match sessions.list_models(provider) {
@@ -453,11 +416,15 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     };
     let mut herdr = crate::herdr::Reporter::from_environment();
 
+    let persistence = PersistenceServices {
+        sessions: &sessions,
+        credentials: &credentials,
+    };
     let loop_result = run_loop(
         terminal.terminal_mut(),
         &mut state,
         &mut backends,
-        &sessions,
+        &persistence,
         &mut control,
         &mut signals,
         herdr.as_mut(),
@@ -476,6 +443,96 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     restore_result.map_err(AppError::Terminal)?;
 
     print_resume_hint(&nakode_executable, &state).map_err(AppError::Terminal)
+}
+
+fn initial_state(
+    config: &Config,
+    providers: &[ProviderRecord],
+    backends: &BackendRegistry,
+    agents: AgentCatalog,
+    skills: SkillCatalog,
+) -> AppState {
+    let active_provider = if backends
+        .commands
+        .contains_key(crate::backend::CODEX_PROVIDER)
+    {
+        crate::backend::CODEX_PROVIDER.to_owned()
+    } else {
+        backends.commands.keys().next().cloned().unwrap_or_default()
+    };
+    let mut state = if active_provider.is_empty() {
+        AppState::new_unconfigured(
+            config.workspace.to_string_lossy(),
+            config.model.clone(),
+            config.scrollback,
+        )
+    } else {
+        let active_name = providers
+            .iter()
+            .find(|record| record.provider == active_provider)
+            .map_or(active_provider.as_str(), |record| {
+                record.display_name.as_str()
+            });
+        AppState::new_for_backend(
+            config.workspace.to_string_lossy(),
+            config.model.clone(),
+            config.scrollback,
+            &active_provider,
+            active_name,
+        )
+    };
+    state.install_agents(agents);
+    state.install_skills(skills);
+    state.set_agent_directory(config.agents.clone());
+    for (provider, error) in &backends.failures {
+        let display_name = providers
+            .iter()
+            .find(|record| record.provider == *provider)
+            .map_or(provider.as_str(), |record| record.display_name.as_str());
+        state.provider_start_failed(provider, display_name, error);
+    }
+    state
+}
+
+async fn start_backends(
+    config: &Config,
+    sessions: &SqliteSessionRepository,
+    credentials: &dyn CredentialStore,
+) -> Result<(Vec<ProviderRecord>, BackendRegistry), SessionError> {
+    let providers = sessions.list_providers()?;
+    let (provider_credentials, credential_failures) =
+        load_provider_credentials(&providers, credentials);
+    let mut backends = BackendRegistry::spawn(
+        config,
+        &providers,
+        sessions.database_path().to_path_buf(),
+        provider_credentials,
+    )
+    .await;
+    backends.failures.extend(credential_failures);
+    Ok((providers, backends))
+}
+
+fn load_provider_credentials(
+    providers: &[ProviderRecord],
+    credentials: &dyn CredentialStore,
+) -> (HashMap<String, serde_json::Value>, Vec<(String, String)>) {
+    let mut failures = Vec::new();
+    let loaded = providers
+        .iter()
+        .filter(|provider| provider.credential.is_some())
+        .filter_map(|provider| match credentials.get(&provider.provider) {
+            Ok(Some(credential)) => {
+                Some((provider.provider.clone(), credential.secret.into_inner()))
+            }
+            Ok(None) => None,
+            Err(error) => {
+                failures.push((provider.provider.clone(), error.to_string()));
+                None
+            }
+        })
+        .collect();
+    (loaded, failures)
 }
 
 async fn start_tui_control(
@@ -543,7 +600,7 @@ async fn run_loop(
     terminal: &mut Tui,
     state: &mut AppState,
     backends: &mut BackendRegistry,
-    sessions: &dyn SessionRepository,
+    persistence: &PersistenceServices<'_>,
     control: &mut ControlServer,
     signals: &mut ShutdownSignals,
     mut herdr: Option<&mut crate::herdr::Reporter>,
@@ -566,7 +623,7 @@ async fn run_loop(
                     Some(Ok(event)) => {
                         let effects = handle_terminal_event(state, event);
                         flush_pending_clipboard(terminal, state);
-                        if apply_effects(state, effects, backends, sessions, &mut agent_requests).await {
+                        if apply_effects(state, effects, backends, persistence, &mut agent_requests).await {
                             break;
                         }
                         dirty = true;
@@ -589,7 +646,7 @@ async fn run_loop(
                     if should_chime {
                         crate::terminal::ring_bell(terminal.backend_mut())?;
                     }
-                    if apply_effects(state, effects, backends, sessions, &mut agent_requests).await {
+                    if apply_effects(state, effects, backends, persistence, &mut agent_requests).await {
                         break;
                     }
                     dirty = true;
@@ -606,7 +663,7 @@ async fn run_loop(
                         let invocation = crate::state::AgentRequest { id, agent: request.invocation.agent.clone(), task: request.invocation.task.clone() };
                         agent_requests.insert(id, request);
                         let effects = state.invoke_agent(&invocation);
-                        if apply_effects(state, effects, backends, sessions, &mut agent_requests).await { break; }
+                        if apply_effects(state, effects, backends, persistence, &mut agent_requests).await { break; }
                     } else {
                         request.respond(AgentResponse { success: false, result: "Nakode session id does not match this TUI.".to_owned() });
                     }
@@ -671,9 +728,11 @@ async fn apply_effects(
     state: &mut AppState,
     effects: Vec<Effect>,
     backends: &mut BackendRegistry,
-    sessions: &dyn SessionRepository,
+    persistence: &PersistenceServices<'_>,
     agent_requests: &mut HashMap<u64, IncomingInvocation>,
 ) -> bool {
+    let sessions = persistence.sessions;
+    let credentials = persistence.credentials;
     let mut quit = false;
     let mut pending = std::collections::VecDeque::from(effects);
     while let Some(effect) = pending.pop_front() {
@@ -706,19 +765,21 @@ async fn apply_effects(
                 kind,
                 metadata,
             } => {
-                save_provider_credential_effect(
+                handle_credential_effect(
                     state,
                     backends,
-                    sessions,
+                    persistence,
                     &mut pending,
-                    provider,
-                    kind,
-                    metadata,
+                    ProviderCredentialInput {
+                        provider,
+                        kind,
+                        metadata,
+                    },
                 )
                 .await;
             }
             Effect::ClearProviderCredential(provider) => {
-                clear_provider_credential(state, backends, sessions, &provider).await;
+                clear_provider_credential(state, backends, sessions, credentials, &provider).await;
             }
             Effect::OpenUrl(url) => open_url(state, &url),
             Effect::SaveAgent {
@@ -738,16 +799,15 @@ async fn apply_effects(
                 workspace,
                 title,
                 model,
-            } => match sessions.create(
+            } => persist_session(
+                state,
+                sessions,
                 &provider,
                 &provider_session_id,
                 &workspace,
                 &title,
                 model.as_deref(),
-            ) {
-                Ok(record) => state.session_persisted(&record),
-                Err(error) => state.session_store_failed(error.to_string()),
-            },
+            ),
             Effect::PersistModels { provider, models } => {
                 persist_models(state, sessions, &provider, &models);
             }
@@ -759,19 +819,45 @@ async fn apply_effects(
                 load_subagents(state, sessions, &parent_session_id);
             }
             Effect::UpdateSessionModel { session_id, model } => {
-                if let Err(error) = sessions.update_model(&session_id, model.as_deref()) {
-                    state.session_store_failed(error.to_string());
-                }
+                update_session_model(state, sessions, &session_id, model.as_deref());
             }
-            Effect::TouchSession(id) => {
-                if let Err(error) = sessions.touch(&id) {
-                    state.session_store_failed(error.to_string());
-                }
-            }
+            Effect::TouchSession(id) => touch_session(state, sessions, &id),
             Effect::Quit => quit = true,
         }
     }
     quit
+}
+
+fn update_session_model(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    session_id: &str,
+    model: Option<&str>,
+) {
+    if let Err(error) = sessions.update_model(session_id, model) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
+fn touch_session(state: &mut AppState, sessions: &dyn SessionRepository, id: &str) {
+    if let Err(error) = sessions.touch(id) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
+fn persist_session(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    provider: &str,
+    provider_session_id: &str,
+    workspace: &str,
+    title: &str,
+    model: Option<&str>,
+) {
+    match sessions.create(provider, provider_session_id, workspace, title, model) {
+        Ok(record) => state.session_persisted(&record),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
 }
 
 fn persist_models(
@@ -799,29 +885,6 @@ fn set_default_model(
     if let Err(error) = sessions.set_default_model(provider, model) {
         state.session_store_failed(error.to_string());
     }
-}
-
-async fn save_provider_credential_effect(
-    state: &mut AppState,
-    backends: &mut BackendRegistry,
-    sessions: &dyn SessionRepository,
-    pending: &mut std::collections::VecDeque<Effect>,
-    provider: String,
-    kind: String,
-    metadata: serde_json::Value,
-) {
-    persist_provider_credential(
-        state,
-        backends,
-        sessions,
-        pending,
-        ProviderCredentialInput {
-            provider,
-            kind,
-            metadata,
-        },
-    )
-    .await;
 }
 
 fn open_url(state: &mut AppState, url: &str) {
@@ -921,18 +984,37 @@ struct ProviderCredentialInput {
     metadata: serde_json::Value,
 }
 
+async fn handle_credential_effect(
+    state: &mut AppState,
+    backends: &mut BackendRegistry,
+    persistence: &PersistenceServices<'_>,
+    pending: &mut std::collections::VecDeque<Effect>,
+    credential: ProviderCredentialInput,
+) {
+    persist_provider_credential(
+        state,
+        backends,
+        persistence.sessions,
+        persistence.credentials,
+        pending,
+        credential,
+    )
+    .await;
+}
+
 async fn persist_provider_credential(
     state: &mut AppState,
     backends: &mut BackendRegistry,
     sessions: &dyn SessionRepository,
+    credentials: &dyn CredentialStore,
     pending: &mut std::collections::VecDeque<Effect>,
     credential: ProviderCredentialInput,
 ) {
-    if let Err(error) = sessions.save_provider_credential(
-        &credential.provider,
-        &credential.kind,
-        &credential.metadata,
-    ) {
+    let stored = Credential {
+        kind: credential.kind,
+        secret: SecretValue::new(credential.metadata.clone()),
+    };
+    if let Err(error) = credentials.put(&credential.provider, &stored) {
         state.session_store_failed(error.to_string());
         return;
     }
@@ -952,13 +1034,18 @@ async fn clear_provider_credential(
     state: &mut AppState,
     backends: &mut BackendRegistry,
     sessions: &dyn SessionRepository,
+    credentials: &dyn CredentialStore,
     provider: &str,
 ) {
     if let Err(error) = backends.clear_provider_credential(provider).await {
         state.session_store_failed(format!("could not clear {provider} credentials: {error}"));
         return;
     }
-    if let Err(error) = sessions.delete_provider_credential(provider) {
+    if let Err(error) = sessions.set_provider_enabled(provider, false) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    if let Err(error) = credentials.delete(provider) {
         state.session_store_failed(error.to_string());
         return;
     }
@@ -2290,10 +2377,9 @@ first_message = "Inspect the change."
             provider: CODEX_PROVIDER.to_owned(),
             display_name: "Codex".to_owned(),
             enabled: true,
-            credential: Some(crate::session::ProviderCredentialRecord {
+            credential: Some(crate::credential::CredentialMetadata {
                 provider: CODEX_PROVIDER.to_owned(),
                 kind: "chatgpt_device_code".to_owned(),
-                metadata: serde_json::json!({}),
                 updated_at: 1,
             }),
         }]);
