@@ -36,7 +36,7 @@ const MAX_DEVICE_POLLS: usize = 120;
 const MAX_INFERENCE_ATTEMPTS: usize = 4;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BackendConfig {
     pub workspace: PathBuf,
     pub credential: Option<Value>,
@@ -47,6 +47,8 @@ pub struct BackendConfig {
     compaction_threshold_percent: usize,
     reasoning_effort: Option<String>,
     web_config: Option<Arc<std::sync::RwLock<crate::web::WebConfig>>>,
+    vision_config: Option<Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
+    vision_service: Option<crate::vision::SharedVisionService>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +77,8 @@ impl BackendConfig {
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             reasoning_effort: Some("medium".to_owned()),
             web_config: None,
+            vision_config: None,
+            vision_service: None,
         }
     }
 
@@ -102,6 +106,17 @@ impl BackendConfig {
         config: Arc<std::sync::RwLock<crate::web::WebConfig>>,
     ) -> Self {
         self.web_config = Some(config);
+        self
+    }
+
+    #[must_use]
+    pub fn with_vision(
+        mut self,
+        config: Arc<std::sync::RwLock<crate::vision::VisionConfig>>,
+        service: Option<crate::vision::SharedVisionService>,
+    ) -> Self {
+        self.vision_config = Some(config);
+        self.vision_service = service;
         self
     }
 
@@ -158,6 +173,88 @@ struct CodexProvider {
     client: Client,
     base_url: String,
     credential: CodexCredential,
+}
+
+#[derive(Clone)]
+struct CodexVisionService {
+    provider: CodexProvider,
+    config: Arc<std::sync::RwLock<crate::vision::VisionConfig>>,
+}
+
+impl crate::vision::VisionService for CodexVisionService {
+    fn analyze<'a>(
+        &'a self,
+        prompt: &'a str,
+        images: Vec<crate::backend::PromptImage>,
+        cancellation: &'a CancellationToken,
+    ) -> crate::vision::VisionFuture<'a> {
+        Box::pin(async move {
+            let model = self
+                .config
+                .read()
+                .map_err(|_| "vision settings lock is unavailable".to_owned())?
+                .model_id()
+                .map(str::to_owned)
+                .ok_or_else(|| "vision add-on has no selected model".to_owned())?;
+            let attachments = images
+                .into_iter()
+                .enumerate()
+                .map(|(index, image)| crate::backend::PromptAttachment {
+                    label: format!("Image {}", index + 1),
+                    path: None,
+                    image: Some(image),
+                })
+                .collect();
+            let request = InferenceRequest {
+                session_id: Uuid::now_v7().to_string(),
+                model,
+                instructions: "Analyze images accurately. Return only the requested visual analysis; do not use tools or continue the caller's coding task.".to_owned(),
+                history: vec![ConversationItem::User {
+                    text: prompt.to_owned(),
+                    attachments,
+                }],
+                tools: Vec::new(),
+                reasoning_effort: Some("low".to_owned()),
+            };
+            let (events, mut event_rx) = mpsc::channel(32);
+            let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+            let result = self
+                .provider
+                .infer_response(request, events, cancellation.clone())
+                .await
+                .map(|output| output.text)
+                .map_err(|failure| failure.message);
+            let _ = drain.await;
+            result
+        })
+    }
+}
+
+/// Creates the shared OpenAI-backed vision service when its credential exists.
+///
+/// # Errors
+/// Returns an error when the stored `OpenAI` credential has an invalid shape.
+pub fn vision_service(
+    credential: Option<Value>,
+    config: Arc<std::sync::RwLock<crate::vision::VisionConfig>>,
+) -> Result<Option<crate::vision::SharedVisionService>, BackendError> {
+    let credential = credential
+        .map(serde_json::from_value::<CodexCredential>)
+        .transpose()
+        .map_err(|source| BackendError::InvalidCredential {
+            provider: CODEX_PROVIDER.to_owned(),
+            detail: source.to_string(),
+        })?;
+    Ok(credential.map(|credential| {
+        Arc::new(CodexVisionService {
+            provider: CodexProvider {
+                client: Client::new(),
+                base_url: CODEX_BASE_URL.to_owned(),
+                credential,
+            },
+            config,
+        }) as crate::vision::SharedVisionService
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -315,6 +412,13 @@ async fn run_supervisor(
             .with_compaction_threshold_percent(config.compaction_threshold_percent);
         if let Some(web_config) = &config.web_config {
             runtime = runtime.with_web_config(Arc::clone(web_config));
+        }
+        if let Some(vision_config) = &config.vision_config {
+            runtime = runtime.with_vision(
+                Arc::clone(vision_config),
+                config.vision_service.clone(),
+                true,
+            );
         }
         runtime
     });
@@ -476,9 +580,10 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             session_id,
             client_id,
             prompt,
+            attachments,
             model,
         } => {
-            start_turn(session_id, client_id, prompt, model, context).await;
+            start_turn(session_id, client_id, prompt, attachments, model, context).await;
         }
         BackendCommand::InterruptTurn { turn_id, .. } => {
             if let Some(active) = context
@@ -566,6 +671,7 @@ async fn start_turn(
     session_id: String,
     client_id: String,
     prompt: String,
+    attachments: Vec<crate::backend::PromptAttachment>,
     model: Option<String>,
     context: &mut CommandContext<'_>,
 ) {
@@ -628,7 +734,14 @@ async fn start_turn(
     let runtime = runtime.clone();
     tokio::spawn(async move {
         let result = runtime
-            .run_turn(&mut session, &client_id, prompt, &events, cancellation)
+            .run_turn(
+                &mut session,
+                &client_id,
+                prompt,
+                attachments,
+                &events,
+                cancellation,
+            )
             .await;
         let _ = completed
             .send(CompletedTurn {
@@ -932,8 +1045,20 @@ fn codex_request_body(request: &InferenceRequest) -> Value {
 
 fn conversation_input(item: &ConversationItem) -> Vec<Value> {
     match item {
-        ConversationItem::User { text } => {
-            vec![json!({"role": "user", "content": [{"type": "input_text", "text": text}]})]
+        ConversationItem::User { text, attachments } => {
+            let mut content = vec![json!({"type": "input_text", "text": text})];
+            content.extend(attachments.iter().filter_map(|attachment| {
+                let image = attachment.image.as_ref()?;
+                Some(json!({
+                    "type": "input_image",
+                    "image_url": format!(
+                        "data:{};base64,{}",
+                        image.mime_type,
+                        base64::engine::general_purpose::STANDARD.encode(&image.data)
+                    )
+                }))
+            }));
+            vec![json!({"role": "user", "content": content})]
         }
         ConversationItem::Assistant {
             text,
@@ -1743,6 +1868,31 @@ mod tests {
     }
 
     #[test]
+    fn codex_request_includes_attached_images() {
+        let mut request = test_request();
+        let ConversationItem::User { attachments, .. } = &mut request.history[0] else {
+            panic!("test history should begin with a user message");
+        };
+        attachments.push(crate::backend::PromptAttachment {
+            label: "Image".to_owned(),
+            path: None,
+            image: Some(crate::backend::PromptImage {
+                mime_type: "image/png".to_owned(),
+                data: vec![1, 2, 3],
+            }),
+        });
+
+        let body = codex_request_body(&request);
+        let content = body["input"][0]["content"]
+            .as_array()
+            .expect("user content array");
+
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,AQID");
+    }
+
+    #[test]
     fn codex_requests_disable_provider_storage() {
         let body = codex_request_body(&test_request());
 
@@ -1870,6 +2020,7 @@ mod tests {
             instructions: "Be direct.".to_owned(),
             history: vec![ConversationItem::User {
                 text: "Hi".to_owned(),
+                attachments: Vec::new(),
             }],
             tools: Vec::new(),
             reasoning_effort: None,

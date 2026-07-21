@@ -38,7 +38,7 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const CONNECT_COMPRESSED: u8 = 0x01;
 const CONNECT_END_STREAM: u8 = 0x02;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BackendConfig {
     pub workspace: PathBuf,
     pub credential: Option<Value>,
@@ -47,6 +47,8 @@ pub struct BackendConfig {
     session_database: Option<PathBuf>,
     compaction_threshold_percent: usize,
     web_config: Option<Arc<std::sync::RwLock<crate::web::WebConfig>>>,
+    vision_config: Option<Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
+    vision_service: Option<crate::vision::SharedVisionService>,
 }
 
 impl BackendConfig {
@@ -60,6 +62,8 @@ impl BackendConfig {
             session_database: None,
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             web_config: None,
+            vision_config: None,
+            vision_service: None,
         }
     }
 
@@ -81,6 +85,17 @@ impl BackendConfig {
         config: Arc<std::sync::RwLock<crate::web::WebConfig>>,
     ) -> Self {
         self.web_config = Some(config);
+        self
+    }
+
+    #[must_use]
+    pub fn with_vision(
+        mut self,
+        config: Arc<std::sync::RwLock<crate::vision::VisionConfig>>,
+        service: Option<crate::vision::SharedVisionService>,
+    ) -> Self {
+        self.vision_config = Some(config);
+        self.vision_service = service;
         self
     }
 
@@ -207,6 +222,13 @@ async fn run_supervisor(
             .with_compaction_threshold_percent(config.compaction_threshold_percent);
         if let Some(web_config) = &config.web_config {
             runtime = runtime.with_web_config(Arc::clone(web_config));
+        }
+        if let Some(vision_config) = &config.vision_config {
+            runtime = runtime.with_vision(
+                Arc::clone(vision_config),
+                config.vision_service.clone(),
+                false,
+            );
         }
         runtime
     });
@@ -365,9 +387,10 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             session_id,
             client_id,
             prompt,
+            attachments,
             model,
         } => {
-            start_turn(session_id, client_id, prompt, model, context).await;
+            start_turn(session_id, client_id, prompt, attachments, model, context).await;
         }
         BackendCommand::InterruptTurn { turn_id, .. } => {
             if let Some(active) = context
@@ -513,6 +536,7 @@ async fn start_turn(
     session_id: String,
     client_id: String,
     prompt: String,
+    attachments: Vec<crate::backend::PromptAttachment>,
     model: Option<String>,
     context: &mut CommandContext<'_>,
 ) {
@@ -575,7 +599,14 @@ async fn start_turn(
     let events = context.events.clone();
     tokio::spawn(async move {
         let result = runtime
-            .run_turn(&mut session, &client_id, prompt, &events, cancellation)
+            .run_turn(
+                &mut session,
+                &client_id,
+                prompt,
+                attachments,
+                &events,
+                cancellation,
+            )
             .await;
         let _ = completed
             .send(CompletedTurn {
@@ -884,7 +915,7 @@ fn conversation_prompts(
     )
     .to_string();
     match item {
-        ConversationItem::User { text } => vec![chat_prompt(message_id, 1, text.clone())],
+        ConversationItem::User { text, .. } => vec![chat_prompt(message_id, 1, text.clone())],
         ConversationItem::Assistant {
             text,
             reasoning,
@@ -1212,6 +1243,7 @@ mod tests {
             instructions: "Explore.".to_owned(),
             history: vec![ConversationItem::User {
                 text: "Inspect.".to_owned(),
+                attachments: Vec::new(),
             }],
             tools: Vec::new(),
             reasoning_effort: None,

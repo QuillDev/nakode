@@ -88,6 +88,42 @@ Then use `/settings` to manage general preferences, agents, models, providers,
 and optional add-ons. The settings menu is searchable. `/providers`, `/agents`,
 and `/models` remain available as direct shortcuts.
 
+## Terminal image previews
+
+Sent image attachments render inline when Nakode detects Kitty, WezTerm, Ghostty,
+iTerm2, Sixel, or another protocol supported by `ratatui-image`. Configure the
+default under `/settings` → **Add-ons** → **Terminal images**:
+
+- **Automatic** uses terminal hints and a capability query.
+- **On** always attempts the capability query, which is useful through tmux or SSH.
+- **Off** keeps attachment labels without probing.
+
+The `NAKODE_TERMINAL_IMAGES=auto|on|off` environment variable remains available
+as a per-launch override.
+
+## Usage diagnostics
+
+Nakode records aggregate inference and tool telemetry inside each local native session. Inspect
+recent usage without exposing prompts, reasoning, tool arguments, tool output, session titles, or
+credentials:
+
+```sh
+nakode diagnostics
+nakode diagnostics --days 30 --provider openai-codex --sessions 40
+nakode diagnostics --days 30 --json > nakode-usage.json
+```
+
+The report includes daily provider usage, reported input/cached/uncached/output tokens, inference
+rounds, compactions, retries, tool calls, failures, output sizes, runtime, and the highest-input
+sessions. JSON output is intended for longitudinal analysis. Token and cache values are available
+only when the provider reports them; cached tokens may still count toward provider subscription or
+rate limits even when an API pricing plan discounts them.
+
+Long-running turns remain unrestricted. Nakode emits non-blocking transcript warnings after every
+25 active inference rounds, when an inference request succeeds only after provider retries, and
+when the same tool fails three times and then at each additional five-failure milestone in one
+turn. These warnings are informational and never interrupt the agent.
+
 ## Optional web browsing
 
 Nakode's portable runtime can expose a `browser` tool when a browser add-on is

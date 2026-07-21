@@ -5,9 +5,11 @@ use std::{
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::markdown::render_markdown;
+use crate::{backend::PromptImage, markdown::render_markdown};
 
 const RECENT_TOOL_CALL_LIMIT: usize = 5;
+pub(crate) const IMAGE_PREVIEW_ROWS: usize = 8;
+pub(crate) const IMAGE_PREVIEW_MARKER: &str = "nakode:image-preview:";
 pub(crate) const TOOL_HISTORY_TOGGLE_KEY: &str = "nakode:tool-history-toggle";
 
 pub use crate::markdown::{
@@ -92,6 +94,8 @@ pub struct Transcript {
     stream_active: bool,
     stream_label: String,
     expanded_tools: HashSet<String>,
+    images: HashMap<String, Vec<PromptImage>>,
+    image_previews_enabled: bool,
     show_all_tools: bool,
 }
 
@@ -109,6 +113,8 @@ impl Transcript {
             stream_active: false,
             stream_label: "Nakode".to_owned(),
             expanded_tools: HashSet::new(),
+            images: HashMap::new(),
+            image_previews_enabled: false,
             show_all_tools: false,
         }
     }
@@ -118,10 +124,33 @@ impl Transcript {
         &self.entries
     }
 
+    #[must_use]
+    pub fn image(&self, key: &str, index: usize) -> Option<&PromptImage> {
+        self.images.get(key).and_then(|images| images.get(index))
+    }
+
+    pub fn set_image_previews_enabled(&mut self, enabled: bool) {
+        if self.image_previews_enabled != enabled {
+            self.image_previews_enabled = enabled;
+            self.changed();
+        }
+    }
+
+    pub fn set_images(&mut self, key: impl Into<String>, images: Vec<PromptImage>) {
+        let key = key.into();
+        if images.is_empty() {
+            self.images.remove(&key);
+        } else {
+            self.images.insert(key, images);
+        }
+        self.changed();
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         self.item_indices.clear();
         self.expanded_tools.clear();
+        self.images.clear();
         self.show_all_tools = false;
         self.stream_active = false;
         self.changed();
@@ -385,6 +414,11 @@ impl Transcript {
                 .as_ref()
                 .is_some_and(|key| self.expanded_tools.contains(key));
             project_entry(entry, width, expanded, &mut projected);
+            project_entry_images(
+                (self.image_previews_enabled, &self.images),
+                entry,
+                &mut projected,
+            );
             let next = self.entries.get(index + 1);
             if projected.len() > line_count
                 && next.is_some_and(|next| needs_gap_between(entry, next))
@@ -422,6 +456,36 @@ impl Transcript {
         self.cache = projected;
         self.cache_width = width;
         self.cache_revision = self.revision;
+    }
+}
+
+fn project_entry_images(
+    image_state: (bool, &HashMap<String, Vec<PromptImage>>),
+    entry: &TranscriptEntry,
+    output: &mut Vec<ProjectedLine>,
+) {
+    let (enabled, images) = image_state;
+    if enabled
+        && entry.kind == EntryKind::User
+        && let Some(key) = entry.key.as_deref()
+        && let Some(images) = images.get(key)
+    {
+        project_image_previews(key, images.len(), output);
+    }
+}
+
+fn project_image_previews(key: &str, image_count: usize, output: &mut Vec<ProjectedLine>) {
+    for index in 0..image_count {
+        output.push(ProjectedLine {
+            text: format!("{IMAGE_PREVIEW_MARKER}{index}"),
+            spans: Vec::new(),
+            tone: LineTone::Body,
+            bold: false,
+            source_key: Some(key.to_owned()),
+        });
+        for _ in 1..IMAGE_PREVIEW_ROWS {
+            output.push(blank_line(Some(key.to_owned())));
+        }
     }
 }
 
@@ -816,9 +880,38 @@ fn display_width(character: char) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        EntryKind, EntryStatus, LineTone, MarkdownModifier, MarkdownTone, TOOL_HISTORY_TOGGLE_KEY,
-        Transcript,
+        EntryKind, EntryStatus, IMAGE_PREVIEW_MARKER, IMAGE_PREVIEW_ROWS, LineTone,
+        MarkdownModifier, MarkdownTone, TOOL_HISTORY_TOGGLE_KEY, Transcript,
     };
+
+    #[test]
+    fn attached_images_reserve_stable_transcript_rows() {
+        let mut transcript = Transcript::new(100);
+        transcript.set_image_previews_enabled(true);
+        transcript.upsert(
+            "user:one",
+            EntryKind::User,
+            "YOU",
+            "[Image]",
+            EntryStatus::Complete,
+        );
+        transcript.set_images(
+            "user:one",
+            vec![crate::backend::PromptImage {
+                mime_type: "image/png".to_owned(),
+                data: vec![1, 2, 3],
+            }],
+        );
+
+        let visible = transcript.visible(80, 30, 0);
+        let marker = visible
+            .lines
+            .iter()
+            .position(|line| line.text == format!("{IMAGE_PREVIEW_MARKER}0"))
+            .expect("image marker");
+        assert!(visible.lines.len() >= marker + IMAGE_PREVIEW_ROWS);
+        assert_eq!(transcript.image("user:one", 0).unwrap().data, [1, 2, 3]);
+    }
 
     #[test]
     fn deltas_are_keyed_and_completion_replaces_stream() {

@@ -344,6 +344,19 @@ pub enum BackendEvent {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PromptAttachment {
+    pub label: String,
+    pub path: Option<PathBuf>,
+    pub image: Option<PromptImage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PromptImage {
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
 /// Provider-neutral commands understood by an agent backend adapter.
 #[derive(Clone, Debug)]
 pub enum BackendCommand {
@@ -362,6 +375,7 @@ pub enum BackendCommand {
         session_id: String,
         client_id: String,
         prompt: String,
+        attachments: Vec<PromptAttachment>,
         model: Option<String>,
     },
     SteerTurn {

@@ -14,7 +14,9 @@ pub use crate::backend::{CODEX_PROVIDER, DEVIN_PROVIDER};
 use crate::{
     backend::ModelInfo,
     credential::CredentialMetadata,
+    terminal_image::TerminalImageMode,
     transcript::{EntryKind, EntryStatus, TranscriptEntry},
+    vision::VisionConfig,
     web::{WebBackend, WebConfig},
 };
 
@@ -213,6 +215,26 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when preference storage cannot be updated.
     fn save_web_config(&self, config: &WebConfig) -> Result<(), SessionError>;
+    /// Loads optional vision add-on preferences.
+    ///
+    /// # Errors
+    /// Returns an error when preference storage cannot be read.
+    fn load_vision_config(&self) -> Result<VisionConfig, SessionError>;
+    /// Saves optional vision add-on preferences.
+    ///
+    /// # Errors
+    /// Returns an error when preference storage cannot be updated.
+    fn save_vision_config(&self, config: &VisionConfig) -> Result<(), SessionError>;
+    /// Loads the terminal image-preview preference.
+    ///
+    /// # Errors
+    /// Returns an error when preference storage cannot be read.
+    fn load_terminal_image_mode(&self) -> Result<TerminalImageMode, SessionError>;
+    /// Saves the terminal image-preview preference.
+    ///
+    /// # Errors
+    /// Returns an error when preference storage cannot be updated.
+    fn save_terminal_image_mode(&self, mode: TerminalImageMode) -> Result<(), SessionError>;
 }
 
 pub struct SqliteSessionRepository {
@@ -445,6 +467,14 @@ fn seed_provider_catalog(connection: &Connection) -> Result<(), SessionError> {
            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
            backend TEXT NOT NULL,
            firecrawl_api_key TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS addon_vision_settings (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           model TEXT
+         );
+         CREATE TABLE IF NOT EXISTS terminal_image_settings (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           mode TEXT NOT NULL
          );",
     )?;
     let provider_catalog =
@@ -860,6 +890,72 @@ impl SessionRepository for SqliteSessionRepository {
         )?;
         Ok(())
     }
+
+    fn load_vision_config(&self) -> Result<VisionConfig, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let model = connection
+            .query_row(
+                "SELECT model FROM addon_vision_settings WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(VisionConfig { model })
+    }
+
+    fn save_vision_config(&self, config: &VisionConfig) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "INSERT INTO addon_vision_settings (singleton, model) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET model = excluded.model",
+            params![config.model],
+        )?;
+        Ok(())
+    }
+
+    fn load_terminal_image_mode(&self) -> Result<TerminalImageMode, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mode = connection
+            .query_row(
+                "SELECT mode FROM terminal_image_settings WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(match mode.as_deref() {
+            Some("on") => TerminalImageMode::On,
+            Some("off") => TerminalImageMode::Off,
+            _ => TerminalImageMode::Auto,
+        })
+    }
+
+    fn save_terminal_image_mode(&self, mode: TerminalImageMode) -> Result<(), SessionError> {
+        let mode = match mode {
+            TerminalImageMode::Auto => "auto",
+            TerminalImageMode::On => "on",
+            TerminalImageMode::Off => "off",
+        };
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "INSERT INTO terminal_image_settings (singleton, mode) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET mode = excluded.mode",
+            [mode],
+        )?;
+        Ok(())
+    }
 }
 
 fn load_subagent_transcript(
@@ -961,6 +1057,31 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_image_mode_defaults_to_auto_and_persists() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        assert_eq!(store.load_terminal_image_mode()?, TerminalImageMode::Auto);
+
+        store.save_terminal_image_mode(TerminalImageMode::Off)?;
+        assert_eq!(store.load_terminal_image_mode()?, TerminalImageMode::Off);
+        Ok(())
+    }
+
+    #[test]
+    fn vision_addon_settings_are_optional_and_persisted() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        assert_eq!(store.load_vision_config()?, VisionConfig::default());
+
+        let configured = VisionConfig {
+            model: Some("openai-codex/gpt-5.4".to_owned()),
+        };
+        store.save_vision_config(&configured)?;
+        assert_eq!(store.load_vision_config()?, configured);
+        Ok(())
+    }
 
     #[test]
     fn browser_addon_settings_are_optional_and_persisted() -> Result<(), SessionError> {

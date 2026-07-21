@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -463,6 +464,7 @@ fn command_request(
             session_id,
             client_id,
             prompt,
+            attachments,
             model,
         } => (
             BackendOperation::StartTurn,
@@ -471,11 +473,7 @@ fn command_request(
                 json!({
                     "threadId": session_id,
                     "clientUserMessageId": client_id,
-                    "input": [{
-                        "type": "text",
-                        "text": prompt,
-                        "text_elements": [],
-                    }],
+                    "input": codex_turn_input(&prompt, attachments),
                 }),
                 model,
             ),
@@ -518,6 +516,29 @@ fn command_request(
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::Shutdown => unreachable!(),
     }
+}
+
+fn codex_turn_input(
+    prompt: &str,
+    attachments: Vec<crate::backend::PromptAttachment>,
+) -> Vec<Value> {
+    let mut input = vec![json!({
+        "type": "text",
+        "text": prompt,
+        "text_elements": [],
+    })];
+    input.extend(attachments.into_iter().filter_map(|attachment| {
+        let image = attachment.image?;
+        Some(json!({
+            "type": "image",
+            "url": format!(
+                "data:{};base64,{}",
+                image.mime_type,
+                STANDARD.encode(image.data)
+            )
+        }))
+    }));
+    input
 }
 
 async fn process_message(

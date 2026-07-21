@@ -105,6 +105,7 @@ async fn verify_successful_turn(backend: &mut BackendHandle, session_id: &str) -
             session_id: session_id.to_owned(),
             client_id: "devin-turn-1".to_owned(),
             prompt: "hello devin".to_owned(),
+            attachments: Vec::new(),
             model: None,
         })
         .await?;
@@ -149,6 +150,7 @@ async fn verify_failure_and_steering(backend: &mut BackendHandle, session_id: &s
             session_id: session_id.to_owned(),
             client_id: "devin-turn-failed".to_owned(),
             prompt: "fail prompt".to_owned(),
+            attachments: Vec::new(),
             model: None,
         })
         .await?;
@@ -218,6 +220,7 @@ async fn verify_resume_and_cancellation(
             session_id: session_id.to_owned(),
             client_id: "devin-turn-cancel".to_owned(),
             prompt: "wait for cancel".to_owned(),
+            attachments: Vec::new(),
             model: None,
         })
         .await?;

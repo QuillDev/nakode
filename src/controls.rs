@@ -29,6 +29,7 @@ pub enum ControlAction {
     Steer,
     Latest,
     Newline,
+    Paste,
     OpenModelPicker,
     ScrollUp,
     ScrollDown,
@@ -209,6 +210,15 @@ const KEY_CONTROLS: &[KeyControl] = &[
         "insert a newline"
     ),
     control!(Global, Newline, KeyCode::Enter, Shift),
+    control!(
+        Global,
+        Paste,
+        KeyCode::Char('v'),
+        Boundary,
+        "Compose",
+        "Ctrl/Cmd+V",
+        "paste text, images, or files"
+    ),
     control!(
         Global,
         OpenModelPicker,
@@ -395,6 +405,7 @@ const KEY_CONTROLS: &[KeyControl] = &[
     control!(Settings, MoveLeft, KeyCode::Left, Any),
     control!(Settings, MoveRight, KeyCode::Right, Any),
     control!(Settings, Backspace, KeyCode::Backspace, Any),
+    control!(Settings, Clear, KeyCode::Char('u'), Control),
     control!(Subagent, CancelOrQuit, KeyCode::Char('c'), Control),
     control!(Subagent, Latest, KeyCode::Char('l'), Control),
     control!(Subagent, ScrollUp, KeyCode::PageUp, Any),

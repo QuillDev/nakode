@@ -12,10 +12,12 @@ use crate::{
     selection::{ScreenPoint, ScreenSnapshot},
     state::AppState,
     transcript::{
-        LineTone, MarkdownModifier, MarkdownSpan, MarkdownTone, ProjectedLine,
-        is_tool_toggle_marker,
+        IMAGE_PREVIEW_MARKER, IMAGE_PREVIEW_ROWS, LineTone, MarkdownModifier, MarkdownSpan,
+        MarkdownTone, ProjectedLine, is_tool_toggle_marker,
     },
 };
+
+use crate::terminal_image::TerminalImageRenderer;
 
 // Nakode shares the opaque pink-on-black visual language used across Quill's apps.
 // Pink communicates interaction and focus; green, amber, and red are reserved for
@@ -53,7 +55,18 @@ fn overlay_block<'a>(title: impl Into<Line<'a>>, border: Color) -> Block<'a> {
 }
 
 pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
+    draw_with_images(frame, state, None);
+}
+
+pub fn draw_with_images(
+    frame: &mut Frame<'_>,
+    state: &mut AppState,
+    mut image_renderer: Option<&mut TerminalImageRenderer>,
+) {
     let area = frame.area();
+    if let Some(renderer) = image_renderer.as_deref_mut() {
+        renderer.begin_frame(area.as_size());
+    }
     frame.render_widget(
         Block::new().style(Style::default().bg(BACKGROUND).fg(TEXT)),
         area,
@@ -81,7 +94,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         .split(area);
 
     render_header(frame, regions[0], state);
-    render_transcript(frame, regions[1], state);
+    render_transcript(frame, regions[1], state, image_renderer);
     if todo_height > 0 {
         render_todos(frame, regions[2], state);
     }
@@ -264,13 +277,19 @@ struct TranscriptHitRegions {
     tool_toggles: Vec<(String, ScreenPoint, ScreenPoint)>,
 }
 
-fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+fn render_transcript(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut AppState,
+    image_renderer: Option<&mut TerminalImageRenderer>,
+) {
     let hit_regions = render_transcript_view(
         frame,
         area,
         &mut state.transcript,
         &mut state.scroll_from_bottom,
         Line::default(),
+        image_renderer,
     );
     state.set_subagent_hit_regions(hit_regions.subagents);
     state.set_tool_toggle_hit_regions(hit_regions.tool_toggles);
@@ -282,6 +301,7 @@ fn render_transcript_view(
     transcript: &mut crate::transcript::Transcript,
     scroll_from_bottom: &mut usize,
     title: Line<'static>,
+    mut image_renderer: Option<&mut TerminalImageRenderer>,
 ) -> TranscriptHitRegions {
     let block = panel_block(title);
     let inner = block.inner(area);
@@ -329,12 +349,46 @@ fn render_transcript_view(
         })
         .collect();
 
+    let image_placements = visible
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, line)| {
+            let index = line.text.strip_prefix(IMAGE_PREVIEW_MARKER)?.parse().ok()?;
+            let key = line.source_key.clone()?;
+            (offset.saturating_add(IMAGE_PREVIEW_ROWS) <= visible.lines.len())
+                .then_some((key, index, offset))
+        })
+        .collect::<Vec<_>>();
     let lines = visible
         .lines
         .into_iter()
-        .map(transcript_line)
+        .map(|line| {
+            if line.text.starts_with(IMAGE_PREVIEW_MARKER) {
+                Line::default()
+            } else {
+                transcript_line(line)
+            }
+        })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    if let Some(renderer) = image_renderer.as_mut() {
+        for (key, index, offset) in image_placements {
+            let Some(image) = transcript.image(&key, index) else {
+                continue;
+            };
+            let row = inner
+                .y
+                .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+            let preview = Rect::new(
+                inner.x.saturating_add(2),
+                row,
+                inner.width.saturating_sub(4),
+                u16::try_from(IMAGE_PREVIEW_ROWS).unwrap_or(u16::MAX),
+            );
+            renderer.render(frame, preview, image);
+        }
+    }
     TranscriptHitRegions {
         subagents,
         tool_toggles,
@@ -472,7 +526,7 @@ fn render_subagent_modal(frame: &mut Frame<'_>, area: Rect, state: &mut AppState
     ]);
     let tool_toggles = if let Some((transcript, scroll)) = state.selected_subagent_transcript_mut()
     {
-        render_transcript_view(frame, popup, transcript, scroll, title).tool_toggles
+        render_transcript_view(frame, popup, transcript, scroll, title, None).tool_toggles
     } else {
         Vec::new()
     };
@@ -718,6 +772,8 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         crate::state::SettingsView::Menu => settings_menu_lines(settings),
         crate::state::SettingsView::Addons => settings_addon_lines(settings),
         crate::state::SettingsView::WebBrowsing => settings_web_browsing_lines(settings),
+        crate::state::SettingsView::Vision => settings_vision_lines(settings),
+        crate::state::SettingsView::TerminalImages => settings_terminal_image_lines(settings),
     };
     frame.render_widget(
         Paragraph::new(lines).block(overlay_block(" Settings ", ACCENT)),
@@ -778,20 +834,77 @@ fn settings_menu_lines(settings: &crate::state::SettingsState) -> Vec<Line<'stat
 }
 
 fn settings_addon_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
-    vec![
+    let rows = [
+        ("Web browsing", settings.web.backend.label().to_owned()),
+        (
+            "Vision",
+            settings
+                .vision
+                .model
+                .clone()
+                .unwrap_or_else(|| "Disabled".to_owned()),
+        ),
+        (
+            "Terminal images",
+            settings.terminal_images.label().to_owned(),
+        ),
+    ];
+    let mut lines = vec![
         Line::styled("Add-ons", Style::default().fg(TEXT).bold()),
         Line::default(),
-        Line::from(vec![
-            Span::styled("› ", Style::default().fg(ACCENT)),
-            Span::styled("Web browsing", Style::default().fg(TEXT).bold()),
-            Span::styled(
-                format!("  {}", settings.web.backend.label()),
-                Style::default().fg(MUTED),
-            ),
-        ])
-        .style(Style::default().bg(SURFACE_RAISED)),
+    ];
+    for (index, (label, value)) in rows.into_iter().enumerate() {
+        lines.push(settings_row(label, &value, settings.selected == index));
+        lines.push(Line::default());
+    }
+    lines.push(Line::styled(
+        "Enter open · ↑/↓ select · Esc back",
+        Style::default().fg(MUTED),
+    ));
+    lines
+}
+
+fn settings_terminal_image_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+    vec![
+        Line::styled("Terminal images", Style::default().fg(TEXT).bold()),
         Line::default(),
-        Line::styled("Enter open · Esc back", Style::default().fg(MUTED)),
+        settings_row("Previews", settings.terminal_images.label(), true),
+        Line::default(),
+        settings_status_row("Applies", "Next launch", MUTED),
+        settings_status_row("Fallback", "Attachment labels", MUTED),
+        Line::default(),
+        Line::styled(
+            "Enter toggle · ←/→ change · Esc back",
+            Style::default().fg(MUTED),
+        ),
+    ]
+}
+
+fn settings_vision_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+    let model = settings.vision.model.as_deref().unwrap_or("Disabled");
+    vec![
+        Line::styled("Vision", Style::default().fg(TEXT).bold()),
+        Line::default(),
+        settings_row("Model", model, true),
+        Line::default(),
+        settings_status_row(
+            "Status",
+            if settings.vision.is_enabled() {
+                "Configured"
+            } else {
+                "Disabled"
+            },
+            if settings.vision.is_enabled() {
+                SUCCESS
+            } else {
+                MUTED
+            },
+        ),
+        Line::default(),
+        Line::styled(
+            "Enter select model · Ctrl+U disable · Esc back",
+            Style::default().fg(MUTED),
+        ),
     ]
 }
 
@@ -1590,6 +1703,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let title = match picker.scope {
         crate::state::ModelSelectionScope::Default => " Default Model ",
         crate::state::ModelSelectionScope::Session => " Switch Session Model ",
+        crate::state::ModelSelectionScope::Vision => " Vision Model ",
     };
     let block = overlay_block(title, ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -1739,6 +1853,32 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, super::BACKGROUND);
         assert_eq!(buffer[(0, 1)].symbol(), "╭");
         assert_eq!(buffer[(0, 1)].fg, super::BORDER);
+    }
+
+    #[test]
+    fn addons_settings_render_terminal_image_choice() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.open_settings();
+        state.settings_move(3);
+        assert!(state.select_setting().is_empty());
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render add-ons settings");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Web browsing"));
+        assert!(rendered.contains("Vision"));
+        assert!(rendered.contains("Terminal images"));
+        assert!(rendered.contains("Automatic"));
     }
 
     #[test]

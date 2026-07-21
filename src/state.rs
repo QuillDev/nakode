@@ -10,7 +10,8 @@ use crate::{
     backend::{
         ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent, BackendOperation,
         CODEX_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus, ModelInfo,
-        NormalizedItem, QuestionRequest, SessionHistoryItem, TodoPhase, TurnOutcome,
+        NormalizedItem, PromptAttachment, QuestionRequest, SessionHistoryItem, TodoPhase,
+        TurnOutcome,
     },
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
@@ -18,6 +19,7 @@ use crate::{
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
     session::{ProviderRecord, SessionRecord, SubagentRecord},
     skill::{Skill, SkillCatalog},
+    terminal_image::TerminalImageMode,
     transcript::{EntryKind, EntryStatus, TOOL_HISTORY_TOGGLE_KEY, Transcript},
     web::{WebBackend, WebConfig},
 };
@@ -99,6 +101,7 @@ pub struct ContextCompactionState {
 pub struct QueuedPrompt {
     pub id: String,
     pub text: String,
+    pub attachments: Vec<PromptAttachment>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,14 +111,30 @@ struct OutgoingPrompt {
     wire_text: String,
     model: Option<String>,
     handoff: Option<HandoffPackage>,
+    attachments: Vec<PromptAttachment>,
 }
 
 impl OutgoingPrompt {
     fn wire_text(&self) -> String {
-        self.handoff.as_ref().map_or_else(
+        let mut text = self.handoff.as_ref().map_or_else(
             || self.wire_text.clone(),
             |handoff| handoff.render_with_prompt(&self.wire_text),
-        )
+        );
+        let paths = self
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment
+                    .path
+                    .as_ref()
+                    .map(|path| format!("- [{}]: {}", attachment.label, path.display()))
+            })
+            .collect::<Vec<_>>();
+        if !paths.is_empty() {
+            text.push_str("\n\nAttached local files:\n");
+            text.push_str(&paths.join("\n"));
+        }
+        text
     }
 }
 
@@ -138,6 +157,7 @@ pub struct ModelPicker {
 pub enum ModelSelectionScope {
     Default,
     Session,
+    Vision,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -342,6 +362,8 @@ pub enum SettingsView {
     Menu,
     Addons,
     WebBrowsing,
+    Vision,
+    TerminalImages,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -357,6 +379,8 @@ pub struct SettingsState {
     pub selected: usize,
     pub view: SettingsView,
     pub web: WebConfig,
+    pub vision: crate::vision::VisionConfig,
+    pub terminal_images: TerminalImageMode,
     pub addon_field: usize,
     pub agent_browser_status: AgentBrowserStatus,
 }
@@ -587,6 +611,8 @@ pub enum Effect {
     },
     TouchSession(String),
     SaveWebConfig(WebConfig),
+    SaveVisionConfig(crate::vision::VisionConfig),
+    SaveTerminalImageMode(TerminalImageMode),
     CheckAgentBrowser,
     Quit,
 }
@@ -605,6 +631,7 @@ pub struct AppState {
     pub context_usage: Option<ContextUsageState>,
     pub context_compaction: Option<ContextCompactionState>,
     pub editor: EditorState,
+    draft_attachments: Vec<PromptAttachment>,
     pub transcript: Transcript,
     pub queue: VecDeque<QueuedPrompt>,
     pub queue_selection: Option<usize>,
@@ -656,9 +683,33 @@ pub struct AppState {
     api_key_input_hit_region: Option<ApiKeyInputHitRegion>,
     transcript_limit: usize,
     web_config: WebConfig,
+    vision_config: crate::vision::VisionConfig,
+    terminal_image_mode: TerminalImageMode,
 }
 
 impl AppState {
+    pub fn install_terminal_image_mode(&mut self, mode: TerminalImageMode) {
+        self.terminal_image_mode = mode;
+        if mode == TerminalImageMode::Off {
+            self.transcript.set_image_previews_enabled(false);
+        }
+        if let Some(settings) = &mut self.settings {
+            settings.terminal_images = mode;
+        }
+    }
+
+    #[must_use]
+    pub const fn terminal_image_mode(&self) -> TerminalImageMode {
+        self.terminal_image_mode
+    }
+
+    pub fn install_vision_config(&mut self, config: crate::vision::VisionConfig) {
+        self.vision_config = config.clone();
+        if let Some(settings) = &mut self.settings {
+            settings.vision = config;
+        }
+    }
+
     pub fn install_web_config(&mut self, config: WebConfig) {
         self.web_config = config.clone();
         if let Some(settings) = &mut self.settings {
@@ -672,6 +723,8 @@ impl AppState {
             selected: 0,
             view: SettingsView::Menu,
             web: self.web_config.clone(),
+            vision: self.vision_config.clone(),
+            terminal_images: self.terminal_image_mode,
             addon_field: 0,
             agent_browser_status: AgentBrowserStatus::Checking,
         });
@@ -716,8 +769,9 @@ impl AppState {
         };
         let length = match settings.view {
             SettingsView::Menu => settings.filtered_sections().len(),
+            SettingsView::Addons => 3,
             SettingsView::WebBrowsing if settings.web.backend == WebBackend::Firecrawl => 2,
-            SettingsView::Addons | SettingsView::WebBrowsing => 1,
+            SettingsView::Vision | SettingsView::TerminalImages | SettingsView::WebBrowsing => 1,
         };
         if length > 0 {
             if settings.view == SettingsView::Menu || settings.view == SettingsView::Addons {
@@ -742,6 +796,47 @@ impl AppState {
         settings.web.backend = WebBackend::ALL[offset_index(index, WebBackend::ALL.len(), delta)];
     }
 
+    pub fn settings_cycle_terminal_images(&mut self, delta: isize) {
+        let Some(settings) = &mut self.settings else {
+            return;
+        };
+        if settings.view != SettingsView::TerminalImages {
+            return;
+        }
+        let index = TerminalImageMode::ALL
+            .iter()
+            .position(|mode| *mode == settings.terminal_images)
+            .unwrap_or_default();
+        settings.terminal_images =
+            TerminalImageMode::ALL[offset_index(index, TerminalImageMode::ALL.len(), delta)];
+    }
+
+    pub fn save_terminal_image_mode(&mut self) -> Vec<Effect> {
+        let Some(mode) = self
+            .settings
+            .as_ref()
+            .map(|settings| settings.terminal_images)
+        else {
+            return Vec::new();
+        };
+        self.set_status("Terminal image setting saved; changes apply on next launch.");
+        vec![Effect::SaveTerminalImageMode(mode)]
+    }
+
+    pub fn settings_cycle_choice(&mut self, delta: isize) -> Vec<Effect> {
+        match self.settings.as_ref().map(|settings| settings.view) {
+            Some(SettingsView::WebBrowsing) => {
+                self.settings_cycle_backend(delta);
+                self.save_web_settings()
+            }
+            Some(SettingsView::TerminalImages) => {
+                self.settings_cycle_terminal_images(delta);
+                self.save_terminal_image_mode()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     pub fn select_setting(&mut self) -> Vec<Effect> {
         if self
             .settings
@@ -754,10 +849,34 @@ impl AppState {
         if let Some(settings) = &mut self.settings
             && settings.view == SettingsView::Addons
         {
-            settings.view = SettingsView::WebBrowsing;
+            match settings.selected {
+                0 => {
+                    settings.view = SettingsView::WebBrowsing;
+                    settings.addon_field = 0;
+                    settings.agent_browser_status = AgentBrowserStatus::Checking;
+                    return vec![Effect::CheckAgentBrowser];
+                }
+                1 => settings.view = SettingsView::Vision,
+                _ => settings.view = SettingsView::TerminalImages,
+            }
             settings.addon_field = 0;
-            settings.agent_browser_status = AgentBrowserStatus::Checking;
-            return vec![Effect::CheckAgentBrowser];
+            return Vec::new();
+        }
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.view == SettingsView::TerminalImages)
+        {
+            self.settings_cycle_terminal_images(1);
+            return self.save_terminal_image_mode();
+        }
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.view == SettingsView::Vision)
+        {
+            self.settings = None;
+            return self.open_vision_model_picker();
         }
         let section = self
             .settings
@@ -791,6 +910,22 @@ impl AppState {
         }
     }
 
+    pub fn disable_vision_addon(&mut self) -> Vec<Effect> {
+        if self
+            .settings
+            .as_ref()
+            .is_none_or(|settings| settings.view != SettingsView::Vision)
+        {
+            return Vec::new();
+        }
+        self.vision_config.model = None;
+        if let Some(settings) = &mut self.settings {
+            settings.vision = self.vision_config.clone();
+        }
+        self.set_status("Vision add-on disabled.");
+        vec![Effect::SaveVisionConfig(self.vision_config.clone())]
+    }
+
     pub fn settings_back(&mut self) -> Vec<Effect> {
         let Some(view) = self.settings.as_ref().map(|settings| settings.view) else {
             return Vec::new();
@@ -804,6 +939,20 @@ impl AppState {
                 if let Some(settings) = &mut self.settings {
                     settings.view = SettingsView::Menu;
                     settings.selected = 0;
+                }
+                Vec::new()
+            }
+            SettingsView::Vision => {
+                if let Some(settings) = &mut self.settings {
+                    settings.view = SettingsView::Addons;
+                    settings.selected = 1;
+                }
+                Vec::new()
+            }
+            SettingsView::TerminalImages => {
+                if let Some(settings) = &mut self.settings {
+                    settings.view = SettingsView::Addons;
+                    settings.selected = 2;
                 }
                 Vec::new()
             }
@@ -836,6 +985,27 @@ impl AppState {
     pub fn set_status(&mut self, message: &str) {
         self.status_message.clear();
         self.status_message.push_str(message);
+    }
+
+    pub fn insert_attachments(&mut self, attachments: Vec<PromptAttachment>) {
+        if attachments.is_empty() {
+            return;
+        }
+        for attachment in &attachments {
+            let text = self.editor.text();
+            if !text.is_empty() && !text.ends_with(char::is_whitespace) {
+                self.editor.insert_char(' ');
+            }
+            self.editor.insert_str(&format!("[{}]", attachment.label));
+            self.editor.insert_char(' ');
+        }
+        let count = attachments.len();
+        self.draft_attachments.extend(attachments);
+        self.status_message = if count == 1 {
+            "Attached 1 file.".to_owned()
+        } else {
+            format!("Attached {count} files.")
+        };
     }
 
     pub fn new(
@@ -887,6 +1057,7 @@ impl AppState {
             context_usage: None,
             context_compaction: None,
             editor: EditorState::default(),
+            draft_attachments: Vec::new(),
             transcript,
             queue: VecDeque::new(),
             queue_selection: None,
@@ -938,6 +1109,8 @@ impl AppState {
             api_key_input_hit_region: None,
             transcript_limit: scrollback,
             web_config: WebConfig::default(),
+            vision_config: crate::vision::VisionConfig::default(),
+            terminal_image_mode: TerminalImageMode::default(),
         }
     }
 
@@ -2202,6 +2375,10 @@ impl AppState {
     }
 
     pub fn steer_editor(&mut self) -> Vec<Effect> {
+        if !self.draft_attachments.is_empty() {
+            self.set_status("Attachments can be sent or queued, but not used for steering.");
+            return Vec::new();
+        }
         if self.editor.is_blank() {
             self.set_status("Write steering guidance first.");
             return Vec::new();
@@ -2346,6 +2523,19 @@ impl AppState {
         self.open_model_picker_for(ModelSelectionScope::Default)
     }
 
+    pub fn open_vision_model_picker(&mut self) -> Vec<Effect> {
+        if !self
+            .models
+            .iter()
+            .any(|model| model.provider == CODEX_PROVIDER)
+        {
+            self.set_status("No configured vision-capable models are available.");
+            return Vec::new();
+        }
+        self.show_model_picker(ModelSelectionScope::Vision);
+        Vec::new()
+    }
+
     fn open_model_picker_for(&mut self, scope: ModelSelectionScope) -> Vec<Effect> {
         if self.pending_model_picker.is_some()
             || (self.creating_session.is_some() && self.provider_session_id.is_none())
@@ -2377,12 +2567,18 @@ impl AppState {
     }
 
     fn show_model_picker(&mut self, scope: ModelSelectionScope) {
-        let selected = self
-            .selected_model
-            .as_ref()
+        let selected_model = if scope == ModelSelectionScope::Vision {
+            self.vision_config.model.as_ref()
+        } else {
+            self.selected_model.as_ref()
+        };
+        let selected = selected_model
             .and_then(|selected| {
                 self.models
                     .iter()
+                    .filter(|model| {
+                        scope != ModelSelectionScope::Vision || model.provider == CODEX_PROVIDER
+                    })
                     .position(|model| &model.qualified_id() == selected)
             })
             .unwrap_or(0);
@@ -2435,6 +2631,9 @@ impl AppState {
                 .model_picker
                 .as_ref()
                 .map_or(ModelSelectionScope::Session, |picker| picker.scope);
+            if scope == ModelSelectionScope::Vision {
+                return self.select_vision_model(&selected);
+            }
             let provider_changed = selected.provider != self.backend_provider;
             let source_provider = self.backend_provider.clone();
             let source_name = self.backend_name.clone();
@@ -2520,6 +2719,14 @@ impl AppState {
         Vec::new()
     }
 
+    fn select_vision_model(&mut self, selected: &ModelInfo) -> Vec<Effect> {
+        let qualified = selected.qualified_id();
+        self.vision_config.model = Some(qualified.clone());
+        self.model_picker = None;
+        self.status_message = format!("Vision model: {qualified}.");
+        vec![Effect::SaveVisionConfig(self.vision_config.clone())]
+    }
+
     #[must_use]
     pub fn filtered_models(&self) -> Vec<&ModelInfo> {
         let Some(picker) = &self.model_picker else {
@@ -2529,7 +2736,10 @@ impl AppState {
         self.models
             .iter()
             .filter(|model| {
-                filter.is_empty() || model.qualified_id().to_lowercase().contains(&filter)
+                let vision_model =
+                    picker.scope != ModelSelectionScope::Vision || model.provider == CODEX_PROVIDER;
+                vision_model
+                    && (filter.is_empty() || model.qualified_id().to_lowercase().contains(&filter))
             })
             .collect()
     }
@@ -3406,9 +3616,32 @@ impl AppState {
     }
 
     fn take_editor_prompt(&mut self) -> QueuedPrompt {
+        let text = self.editor.text();
+        let mut remaining_labels = HashMap::<String, usize>::new();
+        for attachment in &self.draft_attachments {
+            let token = format!("[{}]", attachment.label);
+            remaining_labels
+                .entry(token.clone())
+                .or_insert_with(|| text.matches(&token).count());
+        }
+        let attachments = std::mem::take(&mut self.draft_attachments)
+            .into_iter()
+            .filter(|attachment| {
+                let token = format!("[{}]", attachment.label);
+                let Some(remaining) = remaining_labels.get_mut(&token) else {
+                    return false;
+                };
+                if *remaining == 0 {
+                    return false;
+                }
+                *remaining -= 1;
+                true
+            })
+            .collect();
         let prompt = QueuedPrompt {
             id: self.next_id("msg"),
-            text: self.editor.text(),
+            text,
+            attachments,
         };
         self.editor.clear();
         prompt
@@ -3430,9 +3663,17 @@ impl AppState {
                 .then(|| self.selected_model_for_active_provider())
                 .flatten(),
             handoff: self.pending_handoff.take(),
+            attachments: prompt.attachments,
         };
+        let user_key = format!("user:{}", prompt.id);
+        let images = prompt
+            .attachments
+            .iter()
+            .filter_map(|attachment| attachment.image.clone())
+            .collect::<Vec<_>>();
+        self.transcript.set_images(user_key.clone(), images);
         self.transcript.upsert(
-            format!("user:{}", prompt.id),
+            user_key,
             EntryKind::User,
             format!("YOU · {}", prompt.id),
             &prompt.text,
@@ -3477,6 +3718,7 @@ impl AppState {
             session_id: provider_session_id,
             client_id: prompt.id,
             prompt: wire_text,
+            attachments: prompt.attachments,
             model: prompt.model,
         })]
     }
@@ -3779,6 +4021,7 @@ impl AppState {
         self.transcript
             .set_status(&format!("user:{}", prompt.id), EntryStatus::Failed);
         self.pending_handoff.clone_from(&prompt.handoff);
+        self.draft_attachments.clone_from(&prompt.attachments);
         if self.editor.is_blank() {
             self.editor.set_text(&prompt.text);
             self.status_message.push_str(" Draft restored.");
@@ -4220,6 +4463,7 @@ impl AppState {
                 session_id: provider_session_id,
                 client_id: format!("{run_id}-prompt"),
                 prompt,
+                attachments: Vec::new(),
                 model,
             },
         }]
@@ -4757,8 +5001,8 @@ mod tests {
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
             BackendIdentity, BackendOperation, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport,
             CompactionReason, DEVIN_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo,
-            NormalizedItem, QuestionOption, QuestionRequest, SessionHistoryItem, TodoItem,
-            TodoPhase, TodoStatus, TurnOutcome,
+            NormalizedItem, PromptAttachment, PromptImage, QuestionOption, QuestionRequest,
+            SessionHistoryItem, TodoItem, TodoPhase, TodoStatus, TurnOutcome,
         },
         session::{SessionRecord, SubagentRecord},
         skill::SkillCatalog,
@@ -4822,6 +5066,44 @@ model = "openai-codex/model-a"
         )
         .expect("skill definition");
         state.install_skills(SkillCatalog::load(workspace.path()).expect("skill catalog"));
+    }
+
+    #[test]
+    fn attached_image_is_labeled_and_sent_with_the_turn() {
+        let mut state = ready_state();
+        state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "session-with-image".to_owned(),
+            model: "model-a".to_owned(),
+        });
+        state.insert_attachments(vec![PromptAttachment {
+            label: "Image".to_owned(),
+            path: None,
+            image: Some(PromptImage {
+                mime_type: "image/png".to_owned(),
+                data: vec![1, 2, 3],
+            }),
+        }]);
+
+        assert_eq!(state.editor.text(), "[Image] ");
+        let effects = state.submit_editor();
+        let Effect::Backend(BackendCommand::StartTurn { attachments, .. }) =
+            effects.last().unwrap()
+        else {
+            panic!("expected image prompt to start a turn");
+        };
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].label, "Image");
+        let user_key = state
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.kind == EntryKind::User)
+            .and_then(|entry| entry.key.as_deref())
+            .expect("user transcript key");
+        assert_eq!(
+            state.transcript.image(user_key, 0),
+            attachments[0].image.as_ref()
+        );
     }
 
     #[test]
@@ -5670,6 +5952,56 @@ model = "openai-codex/model-a"
     }
 
     #[test]
+    fn terminal_image_setting_cycles_and_emits_persistence_effect() {
+        let mut state = ready_state();
+        state.open_settings();
+        state.settings_move(3);
+        assert!(state.select_setting().is_empty());
+        state.settings_move(2);
+        assert!(state.select_setting().is_empty());
+        assert_eq!(
+            state.settings.as_ref().map(|settings| settings.view),
+            Some(super::SettingsView::TerminalImages)
+        );
+
+        assert!(matches!(
+            state.select_setting().as_slice(),
+            [Effect::SaveTerminalImageMode(
+                crate::terminal_image::TerminalImageMode::On
+            )]
+        ));
+        assert_eq!(
+            state
+                .settings
+                .as_ref()
+                .map(|settings| settings.terminal_images),
+            Some(crate::terminal_image::TerminalImageMode::On)
+        );
+
+        assert!(matches!(
+            state.settings_cycle_choice(-1).as_slice(),
+            [Effect::SaveTerminalImageMode(
+                crate::terminal_image::TerminalImageMode::Auto
+            )]
+        ));
+        assert!(matches!(
+            state.settings_cycle_choice(1).as_slice(),
+            [Effect::SaveTerminalImageMode(
+                crate::terminal_image::TerminalImageMode::On
+            )]
+        ));
+
+        assert!(state.settings_back().is_empty());
+        assert_eq!(
+            state
+                .settings
+                .as_ref()
+                .map(|settings| (settings.view, settings.selected)),
+            Some((super::SettingsView::Addons, 2))
+        );
+    }
+
+    #[test]
     fn slash_commands_are_not_sent_as_prompts() {
         let mut state = ready_state();
         state.editor.set_text("/resume");
@@ -5893,6 +6225,26 @@ model = "openai-codex/model-a"
             transcript.entries()[0].body,
             "The session store owns orchestration metadata."
         );
+    }
+
+    #[test]
+    fn vision_model_selection_persists_without_switching_the_session_model() {
+        let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "vision-model".to_owned(),
+            is_default: false,
+        });
+        let session_model = state.selected_model.clone();
+
+        assert!(state.open_vision_model_picker().is_empty());
+        state.picker_move(1);
+        assert!(matches!(
+            state.picker_select().as_slice(),
+            [Effect::SaveVisionConfig(config)]
+                if config.model.as_deref() == Some("openai-codex/vision-model")
+        ));
+        assert_eq!(state.selected_model, session_model);
     }
 
     #[test]

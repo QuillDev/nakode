@@ -1,7 +1,7 @@
 use nakode::{
     app,
     config::{Config, NakodeCommand, ServiceAction},
-    control, update,
+    control, diagnostics, update,
 };
 
 #[tokio::main]
@@ -20,6 +20,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     match config.command.clone() {
+        Some(NakodeCommand::Diagnostics {
+            days,
+            sessions,
+            provider,
+            json,
+        }) => {
+            let output = diagnostics::run(&diagnostics::DiagnosticsOptions {
+                days,
+                session_limit: usize::from(sessions),
+                provider,
+                json,
+            })?;
+            println!("{output}");
+        }
         Some(NakodeCommand::Agent {
             agent_slug,
             session_id,

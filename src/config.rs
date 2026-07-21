@@ -84,6 +84,21 @@ impl OpenAiReasoningEffort {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum NakodeCommand {
+    /// Report persisted token, cache, session, and tool telemetry without prompt content.
+    Diagnostics {
+        /// Number of days of telemetry to include.
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u16).range(1..=3650))]
+        days: u16,
+        /// Maximum number of highest-input sessions to display.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=500))]
+        sessions: u16,
+        /// Include only one provider slug, such as `openai-codex`.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Update this installation through its package manager.
     Update,
     /// Invoke a predefined agent through the running Nakode control service.
@@ -182,7 +197,12 @@ impl Config {
         if self.update && self.command.is_some() {
             return Err(ConfigError::UpdateWithCommand);
         }
-        if self.update || matches!(self.command.as_ref(), Some(NakodeCommand::Update)) {
+        if self.update
+            || matches!(
+                self.command.as_ref(),
+                Some(NakodeCommand::Update | NakodeCommand::Diagnostics { .. })
+            )
+        {
             return Ok(self);
         }
         if !self.workspace.exists() {
@@ -327,6 +347,30 @@ mod tests {
             }) if agent_slug == "reviewer" && session_id == "session-7" && task == "Review auth"
         ));
         assert!(Config::try_parse_from(["nakode", "agent", "explorer"]).is_err());
+    }
+
+    #[test]
+    fn diagnostics_command_parses_bounded_privacy_preserving_options() {
+        let config = Config::try_parse_from([
+            "nakode",
+            "diagnostics",
+            "--days=30",
+            "--sessions=40",
+            "--provider=openai-codex",
+            "--json",
+        ])
+        .expect("diagnostics command");
+        assert!(matches!(
+            config.command,
+            Some(NakodeCommand::Diagnostics {
+                days: 30,
+                sessions: 40,
+                provider: Some(ref provider),
+                json: true,
+            }) if provider == "openai-codex"
+        ));
+        assert!(Config::try_parse_from(["nakode", "diagnostics", "--days=0"]).is_err());
+        assert!(Config::try_parse_from(["nakode", "diagnostics", "--sessions=501"]).is_err());
     }
 
     #[test]

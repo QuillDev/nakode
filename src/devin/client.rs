@@ -548,12 +548,9 @@ async fn handle_command(
             )
             .await
         }
-        BackendCommand::StartTurn {
-            session_id,
-            client_id,
-            prompt,
-            model: _,
-        } => start_turn(session_id, client_id, prompt, stdin, events, runtime).await,
+        command @ BackendCommand::StartTurn { .. } => {
+            start_turn_command(command, stdin, events, runtime).await
+        }
         BackendCommand::SteerTurn { .. } => {
             let _ = events
                 .send(BackendEvent::RequestFailed {
@@ -634,15 +631,53 @@ async fn set_session_model(
     .await
 }
 
+async fn start_turn_command(
+    command: BackendCommand,
+    stdin: &mut ChildStdin,
+    events: &mpsc::Sender<BackendEvent>,
+    runtime: &mut AcpRuntime,
+) -> std::io::Result<()> {
+    let BackendCommand::StartTurn {
+        session_id,
+        client_id,
+        prompt,
+        attachments,
+        ..
+    } = command
+    else {
+        unreachable!("start_turn_command requires a start-turn command")
+    };
+    start_turn(
+        session_id,
+        client_id,
+        prompt,
+        attachments,
+        stdin,
+        events,
+        runtime,
+    )
+    .await
+}
+
 async fn start_turn(
     session_id: String,
     turn_id: String,
     prompt: String,
+    attachments: Vec<crate::backend::PromptAttachment>,
     stdin: &mut ChildStdin,
     events: &mpsc::Sender<BackendEvent>,
     runtime: &mut AcpRuntime,
 ) -> std::io::Result<()> {
     let id = allocate_request_id(&runtime.pending, &mut runtime.next_id);
+    let mut content = vec![json!({"type": "text", "text": prompt})];
+    content.extend(attachments.into_iter().filter_map(|attachment| {
+        let image = attachment.image?;
+        Some(json!({
+            "type": "image",
+            "data": base64::engine::general_purpose::STANDARD.encode(image.data),
+            "mimeType": image.mime_type,
+        }))
+    }));
     write_json(
         stdin,
         &request(
@@ -650,7 +685,7 @@ async fn start_turn(
             "session/prompt",
             &json!({
                 "sessionId": session_id,
-                "prompt": [{"type": "text", "text": prompt}],
+                "prompt": content,
             }),
         ),
     )

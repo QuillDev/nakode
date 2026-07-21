@@ -20,10 +20,12 @@ const EVENT_CAPACITY: usize = 1_024;
 const SDK_VERSION: &str = "1.0.23";
 const BRIDGE_SOURCE: &str = include_str!("bridge.mjs");
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BackendConfig {
     pub workspace: PathBuf,
     pub credential: Option<Value>,
+    vision_config: Option<std::sync::Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
+    vision_service: Option<crate::vision::SharedVisionService>,
 }
 
 impl BackendConfig {
@@ -32,12 +34,25 @@ impl BackendConfig {
         Self {
             workspace,
             credential: None,
+            vision_config: None,
+            vision_service: None,
         }
     }
 
     #[must_use]
     pub fn with_credential(mut self, credential: Option<Value>) -> Self {
         self.credential = credential;
+        self
+    }
+
+    #[must_use]
+    pub fn with_vision(
+        mut self,
+        config: std::sync::Arc<std::sync::RwLock<crate::vision::VisionConfig>>,
+        service: Option<crate::vision::SharedVisionService>,
+    ) -> Self {
+        self.vision_config = Some(config);
+        self.vision_service = service;
         self
     }
 }
@@ -311,6 +326,13 @@ async fn handle_command(
         .await;
         return;
     };
+    let command = match augment_image_attachments(command, config).await {
+        Ok(command) => command,
+        Err(error) => {
+            request_failed(events, BackendOperation::StartTurn, error).await;
+            return;
+        }
+    };
     let request_id = Uuid::now_v7().to_string();
     let (method, mut payload) = match command {
         BackendCommand::StartSession {
@@ -327,6 +349,7 @@ async fn handle_command(
             session_id,
             client_id,
             prompt,
+            attachments: _,
             model,
         } => (
             "send",
@@ -396,6 +419,62 @@ async fn send(bridge: &mut Bridge, value: Value) -> Result<(), String> {
         .write_all(&encoded)
         .await
         .map_err(|error| error.to_string())
+}
+
+async fn augment_image_attachments(
+    command: BackendCommand,
+    config: &BackendConfig,
+) -> Result<BackendCommand, String> {
+    let BackendCommand::StartTurn {
+        session_id,
+        client_id,
+        mut prompt,
+        mut attachments,
+        model,
+    } = command
+    else {
+        return Ok(command);
+    };
+    let images = attachments
+        .iter()
+        .filter_map(|attachment| attachment.image.clone())
+        .collect::<Vec<_>>();
+    let vision_enabled = config
+        .vision_config
+        .as_ref()
+        .is_some_and(|config| config.read().is_ok_and(|config| config.is_enabled()));
+    if images.is_empty() || !vision_enabled {
+        return Ok(BackendCommand::StartTurn {
+            session_id,
+            client_id,
+            prompt,
+            attachments,
+            model,
+        });
+    }
+    let service = config.vision_service.as_ref().ok_or_else(|| {
+        "Vision add-on model is configured but its provider is unavailable".to_owned()
+    })?;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let description = service
+        .analyze(
+            "Describe these attached images precisely for the coding agent. Focus on visible text, layout, state, errors, and implementation-relevant details.",
+            images,
+            &cancellation,
+        )
+        .await?;
+    prompt.push_str("\n\nVision add-on analysis of the attached images:\n");
+    prompt.push_str(&description);
+    for attachment in &mut attachments {
+        attachment.image = None;
+    }
+    Ok(BackendCommand::StartTurn {
+        session_id,
+        client_id,
+        prompt,
+        attachments,
+        model,
+    })
 }
 
 #[allow(clippy::too_many_lines)]

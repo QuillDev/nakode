@@ -9,6 +9,7 @@ mod hypa;
 mod process;
 mod read;
 mod todo;
+mod vision;
 mod write;
 
 use std::{future::Future, path::Path, pin::Pin, sync::Arc};
@@ -23,7 +24,7 @@ use crate::{
 };
 
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
-pub const MAX_MODEL_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
+pub const MAX_MODEL_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolConcurrency {
@@ -108,6 +109,17 @@ impl ToolRegistry {
     #[must_use]
     pub fn with_browser(mut self, config: Arc<std::sync::RwLock<crate::web::WebConfig>>) -> Self {
         self.tools.push(Arc::new(browser::BrowserTool::new(config)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_vision(
+        mut self,
+        config: Arc<std::sync::RwLock<crate::vision::VisionConfig>>,
+        service: Option<crate::vision::SharedVisionService>,
+    ) -> Self {
+        self.tools
+            .push(Arc::new(vision::VisionTool::new(config, service)));
         self
     }
 
@@ -386,7 +398,10 @@ mod tests {
         assert!(model_output.len() < output.len());
         assert!(model_output.starts_with("HEAD"));
         assert!(model_output.ends_with("TAIL"));
-        assert!(model_output.contains("full 65544-byte output remains in the transcript"));
+        assert!(model_output.contains(&format!(
+            "full {}-byte output remains in the transcript",
+            output.len()
+        )));
     }
 
     #[tokio::test]

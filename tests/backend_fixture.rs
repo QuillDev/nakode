@@ -80,6 +80,7 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
             session_id: provider_session_id,
             client_id: "client-fixture".to_owned(),
             prompt: "hello fixture".to_owned(),
+            attachments: Vec::new(),
             model: Some("fixture-model".to_owned()),
         })
         .await?;

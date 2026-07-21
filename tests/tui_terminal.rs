@@ -164,6 +164,7 @@ fn spawn_tui(workspace: &Path, control_directory: &Path) -> Result<PtySession, B
     PtySession::spawn(
         "/usr/bin/env",
         [
+            OsString::from("NAKODE_TERMINAL_IMAGES=off"),
             OsString::from(format!("HOME={}", home.display())),
             OsString::from(format!("XDG_DATA_HOME={}", data.display())),
             OsString::from(format!(

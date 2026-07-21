@@ -68,11 +68,19 @@ struct BackendRegistry {
     provider_credentials: HashMap<String, serde_json::Value>,
     provider_cooldowns: HashMap<String, ProviderCooldown>,
     web_config: Arc<RwLock<crate::web::WebConfig>>,
+    vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
+    vision_service: Option<crate::vision::SharedVisionService>,
 }
 
 struct PersistenceServices<'a> {
     sessions: &'a dyn SessionRepository,
     credentials: &'a dyn CredentialStore,
+}
+
+struct InteractiveServices<'a> {
+    control: &'a mut ControlServer,
+    signals: &'a mut ShutdownSignals,
+    image_renderer: Option<&'a mut crate::terminal_image::TerminalImageRenderer>,
 }
 
 struct ProviderCooldown {
@@ -90,14 +98,35 @@ impl BackendRegistry {
         )
     }
 
+    fn current_vision_config(&self) -> crate::vision::VisionConfig {
+        self.vision_config.read().map_or_else(
+            |_| crate::vision::VisionConfig::default(),
+            |config| config.clone(),
+        )
+    }
+
     async fn spawn(
         config: &Config,
         providers: &[ProviderRecord],
         session_database: PathBuf,
         provider_credentials: HashMap<String, serde_json::Value>,
         web_config: Arc<RwLock<crate::web::WebConfig>>,
+        vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
     ) -> Self {
         let (event_tx, events) = mpsc::channel(512);
+        let mut failures = Vec::new();
+        let vision_service = match codex::vision_service(
+            provider_credentials
+                .get(crate::backend::CODEX_PROVIDER)
+                .cloned(),
+            Arc::clone(&vision_config),
+        ) {
+            Ok(service) => service,
+            Err(error) => {
+                failures.push((crate::backend::CODEX_PROVIDER.to_owned(), error.to_string()));
+                None
+            }
+        };
         let mut registry = Self {
             commands: HashMap::new(),
             subagent_commands: HashMap::new(),
@@ -105,12 +134,14 @@ impl BackendRegistry {
             events,
             event_tx: event_tx.clone(),
             tasks: Vec::new(),
-            failures: Vec::new(),
+            failures,
             config: config.clone(),
             session_database,
             provider_credentials,
             provider_cooldowns: HashMap::new(),
             web_config,
+            vision_config,
+            vision_service,
         };
         for provider in providers.iter().filter(|provider| provider.enabled) {
             if let Err(error) = registry.start_provider(&provider.provider).await {
@@ -138,7 +169,8 @@ impl BackendRegistry {
                             self.config.compaction_threshold_percent,
                         ))
                         .with_session_database(self.session_database.clone())
-                        .with_web_config(Arc::clone(&self.web_config)),
+                        .with_web_config(Arc::clone(&self.web_config))
+                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
             }
@@ -146,7 +178,8 @@ impl BackendRegistry {
                 let credential = self.provider_credentials.get(provider).cloned();
                 cursor::spawn(
                     cursor::BackendConfig::native(self.config.workspace.clone())
-                        .with_credential(credential),
+                        .with_credential(credential)
+                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
             }
@@ -159,7 +192,8 @@ impl BackendRegistry {
                             self.config.compaction_threshold_percent,
                         ))
                         .with_session_database(self.session_database.clone())
-                        .with_web_config(Arc::clone(&self.web_config)),
+                        .with_web_config(Arc::clone(&self.web_config))
+                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
             }
@@ -179,8 +213,15 @@ impl BackendRegistry {
         }
     }
 
-    fn set_provider_credential(&mut self, provider: String, metadata: serde_json::Value) {
-        self.provider_credentials.insert(provider, metadata);
+    fn set_provider_credential(&mut self, provider: &str, metadata: serde_json::Value) {
+        self.provider_credentials
+            .insert(provider.to_owned(), metadata.clone());
+        if provider == crate::backend::CODEX_PROVIDER
+            && let Ok(service) =
+                codex::vision_service(Some(metadata), Arc::clone(&self.vision_config))
+        {
+            self.vision_service = service;
+        }
     }
 
     fn insert_primary(&mut self, provider: String, handle: BackendHandle) {
@@ -225,7 +266,8 @@ impl BackendRegistry {
                             self.config.compaction_threshold_percent,
                         ))
                         .with_session_database(self.session_database.clone())
-                        .with_web_config(Arc::clone(&self.web_config)),
+                        .with_web_config(Arc::clone(&self.web_config))
+                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
             }
@@ -233,7 +275,8 @@ impl BackendRegistry {
                 let credential = self.provider_credentials.get(provider).cloned();
                 cursor::spawn(
                     cursor::BackendConfig::native(self.config.workspace.clone())
-                        .with_credential(credential),
+                        .with_credential(credential)
+                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
             }
@@ -246,7 +289,8 @@ impl BackendRegistry {
                             self.config.compaction_threshold_percent,
                         ))
                         .with_session_database(self.session_database.clone())
-                        .with_web_config(Arc::clone(&self.web_config)),
+                        .with_web_config(Arc::clone(&self.web_config))
+                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
             }
@@ -400,6 +444,8 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let agents = AgentCatalog::load(&config.agents)?;
     let skills = SkillCatalog::load(&config.workspace)?;
     let mut state = initial_state(&config, &providers, &backends, agents, skills);
+    let image_mode = sessions.load_terminal_image_mode()?;
+    state.install_terminal_image_mode(image_mode);
     state.set_nakode_executable(&nakode_executable);
     for provider in backends.commands.keys() {
         match sessions.list_models(provider) {
@@ -429,22 +475,32 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             return Err(AppError::Terminal(error));
         }
     };
+    let mut image_renderer = crate::terminal_image::TerminalImageRenderer::detect(image_mode);
+    state
+        .transcript
+        .set_image_previews_enabled(image_renderer.is_some());
     let mut herdr = crate::herdr::Reporter::from_environment();
 
     let persistence = PersistenceServices {
         sessions: &sessions,
         credentials: &credentials,
     };
-    let loop_result = run_loop(
-        terminal.terminal_mut(),
-        &mut state,
-        &mut backends,
-        &persistence,
-        &mut control,
-        &mut signals,
-        herdr.as_mut(),
-    )
-    .await;
+    let loop_result = {
+        let mut interactive = InteractiveServices {
+            control: &mut control,
+            signals: &mut signals,
+            image_renderer: image_renderer.as_mut(),
+        };
+        run_loop(
+            terminal.terminal_mut(),
+            &mut state,
+            &mut backends,
+            &persistence,
+            &mut interactive,
+            herdr.as_mut(),
+        )
+        .await
+    };
 
     if let Some(reporter) = herdr {
         reporter.shutdown().await;
@@ -497,6 +553,7 @@ fn initial_state(
         )
     };
     state.install_web_config(backends.current_web_config());
+    state.install_vision_config(backends.current_vision_config());
     state.install_agents(agents);
     state.install_skills(skills);
     state.set_agent_directory(config.agents.clone());
@@ -519,12 +576,14 @@ async fn start_backends(
     let (provider_credentials, credential_failures) =
         load_provider_credentials(&providers, credentials);
     let web_config = shared_web_config(sessions)?;
+    let vision_config = shared_vision_config(sessions)?;
     let mut backends = BackendRegistry::spawn(
         config,
         &providers,
         sessions.database_path().to_path_buf(),
         provider_credentials,
         web_config,
+        vision_config,
     )
     .await;
     backends.failures.extend(credential_failures);
@@ -573,6 +632,14 @@ fn shared_web_config(
 ) -> Result<Arc<RwLock<crate::web::WebConfig>>, SessionError> {
     sessions
         .load_web_config()
+        .map(|config| Arc::new(RwLock::new(config)))
+}
+
+fn shared_vision_config(
+    sessions: &dyn SessionRepository,
+) -> Result<Arc<RwLock<crate::vision::VisionConfig>>, SessionError> {
+    sessions
+        .load_vision_config()
         .map(|config| Arc::new(RwLock::new(config)))
 }
 
@@ -627,8 +694,7 @@ async fn run_loop(
     state: &mut AppState,
     backends: &mut BackendRegistry,
     persistence: &PersistenceServices<'_>,
-    control: &mut ControlServer,
-    signals: &mut ShutdownSignals,
+    interactive: &mut InteractiveServices<'_>,
     mut herdr: Option<&mut crate::herdr::Reporter>,
 ) -> io::Result<()> {
     let mut input = EventStream::new();
@@ -682,7 +748,7 @@ async fn run_loop(
                     dirty = true;
                 }
             }
-            request = control.requests.recv() => {
+            request = interactive.control.requests.recv() => {
                 if let Some(request) = request {
                     if request.invocation.session_id == state.nakode_session_id {
                         let id = request.id;
@@ -696,13 +762,19 @@ async fn run_loop(
                     dirty = true;
                 }
             }
-            () = signals.recv() => {
+            () = interactive.signals.recv() => {
                 state.should_quit = true;
                 break;
             }
             _ = render_tick.tick() => {
                 if dirty || state.is_busy() {
-                    terminal.draw(|frame| render::draw(frame, state))?;
+                    terminal.draw(|frame| {
+                        render::draw_with_images(
+                            frame,
+                            state,
+                            interactive.image_renderer.as_deref_mut(),
+                        );
+                    })?;
                     dirty = false;
                 }
             }
@@ -759,8 +831,7 @@ async fn apply_effects(
 ) -> bool {
     let sessions = persistence.sessions;
     let credentials = persistence.credentials;
-    let mut quit = false;
-    let mut pending = std::collections::VecDeque::from(effects);
+    let (mut quit, mut pending) = (false, std::collections::VecDeque::from(effects));
     while let Some(effect) = pending.pop_front() {
         match effect {
             Effect::Backend(command) => send_backend_command(state, backends, command).await,
@@ -789,16 +860,12 @@ async fn apply_effects(
                 kind,
                 metadata,
             } => {
-                handle_credential_effect(
+                save_provider_credential_effect(
                     state,
                     backends,
                     persistence,
                     &mut pending,
-                    ProviderCredentialInput {
-                        provider,
-                        kind,
-                        metadata,
-                    },
+                    (provider, kind, metadata),
                 )
                 .await;
             }
@@ -848,6 +915,12 @@ async fn apply_effects(
             Effect::TouchSession(id) => touch_session(state, sessions, &id),
             Effect::SaveWebConfig(config) => {
                 save_web_config_effect(state, backends, sessions, config);
+            }
+            Effect::SaveVisionConfig(config) => {
+                save_vision_config_effect(state, backends, sessions, config);
+            }
+            Effect::SaveTerminalImageMode(mode) => {
+                save_terminal_image_mode_effect(state, sessions, mode);
             }
             Effect::CheckAgentBrowser => check_agent_browser(state).await,
             Effect::Quit => quit = true,
@@ -995,13 +1068,19 @@ struct ProviderCredentialInput {
     metadata: serde_json::Value,
 }
 
-async fn handle_credential_effect(
+async fn save_provider_credential_effect(
     state: &mut AppState,
     backends: &mut BackendRegistry,
     persistence: &PersistenceServices<'_>,
     pending: &mut std::collections::VecDeque<Effect>,
-    credential: ProviderCredentialInput,
+    credential: (String, String, serde_json::Value),
 ) {
+    let (provider, kind, metadata) = credential;
+    let credential = ProviderCredentialInput {
+        provider,
+        kind,
+        metadata,
+    };
     persist_provider_credential(
         state,
         backends,
@@ -1029,7 +1108,7 @@ async fn persist_provider_credential(
         state.session_store_failed(error.to_string());
         return;
     }
-    backends.set_provider_credential(credential.provider.clone(), credential.metadata.clone());
+    backends.set_provider_credential(&credential.provider, credential.metadata.clone());
     backends.stop_provider(&credential.provider).await;
     match sessions.list_providers() {
         Ok(providers) => state.install_providers(providers),
@@ -1208,6 +1287,39 @@ fn save_web_config_effect(
     state.set_status("Browser add-on settings saved.");
 }
 
+fn save_vision_config_effect(
+    state: &mut AppState,
+    backends: &BackendRegistry,
+    sessions: &dyn SessionRepository,
+    config: crate::vision::VisionConfig,
+) {
+    if let Err(error) = sessions.save_vision_config(&config) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    let Ok(mut shared) = backends.vision_config.write() else {
+        state.session_store_failed("vision settings lock is unavailable".to_owned());
+        return;
+    };
+    *shared = config.clone();
+    drop(shared);
+    state.install_vision_config(config);
+    state.set_status("Vision add-on settings saved.");
+}
+
+fn save_terminal_image_mode_effect(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    mode: crate::terminal_image::TerminalImageMode,
+) {
+    if let Err(error) = sessions.save_terminal_image_mode(mode) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    state.install_terminal_image_mode(mode);
+    state.set_status("Terminal image setting saved; changes apply on next launch.");
+}
+
 fn persist_subagent(
     state: &mut AppState,
     sessions: &dyn SessionRepository,
@@ -1263,8 +1375,12 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
                 && !state.show_help
                 && state.approvals.is_empty()
             {
-                state.editor.insert_str(&text);
-                state.set_status("Pasted text into the draft.");
+                if let Some(attachments) = clipboard::attachments_from_terminal_paste(&text) {
+                    state.insert_attachments(attachments);
+                } else {
+                    state.editor.insert_str(&text);
+                    state.set_status("Pasted text into the draft.");
+                }
             }
             Vec::new()
         }
@@ -1341,6 +1457,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.editor.insert_newline();
             Vec::new()
         }
+        Some(ControlAction::Paste) => {
+            paste_desktop_clipboard(state);
+            Vec::new()
+        }
         Some(ControlAction::OpenModelPicker) => state.open_model_picker(),
         Some(ControlAction::ScrollUp) => {
             state.scroll_active_chat(10);
@@ -1395,6 +1515,19 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             Vec::new()
         }
         Some(_) => Vec::new(),
+    }
+}
+
+fn paste_desktop_clipboard(state: &mut AppState) {
+    match clipboard::read_desktop() {
+        Ok(clipboard::ClipboardPayload::Attachments(attachments)) => {
+            state.insert_attachments(attachments);
+        }
+        Ok(clipboard::ClipboardPayload::Text(text)) => {
+            state.editor.insert_str(&text);
+            state.set_status("Pasted text into the draft.");
+        }
+        Err(error) => state.set_status(&format!("Could not paste: {error}")),
     }
 }
 
@@ -1613,14 +1746,9 @@ fn handle_settings_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         Some(ControlAction::Select) => return state.select_setting(),
         Some(ControlAction::Previous) => state.settings_move(-1),
         Some(ControlAction::Next) => state.settings_move(1),
-        Some(ControlAction::MoveLeft) => {
-            state.settings_cycle_backend(-1);
-            return state.save_web_settings();
-        }
-        Some(ControlAction::MoveRight) => {
-            state.settings_cycle_backend(1);
-            return state.save_web_settings();
-        }
+        Some(ControlAction::MoveLeft) => return state.settings_cycle_choice(-1),
+        Some(ControlAction::MoveRight) => return state.settings_cycle_choice(1),
+        Some(ControlAction::Clear) => return state.disable_vision_addon(),
         Some(ControlAction::Backspace) => state.settings_backspace(),
         None => {
             if let KeyCode::Char(character) = key.code
@@ -1840,6 +1968,10 @@ mod tests {
             web_config: std::sync::Arc::new(std::sync::RwLock::new(
                 crate::web::WebConfig::default(),
             )),
+            vision_config: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::vision::VisionConfig::default(),
+            )),
+            vision_service: None,
         };
 
         registry.observe_provider_event(
