@@ -60,50 +60,11 @@ async fn write_file(
     let path = resolve_workspace_path(workspace, required_string(arguments, "path")?)?;
     let content = required_string_allow_empty(arguments, "content")?;
     atomic_write(&path, content.as_bytes(), cancellation).await?;
-    let made_executable = make_shebang_file_executable(&path, content).await?;
     Ok(format!(
-        "wrote {} bytes to {}{}",
+        "wrote {} bytes to {}",
         content.len(),
-        path.display(),
-        if made_executable {
-            "\n[Notice: Made executable via chmod +x]"
-        } else {
-            ""
-        }
+        path.display()
     ))
-}
-
-#[cfg(unix)]
-async fn make_shebang_file_executable(
-    path: &std::path::Path,
-    content: &str,
-) -> Result<bool, String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if !content.starts_with("#!") {
-        return Ok(false);
-    }
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
-    let mut permissions = metadata.permissions();
-    let mode = permissions.mode();
-    if mode & 0o111 != 0 {
-        return Ok(false);
-    }
-    permissions.set_mode(mode | 0o111);
-    tokio::fs::set_permissions(path, permissions)
-        .await
-        .map_err(|error| format!("failed to make {} executable: {error}", path.display()))?;
-    Ok(true)
-}
-
-#[cfg(not(unix))]
-async fn make_shebang_file_executable(
-    _path: &std::path::Path,
-    _content: &str,
-) -> Result<bool, String> {
-    Ok(false)
 }
 
 pub(super) async fn atomic_write(
@@ -131,21 +92,22 @@ pub(super) async fn atomic_write(
         file.flush()
             .await
             .map_err(|error| format!("failed to flush temporary file: {error}"))?;
-        file.sync_all()
-            .await
-            .map_err(|error| format!("failed to sync temporary file: {error}"))?;
-        drop(file);
         if let Ok(metadata) = tokio::fs::metadata(path).await {
             tokio::fs::set_permissions(&temporary, metadata.permissions())
                 .await
                 .map_err(|error| format!("failed to preserve file permissions: {error}"))?;
         }
+        file.sync_all()
+            .await
+            .map_err(|error| format!("failed to sync temporary file: {error}"))?;
+        drop(file);
         if cancellation.is_cancelled() {
             return Err("write interrupted".to_owned());
         }
         tokio::fs::rename(&temporary, &path)
             .await
             .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
+        sync_parent_directory(parent).await?;
         Ok(())
     }
     .await;
@@ -155,9 +117,79 @@ pub(super) async fn atomic_write(
     operation
 }
 
+#[cfg(unix)]
+async fn sync_parent_directory(parent: &std::path::Path) -> Result<(), String> {
+    let parent = parent.to_owned();
+    tokio::task::spawn_blocking(move || {
+        std::fs::File::open(&parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("failed to sync directory {}: {error}", parent.display()))
+    })
+    .await
+    .map_err(|error| format!("directory sync task failed: {error}"))?
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_parent: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn required_string_allow_empty<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
     arguments
         .get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing string argument {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shebang_does_not_implicitly_make_new_file_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        super::write_file(
+            workspace.path(),
+            &json!({"path": "script.sh", "content": "#!/bin/sh\necho ok\n"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("write script");
+
+        let mode = std::fs::metadata(workspace.path().join("script.sh"))
+            .expect("script metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("script.sh");
+        std::fs::write(&path, "old").expect("fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750))
+            .expect("fixture permissions");
+
+        super::write_file(
+            workspace.path(),
+            &json!({"path": "script.sh", "content": "new"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("replace script");
+
+        let mode = std::fs::metadata(path)
+            .expect("script metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o750);
+    }
 }
