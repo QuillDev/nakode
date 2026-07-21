@@ -50,11 +50,15 @@ Install Nakode from the official QuillDev tap:
 brew install quilldev/tap/nakode
 ```
 
-Upgrade it later with:
+Update Nakode from the command line:
 
 ```sh
-brew upgrade nakode
+nakode update
 ```
+
+`nakode --update` is supported as a convenience alias. For a Homebrew
+installation, Nakode delegates the upgrade to Homebrew so the package manager
+remains authoritative.
 
 ### Build from source
 

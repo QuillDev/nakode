@@ -21,3 +21,4 @@ pub mod state;
 pub mod terminal;
 pub mod tools;
 pub mod transcript;
+pub mod update;
