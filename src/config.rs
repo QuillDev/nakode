@@ -13,6 +13,11 @@ use thiserror::Error;
 pub struct Config {
     #[command(subcommand)]
     pub command: Option<NakodeCommand>,
+
+    /// Update this installation through its package manager.
+    #[arg(long)]
+    pub update: bool,
+
     /// Workspace made available to enabled providers.
     #[arg(long, env = "NAKODE_WORKSPACE", default_value = ".")]
     pub workspace: PathBuf,
@@ -79,6 +84,8 @@ impl OpenAiReasoningEffort {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum NakodeCommand {
+    /// Update this installation through its package manager.
+    Update,
     /// Invoke a predefined agent through the running Nakode control service.
     Agent {
         agent_slug: String,
@@ -116,6 +123,8 @@ pub enum ConfigError {
     },
     #[error("model must use the provider/model form: {0}")]
     InvalidModel(String),
+    #[error("--update cannot be combined with another command")]
+    UpdateWithCommand,
 }
 
 impl Config {
@@ -170,6 +179,12 @@ impl Config {
     ///
     /// Returns an error when the workspace or initial model is invalid.
     pub fn validated(mut self) -> Result<Self, ConfigError> {
+        if self.update && self.command.is_some() {
+            return Err(ConfigError::UpdateWithCommand);
+        }
+        if self.update || matches!(self.command.as_ref(), Some(NakodeCommand::Update)) {
+            return Ok(self);
+        }
         if !self.workspace.exists() {
             return Err(ConfigError::MissingWorkspace(self.workspace));
         }
@@ -312,6 +327,23 @@ mod tests {
             }) if agent_slug == "reviewer" && session_id == "session-7" && task == "Review auth"
         ));
         assert!(Config::try_parse_from(["nakode", "agent", "explorer"]).is_err());
+    }
+
+    #[test]
+    fn update_command_and_flag_are_supported() {
+        let command = Config::try_parse_from(["nakode", "update"]).expect("update command");
+        assert!(matches!(command.command, Some(NakodeCommand::Update)));
+
+        let flag = Config::try_parse_from(["nakode", "--update"]).expect("update flag");
+        assert!(flag.update);
+
+        let combined = Config::try_parse_from(["nakode", "--update", "service", "run"])
+            .expect("syntactically valid command")
+            .validated();
+        assert!(matches!(
+            combined,
+            Err(super::ConfigError::UpdateWithCommand)
+        ));
     }
 
     #[test]
