@@ -31,14 +31,16 @@ Nakode currently supports:
 
 - **OpenAI Codex**
 - **Devin**
+- **Cursor**
 
 Providers are disabled on a fresh installation. Start Nakode, open
 `/providers`, and sign in to the providers you want to use. Press `F2` to browse
 and select from their available models.
 
-Nakode does not require the separate Codex or Devin applications. Additional
-providers are planned, and no single provider defines Nakode's workflow or
-session model.
+Nakode does not require the separate Codex or Devin applications. Cursor uses
+its local TypeScript SDK and requires Node.js 22.13 or newer plus npm. Cursor
+setup in `/providers` includes an API-key field and a link to the Cursor API-key
+dashboard. No single provider defines Nakode's workflow or session model.
 
 ## Installation
 

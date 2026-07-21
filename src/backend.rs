@@ -7,6 +7,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 pub const CODEX_PROVIDER: &str = "openai-codex";
 pub const DEVIN_PROVIDER: &str = "devin-acp";
+pub const CURSOR_PROVIDER: &str = "cursor-sdk";
 
 /// Features declared by the active provider adapter.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -436,6 +437,8 @@ pub enum BackendError {
     },
     #[error("stored credential for {provider} is invalid: {detail}")]
     InvalidCredential { provider: String, detail: String },
+    #[error("failed to prepare {provider} SDK bridge: {detail}")]
+    BridgeSetup { provider: String, detail: String },
 }
 
 /// Running provider adapter with a uniform command/event boundary.

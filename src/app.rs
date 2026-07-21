@@ -17,7 +17,7 @@ use crate::{
     config::Config,
     control::{AgentResponse, ControlError, ControlServer, IncomingInvocation},
     controls::{self, ControlAction, ControlContext},
-    devin, render,
+    cursor, devin, render,
     selection::ScreenPoint,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
     state::{AppState, ApprovalDecision, Effect},
@@ -124,6 +124,14 @@ impl BackendRegistry {
                 )
                 .await?
             }
+            crate::backend::CURSOR_PROVIDER => {
+                let credential = self.provider_credentials.get(provider).cloned();
+                cursor::spawn(
+                    cursor::BackendConfig::native(self.config.workspace.clone())
+                        .with_credential(credential),
+                )
+                .await?
+            }
             crate::backend::DEVIN_PROVIDER => {
                 let credential = self.provider_credentials.get(provider).cloned();
                 devin::spawn(
@@ -198,6 +206,14 @@ impl BackendRegistry {
                             self.config.compaction_threshold_percent,
                         ))
                         .with_session_database(self.session_database.clone()),
+                )
+                .await?
+            }
+            crate::backend::CURSOR_PROVIDER => {
+                let credential = self.provider_credentials.get(provider).cloned();
+                cursor::spawn(
+                    cursor::BackendConfig::native(self.config.workspace.clone())
+                        .with_credential(credential),
                 )
                 .await?
             }
@@ -1058,7 +1074,9 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
         }
         Event::Paste(text) => {
             state.clear_text_selection();
-            if state
+            if state.provider_api_key_input_active() {
+                state.provider_api_key_insert_str(&text);
+            } else if state
                 .agent_picker
                 .as_ref()
                 .is_some_and(|picker| picker.editor.is_some())
@@ -1084,6 +1102,12 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
             {
                 state.clear_text_selection();
                 return vec![Effect::OpenUrl(url)];
+            }
+            if action == controls::MouseAction::PrimaryDown
+                && state.focus_provider_api_key_at(point)
+            {
+                state.clear_text_selection();
+                return Vec::new();
             }
             if action == controls::MouseAction::PrimaryDown && state.toggle_tool_at(point) {
                 return Vec::new();
@@ -1373,22 +1397,34 @@ fn handle_provider_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect
         .provider_picker
         .as_ref()
         .is_some_and(|picker| picker.showing_details);
-    let context = if showing_details {
+    let api_key_input = state.provider_api_key_input_active();
+    let context = if api_key_input {
+        ControlContext::ProviderCredential
+    } else if showing_details {
         ControlContext::ProviderDetails
     } else {
         ControlContext::ProviderList
     };
     match controls::resolve(context, key) {
         Some(ControlAction::Close) => {
-            if !state.close_provider_details() {
+            if !state.cancel_provider_api_key_input() && !state.close_provider_details() {
                 state.close_provider_picker();
             }
             Vec::new()
         }
+        Some(ControlAction::Backspace) if api_key_input => {
+            state.provider_api_key_backspace();
+            Vec::new()
+        }
+        Some(ControlAction::Submit) if api_key_input => state.submit_provider_api_key(),
         Some(ControlAction::OpenUrl) => state.open_provider_authentication_url(),
         Some(ControlAction::CopyUrl) => state.copy_provider_authentication_url(),
         Some(ControlAction::Logout) => state.logout_provider(),
         Some(ControlAction::Toggle) => state.toggle_provider(),
+        Some(ControlAction::Focus) => {
+            state.focus_provider_api_key();
+            Vec::new()
+        }
         Some(ControlAction::Open) => {
             state.open_provider_details();
             Vec::new()
@@ -1399,6 +1435,16 @@ fn handle_provider_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect
         }
         Some(ControlAction::Next) => {
             state.provider_picker_move(1);
+            Vec::new()
+        }
+        None if api_key_input => {
+            if let KeyCode::Char(character) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                state.provider_api_key_insert_str(&character.to_string());
+            }
             Vec::new()
         }
         _ => Vec::new(),
@@ -1513,10 +1559,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use crate::{
-        backend::{BackendEvent, CODEX_PROVIDER, CapabilitySupport, TurnOutcome},
+        backend::{BackendEvent, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, TurnOutcome},
         render,
         session::ProviderRecord,
-        state::{ActiveTurn, AgentRequest, AppState},
+        state::{ActiveTurn, AgentRequest, AppState, Effect},
         transcript::{EntryKind, EntryStatus},
     };
 
@@ -2093,6 +2139,48 @@ mod tests {
         state.editor.set_text("please(/sk");
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(state.editor.text(), "please(/skill:");
+    }
+
+    #[test]
+    fn cursor_provider_accepts_pasted_api_key_and_submits_it() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("/providers");
+        let _ = state.submit_editor();
+        state.install_providers(vec![ProviderRecord {
+            provider: CURSOR_PROVIDER.to_owned(),
+            display_name: "Cursor".to_owned(),
+            enabled: false,
+            credential: None,
+        }]);
+        state.open_provider_details();
+
+        let open = super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            open.as_slice(),
+            [Effect::OpenUrl(url)] if url == "https://cursor.com/dashboard/api"
+        ));
+        let _ = super::handle_terminal_event(
+            &mut state,
+            Event::Paste("ignored-before-focus".to_owned()),
+        );
+        assert!(!state.provider_api_key_input_active());
+        let _ = super::handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(state.provider_api_key_input_active());
+        let _ =
+            super::handle_terminal_event(&mut state, Event::Paste("cursor-pasted-key".to_owned()));
+        let effects = super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SaveProviderCredential { provider, metadata, .. }]
+                if provider == CURSOR_PROVIDER
+                    && metadata == &serde_json::json!({"api_key":"cursor-pasted-key"})
+        ));
     }
 
     #[test]

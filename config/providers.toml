@@ -3,5 +3,9 @@ slug = "openai-codex"
 display_name = "Codex"
 
 [[providers]]
+slug = "cursor-sdk"
+display_name = "Cursor"
+
+[[providers]]
 slug = "devin-acp"
 display_name = "Devin"
