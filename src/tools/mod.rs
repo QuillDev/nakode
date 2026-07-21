@@ -1,5 +1,6 @@
 mod ask;
 mod bash;
+mod browser;
 mod edit;
 mod eval;
 mod glob;
@@ -67,6 +68,9 @@ impl ToolResult {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     fn summarize(&self, arguments: &Value) -> String;
+    fn available(&self) -> bool {
+        true
+    }
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::Exclusive
     }
@@ -102,8 +106,18 @@ impl ToolRegistry {
     }
 
     #[must_use]
+    pub fn with_browser(mut self, config: Arc<std::sync::RwLock<crate::web::WebConfig>>) -> Self {
+        self.tools.push(Arc::new(browser::BrowserTool::new(config)));
+        self
+    }
+
+    #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.iter().map(|tool| tool.definition()).collect()
+        self.tools
+            .iter()
+            .filter(|tool| tool.available())
+            .map(|tool| tool.definition())
+            .collect()
     }
 
     #[must_use]
@@ -254,6 +268,8 @@ fn ceil_char_boundary(value: &str, mut index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, RwLock};
+
     use serde_json::{Value, json};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -262,7 +278,31 @@ mod tests {
         MAX_MODEL_TOOL_OUTPUT_BYTES, ToolContext, ToolRegistry, ToolResult, model_facing_output,
         resolve_workspace_path,
     };
-    use crate::runtime::{QuestionBroker, RuntimeSession};
+    use crate::{
+        runtime::{QuestionBroker, RuntimeSession},
+        web::{WebBackend, WebConfig},
+    };
+
+    #[test]
+    fn browser_tool_tracks_optional_backend_enablement() {
+        let config = Arc::new(RwLock::new(WebConfig::default()));
+        let registry = ToolRegistry::base().with_browser(Arc::clone(&config));
+        assert!(registry.find("browser").is_some());
+        assert!(
+            registry
+                .definitions()
+                .iter()
+                .all(|tool| tool.name != "browser")
+        );
+
+        config.write().expect("web config").backend = WebBackend::AgentBrowser;
+        assert!(
+            registry
+                .definitions()
+                .iter()
+                .any(|tool| tool.name == "browser")
+        );
+    }
 
     #[test]
     fn base_registry_contains_only_the_requested_tools() {

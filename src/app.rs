@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -24,7 +25,7 @@ use crate::{
     selection::ScreenPoint,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
     skill::{SkillCatalog, SkillCatalogError},
-    state::{AppState, ApprovalDecision, Effect},
+    state::{AgentBrowserStatus, AppState, ApprovalDecision, Effect},
     terminal::{TerminalSession, Tui},
 };
 
@@ -66,6 +67,7 @@ struct BackendRegistry {
     session_database: PathBuf,
     provider_credentials: HashMap<String, serde_json::Value>,
     provider_cooldowns: HashMap<String, ProviderCooldown>,
+    web_config: Arc<RwLock<crate::web::WebConfig>>,
 }
 
 struct PersistenceServices<'a> {
@@ -81,11 +83,19 @@ struct ProviderCooldown {
 const PROVIDER_FATAL_ERROR_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 impl BackendRegistry {
+    fn current_web_config(&self) -> crate::web::WebConfig {
+        self.web_config.read().map_or_else(
+            |_| crate::web::WebConfig::default(),
+            |config| config.clone(),
+        )
+    }
+
     async fn spawn(
         config: &Config,
         providers: &[ProviderRecord],
         session_database: PathBuf,
         provider_credentials: HashMap<String, serde_json::Value>,
+        web_config: Arc<RwLock<crate::web::WebConfig>>,
     ) -> Self {
         let (event_tx, events) = mpsc::channel(512);
         let mut registry = Self {
@@ -100,6 +110,7 @@ impl BackendRegistry {
             session_database,
             provider_credentials,
             provider_cooldowns: HashMap::new(),
+            web_config,
         };
         for provider in providers.iter().filter(|provider| provider.enabled) {
             if let Err(error) = registry.start_provider(&provider.provider).await {
@@ -126,7 +137,8 @@ impl BackendRegistry {
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
-                        .with_session_database(self.session_database.clone()),
+                        .with_session_database(self.session_database.clone())
+                        .with_web_config(Arc::clone(&self.web_config)),
                 )
                 .await?
             }
@@ -146,7 +158,8 @@ impl BackendRegistry {
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
-                        .with_session_database(self.session_database.clone()),
+                        .with_session_database(self.session_database.clone())
+                        .with_web_config(Arc::clone(&self.web_config)),
                 )
                 .await?
             }
@@ -211,7 +224,8 @@ impl BackendRegistry {
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
-                        .with_session_database(self.session_database.clone()),
+                        .with_session_database(self.session_database.clone())
+                        .with_web_config(Arc::clone(&self.web_config)),
                 )
                 .await?
             }
@@ -231,7 +245,8 @@ impl BackendRegistry {
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
-                        .with_session_database(self.session_database.clone()),
+                        .with_session_database(self.session_database.clone())
+                        .with_web_config(Arc::clone(&self.web_config)),
                 )
                 .await?
             }
@@ -481,6 +496,7 @@ fn initial_state(
             active_name,
         )
     };
+    state.install_web_config(backends.current_web_config());
     state.install_agents(agents);
     state.install_skills(skills);
     state.set_agent_directory(config.agents.clone());
@@ -502,11 +518,13 @@ async fn start_backends(
     let providers = sessions.list_providers()?;
     let (provider_credentials, credential_failures) =
         load_provider_credentials(&providers, credentials);
+    let web_config = shared_web_config(sessions)?;
     let mut backends = BackendRegistry::spawn(
         config,
         &providers,
         sessions.database_path().to_path_buf(),
         provider_credentials,
+        web_config,
     )
     .await;
     backends.failures.extend(credential_failures);
@@ -548,6 +566,14 @@ async fn start_tui_control(
             Err(error)
         }
     }
+}
+
+fn shared_web_config(
+    sessions: &dyn SessionRepository,
+) -> Result<Arc<RwLock<crate::web::WebConfig>>, SessionError> {
+    sessions
+        .load_web_config()
+        .map(|config| Arc::new(RwLock::new(config)))
 }
 
 fn print_resume_hint(executable: &Path, state: &AppState) -> io::Result<()> {
@@ -737,9 +763,7 @@ async fn apply_effects(
     let mut pending = std::collections::VecDeque::from(effects);
     while let Some(effect) = pending.pop_front() {
         match effect {
-            Effect::Backend(command) => {
-                send_backend_command(state, backends, command).await;
-            }
+            Effect::Backend(command) => send_backend_command(state, backends, command).await,
             Effect::SpawnSubagent { run_id, provider } => {
                 spawn_subagent(state, backends, &mut pending, &run_id, &provider).await;
             }
@@ -822,27 +846,14 @@ async fn apply_effects(
                 update_session_model(state, sessions, &session_id, model.as_deref());
             }
             Effect::TouchSession(id) => touch_session(state, sessions, &id),
+            Effect::SaveWebConfig(config) => {
+                save_web_config_effect(state, backends, sessions, config);
+            }
+            Effect::CheckAgentBrowser => check_agent_browser(state).await,
             Effect::Quit => quit = true,
         }
     }
     quit
-}
-
-fn update_session_model(
-    state: &mut AppState,
-    sessions: &dyn SessionRepository,
-    session_id: &str,
-    model: Option<&str>,
-) {
-    if let Err(error) = sessions.update_model(session_id, model) {
-        state.session_store_failed(error.to_string());
-    }
-}
-
-fn touch_session(state: &mut AppState, sessions: &dyn SessionRepository, id: &str) {
-    if let Err(error) = sessions.touch(id) {
-        state.session_store_failed(error.to_string());
-    }
 }
 
 fn persist_session(
@@ -1160,6 +1171,43 @@ fn install_changed_agent_catalog(
     }
 }
 
+fn touch_session(state: &mut AppState, sessions: &dyn SessionRepository, id: &str) {
+    if let Err(error) = sessions.touch(id) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
+fn update_session_model(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    id: &str,
+    model: Option<&str>,
+) {
+    if let Err(error) = sessions.update_model(id, model) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
+fn save_web_config_effect(
+    state: &mut AppState,
+    backends: &BackendRegistry,
+    sessions: &dyn SessionRepository,
+    config: crate::web::WebConfig,
+) {
+    if let Err(error) = sessions.save_web_config(&config) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    let Ok(mut shared) = backends.web_config.write() else {
+        state.session_store_failed("browser settings lock is unavailable".to_owned());
+        return;
+    };
+    *shared = config.clone();
+    drop(shared);
+    state.install_web_config(config);
+    state.set_status("Browser add-on settings saved.");
+}
+
 fn persist_subagent(
     state: &mut AppState,
     sessions: &dyn SessionRepository,
@@ -1204,6 +1252,10 @@ fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
                 .is_some_and(|picker| picker.editor.is_some())
             {
                 state.agent_editor_insert_str(&text);
+            } else if state.settings.is_some() {
+                for character in text.chars() {
+                    state.settings_insert(character);
+                }
             } else if state.model_picker.is_none()
                 && state.session_picker.is_none()
                 && state.provider_picker.is_none()
@@ -1413,8 +1465,13 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
         state.model_picker = None;
         state.session_picker = None;
         state.agent_picker = None;
+        state.settings = None;
         state.show_help = true;
         return Some(Vec::new());
+    }
+
+    if state.settings.is_some() {
+        return Some(handle_settings_key(state, key));
     }
 
     if state.agent_picker.is_some() {
@@ -1513,6 +1570,70 @@ fn handle_question_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         _ => Vec::new(),
     }
+}
+
+async fn check_agent_browser(state: &mut AppState) {
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("agent-browser")
+            .arg("--version")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let status = match result {
+        Ok(Ok(output)) if output.status.success() => {
+            let text = if output.stdout.is_empty() {
+                &output.stderr
+            } else {
+                &output.stdout
+            };
+            let version = String::from_utf8_lossy(text)
+                .lines()
+                .next()
+                .unwrap_or("installed")
+                .trim()
+                .chars()
+                .take(80)
+                .collect::<String>();
+            AgentBrowserStatus::Available(if version.is_empty() {
+                "installed".to_owned()
+            } else {
+                version
+            })
+        }
+        _ => AgentBrowserStatus::Unavailable,
+    };
+    state.set_agent_browser_status(status);
+}
+
+fn handle_settings_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    match controls::resolve(ControlContext::Settings, key) {
+        Some(ControlAction::Close) => return state.settings_back(),
+        Some(ControlAction::Select) => return state.select_setting(),
+        Some(ControlAction::Previous) => state.settings_move(-1),
+        Some(ControlAction::Next) => state.settings_move(1),
+        Some(ControlAction::MoveLeft) => {
+            state.settings_cycle_backend(-1);
+            return state.save_web_settings();
+        }
+        Some(ControlAction::MoveRight) => {
+            state.settings_cycle_backend(1);
+            return state.save_web_settings();
+        }
+        Some(ControlAction::Backspace) => state.settings_backspace(),
+        None => {
+            if let KeyCode::Char(character) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER)
+            {
+                state.settings_insert(character);
+            }
+        }
+        Some(_) => {}
+    }
+    Vec::new()
 }
 
 fn handle_provider_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
@@ -1716,6 +1837,9 @@ mod tests {
             session_database: directory.path().join("sessions.sqlite3"),
             provider_credentials: HashMap::new(),
             provider_cooldowns: HashMap::new(),
+            web_config: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::web::WebConfig::default(),
+            )),
         };
 
         registry.observe_provider_event(

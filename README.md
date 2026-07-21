@@ -84,8 +84,26 @@ Open a project workspace:
 nakode --workspace /path/to/project
 ```
 
-Then use `/providers` to connect a provider and `F2` to choose a model. Press
-`F1` at any time for the complete control reference.
+Then use `/settings` to manage general preferences, agents, models, providers,
+and optional add-ons. The settings menu is searchable. `/providers`, `/agents`,
+and `/models` remain available as direct shortcuts.
+
+## Optional web browsing
+
+Nakode's portable runtime can expose a `browser` tool when a browser add-on is
+enabled under `/settings` → **Add-ons** → **Web browsing**. Browsing is disabled by default and
+neither backend is required to run Nakode:
+
+- **agent-browser** runs the optional open-source `agent-browser` executable on
+  the local machine. Install and configure it separately, then select it in
+  Nakode. If the executable is missing, only browser calls fail.
+- **Firecrawl** uses Firecrawl's hosted search and scrape API. Select Firecrawl
+  and enter an API key in settings. The key is stored in Nakode's protected
+  local application database.
+
+Changes apply to the portable browser tool without restarting Nakode. Provider
+or tool functionality unrelated to web browsing remains available when either
+add-on is absent or disabled.
 
 ## Skills
 

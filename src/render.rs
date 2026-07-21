@@ -97,6 +97,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         || state.session_picker.is_some()
         || state.provider_picker.is_some()
         || state.agent_picker.is_some()
+        || state.settings.is_some()
         || state.model_picker.is_some()
         || state.subagent_modal.is_some();
     if !has_modal {
@@ -113,6 +114,8 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         render_session_picker(frame, area, state);
     } else if state.provider_picker.is_some() {
         render_provider_picker(frame, area, state);
+    } else if state.settings.is_some() {
+        render_settings(frame, area, state);
     } else if state.agent_picker.is_some() {
         render_agent_picker(frame, area, state);
     } else if state.model_picker.is_some() {
@@ -133,6 +136,8 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
         vec![bordered_inner(centered(area, 78, 18))]
     } else if state.provider_picker.is_some() {
         vec![bordered_inner(provider_picker_popup(area, state))]
+    } else if state.settings.is_some() {
+        vec![bordered_inner(centered(area, 76, 22))]
     } else if state.agent_picker.is_some() {
         vec![bordered_inner(centered(area, 82, 24))]
     } else if state.model_picker.is_some() {
@@ -703,6 +708,173 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Clear, popup);
     let block = overlay_block(" Help ", ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let popup = centered(area, 76, 22);
+    frame.render_widget(Clear, popup);
+    let settings = state.settings.as_ref().expect("settings checked");
+    let lines = match settings.view {
+        crate::state::SettingsView::Menu => settings_menu_lines(settings),
+        crate::state::SettingsView::Addons => settings_addon_lines(settings),
+        crate::state::SettingsView::WebBrowsing => settings_web_browsing_lines(settings),
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(overlay_block(" Settings ", ACCENT)),
+        popup,
+    );
+}
+
+fn settings_menu_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(MUTED)),
+            Span::styled(settings.query.clone(), Style::default().fg(TEXT)),
+        ]),
+        Line::default(),
+    ];
+    let sections = settings.filtered_sections();
+    for (index, section) in sections.iter().enumerate() {
+        let selected = index == settings.selected;
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(if selected { ACCENT } else { MUTED }),
+                ),
+                Span::styled(
+                    format!("{:<12}", section.label()),
+                    Style::default()
+                        .fg(if selected { TEXT } else { MUTED })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(section.description(), Style::default().fg(MUTED)),
+            ])
+            .style(Style::default().bg(if selected {
+                SURFACE_RAISED
+            } else {
+                SURFACE
+            })),
+        );
+    }
+    if sections.is_empty() {
+        lines.push(Line::styled(
+            "  No matching settings",
+            Style::default().fg(DANGER),
+        ));
+    }
+    lines.extend([
+        Line::default(),
+        Line::styled(
+            "Type to search · ↑/↓ select · Enter open · Esc close",
+            Style::default().fg(MUTED),
+        ),
+    ]);
+    lines
+}
+
+fn settings_addon_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+    vec![
+        Line::styled("Add-ons", Style::default().fg(TEXT).bold()),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("› ", Style::default().fg(ACCENT)),
+            Span::styled("Web browsing", Style::default().fg(TEXT).bold()),
+            Span::styled(
+                format!("  {}", settings.web.backend.label()),
+                Style::default().fg(MUTED),
+            ),
+        ])
+        .style(Style::default().bg(SURFACE_RAISED)),
+        Line::default(),
+        Line::styled("Enter open · Esc back", Style::default().fg(MUTED)),
+    ]
+}
+
+fn settings_web_browsing_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled("Web browsing", Style::default().fg(TEXT).bold()),
+        Line::default(),
+        settings_row(
+            "Backend",
+            settings.web.backend.label(),
+            settings.addon_field == 0,
+        ),
+        Line::default(),
+    ];
+    match settings.web.backend {
+        crate::web::WebBackend::Disabled => {
+            lines.push(settings_status_row("Status", "Disabled", MUTED));
+        }
+        crate::web::WebBackend::AgentBrowser => {
+            let (status, color) = match &settings.agent_browser_status {
+                crate::state::AgentBrowserStatus::Checking => ("Checking…".to_owned(), MUTED),
+                crate::state::AgentBrowserStatus::Available(version) => {
+                    (format!("Available · {version}"), SUCCESS)
+                }
+                crate::state::AgentBrowserStatus::Unavailable => {
+                    ("Not detected".to_owned(), WARNING)
+                }
+            };
+            lines.push(settings_status_row("Status", &status, color));
+            lines.push(settings_status_row(
+                "Requirement",
+                "agent-browser executable on PATH",
+                MUTED,
+            ));
+        }
+        crate::web::WebBackend::Firecrawl => {
+            let masked = if settings.web.firecrawl_api_key.is_empty() {
+                "not set".to_owned()
+            } else {
+                "•".repeat(settings.web.firecrawl_api_key.chars().count().min(32))
+            };
+            lines.push(settings_row("API key", &masked, settings.addon_field == 1));
+            let (status, color) = if settings.web.firecrawl_api_key.is_empty() {
+                ("Setup required", WARNING)
+            } else {
+                ("Configured", SUCCESS)
+            };
+            lines.push(settings_status_row("Status", status, color));
+        }
+    }
+    lines.extend([
+        Line::default(),
+        Line::styled(
+            "Enter toggle · ↑/↓ field · Esc back",
+            Style::default().fg(MUTED),
+        ),
+    ]);
+    lines
+}
+
+fn settings_status_row(label: &str, value: &str, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(format!("{label:<18}"), Style::default().fg(MUTED)),
+        Span::styled(value.to_owned(), Style::default().fg(color)),
+    ])
+}
+
+fn settings_row(label: &str, value: &str, selected: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            if selected { "› " } else { "  " },
+            Style::default().fg(ACCENT),
+        ),
+        Span::styled(format!("{label:<18}"), Style::default().fg(MUTED)),
+        Span::styled(
+            value.to_owned(),
+            Style::default()
+                .fg(if selected { TEXT } else { MUTED })
+                .bold(),
+        ),
+    ])
+    .style(Style::default().bg(if selected { SURFACE_RAISED } else { SURFACE }))
 }
 
 fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
