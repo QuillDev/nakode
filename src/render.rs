@@ -700,6 +700,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
 
 fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     state.set_oauth_link_hit_region(None);
+    state.set_api_key_input_hit_region(None);
     let picker = state.provider_picker.as_ref().expect("picker checked");
     if picker.showing_details {
         let picker = picker.clone();
@@ -939,42 +940,33 @@ fn render_provider_details(
                 }),
             ),
         ]),
-        Line::default(),
-        Line::styled("Capabilities", Style::default().fg(ACCENT_BRIGHT).bold()),
     ];
-    if let Some(capabilities) = state.provider_capabilities(&provider.provider) {
-        for (name, support) in capability_rows(capabilities) {
-            let supported = support.is_supported();
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {name:<22}"), Style::default().fg(MUTED)),
-                Span::styled(
-                    if supported {
-                        "supported"
-                    } else {
-                        "unsupported"
-                    },
-                    Style::default().fg(if supported { SUCCESS } else { MUTED }),
-                ),
-            ]));
-        }
-    } else {
-        lines.push(Line::styled(
-            "  Unavailable until this provider is started.",
-            Style::default().fg(MUTED),
-        ));
-    }
+    append_provider_capabilities(&mut lines, state, provider);
+    let mut api_key_input_line = None;
     let authentication_url_line = if let Some(authentication) = &picker.authentication {
         let first_line = lines.len();
         append_provider_authentication(&mut lines, authentication);
+        if matches!(
+            authentication,
+            crate::state::ProviderAuthentication::ApiKeyInput { .. }
+        ) {
+            api_key_input_line = Some(first_line + 2);
+        }
         matches!(
             authentication,
             crate::state::ProviderAuthentication::Challenge { .. }
+                | crate::state::ProviderAuthentication::ApiKeyInput { .. }
         )
         .then_some(first_line + 1)
     } else {
         None
     };
-    append_provider_actions(&mut lines, provider.credential.is_some());
+    if !matches!(
+        picker.authentication,
+        Some(crate::state::ProviderAuthentication::ApiKeyInput { .. })
+    ) {
+        append_provider_actions(&mut lines, provider.credential.is_some());
+    }
     let block = overlay_block(format!(" {} ", provider.display_name), ACCENT);
     frame.render_widget(
         Paragraph::new(lines)
@@ -988,6 +980,53 @@ fn render_provider_details(
         authentication_url_line,
         picker.authentication.as_ref(),
     );
+    register_api_key_input(state, popup, api_key_input_line);
+}
+
+fn append_provider_capabilities(
+    lines: &mut Vec<Line<'_>>,
+    state: &AppState,
+    provider: &crate::session::ProviderRecord,
+) {
+    if provider.credential.is_none() {
+        return;
+    }
+    let Some(capabilities) = state.provider_capabilities(&provider.provider) else {
+        return;
+    };
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "Capabilities",
+        Style::default().fg(ACCENT_BRIGHT).bold(),
+    ));
+    for (name, support) in capability_rows(capabilities) {
+        let supported = support.is_supported();
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {name:<22}"), Style::default().fg(MUTED)),
+            Span::styled(
+                if supported {
+                    "supported"
+                } else {
+                    "unsupported"
+                },
+                Style::default().fg(if supported { SUCCESS } else { MUTED }),
+            ),
+        ]));
+    }
+}
+
+fn register_api_key_input(state: &mut AppState, popup: Rect, line: Option<usize>) {
+    let Some(line) = line else {
+        return;
+    };
+    let row = popup
+        .y
+        .saturating_add(1)
+        .saturating_add(u16::try_from(line).unwrap_or(u16::MAX));
+    state.set_api_key_input_hit_region(Some((
+        ScreenPoint::new(popup.x.saturating_add(1), row),
+        ScreenPoint::new(popup.right().saturating_sub(1), row.saturating_add(1)),
+    )));
 }
 
 fn append_provider_actions(lines: &mut Vec<Line<'_>>, has_credential: bool) {
@@ -1021,6 +1060,20 @@ fn register_oauth_link(
         }),
     ) = (line, authentication)
     else {
+        if matches!(
+            authentication,
+            Some(crate::state::ProviderAuthentication::ApiKeyInput { .. })
+        ) {
+            let row = popup
+                .y
+                .saturating_add(1)
+                .saturating_add(u16::try_from(line.unwrap_or_default()).unwrap_or(u16::MAX));
+            state.set_oauth_link_hit_region(Some((
+                "https://cursor.com/dashboard/api".to_owned(),
+                ScreenPoint::new(popup.x.saturating_add(1), row),
+                ScreenPoint::new(popup.right().saturating_sub(1), row.saturating_add(1)),
+            )));
+        }
         return;
     };
     let row = popup
@@ -1041,9 +1094,38 @@ fn append_provider_authentication<'a>(
     lines.push(Line::default());
     match authentication {
         crate::state::ProviderAuthentication::Starting => lines.push(Line::styled(
-            "Starting provider authentication…",
+            "Saving or starting provider authentication…",
             Style::default().fg(WARNING),
         )),
+        crate::state::ProviderAuthentication::ApiKeyInput { value, focused } => {
+            lines.push(Line::styled(
+                "[o] Get API key ↗",
+                Style::default()
+                    .fg(ACCENT_BRIGHT)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ));
+            let masked = if value.is_empty() {
+                if *focused {
+                    " █".to_owned()
+                } else {
+                    " Add API key".to_owned()
+                }
+            } else {
+                format!(" {}█", "•".repeat(value.chars().count().min(48)))
+            };
+            lines.push(Line::from(vec![
+                Span::styled("API key  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    "[",
+                    Style::default().fg(if *focused { ACCENT_BRIGHT } else { MUTED }),
+                ),
+                Span::styled(masked, Style::default().fg(TEXT).bold()),
+                Span::styled(
+                    " ]",
+                    Style::default().fg(if *focused { ACCENT_BRIGHT } else { MUTED }),
+                ),
+            ]));
+        }
         crate::state::ProviderAuthentication::Challenge {
             verification_url,
             user_code,
@@ -1430,8 +1512,8 @@ mod tests {
 
     use crate::{
         backend::{
-            BackendCapabilities, BackendEvent, BackendIdentity, CODEX_PROVIDER, CapabilitySupport,
-            DEVIN_PROVIDER, TodoItem, TodoPhase, TodoStatus,
+            BackendCapabilities, BackendEvent, BackendIdentity, CODEX_PROVIDER, CURSOR_PROVIDER,
+            CapabilitySupport, DEVIN_PROVIDER, TodoItem, TodoPhase, TodoStatus,
         },
         session::ProviderRecord,
         state::{ActiveTurn, AgentRequest, AppState, ContextUsageState, Effect},
@@ -1874,6 +1956,64 @@ mod tests {
         assert!(details.contains("Resume"));
         assert!(details.contains("supported"));
         assert!(details.contains("[l] Log out and clear credentials"));
+    }
+
+    #[test]
+    fn cursor_api_key_input_is_masked_in_provider_details() {
+        let backend = TestBackend::new(100, 34);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("/providers");
+        let _ = state.submit_editor();
+        state.install_providers(vec![ProviderRecord {
+            provider: CURSOR_PROVIDER.to_owned(),
+            display_name: "Cursor".to_owned(),
+            enabled: false,
+            credential: None,
+        }]);
+        state.open_provider_details();
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render unfocused Cursor API key input");
+        let input_row = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .position(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains("Add API key")
+            })
+            .expect("API key input row");
+        assert!(!state.provider_api_key_input_active());
+        assert!(
+            state.focus_provider_api_key_at(crate::selection::ScreenPoint::new(
+                50,
+                u16::try_from(input_row).expect("input row fits")
+            ))
+        );
+        state.provider_api_key_insert_str("cursor-super-secret");
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render Cursor API key input");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Get API key"));
+        assert!(!rendered.contains("Paste or type"));
+        assert!(!rendered.contains("Enter save"));
+        assert!(!rendered.contains("Capabilities"));
+        assert!(!rendered.contains("Unavailable until"));
+        assert!(rendered.contains('•'));
+        assert!(!rendered.contains("cursor-super-secret"));
     }
 
     #[test]

@@ -298,6 +298,24 @@ When adding or changing a control:
 duplicate list in `src/render.rs`. Registry tests must continue rejecting
 ambiguous bindings within one context.
 
+## Interface language and affordances
+
+Prefer brief language and intuitive interaction over explanatory UI copy. The
+interface should communicate through layout, focus, labels, state, and familiar
+affordances rather than instructions.
+
+- Use short labels and compact contextual key hints, not prose.
+- Never use instructional sentences such as “Press X to continue.” If an action
+  requires that explanation, make its affordance or focus state clearer.
+- Reveal controls and information only when they become relevant. Hide
+  unavailable capabilities, implementation details, and premature setup text.
+- Make focus and selection visually obvious. Text entry must require deliberate
+  focus; typing or pasting must not target an unfocused field.
+- Do not explain routine behavior such as masking, persistence, editing, or
+  cancellation unless the user must make a consequential choice.
+- Prefer progressive disclosure. The default view contains only what is needed
+  for the next decision.
+
 ## Process and UI boundaries
 
 Keep these responsibilities separate:

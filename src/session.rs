@@ -1038,7 +1038,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteSessionRepository::open(directory.path().join("providers.db"))?;
         let providers = store.list_providers()?;
-        assert_eq!(providers.len(), 2);
+        assert_eq!(providers.len(), 3);
         assert!(providers.iter().all(|provider| !provider.enabled));
 
         assert!(matches!(

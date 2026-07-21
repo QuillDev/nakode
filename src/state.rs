@@ -136,13 +136,38 @@ pub struct ProviderPicker {
     pub authentication: Option<ProviderAuthentication>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ProviderAuthentication {
     Starting,
+    ApiKeyInput {
+        value: String,
+        focused: bool,
+    },
     Challenge {
         verification_url: String,
         user_code: String,
     },
+}
+
+impl std::fmt::Debug for ProviderAuthentication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Starting => formatter.write_str("Starting"),
+            Self::ApiKeyInput { value, focused } => formatter
+                .debug_struct("ApiKeyInput")
+                .field("characters", &value.chars().count())
+                .field("focused", focused)
+                .finish_non_exhaustive(),
+            Self::Challenge {
+                verification_url,
+                user_code,
+            } => formatter
+                .debug_struct("Challenge")
+                .field("verification_url", verification_url)
+                .field("user_code", user_code)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -372,6 +397,12 @@ struct OAuthLinkHitRegion {
     bottom_right: ScreenPoint,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ApiKeyInputHitRegion {
+    top_left: ScreenPoint,
+    bottom_right: ScreenPoint,
+}
+
 #[derive(Clone, Debug)]
 struct SubagentExecution {
     run: SubagentRun,
@@ -519,6 +550,7 @@ pub struct AppState {
     subagent_hit_regions: Vec<SubagentHitRegion>,
     tool_toggle_hit_regions: Vec<ToolToggleHitRegion>,
     oauth_link_hit_region: Option<OAuthLinkHitRegion>,
+    api_key_input_hit_region: Option<ApiKeyInputHitRegion>,
     transcript_limit: usize,
 }
 
@@ -623,6 +655,7 @@ impl AppState {
             subagent_hit_regions: Vec::new(),
             tool_toggle_hit_regions: Vec::new(),
             oauth_link_hit_region: None,
+            api_key_input_hit_region: None,
             transcript_limit: scrollback,
         }
     }
@@ -916,6 +949,37 @@ impl AppState {
             .map(|region| region.url.clone())
     }
 
+    pub fn set_api_key_input_hit_region(&mut self, region: Option<(ScreenPoint, ScreenPoint)>) {
+        self.api_key_input_hit_region =
+            region.map(|(top_left, bottom_right)| ApiKeyInputHitRegion {
+                top_left,
+                bottom_right,
+            });
+    }
+
+    pub fn focus_provider_api_key_at(&mut self, point: ScreenPoint) -> bool {
+        let contains = self.api_key_input_hit_region.is_some_and(|region| {
+            point.column >= region.top_left.column
+                && point.column < region.bottom_right.column
+                && point.row >= region.top_left.row
+                && point.row < region.bottom_right.row
+        });
+        contains && self.focus_provider_api_key()
+    }
+
+    pub fn focus_provider_api_key(&mut self) -> bool {
+        let Some(ProviderAuthentication::ApiKeyInput { focused, .. }) = self
+            .provider_picker
+            .as_mut()
+            .and_then(|picker| picker.authentication.as_mut())
+        else {
+            return false;
+        };
+        *focused = true;
+        self.set_status("Editing Cursor API key.");
+        true
+    }
+
     pub fn open_provider_authentication_url(&mut self) -> Vec<Effect> {
         let Some(url) = self.provider_authentication_url().map(str::to_owned) else {
             self.set_status("No provider authentication URL is available.");
@@ -942,6 +1006,7 @@ impl AppState {
             ProviderAuthentication::Challenge {
                 verification_url, ..
             } => Some(verification_url),
+            ProviderAuthentication::ApiKeyInput { .. } => Some("https://cursor.com/dashboard/api"),
             ProviderAuthentication::Starting => None,
         }
     }
@@ -1082,8 +1147,15 @@ impl AppState {
         let Some(picker) = &mut self.provider_picker else {
             return;
         };
-        if picker.providers.get(picker.selected).is_some() {
+        if let Some(provider) = picker.providers.get(picker.selected) {
             picker.showing_details = true;
+            if provider.provider == crate::backend::CURSOR_PROVIDER && provider.credential.is_none()
+            {
+                picker.authentication = Some(ProviderAuthentication::ApiKeyInput {
+                    value: String::new(),
+                    focused: false,
+                });
+            }
         }
     }
 
@@ -1095,6 +1167,12 @@ impl AppState {
             return false;
         }
         picker.showing_details = false;
+        if matches!(
+            picker.authentication,
+            Some(ProviderAuthentication::ApiKeyInput { .. })
+        ) {
+            picker.authentication = None;
+        }
         true
     }
 
@@ -1144,6 +1222,21 @@ impl AppState {
             return Vec::new();
         };
         if provider.credential.is_none() {
+            if provider.provider == crate::backend::CURSOR_PROVIDER {
+                match &mut picker.authentication {
+                    Some(ProviderAuthentication::ApiKeyInput { focused, .. }) => {
+                        *focused = true;
+                    }
+                    _ => {
+                        picker.authentication = Some(ProviderAuthentication::ApiKeyInput {
+                            value: String::new(),
+                            focused: true,
+                        });
+                    }
+                }
+                self.set_status("Enter your Cursor API key.");
+                return Vec::new();
+            }
             picker.authentication = Some(ProviderAuthentication::Starting);
             self.status_message = format!("Starting {} authentication…", provider.display_name);
             return vec![Effect::AuthenticateProvider(provider.provider.clone())];
@@ -1162,6 +1255,100 @@ impl AppState {
             provider: provider.provider.clone(),
             enabled: provider.enabled,
         }]
+    }
+
+    #[must_use]
+    pub fn provider_api_key_input_active(&self) -> bool {
+        self.provider_picker.as_ref().is_some_and(|picker| {
+            picker.showing_details
+                && matches!(
+                    picker.authentication,
+                    Some(ProviderAuthentication::ApiKeyInput { focused: true, .. })
+                )
+        })
+    }
+
+    pub fn provider_api_key_insert_str(&mut self, text: &str) {
+        let Some(ProviderAuthentication::ApiKeyInput {
+            value,
+            focused: true,
+        }) = self
+            .provider_picker
+            .as_mut()
+            .and_then(|picker| picker.authentication.as_mut())
+        else {
+            return;
+        };
+        let remaining = 4_096_usize.saturating_sub(value.chars().count());
+        value.extend(
+            text.chars()
+                .filter(|character| !character.is_control())
+                .take(remaining),
+        );
+        self.set_status("Editing Cursor API key.");
+    }
+
+    pub fn provider_api_key_backspace(&mut self) {
+        if let Some(ProviderAuthentication::ApiKeyInput {
+            value,
+            focused: true,
+        }) = self
+            .provider_picker
+            .as_mut()
+            .and_then(|picker| picker.authentication.as_mut())
+        {
+            value.pop();
+        }
+    }
+
+    pub fn submit_provider_api_key(&mut self) -> Vec<Effect> {
+        let Some(picker) = &mut self.provider_picker else {
+            return Vec::new();
+        };
+        let Some(provider) = picker.providers.get(picker.selected) else {
+            return Vec::new();
+        };
+        if provider.provider != crate::backend::CURSOR_PROVIDER {
+            return Vec::new();
+        }
+        let Some(ProviderAuthentication::ApiKeyInput {
+            value,
+            focused: true,
+        }) = &picker.authentication
+        else {
+            return Vec::new();
+        };
+        let api_key = value.trim().to_owned();
+        if api_key.is_empty() {
+            self.set_status("Cursor API key cannot be empty.");
+            return Vec::new();
+        }
+        let provider = provider.provider.clone();
+        picker.authentication = Some(ProviderAuthentication::Starting);
+        self.set_status("Saving Cursor API key…");
+        vec![Effect::SaveProviderCredential {
+            provider,
+            kind: "cursor_api_key".to_owned(),
+            metadata: serde_json::json!({"api_key": api_key}),
+        }]
+    }
+
+    pub fn cancel_provider_api_key_input(&mut self) -> bool {
+        let Some(picker) = &mut self.provider_picker else {
+            return false;
+        };
+        let Some(ProviderAuthentication::ApiKeyInput { value, focused }) =
+            &mut picker.authentication
+        else {
+            return false;
+        };
+        if !*focused {
+            return false;
+        }
+        value.clear();
+        *focused = false;
+        self.set_status("Cursor API key entry cancelled.");
+        true
     }
 
     pub fn logout_provider(&mut self) -> Vec<Effect> {
@@ -4215,10 +4402,10 @@ mod tests {
         agent::AgentCatalog,
         backend::{
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
-            BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, CompactionReason,
-            DEVIN_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem,
-            QuestionOption, QuestionRequest, SessionHistoryItem, TodoItem, TodoPhase, TodoStatus,
-            TurnOutcome,
+            BackendIdentity, BackendOperation, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport,
+            CompactionReason, DEVIN_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo,
+            NormalizedItem, QuestionOption, QuestionRequest, SessionHistoryItem, TodoItem,
+            TodoPhase, TodoStatus, TurnOutcome,
         },
         session::{SessionRecord, SubagentRecord},
         transcript::{EntryKind, EntryStatus, TranscriptEntry},
@@ -5925,6 +6112,60 @@ model = "openai-codex/model-a"
         ));
         assert!(state.close_provider_details());
         assert!(!state.close_provider_details());
+    }
+
+    #[test]
+    fn cursor_setup_collects_and_saves_an_api_key_without_starting_oauth() {
+        let mut state = ready_state();
+        state.editor.set_text("/providers");
+        let _ = state.submit_editor();
+        state.install_providers(vec![crate::session::ProviderRecord {
+            provider: CURSOR_PROVIDER.to_owned(),
+            display_name: "Cursor".to_owned(),
+            enabled: false,
+            credential: None,
+        }]);
+        state.open_provider_details();
+
+        assert!(!state.provider_api_key_input_active());
+        assert!(matches!(
+            state.open_provider_authentication_url().as_slice(),
+            [Effect::OpenUrl(url)] if url == "https://cursor.com/dashboard/api"
+        ));
+        assert!(state.toggle_provider().is_empty());
+        assert!(state.provider_api_key_input_active());
+        state.provider_api_key_insert_str("  cursor-secret-key  ");
+        assert!(matches!(
+            state.submit_provider_api_key().as_slice(),
+            [Effect::SaveProviderCredential { provider, kind, metadata }]
+                if provider == CURSOR_PROVIDER
+                    && kind == "cursor_api_key"
+                    && metadata == &serde_json::json!({"api_key":"cursor-secret-key"})
+        ));
+        assert!(!state.provider_api_key_input_active());
+    }
+
+    #[test]
+    fn cursor_api_key_input_rejects_empty_values_and_can_be_cancelled() {
+        let mut state = ready_state();
+        state.install_providers(vec![crate::session::ProviderRecord {
+            provider: CURSOR_PROVIDER.to_owned(),
+            display_name: "Cursor".to_owned(),
+            enabled: false,
+            credential: None,
+        }]);
+        state.open_provider_details();
+        let _ = state.toggle_provider();
+
+        assert!(state.submit_provider_api_key().is_empty());
+        assert!(state.provider_api_key_input_active());
+        state.provider_api_key_insert_str("secret");
+        let debug = format!("{:?}", state.provider_picker);
+        assert!(!debug.contains("secret"));
+        state.provider_api_key_backspace();
+        assert!(state.cancel_provider_api_key_input());
+        assert!(!state.provider_api_key_input_active());
+        assert!(!state.cancel_provider_api_key_input());
     }
 
     #[test]
