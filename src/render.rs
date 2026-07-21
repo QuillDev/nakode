@@ -633,6 +633,18 @@ fn render_command_completions(frame: &mut Frame<'_>, composer_area: Rect, state:
 }
 
 fn render_prompt_metadata(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    if state.status_message.starts_with("Reloaded ") {
+        let line = Line::from(vec![
+            Span::styled(" ✓ ", Style::default().fg(SUCCESS).bold()),
+            Span::styled(state.status_message.as_str(), Style::default().fg(SUCCESS)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(SURFACE)),
+            area,
+        );
+        return;
+    }
+
     let model = state.selected_model.as_deref().unwrap_or("default");
     let line = Line::from(vec![
         Span::styled(" Model: ", Style::default().fg(MUTED)),
@@ -1555,6 +1567,28 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, super::BACKGROUND);
         assert_eq!(buffer[(0, 1)].symbol(), "╭");
         assert_eq!(buffer[(0, 1)].fg, super::BORDER);
+    }
+
+    #[test]
+    fn successful_reload_replaces_prompt_metadata_with_a_visible_confirmation() {
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.configuration_reloaded(3, 2, false);
+
+        terminal
+            .draw(|frame| super::render_prompt_metadata(frame, frame.area(), &state))
+            .expect("render reload confirmation");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("✓ Reloaded 2 skills and 3 agents."));
+        assert_eq!(terminal.backend().buffer()[(1, 0)].fg, super::SUCCESS);
     }
 
     #[test]
