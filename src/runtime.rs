@@ -226,6 +226,15 @@ impl AgentRuntime {
     }
 
     #[must_use]
+    pub fn with_web_config(
+        mut self,
+        config: Arc<std::sync::RwLock<crate::web::WebConfig>>,
+    ) -> Self {
+        self.tools = self.tools.with_browser(config);
+        self
+    }
+
+    #[must_use]
     pub fn with_compaction_threshold_percent(mut self, threshold_percent: usize) -> Self {
         self.compaction_threshold_percent = threshold_percent;
         self

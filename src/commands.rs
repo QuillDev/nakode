@@ -6,6 +6,7 @@ use crate::controls::{SlashAction, slash_controls};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParsedPromptCommand<'a> {
     Agents,
+    Settings,
     Compress,
     Models,
     New,
@@ -39,6 +40,7 @@ pub fn parse_prompt_command(input: &str) -> Option<ParsedPromptCommand<'_>> {
     {
         return match control.action {
             SlashAction::Agents => Some(ParsedPromptCommand::Agents),
+            SlashAction::Settings => Some(ParsedPromptCommand::Settings),
             SlashAction::Compress => Some(ParsedPromptCommand::Compress),
             SlashAction::Models => Some(ParsedPromptCommand::Models),
             SlashAction::New => Some(ParsedPromptCommand::New),
@@ -101,6 +103,10 @@ mod tests {
 
     #[test]
     fn parser_recognizes_commands_with_and_without_arguments() {
+        assert_eq!(
+            super::parse_prompt_command("/settings"),
+            Some(ParsedPromptCommand::Settings)
+        );
         assert_eq!(
             super::parse_prompt_command("/agents"),
             Some(ParsedPromptCommand::Agents)

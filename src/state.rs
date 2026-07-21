@@ -18,6 +18,7 @@ use crate::{
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
     session::{ProviderRecord, SessionRecord, SubagentRecord},
     transcript::{EntryKind, EntryStatus, TOOL_HISTORY_TOGGLE_KEY, Transcript},
+    web::{WebBackend, WebConfig},
 };
 
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
@@ -278,6 +279,77 @@ pub struct AgentPicker {
     pub editor: Option<AgentEditor>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsSection {
+    General,
+    Agents,
+    Models,
+    Addons,
+}
+
+impl SettingsSection {
+    pub const ALL: [Self; 4] = [Self::General, Self::Agents, Self::Models, Self::Addons];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Agents => "Agents",
+            Self::Models => "Models",
+            Self::Addons => "Add-ons",
+        }
+    }
+
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::General => "Providers and connections",
+            Self::Agents => "Delegated agent archetypes",
+            Self::Models => "Default models",
+            Self::Addons => "Optional tools and web browsing",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsView {
+    Menu,
+    Addons,
+    WebBrowsing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentBrowserStatus {
+    Checking,
+    Available(String),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsState {
+    pub query: String,
+    pub selected: usize,
+    pub view: SettingsView,
+    pub web: WebConfig,
+    pub addon_field: usize,
+    pub agent_browser_status: AgentBrowserStatus,
+}
+
+impl SettingsState {
+    #[must_use]
+    pub fn filtered_sections(&self) -> Vec<SettingsSection> {
+        let query = self.query.to_ascii_lowercase();
+        SettingsSection::ALL
+            .into_iter()
+            .filter(|section| {
+                query.is_empty()
+                    || section.label().to_ascii_lowercase().contains(&query)
+                    || section.description().to_ascii_lowercase().contains(&query)
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ProviderContext {
     name: String,
@@ -487,6 +559,8 @@ pub enum Effect {
         model: Option<String>,
     },
     TouchSession(String),
+    SaveWebConfig(WebConfig),
+    CheckAgentBrowser,
     Quit,
 }
 
@@ -514,6 +588,7 @@ pub struct AppState {
     pub session_picker: Option<SessionPicker>,
     pub provider_picker: Option<ProviderPicker>,
     pub agent_picker: Option<AgentPicker>,
+    pub settings: Option<SettingsState>,
     command_completion_selection: usize,
     pending_model_picker: Option<ModelSelectionScope>,
     pub show_help: bool,
@@ -552,9 +627,184 @@ pub struct AppState {
     oauth_link_hit_region: Option<OAuthLinkHitRegion>,
     api_key_input_hit_region: Option<ApiKeyInputHitRegion>,
     transcript_limit: usize,
+    web_config: WebConfig,
 }
 
 impl AppState {
+    pub fn install_web_config(&mut self, config: WebConfig) {
+        self.web_config = config.clone();
+        if let Some(settings) = &mut self.settings {
+            settings.web = config;
+        }
+    }
+
+    pub fn open_settings(&mut self) {
+        self.settings = Some(SettingsState {
+            query: String::new(),
+            selected: 0,
+            view: SettingsView::Menu,
+            web: self.web_config.clone(),
+            addon_field: 0,
+            agent_browser_status: AgentBrowserStatus::Checking,
+        });
+        self.set_status("Settings opened.");
+    }
+
+    pub fn close_settings(&mut self) {
+        self.settings = None;
+    }
+
+    pub fn settings_insert(&mut self, character: char) {
+        if let Some(settings) = &mut self.settings {
+            if settings.view == SettingsView::Menu {
+                settings.query.push(character);
+            } else if settings.view == SettingsView::WebBrowsing
+                && settings.addon_field == 1
+                && settings.web.backend == WebBackend::Firecrawl
+            {
+                settings.web.firecrawl_api_key.push(character);
+            }
+            settings.selected = 0;
+        }
+    }
+
+    pub fn settings_backspace(&mut self) {
+        if let Some(settings) = &mut self.settings {
+            if settings.view == SettingsView::Menu {
+                settings.query.pop();
+            } else if settings.view == SettingsView::WebBrowsing
+                && settings.addon_field == 1
+                && settings.web.backend == WebBackend::Firecrawl
+            {
+                settings.web.firecrawl_api_key.pop();
+            }
+            settings.selected = 0;
+        }
+    }
+
+    pub fn settings_move(&mut self, delta: isize) {
+        let Some(settings) = &mut self.settings else {
+            return;
+        };
+        let length = match settings.view {
+            SettingsView::Menu => settings.filtered_sections().len(),
+            SettingsView::WebBrowsing if settings.web.backend == WebBackend::Firecrawl => 2,
+            SettingsView::Addons | SettingsView::WebBrowsing => 1,
+        };
+        if length > 0 {
+            if settings.view == SettingsView::Menu || settings.view == SettingsView::Addons {
+                settings.selected = offset_index(settings.selected, length, delta);
+            } else {
+                settings.addon_field = offset_index(settings.addon_field, length, delta);
+            }
+        }
+    }
+
+    pub fn settings_cycle_backend(&mut self, delta: isize) {
+        let Some(settings) = &mut self.settings else {
+            return;
+        };
+        if settings.view != SettingsView::WebBrowsing || settings.addon_field != 0 {
+            return;
+        }
+        let index = WebBackend::ALL
+            .iter()
+            .position(|backend| *backend == settings.web.backend)
+            .unwrap_or_default();
+        settings.web.backend = WebBackend::ALL[offset_index(index, WebBackend::ALL.len(), delta)];
+    }
+
+    pub fn select_setting(&mut self) -> Vec<Effect> {
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.view == SettingsView::WebBrowsing)
+        {
+            self.settings_cycle_backend(1);
+            return self.save_web_settings();
+        }
+        if let Some(settings) = &mut self.settings
+            && settings.view == SettingsView::Addons
+        {
+            settings.view = SettingsView::WebBrowsing;
+            settings.addon_field = 0;
+            settings.agent_browser_status = AgentBrowserStatus::Checking;
+            return vec![Effect::CheckAgentBrowser];
+        }
+        let section = self
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.filtered_sections().get(settings.selected).copied());
+        self.settings = None;
+        match section {
+            Some(SettingsSection::General) => {
+                self.provider_picker = Some(ProviderPicker {
+                    providers: Vec::new(),
+                    selected: 0,
+                    loading: true,
+                    showing_details: false,
+                    authentication: None,
+                });
+                vec![Effect::ListProviders]
+            }
+            Some(SettingsSection::Agents) => {
+                self.open_agent_picker();
+                Vec::new()
+            }
+            Some(SettingsSection::Models) => self.open_default_model_picker(),
+            Some(SettingsSection::Addons) => {
+                self.open_settings();
+                if let Some(settings) = &mut self.settings {
+                    settings.view = SettingsView::Addons;
+                }
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    pub fn settings_back(&mut self) -> Vec<Effect> {
+        let Some(view) = self.settings.as_ref().map(|settings| settings.view) else {
+            return Vec::new();
+        };
+        match view {
+            SettingsView::Menu => {
+                self.settings = None;
+                Vec::new()
+            }
+            SettingsView::Addons => {
+                if let Some(settings) = &mut self.settings {
+                    settings.view = SettingsView::Menu;
+                    settings.selected = 0;
+                }
+                Vec::new()
+            }
+            SettingsView::WebBrowsing => {
+                let effects = self.save_web_settings();
+                if let Some(settings) = &mut self.settings {
+                    settings.view = SettingsView::Addons;
+                    settings.selected = 0;
+                }
+                effects
+            }
+        }
+    }
+
+    pub fn set_agent_browser_status(&mut self, status: AgentBrowserStatus) {
+        if let Some(settings) = &mut self.settings {
+            settings.agent_browser_status = status;
+        }
+    }
+
+    pub fn save_web_settings(&mut self) -> Vec<Effect> {
+        let Some(settings) = &self.settings else {
+            return Vec::new();
+        };
+        let config = settings.web.clone();
+        self.set_status("Saving browser add-on settings…");
+        vec![Effect::SaveWebConfig(config)]
+    }
+
     pub fn set_status(&mut self, message: &str) {
         self.status_message.clear();
         self.status_message.push_str(message);
@@ -619,6 +869,7 @@ impl AppState {
             session_picker: None,
             provider_picker: None,
             agent_picker: None,
+            settings: None,
             command_completion_selection: 0,
             pending_model_picker: None,
             show_help: false,
@@ -657,6 +908,7 @@ impl AppState {
             oauth_link_hit_region: None,
             api_key_input_hit_region: None,
             transcript_limit: scrollback,
+            web_config: WebConfig::default(),
         }
     }
 
@@ -1662,6 +1914,11 @@ impl AppState {
                 ParsedPromptCommand::Agents => {
                     self.editor.clear();
                     self.open_agent_picker();
+                    return Vec::new();
+                }
+                ParsedPromptCommand::Settings => {
+                    self.editor.clear();
+                    self.open_settings();
                     return Vec::new();
                 }
                 ParsedPromptCommand::Compress => {
@@ -5299,7 +5556,61 @@ model = "openai-codex/model-a"
         state.close_provider_picker();
         state.editor.set_text("/agents");
         assert!(state.submit_editor().is_empty());
-        assert!(state.agent_picker.is_some());
+        state.close_agent_picker();
+        state.editor.set_text("/settings");
+        assert!(state.submit_editor().is_empty());
+        let settings = state.settings.as_ref().expect("settings menu");
+        assert_eq!(settings.filtered_sections(), super::SettingsSection::ALL);
+        state.settings_insert('w');
+        state.settings_insert('e');
+        state.settings_insert('b');
+        assert_eq!(
+            state
+                .settings
+                .as_ref()
+                .expect("settings")
+                .filtered_sections(),
+            vec![super::SettingsSection::Addons]
+        );
+
+        state.open_settings();
+        state.settings_move(3);
+        assert!(state.select_setting().is_empty());
+        assert_eq!(
+            state.settings.as_ref().map(|settings| settings.view),
+            Some(super::SettingsView::Addons)
+        );
+        assert!(matches!(
+            state.select_setting().as_slice(),
+            [Effect::CheckAgentBrowser]
+        ));
+        assert_eq!(
+            state.settings.as_ref().map(|settings| settings.view),
+            Some(super::SettingsView::WebBrowsing)
+        );
+        assert!(matches!(
+            state.select_setting().as_slice(),
+            [Effect::SaveWebConfig(config)]
+                if config.backend == crate::web::WebBackend::AgentBrowser
+        ));
+        assert_eq!(
+            state.settings.as_ref().map(|settings| settings.web.backend),
+            Some(crate::web::WebBackend::AgentBrowser)
+        );
+        assert!(matches!(
+            state.select_setting().as_slice(),
+            [Effect::SaveWebConfig(config)]
+                if config.backend == crate::web::WebBackend::Firecrawl
+        ));
+        state.settings_move(1);
+        state.settings_insert('k');
+        assert_eq!(
+            state
+                .settings
+                .as_ref()
+                .map(|settings| settings.web.firecrawl_api_key.as_str()),
+            Some("k")
+        );
     }
 
     #[test]
