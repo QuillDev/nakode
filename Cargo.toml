@@ -18,6 +18,10 @@ incremental = true
 debug = 1
 incremental = true
 
+[features]
+default = []
+codex-process-adapter = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
