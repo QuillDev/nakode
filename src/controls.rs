@@ -35,6 +35,7 @@ pub enum ControlAction {
     QueueNext,
     QueueRemove,
     Submit,
+    SteerOrSubmit,
     BackspaceWord,
     BackspaceLine,
     Backspace,
@@ -247,12 +248,12 @@ const KEY_CONTROLS: &[KeyControl] = &[
     ),
     control!(
         Global,
-        QueueDraft,
+        SteerOrSubmit,
         KeyCode::Enter,
         Alt,
         "Compose",
         "Alt+Enter",
-        "send while idle or queue during a turn"
+        "send while idle or steer during a turn"
     ),
     control!(
         Global,
@@ -261,7 +262,7 @@ const KEY_CONTROLS: &[KeyControl] = &[
         None,
         "Compose",
         "Enter / Ctrl+Enter",
-        "send while idle or steer during a turn"
+        "send while idle or queue during a turn"
     ),
     control!(Global, Submit, KeyCode::Enter, Control),
     control!(
@@ -582,6 +583,24 @@ mod tests {
                 Some(ControlAction::ToggleHelp)
             );
         }
+    }
+
+    #[test]
+    fn enter_queues_by_default_and_alt_enter_steers() {
+        assert_eq!(
+            resolve(
+                ControlContext::Global,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(ControlAction::Submit)
+        );
+        assert_eq!(
+            resolve(
+                ControlContext::Global,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+            ),
+            Some(ControlAction::SteerOrSubmit)
+        );
     }
 
     #[test]
