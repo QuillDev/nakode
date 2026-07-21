@@ -726,6 +726,7 @@ async fn apply_effects(
                 previous_slug,
             } => save_agent_definition(state, &definition, previous_slug.as_deref()),
             Effect::DeleteAgent(slug) => delete_agent_definition(state, &slug),
+            Effect::ReloadConfiguration => apply_configuration_reload(state, &mut pending),
             Effect::ResolveSession(id) => match sessions.find(&id) {
                 Ok(Some(record)) => pending.extend(state.begin_resume(record)),
                 Ok(None) => state.session_store_failed(format!("no session matches {id:?}")),
@@ -1005,6 +1006,35 @@ async fn apply_provider_enablement(
     let _ = backends
         .send(provider, BackendCommand::Reload { session_id: None })
         .await;
+}
+
+fn apply_configuration_reload(
+    state: &mut AppState,
+    pending: &mut std::collections::VecDeque<Effect>,
+) {
+    let reload_backend = state.connection.is_ready() && !state.backend_provider.is_empty();
+    let session_id = state.provider_session_id.clone();
+    match reload_local_configuration(state) {
+        Ok((agent_count, skill_count)) => {
+            state.configuration_reloaded(agent_count, skill_count, reload_backend);
+            if reload_backend {
+                pending.push_front(Effect::Backend(BackendCommand::Reload { session_id }));
+            }
+        }
+        Err(error) => state.configuration_reload_failed(&error),
+    }
+}
+
+fn reload_local_configuration(state: &mut AppState) -> Result<(usize, usize), String> {
+    let agents = AgentCatalog::load(state.agent_directory())
+        .map_err(|error| format!("could not reload agents: {error}"))?;
+    let skills = SkillCatalog::load(Path::new(&state.workspace))
+        .map_err(|error| format!("could not reload skills: {error}"))?;
+    let agent_count = agents.definitions().len();
+    let skill_count = skills.definitions().len();
+    state.install_agents(agents);
+    state.install_skills(skills);
+    Ok((agent_count, skill_count))
 }
 
 fn save_agent_definition(
@@ -1690,6 +1720,55 @@ mod tests {
         .expect("skip resume hint");
 
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn reload_local_configuration_discovers_new_skills_and_agents() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_directory = workspace.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_directory).expect("skill directory");
+        std::fs::write(
+            skill_directory.join("SKILL.md"),
+            "---\nname: review\ndescription: review carefully\n---\n\nReview every change.\n",
+        )
+        .expect("skill definition");
+
+        let agent_directory = workspace.path().join(".nakode/agents");
+        std::fs::create_dir_all(&agent_directory).expect("agent directory");
+        std::fs::write(
+            agent_directory.join("reviewer.toml"),
+            r#"slug = "reviewer"
+description = "Reviews changes"
+system_prompt = "Review carefully."
+first_message = "Inspect the change."
+"#,
+        )
+        .expect("agent definition");
+
+        let mut state = AppState::new(workspace.path().to_string_lossy(), None, 100);
+        state.set_agent_directory(agent_directory);
+        let (agent_count, skill_count) =
+            super::reload_local_configuration(&mut state).expect("reload configuration");
+
+        assert_eq!(agent_count, 1);
+        assert!(skill_count >= 1);
+        state.editor.set_text("/skill:rev");
+        assert_eq!(
+            state
+                .selected_command_completion()
+                .map(crate::state::PromptCompletion::replacement),
+            Some("/skill:review".to_owned())
+        );
+        state.editor.clear();
+        state.open_agent_picker();
+        assert_eq!(
+            state
+                .agent_picker
+                .as_ref()
+                .and_then(|picker| picker.agents.first())
+                .map(|agent| agent.slug.as_str()),
+            Some("reviewer")
+        );
     }
 
     #[test]

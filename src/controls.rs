@@ -530,7 +530,7 @@ const SLASH_CONTROLS: &[SlashControl] = &[
     SlashControl {
         action: SlashAction::Reload,
         invocation: "/reload",
-        description: "refresh backend metadata and models",
+        description: "reload skills, agents, and backend metadata",
         placement: CommandPlacement::PromptStart,
     },
     SlashControl {

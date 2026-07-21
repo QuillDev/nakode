@@ -490,6 +490,7 @@ pub enum Effect {
         previous_slug: Option<String>,
     },
     DeleteAgent(String),
+    ReloadConfiguration,
     ResolveSession(String),
     PersistSession {
         provider: String,
@@ -719,6 +720,27 @@ impl AppState {
 
     pub fn install_skills(&mut self, skills: SkillCatalog) {
         self.skills = skills;
+    }
+
+    pub fn configuration_reloaded(
+        &mut self,
+        agent_count: usize,
+        skill_count: usize,
+        refreshing_backend: bool,
+    ) {
+        self.status_message = if refreshing_backend {
+            format!(
+                "Reloaded {skill_count} skills and {agent_count} agents; refreshing {} metadata…",
+                self.backend_name
+            )
+        } else {
+            format!("Reloaded {skill_count} skills and {agent_count} agents.")
+        };
+    }
+
+    pub fn configuration_reload_failed(&mut self, error: &str) {
+        self.creating_session = None;
+        self.status_message = format!("Reload failed: {error}");
     }
 
     pub fn set_agent_directory(&mut self, directory: PathBuf) {
@@ -1737,7 +1759,7 @@ impl AppState {
                 }
                 ParsedPromptCommand::Reload => {
                     self.editor.clear();
-                    return self.reload_backend();
+                    return self.reload_configuration();
                 }
                 ParsedPromptCommand::Resume(session_id) => {
                     if self.is_busy() {
@@ -1826,23 +1848,23 @@ impl AppState {
         })]
     }
 
-    fn reload_backend(&mut self) -> Vec<Effect> {
+    fn reload_configuration(&mut self) -> Vec<Effect> {
         if self.is_busy() {
             self.set_status("Cannot reload while a turn is active.");
             return Vec::new();
         }
-        if self
-            .backend_capabilities
-            .models_require_session
-            .is_supported()
+        let reload_backend = self.connection.is_ready() && !self.backend_provider.is_empty();
+        if reload_backend
+            && self
+                .backend_capabilities
+                .models_require_session
+                .is_supported()
             && self.provider_session_id.is_none()
         {
             self.creating_session = Some(());
         }
-        self.status_message = format!("Reloading {} metadata…", self.backend_name);
-        vec![Effect::Backend(BackendCommand::Reload {
-            session_id: self.provider_session_id.clone(),
-        })]
+        self.set_status("Reloading skills, agents, and backend metadata…");
+        vec![Effect::ReloadConfiguration]
     }
 
     fn new_session(&mut self) -> Vec<Effect> {
@@ -4845,8 +4867,7 @@ model = "openai-codex/model-a"
         state.editor.set_text("/reload");
         assert!(matches!(
             state.submit_editor().as_slice(),
-            [Effect::Backend(BackendCommand::Reload { session_id: Some(session_id) })]
-                if session_id == "devin-session"
+            [Effect::ReloadConfiguration]
         ));
 
         state.editor.set_text("first real prompt");
@@ -5405,7 +5426,7 @@ model = "openai-codex/model-a"
         state.editor.set_text("/reload");
         assert!(matches!(
             state.submit_editor().as_slice(),
-            [Effect::Backend(BackendCommand::Reload { session_id: None })]
+            [Effect::ReloadConfiguration]
         ));
 
         state.editor.set_text("/resume abc123");
@@ -5429,6 +5450,13 @@ model = "openai-codex/model-a"
         state.editor.set_text("/agents");
         assert!(state.submit_editor().is_empty());
         assert!(state.agent_picker.is_some());
+
+        state.agent_picker = None;
+        state.editor.set_text("/reload");
+        assert!(matches!(
+            state.submit_editor().as_slice(),
+            [Effect::ReloadConfiguration]
+        ));
     }
 
     #[test]
