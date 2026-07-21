@@ -22,8 +22,8 @@ Nakode brings agentic coding work into a single terminal experience:
 
 The longer-term direction is a provider-neutral orchestration and continuity
 layer where logical work can span multiple agents, models, and providers. That
-includes richer delegation and review workflows, portable skills, and durable
-project memory. These are product goals, not all current features.
+includes richer delegation and review workflows and durable project memory. These
+are product goals, not all current features.
 
 ## Supported providers
 
@@ -86,6 +86,19 @@ nakode --workspace /path/to/project
 
 Then use `/providers` to connect a provider and `F2` to choose a model. Press
 `F1` at any time for the complete control reference.
+
+## Skills
+
+Nakode discovers portable Agent Skills from these directories, with
+workspace-local skills taking precedence when names overlap:
+
+- `<workspace>/.agents/skills/<skill-name>/SKILL.md`
+- `~/.agents/skills/<skill-name>/SKILL.md`
+
+Reference a discovered skill anywhere in a prompt with `/skill:<skill-name>`.
+Nakode offers discovered names in composer completion and attaches the selected
+skill instructions to that turn while keeping the original prompt unchanged in
+the visible transcript.
 
 ## Herdr integration
 

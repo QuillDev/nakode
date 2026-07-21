@@ -621,14 +621,14 @@ fn render_command_completions(frame: &mut Frame<'_>, composer_area: Rect, state:
                 Style::default().fg(ACCENT),
             ),
             Span::styled(
-                format!("{:<12}", completion.invocation),
+                format!("{:<12}", completion.replacement()),
                 Style::default().fg(ACCENT_BRIGHT).bold(),
             ),
-            Span::styled(completion.description, Style::default().fg(MUTED)),
+            Span::styled(completion.description(), Style::default().fg(MUTED)),
         ]))
         .style(Style::default().bg(if is_selected { SURFACE_RAISED } else { SURFACE }))
     });
-    let block = overlay_block(" Commands · ↑/↓ select · Tab complete ", ACCENT);
+    let block = overlay_block(" Commands and skills · ↑/↓ select · Tab complete ", ACCENT);
     frame.render_widget(List::new(items).block(block), popup);
 }
 
