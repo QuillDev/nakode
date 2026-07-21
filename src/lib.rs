@@ -18,6 +18,7 @@ pub mod render;
 pub mod runtime;
 pub mod selection;
 pub mod session;
+pub mod skill;
 pub mod state;
 pub mod terminal;
 pub mod tools;

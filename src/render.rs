@@ -509,13 +509,8 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Optio
     let lines = window
         .lines
         .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            styled_composer_line(
-                line,
-                window.first_row + index == 0 && window.horizontal_offset == 0,
-            )
-        })
+        .zip(window.prompt_line_starts)
+        .map(|(line, first_prompt_line)| styled_composer_line(line, first_prompt_line))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     Some(Position::new(
@@ -626,14 +621,14 @@ fn render_command_completions(frame: &mut Frame<'_>, composer_area: Rect, state:
                 Style::default().fg(ACCENT),
             ),
             Span::styled(
-                format!("{:<12}", completion.invocation),
+                format!("{:<12}", completion.replacement()),
                 Style::default().fg(ACCENT_BRIGHT).bold(),
             ),
-            Span::styled(completion.description, Style::default().fg(MUTED)),
+            Span::styled(completion.description(), Style::default().fg(MUTED)),
         ]))
         .style(Style::default().bg(if is_selected { SURFACE_RAISED } else { SURFACE }))
     });
-    let block = overlay_block(" Commands · ↑/↓ select · Tab complete ", ACCENT);
+    let block = overlay_block(" Commands and skills · ↑/↓ select · Tab complete ", ACCENT);
     frame.render_widget(List::new(items).block(block), popup);
 }
 

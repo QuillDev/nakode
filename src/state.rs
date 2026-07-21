@@ -17,10 +17,35 @@ use crate::{
     handoff::HandoffPackage,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
     session::{ProviderRecord, SessionRecord, SubagentRecord},
+    skill::{Skill, SkillCatalog},
     transcript::{EntryKind, EntryStatus, TOOL_HISTORY_TOGGLE_KEY, Transcript},
 };
 
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptCompletion<'a> {
+    Command(&'static CommandSpec),
+    Skill(&'a Skill),
+}
+
+impl<'a> PromptCompletion<'a> {
+    #[must_use]
+    pub fn replacement(self) -> String {
+        match self {
+            Self::Command(command) => command.invocation.to_owned(),
+            Self::Skill(skill) => format!("/skill:{}", skill.name),
+        }
+    }
+
+    #[must_use]
+    pub fn description(self) -> &'a str {
+        match self {
+            Self::Command(command) => command.description,
+            Self::Skill(skill) => skill.description.as_str(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionState {
@@ -79,6 +104,7 @@ pub struct QueuedPrompt {
 struct OutgoingPrompt {
     id: String,
     text: String,
+    wire_text: String,
     model: Option<String>,
     handoff: Option<HandoffPackage>,
 }
@@ -86,8 +112,8 @@ struct OutgoingPrompt {
 impl OutgoingPrompt {
     fn wire_text(&self) -> String {
         self.handoff.as_ref().map_or_else(
-            || self.text.clone(),
-            |handoff| handoff.render_with_prompt(&self.text),
+            || self.wire_text.clone(),
+            |handoff| handoff.render_with_prompt(&self.wire_text),
         )
     }
 }
@@ -544,6 +570,7 @@ pub struct AppState {
     screen_snapshot: Option<ScreenSnapshot>,
     pending_clipboard: Option<String>,
     agents: AgentCatalog,
+    skills: SkillCatalog,
     agent_directory: PathBuf,
     subagent_executions: HashMap<String, SubagentExecution>,
     subagent_chats: HashMap<String, SubagentChat>,
@@ -649,6 +676,7 @@ impl AppState {
             screen_snapshot: None,
             pending_clipboard: None,
             agents: AgentCatalog::default(),
+            skills: SkillCatalog::default(),
             agent_directory: PathBuf::from(".nakode/agents"),
             subagent_executions: HashMap::new(),
             subagent_chats: HashMap::new(),
@@ -687,6 +715,10 @@ impl AppState {
             picker.selected = picker.selected.min(picker.agents.len().saturating_sub(1));
             picker.editor = None;
         }
+    }
+
+    pub fn install_skills(&mut self, skills: SkillCatalog) {
+        self.skills = skills;
     }
 
     pub fn set_agent_directory(&mut self, directory: PathBuf) {
@@ -1605,13 +1637,28 @@ impl AppState {
     }
 
     #[must_use]
-    pub fn command_completions(&self) -> Vec<&'static CommandSpec> {
+    pub fn command_completions(&self) -> Vec<PromptCompletion<'_>> {
         let token = self.editor.token_before_cursor();
+        if let Some(prefix) = token.text.strip_prefix(crate::controls::SKILL_PREFIX) {
+            let completions = self
+                .skills
+                .definitions()
+                .iter()
+                .filter(|skill| skill.name.starts_with(prefix))
+                .map(PromptCompletion::Skill)
+                .collect::<Vec<_>>();
+            if !completions.is_empty() {
+                return completions;
+            }
+        }
         commands::matching(&token.text, token.at_prompt_start)
+            .into_iter()
+            .map(PromptCompletion::Command)
+            .collect()
     }
 
     #[must_use]
-    pub fn selected_command_completion(&self) -> Option<&'static CommandSpec> {
+    pub fn selected_command_completion(&self) -> Option<PromptCompletion<'_>> {
         let completions = self.command_completions();
         let selected = self
             .command_completion_selection
@@ -1623,7 +1670,7 @@ impl AppState {
     pub fn command_completion_is_exact(&self) -> bool {
         self.selected_command_completion()
             .is_some_and(|completion| {
-                completion.invocation == self.editor.token_before_cursor().text
+                completion.replacement() == self.editor.token_before_cursor().text
             })
     }
 
@@ -1645,10 +1692,10 @@ impl AppState {
         let Some(completion) = self.selected_command_completion() else {
             return;
         };
-        self.editor
-            .replace_token_before_cursor(completion.invocation);
+        let replacement = completion.replacement();
+        self.editor.replace_token_before_cursor(&replacement);
         self.command_completion_selection = 0;
-        self.status_message = format!("Inserted {}.", completion.invocation);
+        self.status_message = format!("Inserted {replacement}.");
     }
 
     pub fn submit_editor(&mut self) -> Vec<Effect> {
@@ -1715,6 +1762,13 @@ impl AppState {
                     return self.open_model_picker();
                 }
             }
+        }
+
+        if let Err(name) = self.skills.referenced(&editor_text) {
+            self.status_message = format!(
+                "Unknown skill /skill:{name}. Install it under .agents/skills or ~/.agents/skills."
+            );
+            return Vec::new();
         }
 
         if !self.connection.is_ready() {
@@ -1842,6 +1896,12 @@ impl AppState {
             self.set_status("Write a message before queueing.");
             return Vec::new();
         }
+        if let Err(name) = self.skills.referenced(&self.editor.text()) {
+            self.status_message = format!(
+                "Unknown skill /skill:{name}. Install it under .agents/skills or ~/.agents/skills."
+            );
+            return Vec::new();
+        }
         if !self.is_busy() {
             return self.submit_editor();
         }
@@ -1865,6 +1925,12 @@ impl AppState {
     pub fn steer_editor(&mut self) -> Vec<Effect> {
         if self.editor.is_blank() {
             self.set_status("Write steering guidance first.");
+            return Vec::new();
+        }
+        if let Err(name) = self.skills.referenced(&self.editor.text()) {
+            self.status_message = format!(
+                "Unknown skill /skill:{name}. Install it under .agents/skills or ~/.agents/skills."
+            );
             return Vec::new();
         }
         if !self.backend_capabilities.steering.is_supported() {
@@ -1902,7 +1968,10 @@ impl AppState {
             session_id: provider_session_id,
             turn_id,
             client_id: id,
-            prompt: text,
+            prompt: self
+                .skills
+                .render_prompt(&text)
+                .unwrap_or_else(|_| text.clone()),
         })]
     }
 
@@ -3067,9 +3136,14 @@ impl AppState {
     }
 
     fn begin_prompt(&mut self, prompt: QueuedPrompt) -> Vec<Effect> {
+        let wire_text = self
+            .skills
+            .render_prompt(&prompt.text)
+            .unwrap_or_else(|_| prompt.text.clone());
         let prompt = OutgoingPrompt {
             id: prompt.id,
             text: prompt.text,
+            wire_text,
             model: self
                 .backend_capabilities
                 .model_catalog
@@ -4408,6 +4482,7 @@ mod tests {
             TodoPhase, TodoStatus, TurnOutcome,
         },
         session::{SessionRecord, SubagentRecord},
+        skill::SkillCatalog,
         transcript::{EntryKind, EntryStatus, TranscriptEntry},
     };
     use tempfile::tempdir;
@@ -4456,6 +4531,60 @@ model = "openai-codex/model-a"
             is_default: true,
         }]));
         state
+    }
+
+    fn install_review_skill(state: &mut AppState) {
+        let workspace = tempdir().expect("skill workspace");
+        let directory = workspace.path().join(".agents/skills/review");
+        fs::create_dir_all(&directory).expect("skill directory");
+        fs::write(
+            directory.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code carefully\n---\n\nCheck correctness and tests.\n",
+        )
+        .expect("skill definition");
+        state.install_skills(SkillCatalog::load(workspace.path()).expect("skill catalog"));
+    }
+
+    #[test]
+    fn discovered_skills_complete_and_attach_to_wire_prompts() {
+        let mut state = ready_state();
+        install_review_skill(&mut state);
+        state.editor.set_text("Please use /skill:rev");
+        let completion = state
+            .selected_command_completion()
+            .expect("skill completion");
+        assert_eq!(completion.replacement(), "/skill:review");
+        state.accept_command_completion();
+        assert_eq!(state.editor.text(), "Please use /skill:review");
+
+        state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "session-with-skills".to_owned(),
+            model: "model-a".to_owned(),
+        });
+        let effects = state.submit_editor();
+        let Effect::Backend(BackendCommand::StartTurn { prompt, .. }) = effects.last().unwrap()
+        else {
+            panic!("expected skill prompt to start a turn");
+        };
+        assert!(prompt.contains("# Nakode attached skills"));
+        assert!(prompt.contains("Check correctness and tests."));
+        assert_eq!(
+            state.transcript.entries().last().unwrap().body,
+            "Please use /skill:review"
+        );
+    }
+
+    #[test]
+    fn unknown_skill_preserves_the_draft() {
+        let mut state = ready_state();
+        state.editor.set_text("Use /skill:missing");
+        assert!(state.submit_editor().is_empty());
+        assert_eq!(state.editor.text(), "Use /skill:missing");
+        assert!(
+            state
+                .status_message
+                .contains("Unknown skill /skill:missing")
+        );
     }
 
     #[test]

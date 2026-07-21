@@ -20,6 +20,7 @@ use crate::{
     cursor, devin, render,
     selection::ScreenPoint,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
+    skill::{SkillCatalog, SkillCatalogError},
     state::{AppState, ApprovalDecision, Effect},
     terminal::{TerminalSession, Tui},
 };
@@ -34,6 +35,8 @@ pub enum AppError {
     Session(#[from] SessionError),
     #[error(transparent)]
     Agents(#[from] AgentCatalogError),
+    #[error(transparent)]
+    Skills(#[from] SkillCatalogError),
     #[error(transparent)]
     Control(#[from] ControlError),
     #[error("failed to locate the running Nakode executable: {0}")]
@@ -376,6 +379,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let session_database = sessions.database_path().to_path_buf();
     let providers = sessions.list_providers()?;
     let agents = AgentCatalog::load(&config.agents)?;
+    let skills = SkillCatalog::load(&config.workspace)?;
     let mut backends = BackendRegistry::spawn(&config, &providers, session_database).await;
     let active_provider = if backends
         .commands
@@ -409,6 +413,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         )
     };
     state.install_agents(agents);
+    state.install_skills(skills);
     state.set_agent_directory(config.agents.clone());
     for (provider, error) in &backends.failures {
         let display_name = providers

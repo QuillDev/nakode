@@ -11,10 +11,9 @@ pub struct EditorState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EditorWindow {
     pub lines: Vec<String>,
+    pub prompt_line_starts: Vec<bool>,
     pub cursor_x: u16,
     pub cursor_y: u16,
-    pub first_row: usize,
-    pub horizontal_offset: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -299,30 +298,41 @@ impl EditorState {
     pub fn window(&self, height: u16, width: u16) -> EditorWindow {
         let height = usize::from(height.max(1));
         let width = usize::from(width.max(1));
-        let first_row = self.row.saturating_sub(height - 1);
-        let cursor_display_x = display_width_prefix(&self.lines[self.row], self.column);
-        let horizontal_offset = cursor_display_x.saturating_sub(width - 1);
+        let mut visual_lines = Vec::new();
+        let mut prompt_line_starts = Vec::new();
+        let mut cursor = (0, 0);
 
-        let lines = self
-            .lines
-            .iter()
-            .skip(first_row)
+        for (row, line) in self.lines.iter().enumerate() {
+            let wrapped = wrap_display_line(line, width, (row == self.row).then_some(self.column));
+            let first_visual_row = visual_lines.len();
+            if let Some((cursor_row, cursor_column)) = wrapped.cursor {
+                cursor = (first_visual_row + cursor_row, cursor_column);
+            }
+            for (visual_row, line) in wrapped.lines.into_iter().enumerate() {
+                visual_lines.push(line);
+                prompt_line_starts.push(row == 0 && visual_row == 0);
+            }
+        }
+
+        let first_visual_row = cursor.0.saturating_sub(height - 1);
+        let lines = visual_lines
+            .into_iter()
+            .skip(first_visual_row)
             .take(height)
-            .map(|line| clip_display(line, horizontal_offset, width))
+            .collect();
+        let prompt_line_starts = prompt_line_starts
+            .into_iter()
+            .skip(first_visual_row)
+            .take(height)
             .collect();
 
         EditorWindow {
             lines,
-            cursor_x: u16::try_from(
-                cursor_display_x
-                    .saturating_sub(horizontal_offset)
-                    .min(width - 1),
-            )
-            .expect("cursor x is bounded by the u16 terminal width"),
-            cursor_y: u16::try_from(self.row.saturating_sub(first_row))
+            prompt_line_starts,
+            cursor_x: u16::try_from(cursor.1.min(width - 1))
+                .expect("cursor x is bounded by the u16 terminal width"),
+            cursor_y: u16::try_from(cursor.0.saturating_sub(first_visual_row))
                 .expect("cursor y is bounded by the u16 terminal height"),
-            first_row,
-            horizontal_offset,
         }
     }
 
@@ -342,13 +352,6 @@ fn char_to_byte(text: &str, character_index: usize) -> usize {
     text.char_indices()
         .nth(character_index)
         .map_or(text.len(), |(index, _)| index)
-}
-
-fn display_width_prefix(text: &str, character_count: usize) -> usize {
-    text.chars()
-        .take(character_count)
-        .map(character_width)
-        .sum()
 }
 
 fn character_width(character: char) -> usize {
@@ -376,41 +379,48 @@ fn character_class(character: char) -> CharacterClass {
     }
 }
 
-fn clip_display(text: &str, offset: usize, width: usize) -> String {
-    let mut output = String::new();
-    let mut column = 0;
+struct WrappedDisplayLine {
+    lines: Vec<String>,
+    cursor: Option<(usize, usize)>,
+}
 
-    for character in text.chars() {
-        let rendered = if character == '\t' {
-            "    ".to_owned()
+fn wrap_display_line(text: &str, width: usize, cursor_column: Option<usize>) -> WrappedDisplayLine {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut display_column: usize = 0;
+    let mut cursor = None;
+
+    for (character_index, character) in text.chars().enumerate() {
+        let (rendered, rendered_width) = if character == '\t' {
+            ("    ".to_owned(), 4)
         } else if character.is_control() {
-            "�".to_owned()
+            ("�".to_owned(), 1)
         } else {
-            character.to_string()
+            (character.to_string(), character_width(character))
         };
-        let character_width = if character == '\t' {
-            4
+        let (rendered, rendered_width) = if rendered_width > width {
+            ("�".to_owned(), 1)
         } else {
-            character_width(character)
+            (rendered, rendered_width)
         };
-        let next_column = column + character_width;
 
-        if next_column <= offset {
-            column = next_column;
-            continue;
+        if display_column > 0 && display_column.saturating_add(rendered_width) > width {
+            lines.push(std::mem::take(&mut line));
+            display_column = 0;
         }
-        if column >= offset + width {
-            break;
+        if cursor_column == Some(character_index) {
+            cursor = Some((lines.len(), display_column));
         }
-        if column < offset && next_column > offset {
-            output.push(' ');
-        } else if next_column <= offset + width {
-            output.push_str(&rendered);
-        }
-        column = next_column;
+        line.push_str(&rendered);
+        display_column = display_column.saturating_add(rendered_width);
     }
 
-    output
+    if cursor_column == Some(text.chars().count()) {
+        cursor = Some((lines.len(), display_column));
+    }
+    lines.push(line);
+
+    WrappedDisplayLine { lines, cursor }
 }
 
 #[cfg(test)]
@@ -447,13 +457,38 @@ mod tests {
     }
 
     #[test]
-    fn window_tracks_wide_cursor() {
+    fn window_wraps_wide_text_and_tracks_the_cursor() {
         let mut editor = EditorState::default();
         editor.insert_str("ab世界");
         let window = editor.window(2, 5);
 
-        assert_eq!(window.cursor_x, 4);
-        assert_eq!(window.lines, vec!["世界"]);
+        assert_eq!(window.cursor_x, 2);
+        assert_eq!(window.cursor_y, 1);
+        assert_eq!(window.lines, vec!["ab世", "界"]);
+    }
+
+    #[test]
+    fn window_wraps_long_input_instead_of_scrolling_horizontally() {
+        let mut editor = EditorState::default();
+        editor.insert_str("abcdefghijkl");
+        let window = editor.window(2, 5);
+
+        assert_eq!(window.lines, vec!["fghij", "kl"]);
+        assert_eq!(window.cursor_x, 2);
+        assert_eq!(window.cursor_y, 1);
+        assert_eq!(window.prompt_line_starts, vec![false, false]);
+    }
+
+    #[test]
+    fn window_preserves_explicit_newlines_while_wrapping() {
+        let mut editor = EditorState::default();
+        editor.insert_str("abcdef\nxy");
+        let window = editor.window(3, 5);
+
+        assert_eq!(window.lines, vec!["abcde", "f", "xy"]);
+        assert_eq!(window.cursor_x, 2);
+        assert_eq!(window.cursor_y, 2);
+        assert_eq!(window.prompt_line_starts, vec![true, false, false]);
     }
 
     #[test]
