@@ -1,3 +1,5 @@
+#![cfg(feature = "codex-process-adapter")]
+
 use std::{error::Error, ffi::OsString, io, path::PathBuf, time::Duration};
 
 #[cfg(unix)]
