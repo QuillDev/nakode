@@ -150,7 +150,8 @@ pub fn optional_u64(arguments: &Value, name: &str, default: u64) -> Result<u64, 
 ///
 /// # Errors
 ///
-/// Returns an error when the path is empty or home-directory expansion is unavailable.
+/// Returns an error when the path is empty, absolute, escapes through `..`, or resolves through
+/// a symlink outside the workspace.
 pub fn resolve_workspace_path(
     workspace: &Path,
     supplied: &str,
@@ -158,21 +159,56 @@ pub fn resolve_workspace_path(
     if supplied.is_empty() {
         return Err("tool path must not be empty".to_owned());
     }
-    let expanded = if supplied == "~" || supplied.starts_with("~/") {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| {
-                "cannot expand ~ because the home directory is unavailable".to_owned()
-            })?;
-        home.join(supplied.trim_start_matches('~').trim_start_matches('/'))
-    } else {
-        std::path::PathBuf::from(supplied)
-    };
-    if expanded.is_absolute() {
-        Ok(expanded)
-    } else {
-        Ok(workspace.join(expanded))
+    let supplied = Path::new(supplied);
+    if supplied.is_absolute() {
+        return Err("tool paths must be relative to the workspace".to_owned());
     }
+    let mut relative = std::path::PathBuf::new();
+    for component in supplied.components() {
+        match component {
+            std::path::Component::Normal(component) => relative.push(component),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !relative.pop() {
+                    return Err("tool path escapes the workspace through ..".to_owned());
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err("tool paths must be relative to the workspace".to_owned());
+            }
+        }
+    }
+    let candidate = workspace.join(relative);
+    ensure_existing_ancestor_is_confined(workspace, &candidate)?;
+    Ok(candidate)
+}
+
+fn ensure_existing_ancestor_is_confined(workspace: &Path, candidate: &Path) -> Result<(), String> {
+    let canonical_workspace = workspace.canonicalize().map_err(|error| {
+        format!(
+            "failed to resolve workspace {}: {error}",
+            workspace.display()
+        )
+    })?;
+    let mut ancestor = candidate;
+    while std::fs::symlink_metadata(ancestor).is_err() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| "tool path has no existing ancestor".to_owned())?;
+    }
+    let canonical_ancestor = ancestor.canonicalize().map_err(|error| {
+        format!(
+            "failed to resolve path ancestor {}: {error}",
+            ancestor.display()
+        )
+    })?;
+    if !canonical_ancestor.starts_with(&canonical_workspace) {
+        return Err(format!(
+            "tool path resolves outside workspace {}",
+            canonical_workspace.display()
+        ));
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -277,20 +313,28 @@ mod tests {
     }
 
     #[test]
-    fn tool_paths_follow_shell_style_local_path_resolution() {
-        let root = std::path::Path::new("/tmp/workspace");
+    fn tool_paths_are_confined_to_the_workspace() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
         assert_eq!(
             resolve_workspace_path(root, "src/main.rs").expect("relative path"),
             root.join("src/main.rs")
         );
-        assert_eq!(
-            resolve_workspace_path(root, "../secret").expect("parent path"),
-            root.join("../secret")
-        );
-        assert_eq!(
-            resolve_workspace_path(root, "/etc/passwd").expect("absolute path"),
-            std::path::PathBuf::from("/etc/passwd")
-        );
+        assert!(resolve_workspace_path(root, "../secret").is_err());
+        assert!(resolve_workspace_path(root, "/etc/passwd").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_paths_reject_symlinks_that_leave_the_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("escape"))
+            .expect("escape symlink");
+
+        let error = resolve_workspace_path(workspace.path(), "escape/secret.txt")
+            .expect_err("symlink escape must fail");
+        assert!(error.contains("outside workspace"));
     }
 
     #[test]
