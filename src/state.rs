@@ -6242,10 +6242,9 @@ model = "openai-codex/model-a"
             provider: CODEX_PROVIDER.to_owned(),
             display_name: "Codex".to_owned(),
             enabled: true,
-            credential: Some(crate::session::ProviderCredentialRecord {
+            credential: Some(crate::credential::CredentialMetadata {
                 provider: CODEX_PROVIDER.to_owned(),
                 kind: "chatgpt_device_code".to_owned(),
-                metadata: serde_json::json!({}),
                 updated_at: 1,
             }),
         }]);

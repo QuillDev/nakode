@@ -7,6 +7,7 @@ pub mod commands;
 pub mod config;
 pub mod control;
 pub mod controls;
+pub mod credential;
 pub mod cursor;
 pub mod devin;
 pub mod editor;
