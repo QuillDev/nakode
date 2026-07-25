@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::{
     Tool, ToolContext, ToolFuture, ToolResult, optional_u64, required_string, truncate_output,
 };
+use crate::permission::OperationClass;
 use crate::runtime::ToolDefinition;
 
 const DONE_PREFIX: &str = "__NAKODE_EVAL_DONE__";
@@ -23,6 +24,10 @@ pub struct EvalTool {
 }
 
 impl Tool for EvalTool {
+    fn operation(&self) -> OperationClass {
+        OperationClass::ExecuteProcess
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "eval",
@@ -94,15 +99,14 @@ impl EvalTool {
             .get("reset")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let mut kernel = {
-            let mut kernels = self.kernels.lock().await;
-            let previous = kernels.remove(&key);
-            if reset && let Some(mut previous) = previous {
+        let previous = self.kernels.lock().await.remove(&key);
+        let mut kernel = if reset {
+            if let Some(mut previous) = previous {
                 previous.stop().await;
-                None
-            } else {
-                previous
             }
+            None
+        } else {
+            previous
         };
         if kernel.is_none() {
             kernel = Some(EvalKernel::spawn(language, workspace)?);

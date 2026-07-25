@@ -176,7 +176,7 @@ impl SearchTarget {
                 matcher: None,
             });
         }
-        let root = glob_root(&resolved);
+        let root = super::glob_root(&resolved);
         Ok(Self {
             root,
             matcher: Some(
@@ -192,19 +192,4 @@ impl SearchTarget {
             .as_ref()
             .is_none_or(|matcher| matcher.is_match(path))
     }
-}
-
-fn glob_root(pattern: &std::path::Path) -> std::path::PathBuf {
-    let mut root = std::path::PathBuf::new();
-    for component in pattern.components() {
-        let text = component.as_os_str().to_string_lossy();
-        if text
-            .chars()
-            .any(|character| matches!(character, '*' | '?' | '[' | '{'))
-        {
-            break;
-        }
-        root.push(component.as_os_str());
-    }
-    root
 }

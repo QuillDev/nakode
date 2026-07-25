@@ -1345,35 +1345,24 @@ fn register_oauth_link(
     line: Option<usize>,
     authentication: Option<&crate::state::ProviderAuthentication>,
 ) {
-    let (
-        Some(line),
+    let Some(line) = line else {
+        return;
+    };
+    let url = match authentication {
         Some(crate::state::ProviderAuthentication::Challenge {
             verification_url, ..
-        }),
-    ) = (line, authentication)
-    else {
-        if matches!(
-            authentication,
-            Some(crate::state::ProviderAuthentication::ApiKeyInput { .. })
-        ) {
-            let row = popup
-                .y
-                .saturating_add(1)
-                .saturating_add(u16::try_from(line.unwrap_or_default()).unwrap_or(u16::MAX));
-            state.set_oauth_link_hit_region(Some((
-                "https://cursor.com/dashboard/api".to_owned(),
-                ScreenPoint::new(popup.x.saturating_add(1), row),
-                ScreenPoint::new(popup.right().saturating_sub(1), row.saturating_add(1)),
-            )));
+        }) => verification_url.clone(),
+        Some(crate::state::ProviderAuthentication::ApiKeyInput { .. }) => {
+            "https://cursor.com/dashboard/api".to_owned()
         }
-        return;
+        Some(crate::state::ProviderAuthentication::Starting) | None => return,
     };
     let row = popup
         .y
         .saturating_add(1)
         .saturating_add(u16::try_from(line).unwrap_or(u16::MAX));
     state.set_oauth_link_hit_region(Some((
-        verification_url.clone(),
+        url,
         ScreenPoint::new(popup.x.saturating_add(1), row),
         ScreenPoint::new(popup.right().saturating_sub(1), row.saturating_add(1)),
     )));

@@ -1,7 +1,7 @@
 use nakode::{
     app,
     config::{Config, NakodeCommand, ServiceAction},
-    control, diagnostics, update,
+    control_service, diagnostics, update,
 };
 
 #[tokio::main]
@@ -16,7 +16,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     if config.update || matches!(config.command.as_ref(), Some(NakodeCommand::Update)) {
         update::run()?;
-        control::shutdown_service().await?;
+        control_service::shutdown_service().await?;
         return Ok(());
     }
     match config.command.clone() {
@@ -39,9 +39,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_id,
             task,
         }) => {
-            let response = control::invoke_via_service(
+            let response = control_service::invoke_via_service(
                 &config.workspace,
-                &control::AgentInvocation {
+                &control_service::AgentInvocation {
                     agent: agent_slug,
                     session_id,
                     task,
@@ -55,10 +55,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(NakodeCommand::Service {
             action: ServiceAction::Run,
-        }) => control::run_service().await?,
+        }) => control_service::run_service().await?,
         Some(NakodeCommand::Service {
             action: ServiceAction::Shutdown,
-        }) => control::shutdown_service().await?,
+        }) => control_service::shutdown_service().await?,
         Some(NakodeCommand::Update) => unreachable!("update commands return before dispatch"),
         None => app::run(config).await?,
     }

@@ -177,7 +177,7 @@ impl GlobTarget {
             });
         }
         let absolute_pattern = super::resolve_workspace_path(workspace, input)?;
-        let root = glob_root(&absolute_pattern);
+        let root = super::glob_root(&absolute_pattern);
         if root == std::path::Path::new("/") {
             return Err("searching from the filesystem root is not allowed".to_owned());
         }
@@ -196,19 +196,4 @@ impl GlobTarget {
             .as_ref()
             .is_none_or(|matcher| matcher.is_match(path))
     }
-}
-
-fn glob_root(pattern: &std::path::Path) -> std::path::PathBuf {
-    let mut root = std::path::PathBuf::new();
-    for component in pattern.components() {
-        let text = component.as_os_str().to_string_lossy();
-        if text
-            .chars()
-            .any(|character| matches!(character, '*' | '?' | '[' | '{'))
-        {
-            break;
-        }
-        root.push(component.as_os_str());
-    }
-    root
 }

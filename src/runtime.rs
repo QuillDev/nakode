@@ -10,6 +10,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -18,6 +19,8 @@ use crate::backend::{
     BackendEvent, CompactionReason, DeltaKind, ItemKind, ItemStatus, NormalizedItem,
     PromptAttachment, SessionHistoryItem, TodoPhase,
 };
+use crate::permission::PermissionEnvelope;
+use crate::session::InitializedDatabase;
 use crate::tools::{ToolConcurrency, ToolRegistry, model_facing_output};
 
 const COMPACTION_RESERVE_TOKENS: usize = 32_768;
@@ -162,6 +165,20 @@ pub struct InferenceFailure {
     pub retry_count: usize,
 }
 
+#[derive(Debug, Error)]
+pub enum TurnError {
+    #[error("turn interrupted")]
+    Interrupted,
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for TurnError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
 impl InferenceFailure {
     #[must_use]
     pub fn new(message: impl Into<String>, retry_count: usize) -> Self {
@@ -220,6 +237,7 @@ pub struct AgentRuntime {
     vision_config: Option<Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
     vision: Option<crate::vision::SharedVisionService>,
     direct_image_input: bool,
+    permissions: PermissionEnvelope,
 }
 
 impl AgentRuntime {
@@ -234,7 +252,14 @@ impl AgentRuntime {
             vision_config: None,
             vision: None,
             direct_image_input: true,
+            permissions: PermissionEnvelope::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_permissions(mut self, permissions: PermissionEnvelope) -> Self {
+        self.permissions = permissions;
+        self
     }
 
     #[must_use]
@@ -327,7 +352,7 @@ impl AgentRuntime {
         mut attachments: Vec<PromptAttachment>,
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: CancellationToken,
-    ) -> Result<(), String> {
+    ) -> Result<(), TurnError> {
         self.prepare_image_fallback(&mut prompt, &mut attachments, &cancellation)
             .await?;
         session.history.push(ConversationItem::User {
@@ -347,7 +372,7 @@ impl AgentRuntime {
         let mut tool_failures = HashMap::<String, usize>::new();
         loop {
             if cancellation.is_cancelled() {
-                return Err("turn interrupted".to_owned());
+                return Err(TurnError::Interrupted);
             }
             if session.should_compact(self.compaction_threshold_percent) {
                 let compaction = self
@@ -365,7 +390,8 @@ impl AgentRuntime {
                 {
                     return Err(format!(
                         "context compaction is required before inference: {error}"
-                    ));
+                    )
+                    .into());
                 }
             }
             let result = self
@@ -396,7 +422,7 @@ impl AgentRuntime {
                     })?;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             };
             warn_about_retries(backend_events, inference_round, output.retry_count).await;
             session.history.push(ConversationItem::Assistant {
@@ -769,19 +795,26 @@ impl AgentRuntime {
         send_tool_started(turn_id, &tool_call.id, &title, backend_events).await?;
         let started_at_ms = unix_time_ms();
         let started = Instant::now();
-        let result = tool
-            .execute(
+        let result = if self.permissions.allows(tool.operation()) {
+            tool.execute(
                 crate::tools::ToolContext {
                     workspace: &self.workspace,
                     session,
                     backend_events,
                     turn_id,
                     questions: &self.questions,
+                    permissions: &self.permissions,
                 },
                 tool_call.arguments,
                 cancellation,
             )
-            .await;
+            .await
+        } else {
+            crate::tools::ToolResult::failure(format!(
+                "permission envelope denied {}",
+                tool_call.name
+            ))
+        };
         Ok(ExecutedTool::new(
             tool_call.id,
             tool_call.name,
@@ -810,19 +843,26 @@ impl AgentRuntime {
         let started_at_ms = unix_time_ms();
         let started = Instant::now();
         let mut isolated_session = RuntimeSession::new(String::new(), String::new());
-        let result = tool
-            .execute(
+        let result = if self.permissions.allows(tool.operation()) {
+            tool.execute(
                 crate::tools::ToolContext {
                     workspace: &self.workspace,
                     session: &mut isolated_session,
                     backend_events,
                     turn_id,
                     questions: &self.questions,
+                    permissions: &self.permissions,
                 },
                 tool_call.arguments,
                 cancellation,
             )
-            .await;
+            .await
+        } else {
+            crate::tools::ToolResult::failure(format!(
+                "permission envelope denied {}",
+                tool_call.name
+            ))
+        };
         Ok(ExecutedTool::new(
             tool_call.id,
             tool_call.name,
@@ -1518,13 +1558,32 @@ fn is_context_overflow(message: &str) -> bool {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeSessionStore {
-    database: PathBuf,
+    database: InitializedDatabase,
     provider: String,
+}
+
+pub(crate) fn set_session_model(
+    sessions: &mut HashMap<String, RuntimeSession>,
+    store: Option<&RuntimeSessionStore>,
+    provider_session_id: &str,
+    model: String,
+) -> Result<(), String> {
+    let session = sessions
+        .get_mut(provider_session_id)
+        .ok_or_else(|| "unknown native session".to_owned())?;
+    if session.model != model {
+        session.context_window = None;
+    }
+    session.model = model;
+    if let Some(store) = store {
+        store.save(session)?;
+    }
+    Ok(())
 }
 
 impl RuntimeSessionStore {
     #[must_use]
-    pub fn new(database: PathBuf, provider: impl Into<String>) -> Self {
+    pub fn new(database: InitializedDatabase, provider: impl Into<String>) -> Self {
         Self {
             database,
             provider: provider.into(),
@@ -1576,7 +1635,8 @@ impl RuntimeSessionStore {
     }
 
     fn connection(&self) -> Result<Connection, String> {
-        Connection::open(&self.database)
+        self.database
+            .connection()
             .map_err(|error| format!("failed to open native session store: {error}"))
     }
 }
@@ -1598,7 +1658,8 @@ mod tests {
     use crate::backend::{
         BackendEvent, CompactionReason, ItemKind, QuestionOption, QuestionRequest,
     };
-    use crate::session::SqliteSessionRepository;
+    use crate::permission::{OperationClass, PermissionEnvelope};
+    use crate::session::InitializedDatabase;
     use crate::tools::{
         Tool, ToolConcurrency, ToolContext, ToolFuture as RuntimeToolFuture, ToolRegistry,
         ToolResult,
@@ -1633,6 +1694,10 @@ mod tests {
     struct AlwaysFailTool;
 
     impl Tool for AlwaysFailTool {
+        fn operation(&self) -> OperationClass {
+            OperationClass::ExecuteProcess
+        }
+
         fn definition(&self) -> super::ToolDefinition {
             super::ToolDefinition {
                 name: "todo",
@@ -2092,6 +2157,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permission_envelope_denies_process_tools_before_execution() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(RepeatingToolProvider {
+            calls: AtomicUsize::new(0),
+            tool_rounds: 1,
+        });
+        let tools = ToolRegistry::testing(vec![Arc::new(AlwaysFailTool)]);
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider)
+            .with_tools(tools)
+            .with_permissions(PermissionEnvelope::read_only());
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        let (events, _receiver) = mpsc::channel(32);
+
+        runtime
+            .run_turn(
+                &mut session,
+                "turn-denied",
+                "Try a process.".to_owned(),
+                Vec::new(),
+                &events,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("denial is a tool result");
+
+        assert!(session.history.iter().any(|item| matches!(
+            item,
+            ConversationItem::ToolResult { output, failed: true, .. }
+                if output == "permission envelope denied todo"
+        )));
+    }
+
+    #[tokio::test]
     async fn proactively_compacts_before_the_context_threshold() {
         let directory = tempfile::tempdir().expect("workspace");
         let provider = Arc::new(CompactionProvider::new(false));
@@ -2216,7 +2314,11 @@ mod tests {
             .await
             .expect_err("unsafe inference is rejected");
 
-        assert!(error.contains("context compaction is required before inference"));
+        assert!(
+            error
+                .to_string()
+                .contains("context compaction is required before inference")
+        );
         assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
         assert!(session.telemetry.inference.iter().any(|metric| {
             metric.kind == super::InferenceKind::Compaction && metric.error.is_some()
@@ -2363,8 +2465,8 @@ mod tests {
     #[test]
     fn native_sessions_survive_provider_restarts() {
         let directory = tempfile::tempdir().expect("session directory");
-        let database = directory.path().join("sessions.sqlite3");
-        let _repository = SqliteSessionRepository::open(&database).expect("session repository");
+        let database = InitializedDatabase::open(directory.path().join("sessions.sqlite3"))
+            .expect("initialized database");
         let store = RuntimeSessionStore::new(database, "test-provider");
         let mut session = RuntimeSession::new("test-model".to_owned(), "Be concise.".to_owned())
             .with_reasoning_effort(Some("low".to_owned()));

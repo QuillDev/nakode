@@ -1,8 +1,10 @@
-use std::{fmt, path::Path, sync::Mutex};
+use std::{fmt, sync::Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::session::InitializedDatabase;
 
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 
@@ -86,10 +88,8 @@ impl SqliteCredentialStore {
     ///
     /// # Errors
     /// Returns an error when `SQLite` cannot open or configure the database.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, CredentialError> {
-        let connection = Connection::open(path)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
+    pub fn from_database(database: &InitializedDatabase) -> Result<Self, CredentialError> {
+        let connection = database.connection()?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -176,14 +176,14 @@ mod tests {
     use serde_json::json;
 
     use super::{Credential, CredentialStore, SecretValue, SqliteCredentialStore};
-    use crate::session::{CODEX_PROVIDER, SqliteSessionRepository};
+    use crate::session::{CODEX_PROVIDER, InitializedDatabase};
 
     #[test]
     fn sqlite_store_round_trips_replaces_and_deletes_credentials() {
         let directory = tempfile::tempdir().expect("credential directory");
         let path = directory.path().join("credentials.db");
-        let _sessions = SqliteSessionRepository::open(&path).expect("initialize database");
-        let store = SqliteCredentialStore::open(&path).expect("credential store");
+        let database = InitializedDatabase::open(&path).expect("initialize database");
+        let store = SqliteCredentialStore::from_database(&database).expect("credential store");
         let first = Credential {
             kind: "oauth".to_owned(),
             secret: SecretValue::new(json!({"access_token":"secret-one"})),

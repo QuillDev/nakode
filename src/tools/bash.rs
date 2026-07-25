@@ -12,11 +12,16 @@ use super::{
     process::{ProcessRequest, ProcessResult, run_process},
     required_string, resolve_workspace_path,
 };
+use crate::permission::OperationClass;
 use crate::runtime::ToolDefinition;
 
 pub struct BashTool;
 
 impl Tool for BashTool {
+    fn operation(&self) -> OperationClass {
+        OperationClass::ExecuteProcess
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash",

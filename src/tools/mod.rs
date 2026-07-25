@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     backend::BackendEvent,
+    permission::{OperationClass, PermissionEnvelope},
     runtime::{QuestionBroker, RuntimeSession, ToolDefinition},
 };
 
@@ -40,6 +41,7 @@ pub struct ToolContext<'a> {
     pub backend_events: &'a mpsc::Sender<BackendEvent>,
     pub turn_id: &'a str,
     pub questions: &'a QuestionBroker,
+    pub permissions: &'a PermissionEnvelope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +76,9 @@ pub trait Tool: Send + Sync {
     }
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::Exclusive
+    }
+    fn operation(&self) -> OperationClass {
+        OperationClass::ReadWorkspace
     }
     fn execute<'a>(
         &'a self,
@@ -207,6 +212,21 @@ pub fn resolve_workspace_path(
     let candidate = workspace.join(relative);
     ensure_existing_ancestor_is_confined(workspace, &candidate)?;
     Ok(candidate)
+}
+
+fn glob_root(pattern: &Path) -> std::path::PathBuf {
+    let mut root = std::path::PathBuf::new();
+    for component in pattern.components() {
+        let text = component.as_os_str().to_string_lossy();
+        if text
+            .chars()
+            .any(|character| matches!(character, '*' | '?' | '[' | '{'))
+        {
+            break;
+        }
+        root.push(component.as_os_str());
+    }
+    root
 }
 
 fn ensure_existing_ancestor_is_confined(workspace: &Path, candidate: &Path) -> Result<(), String> {
@@ -593,6 +613,7 @@ mod tests {
 
     impl ToolHarness<'_> {
         async fn execute(&mut self, name: &str, arguments: Value) -> ToolResult {
+            let permissions = crate::permission::PermissionEnvelope::default();
             self.registry
                 .find(name)
                 .expect("registered tool")
@@ -603,6 +624,7 @@ mod tests {
                         backend_events: &self.events,
                         turn_id: "turn-1",
                         questions: &self.questions,
+                        permissions: &permissions,
                     },
                     arguments,
                     &self.cancellation,

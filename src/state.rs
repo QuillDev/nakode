@@ -16,8 +16,11 @@ use crate::{
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
     handoff::HandoffPackage,
+    permission::PermissionEnvelope,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
-    session::{ProviderRecord, SessionRecord, SubagentRecord},
+    session::{
+        ApprovalAuditContext, ApprovalAuditRecord, ProviderRecord, SessionRecord, SubagentRecord,
+    },
     skill::{Skill, SkillCatalog},
     terminal_image::TerminalImageMode,
     transcript::{EntryKind, EntryStatus, TOOL_HISTORY_TOGGLE_KEY, Transcript},
@@ -406,6 +409,7 @@ struct ProviderContext {
     capabilities: BackendCapabilities,
     connection: ConnectionState,
     provider_session_id: Option<String>,
+    agent_session_id: Option<String>,
     session_id: Option<String>,
     context_usage: Option<ContextUsageState>,
 }
@@ -535,6 +539,7 @@ struct SubagentExecution {
     response: String,
     model_targets: Vec<AgentModelTarget>,
     model_target_index: usize,
+    permissions: PermissionEnvelope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -548,6 +553,16 @@ pub struct AgentRequest {
     pub id: u64,
     pub agent: String,
     pub task: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionPersistence {
+    pub nakode_session_id: String,
+    pub provider: String,
+    pub provider_session_id: String,
+    pub workspace: String,
+    pub title: String,
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -588,13 +603,7 @@ pub enum Effect {
     DeleteAgent(String),
     ReloadConfiguration,
     ResolveSession(String),
-    PersistSession {
-        provider: String,
-        provider_session_id: String,
-        workspace: String,
-        title: String,
-        model: Option<String>,
-    },
+    PersistSession(SessionPersistence),
     PersistModels {
         provider: String,
         models: Vec<ModelInfo>,
@@ -604,6 +613,7 @@ pub enum Effect {
         model: String,
     },
     PersistSubagent(SubagentRecord),
+    PersistApprovalDecision(ApprovalAuditRecord),
     LoadSubagents(String),
     UpdateSessionModel {
         session_id: String,
@@ -626,6 +636,7 @@ pub struct AppState {
     pub backend_capabilities: BackendCapabilities,
     provider_contexts: HashMap<String, ProviderContext>,
     pub provider_session_id: Option<String>,
+    pub agent_session_id: Option<String>,
     pub session_id: Option<String>,
     pub active_turn: Option<ActiveTurn>,
     pub context_usage: Option<ContextUsageState>,
@@ -782,7 +793,7 @@ impl AppState {
         }
     }
 
-    pub fn settings_cycle_backend(&mut self, delta: isize) {
+    pub fn settings_cycle_web_backend(&mut self, delta: isize) {
         let Some(settings) = &mut self.settings else {
             return;
         };
@@ -819,14 +830,13 @@ impl AppState {
         else {
             return Vec::new();
         };
-        self.set_status("Terminal image setting saved; changes apply on next launch.");
         vec![Effect::SaveTerminalImageMode(mode)]
     }
 
     pub fn settings_cycle_choice(&mut self, delta: isize) -> Vec<Effect> {
         match self.settings.as_ref().map(|settings| settings.view) {
             Some(SettingsView::WebBrowsing) => {
-                self.settings_cycle_backend(delta);
+                self.settings_cycle_web_backend(delta);
                 self.save_web_settings()
             }
             Some(SettingsView::TerminalImages) => {
@@ -843,7 +853,7 @@ impl AppState {
             .as_ref()
             .is_some_and(|settings| settings.view == SettingsView::WebBrowsing)
         {
-            self.settings_cycle_backend(1);
+            self.settings_cycle_web_backend(1);
             return self.save_web_settings();
         }
         if let Some(settings) = &mut self.settings
@@ -1040,6 +1050,7 @@ impl AppState {
                 capabilities: BackendCapabilities::default(),
                 connection: ConnectionState::Starting,
                 provider_session_id: None,
+                agent_session_id: None,
                 session_id: None,
                 context_usage: None,
             },
@@ -1052,6 +1063,7 @@ impl AppState {
             backend_capabilities: BackendCapabilities::default(),
             provider_contexts,
             provider_session_id: None,
+            agent_session_id: None,
             session_id: None,
             active_turn: None,
             context_usage: None,
@@ -1853,6 +1865,7 @@ impl AppState {
         if provider == self.backend_provider {
             self.connection = ConnectionState::Disconnected("logged out".to_owned());
             self.provider_session_id = None;
+            self.agent_session_id = None;
             self.session_id = None;
             self.context_usage = None;
         }
@@ -1891,6 +1904,7 @@ impl AppState {
                 capabilities: BackendCapabilities::default(),
                 connection: ConnectionState::Starting,
                 provider_session_id: None,
+                agent_session_id: None,
                 session_id: None,
                 context_usage: None,
             },
@@ -1912,6 +1926,7 @@ impl AppState {
                 capabilities: BackendCapabilities::default(),
                 connection: ConnectionState::Failed(message.to_owned()),
                 provider_session_id: None,
+                agent_session_id: None,
                 session_id: None,
                 context_usage: None,
             },
@@ -1945,6 +1960,7 @@ impl AppState {
             self.connection = context.connection.clone();
             self.provider_session_id
                 .clone_from(&context.provider_session_id);
+            self.agent_session_id.clone_from(&context.agent_session_id);
             self.session_id.clone_from(&context.session_id);
             self.context_usage = context.context_usage;
         } else {
@@ -1953,6 +1969,7 @@ impl AppState {
             self.backend_capabilities = BackendCapabilities::default();
             self.connection = ConnectionState::Disconnected("no provider enabled".to_owned());
             self.provider_session_id = None;
+            self.agent_session_id = None;
             self.session_id = None;
             self.context_usage = None;
             self.set_status("No provider is enabled. Open /providers to configure one.");
@@ -1960,6 +1977,8 @@ impl AppState {
     }
 
     pub fn session_persisted(&mut self, session: &SessionRecord) {
+        self.nakode_session_id.clone_from(&session.id);
+        self.agent_session_id = Some(session.agent_session_id.clone());
         self.session_id = Some(session.id.clone());
         self.status_message = format!("Session {} started.", short_id(&session.id));
     }
@@ -2273,7 +2292,7 @@ impl AppState {
         );
         self.set_status("Compressing the current chat context…");
         vec![Effect::Backend(BackendCommand::CompactSession {
-            session_id,
+            provider_session_id: session_id,
             compaction_id,
         })]
     }
@@ -2303,7 +2322,9 @@ impl AppState {
             return Vec::new();
         }
         let previous = self.provider_session_id.take();
+        self.agent_session_id = None;
         self.session_id = None;
+        self.nakode_session_id = uuid::Uuid::now_v7().to_string();
         self.session_model_override = false;
         self.selected_model = self.default_model();
         self.active_turn = None;
@@ -2421,7 +2442,7 @@ impl AppState {
         });
         self.set_status("Sending steering guidance…");
         vec![Effect::Backend(BackendCommand::SteerTurn {
-            session_id: provider_session_id,
+            provider_session_id,
             turn_id,
             client_id: id,
             prompt: self
@@ -2448,7 +2469,7 @@ impl AppState {
             let turn_id = compaction.turn_id.clone();
             self.set_status("Interrupting context compression…");
             effects.push(Effect::Backend(BackendCommand::InterruptTurn {
-                session_id: provider_session_id,
+                provider_session_id,
                 turn_id,
             }));
             return effects;
@@ -2485,7 +2506,7 @@ impl AppState {
             )
         };
         effects.push(Effect::Backend(BackendCommand::InterruptTurn {
-            session_id: provider_session_id,
+            provider_session_id,
             turn_id: active.id.clone(),
         }));
         effects
@@ -2562,7 +2583,7 @@ impl AppState {
             self.creating_session = Some(());
         }
         vec![Effect::Backend(BackendCommand::Reload {
-            session_id: self.provider_session_id.clone(),
+            provider_session_id: self.provider_session_id.clone(),
         })]
     }
 
@@ -2657,6 +2678,7 @@ impl AppState {
             }
             if provider_changed {
                 self.provider_session_id = None;
+                self.agent_session_id = None;
                 self.session_id = None;
                 self.context_usage = None;
                 self.pending_handoff = handoff.flatten();
@@ -2705,7 +2727,7 @@ impl AppState {
                 && let Some(session_id) = self.provider_session_id.clone()
             {
                 effects.push(Effect::Backend(BackendCommand::SetSessionModel {
-                    session_id,
+                    provider_session_id: session_id,
                     model: selected.id,
                 }));
             } else if let Some(session_id) = self.session_id.clone() {
@@ -2789,10 +2811,36 @@ impl AppState {
             EntryStatus::Complete,
         );
         self.status_message = format!("Approval {decision_name}.");
-        vec![Effect::Backend(BackendCommand::ResolveApproval {
-            id: approval.id,
+        let audit = self.approval_audit(&approval, decision, None, "interactive user decision");
+        vec![
+            Effect::Backend(BackendCommand::ResolveApproval {
+                id: approval.id,
+                decision,
+            }),
+            Effect::PersistApprovalDecision(audit),
+        ]
+    }
+
+    fn approval_audit(
+        &self,
+        approval: &ApprovalRequest,
+        decision: ApprovalDecision,
+        run_id: Option<String>,
+        policy_rule: &str,
+    ) -> ApprovalAuditRecord {
+        ApprovalAuditRecord::new(
+            ApprovalAuditContext {
+                nakode_session_id: self.nakode_session_id.clone(),
+                agent_session_id: self.agent_session_id.clone(),
+                run_id,
+                turn_id: self.active_turn.as_ref().map(|turn| turn.id.clone()),
+                provider: self.backend_provider.clone(),
+            },
+            approval.id.to_string(),
+            approval.kind,
             decision,
-        })]
+            policy_rule,
+        )
     }
 
     pub fn move_question_selection(&mut self, delta: isize) {
@@ -2851,28 +2899,23 @@ impl AppState {
         }
         match &event {
             BackendEvent::Ready(identity) => {
-                self.provider_contexts.insert(
-                    provider.to_owned(),
-                    ProviderContext {
-                        name: identity.display_name.clone(),
-                        capabilities: identity.capabilities.clone(),
-                        connection: ConnectionState::Ready {
-                            server: identity.display_name.clone(),
-                        },
-                        provider_session_id: self
-                            .provider_contexts
-                            .get(provider)
-                            .and_then(|context| context.provider_session_id.clone()),
-                        session_id: self
-                            .provider_contexts
-                            .get(provider)
-                            .and_then(|context| context.session_id.clone()),
-                        context_usage: self
-                            .provider_contexts
-                            .get(provider)
-                            .and_then(|context| context.context_usage),
-                    },
-                );
+                let context = self
+                    .provider_contexts
+                    .entry(provider.to_owned())
+                    .or_insert_with(|| ProviderContext {
+                        name: String::new(),
+                        capabilities: BackendCapabilities::default(),
+                        connection: ConnectionState::Starting,
+                        provider_session_id: None,
+                        agent_session_id: None,
+                        session_id: None,
+                        context_usage: None,
+                    });
+                context.name.clone_from(&identity.display_name);
+                context.capabilities = identity.capabilities.clone();
+                context.connection = ConnectionState::Ready {
+                    server: identity.display_name.clone(),
+                };
                 if self.backend_provider.is_empty() && !self.provider_is_authenticating(provider) {
                     provider.clone_into(&mut self.backend_provider);
                     self.backend_name.clone_from(&identity.display_name);
@@ -2883,10 +2926,11 @@ impl AppState {
                 }
             }
             BackendEvent::Models(models) => {
-                let mut models = models.clone();
-                for model in &mut models {
-                    provider.clone_into(&mut model.provider);
+                if models.iter().any(|model| model.provider != provider) {
+                    self.diagnostic_count += 1;
+                    return Vec::new();
                 }
+                let models = models.clone();
                 if !models.is_empty() {
                     self.install_models(models.clone());
                 }
@@ -3014,6 +3058,7 @@ impl AppState {
                 capabilities: self.backend_capabilities.clone(),
                 connection: self.connection.clone(),
                 provider_session_id: None,
+                agent_session_id: None,
                 session_id: None,
                 context_usage: None,
             });
@@ -3023,6 +3068,7 @@ impl AppState {
         context
             .provider_session_id
             .clone_from(&self.provider_session_id);
+        context.agent_session_id.clone_from(&self.agent_session_id);
         context.session_id.clone_from(&self.session_id);
         context.context_usage = self.context_usage;
     }
@@ -3045,6 +3091,7 @@ impl AppState {
         self.backend_capabilities = context.capabilities;
         self.connection = context.connection;
         self.provider_session_id = context.provider_session_id;
+        self.agent_session_id = context.agent_session_id;
         self.session_id = context.session_id;
         self.context_usage = context.context_usage;
         true
@@ -3310,13 +3357,14 @@ impl AppState {
         let Some(prompt) = self.pending_session_prompt.take() else {
             return Vec::new();
         };
-        let mut effects = vec![Effect::PersistSession {
+        let mut effects = vec![Effect::PersistSession(SessionPersistence {
+            nakode_session_id: self.nakode_session_id.clone(),
             provider: self.backend_provider.clone(),
             provider_session_id: provider_session_id.clone(),
             workspace: self.workspace.clone(),
             title: prompt.text.clone(),
             model: self.selected_model.clone(),
-        }];
+        })];
         effects.extend(self.start_prompt_on_session(prompt, provider_session_id));
         effects
     }
@@ -3334,6 +3382,8 @@ impl AppState {
             return self.protocol_problem("session resume returned an empty provider id");
         }
         self.provider_session_id = Some(provider_session_id);
+        self.nakode_session_id.clone_from(&session.id);
+        self.agent_session_id = Some(session.agent_session_id.clone());
         self.session_id = Some(session.id.clone());
         self.context_usage = None;
         self.context_compaction = None;
@@ -3580,6 +3630,7 @@ impl AppState {
             .or_else(|| self.starting_turn.take());
         self.transcript.set_stream_active(false);
         self.provider_session_id = None;
+        self.agent_session_id = None;
         self.active_turn = None;
         self.context_usage = None;
         self.context_compaction = None;
@@ -3683,12 +3734,15 @@ impl AppState {
         self.scroll_from_bottom = 0;
 
         if let Some(provider_session_id) = self.provider_session_id.clone() {
-            let persist = self.session_id.is_none().then(|| Effect::PersistSession {
-                provider: self.backend_provider.clone(),
-                provider_session_id: provider_session_id.clone(),
-                workspace: self.workspace.clone(),
-                title: prompt.text.clone(),
-                model: self.selected_model.clone(),
+            let persist = self.session_id.is_none().then(|| {
+                Effect::PersistSession(SessionPersistence {
+                    nakode_session_id: self.nakode_session_id.clone(),
+                    provider: self.backend_provider.clone(),
+                    provider_session_id: provider_session_id.clone(),
+                    workspace: self.workspace.clone(),
+                    title: prompt.text.clone(),
+                    model: self.selected_model.clone(),
+                })
             });
             let mut effects = self.start_prompt_on_session(prompt, provider_session_id);
             if let Some(persist) = persist {
@@ -3715,7 +3769,7 @@ impl AppState {
         self.starting_turn = Some(prompt.clone());
         self.set_status("Starting turn…");
         vec![Effect::Backend(BackendCommand::StartTurn {
-            session_id: provider_session_id,
+            provider_session_id,
             client_id: prompt.id,
             prompt: wire_text,
             attachments: prompt.attachments,
@@ -4111,6 +4165,7 @@ impl AppState {
                 response: String::new(),
                 model_targets,
                 model_target_index: 0,
+                permissions: PermissionEnvelope::unattended_workspace(),
             },
         );
         self.status_message = format!("Spawned subagent {agent_slug} as {run_id}.");
@@ -4144,7 +4199,7 @@ impl AppState {
             .join("\n");
         let model = self.selected_model.as_ref().map_or_else(
             || format!("{}/provider-default", self.backend_provider),
-            |model| format!("{}/{}", self.backend_provider, model),
+            Clone::clone,
         );
         format!(
             "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode invocation is available through the native shell. It is a Nakode control-plane command, not a provider tool.\nAvailable agents:\n{}\nTo delegate a concrete bounded task, execute the matching absolute-path command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed above. Use only these Nakode commands for delegation; do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one command per task concurrently using the provider's native shell facilities. Keep each objective distinct and bounded. Each command returns its own agent result on stdout when that child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
@@ -4202,13 +4257,9 @@ impl AppState {
                 self.observe_subagent_item(run_id, item);
                 Vec::new()
             }
-            BackendEvent::ApprovalRequested(approval) => vec![Effect::SubagentBackend {
-                run_id: run_id.to_owned(),
-                command: BackendCommand::ResolveApproval {
-                    id: approval.id,
-                    decision: ApprovalDecision::AcceptForSession,
-                },
-            }],
+            BackendEvent::ApprovalRequested(approval) => {
+                self.resolve_subagent_approval(run_id, approval)
+            }
             BackendEvent::QuestionRequested(request) => vec![Effect::SubagentBackend {
                 run_id: run_id.to_owned(),
                 command: BackendCommand::ResolveQuestion {
@@ -4271,6 +4322,31 @@ impl AppState {
             | BackendEvent::ModelRerouted { .. }
             | BackendEvent::SessionClosed { .. } => Vec::new(),
         }
+    }
+
+    fn resolve_subagent_approval(&self, run_id: &str, approval: ApprovalRequest) -> Vec<Effect> {
+        let decision = self
+            .subagent_executions
+            .get(run_id)
+            .map_or(ApprovalDecision::Decline, |execution| {
+                execution.permissions.provider_decision(approval.kind)
+            });
+        let audit = self.approval_audit(
+            &approval,
+            decision,
+            Some(run_id.to_owned()),
+            "delegated unattended permission envelope",
+        );
+        vec![
+            Effect::SubagentBackend {
+                run_id: run_id.to_owned(),
+                command: BackendCommand::ResolveApproval {
+                    id: approval.id,
+                    decision,
+                },
+            },
+            Effect::PersistApprovalDecision(audit),
+        ]
     }
 
     fn reduce_subagent_compaction_event(
@@ -4448,11 +4524,7 @@ impl AppState {
         execution.run.provider_session_id = Some(provider_session_id.clone());
         execution.run.status = SubagentStatus::Working;
         "Working…".clone_into(&mut execution.run.latest_activity);
-        let prompt = format!(
-            "# Agent role instructions\n\n{}\n\n{}",
-            execution.definition.system_prompt.trim(),
-            execution.definition.initial_prompt(&execution.task)
-        );
+        let prompt = execution.definition.initial_prompt(&execution.task);
         let model = execution.model_targets[execution.model_target_index]
             .model
             .clone();
@@ -4460,7 +4532,7 @@ impl AppState {
         vec![Effect::SubagentBackend {
             run_id: run_id.to_owned(),
             command: BackendCommand::StartTurn {
-                session_id: provider_session_id,
+                provider_session_id,
                 client_id: format!("{run_id}-prompt"),
                 prompt,
                 attachments: Vec::new(),
@@ -4710,6 +4782,12 @@ impl AppState {
         let parent_session_id = self.session_id.clone()?;
         let run = self.subagents.iter().find(|run| run.id == run_id)?;
         let chat = self.subagent_chats.get(run_id)?;
+        let permissions = self
+            .subagent_executions
+            .get(run_id)
+            .map_or_else(PermissionEnvelope::default, |execution| {
+                execution.permissions.clone()
+            });
         Some(Effect::PersistSubagent(SubagentRecord {
             parent_session_id,
             id: run.id.clone(),
@@ -4720,6 +4798,7 @@ impl AppState {
             status: run.status,
             latest_activity: run.latest_activity.clone(),
             transcript: chat.transcript.entries().to_vec(),
+            permissions,
         }))
     }
 
@@ -5010,7 +5089,9 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus};
+    use super::{
+        AgentRequest, AppState, ApprovalDecision, Effect, SessionPersistence, SubagentStatus,
+    };
 
     fn explorer_catalog() -> AgentCatalog {
         let directory = tempdir().expect("agent directory");
@@ -5200,7 +5281,7 @@ model = "openai-codex/model-a"
 
         let [
             Effect::Backend(BackendCommand::CompactSession {
-                session_id,
+                provider_session_id: session_id,
                 compaction_id,
             }),
         ] = effects.as_slice()
@@ -5242,7 +5323,7 @@ model = "openai-codex/model-a"
         assert!(matches!(
             interrupt.as_slice(),
             [Effect::Backend(BackendCommand::InterruptTurn {
-                session_id,
+                provider_session_id: session_id,
                 turn_id,
             })] if session_id == "native-session" && turn_id == &compaction_id
         ));
@@ -5375,7 +5456,9 @@ model = "openai-codex/model-a"
 
         assert!(matches!(
             state.open_model_picker().as_slice(),
-            [Effect::Backend(BackendCommand::Reload { session_id: None })]
+            [Effect::Backend(BackendCommand::Reload {
+                provider_session_id: None
+            })]
         ));
         assert!(state.status_message.contains("Loading Devin models"));
         assert!(state.open_model_picker().is_empty());
@@ -5399,7 +5482,10 @@ model = "openai-codex/model-a"
         state.picker_move(1);
         assert!(matches!(
             state.picker_select().as_slice(),
-            [Effect::Backend(BackendCommand::SetSessionModel { session_id, model })]
+            [Effect::Backend(BackendCommand::SetSessionModel {
+                provider_session_id: session_id,
+                model
+            })]
                 if session_id == "devin-session" && model == "model-b"
         ));
 
@@ -5414,7 +5500,11 @@ model = "openai-codex/model-a"
         assert!(matches!(
             effects.as_slice(),
             [
-                Effect::PersistSession { provider_session_id, model, .. },
+                Effect::PersistSession(SessionPersistence {
+                    provider_session_id,
+                    model,
+                    ..
+                }),
                 Effect::Backend(BackendCommand::StartTurn { .. })
             ] if provider_session_id == "devin-session" && model.as_deref() == Some("devin-acp/model-b")
         ));
@@ -5531,7 +5621,7 @@ model = "openai-codex/model-a"
         });
         assert!(matches!(
             effects.as_slice(),
-            [Effect::PersistSession { .. }, Effect::Backend(_)]
+            [Effect::PersistSession(_), Effect::Backend(_)]
         ));
     }
 
@@ -5704,8 +5794,10 @@ model = "openai-codex/model-a"
             detail: "cargo test".to_owned(),
         });
         let effects = state.resolve_approval(ApprovalDecision::AcceptOnce);
-        let [Effect::Backend(BackendCommand::ResolveApproval { decision, .. })] =
-            effects.as_slice()
+        let [
+            Effect::Backend(BackendCommand::ResolveApproval { decision, .. }),
+            Effect::PersistApprovalDecision(_),
+        ] = effects.as_slice()
         else {
             panic!("expected approval response");
         };
@@ -5719,8 +5811,10 @@ model = "openai-codex/model-a"
             detail: "cargo test".to_owned(),
         });
         let effects = state.resolve_approval(ApprovalDecision::AcceptForSession);
-        let [Effect::Backend(BackendCommand::ResolveApproval { decision, .. })] =
-            effects.as_slice()
+        let [
+            Effect::Backend(BackendCommand::ResolveApproval { decision, .. }),
+            Effect::PersistApprovalDecision(_),
+        ] = effects.as_slice()
         else {
             panic!("expected approval response");
         };
@@ -6131,6 +6225,7 @@ model = "openai-codex/model-a"
         let mut state = ready_state();
         let session = SessionRecord {
             id: "01950000-0000-7000-8000-000000000000".to_owned(),
+            agent_session_id: "01950000-0000-7000-8000-000000000001".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-resumed".to_owned(),
             workspace: "/tmp/project".to_owned(),
@@ -6212,6 +6307,7 @@ model = "openai-codex/model-a"
                 body: "The session store owns orchestration metadata.".to_owned(),
                 status: EntryStatus::Complete,
             }],
+            permissions: crate::permission::PermissionEnvelope::default(),
         }]);
 
         assert_eq!(state.subagents.len(), 1);
@@ -6357,7 +6453,7 @@ model = "openai-codex/model-a"
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Models(vec![ModelInfo {
-                provider: String::new(),
+                provider: CODEX_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
             }]),
@@ -6365,7 +6461,7 @@ model = "openai-codex/model-a"
         state.handle_provider_backend(
             DEVIN_PROVIDER,
             BackendEvent::Models(vec![ModelInfo {
-                provider: String::new(),
+                provider: DEVIN_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
             }]),
@@ -6405,7 +6501,7 @@ model = "openai-codex/model-a"
             state.handle_provider_backend(
                 provider,
                 BackendEvent::Models(vec![ModelInfo {
-                    provider: String::new(),
+                    provider: provider.to_owned(),
                     id: "shared".to_owned(),
                     is_default: true,
                 }]),
@@ -6448,7 +6544,7 @@ model = "openai-codex/model-a"
             model: "shared".to_owned(),
         });
         let [
-            Effect::PersistSession { title, .. },
+            Effect::PersistSession(SessionPersistence { title, .. }),
             Effect::Backend(BackendCommand::StartTurn { prompt, .. }),
         ] = effects.as_slice()
         else {
@@ -6514,7 +6610,9 @@ model = "openai-codex/model-a"
             [Effect::SubagentBackend {
                 command: BackendCommand::StartTurn { prompt, .. },
                 ..
-            }] if prompt.contains("Inspect the delegated question") && prompt.contains("Map auth")
+            }] if prompt.contains("Inspect the delegated question")
+                && prompt.contains("Map auth")
+                && !prompt.contains("Explore carefully")
         ));
         run_id
     }
@@ -6524,7 +6622,7 @@ model = "openai-codex/model-a"
         let mut state = ready_state();
         state.install_agents(explorer_catalog());
         state.set_nakode_executable(Path::new("/opt/nakode/bin/nakode"));
-        state.selected_model = Some("model-a".to_owned());
+        state.selected_model = Some("openai-codex/model-a".to_owned());
         state.editor.set_text("Start work");
 
         let effects = state.submit_editor();
@@ -6762,13 +6860,16 @@ model = "openai-codex/model-a"
         );
         assert!(matches!(
             approval_effects.as_slice(),
-            [Effect::SubagentBackend {
-                command: BackendCommand::ResolveApproval {
-                    decision: ApprovalDecision::AcceptForSession,
+            [
+                Effect::SubagentBackend {
+                    command: BackendCommand::ResolveApproval {
+                        decision: ApprovalDecision::AcceptOnce,
+                        ..
+                    },
                     ..
                 },
-                ..
-            }]
+                Effect::PersistApprovalDecision(_)
+            ]
         ));
 
         state.handle_subagent_backend(
@@ -6876,7 +6977,7 @@ model = "openai-codex/model-a"
                 Effect::CompleteAgentRequest { success: false, .. },
                 Effect::StopSubagent(stopped_run),
                 Effect::Backend(BackendCommand::InterruptTurn {
-                    session_id,
+                    provider_session_id: session_id,
                     turn_id,
                 }),
             ] if stopped_run == &run_id

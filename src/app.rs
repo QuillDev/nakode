@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -16,16 +16,20 @@ use crate::{
     backend::{BackendCommand, BackendError, BackendEvent, BackendHandle},
     clipboard, codex,
     config::Config,
-    control::{AgentResponse, ControlError, ControlServer, IncomingInvocation},
+    control_service::{AgentResponse, ControlError, ControlServer, IncomingInvocation},
     controls::{self, ControlAction, ControlContext},
     credential::{
         Credential, CredentialError, CredentialStore, SecretValue, SqliteCredentialStore,
     },
     cursor, devin, render,
+    runtime::RuntimeSessionStore,
     selection::ScreenPoint,
-    session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
+    session::{
+        InitializedDatabase, ProviderRecord, SessionError, SessionRepository,
+        SqliteSessionRepository,
+    },
     skill::{SkillCatalog, SkillCatalogError},
-    state::{AgentBrowserStatus, AppState, ApprovalDecision, Effect},
+    state::{AgentBrowserStatus, AppState, ApprovalDecision, Effect, SessionPersistence},
     terminal::{TerminalSession, Tui},
 };
 
@@ -64,7 +68,7 @@ struct BackendRegistry {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     failures: Vec<(String, String)>,
     config: Config,
-    session_database: PathBuf,
+    database: InitializedDatabase,
     provider_credentials: HashMap<String, serde_json::Value>,
     provider_cooldowns: HashMap<String, ProviderCooldown>,
     web_config: Arc<RwLock<crate::web::WebConfig>>,
@@ -92,23 +96,17 @@ const PROVIDER_FATAL_ERROR_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 impl BackendRegistry {
     fn current_web_config(&self) -> crate::web::WebConfig {
-        self.web_config.read().map_or_else(
-            |_| crate::web::WebConfig::default(),
-            |config| config.clone(),
-        )
+        read_shared_config(&self.web_config)
     }
 
     fn current_vision_config(&self) -> crate::vision::VisionConfig {
-        self.vision_config.read().map_or_else(
-            |_| crate::vision::VisionConfig::default(),
-            |config| config.clone(),
-        )
+        read_shared_config(&self.vision_config)
     }
 
     async fn spawn(
         config: &Config,
         providers: &[ProviderRecord],
-        session_database: PathBuf,
+        database: InitializedDatabase,
         provider_credentials: HashMap<String, serde_json::Value>,
         web_config: Arc<RwLock<crate::web::WebConfig>>,
         vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
@@ -136,7 +134,7 @@ impl BackendRegistry {
             tasks: Vec::new(),
             failures,
             config: config.clone(),
-            session_database,
+            database,
             provider_credentials,
             provider_cooldowns: HashMap::new(),
             web_config,
@@ -158,24 +156,39 @@ impl BackendRegistry {
         if self.commands.contains_key(provider) {
             return Ok(());
         }
+        let handle = self
+            .spawn_provider_handle(provider, crate::permission::PermissionEnvelope::default())
+            .await?;
+        self.insert_primary(provider.to_owned(), handle);
+        Ok(())
+    }
+
+    async fn spawn_provider_handle(
+        &self,
+        provider: &str,
+        permissions: crate::permission::PermissionEnvelope,
+    ) -> Result<BackendHandle, BackendError> {
+        let credential = self.provider_credentials.get(provider).cloned();
         let handle = match provider {
             crate::backend::CODEX_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
                 codex::spawn(
                     codex::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_permissions(permissions.clone())
                         .with_reasoning_effort(self.config.openai_reasoning_effort.as_str())
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
-                        .with_session_database(self.session_database.clone())
+                        .with_session_store(RuntimeSessionStore::new(
+                            self.database.clone(),
+                            crate::backend::CODEX_PROVIDER,
+                        ))
                         .with_web_config(Arc::clone(&self.web_config))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
             }
             crate::backend::CURSOR_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
                 cursor::spawn(
                     cursor::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
@@ -184,14 +197,17 @@ impl BackendRegistry {
                 .await?
             }
             crate::backend::DEVIN_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
                 devin::spawn(
                     devin::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_permissions(permissions)
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
-                        .with_session_database(self.session_database.clone())
+                        .with_session_store(RuntimeSessionStore::new(
+                            self.database.clone(),
+                            crate::backend::DEVIN_PROVIDER,
+                        ))
                         .with_web_config(Arc::clone(&self.web_config))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
@@ -203,8 +219,7 @@ impl BackendRegistry {
                 });
             }
         };
-        self.insert_primary(provider.to_owned(), handle);
-        Ok(())
+        Ok(handle)
     }
 
     async fn stop_provider(&mut self, provider: &str) {
@@ -255,51 +270,12 @@ impl BackendRegistry {
                 provider: provider.to_owned(),
             });
         }
-        let handle = match provider {
-            crate::backend::CODEX_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
-                codex::spawn(
-                    codex::BackendConfig::native(self.config.workspace.clone())
-                        .with_credential(credential)
-                        .with_reasoning_effort(self.config.openai_reasoning_effort.as_str())
-                        .with_compaction_threshold_percent(usize::from(
-                            self.config.compaction_threshold_percent,
-                        ))
-                        .with_session_database(self.session_database.clone())
-                        .with_web_config(Arc::clone(&self.web_config))
-                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
-                )
-                .await?
-            }
-            crate::backend::CURSOR_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
-                cursor::spawn(
-                    cursor::BackendConfig::native(self.config.workspace.clone())
-                        .with_credential(credential)
-                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
-                )
-                .await?
-            }
-            crate::backend::DEVIN_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
-                devin::spawn(
-                    devin::BackendConfig::native(self.config.workspace.clone())
-                        .with_credential(credential)
-                        .with_compaction_threshold_percent(usize::from(
-                            self.config.compaction_threshold_percent,
-                        ))
-                        .with_session_database(self.session_database.clone())
-                        .with_web_config(Arc::clone(&self.web_config))
-                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
-                )
-                .await?
-            }
-            _ => {
-                return Err(BackendError::UnsupportedProvider {
-                    provider: provider.to_owned(),
-                });
-            }
-        };
+        let handle = self
+            .spawn_provider_handle(
+                provider,
+                crate::permission::PermissionEnvelope::unattended_workspace(),
+            )
+            .await?;
         let (commands, mut events, task) = handle.into_parts();
         self.subagent_commands.insert(run_id.clone(), commands);
         self.subagent_providers
@@ -428,6 +404,12 @@ impl BackendRegistry {
     }
 }
 
+fn read_shared_config<T: Clone + Default>(shared: &RwLock<T>) -> T {
+    shared
+        .read()
+        .map_or_else(|_| T::default(), |config| config.clone())
+}
+
 /// Runs the interactive application until the user exits or a subsystem fails.
 ///
 /// # Errors
@@ -438,8 +420,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let nakode_executable = std::env::current_exe().map_err(AppError::CurrentExecutable)?;
     let mut signals = ShutdownSignals::install()?;
     let sessions = SqliteSessionRepository::open_default()?;
-    let session_database = sessions.database_path().to_path_buf();
-    let credentials = SqliteCredentialStore::open(&session_database)?;
+    let credentials = SqliteCredentialStore::from_database(&sessions.database())?;
     let (providers, mut backends) = start_backends(&config, &sessions, &credentials).await?;
     let agents = AgentCatalog::load(&config.agents)?;
     let skills = SkillCatalog::load(&config.workspace)?;
@@ -453,12 +434,17 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             Err(error) => state.session_store_failed(error.to_string()),
         }
         let _ = backends
-            .send(provider, BackendCommand::Reload { session_id: None })
+            .send(
+                provider,
+                BackendCommand::Reload {
+                    provider_session_id: None,
+                },
+            )
             .await;
     }
     state.set_startup_resume(config.resume);
 
-    let (control_path, mut control, registration) =
+    let (mut control, registration) =
         match start_tui_control(&nakode_executable, &state.nakode_session_id).await {
             Ok(control) => control,
             Err(error) => {
@@ -471,7 +457,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         Err(error) => {
             backends.shutdown().await;
             registration.shutdown().await;
-            control.shutdown(&control_path);
+            control.shutdown();
             return Err(AppError::Terminal(error));
         }
     };
@@ -508,7 +494,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let restore_result = terminal.restore();
     backends.shutdown().await;
     registration.shutdown().await;
-    control.shutdown(&control_path);
+    control.shutdown();
 
     loop_result?;
     restore_result.map_err(AppError::Terminal)?;
@@ -580,7 +566,7 @@ async fn start_backends(
     let mut backends = BackendRegistry::spawn(
         config,
         &providers,
-        sessions.database_path().to_path_buf(),
+        sessions.database(),
         provider_credentials,
         web_config,
         vision_config,
@@ -615,13 +601,13 @@ fn load_provider_credentials(
 async fn start_tui_control(
     executable: &Path,
     session_id: &str,
-) -> Result<(PathBuf, ControlServer, crate::control::ControlRegistration), ControlError> {
-    let path = crate::control::tui_socket_path()?;
+) -> Result<(ControlServer, crate::control_service::ControlRegistration), ControlError> {
+    let path = crate::control_service::tui_socket_path()?;
     let control = ControlServer::bind(&path).await?;
-    match crate::control::ControlRegistration::start(executable, session_id, &path).await {
-        Ok(registration) => Ok((path, control, registration)),
+    match crate::control_service::ControlRegistration::start(executable, session_id, &path).await {
+        Ok(registration) => Ok((control, registration)),
         Err(error) => {
-            control.shutdown(&path);
+            control.shutdown();
             Err(error)
         }
     }
@@ -879,26 +865,8 @@ async fn apply_effects(
             } => save_agent_definition(state, &definition, previous_slug.as_deref()),
             Effect::DeleteAgent(slug) => delete_agent_definition(state, &slug),
             Effect::ReloadConfiguration => apply_configuration_reload(state, &mut pending),
-            Effect::ResolveSession(id) => match sessions.find(&id) {
-                Ok(Some(record)) => pending.extend(state.begin_resume(record)),
-                Ok(None) => state.session_store_failed(format!("no session matches {id:?}")),
-                Err(error) => state.session_store_failed(error.to_string()),
-            },
-            Effect::PersistSession {
-                provider,
-                provider_session_id,
-                workspace,
-                title,
-                model,
-            } => persist_session(
-                state,
-                sessions,
-                &provider,
-                &provider_session_id,
-                &workspace,
-                &title,
-                model.as_deref(),
-            ),
+            Effect::ResolveSession(id) => resolve_session(state, sessions, &mut pending, &id),
+            Effect::PersistSession(request) => persist_session(state, sessions, &request),
             Effect::PersistModels { provider, models } => {
                 persist_models(state, sessions, &provider, &models);
             }
@@ -906,6 +874,9 @@ async fn apply_effects(
                 set_default_model(state, sessions, &provider, &model);
             }
             Effect::PersistSubagent(record) => persist_subagent(state, sessions, &record),
+            Effect::PersistApprovalDecision(record) => {
+                persist_approval_decision(state, sessions, &record);
+            }
             Effect::LoadSubagents(parent_session_id) => {
                 load_subagents(state, sessions, &parent_session_id);
             }
@@ -929,16 +900,42 @@ async fn apply_effects(
     quit
 }
 
+fn resolve_session(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    pending: &mut std::collections::VecDeque<Effect>,
+    id: &str,
+) {
+    match sessions.find(id) {
+        Ok(Some(record)) => pending.extend(state.begin_resume(record)),
+        Ok(None) => state.session_store_failed(format!("no session matches {id:?}")),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
+}
+
+fn persist_approval_decision(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    record: &crate::session::ApprovalAuditRecord,
+) {
+    if let Err(error) = sessions.save_approval_decision(record) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
 fn persist_session(
     state: &mut AppState,
     sessions: &dyn SessionRepository,
-    provider: &str,
-    provider_session_id: &str,
-    workspace: &str,
-    title: &str,
-    model: Option<&str>,
+    request: &SessionPersistence,
 ) {
-    match sessions.create(provider, provider_session_id, workspace, title, model) {
+    match sessions.create_agent_session(
+        &request.nakode_session_id,
+        &request.provider,
+        &request.provider_session_id,
+        &request.workspace,
+        &request.title,
+        request.model.as_deref(),
+    ) {
         Ok(record) => state.session_persisted(&record),
         Err(error) => state.session_store_failed(error.to_string()),
     }
@@ -981,9 +978,19 @@ fn open_url(state: &mut AppState, url: &str) {
 }
 
 fn install_provider_records(state: &mut AppState, sessions: &dyn SessionRepository) {
+    try_install_provider_records(state, sessions);
+}
+
+fn try_install_provider_records(state: &mut AppState, sessions: &dyn SessionRepository) -> bool {
     match sessions.list_providers() {
-        Ok(providers) => state.install_providers(providers),
-        Err(error) => state.session_store_failed(error.to_string()),
+        Ok(providers) => {
+            state.install_providers(providers);
+            true
+        }
+        Err(error) => {
+            state.session_store_failed(error.to_string());
+            false
+        }
     }
 }
 
@@ -1110,10 +1117,7 @@ async fn persist_provider_credential(
     }
     backends.set_provider_credential(&credential.provider, credential.metadata.clone());
     backends.stop_provider(&credential.provider).await;
-    match sessions.list_providers() {
-        Ok(providers) => state.install_providers(providers),
-        Err(error) => state.session_store_failed(error.to_string()),
-    }
+    install_provider_records(state, sessions);
     pending.push_back(Effect::SetProviderEnabled {
         provider: credential.provider,
         enabled: true,
@@ -1139,12 +1143,8 @@ async fn clear_provider_credential(
         state.session_store_failed(error.to_string());
         return;
     }
-    match sessions.list_providers() {
-        Ok(providers) => state.install_providers(providers),
-        Err(error) => {
-            state.session_store_failed(error.to_string());
-            return;
-        }
+    if !try_install_provider_records(state, sessions) {
+        return;
     }
     state.provider_logged_out(provider);
 }
@@ -1160,10 +1160,7 @@ async fn apply_provider_enablement(
         state.session_store_failed(error.to_string());
         return;
     }
-    match sessions.list_providers() {
-        Ok(providers) => state.install_providers(providers),
-        Err(error) => state.session_store_failed(error.to_string()),
-    }
+    install_provider_records(state, sessions);
     if !enabled {
         backends.stop_provider(provider).await;
         state.provider_disabled(provider);
@@ -1181,7 +1178,12 @@ async fn apply_provider_enablement(
         Err(error) => state.session_store_failed(error.to_string()),
     }
     let _ = backends
-        .send(provider, BackendCommand::Reload { session_id: None })
+        .send(
+            provider,
+            BackendCommand::Reload {
+                provider_session_id: None,
+            },
+        )
         .await;
 }
 
@@ -1195,7 +1197,9 @@ fn apply_configuration_reload(
         Ok((agent_count, skill_count)) => {
             state.configuration_reloaded(agent_count, skill_count, reload_backend);
             if reload_backend {
-                pending.push_front(Effect::Backend(BackendCommand::Reload { session_id }));
+                pending.push_front(Effect::Backend(BackendCommand::Reload {
+                    provider_session_id: session_id,
+                }));
             }
         }
         Err(error) => state.configuration_reload_failed(&error),
@@ -1277,12 +1281,10 @@ fn save_web_config_effect(
         state.session_store_failed(error.to_string());
         return;
     }
-    let Ok(mut shared) = backends.web_config.write() else {
-        state.session_store_failed("browser settings lock is unavailable".to_owned());
+    if let Err(error) = replace_shared_config(&backends.web_config, config.clone(), "browser") {
+        state.session_store_failed(error);
         return;
-    };
-    *shared = config.clone();
-    drop(shared);
+    }
     state.install_web_config(config);
     state.set_status("Browser add-on settings saved.");
 }
@@ -1297,14 +1299,20 @@ fn save_vision_config_effect(
         state.session_store_failed(error.to_string());
         return;
     }
-    let Ok(mut shared) = backends.vision_config.write() else {
-        state.session_store_failed("vision settings lock is unavailable".to_owned());
+    if let Err(error) = replace_shared_config(&backends.vision_config, config.clone(), "vision") {
+        state.session_store_failed(error);
         return;
-    };
-    *shared = config.clone();
-    drop(shared);
+    }
     state.install_vision_config(config);
     state.set_status("Vision add-on settings saved.");
+}
+
+fn replace_shared_config<T>(shared: &RwLock<T>, config: T, name: &str) -> Result<(), String> {
+    let mut current = shared
+        .write()
+        .map_err(|_| format!("{name} settings lock is unavailable"))?;
+    *current = config;
+    Ok(())
 }
 
 fn save_terminal_image_mode_effect(
@@ -1933,7 +1941,7 @@ mod tests {
     use crate::{
         backend::{BackendEvent, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, TurnOutcome},
         render,
-        session::ProviderRecord,
+        session::{InitializedDatabase, ProviderRecord},
         state::{ActiveTurn, AgentRequest, AppState, ConnectionState, Effect},
         transcript::{EntryKind, EntryStatus},
     };
@@ -1962,7 +1970,8 @@ mod tests {
             tasks: Vec::new(),
             failures: Vec::new(),
             config,
-            session_database: directory.path().join("sessions.sqlite3"),
+            database: InitializedDatabase::open(directory.path().join("sessions.sqlite3"))
+                .expect("initialize test database"),
             provider_credentials: HashMap::new(),
             provider_cooldowns: HashMap::new(),
             web_config: std::sync::Arc::new(std::sync::RwLock::new(
@@ -2510,7 +2519,7 @@ first_message = "Inspect the change."
         assert!(matches!(
             effects.as_slice(),
             [Effect::Backend(crate::backend::BackendCommand::SteerTurn {
-                session_id,
+                provider_session_id: session_id,
                 turn_id,
                 prompt,
                 ..

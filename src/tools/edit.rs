@@ -5,11 +5,16 @@ use super::{
     Tool, ToolContext, ToolFuture, ToolResult, required_string, resolve_workspace_path,
     write::atomic_write,
 };
+use crate::permission::OperationClass;
 use crate::runtime::ToolDefinition;
 
 pub struct EditTool;
 
 impl Tool for EditTool {
+    fn operation(&self) -> OperationClass {
+        OperationClass::MutateWorkspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit",

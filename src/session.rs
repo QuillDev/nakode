@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 pub use crate::backend::{CODEX_PROVIDER, DEVIN_PROVIDER};
 use crate::{
-    backend::ModelInfo,
+    backend::{ApprovalDecision, ApprovalKind, ModelInfo},
     credential::CredentialMetadata,
     terminal_image::TerminalImageMode,
     transcript::{EntryKind, EntryStatus, TranscriptEntry},
@@ -39,6 +39,7 @@ struct ProviderCatalogEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
     pub id: String,
+    pub agent_session_id: String,
     pub provider: String,
     pub provider_session_id: String,
     pub workspace: String,
@@ -46,6 +47,66 @@ pub struct SessionRecord {
     pub model: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSessionRecord {
+    pub id: String,
+    pub nakode_session_id: String,
+    pub provider: String,
+    pub provider_session_id: String,
+    pub model: Option<String>,
+    pub role: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalAuditRecord {
+    pub id: String,
+    pub nakode_session_id: String,
+    pub agent_session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub provider: String,
+    pub request_id: String,
+    pub kind: ApprovalKind,
+    pub decision: ApprovalDecision,
+    pub policy_rule: String,
+    pub created_at: i64,
+}
+
+pub struct ApprovalAuditContext {
+    pub nakode_session_id: String,
+    pub agent_session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub provider: String,
+}
+
+impl ApprovalAuditRecord {
+    #[must_use]
+    pub fn new(
+        context: ApprovalAuditContext,
+        request_id: String,
+        kind: ApprovalKind,
+        decision: ApprovalDecision,
+        policy_rule: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::now_v7().to_string(),
+            nakode_session_id: context.nakode_session_id,
+            agent_session_id: context.agent_session_id,
+            run_id: context.run_id,
+            turn_id: context.turn_id,
+            provider: context.provider,
+            request_id,
+            kind,
+            decision,
+            policy_rule: policy_rule.into(),
+            created_at: unix_timestamp(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,6 +163,7 @@ pub struct SubagentRecord {
     pub status: SubagentStatus,
     pub latest_activity: String,
     pub transcript: Vec<TranscriptEntry>,
+    pub permissions: crate::permission::PermissionEnvelope,
 }
 
 #[derive(Debug, Error)]
@@ -122,6 +184,10 @@ pub enum SessionError {
     Database(#[from] rusqlite::Error),
     #[error("session {0:?} is ambiguous; use a longer id")]
     Ambiguous(String),
+    #[error("session {0:?} was not found")]
+    SessionNotFound(String),
+    #[error("provider {0:?} was not found")]
+    ProviderNotFound(String),
     #[error("invalid persisted value for {field}: {value:?}")]
     InvalidStoredValue { field: &'static str, value: String },
     #[error("provider {0} has no configured credentials")]
@@ -131,6 +197,35 @@ pub enum SessionError {
         path: &'static str,
         source: toml::de::Error,
     },
+}
+
+/// A Nakode database whose connection policy and schema migrations have been applied.
+#[derive(Clone, Debug)]
+pub struct InitializedDatabase {
+    path: Arc<PathBuf>,
+}
+
+impl InitializedDatabase {
+    /// Opens a database and applies Nakode's forward schema migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database cannot be opened, protected, or migrated.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
+        SqliteSessionRepository::bootstrap(path).map(|repository| repository.database)
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn connection(&self) -> Result<Connection, rusqlite::Error> {
+        let connection = Connection::open(self.path())?;
+        configure_connection(&connection)?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Ok(connection)
+    }
 }
 
 pub trait SessionRepository: Send + Sync {
@@ -160,6 +255,40 @@ pub trait SessionRepository: Send + Sync {
         title: &str,
         model: Option<&str>,
     ) -> Result<SessionRecord, SessionError>;
+    /// Creates or selects a provider-native session under a logical Nakode session.
+    ///
+    /// # Errors
+    /// Returns an error when either session record cannot be persisted.
+    fn create_agent_session(
+        &self,
+        nakode_session_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        workspace: &str,
+        title: &str,
+        model: Option<&str>,
+    ) -> Result<SessionRecord, SessionError>;
+    /// Lists every provider-native session belonging to a logical Nakode session.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried.
+    fn list_agent_sessions(
+        &self,
+        nakode_session_id: &str,
+    ) -> Result<Vec<AgentSessionRecord>, SessionError>;
+    /// Persists one provider approval policy decision.
+    ///
+    /// # Errors
+    /// Returns an error when the audit record cannot be stored.
+    fn save_approval_decision(&self, record: &ApprovalAuditRecord) -> Result<(), SessionError>;
+    /// Lists approval decisions for a logical session in decision order.
+    ///
+    /// # Errors
+    /// Returns an error when audit storage cannot be queried.
+    fn list_approval_decisions(
+        &self,
+        nakode_session_id: &str,
+    ) -> Result<Vec<ApprovalAuditRecord>, SessionError>;
     /// Marks a session as recently used.
     ///
     /// # Errors
@@ -239,7 +368,7 @@ pub trait SessionRepository: Send + Sync {
 
 pub struct SqliteSessionRepository {
     connection: Mutex<Connection>,
-    path: PathBuf,
+    database: InitializedDatabase,
 }
 
 impl SqliteSessionRepository {
@@ -288,26 +417,82 @@ impl SqliteSessionRepository {
     ///
     /// Returns an error when the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
+        Self::from_database(InitializedDatabase::open(path)?)
+    }
+
+    /// Opens a repository view over an initialized Nakode database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured `SQLite` connection cannot be opened.
+    pub fn from_database(database: InitializedDatabase) -> Result<Self, SessionError> {
+        Ok(Self {
+            connection: Mutex::new(database.connection()?),
+            database,
+        })
+    }
+
+    #[must_use]
+    pub fn database(&self) -> InitializedDatabase {
+        self.database.clone()
+    }
+
+    fn bootstrap(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let path = path.as_ref();
         let connection = Connection::open(path)?;
         configure_connection(&connection)?;
         protect_path(path, 0o600)?;
-        execute_batch_with_busy_retry(
-            &connection,
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS sessions (
-               id TEXT PRIMARY KEY,
-               provider TEXT NOT NULL,
-               provider_session_id TEXT NOT NULL,
-               workspace TEXT NOT NULL,
-               title TEXT NOT NULL,
-               model TEXT,
-               created_at INTEGER NOT NULL,
-               updated_at INTEGER NOT NULL,
-               UNIQUE(provider, provider_session_id)
-             );
-             CREATE INDEX IF NOT EXISTS sessions_workspace_updated
-               ON sessions(workspace, updated_at DESC);
+        initialize_schema(&connection)?;
+        migrate_logical_sessions(&connection)?;
+        let has_legacy_models = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backend_models'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if has_legacy_models {
+            connection.execute_batch(
+                "INSERT OR IGNORE INTO provider_models
+                   (provider, model_id, is_default, cached_at)
+                 SELECT provider, model_id, is_default, cached_at FROM backend_models;
+                 DROP TABLE backend_models;",
+            )?;
+        }
+        seed_provider_catalog(&connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            database: InitializedDatabase {
+                path: Arc::new(path.to_path_buf()),
+            },
+        })
+    }
+
+    #[must_use]
+    pub fn database_path(&self) -> &Path {
+        self.database.path()
+    }
+
+    fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+        Ok(SessionRecord {
+            id: row.get(0)?,
+            agent_session_id: row.get(1)?,
+            provider: row.get(2)?,
+            provider_session_id: row.get(3)?,
+            workspace: row.get(4)?,
+            title: row.get(5)?,
+            model: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    }
+}
+
+fn initialize_schema(connection: &Connection) -> Result<(), SessionError> {
+    execute_batch_with_busy_retry(
+        connection,
+        "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS provider_models (
                provider TEXT NOT NULL,
                model_id TEXT NOT NULL,
@@ -338,75 +523,110 @@ impl SqliteSessionRepository {
                updated_at INTEGER NOT NULL,
                PRIMARY KEY(provider, session_id)
              );
-             CREATE TABLE IF NOT EXISTS orchestration_runs (
-               parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-               id TEXT NOT NULL,
-               agent_slug TEXT NOT NULL,
-               provider TEXT NOT NULL,
-               provider_session_id TEXT,
-               objective TEXT NOT NULL,
-               status TEXT NOT NULL,
-               latest_activity TEXT NOT NULL,
-               created_at INTEGER NOT NULL,
-               updated_at INTEGER NOT NULL,
-               PRIMARY KEY(parent_session_id, id)
-             );
-             CREATE INDEX IF NOT EXISTS orchestration_runs_parent_created
-               ON orchestration_runs(parent_session_id, created_at, id);
-             CREATE TABLE IF NOT EXISTS agent_turns (
-               parent_session_id TEXT NOT NULL,
-               run_id TEXT NOT NULL,
-               sequence INTEGER NOT NULL,
-               item_key TEXT,
-               kind TEXT NOT NULL,
-               title TEXT NOT NULL,
-               body TEXT NOT NULL,
-               status TEXT NOT NULL,
-               PRIMARY KEY(parent_session_id, run_id, sequence),
-               FOREIGN KEY(parent_session_id, run_id)
-                 REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
-             );",
+             ",
+    )?;
+    Ok(())
+}
+
+fn migrate_logical_sessions(connection: &Connection) -> Result<(), SessionError> {
+    let has_legacy_sessions = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if has_legacy_sessions {
+        connection.execute_batch(
+            "DROP TABLE IF EXISTS agent_turns;
+             DROP TABLE IF EXISTS orchestration_turn_items;
+             DROP TABLE IF EXISTS orchestration_runs;
+             DROP TABLE sessions;",
         )?;
-        let has_legacy_models = connection
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backend_models'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if has_legacy_models {
-            connection.execute_batch(
-                "INSERT OR IGNORE INTO provider_models
-                   (provider, model_id, is_default, cached_at)
-                 SELECT provider, model_id, is_default, cached_at FROM backend_models;
-                 DROP TABLE backend_models;",
-            )?;
-        }
-        seed_provider_catalog(&connection)?;
-        Ok(Self {
-            connection: Mutex::new(connection),
-            path: path.to_path_buf(),
-        })
     }
-
-    #[must_use]
-    pub fn database_path(&self) -> &Path {
-        &self.path
-    }
-
-    fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-        Ok(SessionRecord {
-            id: row.get(0)?,
-            provider: row.get(1)?,
-            provider_session_id: row.get(2)?,
-            workspace: row.get(3)?,
-            title: row.get(4)?,
-            model: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
-        })
-    }
+    execute_batch_with_busy_retry(
+        connection,
+        "CREATE TABLE IF NOT EXISTS nakode_sessions (
+           id TEXT PRIMARY KEY,
+           workspace TEXT NOT NULL,
+           title TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS nakode_sessions_workspace_updated
+           ON nakode_sessions(workspace, updated_at DESC);
+         CREATE TABLE IF NOT EXISTS agent_sessions (
+           id TEXT PRIMARY KEY,
+           nakode_session_id TEXT NOT NULL
+             REFERENCES nakode_sessions(id) ON DELETE CASCADE,
+           provider TEXT NOT NULL,
+           provider_session_id TEXT NOT NULL,
+           model TEXT,
+           role TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           UNIQUE(provider, provider_session_id)
+         );
+         CREATE INDEX IF NOT EXISTS agent_sessions_logical_updated
+           ON agent_sessions(nakode_session_id, updated_at DESC);
+         CREATE TABLE IF NOT EXISTS agent_turns (
+           id TEXT PRIMARY KEY,
+           agent_session_id TEXT NOT NULL
+             REFERENCES agent_sessions(id) ON DELETE CASCADE,
+           provider_turn_id TEXT,
+           status TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS approval_decisions (
+           id TEXT PRIMARY KEY,
+           nakode_session_id TEXT NOT NULL
+             REFERENCES nakode_sessions(id) ON DELETE CASCADE,
+           agent_session_id TEXT REFERENCES agent_sessions(id) ON DELETE SET NULL,
+           run_id TEXT,
+           turn_id TEXT,
+           provider TEXT NOT NULL,
+           request_id TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           decision TEXT NOT NULL,
+           policy_rule TEXT NOT NULL,
+           created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS approval_decisions_session_created
+           ON approval_decisions(nakode_session_id, created_at, id);
+         CREATE TABLE IF NOT EXISTS orchestration_runs (
+           parent_session_id TEXT NOT NULL
+             REFERENCES nakode_sessions(id) ON DELETE CASCADE,
+           id TEXT NOT NULL,
+           agent_slug TEXT NOT NULL,
+           provider TEXT NOT NULL,
+           provider_session_id TEXT,
+           objective TEXT NOT NULL,
+           status TEXT NOT NULL,
+           latest_activity TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           permission_envelope TEXT NOT NULL DEFAULT '{}',
+           PRIMARY KEY(parent_session_id, id)
+         );
+         CREATE INDEX IF NOT EXISTS orchestration_runs_parent_created
+           ON orchestration_runs(parent_session_id, created_at, id);
+         CREATE TABLE IF NOT EXISTS orchestration_turn_items (
+           parent_session_id TEXT NOT NULL,
+           run_id TEXT NOT NULL,
+           sequence INTEGER NOT NULL,
+           item_key TEXT,
+           kind TEXT NOT NULL,
+           title TEXT NOT NULL,
+           body TEXT NOT NULL,
+           status TEXT NOT NULL,
+           PRIMARY KEY(parent_session_id, run_id, sequence),
+           FOREIGN KEY(parent_session_id, run_id)
+             REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
+         );",
+    )?;
+    Ok(())
 }
 
 fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
@@ -511,12 +731,92 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
-             FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
+            "SELECT logical.id, agent.id, agent.provider, agent.provider_session_id,
+                    logical.workspace, logical.title, agent.model,
+                    logical.created_at, logical.updated_at
+             FROM nakode_sessions AS logical
+             JOIN agent_sessions AS agent ON agent.id = (
+               SELECT candidate.id FROM agent_sessions AS candidate
+               WHERE candidate.nakode_session_id = logical.id
+               ORDER BY candidate.updated_at DESC, candidate.id DESC LIMIT 1
+             )
+             WHERE logical.workspace = ?1
+             ORDER BY logical.updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
         let rows = statement.query_map(params![workspace, bounded_limit], Self::row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn save_approval_decision(&self, record: &ApprovalAuditRecord) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "INSERT INTO approval_decisions
+               (id, nakode_session_id, agent_session_id, run_id, turn_id, provider,
+                request_id, kind, decision, policy_rule, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                record.id,
+                record.nakode_session_id,
+                record.agent_session_id,
+                record.run_id,
+                record.turn_id,
+                record.provider,
+                record.request_id,
+                approval_kind_value(record.kind),
+                approval_decision_value(record.decision),
+                record.policy_rule,
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_approval_decisions(
+        &self,
+        nakode_session_id: &str,
+    ) -> Result<Vec<ApprovalAuditRecord>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, nakode_session_id, agent_session_id, run_id, turn_id, provider,
+                    request_id, kind, decision, policy_rule, created_at
+             FROM approval_decisions WHERE nakode_session_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map([nakode_session_id], |row| {
+            let kind = row.get::<_, String>(7)?;
+            let decision = row.get::<_, String>(8)?;
+            Ok((
+                ApprovalAuditRecord {
+                    id: row.get(0)?,
+                    nakode_session_id: row.get(1)?,
+                    agent_session_id: row.get(2)?,
+                    run_id: row.get(3)?,
+                    turn_id: row.get(4)?,
+                    provider: row.get(5)?,
+                    request_id: row.get(6)?,
+                    kind: ApprovalKind::Other,
+                    decision: ApprovalDecision::Decline,
+                    policy_rule: row.get(9)?,
+                    created_at: row.get(10)?,
+                },
+                kind,
+                decision,
+            ))
+        })?;
+        rows.map(|row| {
+            let (mut record, kind, decision) = row?;
+            record.kind = approval_kind_from_value(&kind)?;
+            record.decision = approval_decision_from_value(&decision)?;
+            Ok(record)
+        })
+        .collect()
     }
 
     fn find(&self, id: &str) -> Result<Option<SessionRecord>, SessionError> {
@@ -526,8 +826,16 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
-                 FROM sessions WHERE id = ?1",
+                "SELECT logical.id, agent.id, agent.provider, agent.provider_session_id,
+                        logical.workspace, logical.title, agent.model,
+                        logical.created_at, logical.updated_at
+                 FROM nakode_sessions AS logical
+                 JOIN agent_sessions AS agent ON agent.id = (
+                   SELECT candidate.id FROM agent_sessions AS candidate
+                   WHERE candidate.nakode_session_id = logical.id
+                   ORDER BY candidate.updated_at DESC, candidate.id DESC LIMIT 1
+                 )
+                 WHERE logical.id = ?1",
                 [id],
                 Self::row,
             )
@@ -537,8 +845,17 @@ impl SessionRepository for SqliteSessionRepository {
         }
         let pattern = format!("{id}%");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
-             FROM sessions WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
+            "SELECT logical.id, agent.id, agent.provider, agent.provider_session_id,
+                    logical.workspace, logical.title, agent.model,
+                    logical.created_at, logical.updated_at
+             FROM nakode_sessions AS logical
+             JOIN agent_sessions AS agent ON agent.id = (
+               SELECT candidate.id FROM agent_sessions AS candidate
+               WHERE candidate.nakode_session_id = logical.id
+               ORDER BY candidate.updated_at DESC, candidate.id DESC LIMIT 1
+             )
+             WHERE logical.id LIKE ?1
+             ORDER BY logical.updated_at DESC LIMIT 2",
         )?;
         let matches = statement
             .query_map([pattern], Self::row)?
@@ -558,30 +875,113 @@ impl SessionRepository for SqliteSessionRepository {
         title: &str,
         model: Option<&str>,
     ) -> Result<SessionRecord, SessionError> {
+        self.create_agent_session(
+            &Uuid::now_v7().to_string(),
+            provider,
+            provider_session_id,
+            workspace,
+            title,
+            model,
+        )
+    }
+
+    fn create_agent_session(
+        &self,
+        nakode_session_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        workspace: &str,
+        title: &str,
+        model: Option<&str>,
+    ) -> Result<SessionRecord, SessionError> {
         let now = unix_timestamp();
-        let id = Uuid::now_v7().to_string();
+        let agent_session_id = Uuid::now_v7().to_string();
         let title = title.lines().next().unwrap_or("New session").trim();
         let title = if title.is_empty() {
             "New session"
         } else {
             title
         };
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let existing_logical_id = transaction
+            .query_row(
+                "SELECT nakode_session_id FROM agent_sessions
+                 WHERE provider = ?1 AND provider_session_id = ?2",
+                params![provider, provider_session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let nakode_session_id = existing_logical_id.as_deref().unwrap_or(nakode_session_id);
+        transaction.execute(
+            "INSERT INTO nakode_sessions
+               (id, workspace, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at",
+            params![nakode_session_id, workspace, title, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO agent_sessions
+               (id, nakode_session_id, provider, provider_session_id, model, role,
+                created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'primary', ?6, ?6)
+             ON CONFLICT(provider, provider_session_id) DO UPDATE SET
+               updated_at = excluded.updated_at,
+               model = COALESCE(excluded.model, agent_sessions.model)",
+            params![
+                agent_session_id,
+                nakode_session_id,
+                provider,
+                provider_session_id,
+                model,
+                now
+            ],
+        )?;
+        let record = transaction.query_row(
+            "SELECT logical.id, agent.id, agent.provider, agent.provider_session_id,
+                    logical.workspace, logical.title, agent.model,
+                    logical.created_at, logical.updated_at
+             FROM nakode_sessions AS logical
+             JOIN agent_sessions AS agent ON agent.nakode_session_id = logical.id
+             WHERE agent.provider = ?1 AND agent.provider_session_id = ?2",
+            params![provider, provider_session_id],
+            Self::row,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    fn list_agent_sessions(
+        &self,
+        nakode_session_id: &str,
+    ) -> Result<Vec<AgentSessionRecord>, SessionError> {
         let connection = self
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
-            "INSERT INTO sessions (id, provider, provider_session_id, workspace, title, model, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-             ON CONFLICT(provider, provider_session_id) DO UPDATE SET updated_at = excluded.updated_at",
-            params![id, provider, provider_session_id, workspace, title, model, now],
+        let mut statement = connection.prepare(
+            "SELECT id, nakode_session_id, provider, provider_session_id, model, role,
+                    created_at, updated_at
+             FROM agent_sessions
+             WHERE nakode_session_id = ?1
+             ORDER BY created_at, id",
         )?;
-        connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
-             FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
-            params![provider, provider_session_id],
-            Self::row,
-        ).map_err(Into::into)
+        let rows = statement.query_map([nakode_session_id], |row| {
+            Ok(AgentSessionRecord {
+                id: row.get(0)?,
+                nakode_session_id: row.get(1)?,
+                provider: row.get(2)?,
+                provider_session_id: row.get(3)?,
+                model: row.get(4)?,
+                role: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     fn touch(&self, id: &str) -> Result<(), SessionError> {
@@ -589,10 +989,14 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
-            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
-            params![unix_timestamp(), id],
+        let now = unix_timestamp();
+        let updated = connection.execute(
+            "UPDATE nakode_sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now, id],
         )?;
+        if updated == 0 {
+            return Err(SessionError::SessionNotFound(id.to_owned()));
+        }
         Ok(())
     }
 
@@ -601,10 +1005,18 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
-            "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
-            params![model, unix_timestamp(), id],
+        let now = unix_timestamp();
+        let updated = connection.execute(
+            "UPDATE agent_sessions SET model = ?1, updated_at = ?2
+             WHERE id = (
+               SELECT id FROM agent_sessions WHERE nakode_session_id = ?3
+               ORDER BY updated_at DESC, id DESC LIMIT 1
+             )",
+            params![model, now, id],
         )?;
+        if updated == 0 {
+            return Err(SessionError::SessionNotFound(id.to_owned()));
+        }
         Ok(())
     }
 
@@ -730,10 +1142,13 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
+        let updated = connection.execute(
             "UPDATE providers SET enabled = ?1, updated_at = ?2 WHERE provider = ?3",
             params![i64::from(enabled), unix_timestamp(), provider],
         )?;
+        if updated == 0 {
+            return Err(SessionError::ProviderNotFound(provider.to_owned()));
+        }
         Ok(())
     }
 
@@ -747,8 +1162,8 @@ impl SessionRepository for SqliteSessionRepository {
         transaction.execute(
             "INSERT INTO orchestration_runs
                (parent_session_id, id, agent_slug, provider, provider_session_id, objective,
-                status, latest_activity, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                status, latest_activity, created_at, updated_at, permission_envelope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
              ON CONFLICT(parent_session_id, id) DO UPDATE SET
                agent_slug = excluded.agent_slug,
                provider = excluded.provider,
@@ -756,6 +1171,7 @@ impl SessionRepository for SqliteSessionRepository {
                objective = excluded.objective,
                status = excluded.status,
                latest_activity = excluded.latest_activity,
+               permission_envelope = excluded.permission_envelope,
                updated_at = excluded.updated_at",
             params![
                 record.parent_session_id,
@@ -767,15 +1183,22 @@ impl SessionRepository for SqliteSessionRepository {
                 record.status.database_value(),
                 record.latest_activity,
                 now,
+                serde_json::to_string(&record.permissions).map_err(|error| {
+                    SessionError::InvalidStoredValue {
+                        field: "orchestration_runs.permission_envelope",
+                        value: error.to_string(),
+                    }
+                })?,
             ],
         )?;
         transaction.execute(
-            "DELETE FROM agent_turns WHERE parent_session_id = ?1 AND run_id = ?2",
+            "DELETE FROM orchestration_turn_items
+             WHERE parent_session_id = ?1 AND run_id = ?2",
             params![record.parent_session_id, record.id],
         )?;
         {
             let mut statement = transaction.prepare(
-                "INSERT INTO agent_turns
+                "INSERT INTO orchestration_turn_items
                    (parent_session_id, run_id, sequence, item_key, kind, title, body, status)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
@@ -804,7 +1227,7 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id, agent_slug, provider, provider_session_id, objective, status,
-                    latest_activity
+                    latest_activity, permission_envelope
              FROM orchestration_runs
              WHERE parent_session_id = ?1
              ORDER BY created_at, id",
@@ -818,12 +1241,21 @@ impl SessionRepository for SqliteSessionRepository {
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
         let stored_runs = rows.collect::<Result<Vec<_>, _>>()?;
         let mut records = Vec::with_capacity(stored_runs.len());
-        for (id, agent, provider, provider_session_id, objective, status, latest_activity) in
-            stored_runs
+        for (
+            id,
+            agent,
+            provider,
+            provider_session_id,
+            objective,
+            status,
+            latest_activity,
+            permission_envelope,
+        ) in stored_runs
         {
             let transcript = load_subagent_transcript(&connection, parent_session_id, &id)?;
             records.push(SubagentRecord {
@@ -836,6 +1268,12 @@ impl SessionRepository for SqliteSessionRepository {
                 status: SubagentStatus::from_database(&status)?,
                 latest_activity,
                 transcript,
+                permissions: serde_json::from_str(&permission_envelope).map_err(|_| {
+                    SessionError::InvalidStoredValue {
+                        field: "orchestration_runs.permission_envelope",
+                        value: permission_envelope,
+                    }
+                })?,
             });
         }
         Ok(records)
@@ -965,7 +1403,7 @@ fn load_subagent_transcript(
 ) -> Result<Vec<TranscriptEntry>, SessionError> {
     let mut statement = connection.prepare(
         "SELECT item_key, kind, title, body, status
-         FROM agent_turns
+         FROM orchestration_turn_items
          WHERE parent_session_id = ?1 AND run_id = ?2
          ORDER BY sequence",
     )?;
@@ -1017,7 +1455,7 @@ fn entry_kind_from_value(value: &str) -> Result<EntryKind, SessionError> {
         "warning" => Ok(EntryKind::Warning),
         "error" => Ok(EntryKind::Error),
         _ => Err(SessionError::InvalidStoredValue {
-            field: "agent_turns.kind",
+            field: "orchestration_turn_items.kind",
             value: value.to_owned(),
         }),
     }
@@ -1039,7 +1477,47 @@ fn entry_status_from_value(value: &str) -> Result<EntryStatus, SessionError> {
         "failed" => Ok(EntryStatus::Failed),
         "interrupted" => Ok(EntryStatus::Interrupted),
         _ => Err(SessionError::InvalidStoredValue {
-            field: "agent_turns.status",
+            field: "orchestration_turn_items.status",
+            value: value.to_owned(),
+        }),
+    }
+}
+
+const fn approval_kind_value(kind: ApprovalKind) -> &'static str {
+    match kind {
+        ApprovalKind::Command => "command",
+        ApprovalKind::FileChange => "file_change",
+        ApprovalKind::Other => "other",
+    }
+}
+
+fn approval_kind_from_value(value: &str) -> Result<ApprovalKind, SessionError> {
+    match value {
+        "command" => Ok(ApprovalKind::Command),
+        "file_change" => Ok(ApprovalKind::FileChange),
+        "other" => Ok(ApprovalKind::Other),
+        _ => Err(SessionError::InvalidStoredValue {
+            field: "approval_decisions.kind",
+            value: value.to_owned(),
+        }),
+    }
+}
+
+const fn approval_decision_value(decision: ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::AcceptOnce => "accept_once",
+        ApprovalDecision::AcceptForSession => "accept_for_session",
+        ApprovalDecision::Decline => "decline",
+    }
+}
+
+fn approval_decision_from_value(value: &str) -> Result<ApprovalDecision, SessionError> {
+    match value {
+        "accept_once" => Ok(ApprovalDecision::AcceptOnce),
+        "accept_for_session" => Ok(ApprovalDecision::AcceptForSession),
+        "decline" => Ok(ApprovalDecision::Decline),
+        _ => Err(SessionError::InvalidStoredValue {
+            field: "approval_decisions.decision",
             value: value.to_owned(),
         }),
     }
@@ -1154,12 +1632,114 @@ mod tests {
     }
 
     #[test]
+    fn one_logical_session_owns_multiple_provider_sessions() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let logical_id = Uuid::now_v7().to_string();
+        let codex = store.create_agent_session(
+            &logical_id,
+            CODEX_PROVIDER,
+            "codex-thread",
+            "/tmp/project",
+            "Shared objective",
+            Some("openai-codex/gpt-5.4"),
+        )?;
+        let devin = store.create_agent_session(
+            &logical_id,
+            DEVIN_PROVIDER,
+            "devin-thread",
+            "/tmp/project",
+            "Shared objective",
+            Some("devin-acp/sonnet-4.5"),
+        )?;
+
+        assert_eq!(codex.id, logical_id);
+        assert_eq!(devin.id, logical_id);
+        assert_ne!(codex.agent_session_id, devin.agent_session_id);
+        let agents = store.list_agent_sessions(&logical_id)?;
+        assert_eq!(agents.len(), 2);
+        assert!(agents.iter().any(|agent| agent.provider == CODEX_PROVIDER));
+        assert!(agents.iter().any(|agent| agent.provider == DEVIN_PROVIDER));
+        assert_eq!(store.list_recent("/tmp/project", 10)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn approval_decisions_round_trip_with_session_provenance() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let session = store.create(
+            CODEX_PROVIDER,
+            "provider-session",
+            "/tmp/project",
+            "Audited work",
+            Some("openai-codex/gpt-5.4"),
+        )?;
+        let record = ApprovalAuditRecord::new(
+            ApprovalAuditContext {
+                nakode_session_id: session.id.clone(),
+                agent_session_id: Some(session.agent_session_id),
+                run_id: Some("run-1".to_owned()),
+                turn_id: Some("turn-1".to_owned()),
+                provider: CODEX_PROVIDER.to_owned(),
+            },
+            "\"request-1\"".to_owned(),
+            ApprovalKind::Command,
+            ApprovalDecision::AcceptOnce,
+            "delegated unattended permission envelope",
+        );
+
+        store.save_approval_decision(&record)?;
+        assert_eq!(store.list_approval_decisions(&session.id)?, vec![record]);
+        Ok(())
+    }
+
+    #[test]
+    fn cuts_over_legacy_session_storage_without_repurposing_it() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("sessions.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE sessions (
+               id TEXT PRIMARY KEY,
+               provider TEXT NOT NULL,
+               provider_session_id TEXT NOT NULL,
+               workspace TEXT NOT NULL,
+               title TEXT NOT NULL,
+               model TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               UNIQUE(provider, provider_session_id)
+             );
+             INSERT INTO sessions VALUES
+               ('logical-legacy', 'openai-codex', 'thread-legacy', '/tmp/project',
+                'Legacy work', 'openai-codex/gpt-5.4', 1, 2);",
+        )?;
+        drop(connection);
+
+        let store = SqliteSessionRepository::open(&path)?;
+        assert_eq!(store.find("logical-legacy")?, None);
+        assert!(store.list_agent_sessions("logical-legacy")?.is_empty());
+        let connection = store.database.connection()?;
+        let legacy_table = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?;
+        assert_eq!(legacy_table, None);
+        Ok(())
+    }
+
+    #[test]
     fn persists_provider_enablement() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("providers.db");
         let store = SqliteSessionRepository::open(&path)?;
         let credentials =
-            crate::credential::SqliteCredentialStore::open(&path).expect("credential store");
+            crate::credential::SqliteCredentialStore::from_database(&store.database())
+                .expect("credential store");
         let providers = store.list_providers()?;
         assert_eq!(providers.len(), 3);
         assert!(providers.iter().all(|provider| !provider.enabled));
@@ -1210,6 +1790,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mutations_for_unknown_records() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("unknown.db"))?;
+
+        assert!(matches!(
+            store.touch("missing-session"),
+            Err(SessionError::SessionNotFound(id)) if id == "missing-session"
+        ));
+        assert!(matches!(
+            store.update_model("missing-session", Some("model")),
+            Err(SessionError::SessionNotFound(id)) if id == "missing-session"
+        ));
+        assert!(matches!(
+            store.set_provider_enabled("missing-provider", true),
+            Err(SessionError::ProviderNotFound(provider)) if provider == "missing-provider"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn persists_subagent_run_and_transcript_projection() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteSessionRepository::open(directory.path().join("subagents.db"))?;
@@ -1245,6 +1845,7 @@ mod tests {
                     status: EntryStatus::Complete,
                 },
             ],
+            permissions: crate::permission::PermissionEnvelope::default(),
         };
 
         store.save_subagent(&record)?;
