@@ -29,7 +29,7 @@ use crate::{
         SqliteSessionRepository,
     },
     skill::{SkillCatalog, SkillCatalogError},
-    state::{AgentBrowserStatus, AppState, ApprovalDecision, Effect},
+    state::{AgentBrowserStatus, AppState, ApprovalDecision, Effect, SessionPersistence},
     terminal::{TerminalSession, Tui},
 };
 
@@ -156,18 +156,25 @@ impl BackendRegistry {
         if self.commands.contains_key(provider) {
             return Ok(());
         }
-        let handle = self.spawn_provider_handle(provider).await?;
+        let handle = self
+            .spawn_provider_handle(provider, crate::permission::PermissionEnvelope::default())
+            .await?;
         self.insert_primary(provider.to_owned(), handle);
         Ok(())
     }
 
-    async fn spawn_provider_handle(&self, provider: &str) -> Result<BackendHandle, BackendError> {
+    async fn spawn_provider_handle(
+        &self,
+        provider: &str,
+        permissions: crate::permission::PermissionEnvelope,
+    ) -> Result<BackendHandle, BackendError> {
         let credential = self.provider_credentials.get(provider).cloned();
         let handle = match provider {
             crate::backend::CODEX_PROVIDER => {
                 codex::spawn(
                     codex::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_permissions(permissions.clone())
                         .with_reasoning_effort(self.config.openai_reasoning_effort.as_str())
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
@@ -193,6 +200,7 @@ impl BackendRegistry {
                 devin::spawn(
                     devin::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_permissions(permissions)
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
@@ -262,7 +270,12 @@ impl BackendRegistry {
                 provider: provider.to_owned(),
             });
         }
-        let handle = self.spawn_provider_handle(provider).await?;
+        let handle = self
+            .spawn_provider_handle(
+                provider,
+                crate::permission::PermissionEnvelope::unattended_workspace(),
+            )
+            .await?;
         let (commands, mut events, task) = handle.into_parts();
         self.subagent_commands.insert(run_id.clone(), commands);
         self.subagent_providers
@@ -853,25 +866,7 @@ async fn apply_effects(
             Effect::DeleteAgent(slug) => delete_agent_definition(state, &slug),
             Effect::ReloadConfiguration => apply_configuration_reload(state, &mut pending),
             Effect::ResolveSession(id) => resolve_session(state, sessions, &mut pending, &id),
-            Effect::PersistSession {
-                nakode_session_id,
-                provider,
-                provider_session_id,
-                workspace,
-                title,
-                model,
-            } => persist_session(
-                state,
-                sessions,
-                &SessionCreateRequest {
-                    nakode_session_id: &nakode_session_id,
-                    provider: &provider,
-                    provider_session_id: &provider_session_id,
-                    workspace: &workspace,
-                    title: &title,
-                    model: model.as_deref(),
-                },
-            ),
+            Effect::PersistSession(request) => persist_session(state, sessions, &request),
             Effect::PersistModels { provider, models } => {
                 persist_models(state, sessions, &provider, &models);
             }
@@ -879,6 +874,9 @@ async fn apply_effects(
                 set_default_model(state, sessions, &provider, &model);
             }
             Effect::PersistSubagent(record) => persist_subagent(state, sessions, &record),
+            Effect::PersistApprovalDecision(record) => {
+                persist_approval_decision(state, sessions, &record);
+            }
             Effect::LoadSubagents(parent_session_id) => {
                 load_subagents(state, sessions, &parent_session_id);
             }
@@ -902,15 +900,6 @@ async fn apply_effects(
     quit
 }
 
-struct SessionCreateRequest<'a> {
-    nakode_session_id: &'a str,
-    provider: &'a str,
-    provider_session_id: &'a str,
-    workspace: &'a str,
-    title: &'a str,
-    model: Option<&'a str>,
-}
-
 fn resolve_session(
     state: &mut AppState,
     sessions: &dyn SessionRepository,
@@ -924,18 +913,28 @@ fn resolve_session(
     }
 }
 
+fn persist_approval_decision(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    record: &crate::session::ApprovalAuditRecord,
+) {
+    if let Err(error) = sessions.save_approval_decision(record) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
 fn persist_session(
     state: &mut AppState,
     sessions: &dyn SessionRepository,
-    request: &SessionCreateRequest<'_>,
+    request: &SessionPersistence,
 ) {
     match sessions.create_agent_session(
-        request.nakode_session_id,
-        request.provider,
-        request.provider_session_id,
-        request.workspace,
-        request.title,
-        request.model,
+        &request.nakode_session_id,
+        &request.provider,
+        &request.provider_session_id,
+        &request.workspace,
+        &request.title,
+        request.model.as_deref(),
     ) {
         Ok(record) => state.session_persisted(&record),
         Err(error) => state.session_store_failed(error.to_string()),

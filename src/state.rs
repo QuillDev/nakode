@@ -16,8 +16,11 @@ use crate::{
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
     handoff::HandoffPackage,
+    permission::PermissionEnvelope,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
-    session::{ProviderRecord, SessionRecord, SubagentRecord},
+    session::{
+        ApprovalAuditContext, ApprovalAuditRecord, ProviderRecord, SessionRecord, SubagentRecord,
+    },
     skill::{Skill, SkillCatalog},
     terminal_image::TerminalImageMode,
     transcript::{EntryKind, EntryStatus, TOOL_HISTORY_TOGGLE_KEY, Transcript},
@@ -536,6 +539,7 @@ struct SubagentExecution {
     response: String,
     model_targets: Vec<AgentModelTarget>,
     model_target_index: usize,
+    permissions: PermissionEnvelope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -549,6 +553,16 @@ pub struct AgentRequest {
     pub id: u64,
     pub agent: String,
     pub task: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionPersistence {
+    pub nakode_session_id: String,
+    pub provider: String,
+    pub provider_session_id: String,
+    pub workspace: String,
+    pub title: String,
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -589,14 +603,7 @@ pub enum Effect {
     DeleteAgent(String),
     ReloadConfiguration,
     ResolveSession(String),
-    PersistSession {
-        nakode_session_id: String,
-        provider: String,
-        provider_session_id: String,
-        workspace: String,
-        title: String,
-        model: Option<String>,
-    },
+    PersistSession(SessionPersistence),
     PersistModels {
         provider: String,
         models: Vec<ModelInfo>,
@@ -606,6 +613,7 @@ pub enum Effect {
         model: String,
     },
     PersistSubagent(SubagentRecord),
+    PersistApprovalDecision(ApprovalAuditRecord),
     LoadSubagents(String),
     UpdateSessionModel {
         session_id: String,
@@ -2803,10 +2811,36 @@ impl AppState {
             EntryStatus::Complete,
         );
         self.status_message = format!("Approval {decision_name}.");
-        vec![Effect::Backend(BackendCommand::ResolveApproval {
-            id: approval.id,
+        let audit = self.approval_audit(&approval, decision, None, "interactive user decision");
+        vec![
+            Effect::Backend(BackendCommand::ResolveApproval {
+                id: approval.id,
+                decision,
+            }),
+            Effect::PersistApprovalDecision(audit),
+        ]
+    }
+
+    fn approval_audit(
+        &self,
+        approval: &ApprovalRequest,
+        decision: ApprovalDecision,
+        run_id: Option<String>,
+        policy_rule: &str,
+    ) -> ApprovalAuditRecord {
+        ApprovalAuditRecord::new(
+            ApprovalAuditContext {
+                nakode_session_id: self.nakode_session_id.clone(),
+                agent_session_id: self.agent_session_id.clone(),
+                run_id,
+                turn_id: self.active_turn.as_ref().map(|turn| turn.id.clone()),
+                provider: self.backend_provider.clone(),
+            },
+            approval.id.to_string(),
+            approval.kind,
             decision,
-        })]
+            policy_rule,
+        )
     }
 
     pub fn move_question_selection(&mut self, delta: isize) {
@@ -3323,14 +3357,14 @@ impl AppState {
         let Some(prompt) = self.pending_session_prompt.take() else {
             return Vec::new();
         };
-        let mut effects = vec![Effect::PersistSession {
+        let mut effects = vec![Effect::PersistSession(SessionPersistence {
             nakode_session_id: self.nakode_session_id.clone(),
             provider: self.backend_provider.clone(),
             provider_session_id: provider_session_id.clone(),
             workspace: self.workspace.clone(),
             title: prompt.text.clone(),
             model: self.selected_model.clone(),
-        }];
+        })];
         effects.extend(self.start_prompt_on_session(prompt, provider_session_id));
         effects
     }
@@ -3700,13 +3734,15 @@ impl AppState {
         self.scroll_from_bottom = 0;
 
         if let Some(provider_session_id) = self.provider_session_id.clone() {
-            let persist = self.session_id.is_none().then(|| Effect::PersistSession {
-                nakode_session_id: self.nakode_session_id.clone(),
-                provider: self.backend_provider.clone(),
-                provider_session_id: provider_session_id.clone(),
-                workspace: self.workspace.clone(),
-                title: prompt.text.clone(),
-                model: self.selected_model.clone(),
+            let persist = self.session_id.is_none().then(|| {
+                Effect::PersistSession(SessionPersistence {
+                    nakode_session_id: self.nakode_session_id.clone(),
+                    provider: self.backend_provider.clone(),
+                    provider_session_id: provider_session_id.clone(),
+                    workspace: self.workspace.clone(),
+                    title: prompt.text.clone(),
+                    model: self.selected_model.clone(),
+                })
             });
             let mut effects = self.start_prompt_on_session(prompt, provider_session_id);
             if let Some(persist) = persist {
@@ -4129,6 +4165,7 @@ impl AppState {
                 response: String::new(),
                 model_targets,
                 model_target_index: 0,
+                permissions: PermissionEnvelope::unattended_workspace(),
             },
         );
         self.status_message = format!("Spawned subagent {agent_slug} as {run_id}.");
@@ -4220,13 +4257,9 @@ impl AppState {
                 self.observe_subagent_item(run_id, item);
                 Vec::new()
             }
-            BackendEvent::ApprovalRequested(approval) => vec![Effect::SubagentBackend {
-                run_id: run_id.to_owned(),
-                command: BackendCommand::ResolveApproval {
-                    id: approval.id,
-                    decision: ApprovalDecision::AcceptForSession,
-                },
-            }],
+            BackendEvent::ApprovalRequested(approval) => {
+                self.resolve_subagent_approval(run_id, approval)
+            }
             BackendEvent::QuestionRequested(request) => vec![Effect::SubagentBackend {
                 run_id: run_id.to_owned(),
                 command: BackendCommand::ResolveQuestion {
@@ -4289,6 +4322,31 @@ impl AppState {
             | BackendEvent::ModelRerouted { .. }
             | BackendEvent::SessionClosed { .. } => Vec::new(),
         }
+    }
+
+    fn resolve_subagent_approval(&self, run_id: &str, approval: ApprovalRequest) -> Vec<Effect> {
+        let decision = self
+            .subagent_executions
+            .get(run_id)
+            .map_or(ApprovalDecision::Decline, |execution| {
+                execution.permissions.provider_decision(approval.kind)
+            });
+        let audit = self.approval_audit(
+            &approval,
+            decision,
+            Some(run_id.to_owned()),
+            "delegated unattended permission envelope",
+        );
+        vec![
+            Effect::SubagentBackend {
+                run_id: run_id.to_owned(),
+                command: BackendCommand::ResolveApproval {
+                    id: approval.id,
+                    decision,
+                },
+            },
+            Effect::PersistApprovalDecision(audit),
+        ]
     }
 
     fn reduce_subagent_compaction_event(
@@ -4724,6 +4782,12 @@ impl AppState {
         let parent_session_id = self.session_id.clone()?;
         let run = self.subagents.iter().find(|run| run.id == run_id)?;
         let chat = self.subagent_chats.get(run_id)?;
+        let permissions = self
+            .subagent_executions
+            .get(run_id)
+            .map_or_else(PermissionEnvelope::default, |execution| {
+                execution.permissions.clone()
+            });
         Some(Effect::PersistSubagent(SubagentRecord {
             parent_session_id,
             id: run.id.clone(),
@@ -4734,6 +4798,7 @@ impl AppState {
             status: run.status,
             latest_activity: run.latest_activity.clone(),
             transcript: chat.transcript.entries().to_vec(),
+            permissions,
         }))
     }
 
@@ -5024,7 +5089,9 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus};
+    use super::{
+        AgentRequest, AppState, ApprovalDecision, Effect, SessionPersistence, SubagentStatus,
+    };
 
     fn explorer_catalog() -> AgentCatalog {
         let directory = tempdir().expect("agent directory");
@@ -5433,7 +5500,11 @@ model = "openai-codex/model-a"
         assert!(matches!(
             effects.as_slice(),
             [
-                Effect::PersistSession { provider_session_id, model, .. },
+                Effect::PersistSession(SessionPersistence {
+                    provider_session_id,
+                    model,
+                    ..
+                }),
                 Effect::Backend(BackendCommand::StartTurn { .. })
             ] if provider_session_id == "devin-session" && model.as_deref() == Some("devin-acp/model-b")
         ));
@@ -5550,7 +5621,7 @@ model = "openai-codex/model-a"
         });
         assert!(matches!(
             effects.as_slice(),
-            [Effect::PersistSession { .. }, Effect::Backend(_)]
+            [Effect::PersistSession(_), Effect::Backend(_)]
         ));
     }
 
@@ -5723,8 +5794,10 @@ model = "openai-codex/model-a"
             detail: "cargo test".to_owned(),
         });
         let effects = state.resolve_approval(ApprovalDecision::AcceptOnce);
-        let [Effect::Backend(BackendCommand::ResolveApproval { decision, .. })] =
-            effects.as_slice()
+        let [
+            Effect::Backend(BackendCommand::ResolveApproval { decision, .. }),
+            Effect::PersistApprovalDecision(_),
+        ] = effects.as_slice()
         else {
             panic!("expected approval response");
         };
@@ -5738,8 +5811,10 @@ model = "openai-codex/model-a"
             detail: "cargo test".to_owned(),
         });
         let effects = state.resolve_approval(ApprovalDecision::AcceptForSession);
-        let [Effect::Backend(BackendCommand::ResolveApproval { decision, .. })] =
-            effects.as_slice()
+        let [
+            Effect::Backend(BackendCommand::ResolveApproval { decision, .. }),
+            Effect::PersistApprovalDecision(_),
+        ] = effects.as_slice()
         else {
             panic!("expected approval response");
         };
@@ -6232,6 +6307,7 @@ model = "openai-codex/model-a"
                 body: "The session store owns orchestration metadata.".to_owned(),
                 status: EntryStatus::Complete,
             }],
+            permissions: crate::permission::PermissionEnvelope::default(),
         }]);
 
         assert_eq!(state.subagents.len(), 1);
@@ -6468,7 +6544,7 @@ model = "openai-codex/model-a"
             model: "shared".to_owned(),
         });
         let [
-            Effect::PersistSession { title, .. },
+            Effect::PersistSession(SessionPersistence { title, .. }),
             Effect::Backend(BackendCommand::StartTurn { prompt, .. }),
         ] = effects.as_slice()
         else {
@@ -6784,13 +6860,16 @@ model = "openai-codex/model-a"
         );
         assert!(matches!(
             approval_effects.as_slice(),
-            [Effect::SubagentBackend {
-                command: BackendCommand::ResolveApproval {
-                    decision: ApprovalDecision::AcceptForSession,
+            [
+                Effect::SubagentBackend {
+                    command: BackendCommand::ResolveApproval {
+                        decision: ApprovalDecision::AcceptOnce,
+                        ..
+                    },
                     ..
                 },
-                ..
-            }]
+                Effect::PersistApprovalDecision(_)
+            ]
         ));
 
         state.handle_subagent_backend(

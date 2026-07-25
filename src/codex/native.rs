@@ -49,6 +49,7 @@ pub struct BackendConfig {
     web_config: Option<Arc<std::sync::RwLock<crate::web::WebConfig>>>,
     vision_config: Option<Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
     vision_service: Option<crate::vision::SharedVisionService>,
+    permissions: crate::permission::PermissionEnvelope,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +80,7 @@ impl BackendConfig {
             web_config: None,
             vision_config: None,
             vision_service: None,
+            permissions: crate::permission::PermissionEnvelope::default(),
         }
     }
 
@@ -91,6 +93,12 @@ impl BackendConfig {
     #[must_use]
     pub fn with_session_store(mut self, store: RuntimeSessionStore) -> Self {
         self.session_store = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn with_permissions(mut self, permissions: crate::permission::PermissionEnvelope) -> Self {
+        self.permissions = permissions;
         self
     }
 
@@ -409,7 +417,8 @@ async fn run_supervisor(
     });
     let runtime = provider.map(|provider| {
         let mut runtime = AgentRuntime::new(config.workspace.clone(), provider)
-            .with_compaction_threshold_percent(config.compaction_threshold_percent);
+            .with_compaction_threshold_percent(config.compaction_threshold_percent)
+            .with_permissions(config.permissions.clone());
         if let Some(web_config) = &config.web_config {
             runtime = runtime.with_web_config(Arc::clone(web_config));
         }

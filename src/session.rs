@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 pub use crate::backend::{CODEX_PROVIDER, DEVIN_PROVIDER};
 use crate::{
-    backend::ModelInfo,
+    backend::{ApprovalDecision, ApprovalKind, ModelInfo},
     credential::CredentialMetadata,
     terminal_image::TerminalImageMode,
     transcript::{EntryKind, EntryStatus, TranscriptEntry},
@@ -59,6 +59,54 @@ pub struct AgentSessionRecord {
     pub role: String,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalAuditRecord {
+    pub id: String,
+    pub nakode_session_id: String,
+    pub agent_session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub provider: String,
+    pub request_id: String,
+    pub kind: ApprovalKind,
+    pub decision: ApprovalDecision,
+    pub policy_rule: String,
+    pub created_at: i64,
+}
+
+pub struct ApprovalAuditContext {
+    pub nakode_session_id: String,
+    pub agent_session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub provider: String,
+}
+
+impl ApprovalAuditRecord {
+    #[must_use]
+    pub fn new(
+        context: ApprovalAuditContext,
+        request_id: String,
+        kind: ApprovalKind,
+        decision: ApprovalDecision,
+        policy_rule: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::now_v7().to_string(),
+            nakode_session_id: context.nakode_session_id,
+            agent_session_id: context.agent_session_id,
+            run_id: context.run_id,
+            turn_id: context.turn_id,
+            provider: context.provider,
+            request_id,
+            kind,
+            decision,
+            policy_rule: policy_rule.into(),
+            created_at: unix_timestamp(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,6 +163,7 @@ pub struct SubagentRecord {
     pub status: SubagentStatus,
     pub latest_activity: String,
     pub transcript: Vec<TranscriptEntry>,
+    pub permissions: crate::permission::PermissionEnvelope,
 }
 
 #[derive(Debug, Error)]
@@ -227,6 +276,19 @@ pub trait SessionRepository: Send + Sync {
         &self,
         nakode_session_id: &str,
     ) -> Result<Vec<AgentSessionRecord>, SessionError>;
+    /// Persists one provider approval policy decision.
+    ///
+    /// # Errors
+    /// Returns an error when the audit record cannot be stored.
+    fn save_approval_decision(&self, record: &ApprovalAuditRecord) -> Result<(), SessionError>;
+    /// Lists approval decisions for a logical session in decision order.
+    ///
+    /// # Errors
+    /// Returns an error when audit storage cannot be queried.
+    fn list_approval_decisions(
+        &self,
+        nakode_session_id: &str,
+    ) -> Result<Vec<ApprovalAuditRecord>, SessionError>;
     /// Marks a session as recently used.
     ///
     /// # Errors
@@ -517,6 +579,22 @@ fn migrate_logical_sessions(connection: &Connection) -> Result<(), SessionError>
            created_at INTEGER NOT NULL,
            updated_at INTEGER NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS approval_decisions (
+           id TEXT PRIMARY KEY,
+           nakode_session_id TEXT NOT NULL
+             REFERENCES nakode_sessions(id) ON DELETE CASCADE,
+           agent_session_id TEXT REFERENCES agent_sessions(id) ON DELETE SET NULL,
+           run_id TEXT,
+           turn_id TEXT,
+           provider TEXT NOT NULL,
+           request_id TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           decision TEXT NOT NULL,
+           policy_rule TEXT NOT NULL,
+           created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS approval_decisions_session_created
+           ON approval_decisions(nakode_session_id, created_at, id);
          CREATE TABLE IF NOT EXISTS orchestration_runs (
            parent_session_id TEXT NOT NULL
              REFERENCES nakode_sessions(id) ON DELETE CASCADE,
@@ -529,6 +607,7 @@ fn migrate_logical_sessions(connection: &Connection) -> Result<(), SessionError>
            latest_activity TEXT NOT NULL,
            created_at INTEGER NOT NULL,
            updated_at INTEGER NOT NULL,
+           permission_envelope TEXT NOT NULL DEFAULT '{}',
            PRIMARY KEY(parent_session_id, id)
          );
          CREATE INDEX IF NOT EXISTS orchestration_runs_parent_created
@@ -667,6 +746,77 @@ impl SessionRepository for SqliteSessionRepository {
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
         let rows = statement.query_map(params![workspace, bounded_limit], Self::row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn save_approval_decision(&self, record: &ApprovalAuditRecord) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "INSERT INTO approval_decisions
+               (id, nakode_session_id, agent_session_id, run_id, turn_id, provider,
+                request_id, kind, decision, policy_rule, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                record.id,
+                record.nakode_session_id,
+                record.agent_session_id,
+                record.run_id,
+                record.turn_id,
+                record.provider,
+                record.request_id,
+                approval_kind_value(record.kind),
+                approval_decision_value(record.decision),
+                record.policy_rule,
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_approval_decisions(
+        &self,
+        nakode_session_id: &str,
+    ) -> Result<Vec<ApprovalAuditRecord>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, nakode_session_id, agent_session_id, run_id, turn_id, provider,
+                    request_id, kind, decision, policy_rule, created_at
+             FROM approval_decisions WHERE nakode_session_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map([nakode_session_id], |row| {
+            let kind = row.get::<_, String>(7)?;
+            let decision = row.get::<_, String>(8)?;
+            Ok((
+                ApprovalAuditRecord {
+                    id: row.get(0)?,
+                    nakode_session_id: row.get(1)?,
+                    agent_session_id: row.get(2)?,
+                    run_id: row.get(3)?,
+                    turn_id: row.get(4)?,
+                    provider: row.get(5)?,
+                    request_id: row.get(6)?,
+                    kind: ApprovalKind::Other,
+                    decision: ApprovalDecision::Decline,
+                    policy_rule: row.get(9)?,
+                    created_at: row.get(10)?,
+                },
+                kind,
+                decision,
+            ))
+        })?;
+        rows.map(|row| {
+            let (mut record, kind, decision) = row?;
+            record.kind = approval_kind_from_value(&kind)?;
+            record.decision = approval_decision_from_value(&decision)?;
+            Ok(record)
+        })
+        .collect()
     }
 
     fn find(&self, id: &str) -> Result<Option<SessionRecord>, SessionError> {
@@ -1012,8 +1162,8 @@ impl SessionRepository for SqliteSessionRepository {
         transaction.execute(
             "INSERT INTO orchestration_runs
                (parent_session_id, id, agent_slug, provider, provider_session_id, objective,
-                status, latest_activity, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                status, latest_activity, created_at, updated_at, permission_envelope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
              ON CONFLICT(parent_session_id, id) DO UPDATE SET
                agent_slug = excluded.agent_slug,
                provider = excluded.provider,
@@ -1021,6 +1171,7 @@ impl SessionRepository for SqliteSessionRepository {
                objective = excluded.objective,
                status = excluded.status,
                latest_activity = excluded.latest_activity,
+               permission_envelope = excluded.permission_envelope,
                updated_at = excluded.updated_at",
             params![
                 record.parent_session_id,
@@ -1032,6 +1183,12 @@ impl SessionRepository for SqliteSessionRepository {
                 record.status.database_value(),
                 record.latest_activity,
                 now,
+                serde_json::to_string(&record.permissions).map_err(|error| {
+                    SessionError::InvalidStoredValue {
+                        field: "orchestration_runs.permission_envelope",
+                        value: error.to_string(),
+                    }
+                })?,
             ],
         )?;
         transaction.execute(
@@ -1070,7 +1227,7 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id, agent_slug, provider, provider_session_id, objective, status,
-                    latest_activity
+                    latest_activity, permission_envelope
              FROM orchestration_runs
              WHERE parent_session_id = ?1
              ORDER BY created_at, id",
@@ -1084,12 +1241,21 @@ impl SessionRepository for SqliteSessionRepository {
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
         let stored_runs = rows.collect::<Result<Vec<_>, _>>()?;
         let mut records = Vec::with_capacity(stored_runs.len());
-        for (id, agent, provider, provider_session_id, objective, status, latest_activity) in
-            stored_runs
+        for (
+            id,
+            agent,
+            provider,
+            provider_session_id,
+            objective,
+            status,
+            latest_activity,
+            permission_envelope,
+        ) in stored_runs
         {
             let transcript = load_subagent_transcript(&connection, parent_session_id, &id)?;
             records.push(SubagentRecord {
@@ -1102,6 +1268,12 @@ impl SessionRepository for SqliteSessionRepository {
                 status: SubagentStatus::from_database(&status)?,
                 latest_activity,
                 transcript,
+                permissions: serde_json::from_str(&permission_envelope).map_err(|_| {
+                    SessionError::InvalidStoredValue {
+                        field: "orchestration_runs.permission_envelope",
+                        value: permission_envelope,
+                    }
+                })?,
             });
         }
         Ok(records)
@@ -1311,6 +1483,46 @@ fn entry_status_from_value(value: &str) -> Result<EntryStatus, SessionError> {
     }
 }
 
+const fn approval_kind_value(kind: ApprovalKind) -> &'static str {
+    match kind {
+        ApprovalKind::Command => "command",
+        ApprovalKind::FileChange => "file_change",
+        ApprovalKind::Other => "other",
+    }
+}
+
+fn approval_kind_from_value(value: &str) -> Result<ApprovalKind, SessionError> {
+    match value {
+        "command" => Ok(ApprovalKind::Command),
+        "file_change" => Ok(ApprovalKind::FileChange),
+        "other" => Ok(ApprovalKind::Other),
+        _ => Err(SessionError::InvalidStoredValue {
+            field: "approval_decisions.kind",
+            value: value.to_owned(),
+        }),
+    }
+}
+
+const fn approval_decision_value(decision: ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::AcceptOnce => "accept_once",
+        ApprovalDecision::AcceptForSession => "accept_for_session",
+        ApprovalDecision::Decline => "decline",
+    }
+}
+
+fn approval_decision_from_value(value: &str) -> Result<ApprovalDecision, SessionError> {
+    match value {
+        "accept_once" => Ok(ApprovalDecision::AcceptOnce),
+        "accept_for_session" => Ok(ApprovalDecision::AcceptForSession),
+        "decline" => Ok(ApprovalDecision::Decline),
+        _ => Err(SessionError::InvalidStoredValue {
+            field: "approval_decisions.decision",
+            value: value.to_owned(),
+        }),
+    }
+}
+
 fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1449,6 +1661,36 @@ mod tests {
         assert!(agents.iter().any(|agent| agent.provider == CODEX_PROVIDER));
         assert!(agents.iter().any(|agent| agent.provider == DEVIN_PROVIDER));
         assert_eq!(store.list_recent("/tmp/project", 10)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn approval_decisions_round_trip_with_session_provenance() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let session = store.create(
+            CODEX_PROVIDER,
+            "provider-session",
+            "/tmp/project",
+            "Audited work",
+            Some("openai-codex/gpt-5.4"),
+        )?;
+        let record = ApprovalAuditRecord::new(
+            ApprovalAuditContext {
+                nakode_session_id: session.id.clone(),
+                agent_session_id: Some(session.agent_session_id),
+                run_id: Some("run-1".to_owned()),
+                turn_id: Some("turn-1".to_owned()),
+                provider: CODEX_PROVIDER.to_owned(),
+            },
+            "\"request-1\"".to_owned(),
+            ApprovalKind::Command,
+            ApprovalDecision::AcceptOnce,
+            "delegated unattended permission envelope",
+        );
+
+        store.save_approval_decision(&record)?;
+        assert_eq!(store.list_approval_decisions(&session.id)?, vec![record]);
         Ok(())
     }
 
@@ -1603,6 +1845,7 @@ mod tests {
                     status: EntryStatus::Complete,
                 },
             ],
+            permissions: crate::permission::PermissionEnvelope::default(),
         };
 
         store.save_subagent(&record)?;

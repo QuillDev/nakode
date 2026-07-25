@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::{
     Tool, ToolContext, ToolFuture, ToolResult, optional_u64, required_string, truncate_output,
 };
+use crate::permission::OperationClass;
 use crate::runtime::ToolDefinition;
 
 const DONE_PREFIX: &str = "__NAKODE_EVAL_DONE__";
@@ -23,6 +24,10 @@ pub struct EvalTool {
 }
 
 impl Tool for EvalTool {
+    fn operation(&self) -> OperationClass {
+        OperationClass::ExecuteProcess
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "eval",

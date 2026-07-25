@@ -19,6 +19,7 @@ use crate::backend::{
     BackendEvent, CompactionReason, DeltaKind, ItemKind, ItemStatus, NormalizedItem,
     PromptAttachment, SessionHistoryItem, TodoPhase,
 };
+use crate::permission::PermissionEnvelope;
 use crate::session::InitializedDatabase;
 use crate::tools::{ToolConcurrency, ToolRegistry, model_facing_output};
 
@@ -236,6 +237,7 @@ pub struct AgentRuntime {
     vision_config: Option<Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
     vision: Option<crate::vision::SharedVisionService>,
     direct_image_input: bool,
+    permissions: PermissionEnvelope,
 }
 
 impl AgentRuntime {
@@ -250,7 +252,14 @@ impl AgentRuntime {
             vision_config: None,
             vision: None,
             direct_image_input: true,
+            permissions: PermissionEnvelope::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_permissions(mut self, permissions: PermissionEnvelope) -> Self {
+        self.permissions = permissions;
+        self
     }
 
     #[must_use]
@@ -786,19 +795,26 @@ impl AgentRuntime {
         send_tool_started(turn_id, &tool_call.id, &title, backend_events).await?;
         let started_at_ms = unix_time_ms();
         let started = Instant::now();
-        let result = tool
-            .execute(
+        let result = if self.permissions.allows(tool.operation()) {
+            tool.execute(
                 crate::tools::ToolContext {
                     workspace: &self.workspace,
                     session,
                     backend_events,
                     turn_id,
                     questions: &self.questions,
+                    permissions: &self.permissions,
                 },
                 tool_call.arguments,
                 cancellation,
             )
-            .await;
+            .await
+        } else {
+            crate::tools::ToolResult::failure(format!(
+                "permission envelope denied {}",
+                tool_call.name
+            ))
+        };
         Ok(ExecutedTool::new(
             tool_call.id,
             tool_call.name,
@@ -827,19 +843,26 @@ impl AgentRuntime {
         let started_at_ms = unix_time_ms();
         let started = Instant::now();
         let mut isolated_session = RuntimeSession::new(String::new(), String::new());
-        let result = tool
-            .execute(
+        let result = if self.permissions.allows(tool.operation()) {
+            tool.execute(
                 crate::tools::ToolContext {
                     workspace: &self.workspace,
                     session: &mut isolated_session,
                     backend_events,
                     turn_id,
                     questions: &self.questions,
+                    permissions: &self.permissions,
                 },
                 tool_call.arguments,
                 cancellation,
             )
-            .await;
+            .await
+        } else {
+            crate::tools::ToolResult::failure(format!(
+                "permission envelope denied {}",
+                tool_call.name
+            ))
+        };
         Ok(ExecutedTool::new(
             tool_call.id,
             tool_call.name,
@@ -1635,6 +1658,7 @@ mod tests {
     use crate::backend::{
         BackendEvent, CompactionReason, ItemKind, QuestionOption, QuestionRequest,
     };
+    use crate::permission::{OperationClass, PermissionEnvelope};
     use crate::session::InitializedDatabase;
     use crate::tools::{
         Tool, ToolConcurrency, ToolContext, ToolFuture as RuntimeToolFuture, ToolRegistry,
@@ -1670,6 +1694,10 @@ mod tests {
     struct AlwaysFailTool;
 
     impl Tool for AlwaysFailTool {
+        fn operation(&self) -> OperationClass {
+            OperationClass::ExecuteProcess
+        }
+
         fn definition(&self) -> super::ToolDefinition {
             super::ToolDefinition {
                 name: "todo",
@@ -2126,6 +2154,39 @@ mod tests {
                 .iter()
                 .all(|warning| warning.contains("will continue"))
         );
+    }
+
+    #[tokio::test]
+    async fn permission_envelope_denies_process_tools_before_execution() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(RepeatingToolProvider {
+            calls: AtomicUsize::new(0),
+            tool_rounds: 1,
+        });
+        let tools = ToolRegistry::testing(vec![Arc::new(AlwaysFailTool)]);
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider)
+            .with_tools(tools)
+            .with_permissions(PermissionEnvelope::read_only());
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        let (events, _receiver) = mpsc::channel(32);
+
+        runtime
+            .run_turn(
+                &mut session,
+                "turn-denied",
+                "Try a process.".to_owned(),
+                Vec::new(),
+                &events,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("denial is a tool result");
+
+        assert!(session.history.iter().any(|item| matches!(
+            item,
+            ConversationItem::ToolResult { output, failed: true, .. }
+                if output == "permission envelope denied todo"
+        )));
     }
 
     #[tokio::test]

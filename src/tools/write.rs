@@ -4,11 +4,16 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{Tool, ToolContext, ToolFuture, ToolResult, required_string, resolve_workspace_path};
+use crate::permission::OperationClass;
 use crate::runtime::ToolDefinition;
 
 pub struct WriteTool;
 
 impl Tool for WriteTool {
+    fn operation(&self) -> OperationClass {
+        OperationClass::MutateWorkspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write",

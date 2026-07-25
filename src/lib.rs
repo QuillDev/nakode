@@ -15,6 +15,7 @@ pub mod editor;
 pub mod handoff;
 mod herdr;
 mod markdown;
+pub mod permission;
 pub mod pty;
 pub mod render;
 pub mod runtime;
