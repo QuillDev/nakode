@@ -44,7 +44,7 @@ pub struct BackendConfig {
     pub credential: Option<Value>,
     pub base_url: String,
     client: Client,
-    session_database: Option<PathBuf>,
+    session_store: Option<RuntimeSessionStore>,
     compaction_threshold_percent: usize,
     web_config: Option<Arc<std::sync::RwLock<crate::web::WebConfig>>>,
     vision_config: Option<Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
@@ -59,7 +59,7 @@ impl BackendConfig {
             credential: None,
             base_url: DEVIN_BASE_URL.to_owned(),
             client: Client::new(),
-            session_database: None,
+            session_store: None,
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             web_config: None,
             vision_config: None,
@@ -74,8 +74,8 @@ impl BackendConfig {
     }
 
     #[must_use]
-    pub fn with_session_database(mut self, path: PathBuf) -> Self {
-        self.session_database = Some(path);
+    pub fn with_session_store(mut self, store: RuntimeSessionStore) -> Self {
+        self.session_store = Some(store);
         self
     }
 
@@ -232,10 +232,7 @@ async fn run_supervisor(
         }
         runtime
     });
-    let session_store = config
-        .session_database
-        .clone()
-        .map(|database| RuntimeSessionStore::new(database, DEVIN_PROVIDER));
+    let session_store = config.session_store.clone();
     let mut sessions = HashMap::<String, RuntimeSession>::new();
     let mut active: Option<ActiveTurn> = None;
     let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedTurn>(8);

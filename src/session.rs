@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -137,6 +137,35 @@ pub enum SessionError {
     },
 }
 
+/// A Nakode database whose connection policy and schema migrations have been applied.
+#[derive(Clone, Debug)]
+pub struct InitializedDatabase {
+    path: Arc<PathBuf>,
+}
+
+impl InitializedDatabase {
+    /// Opens a database and applies Nakode's forward schema migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database cannot be opened, protected, or migrated.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
+        SqliteSessionRepository::bootstrap(path).map(|repository| repository.database)
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn connection(&self) -> Result<Connection, rusqlite::Error> {
+        let connection = Connection::open(self.path())?;
+        configure_connection(&connection)?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Ok(connection)
+    }
+}
+
 pub trait SessionRepository: Send + Sync {
     /// Lists the most recently used sessions in a workspace.
     ///
@@ -243,7 +272,7 @@ pub trait SessionRepository: Send + Sync {
 
 pub struct SqliteSessionRepository {
     connection: Mutex<Connection>,
-    path: PathBuf,
+    database: InitializedDatabase,
 }
 
 impl SqliteSessionRepository {
@@ -292,13 +321,80 @@ impl SqliteSessionRepository {
     ///
     /// Returns an error when the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
+        Self::from_database(InitializedDatabase::open(path)?)
+    }
+
+    /// Opens a repository view over an initialized Nakode database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured `SQLite` connection cannot be opened.
+    pub fn from_database(database: InitializedDatabase) -> Result<Self, SessionError> {
+        Ok(Self {
+            connection: Mutex::new(database.connection()?),
+            database,
+        })
+    }
+
+    #[must_use]
+    pub fn database(&self) -> InitializedDatabase {
+        self.database.clone()
+    }
+
+    fn bootstrap(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let path = path.as_ref();
         let connection = Connection::open(path)?;
         configure_connection(&connection)?;
         protect_path(path, 0o600)?;
-        execute_batch_with_busy_retry(
-            &connection,
-            "PRAGMA foreign_keys = ON;
+        initialize_schema(&connection)?;
+        let has_legacy_models = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backend_models'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if has_legacy_models {
+            connection.execute_batch(
+                "INSERT OR IGNORE INTO provider_models
+                   (provider, model_id, is_default, cached_at)
+                 SELECT provider, model_id, is_default, cached_at FROM backend_models;
+                 DROP TABLE backend_models;",
+            )?;
+        }
+        seed_provider_catalog(&connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            database: InitializedDatabase {
+                path: Arc::new(path.to_path_buf()),
+            },
+        })
+    }
+
+    #[must_use]
+    pub fn database_path(&self) -> &Path {
+        self.database.path()
+    }
+
+    fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+        Ok(SessionRecord {
+            id: row.get(0)?,
+            provider: row.get(1)?,
+            provider_session_id: row.get(2)?,
+            workspace: row.get(3)?,
+            title: row.get(4)?,
+            model: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+        })
+    }
+}
+
+fn initialize_schema(connection: &Connection) -> Result<(), SessionError> {
+    execute_batch_with_busy_retry(
+        connection,
+        "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS sessions (
                id TEXT PRIMARY KEY,
                provider TEXT NOT NULL,
@@ -370,47 +466,8 @@ impl SqliteSessionRepository {
                FOREIGN KEY(parent_session_id, run_id)
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
              );",
-        )?;
-        let has_legacy_models = connection
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backend_models'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if has_legacy_models {
-            connection.execute_batch(
-                "INSERT OR IGNORE INTO provider_models
-                   (provider, model_id, is_default, cached_at)
-                 SELECT provider, model_id, is_default, cached_at FROM backend_models;
-                 DROP TABLE backend_models;",
-            )?;
-        }
-        seed_provider_catalog(&connection)?;
-        Ok(Self {
-            connection: Mutex::new(connection),
-            path: path.to_path_buf(),
-        })
-    }
-
-    #[must_use]
-    pub fn database_path(&self) -> &Path {
-        &self.path
-    }
-
-    fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-        Ok(SessionRecord {
-            id: row.get(0)?,
-            provider: row.get(1)?,
-            provider_session_id: row.get(2)?,
-            workspace: row.get(3)?,
-            title: row.get(4)?,
-            model: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
-        })
-    }
+    )?;
+    Ok(())
 }
 
 fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
@@ -1172,7 +1229,8 @@ mod tests {
         let path = directory.path().join("providers.db");
         let store = SqliteSessionRepository::open(&path)?;
         let credentials =
-            crate::credential::SqliteCredentialStore::open(&path).expect("credential store");
+            crate::credential::SqliteCredentialStore::from_database(&store.database())
+                .expect("credential store");
         let providers = store.list_providers()?;
         assert_eq!(providers.len(), 3);
         assert!(providers.iter().all(|provider| !provider.enabled));

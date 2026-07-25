@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -22,8 +22,12 @@ use crate::{
         Credential, CredentialError, CredentialStore, SecretValue, SqliteCredentialStore,
     },
     cursor, devin, render,
+    runtime::RuntimeSessionStore,
     selection::ScreenPoint,
-    session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
+    session::{
+        InitializedDatabase, ProviderRecord, SessionError, SessionRepository,
+        SqliteSessionRepository,
+    },
     skill::{SkillCatalog, SkillCatalogError},
     state::{AgentBrowserStatus, AppState, ApprovalDecision, Effect},
     terminal::{TerminalSession, Tui},
@@ -64,7 +68,7 @@ struct BackendRegistry {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     failures: Vec<(String, String)>,
     config: Config,
-    session_database: PathBuf,
+    database: InitializedDatabase,
     provider_credentials: HashMap<String, serde_json::Value>,
     provider_cooldowns: HashMap<String, ProviderCooldown>,
     web_config: Arc<RwLock<crate::web::WebConfig>>,
@@ -102,7 +106,7 @@ impl BackendRegistry {
     async fn spawn(
         config: &Config,
         providers: &[ProviderRecord],
-        session_database: PathBuf,
+        database: InitializedDatabase,
         provider_credentials: HashMap<String, serde_json::Value>,
         web_config: Arc<RwLock<crate::web::WebConfig>>,
         vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
@@ -130,7 +134,7 @@ impl BackendRegistry {
             tasks: Vec::new(),
             failures,
             config: config.clone(),
-            session_database,
+            database,
             provider_credentials,
             provider_cooldowns: HashMap::new(),
             web_config,
@@ -168,7 +172,10 @@ impl BackendRegistry {
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
-                        .with_session_database(self.session_database.clone())
+                        .with_session_store(RuntimeSessionStore::new(
+                            self.database.clone(),
+                            crate::backend::CODEX_PROVIDER,
+                        ))
                         .with_web_config(Arc::clone(&self.web_config))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
@@ -189,7 +196,10 @@ impl BackendRegistry {
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
                         ))
-                        .with_session_database(self.session_database.clone())
+                        .with_session_store(RuntimeSessionStore::new(
+                            self.database.clone(),
+                            crate::backend::DEVIN_PROVIDER,
+                        ))
                         .with_web_config(Arc::clone(&self.web_config))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
@@ -397,8 +407,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let nakode_executable = std::env::current_exe().map_err(AppError::CurrentExecutable)?;
     let mut signals = ShutdownSignals::install()?;
     let sessions = SqliteSessionRepository::open_default()?;
-    let session_database = sessions.database_path().to_path_buf();
-    let credentials = SqliteCredentialStore::open(&session_database)?;
+    let credentials = SqliteCredentialStore::from_database(&sessions.database())?;
     let (providers, mut backends) = start_backends(&config, &sessions, &credentials).await?;
     let agents = AgentCatalog::load(&config.agents)?;
     let skills = SkillCatalog::load(&config.workspace)?;
@@ -544,7 +553,7 @@ async fn start_backends(
     let mut backends = BackendRegistry::spawn(
         config,
         &providers,
-        sessions.database_path().to_path_buf(),
+        sessions.database(),
         provider_credentials,
         web_config,
         vision_config,
@@ -1908,7 +1917,7 @@ mod tests {
     use crate::{
         backend::{BackendEvent, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, TurnOutcome},
         render,
-        session::ProviderRecord,
+        session::{InitializedDatabase, ProviderRecord},
         state::{ActiveTurn, AgentRequest, AppState, ConnectionState, Effect},
         transcript::{EntryKind, EntryStatus},
     };
@@ -1937,7 +1946,8 @@ mod tests {
             tasks: Vec::new(),
             failures: Vec::new(),
             config,
-            session_database: directory.path().join("sessions.sqlite3"),
+            database: InitializedDatabase::open(directory.path().join("sessions.sqlite3"))
+                .expect("initialize test database"),
             provider_credentials: HashMap::new(),
             provider_cooldowns: HashMap::new(),
             web_config: std::sync::Arc::new(std::sync::RwLock::new(

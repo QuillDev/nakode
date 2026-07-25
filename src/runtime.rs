@@ -19,6 +19,7 @@ use crate::backend::{
     BackendEvent, CompactionReason, DeltaKind, ItemKind, ItemStatus, NormalizedItem,
     PromptAttachment, SessionHistoryItem, TodoPhase,
 };
+use crate::session::InitializedDatabase;
 use crate::tools::{ToolConcurrency, ToolRegistry, model_facing_output};
 
 const COMPACTION_RESERVE_TOKENS: usize = 32_768;
@@ -1534,7 +1535,7 @@ fn is_context_overflow(message: &str) -> bool {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeSessionStore {
-    database: PathBuf,
+    database: InitializedDatabase,
     provider: String,
 }
 
@@ -1559,7 +1560,7 @@ pub(crate) fn set_session_model(
 
 impl RuntimeSessionStore {
     #[must_use]
-    pub fn new(database: PathBuf, provider: impl Into<String>) -> Self {
+    pub fn new(database: InitializedDatabase, provider: impl Into<String>) -> Self {
         Self {
             database,
             provider: provider.into(),
@@ -1611,7 +1612,8 @@ impl RuntimeSessionStore {
     }
 
     fn connection(&self) -> Result<Connection, String> {
-        Connection::open(&self.database)
+        self.database
+            .connection()
             .map_err(|error| format!("failed to open native session store: {error}"))
     }
 }
@@ -1633,7 +1635,7 @@ mod tests {
     use crate::backend::{
         BackendEvent, CompactionReason, ItemKind, QuestionOption, QuestionRequest,
     };
-    use crate::session::SqliteSessionRepository;
+    use crate::session::InitializedDatabase;
     use crate::tools::{
         Tool, ToolConcurrency, ToolContext, ToolFuture as RuntimeToolFuture, ToolRegistry,
         ToolResult,
@@ -2402,8 +2404,8 @@ mod tests {
     #[test]
     fn native_sessions_survive_provider_restarts() {
         let directory = tempfile::tempdir().expect("session directory");
-        let database = directory.path().join("sessions.sqlite3");
-        let _repository = SqliteSessionRepository::open(&database).expect("session repository");
+        let database = InitializedDatabase::open(directory.path().join("sessions.sqlite3"))
+            .expect("initialized database");
         let store = RuntimeSessionStore::new(database, "test-provider");
         let mut session = RuntimeSession::new("test-model".to_owned(), "Be concise.".to_owned())
             .with_reasoning_effort(Some("low".to_owned()));

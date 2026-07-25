@@ -43,7 +43,7 @@ pub struct BackendConfig {
     pub base_url: String,
     client: Client,
     auth_urls: AuthUrls,
-    session_database: Option<PathBuf>,
+    session_store: Option<RuntimeSessionStore>,
     compaction_threshold_percent: usize,
     reasoning_effort: Option<String>,
     web_config: Option<Arc<std::sync::RwLock<crate::web::WebConfig>>>,
@@ -73,7 +73,7 @@ impl BackendConfig {
                 verification: DEVICE_AUTH_URL.to_owned(),
                 token: TOKEN_URL.to_owned(),
             },
-            session_database: None,
+            session_store: None,
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             reasoning_effort: Some("medium".to_owned()),
             web_config: None,
@@ -89,8 +89,8 @@ impl BackendConfig {
     }
 
     #[must_use]
-    pub fn with_session_database(mut self, path: PathBuf) -> Self {
-        self.session_database = Some(path);
+    pub fn with_session_store(mut self, store: RuntimeSessionStore) -> Self {
+        self.session_store = Some(store);
         self
     }
 
@@ -422,10 +422,7 @@ async fn run_supervisor(
         }
         runtime
     });
-    let session_store = config
-        .session_database
-        .clone()
-        .map(|database| RuntimeSessionStore::new(database, CODEX_PROVIDER));
+    let session_store = config.session_store.clone();
     let mut sessions = HashMap::<String, RuntimeSession>::new();
     let mut active: Option<ActiveTurn> = None;
     let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedTurn>(8);
