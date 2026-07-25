@@ -1,7 +1,7 @@
 use nakode::{
     app,
     config::{Config, NakodeCommand, ServiceAction},
-    control, diagnostics, update,
+    control, diagnostics, tui_eval, update,
 };
 
 #[tokio::main]
@@ -59,6 +59,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(NakodeCommand::Service {
             action: ServiceAction::Shutdown,
         }) => control::shutdown_service().await?,
+        Some(NakodeCommand::TuiEval {
+            scenario,
+            width,
+            height,
+        }) => tui_eval::run(&tui_eval::Options {
+            workspace: config.workspace,
+            scenario,
+            width,
+            height,
+        })?,
         Some(NakodeCommand::Update) => unreachable!("update commands return before dispatch"),
         None => app::run(config).await?,
     }

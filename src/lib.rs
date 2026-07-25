@@ -26,6 +26,7 @@ pub mod terminal;
 pub mod terminal_image;
 pub mod tools;
 pub mod transcript;
+pub mod tui_eval;
 pub mod update;
 pub mod vision;
 pub mod web;
