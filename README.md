@@ -6,6 +6,9 @@ each session or delegated task to use the provider and model that fit it best.
 
 Nakode is experimental and under active development.
 
+Developers and coding agents can drive the real TUI reducer and renderer through
+the deterministic JSON Lines [TUI evaluation harness](docs/tui-evaluation.md).
+
 ## What does it do?
 
 Nakode brings agentic coding work into a single terminal experience:

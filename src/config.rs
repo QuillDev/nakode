@@ -114,6 +114,19 @@ pub enum NakodeCommand {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Run the deterministic, headless TUI evaluation protocol.
+    #[command(hide = true)]
+    TuiEval {
+        /// Read JSON Lines actions from this file instead of standard input.
+        #[arg(long)]
+        scenario: Option<PathBuf>,
+        /// Terminal width in cells.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(20..))]
+        width: u16,
+        /// Terminal height in cells.
+        #[arg(long, default_value_t = 28, value_parser = clap::value_parser!(u16).range(8..))]
+        height: u16,
+    },
 }
 
 #[derive(Clone, Debug, Subcommand)]

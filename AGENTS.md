@@ -342,6 +342,48 @@ channels, normalized event reduction, provider-native authentication,
 queue-versus-steer semantics, SQLite metadata, and terminal and child-process
 cleanup on every exit path.
 
+## Headless TUI evaluation
+
+Use Nakode's deterministic TUI evaluation harness for interaction, rendering,
+and UI smoke tests. It runs fully headlessly: it does not open a window, acquire
+the desktop terminal, start a provider process, touch persistence, or parse ANSI
+output. It drives the real control registry, application event reducer, state,
+and Ratatui renderer through an in-memory terminal.
+
+Run the committed smoke scenario with:
+
+```text
+cargo run -- --workspace . tui-eval \
+  --scenario tests/tui_scenarios/agent_smoke.jsonl
+```
+
+The harness reads JSON Lines actions from `--scenario` or standard input and
+emits one structured JSON observation per action. Use it to:
+
+- send real key, text, paste, mouse, and resize events;
+- inject normalized backend events for sessions, turns, streamed items,
+  approvals, questions, todos, warnings, failures, and disconnects;
+- inspect rendered lines, cursor state, optional style runs, semantic
+  application state, recent transcript entries, and emitted effects;
+- assert screen content, modal state, status, draft contents, connection,
+  effects, cursor visibility, and terminal dimensions.
+
+Prefer semantic assertions for behavior and a small number of rendered-text
+assertions for important affordances. Request styled snapshots only for focused
+visual evaluation. A failed assertion must exit nonzero, identify its scenario
+line, and retain the failed observation for diagnosis.
+
+Keep reusable end-to-end scenarios under `tests/tui_scenarios/` and execute
+them from Rust tests so they cannot silently drift. Extend harness fixtures at
+the normalized backend boundary; provider wire-protocol fixtures remain inside
+their adapter tests. The complete action, fixture, assertion, and observation
+reference lives in `docs/tui-evaluation.md`.
+
+The headless harness complements `tests/tui_terminal.rs`. Use the PTY tests only
+for behavior that depends on the actual executable or terminal lifecycle, such
+as Crossterm mode changes, alternate-screen ownership, control-service
+coordination, and terminal restoration.
+
 ## Portability and development lifecycle
 
 User-facing operating-system integrations use maintained cross-platform

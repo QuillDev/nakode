@@ -1348,7 +1348,7 @@ fn flush_pending_clipboard(terminal: &mut Tui, state: &mut AppState) {
     }
 }
 
-fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
+pub(crate) fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<Effect> {
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             state.clear_text_selection();
