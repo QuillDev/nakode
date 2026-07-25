@@ -782,7 +782,7 @@ impl AppState {
         }
     }
 
-    pub fn settings_cycle_backend(&mut self, delta: isize) {
+    pub fn settings_cycle_web_backend(&mut self, delta: isize) {
         let Some(settings) = &mut self.settings else {
             return;
         };
@@ -819,14 +819,13 @@ impl AppState {
         else {
             return Vec::new();
         };
-        self.set_status("Terminal image setting saved; changes apply on next launch.");
         vec![Effect::SaveTerminalImageMode(mode)]
     }
 
     pub fn settings_cycle_choice(&mut self, delta: isize) -> Vec<Effect> {
         match self.settings.as_ref().map(|settings| settings.view) {
             Some(SettingsView::WebBrowsing) => {
-                self.settings_cycle_backend(delta);
+                self.settings_cycle_web_backend(delta);
                 self.save_web_settings()
             }
             Some(SettingsView::TerminalImages) => {
@@ -843,7 +842,7 @@ impl AppState {
             .as_ref()
             .is_some_and(|settings| settings.view == SettingsView::WebBrowsing)
         {
-            self.settings_cycle_backend(1);
+            self.settings_cycle_web_backend(1);
             return self.save_web_settings();
         }
         if let Some(settings) = &mut self.settings
@@ -2273,7 +2272,7 @@ impl AppState {
         );
         self.set_status("Compressing the current chat context…");
         vec![Effect::Backend(BackendCommand::CompactSession {
-            session_id,
+            provider_session_id: session_id,
             compaction_id,
         })]
     }
@@ -2421,7 +2420,7 @@ impl AppState {
         });
         self.set_status("Sending steering guidance…");
         vec![Effect::Backend(BackendCommand::SteerTurn {
-            session_id: provider_session_id,
+            provider_session_id,
             turn_id,
             client_id: id,
             prompt: self
@@ -2448,7 +2447,7 @@ impl AppState {
             let turn_id = compaction.turn_id.clone();
             self.set_status("Interrupting context compression…");
             effects.push(Effect::Backend(BackendCommand::InterruptTurn {
-                session_id: provider_session_id,
+                provider_session_id,
                 turn_id,
             }));
             return effects;
@@ -2485,7 +2484,7 @@ impl AppState {
             )
         };
         effects.push(Effect::Backend(BackendCommand::InterruptTurn {
-            session_id: provider_session_id,
+            provider_session_id,
             turn_id: active.id.clone(),
         }));
         effects
@@ -2562,7 +2561,7 @@ impl AppState {
             self.creating_session = Some(());
         }
         vec![Effect::Backend(BackendCommand::Reload {
-            session_id: self.provider_session_id.clone(),
+            provider_session_id: self.provider_session_id.clone(),
         })]
     }
 
@@ -2705,7 +2704,7 @@ impl AppState {
                 && let Some(session_id) = self.provider_session_id.clone()
             {
                 effects.push(Effect::Backend(BackendCommand::SetSessionModel {
-                    session_id,
+                    provider_session_id: session_id,
                     model: selected.id,
                 }));
             } else if let Some(session_id) = self.session_id.clone() {
@@ -2851,28 +2850,22 @@ impl AppState {
         }
         match &event {
             BackendEvent::Ready(identity) => {
-                self.provider_contexts.insert(
-                    provider.to_owned(),
-                    ProviderContext {
-                        name: identity.display_name.clone(),
-                        capabilities: identity.capabilities.clone(),
-                        connection: ConnectionState::Ready {
-                            server: identity.display_name.clone(),
-                        },
-                        provider_session_id: self
-                            .provider_contexts
-                            .get(provider)
-                            .and_then(|context| context.provider_session_id.clone()),
-                        session_id: self
-                            .provider_contexts
-                            .get(provider)
-                            .and_then(|context| context.session_id.clone()),
-                        context_usage: self
-                            .provider_contexts
-                            .get(provider)
-                            .and_then(|context| context.context_usage),
-                    },
-                );
+                let context = self
+                    .provider_contexts
+                    .entry(provider.to_owned())
+                    .or_insert_with(|| ProviderContext {
+                        name: String::new(),
+                        capabilities: BackendCapabilities::default(),
+                        connection: ConnectionState::Starting,
+                        provider_session_id: None,
+                        session_id: None,
+                        context_usage: None,
+                    });
+                context.name.clone_from(&identity.display_name);
+                context.capabilities = identity.capabilities.clone();
+                context.connection = ConnectionState::Ready {
+                    server: identity.display_name.clone(),
+                };
                 if self.backend_provider.is_empty() && !self.provider_is_authenticating(provider) {
                     provider.clone_into(&mut self.backend_provider);
                     self.backend_name.clone_from(&identity.display_name);
@@ -2883,10 +2876,11 @@ impl AppState {
                 }
             }
             BackendEvent::Models(models) => {
-                let mut models = models.clone();
-                for model in &mut models {
-                    provider.clone_into(&mut model.provider);
+                if models.iter().any(|model| model.provider != provider) {
+                    self.diagnostic_count += 1;
+                    return Vec::new();
                 }
+                let models = models.clone();
                 if !models.is_empty() {
                     self.install_models(models.clone());
                 }
@@ -3715,7 +3709,7 @@ impl AppState {
         self.starting_turn = Some(prompt.clone());
         self.set_status("Starting turn…");
         vec![Effect::Backend(BackendCommand::StartTurn {
-            session_id: provider_session_id,
+            provider_session_id,
             client_id: prompt.id,
             prompt: wire_text,
             attachments: prompt.attachments,
@@ -4144,7 +4138,7 @@ impl AppState {
             .join("\n");
         let model = self.selected_model.as_ref().map_or_else(
             || format!("{}/provider-default", self.backend_provider),
-            |model| format!("{}/{}", self.backend_provider, model),
+            Clone::clone,
         );
         format!(
             "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode invocation is available through the native shell. It is a Nakode control-plane command, not a provider tool.\nAvailable agents:\n{}\nTo delegate a concrete bounded task, execute the matching absolute-path command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed above. Use only these Nakode commands for delegation; do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one command per task concurrently using the provider's native shell facilities. Keep each objective distinct and bounded. Each command returns its own agent result on stdout when that child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
@@ -4448,11 +4442,7 @@ impl AppState {
         execution.run.provider_session_id = Some(provider_session_id.clone());
         execution.run.status = SubagentStatus::Working;
         "Working…".clone_into(&mut execution.run.latest_activity);
-        let prompt = format!(
-            "# Agent role instructions\n\n{}\n\n{}",
-            execution.definition.system_prompt.trim(),
-            execution.definition.initial_prompt(&execution.task)
-        );
+        let prompt = execution.definition.initial_prompt(&execution.task);
         let model = execution.model_targets[execution.model_target_index]
             .model
             .clone();
@@ -4460,7 +4450,7 @@ impl AppState {
         vec![Effect::SubagentBackend {
             run_id: run_id.to_owned(),
             command: BackendCommand::StartTurn {
-                session_id: provider_session_id,
+                provider_session_id,
                 client_id: format!("{run_id}-prompt"),
                 prompt,
                 attachments: Vec::new(),
@@ -5200,7 +5190,7 @@ model = "openai-codex/model-a"
 
         let [
             Effect::Backend(BackendCommand::CompactSession {
-                session_id,
+                provider_session_id: session_id,
                 compaction_id,
             }),
         ] = effects.as_slice()
@@ -5242,7 +5232,7 @@ model = "openai-codex/model-a"
         assert!(matches!(
             interrupt.as_slice(),
             [Effect::Backend(BackendCommand::InterruptTurn {
-                session_id,
+                provider_session_id: session_id,
                 turn_id,
             })] if session_id == "native-session" && turn_id == &compaction_id
         ));
@@ -5375,7 +5365,9 @@ model = "openai-codex/model-a"
 
         assert!(matches!(
             state.open_model_picker().as_slice(),
-            [Effect::Backend(BackendCommand::Reload { session_id: None })]
+            [Effect::Backend(BackendCommand::Reload {
+                provider_session_id: None
+            })]
         ));
         assert!(state.status_message.contains("Loading Devin models"));
         assert!(state.open_model_picker().is_empty());
@@ -5399,7 +5391,10 @@ model = "openai-codex/model-a"
         state.picker_move(1);
         assert!(matches!(
             state.picker_select().as_slice(),
-            [Effect::Backend(BackendCommand::SetSessionModel { session_id, model })]
+            [Effect::Backend(BackendCommand::SetSessionModel {
+                provider_session_id: session_id,
+                model
+            })]
                 if session_id == "devin-session" && model == "model-b"
         ));
 
@@ -6357,7 +6352,7 @@ model = "openai-codex/model-a"
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Models(vec![ModelInfo {
-                provider: String::new(),
+                provider: CODEX_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
             }]),
@@ -6365,7 +6360,7 @@ model = "openai-codex/model-a"
         state.handle_provider_backend(
             DEVIN_PROVIDER,
             BackendEvent::Models(vec![ModelInfo {
-                provider: String::new(),
+                provider: DEVIN_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
             }]),
@@ -6405,7 +6400,7 @@ model = "openai-codex/model-a"
             state.handle_provider_backend(
                 provider,
                 BackendEvent::Models(vec![ModelInfo {
-                    provider: String::new(),
+                    provider: provider.to_owned(),
                     id: "shared".to_owned(),
                     is_default: true,
                 }]),
@@ -6514,7 +6509,9 @@ model = "openai-codex/model-a"
             [Effect::SubagentBackend {
                 command: BackendCommand::StartTurn { prompt, .. },
                 ..
-            }] if prompt.contains("Inspect the delegated question") && prompt.contains("Map auth")
+            }] if prompt.contains("Inspect the delegated question")
+                && prompt.contains("Map auth")
+                && !prompt.contains("Explore carefully")
         ));
         run_id
     }
@@ -6524,7 +6521,7 @@ model = "openai-codex/model-a"
         let mut state = ready_state();
         state.install_agents(explorer_catalog());
         state.set_nakode_executable(Path::new("/opt/nakode/bin/nakode"));
-        state.selected_model = Some("model-a".to_owned());
+        state.selected_model = Some("openai-codex/model-a".to_owned());
         state.editor.set_text("Start work");
 
         let effects = state.submit_editor();
@@ -6876,7 +6873,7 @@ model = "openai-codex/model-a"
                 Effect::CompleteAgentRequest { success: false, .. },
                 Effect::StopSubagent(stopped_run),
                 Effect::Backend(BackendCommand::InterruptTurn {
-                    session_id,
+                    provider_session_id: session_id,
                     turn_id,
                 }),
             ] if stopped_run == &run_id

@@ -122,6 +122,10 @@ pub enum SessionError {
     Database(#[from] rusqlite::Error),
     #[error("session {0:?} is ambiguous; use a longer id")]
     Ambiguous(String),
+    #[error("session {0:?} was not found")]
+    SessionNotFound(String),
+    #[error("provider {0:?} was not found")]
+    ProviderNotFound(String),
     #[error("invalid persisted value for {field}: {value:?}")]
     InvalidStoredValue { field: &'static str, value: String },
     #[error("provider {0} has no configured credentials")]
@@ -589,10 +593,13 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
+        let updated = connection.execute(
             "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
             params![unix_timestamp(), id],
         )?;
+        if updated == 0 {
+            return Err(SessionError::SessionNotFound(id.to_owned()));
+        }
         Ok(())
     }
 
@@ -601,10 +608,13 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
+        let updated = connection.execute(
             "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
             params![model, unix_timestamp(), id],
         )?;
+        if updated == 0 {
+            return Err(SessionError::SessionNotFound(id.to_owned()));
+        }
         Ok(())
     }
 
@@ -730,10 +740,13 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
+        let updated = connection.execute(
             "UPDATE providers SET enabled = ?1, updated_at = ?2 WHERE provider = ?3",
             params![i64::from(enabled), unix_timestamp(), provider],
         )?;
+        if updated == 0 {
+            return Err(SessionError::ProviderNotFound(provider.to_owned()));
+        }
         Ok(())
     }
 
@@ -1206,6 +1219,26 @@ mod tests {
             .find(|provider| provider.provider == DEVIN_PROVIDER)
             .expect("Devin provider");
         assert!(!devin.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mutations_for_unknown_records() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("unknown.db"))?;
+
+        assert!(matches!(
+            store.touch("missing-session"),
+            Err(SessionError::SessionNotFound(id)) if id == "missing-session"
+        ));
+        assert!(matches!(
+            store.update_model("missing-session", Some("model")),
+            Err(SessionError::SessionNotFound(id)) if id == "missing-session"
+        ));
+        assert!(matches!(
+            store.set_provider_enabled("missing-provider", true),
+            Err(SessionError::ProviderNotFound(provider)) if provider == "missing-provider"
+        ));
         Ok(())
     }
 

@@ -10,6 +10,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -160,6 +161,20 @@ pub struct InferenceOutput {
 pub struct InferenceFailure {
     pub message: String,
     pub retry_count: usize,
+}
+
+#[derive(Debug, Error)]
+pub enum TurnError {
+    #[error("turn interrupted")]
+    Interrupted,
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for TurnError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
 }
 
 impl InferenceFailure {
@@ -327,7 +342,7 @@ impl AgentRuntime {
         mut attachments: Vec<PromptAttachment>,
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: CancellationToken,
-    ) -> Result<(), String> {
+    ) -> Result<(), TurnError> {
         self.prepare_image_fallback(&mut prompt, &mut attachments, &cancellation)
             .await?;
         session.history.push(ConversationItem::User {
@@ -347,7 +362,7 @@ impl AgentRuntime {
         let mut tool_failures = HashMap::<String, usize>::new();
         loop {
             if cancellation.is_cancelled() {
-                return Err("turn interrupted".to_owned());
+                return Err(TurnError::Interrupted);
             }
             if session.should_compact(self.compaction_threshold_percent) {
                 let compaction = self
@@ -365,7 +380,8 @@ impl AgentRuntime {
                 {
                     return Err(format!(
                         "context compaction is required before inference: {error}"
-                    ));
+                    )
+                    .into());
                 }
             }
             let result = self
@@ -396,7 +412,7 @@ impl AgentRuntime {
                     })?;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             };
             warn_about_retries(backend_events, inference_round, output.retry_count).await;
             session.history.push(ConversationItem::Assistant {
@@ -1522,6 +1538,25 @@ pub struct RuntimeSessionStore {
     provider: String,
 }
 
+pub(crate) fn set_session_model(
+    sessions: &mut HashMap<String, RuntimeSession>,
+    store: Option<&RuntimeSessionStore>,
+    provider_session_id: &str,
+    model: String,
+) -> Result<(), String> {
+    let session = sessions
+        .get_mut(provider_session_id)
+        .ok_or_else(|| "unknown native session".to_owned())?;
+    if session.model != model {
+        session.context_window = None;
+    }
+    session.model = model;
+    if let Some(store) = store {
+        store.save(session)?;
+    }
+    Ok(())
+}
+
 impl RuntimeSessionStore {
     #[must_use]
     pub fn new(database: PathBuf, provider: impl Into<String>) -> Self {
@@ -2216,7 +2251,11 @@ mod tests {
             .await
             .expect_err("unsafe inference is rejected");
 
-        assert!(error.contains("context compaction is required before inference"));
+        assert!(
+            error
+                .to_string()
+                .contains("context compaction is required before inference")
+        );
         assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
         assert!(session.telemetry.inference.iter().any(|metric| {
             metric.kind == super::InferenceKind::Compaction && metric.error.is_some()

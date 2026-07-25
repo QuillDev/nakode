@@ -44,7 +44,9 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
 
     backend
         .commands
-        .send(BackendCommand::Reload { session_id: None })
+        .send(BackendCommand::Reload {
+            provider_session_id: None,
+        })
         .await?;
     assert!(matches!(
         next_event(&mut backend).await?,
@@ -77,7 +79,7 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
     backend
         .commands
         .send(BackendCommand::StartTurn {
-            session_id: provider_session_id,
+            provider_session_id,
             client_id: "client-fixture".to_owned(),
             prompt: "hello fixture".to_owned(),
             attachments: Vec::new(),
@@ -87,7 +89,7 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
     backend
         .commands
         .send(BackendCommand::SteerTurn {
-            session_id: "thread-fixture".to_owned(),
+            provider_session_id: "thread-fixture".to_owned(),
             turn_id: "turn-fixture".to_owned(),
             client_id: "steer-fixture".to_owned(),
             prompt: "steer fixture".to_owned(),
@@ -100,7 +102,7 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
     assert_eq!(final_text.as_deref(), Some("hello world"));
     assert!(steer_accepted);
     backend.commands.send(BackendCommand::Shutdown).await?;
-    timeout(Duration::from_secs(5), backend.join()).await?;
+    timeout(Duration::from_secs(5), backend.join()).await??;
     Ok(())
 }
 
@@ -256,7 +258,7 @@ async fn codex_client_resumes_history_and_unsubscribes() -> TestResult {
     ));
 
     backend.commands.send(BackendCommand::Shutdown).await?;
-    timeout(Duration::from_secs(5), backend.join()).await?;
+    timeout(Duration::from_secs(5), backend.join()).await??;
     Ok(())
 }
 
@@ -310,7 +312,7 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
     }
 
     backend.commands.send(BackendCommand::Shutdown).await?;
-    timeout(Duration::from_secs(5), backend.join()).await?;
+    timeout(Duration::from_secs(5), backend.join()).await??;
     Ok(())
 }
 

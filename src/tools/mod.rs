@@ -209,6 +209,21 @@ pub fn resolve_workspace_path(
     Ok(candidate)
 }
 
+fn glob_root(pattern: &Path) -> std::path::PathBuf {
+    let mut root = std::path::PathBuf::new();
+    for component in pattern.components() {
+        let text = component.as_os_str().to_string_lossy();
+        if text
+            .chars()
+            .any(|character| matches!(character, '*' | '?' | '[' | '{'))
+        {
+            break;
+        }
+        root.push(component.as_os_str());
+    }
+    root
+}
+
 fn ensure_existing_ancestor_is_confined(workspace: &Path, candidate: &Path) -> Result<(), String> {
     let canonical_workspace = workspace.canonicalize().map_err(|error| {
         format!(

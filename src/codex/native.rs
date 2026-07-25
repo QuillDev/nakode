@@ -13,12 +13,12 @@ use crate::{
     backend::{
         BackendCapabilities, BackendCommand, BackendError, BackendEvent, BackendHandle,
         BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, ModelInfo,
-        TurnOutcome,
+        TurnOutcome, request_failed,
     },
     runtime::{
         AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
         InferenceFailure, InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest,
-        RuntimeSession, RuntimeSessionStore, ToolCall,
+        RuntimeSession, RuntimeSessionStore, ToolCall, TurnError, set_session_model,
     },
 };
 
@@ -468,8 +468,8 @@ async fn run_supervisor(
                 if completed.kind == CompletedWorkKind::Turn {
                     let (outcome, error) = match completed.result {
                         Ok(()) => (TurnOutcome::Completed, None),
-                        Err(error) if error == "turn interrupted" => (TurnOutcome::Interrupted, None),
-                        Err(error) => (TurnOutcome::Failed, Some(error)),
+                        Err(TurnError::Interrupted) => (TurnOutcome::Interrupted, None),
+                        Err(error) => (TurnOutcome::Failed, Some(error.to_string())),
                     };
                     let _ = events.send(BackendEvent::TurnCompleted {
                         turn_id: completed.turn_id,
@@ -496,7 +496,7 @@ enum CompletedWorkKind {
 struct CompletedTurn {
     turn_id: String,
     session: RuntimeSession,
-    result: Result<(), String>,
+    result: Result<(), TurnError>,
     kind: CompletedWorkKind,
 }
 
@@ -538,14 +538,10 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::StartSession {
             model,
             instructions,
-        } => {
-            start_session(model, instructions, context).await;
-        }
+        } => start_session(model, instructions, context).await,
         BackendCommand::ResumeSession {
             provider_session_id,
-        } => {
-            resume_session(provider_session_id, context).await;
-        }
+        } => resume_session(provider_session_id, context).await,
         BackendCommand::UnsubscribeSession {
             provider_session_id,
         } => {
@@ -553,37 +549,38 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             let _ = context.events.send(BackendEvent::SessionUnsubscribed).await;
         }
         BackendCommand::CompactSession {
-            session_id,
+            provider_session_id,
             compaction_id,
-        } => compact_session(session_id, compaction_id, context).await,
-        BackendCommand::SetSessionModel { session_id, model } => {
-            if let Some(session) = context.sessions.get_mut(&session_id) {
-                if session.model != model {
-                    session.context_window = None;
-                }
-                session.model = model;
-                if let Some(store) = context.session_store
-                    && let Err(error) = store.save(session)
-                {
-                    request_failed(context.events, BackendOperation::SetSessionModel, error).await;
-                }
-            } else {
-                request_failed(
-                    context.events,
-                    BackendOperation::SetSessionModel,
-                    "unknown native session",
-                )
-                .await;
+        } => compact_session(provider_session_id, compaction_id, context).await,
+        BackendCommand::SetSessionModel {
+            provider_session_id,
+            model,
+        } => {
+            if let Err(error) = set_session_model(
+                context.sessions,
+                context.session_store,
+                &provider_session_id,
+                model,
+            ) {
+                request_failed(context.events, BackendOperation::SetSessionModel, error).await;
             }
         }
         BackendCommand::StartTurn {
-            session_id,
+            provider_session_id,
             client_id,
             prompt,
             attachments,
             model,
         } => {
-            start_turn(session_id, client_id, prompt, attachments, model, context).await;
+            start_turn(
+                provider_session_id,
+                client_id,
+                prompt,
+                attachments,
+                model,
+                context,
+            )
+            .await;
         }
         BackendCommand::InterruptTurn { turn_id, .. } => {
             if let Some(active) = context
@@ -655,7 +652,8 @@ async fn compact_session(
     tokio::spawn(async move {
         let result = runtime
             .force_compact(&mut session, &compaction_id, &events, cancellation)
-            .await;
+            .await
+            .map_err(TurnError::from);
         let _ = completed
             .send(CompletedTurn {
                 turn_id: compaction_id,
@@ -900,20 +898,6 @@ fn native_capabilities() -> BackendCapabilities {
     }
 }
 
-async fn request_failed(
-    events: &mpsc::Sender<BackendEvent>,
-    operation: BackendOperation,
-    message: impl Into<String>,
-) {
-    let _ = events
-        .send(BackendEvent::RequestFailed {
-            operation,
-            code: -1,
-            message: message.into(),
-        })
-        .await;
-}
-
 async fn discover_models(
     config: &BackendConfig,
     credential: &CodexCredential,
@@ -1148,6 +1132,7 @@ async fn parse_codex_sse(
     let mut stream = response.bytes_stream();
     let mut pending = String::new();
     let mut output = InferenceOutput::default();
+    let mut completed = false;
     loop {
         let chunk = tokio::select! {
             chunk = stream.next() => chunk,
@@ -1172,22 +1157,36 @@ async fn parse_codex_sse(
                 continue;
             };
             if data == "[DONE]" {
+                completed = true;
                 continue;
             }
             let event: Value = serde_json::from_str(data).map_err(|error| {
                 InferenceAttemptError::terminal(format!("invalid Codex event: {error}"))
             })?;
-            if let Err(message) = apply_codex_event(&event, &events, &mut output).await {
-                let retryable = output.text.is_empty()
-                    && output.reasoning.is_empty()
-                    && retryable_stream_message(&message);
-                return Err(InferenceAttemptError {
-                    message,
-                    retryable,
-                    retry_after: None,
-                });
+            match apply_codex_event(&event, &events, &mut output).await {
+                Ok(event_completed) => completed |= event_completed,
+                Err(message) => {
+                    let retryable = output.text.is_empty()
+                        && output.reasoning.is_empty()
+                        && retryable_stream_message(&message);
+                    return Err(InferenceAttemptError {
+                        message,
+                        retryable,
+                        retry_after: None,
+                    });
+                }
             }
         }
+    }
+    if !pending.is_empty() {
+        return Err(InferenceAttemptError::terminal(
+            "Codex stream ended in the middle of an event",
+        ));
+    }
+    if !completed {
+        return Err(InferenceAttemptError::terminal(
+            "Codex stream ended before a completion marker",
+        ));
     }
     Ok(output)
 }
@@ -1196,12 +1195,12 @@ async fn apply_codex_event(
     event: &Value,
     events: &mpsc::Sender<InferenceEvent>,
     output: &mut InferenceOutput,
-) -> Result<(), String> {
-    match event
+) -> Result<bool, String> {
+    let event_type = event
         .get("type")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-    {
+        .unwrap_or_default();
+    match event_type {
         "response.created" => {
             output.response_id = event
                 .pointer("/response/id")
@@ -1288,7 +1287,7 @@ async fn apply_codex_event(
         }
         _ => {}
     }
-    Ok(())
+    Ok(event_type == "response.completed")
 }
 
 fn codex_error_message(event: &Value, fallback: &str) -> String {
@@ -1622,6 +1621,44 @@ mod tests {
         assert!(
             matches!(event_rx.recv().await, Some(InferenceEvent::TextDelta(delta)) if delta == "hello")
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_native_streams_without_a_completion_marker() {
+        let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n";
+        let (base_url, server) = serve_once("text/event-stream", body).await;
+        let response = Client::new()
+            .get(base_url)
+            .send()
+            .await
+            .expect("mock stream response");
+        let (events, _receiver) = mpsc::channel(1);
+
+        let error = parse_codex_sse(response, events, CancellationToken::new())
+            .await
+            .expect_err("truncated stream must fail");
+        server.await.expect("mock server task");
+
+        assert!(error.message.contains("before a completion marker"));
+    }
+
+    #[tokio::test]
+    async fn rejects_native_streams_ending_mid_event() {
+        let (base_url, server) =
+            serve_once("text/event-stream", "data: {\"type\":\"response.created\"").await;
+        let response = Client::new()
+            .get(base_url)
+            .send()
+            .await
+            .expect("mock stream response");
+        let (events, _receiver) = mpsc::channel(1);
+
+        let error = parse_codex_sse(response, events, CancellationToken::new())
+            .await
+            .expect_err("partial event must fail");
+        server.await.expect("mock server task");
+
+        assert!(error.message.contains("middle of an event"));
     }
 
     #[tokio::test]

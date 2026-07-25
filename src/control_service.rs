@@ -72,6 +72,7 @@ pub struct IncomingInvocation {
 
 pub struct ControlServer {
     pub requests: tokio::sync::mpsc::Receiver<IncomingInvocation>,
+    socket_path: PathBuf,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -133,12 +134,16 @@ impl ControlServer {
                 });
             }
         });
-        Ok(Self { requests, task })
+        Ok(Self {
+            requests,
+            socket_path: path.to_path_buf(),
+            task,
+        })
     }
 
-    pub fn shutdown(self, path: &Path) {
+    pub fn shutdown(self) {
         self.task.abort();
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(self.socket_path);
     }
 }
 
@@ -681,7 +686,7 @@ mod tests {
         let response = client.await.expect("client task").expect("agent response");
         assert!(response.success);
         assert_eq!(response.result, "No defects");
-        server.shutdown(&path);
+        server.shutdown();
     }
 
     #[tokio::test]
@@ -718,7 +723,7 @@ mod tests {
             .expect("second result");
         assert_eq!(first.result, "hardware complete");
         assert_eq!(second.result, "operating system complete");
-        server.shutdown(&path);
+        server.shutdown();
     }
 
     #[tokio::test]
@@ -732,7 +737,7 @@ mod tests {
             .err()
             .expect("second server must fail");
         assert!(matches!(error, ControlError::AlreadyRunning(_)));
-        server.shutdown(&path);
+        server.shutdown();
     }
 
     #[tokio::test]
@@ -808,8 +813,8 @@ mod tests {
             .await
             .expect("service task")
             .expect("service result");
-        first_server.shutdown(&first_path);
-        second_server.shutdown(&second_path);
+        first_server.shutdown();
+        second_server.shutdown();
     }
 
     fn invocation(session_id: &str, task: &str) -> AgentInvocation {

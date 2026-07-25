@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::backend::{
     BackendCapabilities, BackendCommand, BackendError, BackendEvent, BackendHandle,
     BackendIdentity, BackendOperation, CURSOR_PROVIDER, CapabilitySupport, DeltaKind, ItemKind,
-    ItemStatus, ModelInfo, NormalizedItem, TurnOutcome,
+    ItemStatus, ModelInfo, NormalizedItem, TurnOutcome, request_failed,
 };
 
 const COMMAND_CAPACITY: usize = 128;
@@ -63,6 +63,16 @@ struct Bridge {
     task: tokio::task::JoinHandle<()>,
 }
 
+struct BridgeRequest {
+    method: &'static str,
+    payload: Value,
+}
+
+struct UnsupportedCommand {
+    operation: BackendOperation,
+    message: &'static str,
+}
+
 /// Starts the Cursor TypeScript SDK adapter.
 ///
 /// # Errors
@@ -100,8 +110,12 @@ fn credential_api_key(credential: Option<&Value>) -> Result<Option<String>, Back
     Ok(key)
 }
 
-#[allow(clippy::too_many_lines)]
 async fn spawn_bridge(workspace: &std::path::Path) -> Result<Bridge, BackendError> {
+    let directory = prepare_bridge_directory().await?;
+    launch_bridge(&directory, workspace)
+}
+
+async fn prepare_bridge_directory() -> Result<PathBuf, BackendError> {
     ensure_node_version().await?;
     let project =
         ProjectDirs::from("dev", "nakode", "Nakode").ok_or_else(|| BackendError::BridgeSetup {
@@ -130,10 +144,7 @@ async fn spawn_bridge(workspace: &std::path::Path) -> Result<Bridge, BackendErro
             provider: CURSOR_PROVIDER.to_owned(),
             detail: error.to_string(),
         })?;
-    if !directory
-        .join("node_modules/@cursor/sdk/dist/esm/index.js")
-        .exists()
-    {
+    if !cursor_sdk_is_current(&directory).await {
         let output = Command::new("npm")
             .args([
                 "install",
@@ -156,15 +167,37 @@ async fn spawn_bridge(workspace: &std::path::Path) -> Result<Bridge, BackendErro
             });
         }
     }
+    Ok(directory)
+}
+
+async fn cursor_sdk_is_current(directory: &std::path::Path) -> bool {
+    let entrypoint = directory.join("node_modules/@cursor/sdk/dist/esm/index.js");
+    if !entrypoint.is_file() {
+        return false;
+    }
+    let manifest = directory.join("node_modules/@cursor/sdk/package.json");
+    tokio::fs::read_to_string(manifest)
+        .await
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|manifest| manifest["version"].as_str().map(str::to_owned))
+        .is_some_and(|version| version == SDK_VERSION)
+}
+
+fn launch_bridge(
+    directory: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<Bridge, BackendError> {
     let executable = std::env::current_exe().map_err(|error| BackendError::BridgeSetup {
         provider: CURSOR_PROVIDER.to_owned(),
         detail: error.to_string(),
     })?;
     let mut child = Command::new("node")
         .arg(directory.join("bridge.mjs"))
-        .current_dir(&directory)
+        .current_dir(directory)
         .env("NAKODE_WORKSPACE", workspace)
         .env("NAKODE_EXECUTABLE", executable)
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -281,7 +314,6 @@ async fn run_supervisor(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn handle_command(
     command: BackendCommand,
     config: &BackendConfig,
@@ -290,22 +322,7 @@ async fn handle_command(
     events: &mpsc::Sender<BackendEvent>,
 ) {
     if matches!(command, BackendCommand::BeginAuthentication) {
-        if let Some(key) = api_key {
-            let _ = events
-                .send(BackendEvent::AuthenticationCompleted {
-                    kind: "api_key".to_owned(),
-                    metadata: json!({"api_key": key}),
-                })
-                .await;
-        } else {
-            let _ = events
-                .send(BackendEvent::AuthenticationChallenge {
-                    login_id: Uuid::now_v7().to_string(),
-                    verification_url: "https://cursor.com/dashboard/api".to_owned(),
-                    user_code: "Set CURSOR_API_KEY, then retry".to_owned(),
-                })
-                .await;
-        }
+        authenticate(api_key, events).await;
         return;
     }
     let Some(key) = api_key else {
@@ -333,70 +350,25 @@ async fn handle_command(
             return;
         }
     };
-    let request_id = Uuid::now_v7().to_string();
-    let (method, mut payload) = match command {
-        BackendCommand::StartSession {
-            model,
-            instructions,
-        } => ("create", json!({"model":model,"instructions":instructions})),
-        BackendCommand::ResumeSession {
-            provider_session_id,
-        } => ("resume", json!({"sessionId":provider_session_id})),
-        BackendCommand::UnsubscribeSession {
-            provider_session_id,
-        } => ("close", json!({"sessionId":provider_session_id})),
-        BackendCommand::StartTurn {
-            session_id,
-            client_id,
-            prompt,
-            attachments: _,
-            model,
-        } => (
-            "send",
-            json!({"sessionId":session_id,"turnId":client_id,"prompt":prompt,"model":model}),
-        ),
-        BackendCommand::InterruptTurn {
-            session_id: _,
-            turn_id,
-        } => ("cancel", json!({"turnId":turn_id})),
-        BackendCommand::Reload { session_id } => ("reload", json!({"sessionId":session_id})),
-        BackendCommand::SetSessionModel { .. } => {
-            request_failed(
-                events,
-                BackendOperation::SetSessionModel,
-                "Cursor applies model changes on the next turn",
-            )
-            .await;
+    let BridgeRequest {
+        method,
+        mut payload,
+    } = match bridge_request(command) {
+        Ok(Some(request)) => request,
+        Ok(None) => return,
+        Err(unsupported) => {
+            request_failed(events, unsupported.operation, unsupported.message).await;
             return;
         }
-        BackendCommand::CompactSession { .. } => {
-            request_failed(
-                events,
-                BackendOperation::CompactSession,
-                "Cursor manages its own context",
-            )
-            .await;
-            return;
-        }
-        BackendCommand::SteerTurn { .. } => {
-            request_failed(
-                events,
-                BackendOperation::SteerTurn,
-                "Cursor SDK does not expose steering",
-            )
-            .await;
-            return;
-        }
-        BackendCommand::ResolveApproval { .. }
-        | BackendCommand::ResolveQuestion { .. }
-        | BackendCommand::BeginAuthentication
-        | BackendCommand::Shutdown => return,
     };
     let Some(object) = payload.as_object_mut() else {
         return;
     };
     object.insert("method".to_owned(), Value::String(method.to_owned()));
-    object.insert("requestId".to_owned(), Value::String(request_id));
+    object.insert(
+        "requestId".to_owned(),
+        Value::String(Uuid::now_v7().to_string()),
+    );
     object.insert(
         "operation".to_owned(),
         Value::String(operation_for_method(method).label().to_owned()),
@@ -409,6 +381,76 @@ async fn handle_command(
     if let Err(error) = send(bridge, payload).await {
         request_failed(events, operation_for_method(method), error).await;
     }
+}
+
+async fn authenticate(api_key: Option<&str>, events: &mpsc::Sender<BackendEvent>) {
+    let event = api_key.map_or_else(
+        || BackendEvent::AuthenticationChallenge {
+            login_id: Uuid::now_v7().to_string(),
+            verification_url: "https://cursor.com/dashboard/api".to_owned(),
+            user_code: "Set CURSOR_API_KEY, then retry".to_owned(),
+        },
+        |key| BackendEvent::AuthenticationCompleted {
+            kind: "api_key".to_owned(),
+            metadata: json!({"api_key": key}),
+        },
+    );
+    let _ = events.send(event).await;
+}
+
+fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, UnsupportedCommand> {
+    let (method, payload) = match command {
+        BackendCommand::StartSession {
+            model,
+            instructions,
+        } => ("create", json!({"model":model,"instructions":instructions})),
+        BackendCommand::ResumeSession {
+            provider_session_id,
+        } => ("resume", json!({"sessionId":provider_session_id})),
+        BackendCommand::UnsubscribeSession {
+            provider_session_id,
+        } => ("close", json!({"sessionId":provider_session_id})),
+        BackendCommand::StartTurn {
+            provider_session_id,
+            client_id,
+            prompt,
+            attachments: _,
+            model,
+        } => (
+            "send",
+            json!({"sessionId":provider_session_id,"turnId":client_id,"prompt":prompt,"model":model}),
+        ),
+        BackendCommand::InterruptTurn {
+            provider_session_id: _,
+            turn_id,
+        } => ("cancel", json!({"turnId":turn_id})),
+        BackendCommand::Reload {
+            provider_session_id,
+        } => ("reload", json!({"sessionId":provider_session_id})),
+        BackendCommand::SetSessionModel { .. } => {
+            return Err(UnsupportedCommand {
+                operation: BackendOperation::SetSessionModel,
+                message: "Cursor applies model changes on the next turn",
+            });
+        }
+        BackendCommand::CompactSession { .. } => {
+            return Err(UnsupportedCommand {
+                operation: BackendOperation::CompactSession,
+                message: "Cursor manages its own context",
+            });
+        }
+        BackendCommand::SteerTurn { .. } => {
+            return Err(UnsupportedCommand {
+                operation: BackendOperation::SteerTurn,
+                message: "Cursor SDK does not expose steering",
+            });
+        }
+        BackendCommand::ResolveApproval { .. }
+        | BackendCommand::ResolveQuestion { .. }
+        | BackendCommand::BeginAuthentication
+        | BackendCommand::Shutdown => return Ok(None),
+    };
+    Ok(Some(BridgeRequest { method, payload }))
 }
 
 async fn send(bridge: &mut Bridge, value: Value) -> Result<(), String> {
@@ -426,7 +468,7 @@ async fn augment_image_attachments(
     config: &BackendConfig,
 ) -> Result<BackendCommand, String> {
     let BackendCommand::StartTurn {
-        session_id,
+        provider_session_id,
         client_id,
         mut prompt,
         mut attachments,
@@ -445,7 +487,7 @@ async fn augment_image_attachments(
         .is_some_and(|config| config.read().is_ok_and(|config| config.is_enabled()));
     if images.is_empty() || !vision_enabled {
         return Ok(BackendCommand::StartTurn {
-            session_id,
+            provider_session_id,
             client_id,
             prompt,
             attachments,
@@ -469,7 +511,7 @@ async fn augment_image_attachments(
         attachment.image = None;
     }
     Ok(BackendCommand::StartTurn {
-        session_id,
+        provider_session_id,
         client_id,
         prompt,
         attachments,
@@ -477,55 +519,25 @@ async fn augment_image_attachments(
     })
 }
 
-#[allow(clippy::too_many_lines)]
 async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEvent>) {
-    let event = message
+    let event_name = message
         .get("event")
         .and_then(Value::as_str)
         .unwrap_or("diagnostic");
-    match event {
-        "models" => {
-            let models = message["models"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|model| {
-                    Some(ModelInfo {
-                        provider: CURSOR_PROVIDER.to_owned(),
-                        id: model.get("id")?.as_str()?.to_owned(),
-                        is_default: model
-                            .get("isDefault")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    })
-                })
-                .collect();
-            let _ = events.send(BackendEvent::Models(models)).await;
-        }
-        "session_created" => {
-            let _ = events
-                .send(BackendEvent::SessionCreated {
-                    provider_session_id: string(message, "sessionId"),
-                    model: string(message, "model"),
-                })
-                .await;
-        }
-        "session_resumed" => {
-            let _ = events
-                .send(BackendEvent::SessionResumed {
-                    provider_session_id: string(message, "sessionId"),
-                    model: string(message, "model"),
-                    history: Vec::new(),
-                })
-                .await;
-        }
-        "session_closed" => {
-            let _ = events
-                .send(BackendEvent::SessionClosed {
-                    provider_session_id: string(message, "sessionId"),
-                })
-                .await;
-        }
+    let event = match event_name {
+        "models" => models_event(message),
+        "session_created" => BackendEvent::SessionCreated {
+            provider_session_id: string(message, "sessionId"),
+            model: string(message, "model"),
+        },
+        "session_resumed" => BackendEvent::SessionResumed {
+            provider_session_id: string(message, "sessionId"),
+            model: string(message, "model"),
+            history: Vec::new(),
+        },
+        "session_closed" => BackendEvent::SessionClosed {
+            provider_session_id: string(message, "sessionId"),
+        },
         "turn_started" => {
             let turn_id = string(message, "turnId");
             let _ = events
@@ -533,7 +545,7 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
                     turn_id: turn_id.clone(),
                 })
                 .await;
-            let _ = events.send(BackendEvent::TurnStarted { turn_id }).await;
+            BackendEvent::TurnStarted { turn_id }
         }
         "delta" => {
             let kind = if message["kind"] == "reasoning" {
@@ -542,56 +554,19 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
                 DeltaKind::Assistant
             };
             let turn_id = string(message, "turnId");
-            let _ = events
-                .send(BackendEvent::ItemDelta {
-                    item_id: format!("{turn_id}:cursor"),
-                    turn_id,
-                    kind,
-                    delta: string(message, "text"),
-                })
-                .await;
+            BackendEvent::ItemDelta {
+                item_id: format!("{turn_id}:cursor"),
+                turn_id,
+                kind,
+                delta: string(message, "text"),
+            }
         }
-        "tool_call" => {
-            let status = match message["status"].as_str() {
-                Some("running") => ItemStatus::Running,
-                Some("error") => ItemStatus::Failed,
-                _ => ItemStatus::Complete,
-            };
-            let body = message
-                .get("result")
-                .or_else(|| message.get("args"))
-                .map_or_else(String::new, display_value);
-            let item = NormalizedItem {
-                id: string(message, "callId"),
-                kind: ItemKind::Tool,
-                title: string(message, "name"),
-                body,
-                status,
-            };
-            let output = if status == ItemStatus::Running {
-                BackendEvent::ItemStarted {
-                    turn_id: string(message, "turnId"),
-                    item,
-                }
-            } else {
-                BackendEvent::ItemCompleted {
-                    turn_id: string(message, "turnId"),
-                    item,
-                }
-            };
-            let _ = events.send(output).await;
-        }
-        "plan" => {
-            let _ = events
-                .send(BackendEvent::TurnPlan {
-                    turn_id: string(message, "turnId"),
-                    plan: string(message, "text"),
-                })
-                .await;
-        }
-        "interrupt_accepted" => {
-            let _ = events.send(BackendEvent::InterruptAccepted).await;
-        }
+        "tool_call" => tool_call_event(message),
+        "plan" => BackendEvent::TurnPlan {
+            turn_id: string(message, "turnId"),
+            plan: string(message, "text"),
+        },
+        "interrupt_accepted" => BackendEvent::InterruptAccepted,
         "turn_completed" => {
             let outcome = match message["status"].as_str() {
                 Some("finished") => TurnOutcome::Completed,
@@ -602,13 +577,11 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
                 .get("error")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let _ = events
-                .send(BackendEvent::TurnCompleted {
-                    turn_id: string(message, "turnId"),
-                    outcome,
-                    error,
-                })
-                .await;
+            BackendEvent::TurnCompleted {
+                turn_id: string(message, "turnId"),
+                outcome,
+                error,
+            }
         }
         "error" => {
             request_failed(
@@ -617,11 +590,58 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
                 string(message, "message"),
             )
             .await;
+            return;
         }
-        _ => {
-            let _ = events
-                .send(BackendEvent::ProtocolDiagnostic(string(message, "message")))
-                .await;
+        _ => BackendEvent::ProtocolDiagnostic(string(message, "message")),
+    };
+    let _ = events.send(event).await;
+}
+
+fn models_event(message: &Value) -> BackendEvent {
+    let models = message["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            Some(ModelInfo {
+                provider: CURSOR_PROVIDER.to_owned(),
+                id: model.get("id")?.as_str()?.to_owned(),
+                is_default: model
+                    .get("isDefault")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect();
+    BackendEvent::Models(models)
+}
+
+fn tool_call_event(message: &Value) -> BackendEvent {
+    let status = match message["status"].as_str() {
+        Some("running") => ItemStatus::Running,
+        Some("error") => ItemStatus::Failed,
+        _ => ItemStatus::Complete,
+    };
+    let body = message
+        .get("result")
+        .or_else(|| message.get("args"))
+        .map_or_else(String::new, display_value);
+    let item = NormalizedItem {
+        id: string(message, "callId"),
+        kind: ItemKind::Tool,
+        title: string(message, "name"),
+        body,
+        status,
+    };
+    if status == ItemStatus::Running {
+        BackendEvent::ItemStarted {
+            turn_id: string(message, "turnId"),
+            item,
+        }
+    } else {
+        BackendEvent::ItemCompleted {
+            turn_id: string(message, "turnId"),
+            item,
         }
     }
 }
@@ -633,12 +653,14 @@ fn string(value: &Value, key: &str) -> String {
         .unwrap_or_default()
         .to_owned()
 }
+
 fn display_value(value: &Value) -> String {
     value.as_str().map_or_else(
         || serde_json::to_string_pretty(value).unwrap_or_default(),
         str::to_owned,
     )
 }
+
 fn operation_for(command: &BackendCommand) -> BackendOperation {
     match command {
         BackendCommand::StartSession { .. } => BackendOperation::StartSession,
@@ -653,6 +675,7 @@ fn operation_for(command: &BackendCommand) -> BackendOperation {
         _ => BackendOperation::StartTurn,
     }
 }
+
 fn operation_for_method(method: &str) -> BackendOperation {
     match method {
         "create" => BackendOperation::StartSession,
@@ -663,19 +686,7 @@ fn operation_for_method(method: &str) -> BackendOperation {
         _ => BackendOperation::StartTurn,
     }
 }
-async fn request_failed(
-    events: &mpsc::Sender<BackendEvent>,
-    operation: BackendOperation,
-    message: impl Into<String>,
-) {
-    let _ = events
-        .send(BackendEvent::RequestFailed {
-            operation,
-            code: -1,
-            message: message.into(),
-        })
-        .await;
-}
+
 fn capabilities() -> BackendCapabilities {
     BackendCapabilities {
         resume: CapabilitySupport::Supported,
@@ -690,6 +701,7 @@ fn capabilities() -> BackendCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn bridge_injects_only_the_nakode_coordination_tool() {
         assert!(BRIDGE_SOURCE.contains("nakode_agent:"));
@@ -700,6 +712,7 @@ mod tests {
             assert!(!BRIDGE_SOURCE.contains(&format!("      {name}: {{")));
         }
     }
+
     #[test]
     fn credential_prefers_persisted_key() {
         let value = json!({"api_key":"stored"});
@@ -707,5 +720,23 @@ mod tests {
             credential_api_key(Some(&value)).unwrap().as_deref(),
             Some("stored")
         );
+    }
+
+    #[tokio::test]
+    async fn installed_cursor_sdk_must_match_the_bridge_version() {
+        let directory = tempfile::tempdir().expect("temporary SDK directory");
+        let sdk = directory.path().join("node_modules/@cursor/sdk");
+        std::fs::create_dir_all(sdk.join("dist/esm")).expect("SDK directory");
+        std::fs::write(sdk.join("dist/esm/index.js"), "").expect("SDK entrypoint");
+        std::fs::write(
+            sdk.join("package.json"),
+            format!(r#"{{"version":"{SDK_VERSION}"}}"#),
+        )
+        .expect("SDK manifest");
+        assert!(cursor_sdk_is_current(directory.path()).await);
+
+        std::fs::write(sdk.join("package.json"), r#"{"version":"0.0.0"}"#)
+            .expect("stale SDK manifest");
+        assert!(!cursor_sdk_is_current(directory.path()).await);
     }
 }

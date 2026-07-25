@@ -9,6 +9,20 @@ pub const CODEX_PROVIDER: &str = "openai-codex";
 pub const DEVIN_PROVIDER: &str = "devin-acp";
 pub const CURSOR_PROVIDER: &str = "cursor-sdk";
 
+pub(crate) async fn request_failed(
+    events: &mpsc::Sender<BackendEvent>,
+    operation: BackendOperation,
+    message: impl Into<String>,
+) {
+    let _ = events
+        .send(BackendEvent::RequestFailed {
+            operation,
+            code: -1,
+            message: message.into(),
+        })
+        .await;
+}
+
 /// Features declared by the active provider adapter.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CapabilitySupport {
@@ -372,32 +386,32 @@ pub enum BackendCommand {
         provider_session_id: String,
     },
     StartTurn {
-        session_id: String,
+        provider_session_id: String,
         client_id: String,
         prompt: String,
         attachments: Vec<PromptAttachment>,
         model: Option<String>,
     },
     SteerTurn {
-        session_id: String,
+        provider_session_id: String,
         turn_id: String,
         client_id: String,
         prompt: String,
     },
     InterruptTurn {
-        session_id: String,
+        provider_session_id: String,
         turn_id: String,
     },
     CompactSession {
-        session_id: String,
+        provider_session_id: String,
         compaction_id: String,
     },
     SetSessionModel {
-        session_id: String,
+        provider_session_id: String,
         model: String,
     },
     Reload {
-        session_id: Option<String>,
+        provider_session_id: Option<String>,
     },
     ResolveApproval {
         id: Value,
@@ -475,8 +489,13 @@ impl BackendHandle {
         }
     }
 
-    pub async fn join(self) {
-        let _ = self.task.await;
+    /// Waits for the provider supervisor to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the supervisor task's cancellation or panic error.
+    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
+        self.task.await
     }
 
     pub(crate) fn into_parts(
