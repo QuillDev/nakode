@@ -406,6 +406,7 @@ struct ProviderContext {
     capabilities: BackendCapabilities,
     connection: ConnectionState,
     provider_session_id: Option<String>,
+    agent_session_id: Option<String>,
     session_id: Option<String>,
     context_usage: Option<ContextUsageState>,
 }
@@ -589,6 +590,7 @@ pub enum Effect {
     ReloadConfiguration,
     ResolveSession(String),
     PersistSession {
+        nakode_session_id: String,
         provider: String,
         provider_session_id: String,
         workspace: String,
@@ -626,6 +628,7 @@ pub struct AppState {
     pub backend_capabilities: BackendCapabilities,
     provider_contexts: HashMap<String, ProviderContext>,
     pub provider_session_id: Option<String>,
+    pub agent_session_id: Option<String>,
     pub session_id: Option<String>,
     pub active_turn: Option<ActiveTurn>,
     pub context_usage: Option<ContextUsageState>,
@@ -1039,6 +1042,7 @@ impl AppState {
                 capabilities: BackendCapabilities::default(),
                 connection: ConnectionState::Starting,
                 provider_session_id: None,
+                agent_session_id: None,
                 session_id: None,
                 context_usage: None,
             },
@@ -1051,6 +1055,7 @@ impl AppState {
             backend_capabilities: BackendCapabilities::default(),
             provider_contexts,
             provider_session_id: None,
+            agent_session_id: None,
             session_id: None,
             active_turn: None,
             context_usage: None,
@@ -1852,6 +1857,7 @@ impl AppState {
         if provider == self.backend_provider {
             self.connection = ConnectionState::Disconnected("logged out".to_owned());
             self.provider_session_id = None;
+            self.agent_session_id = None;
             self.session_id = None;
             self.context_usage = None;
         }
@@ -1890,6 +1896,7 @@ impl AppState {
                 capabilities: BackendCapabilities::default(),
                 connection: ConnectionState::Starting,
                 provider_session_id: None,
+                agent_session_id: None,
                 session_id: None,
                 context_usage: None,
             },
@@ -1911,6 +1918,7 @@ impl AppState {
                 capabilities: BackendCapabilities::default(),
                 connection: ConnectionState::Failed(message.to_owned()),
                 provider_session_id: None,
+                agent_session_id: None,
                 session_id: None,
                 context_usage: None,
             },
@@ -1944,6 +1952,7 @@ impl AppState {
             self.connection = context.connection.clone();
             self.provider_session_id
                 .clone_from(&context.provider_session_id);
+            self.agent_session_id.clone_from(&context.agent_session_id);
             self.session_id.clone_from(&context.session_id);
             self.context_usage = context.context_usage;
         } else {
@@ -1952,6 +1961,7 @@ impl AppState {
             self.backend_capabilities = BackendCapabilities::default();
             self.connection = ConnectionState::Disconnected("no provider enabled".to_owned());
             self.provider_session_id = None;
+            self.agent_session_id = None;
             self.session_id = None;
             self.context_usage = None;
             self.set_status("No provider is enabled. Open /providers to configure one.");
@@ -1959,6 +1969,8 @@ impl AppState {
     }
 
     pub fn session_persisted(&mut self, session: &SessionRecord) {
+        self.nakode_session_id.clone_from(&session.id);
+        self.agent_session_id = Some(session.agent_session_id.clone());
         self.session_id = Some(session.id.clone());
         self.status_message = format!("Session {} started.", short_id(&session.id));
     }
@@ -2302,7 +2314,9 @@ impl AppState {
             return Vec::new();
         }
         let previous = self.provider_session_id.take();
+        self.agent_session_id = None;
         self.session_id = None;
+        self.nakode_session_id = uuid::Uuid::now_v7().to_string();
         self.session_model_override = false;
         self.selected_model = self.default_model();
         self.active_turn = None;
@@ -2656,6 +2670,7 @@ impl AppState {
             }
             if provider_changed {
                 self.provider_session_id = None;
+                self.agent_session_id = None;
                 self.session_id = None;
                 self.context_usage = None;
                 self.pending_handoff = handoff.flatten();
@@ -2858,6 +2873,7 @@ impl AppState {
                         capabilities: BackendCapabilities::default(),
                         connection: ConnectionState::Starting,
                         provider_session_id: None,
+                        agent_session_id: None,
                         session_id: None,
                         context_usage: None,
                     });
@@ -3008,6 +3024,7 @@ impl AppState {
                 capabilities: self.backend_capabilities.clone(),
                 connection: self.connection.clone(),
                 provider_session_id: None,
+                agent_session_id: None,
                 session_id: None,
                 context_usage: None,
             });
@@ -3017,6 +3034,7 @@ impl AppState {
         context
             .provider_session_id
             .clone_from(&self.provider_session_id);
+        context.agent_session_id.clone_from(&self.agent_session_id);
         context.session_id.clone_from(&self.session_id);
         context.context_usage = self.context_usage;
     }
@@ -3039,6 +3057,7 @@ impl AppState {
         self.backend_capabilities = context.capabilities;
         self.connection = context.connection;
         self.provider_session_id = context.provider_session_id;
+        self.agent_session_id = context.agent_session_id;
         self.session_id = context.session_id;
         self.context_usage = context.context_usage;
         true
@@ -3305,6 +3324,7 @@ impl AppState {
             return Vec::new();
         };
         let mut effects = vec![Effect::PersistSession {
+            nakode_session_id: self.nakode_session_id.clone(),
             provider: self.backend_provider.clone(),
             provider_session_id: provider_session_id.clone(),
             workspace: self.workspace.clone(),
@@ -3328,6 +3348,8 @@ impl AppState {
             return self.protocol_problem("session resume returned an empty provider id");
         }
         self.provider_session_id = Some(provider_session_id);
+        self.nakode_session_id.clone_from(&session.id);
+        self.agent_session_id = Some(session.agent_session_id.clone());
         self.session_id = Some(session.id.clone());
         self.context_usage = None;
         self.context_compaction = None;
@@ -3574,6 +3596,7 @@ impl AppState {
             .or_else(|| self.starting_turn.take());
         self.transcript.set_stream_active(false);
         self.provider_session_id = None;
+        self.agent_session_id = None;
         self.active_turn = None;
         self.context_usage = None;
         self.context_compaction = None;
@@ -3678,6 +3701,7 @@ impl AppState {
 
         if let Some(provider_session_id) = self.provider_session_id.clone() {
             let persist = self.session_id.is_none().then(|| Effect::PersistSession {
+                nakode_session_id: self.nakode_session_id.clone(),
                 provider: self.backend_provider.clone(),
                 provider_session_id: provider_session_id.clone(),
                 workspace: self.workspace.clone(),
@@ -6126,6 +6150,7 @@ model = "openai-codex/model-a"
         let mut state = ready_state();
         let session = SessionRecord {
             id: "01950000-0000-7000-8000-000000000000".to_owned(),
+            agent_session_id: "01950000-0000-7000-8000-000000000001".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-resumed".to_owned(),
             workspace: "/tmp/project".to_owned(),

@@ -852,12 +852,9 @@ async fn apply_effects(
             } => save_agent_definition(state, &definition, previous_slug.as_deref()),
             Effect::DeleteAgent(slug) => delete_agent_definition(state, &slug),
             Effect::ReloadConfiguration => apply_configuration_reload(state, &mut pending),
-            Effect::ResolveSession(id) => match sessions.find(&id) {
-                Ok(Some(record)) => pending.extend(state.begin_resume(record)),
-                Ok(None) => state.session_store_failed(format!("no session matches {id:?}")),
-                Err(error) => state.session_store_failed(error.to_string()),
-            },
+            Effect::ResolveSession(id) => resolve_session(state, sessions, &mut pending, &id),
             Effect::PersistSession {
+                nakode_session_id,
                 provider,
                 provider_session_id,
                 workspace,
@@ -866,11 +863,14 @@ async fn apply_effects(
             } => persist_session(
                 state,
                 sessions,
-                &provider,
-                &provider_session_id,
-                &workspace,
-                &title,
-                model.as_deref(),
+                &SessionCreateRequest {
+                    nakode_session_id: &nakode_session_id,
+                    provider: &provider,
+                    provider_session_id: &provider_session_id,
+                    workspace: &workspace,
+                    title: &title,
+                    model: model.as_deref(),
+                },
             ),
             Effect::PersistModels { provider, models } => {
                 persist_models(state, sessions, &provider, &models);
@@ -902,16 +902,41 @@ async fn apply_effects(
     quit
 }
 
+struct SessionCreateRequest<'a> {
+    nakode_session_id: &'a str,
+    provider: &'a str,
+    provider_session_id: &'a str,
+    workspace: &'a str,
+    title: &'a str,
+    model: Option<&'a str>,
+}
+
+fn resolve_session(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    pending: &mut std::collections::VecDeque<Effect>,
+    id: &str,
+) {
+    match sessions.find(id) {
+        Ok(Some(record)) => pending.extend(state.begin_resume(record)),
+        Ok(None) => state.session_store_failed(format!("no session matches {id:?}")),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
+}
+
 fn persist_session(
     state: &mut AppState,
     sessions: &dyn SessionRepository,
-    provider: &str,
-    provider_session_id: &str,
-    workspace: &str,
-    title: &str,
-    model: Option<&str>,
+    request: &SessionCreateRequest<'_>,
 ) {
-    match sessions.create(provider, provider_session_id, workspace, title, model) {
+    match sessions.create_agent_session(
+        request.nakode_session_id,
+        request.provider,
+        request.provider_session_id,
+        request.workspace,
+        request.title,
+        request.model,
+    ) {
         Ok(record) => state.session_persisted(&record),
         Err(error) => state.session_store_failed(error.to_string()),
     }

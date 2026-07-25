@@ -2,9 +2,9 @@
 
 This document defines the next three architecture migrations for Nakode. They
 are intentionally ordered because each one establishes contracts used by the
-next. Every migration must preserve existing installations through forward
-SQLite migrations and must pass the complete Rust quality gate before it is
-merged.
+next. Every migration must pass the complete Rust quality gate before it is
+merged. Configuration, credentials, and preferences are preserved, but the
+logical-session cutover deliberately does not retain legacy session history.
 
 ## Merge order
 
@@ -95,12 +95,9 @@ history belong to an agent session underneath it.
    - provider-local model;
    - role and lifecycle timestamps.
 3. Add `agent_turns` for normalized turn identity and lifecycle metadata.
-4. Backfill every legacy `sessions` row as one logical session containing one
-   initial agent session. Preserve the legacy logical ID where possible so
-   resume links continue to work.
-5. Keep the legacy table readable during the migration boundary, then route all
-   repository operations through the new records. Do not repurpose the legacy
-   table into a different entity.
+4. Remove the legacy `sessions` projection and its session-owned orchestration
+   rows during cutover. Do not dual-write or retain a compatibility repository.
+5. Route all repository operations through the new records.
 
 ### Runtime and state changes
 
@@ -116,14 +113,16 @@ history belong to an agent session underneath it.
 
 ### Compatibility and failure behavior
 
-- Existing installations are migrated forward without losing resume data.
+- Existing provider sessions and resume links are intentionally reset.
+- Provider configuration, credentials, model preferences, and add-on settings
+  remain intact.
 - Provider session IDs remain opaque and provider-scoped.
 - A failed provider handoff cannot replace or delete the logical session.
 - No hidden provider context is claimed to have moved between providers.
 
 ### Acceptance
 
-- A migrated legacy session resumes through its original provider.
+- A legacy session table is removed cleanly without being repurposed.
 - One logical session can persist and resume two provider-native child
   sessions.
 - Switching providers preserves the logical ID and creates an explicit
@@ -217,4 +216,3 @@ The final smoke test uses an isolated application-data directory and exercises:
 4. restart and resume through persisted state;
 5. one allowed and one denied supervised local operation;
 6. clean control-service, provider, terminal, and child-process shutdown.
-

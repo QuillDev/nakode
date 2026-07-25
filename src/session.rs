@@ -39,11 +39,24 @@ struct ProviderCatalogEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
     pub id: String,
+    pub agent_session_id: String,
     pub provider: String,
     pub provider_session_id: String,
     pub workspace: String,
     pub title: String,
     pub model: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSessionRecord {
+    pub id: String,
+    pub nakode_session_id: String,
+    pub provider: String,
+    pub provider_session_id: String,
+    pub model: Option<String>,
+    pub role: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -193,6 +206,27 @@ pub trait SessionRepository: Send + Sync {
         title: &str,
         model: Option<&str>,
     ) -> Result<SessionRecord, SessionError>;
+    /// Creates or selects a provider-native session under a logical Nakode session.
+    ///
+    /// # Errors
+    /// Returns an error when either session record cannot be persisted.
+    fn create_agent_session(
+        &self,
+        nakode_session_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        workspace: &str,
+        title: &str,
+        model: Option<&str>,
+    ) -> Result<SessionRecord, SessionError>;
+    /// Lists every provider-native session belonging to a logical Nakode session.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried.
+    fn list_agent_sessions(
+        &self,
+        nakode_session_id: &str,
+    ) -> Result<Vec<AgentSessionRecord>, SessionError>;
     /// Marks a session as recently used.
     ///
     /// # Errors
@@ -347,6 +381,7 @@ impl SqliteSessionRepository {
         configure_connection(&connection)?;
         protect_path(path, 0o600)?;
         initialize_schema(&connection)?;
+        migrate_logical_sessions(&connection)?;
         let has_legacy_models = connection
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backend_models'",
@@ -380,13 +415,14 @@ impl SqliteSessionRepository {
     fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         Ok(SessionRecord {
             id: row.get(0)?,
-            provider: row.get(1)?,
-            provider_session_id: row.get(2)?,
-            workspace: row.get(3)?,
-            title: row.get(4)?,
-            model: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
+            agent_session_id: row.get(1)?,
+            provider: row.get(2)?,
+            provider_session_id: row.get(3)?,
+            workspace: row.get(4)?,
+            title: row.get(5)?,
+            model: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
         })
     }
 }
@@ -395,19 +431,6 @@ fn initialize_schema(connection: &Connection) -> Result<(), SessionError> {
     execute_batch_with_busy_retry(
         connection,
         "PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS sessions (
-               id TEXT PRIMARY KEY,
-               provider TEXT NOT NULL,
-               provider_session_id TEXT NOT NULL,
-               workspace TEXT NOT NULL,
-               title TEXT NOT NULL,
-               model TEXT,
-               created_at INTEGER NOT NULL,
-               updated_at INTEGER NOT NULL,
-               UNIQUE(provider, provider_session_id)
-             );
-             CREATE INDEX IF NOT EXISTS sessions_workspace_updated
-               ON sessions(workspace, updated_at DESC);
              CREATE TABLE IF NOT EXISTS provider_models (
                provider TEXT NOT NULL,
                model_id TEXT NOT NULL,
@@ -438,34 +461,91 @@ fn initialize_schema(connection: &Connection) -> Result<(), SessionError> {
                updated_at INTEGER NOT NULL,
                PRIMARY KEY(provider, session_id)
              );
-             CREATE TABLE IF NOT EXISTS orchestration_runs (
-               parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-               id TEXT NOT NULL,
-               agent_slug TEXT NOT NULL,
-               provider TEXT NOT NULL,
-               provider_session_id TEXT,
-               objective TEXT NOT NULL,
-               status TEXT NOT NULL,
-               latest_activity TEXT NOT NULL,
-               created_at INTEGER NOT NULL,
-               updated_at INTEGER NOT NULL,
-               PRIMARY KEY(parent_session_id, id)
-             );
-             CREATE INDEX IF NOT EXISTS orchestration_runs_parent_created
-               ON orchestration_runs(parent_session_id, created_at, id);
-             CREATE TABLE IF NOT EXISTS agent_turns (
-               parent_session_id TEXT NOT NULL,
-               run_id TEXT NOT NULL,
-               sequence INTEGER NOT NULL,
-               item_key TEXT,
-               kind TEXT NOT NULL,
-               title TEXT NOT NULL,
-               body TEXT NOT NULL,
-               status TEXT NOT NULL,
-               PRIMARY KEY(parent_session_id, run_id, sequence),
-               FOREIGN KEY(parent_session_id, run_id)
-                 REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
-             );",
+             ",
+    )?;
+    Ok(())
+}
+
+fn migrate_logical_sessions(connection: &Connection) -> Result<(), SessionError> {
+    let has_legacy_sessions = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if has_legacy_sessions {
+        connection.execute_batch(
+            "DROP TABLE IF EXISTS agent_turns;
+             DROP TABLE IF EXISTS orchestration_turn_items;
+             DROP TABLE IF EXISTS orchestration_runs;
+             DROP TABLE sessions;",
+        )?;
+    }
+    execute_batch_with_busy_retry(
+        connection,
+        "CREATE TABLE IF NOT EXISTS nakode_sessions (
+           id TEXT PRIMARY KEY,
+           workspace TEXT NOT NULL,
+           title TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS nakode_sessions_workspace_updated
+           ON nakode_sessions(workspace, updated_at DESC);
+         CREATE TABLE IF NOT EXISTS agent_sessions (
+           id TEXT PRIMARY KEY,
+           nakode_session_id TEXT NOT NULL
+             REFERENCES nakode_sessions(id) ON DELETE CASCADE,
+           provider TEXT NOT NULL,
+           provider_session_id TEXT NOT NULL,
+           model TEXT,
+           role TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           UNIQUE(provider, provider_session_id)
+         );
+         CREATE INDEX IF NOT EXISTS agent_sessions_logical_updated
+           ON agent_sessions(nakode_session_id, updated_at DESC);
+         CREATE TABLE IF NOT EXISTS agent_turns (
+           id TEXT PRIMARY KEY,
+           agent_session_id TEXT NOT NULL
+             REFERENCES agent_sessions(id) ON DELETE CASCADE,
+           provider_turn_id TEXT,
+           status TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS orchestration_runs (
+           parent_session_id TEXT NOT NULL
+             REFERENCES nakode_sessions(id) ON DELETE CASCADE,
+           id TEXT NOT NULL,
+           agent_slug TEXT NOT NULL,
+           provider TEXT NOT NULL,
+           provider_session_id TEXT,
+           objective TEXT NOT NULL,
+           status TEXT NOT NULL,
+           latest_activity TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY(parent_session_id, id)
+         );
+         CREATE INDEX IF NOT EXISTS orchestration_runs_parent_created
+           ON orchestration_runs(parent_session_id, created_at, id);
+         CREATE TABLE IF NOT EXISTS orchestration_turn_items (
+           parent_session_id TEXT NOT NULL,
+           run_id TEXT NOT NULL,
+           sequence INTEGER NOT NULL,
+           item_key TEXT,
+           kind TEXT NOT NULL,
+           title TEXT NOT NULL,
+           body TEXT NOT NULL,
+           status TEXT NOT NULL,
+           PRIMARY KEY(parent_session_id, run_id, sequence),
+           FOREIGN KEY(parent_session_id, run_id)
+             REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
+         );",
     )?;
     Ok(())
 }
@@ -572,8 +652,17 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
-             FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
+            "SELECT logical.id, agent.id, agent.provider, agent.provider_session_id,
+                    logical.workspace, logical.title, agent.model,
+                    logical.created_at, logical.updated_at
+             FROM nakode_sessions AS logical
+             JOIN agent_sessions AS agent ON agent.id = (
+               SELECT candidate.id FROM agent_sessions AS candidate
+               WHERE candidate.nakode_session_id = logical.id
+               ORDER BY candidate.updated_at DESC, candidate.id DESC LIMIT 1
+             )
+             WHERE logical.workspace = ?1
+             ORDER BY logical.updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
         let rows = statement.query_map(params![workspace, bounded_limit], Self::row)?;
@@ -587,8 +676,16 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
-                 FROM sessions WHERE id = ?1",
+                "SELECT logical.id, agent.id, agent.provider, agent.provider_session_id,
+                        logical.workspace, logical.title, agent.model,
+                        logical.created_at, logical.updated_at
+                 FROM nakode_sessions AS logical
+                 JOIN agent_sessions AS agent ON agent.id = (
+                   SELECT candidate.id FROM agent_sessions AS candidate
+                   WHERE candidate.nakode_session_id = logical.id
+                   ORDER BY candidate.updated_at DESC, candidate.id DESC LIMIT 1
+                 )
+                 WHERE logical.id = ?1",
                 [id],
                 Self::row,
             )
@@ -598,8 +695,17 @@ impl SessionRepository for SqliteSessionRepository {
         }
         let pattern = format!("{id}%");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
-             FROM sessions WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
+            "SELECT logical.id, agent.id, agent.provider, agent.provider_session_id,
+                    logical.workspace, logical.title, agent.model,
+                    logical.created_at, logical.updated_at
+             FROM nakode_sessions AS logical
+             JOIN agent_sessions AS agent ON agent.id = (
+               SELECT candidate.id FROM agent_sessions AS candidate
+               WHERE candidate.nakode_session_id = logical.id
+               ORDER BY candidate.updated_at DESC, candidate.id DESC LIMIT 1
+             )
+             WHERE logical.id LIKE ?1
+             ORDER BY logical.updated_at DESC LIMIT 2",
         )?;
         let matches = statement
             .query_map([pattern], Self::row)?
@@ -619,30 +725,113 @@ impl SessionRepository for SqliteSessionRepository {
         title: &str,
         model: Option<&str>,
     ) -> Result<SessionRecord, SessionError> {
+        self.create_agent_session(
+            &Uuid::now_v7().to_string(),
+            provider,
+            provider_session_id,
+            workspace,
+            title,
+            model,
+        )
+    }
+
+    fn create_agent_session(
+        &self,
+        nakode_session_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        workspace: &str,
+        title: &str,
+        model: Option<&str>,
+    ) -> Result<SessionRecord, SessionError> {
         let now = unix_timestamp();
-        let id = Uuid::now_v7().to_string();
+        let agent_session_id = Uuid::now_v7().to_string();
         let title = title.lines().next().unwrap_or("New session").trim();
         let title = if title.is_empty() {
             "New session"
         } else {
             title
         };
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let existing_logical_id = transaction
+            .query_row(
+                "SELECT nakode_session_id FROM agent_sessions
+                 WHERE provider = ?1 AND provider_session_id = ?2",
+                params![provider, provider_session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let nakode_session_id = existing_logical_id.as_deref().unwrap_or(nakode_session_id);
+        transaction.execute(
+            "INSERT INTO nakode_sessions
+               (id, workspace, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at",
+            params![nakode_session_id, workspace, title, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO agent_sessions
+               (id, nakode_session_id, provider, provider_session_id, model, role,
+                created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'primary', ?6, ?6)
+             ON CONFLICT(provider, provider_session_id) DO UPDATE SET
+               updated_at = excluded.updated_at,
+               model = COALESCE(excluded.model, agent_sessions.model)",
+            params![
+                agent_session_id,
+                nakode_session_id,
+                provider,
+                provider_session_id,
+                model,
+                now
+            ],
+        )?;
+        let record = transaction.query_row(
+            "SELECT logical.id, agent.id, agent.provider, agent.provider_session_id,
+                    logical.workspace, logical.title, agent.model,
+                    logical.created_at, logical.updated_at
+             FROM nakode_sessions AS logical
+             JOIN agent_sessions AS agent ON agent.nakode_session_id = logical.id
+             WHERE agent.provider = ?1 AND agent.provider_session_id = ?2",
+            params![provider, provider_session_id],
+            Self::row,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    fn list_agent_sessions(
+        &self,
+        nakode_session_id: &str,
+    ) -> Result<Vec<AgentSessionRecord>, SessionError> {
         let connection = self
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
-            "INSERT INTO sessions (id, provider, provider_session_id, workspace, title, model, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-             ON CONFLICT(provider, provider_session_id) DO UPDATE SET updated_at = excluded.updated_at",
-            params![id, provider, provider_session_id, workspace, title, model, now],
+        let mut statement = connection.prepare(
+            "SELECT id, nakode_session_id, provider, provider_session_id, model, role,
+                    created_at, updated_at
+             FROM agent_sessions
+             WHERE nakode_session_id = ?1
+             ORDER BY created_at, id",
         )?;
-        connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
-             FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
-            params![provider, provider_session_id],
-            Self::row,
-        ).map_err(Into::into)
+        let rows = statement.query_map([nakode_session_id], |row| {
+            Ok(AgentSessionRecord {
+                id: row.get(0)?,
+                nakode_session_id: row.get(1)?,
+                provider: row.get(2)?,
+                provider_session_id: row.get(3)?,
+                model: row.get(4)?,
+                role: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     fn touch(&self, id: &str) -> Result<(), SessionError> {
@@ -650,9 +839,10 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
+        let now = unix_timestamp();
         let updated = connection.execute(
-            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
-            params![unix_timestamp(), id],
+            "UPDATE nakode_sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now, id],
         )?;
         if updated == 0 {
             return Err(SessionError::SessionNotFound(id.to_owned()));
@@ -665,9 +855,14 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
+        let now = unix_timestamp();
         let updated = connection.execute(
-            "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
-            params![model, unix_timestamp(), id],
+            "UPDATE agent_sessions SET model = ?1, updated_at = ?2
+             WHERE id = (
+               SELECT id FROM agent_sessions WHERE nakode_session_id = ?3
+               ORDER BY updated_at DESC, id DESC LIMIT 1
+             )",
+            params![model, now, id],
         )?;
         if updated == 0 {
             return Err(SessionError::SessionNotFound(id.to_owned()));
@@ -840,12 +1035,13 @@ impl SessionRepository for SqliteSessionRepository {
             ],
         )?;
         transaction.execute(
-            "DELETE FROM agent_turns WHERE parent_session_id = ?1 AND run_id = ?2",
+            "DELETE FROM orchestration_turn_items
+             WHERE parent_session_id = ?1 AND run_id = ?2",
             params![record.parent_session_id, record.id],
         )?;
         {
             let mut statement = transaction.prepare(
-                "INSERT INTO agent_turns
+                "INSERT INTO orchestration_turn_items
                    (parent_session_id, run_id, sequence, item_key, kind, title, body, status)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
@@ -1035,7 +1231,7 @@ fn load_subagent_transcript(
 ) -> Result<Vec<TranscriptEntry>, SessionError> {
     let mut statement = connection.prepare(
         "SELECT item_key, kind, title, body, status
-         FROM agent_turns
+         FROM orchestration_turn_items
          WHERE parent_session_id = ?1 AND run_id = ?2
          ORDER BY sequence",
     )?;
@@ -1087,7 +1283,7 @@ fn entry_kind_from_value(value: &str) -> Result<EntryKind, SessionError> {
         "warning" => Ok(EntryKind::Warning),
         "error" => Ok(EntryKind::Error),
         _ => Err(SessionError::InvalidStoredValue {
-            field: "agent_turns.kind",
+            field: "orchestration_turn_items.kind",
             value: value.to_owned(),
         }),
     }
@@ -1109,7 +1305,7 @@ fn entry_status_from_value(value: &str) -> Result<EntryStatus, SessionError> {
         "failed" => Ok(EntryStatus::Failed),
         "interrupted" => Ok(EntryStatus::Interrupted),
         _ => Err(SessionError::InvalidStoredValue {
-            field: "agent_turns.status",
+            field: "orchestration_turn_items.status",
             value: value.to_owned(),
         }),
     }
@@ -1220,6 +1416,77 @@ mod tests {
         assert_eq!(store.list_models(CODEX_PROVIDER)?, preferred);
         store.replace_models(CODEX_PROVIDER, &[])?;
         assert!(store.list_models(CODEX_PROVIDER)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn one_logical_session_owns_multiple_provider_sessions() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let logical_id = Uuid::now_v7().to_string();
+        let codex = store.create_agent_session(
+            &logical_id,
+            CODEX_PROVIDER,
+            "codex-thread",
+            "/tmp/project",
+            "Shared objective",
+            Some("openai-codex/gpt-5.4"),
+        )?;
+        let devin = store.create_agent_session(
+            &logical_id,
+            DEVIN_PROVIDER,
+            "devin-thread",
+            "/tmp/project",
+            "Shared objective",
+            Some("devin-acp/sonnet-4.5"),
+        )?;
+
+        assert_eq!(codex.id, logical_id);
+        assert_eq!(devin.id, logical_id);
+        assert_ne!(codex.agent_session_id, devin.agent_session_id);
+        let agents = store.list_agent_sessions(&logical_id)?;
+        assert_eq!(agents.len(), 2);
+        assert!(agents.iter().any(|agent| agent.provider == CODEX_PROVIDER));
+        assert!(agents.iter().any(|agent| agent.provider == DEVIN_PROVIDER));
+        assert_eq!(store.list_recent("/tmp/project", 10)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cuts_over_legacy_session_storage_without_repurposing_it() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("sessions.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE sessions (
+               id TEXT PRIMARY KEY,
+               provider TEXT NOT NULL,
+               provider_session_id TEXT NOT NULL,
+               workspace TEXT NOT NULL,
+               title TEXT NOT NULL,
+               model TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               UNIQUE(provider, provider_session_id)
+             );
+             INSERT INTO sessions VALUES
+               ('logical-legacy', 'openai-codex', 'thread-legacy', '/tmp/project',
+                'Legacy work', 'openai-codex/gpt-5.4', 1, 2);",
+        )?;
+        drop(connection);
+
+        let store = SqliteSessionRepository::open(&path)?;
+        assert_eq!(store.find("logical-legacy")?, None);
+        assert!(store.list_agent_sessions("logical-legacy")?.is_empty());
+        let connection = store.database.connection()?;
+        let legacy_table = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?;
+        assert_eq!(legacy_table, None);
         Ok(())
     }
 
