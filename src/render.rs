@@ -1283,6 +1283,7 @@ fn render_provider_details(
         popup,
         authentication_url_line,
         picker.authentication.as_ref(),
+        crate::backend::api_key_provider_setup(&provider.provider).map(|setup| setup.dashboard_url),
     );
     register_api_key_input(state, popup, api_key_input_line);
 }
@@ -1356,6 +1357,7 @@ fn register_oauth_link(
     popup: Rect,
     line: Option<usize>,
     authentication: Option<&crate::state::ProviderAuthentication>,
+    api_key_url: Option<&str>,
 ) {
     let Some(line) = line else {
         return;
@@ -1365,7 +1367,8 @@ fn register_oauth_link(
             verification_url, ..
         }) => verification_url.clone(),
         Some(crate::state::ProviderAuthentication::ApiKeyInput { .. }) => {
-            "https://cursor.com/dashboard/api".to_owned()
+            let Some(url) = api_key_url else { return };
+            url.to_owned()
         }
         Some(crate::state::ProviderAuthentication::Starting) | None => return,
     };

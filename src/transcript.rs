@@ -282,6 +282,22 @@ impl Transcript {
         }
     }
 
+    pub fn move_before(&mut self, key: &str, anchor: &str) {
+        let Some(index) = self.item_indices.get(key).copied() else {
+            return;
+        };
+        let Some(anchor_index) = self.item_indices.get(anchor).copied() else {
+            return;
+        };
+        if index < anchor_index {
+            return;
+        }
+        let entry = self.entries.remove(index);
+        self.entries.insert(anchor_index, entry);
+        self.reindex();
+        self.changed();
+    }
+
     pub fn remove(&mut self, key: &str) {
         let Some(index) = self.item_indices.get(key).copied() else {
             return;

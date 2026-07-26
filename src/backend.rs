@@ -8,6 +8,31 @@ use tokio::{sync::mpsc, task::JoinHandle};
 pub const CODEX_PROVIDER: &str = "openai-codex";
 pub const DEVIN_PROVIDER: &str = "devin-acp";
 pub const CURSOR_PROVIDER: &str = "cursor-sdk";
+pub const KIMI_PROVIDER: &str = "kimi-coding";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiKeyProviderSetup {
+    pub dashboard_url: &'static str,
+    pub credential_kind: &'static str,
+    pub display_name: &'static str,
+}
+
+#[must_use]
+pub fn api_key_provider_setup(provider: &str) -> Option<ApiKeyProviderSetup> {
+    match provider {
+        CURSOR_PROVIDER => Some(ApiKeyProviderSetup {
+            dashboard_url: "https://cursor.com/dashboard/api",
+            credential_kind: "cursor_api_key",
+            display_name: "Cursor",
+        }),
+        KIMI_PROVIDER => Some(ApiKeyProviderSetup {
+            dashboard_url: "https://www.kimi.com/code/console",
+            credential_kind: "kimi_coding_api_key",
+            display_name: "Kimi",
+        }),
+        _ => None,
+    }
+}
 
 pub(crate) async fn request_failed(
     events: &mpsc::Sender<BackendEvent>,

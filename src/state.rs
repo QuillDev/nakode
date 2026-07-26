@@ -1494,7 +1494,7 @@ impl AppState {
             return false;
         };
         *focused = true;
-        self.set_status("Editing Cursor API key.");
+        self.set_status("Editing provider API key.");
         true
     }
 
@@ -1524,7 +1524,11 @@ impl AppState {
             ProviderAuthentication::Challenge {
                 verification_url, ..
             } => Some(verification_url),
-            ProviderAuthentication::ApiKeyInput { .. } => Some("https://cursor.com/dashboard/api"),
+            ProviderAuthentication::ApiKeyInput { .. } => picker
+                .providers
+                .get(picker.selected)
+                .and_then(|provider| crate::backend::api_key_provider_setup(&provider.provider))
+                .map(|setup| setup.dashboard_url),
             ProviderAuthentication::Starting => None,
         }
     }
@@ -1667,7 +1671,8 @@ impl AppState {
         };
         if let Some(provider) = picker.providers.get(picker.selected) {
             picker.showing_details = true;
-            if provider.provider == crate::backend::CURSOR_PROVIDER && provider.credential.is_none()
+            if crate::backend::api_key_provider_setup(&provider.provider).is_some()
+                && provider.credential.is_none()
             {
                 picker.authentication = Some(ProviderAuthentication::ApiKeyInput {
                     value: String::new(),
@@ -1740,7 +1745,7 @@ impl AppState {
             return Vec::new();
         };
         if provider.credential.is_none() {
-            if provider.provider == crate::backend::CURSOR_PROVIDER {
+            if let Some(setup) = crate::backend::api_key_provider_setup(&provider.provider) {
                 match &mut picker.authentication {
                     Some(ProviderAuthentication::ApiKeyInput { focused, .. }) => {
                         *focused = true;
@@ -1752,7 +1757,7 @@ impl AppState {
                         });
                     }
                 }
-                self.set_status("Enter your Cursor API key.");
+                self.set_status(&format!("Enter your {} API key.", setup.display_name));
                 return Vec::new();
             }
             picker.authentication = Some(ProviderAuthentication::Starting);
@@ -1803,7 +1808,7 @@ impl AppState {
                 .filter(|character| !character.is_control())
                 .take(remaining),
         );
-        self.set_status("Editing Cursor API key.");
+        self.set_status("Editing provider API key.");
     }
 
     pub fn provider_api_key_backspace(&mut self) {
@@ -1826,9 +1831,9 @@ impl AppState {
         let Some(provider) = picker.providers.get(picker.selected) else {
             return Vec::new();
         };
-        if provider.provider != crate::backend::CURSOR_PROVIDER {
+        let Some(setup) = crate::backend::api_key_provider_setup(&provider.provider) else {
             return Vec::new();
-        }
+        };
         let Some(ProviderAuthentication::ApiKeyInput {
             value,
             focused: true,
@@ -1838,15 +1843,15 @@ impl AppState {
         };
         let api_key = value.trim().to_owned();
         if api_key.is_empty() {
-            self.set_status("Cursor API key cannot be empty.");
+            self.set_status(&format!("{} API key cannot be empty.", setup.display_name));
             return Vec::new();
         }
         let provider = provider.provider.clone();
         picker.authentication = Some(ProviderAuthentication::Starting);
-        self.set_status("Saving Cursor API key…");
+        self.set_status(&format!("Saving {} API key…", setup.display_name));
         vec![Effect::SaveProviderCredential {
             provider,
-            kind: "cursor_api_key".to_owned(),
+            kind: setup.credential_kind.to_owned(),
             metadata: serde_json::json!({"api_key": api_key}),
         }]
     }
@@ -1865,7 +1870,7 @@ impl AppState {
         }
         value.clear();
         *focused = false;
-        self.set_status("Cursor API key entry cancelled.");
+        self.set_status("API key entry cancelled.");
         true
     }
 
@@ -3280,7 +3285,7 @@ impl AppState {
                 item_id,
                 kind,
                 delta,
-            } => self.observe_delta(&turn_id, item_id, kind, &delta),
+            } => self.observe_delta(&turn_id, &item_id, kind, &delta),
             BackendEvent::TurnDiff { turn_id, diff } => {
                 self.observe_turn_artifact(&turn_id, diff, EntryKind::Diff, "TURN DIFF", "diff");
             }
@@ -4094,17 +4099,18 @@ impl AppState {
             .upsert(item.id, entry_kind(item.kind), item.title, body, status);
     }
 
-    fn observe_delta(&mut self, turn_id: &str, item_id: String, kind: DeltaKind, delta: &str) {
+    fn observe_delta(&mut self, turn_id: &str, item_id: &str, kind: DeltaKind, delta: &str) {
         if !self.turn_is_current(turn_id) {
             self.diagnostic_count += 1;
             return;
         }
-        self.item_turns.insert(item_id.clone(), turn_id.to_owned());
-        if self.subagent_result_items.contains(&item_id)
+        self.item_turns
+            .insert(item_id.to_owned(), turn_id.to_owned());
+        if self.subagent_result_items.contains(item_id)
             || (kind == DeltaKind::Tool && delta.contains("[Subagent Result]"))
         {
-            self.subagent_result_items.insert(item_id.clone());
-            self.transcript.remove(&item_id);
+            self.subagent_result_items.insert(item_id.to_owned());
+            self.transcript.remove(item_id);
             return;
         }
         let (entry_kind, title) = match kind {
@@ -4113,7 +4119,7 @@ impl AppState {
                     &mut self.transcript,
                     &mut self.reasoning_summaries,
                     turn_id,
-                    &item_id,
+                    item_id,
                     index,
                     delta,
                 );
@@ -4124,8 +4130,16 @@ impl AppState {
             DeltaKind::Reasoning => (EntryKind::Reasoning, "REASONING"),
             DeltaKind::Tool => (EntryKind::Tool, "TOOL OUTPUT"),
         };
+        let assistant_anchor = if kind == DeltaKind::Reasoning {
+            assistant_item_id_for_reasoning(item_id)
+        } else {
+            None
+        };
         self.transcript
             .append_delta(item_id, entry_kind, title, delta);
+        if let Some(anchor) = assistant_anchor {
+            self.transcript.move_before(item_id, &anchor);
+        }
     }
 
     fn request_failed(
@@ -4679,6 +4693,11 @@ impl AppState {
         };
         chat.transcript
             .append_delta(item_id, entry_kind, title, delta);
+        if kind == DeltaKind::Reasoning
+            && let Some(anchor) = assistant_item_id_for_reasoning(item_id)
+        {
+            chat.transcript.move_before(item_id, &anchor);
+        }
     }
 
     fn record_subagent_item(&mut self, run_id: &str, turn_id: &str, item: &NormalizedItem) {
@@ -5040,6 +5059,11 @@ fn offset_index(index: usize, len: usize, delta: isize) -> usize {
 
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+fn assistant_item_id_for_reasoning(item_id: &str) -> Option<String> {
+    let (prefix, round) = item_id.rsplit_once(":reasoning:")?;
+    Some(format!("{prefix}:assistant:{round}"))
 }
 
 fn entry_kind(kind: ItemKind) -> EntryKind {
@@ -5982,6 +6006,31 @@ model = "openai-codex/model-a"
     fn successful_connection_does_not_add_transcript_noise() {
         let state = ready_state();
         assert!(state.transcript.entries().is_empty());
+    }
+
+    #[test]
+    fn same_round_reasoning_is_placed_before_an_earlier_assistant_delta() {
+        let mut state = ready_state();
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("kimi-coding/k3-256k".to_owned()),
+            cancelling: false,
+        });
+        for (item_id, kind, delta) in [
+            ("turn-1:assistant:0", DeltaKind::Assistant, "Final answer"),
+            ("turn-1:reasoning:0", DeltaKind::Reasoning, "Thinking first"),
+        ] {
+            state.handle_backend(BackendEvent::ItemDelta {
+                turn_id: "turn-1".to_owned(),
+                item_id: item_id.to_owned(),
+                kind,
+                delta: delta.to_owned(),
+            });
+        }
+
+        let entries = state.transcript.entries();
+        assert_eq!(entries[0].key.as_deref(), Some("turn-1:reasoning:0"));
+        assert_eq!(entries[1].key.as_deref(), Some("turn-1:assistant:0"));
     }
 
     #[test]
@@ -7227,6 +7276,32 @@ model = "openai-codex/model-a"
                     && metadata == &serde_json::json!({"api_key":"cursor-secret-key"})
         ));
         assert!(!state.provider_api_key_input_active());
+    }
+
+    #[test]
+    fn kimi_setup_uses_coding_plan_console_and_credential_kind() {
+        let mut state = ready_state();
+        state.install_providers(vec![crate::session::ProviderRecord {
+            provider: crate::backend::KIMI_PROVIDER.to_owned(),
+            display_name: "Kimi For Coding".to_owned(),
+            enabled: false,
+            credential: None,
+        }]);
+        state.open_provider_details();
+
+        assert!(matches!(
+            state.open_provider_authentication_url().as_slice(),
+            [Effect::OpenUrl(url)] if url == "https://www.kimi.com/code/console"
+        ));
+        assert!(state.toggle_provider().is_empty());
+        state.provider_api_key_insert_str(" kimi-secret ");
+        assert!(matches!(
+            state.submit_provider_api_key().as_slice(),
+            [Effect::SaveProviderCredential { provider, kind, metadata }]
+                if provider == crate::backend::KIMI_PROVIDER
+                    && kind == "kimi_coding_api_key"
+                    && metadata == &serde_json::json!({"api_key":"kimi-secret"})
+        ));
     }
 
     #[test]

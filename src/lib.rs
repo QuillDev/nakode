@@ -14,6 +14,7 @@ pub mod diagnostics;
 pub mod editor;
 pub mod handoff;
 mod herdr;
+pub mod kimi;
 mod markdown;
 pub mod pty;
 pub mod render;

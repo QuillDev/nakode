@@ -1333,7 +1333,12 @@ mod tests {
         let credentials =
             crate::credential::SqliteCredentialStore::open(&path).expect("credential store");
         let providers = store.list_providers()?;
-        assert_eq!(providers.len(), 3);
+        assert_eq!(providers.len(), 4);
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider.provider == crate::backend::KIMI_PROVIDER)
+        );
         assert!(providers.iter().all(|provider| !provider.enabled));
 
         let metadata = serde_json::json!({

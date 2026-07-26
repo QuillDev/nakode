@@ -7,5 +7,9 @@ slug = "cursor-sdk"
 display_name = "Cursor"
 
 [[providers]]
+slug = "kimi-coding"
+display_name = "Kimi For Coding"
+
+[[providers]]
 slug = "devin-acp"
 display_name = "Devin"

@@ -21,7 +21,7 @@ use crate::{
     credential::{
         Credential, CredentialError, CredentialStore, SecretValue, SqliteCredentialStore,
     },
-    cursor, devin, render,
+    cursor, devin, kimi, render,
     selection::ScreenPoint,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
     skill::{SkillCatalog, SkillCatalogError},
@@ -178,6 +178,19 @@ impl BackendRegistry {
                 cursor::spawn(
                     cursor::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
+                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
+                )
+                .await?
+            }
+            crate::backend::KIMI_PROVIDER => {
+                kimi::spawn(
+                    kimi::BackendConfig::native(self.config.workspace.clone())
+                        .with_credential(credential)
+                        .with_compaction_threshold_percent(usize::from(
+                            self.config.compaction_threshold_percent,
+                        ))
+                        .with_session_database(self.session_database.clone())
+                        .with_web_config(Arc::clone(&self.web_config))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?

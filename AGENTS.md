@@ -328,8 +328,8 @@ Keep these responsibilities separate:
 - `src/backend.rs` — provider-neutral adapter command/event contracts
 - `src/runtime.rs` — portable inference and tool loop
 - `src/tools/` — supervised local tool implementations
-- `src/codex/native.rs` and `src/devin/native.rs` — in-process provider wire
-  adapters
+- `src/codex/native.rs`, `src/devin/native.rs`, and `src/kimi/native.rs` — in-process
+  provider wire adapters
 - `src/session.rs` — SQLite metadata persistence
 - `src/pty.rs` and process helpers — child-process supervision and cleanup
 
