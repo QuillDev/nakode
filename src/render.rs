@@ -249,15 +249,19 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         brand_area,
     );
 
-    let (model, model_style) = state.selected_model.as_deref().map_or_else(
-        || ("No model selected", Style::default().fg(MUTED)),
+    let (model, model_style) = state.selected_model_display_name().map_or_else(
+        || ("No model selected".to_owned(), Style::default().fg(MUTED)),
         |model| (model, Style::default().fg(ACCENT_BRIGHT).bold()),
     );
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("MODEL ", Style::default().fg(MUTED)),
         Span::styled(model, model_style),
-        Span::raw(" "),
-    ]);
+    ];
+    if state.selected_model_uses_fast_mode() {
+        spans.push(Span::styled(" ⚡", Style::default().fg(ACCENT).bold()));
+    }
+    spans.push(Span::raw(" "));
+    let line = Line::from(spans);
     let model_area = Rect::new(
         area.x.saturating_add(brand_width),
         area.y,
@@ -704,13 +708,21 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         return;
     }
 
-    let model = state.selected_model.as_deref().unwrap_or("default");
-    let line = Line::from(vec![
+    let model = state
+        .selected_model_display_name()
+        .unwrap_or_else(|| "Default".to_owned());
+    let mut spans = vec![
         Span::styled(" Model: ", Style::default().fg(MUTED)),
         Span::styled(model, Style::default().fg(TEXT)),
+    ];
+    if state.selected_model_uses_fast_mode() {
+        spans.push(Span::styled(" ⚡", Style::default().fg(ACCENT)));
+    }
+    spans.extend([
         Span::styled(" · Directory: ", Style::default().fg(MUTED)),
         Span::styled(state.workspace.as_str(), Style::default().fg(TEXT)),
     ]);
+    let line = Line::from(spans);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(SURFACE)),
         area,
@@ -1345,35 +1357,24 @@ fn register_oauth_link(
     line: Option<usize>,
     authentication: Option<&crate::state::ProviderAuthentication>,
 ) {
-    let (
-        Some(line),
+    let Some(line) = line else {
+        return;
+    };
+    let url = match authentication {
         Some(crate::state::ProviderAuthentication::Challenge {
             verification_url, ..
-        }),
-    ) = (line, authentication)
-    else {
-        if matches!(
-            authentication,
-            Some(crate::state::ProviderAuthentication::ApiKeyInput { .. })
-        ) {
-            let row = popup
-                .y
-                .saturating_add(1)
-                .saturating_add(u16::try_from(line.unwrap_or_default()).unwrap_or(u16::MAX));
-            state.set_oauth_link_hit_region(Some((
-                "https://cursor.com/dashboard/api".to_owned(),
-                ScreenPoint::new(popup.x.saturating_add(1), row),
-                ScreenPoint::new(popup.right().saturating_sub(1), row.saturating_add(1)),
-            )));
+        }) => verification_url.clone(),
+        Some(crate::state::ProviderAuthentication::ApiKeyInput { .. }) => {
+            "https://cursor.com/dashboard/api".to_owned()
         }
-        return;
+        Some(crate::state::ProviderAuthentication::Starting) | None => return,
     };
     let row = popup
         .y
         .saturating_add(1)
         .saturating_add(u16::try_from(line).unwrap_or(u16::MAX));
     state.set_oauth_link_hit_region(Some((
-        verification_url.clone(),
+        url,
         ScreenPoint::new(popup.x.saturating_add(1), row),
         ScreenPoint::new(popup.right().saturating_sub(1), row.saturating_add(1)),
     )));
@@ -1642,10 +1643,71 @@ fn relative_time(timestamp: i64) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let popup = centered(area, 72, 18);
     frame.render_widget(Clear, popup);
     let picker = state.model_picker.as_ref().expect("picker checked");
+    if picker.stage == crate::state::ModelPickerStage::Options {
+        let effort = picker
+            .options
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("medium");
+        let fast = if picker.options.fast_mode {
+            "⚡ on"
+        } else {
+            "off"
+        };
+        let option_line = |index: usize, label: &str, value: &str| {
+            let selected = picker.option_selected == index;
+            Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(if selected { ACCENT } else { MUTED }),
+                ),
+                Span::styled(
+                    format!("{label}: "),
+                    Style::default()
+                        .fg(if selected { TEXT } else { MUTED })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    value.to_owned(),
+                    Style::default().fg(if selected { ACCENT } else { MUTED }),
+                ),
+            ])
+        };
+        let lines = vec![
+            Line::styled(
+                "Configure the OpenAI model default",
+                Style::default().fg(MUTED),
+            ),
+            Line::default(),
+            option_line(0, "Reasoning effort", effort),
+            option_line(1, "Fast mode", fast),
+            Line::default(),
+            Line::styled(
+                "↑/↓ select · ←/→ change · Enter apply · Esc cancel",
+                Style::default().fg(MUTED),
+            ),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Model Options "),
+                )
+                .style(Style::default().bg(SURFACE)),
+            popup,
+        );
+        return;
+    }
     let filtered = state.filtered_models();
     let mut lines = vec![Line::from(vec![
         Span::styled("Filter: ", Style::default().fg(MUTED)),
@@ -1656,6 +1718,8 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         let selected = index == picker.selected;
         let marker = if selected { "› " } else { "  " };
         let qualified = model.qualified_id();
+        let display = model.display_name();
+        let fast = state.model_uses_fast_mode(model);
         let current = if state.selected_model.as_deref() == Some(qualified.as_str()) {
             "  current"
         } else if model.is_default {
@@ -1670,7 +1734,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     Style::default().fg(if selected { ACCENT } else { MUTED }),
                 ),
                 Span::styled(
-                    qualified,
+                    display,
                     Style::default()
                         .fg(if selected { TEXT } else { MUTED })
                         .add_modifier(if selected {
@@ -1679,6 +1743,8 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             Modifier::empty()
                         }),
                 ),
+                Span::styled(format!("  {}", model.provider), Style::default().fg(MUTED)),
+                Span::styled(if fast { "  ⚡" } else { "" }, Style::default().fg(ACCENT)),
                 Span::styled(current, Style::default().fg(MUTED)),
             ])
             .style(Style::default().bg(if selected {
@@ -1806,7 +1872,8 @@ mod tests {
     use crate::{
         backend::{
             BackendCapabilities, BackendEvent, BackendIdentity, CODEX_PROVIDER, CURSOR_PROVIDER,
-            CapabilitySupport, DEVIN_PROVIDER, TodoItem, TodoPhase, TodoStatus,
+            CapabilitySupport, DEVIN_PROVIDER, ModelInfo, ModelOptions, TodoItem, TodoPhase,
+            TodoStatus,
         },
         session::ProviderRecord,
         state::{ActiveTurn, AgentRequest, AppState, ContextUsageState, Effect},
@@ -1843,7 +1910,7 @@ mod tests {
         assert!(!rendered.contains("Prompt"));
         assert!(!rendered.contains("Ready."));
         assert!(!rendered.contains("Transcript"));
-        assert!(rendered.contains("Model: fixture-model"));
+        assert!(rendered.contains("Model: Fixture Model"));
         assert!(rendered.contains("Directory: /tmp/project"));
         assert!(!rendered.contains("queue 0"));
         assert!(!rendered.contains("F1 help"));
@@ -1995,6 +2062,43 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("MODEL No model selected"));
+    }
+
+    #[test]
+    fn header_normalizes_model_name_and_marks_fast_mode() {
+        let backend = TestBackend::new(50, 1);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new(
+            "/tmp/project",
+            Some("openai-codex/gpt-5.6-sol".to_owned()),
+            100,
+        );
+        state.models.push(ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "gpt-5.6-sol".to_owned(),
+            is_default: true,
+        });
+        state.install_model_options(
+            CODEX_PROVIDER,
+            "gpt-5.6-sol",
+            ModelOptions {
+                reasoning_effort: Some("high".to_owned()),
+                fast_mode: true,
+            },
+        );
+
+        terminal
+            .draw(|frame| super::render_header(frame, frame.area(), &state))
+            .expect("render Nakode header");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("MODEL GPT 5.6 Sol ⚡"));
     }
 
     #[test]

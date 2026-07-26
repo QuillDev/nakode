@@ -113,6 +113,9 @@ impl Default for AgentCatalog {
 impl AgentCatalog {
     /// Loads all TOML agent definitions from `directory` in filename order.
     ///
+    /// Returns the shipped default catalog when `directory` does not exist. An existing empty
+    /// directory produces an empty catalog.
+    ///
     /// # Errors
     /// Returns an error when a definition cannot be read or validated.
     pub fn load(directory: &Path) -> Result<Self, AgentCatalogError> {

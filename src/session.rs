@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 pub use crate::backend::{CODEX_PROVIDER, DEVIN_PROVIDER};
 use crate::{
-    backend::ModelInfo,
+    backend::{ModelInfo, ModelOptions},
     credential::CredentialMetadata,
     terminal_image::TerminalImageMode,
     transcript::{EntryKind, EntryStatus, TranscriptEntry},
@@ -122,6 +122,10 @@ pub enum SessionError {
     Database(#[from] rusqlite::Error),
     #[error("session {0:?} is ambiguous; use a longer id")]
     Ambiguous(String),
+    #[error("session {0:?} was not found")]
+    SessionNotFound(String),
+    #[error("provider {0:?} was not found")]
+    ProviderNotFound(String),
     #[error("invalid persisted value for {field}: {value:?}")]
     InvalidStoredValue { field: &'static str, value: String },
     #[error("provider {0} has no configured credentials")]
@@ -185,6 +189,24 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when the preference cannot be persisted.
     fn set_default_model(&self, provider: &str, model: &str) -> Result<(), SessionError>;
+    /// Lists model-specific inference options saved through `/models`.
+    ///
+    /// # Errors
+    /// Returns an error when preference storage cannot be read.
+    fn list_model_options(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<(String, ModelOptions)>, SessionError>;
+    /// Saves model-specific inference options selected through `/models`.
+    ///
+    /// # Errors
+    /// Returns an error when preference storage cannot be updated.
+    fn save_model_options(
+        &self,
+        provider: &str,
+        model: &str,
+        options: &ModelOptions,
+    ) -> Result<(), SessionError>;
     /// Lists configured providers.
     ///
     /// # Errors
@@ -287,6 +309,7 @@ impl SqliteSessionRepository {
     /// # Errors
     ///
     /// Returns an error when the database cannot be opened or migrated.
+    #[allow(clippy::too_many_lines)]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let path = path.as_ref();
         let connection = Connection::open(path)?;
@@ -318,6 +341,13 @@ impl SqliteSessionRepository {
              CREATE TABLE IF NOT EXISTS provider_model_preferences (
                provider TEXT PRIMARY KEY,
                model_id TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS provider_model_options (
+               provider TEXT NOT NULL,
+               model_id TEXT NOT NULL,
+               reasoning_effort TEXT,
+               fast_mode INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY(provider, model_id)
              );
              CREATE TABLE IF NOT EXISTS providers (
                provider TEXT PRIMARY KEY,
@@ -367,6 +397,33 @@ impl SqliteSessionRepository {
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
              );",
         )?;
+        let has_model_specific_options = {
+            let mut statement = connection.prepare("PRAGMA table_info(provider_model_options)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns.iter().any(|column| column == "model_id")
+        };
+        if !has_model_specific_options {
+            execute_batch_with_busy_retry(
+                &connection,
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE provider_model_options RENAME TO provider_model_options_legacy;
+                 CREATE TABLE provider_model_options (
+                   provider TEXT NOT NULL,
+                   model_id TEXT NOT NULL,
+                   reasoning_effort TEXT,
+                   fast_mode INTEGER NOT NULL DEFAULT 0,
+                   PRIMARY KEY(provider, model_id)
+                 );
+                 INSERT INTO provider_model_options
+                   (provider, model_id, reasoning_effort, fast_mode)
+                 SELECT provider, '*', reasoning_effort, fast_mode
+                 FROM provider_model_options_legacy;
+                 DROP TABLE provider_model_options_legacy;
+                 COMMIT;",
+            )?;
+        }
         let has_legacy_models = connection
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backend_models'",
@@ -589,10 +646,13 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
+        let updated = connection.execute(
             "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
             params![unix_timestamp(), id],
         )?;
+        if updated == 0 {
+            return Err(SessionError::SessionNotFound(id.to_owned()));
+        }
         Ok(())
     }
 
@@ -601,10 +661,13 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
+        let updated = connection.execute(
             "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
             params![model, unix_timestamp(), id],
         )?;
+        if updated == 0 {
+            return Err(SessionError::SessionNotFound(id.to_owned()));
+        }
         Ok(())
     }
 
@@ -693,6 +756,57 @@ impl SessionRepository for SqliteSessionRepository {
         Ok(())
     }
 
+    fn list_model_options(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<(String, ModelOptions)>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT model_id, reasoning_effort, fast_mode
+             FROM provider_model_options WHERE provider = ?1
+             ORDER BY model_id COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([provider], |row| {
+            Ok((
+                row.get(0)?,
+                ModelOptions {
+                    reasoning_effort: row.get(1)?,
+                    fast_mode: row.get::<_, i64>(2)? != 0,
+                },
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn save_model_options(
+        &self,
+        provider: &str,
+        model: &str,
+        options: &ModelOptions,
+    ) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "INSERT INTO provider_model_options (provider, model_id, reasoning_effort, fast_mode)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(provider, model_id) DO UPDATE SET
+               reasoning_effort = excluded.reasoning_effort,
+               fast_mode = excluded.fast_mode",
+            params![
+                provider,
+                model,
+                options.reasoning_effort,
+                i64::from(options.fast_mode)
+            ],
+        )?;
+        Ok(())
+    }
+
     fn list_providers(&self) -> Result<Vec<ProviderRecord>, SessionError> {
         let connection = self
             .connection
@@ -730,10 +844,13 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection.execute(
+        let updated = connection.execute(
             "UPDATE providers SET enabled = ?1, updated_at = ?2 WHERE provider = ?3",
             params![i64::from(enabled), unix_timestamp(), provider],
         )?;
+        if updated == 0 {
+            return Err(SessionError::ProviderNotFound(provider.to_owned()));
+        }
         Ok(())
     }
 
@@ -1070,6 +1187,61 @@ mod tests {
     }
 
     #[test]
+    fn model_options_are_saved_per_model() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        assert!(store.list_model_options(CODEX_PROVIDER)?.is_empty());
+
+        let high_fast = ModelOptions {
+            reasoning_effort: Some("high".to_owned()),
+            fast_mode: true,
+        };
+        let low_standard = ModelOptions {
+            reasoning_effort: Some("low".to_owned()),
+            fast_mode: false,
+        };
+        store.save_model_options(CODEX_PROVIDER, "model-a", &high_fast)?;
+        store.save_model_options(CODEX_PROVIDER, "model-b", &low_standard)?;
+        assert_eq!(
+            store.list_model_options(CODEX_PROVIDER)?,
+            vec![
+                ("model-a".to_owned(), high_fast),
+                ("model-b".to_owned(), low_standard),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_provider_wide_model_options_to_a_wildcard_profile() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("legacy-options.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE provider_model_options (
+               provider TEXT PRIMARY KEY,
+               reasoning_effort TEXT,
+               fast_mode INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO provider_model_options VALUES ('openai-codex', 'high', 1);",
+        )?;
+        drop(connection);
+
+        let store = SqliteSessionRepository::open(&path)?;
+        assert_eq!(
+            store.list_model_options(CODEX_PROVIDER)?,
+            vec![(
+                "*".to_owned(),
+                ModelOptions {
+                    reasoning_effort: Some("high".to_owned()),
+                    fast_mode: true,
+                },
+            )]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn vision_addon_settings_are_optional_and_persisted() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
@@ -1206,6 +1378,26 @@ mod tests {
             .find(|provider| provider.provider == DEVIN_PROVIDER)
             .expect("Devin provider");
         assert!(!devin.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mutations_for_unknown_records() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("unknown.db"))?;
+
+        assert!(matches!(
+            store.touch("missing-session"),
+            Err(SessionError::SessionNotFound(id)) if id == "missing-session"
+        ));
+        assert!(matches!(
+            store.update_model("missing-session", Some("model")),
+            Err(SessionError::SessionNotFound(id)) if id == "missing-session"
+        ));
+        assert!(matches!(
+            store.set_provider_enabled("missing-provider", true),
+            Err(SessionError::ProviderNotFound(provider)) if provider == "missing-provider"
+        ));
         Ok(())
     }
 

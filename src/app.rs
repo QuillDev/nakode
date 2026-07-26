@@ -16,7 +16,7 @@ use crate::{
     backend::{BackendCommand, BackendError, BackendEvent, BackendHandle},
     clipboard, codex,
     config::Config,
-    control::{AgentResponse, ControlError, ControlServer, IncomingInvocation},
+    control_service::{AgentResponse, ControlError, ControlServer, IncomingInvocation},
     controls::{self, ControlAction, ControlContext},
     credential::{
         Credential, CredentialError, CredentialStore, SecretValue, SqliteCredentialStore,
@@ -92,17 +92,11 @@ const PROVIDER_FATAL_ERROR_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 impl BackendRegistry {
     fn current_web_config(&self) -> crate::web::WebConfig {
-        self.web_config.read().map_or_else(
-            |_| crate::web::WebConfig::default(),
-            |config| config.clone(),
-        )
+        read_shared_config(&self.web_config)
     }
 
     fn current_vision_config(&self) -> crate::vision::VisionConfig {
-        self.vision_config.read().map_or_else(
-            |_| crate::vision::VisionConfig::default(),
-            |config| config.clone(),
-        )
+        read_shared_config(&self.vision_config)
     }
 
     async fn spawn(
@@ -158,9 +152,15 @@ impl BackendRegistry {
         if self.commands.contains_key(provider) {
             return Ok(());
         }
+        let handle = self.spawn_provider_handle(provider).await?;
+        self.insert_primary(provider.to_owned(), handle);
+        Ok(())
+    }
+
+    async fn spawn_provider_handle(&self, provider: &str) -> Result<BackendHandle, BackendError> {
+        let credential = self.provider_credentials.get(provider).cloned();
         let handle = match provider {
             crate::backend::CODEX_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
                 codex::spawn(
                     codex::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
@@ -175,7 +175,6 @@ impl BackendRegistry {
                 .await?
             }
             crate::backend::CURSOR_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
                 cursor::spawn(
                     cursor::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
@@ -184,7 +183,6 @@ impl BackendRegistry {
                 .await?
             }
             crate::backend::DEVIN_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
                 devin::spawn(
                     devin::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
@@ -203,8 +201,7 @@ impl BackendRegistry {
                 });
             }
         };
-        self.insert_primary(provider.to_owned(), handle);
-        Ok(())
+        Ok(handle)
     }
 
     async fn stop_provider(&mut self, provider: &str) {
@@ -255,51 +252,7 @@ impl BackendRegistry {
                 provider: provider.to_owned(),
             });
         }
-        let handle = match provider {
-            crate::backend::CODEX_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
-                codex::spawn(
-                    codex::BackendConfig::native(self.config.workspace.clone())
-                        .with_credential(credential)
-                        .with_reasoning_effort(self.config.openai_reasoning_effort.as_str())
-                        .with_compaction_threshold_percent(usize::from(
-                            self.config.compaction_threshold_percent,
-                        ))
-                        .with_session_database(self.session_database.clone())
-                        .with_web_config(Arc::clone(&self.web_config))
-                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
-                )
-                .await?
-            }
-            crate::backend::CURSOR_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
-                cursor::spawn(
-                    cursor::BackendConfig::native(self.config.workspace.clone())
-                        .with_credential(credential)
-                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
-                )
-                .await?
-            }
-            crate::backend::DEVIN_PROVIDER => {
-                let credential = self.provider_credentials.get(provider).cloned();
-                devin::spawn(
-                    devin::BackendConfig::native(self.config.workspace.clone())
-                        .with_credential(credential)
-                        .with_compaction_threshold_percent(usize::from(
-                            self.config.compaction_threshold_percent,
-                        ))
-                        .with_session_database(self.session_database.clone())
-                        .with_web_config(Arc::clone(&self.web_config))
-                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
-                )
-                .await?
-            }
-            _ => {
-                return Err(BackendError::UnsupportedProvider {
-                    provider: provider.to_owned(),
-                });
-            }
-        };
+        let handle = self.spawn_provider_handle(provider).await?;
         let (commands, mut events, task) = handle.into_parts();
         self.subagent_commands.insert(run_id.clone(), commands);
         self.subagent_providers
@@ -428,6 +381,12 @@ impl BackendRegistry {
     }
 }
 
+fn read_shared_config<T: Clone + Default>(shared: &RwLock<T>) -> T {
+    shared
+        .read()
+        .map_or_else(|_| T::default(), |config| config.clone())
+}
+
 /// Runs the interactive application until the user exits or a subsystem fails.
 ///
 /// # Errors
@@ -448,17 +407,26 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     state.install_terminal_image_mode(image_mode);
     state.set_nakode_executable(&nakode_executable);
     for provider in backends.commands.keys() {
+        match sessions.list_model_options(provider) {
+            Ok(profiles) => state.install_model_option_profiles(provider, profiles),
+            Err(error) => state.session_store_failed(error.to_string()),
+        }
         match sessions.list_models(provider) {
             Ok(models) => state.install_cached_models(models),
             Err(error) => state.session_store_failed(error.to_string()),
         }
         let _ = backends
-            .send(provider, BackendCommand::Reload { session_id: None })
+            .send(
+                provider,
+                BackendCommand::Reload {
+                    provider_session_id: None,
+                },
+            )
             .await;
     }
     state.set_startup_resume(config.resume);
 
-    let (control_path, mut control, registration) =
+    let (mut control, registration) =
         match start_tui_control(&nakode_executable, &state.nakode_session_id).await {
             Ok(control) => control,
             Err(error) => {
@@ -471,7 +439,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         Err(error) => {
             backends.shutdown().await;
             registration.shutdown().await;
-            control.shutdown(&control_path);
+            control.shutdown();
             return Err(AppError::Terminal(error));
         }
     };
@@ -508,7 +476,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let restore_result = terminal.restore();
     backends.shutdown().await;
     registration.shutdown().await;
-    control.shutdown(&control_path);
+    control.shutdown();
 
     loop_result?;
     restore_result.map_err(AppError::Terminal)?;
@@ -552,6 +520,10 @@ fn initial_state(
             active_name,
         )
     };
+    state.set_default_model_options(crate::backend::ModelOptions {
+        reasoning_effort: Some(config.openai_reasoning_effort.as_str().to_owned()),
+        fast_mode: false,
+    });
     state.install_web_config(backends.current_web_config());
     state.install_vision_config(backends.current_vision_config());
     state.install_agents(agents);
@@ -615,13 +587,13 @@ fn load_provider_credentials(
 async fn start_tui_control(
     executable: &Path,
     session_id: &str,
-) -> Result<(PathBuf, ControlServer, crate::control::ControlRegistration), ControlError> {
-    let path = crate::control::tui_socket_path()?;
+) -> Result<(ControlServer, crate::control_service::ControlRegistration), ControlError> {
+    let path = crate::control_service::tui_socket_path()?;
     let control = ControlServer::bind(&path).await?;
-    match crate::control::ControlRegistration::start(executable, session_id, &path).await {
-        Ok(registration) => Ok((path, control, registration)),
+    match crate::control_service::ControlRegistration::start(executable, session_id, &path).await {
+        Ok(registration) => Ok((control, registration)),
         Err(error) => {
-            control.shutdown(&path);
+            control.shutdown();
             Err(error)
         }
     }
@@ -822,6 +794,7 @@ fn should_chime_for_backend_event(source: &BackendSource, event: &BackendEvent) 
         && matches!(event, BackendEvent::TurnCompleted { .. })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn apply_effects(
     state: &mut AppState,
     effects: Vec<Effect>,
@@ -905,6 +878,11 @@ async fn apply_effects(
             Effect::SetDefaultModel { provider, model } => {
                 set_default_model(state, sessions, &provider, &model);
             }
+            Effect::SaveModelOptions {
+                provider,
+                model,
+                options,
+            } => save_model_options(state, sessions, &provider, &model, &options),
             Effect::PersistSubagent(record) => persist_subagent(state, sessions, &record),
             Effect::LoadSubagents(parent_session_id) => {
                 load_subagents(state, sessions, &parent_session_id);
@@ -971,6 +949,18 @@ fn set_default_model(
     }
 }
 
+fn save_model_options(
+    state: &mut AppState,
+    sessions: &dyn SessionRepository,
+    provider: &str,
+    model: &str,
+    options: &crate::backend::ModelOptions,
+) {
+    if let Err(error) = sessions.save_model_options(provider, model, options) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
 fn open_url(state: &mut AppState, url: &str) {
     match open::that(url) {
         Ok(()) => state.set_status("Opened the authentication page in your browser."),
@@ -981,9 +971,19 @@ fn open_url(state: &mut AppState, url: &str) {
 }
 
 fn install_provider_records(state: &mut AppState, sessions: &dyn SessionRepository) {
+    try_install_provider_records(state, sessions);
+}
+
+fn try_install_provider_records(state: &mut AppState, sessions: &dyn SessionRepository) -> bool {
     match sessions.list_providers() {
-        Ok(providers) => state.install_providers(providers),
-        Err(error) => state.session_store_failed(error.to_string()),
+        Ok(providers) => {
+            state.install_providers(providers);
+            true
+        }
+        Err(error) => {
+            state.session_store_failed(error.to_string());
+            false
+        }
     }
 }
 
@@ -1110,10 +1110,7 @@ async fn persist_provider_credential(
     }
     backends.set_provider_credential(&credential.provider, credential.metadata.clone());
     backends.stop_provider(&credential.provider).await;
-    match sessions.list_providers() {
-        Ok(providers) => state.install_providers(providers),
-        Err(error) => state.session_store_failed(error.to_string()),
-    }
+    install_provider_records(state, sessions);
     pending.push_back(Effect::SetProviderEnabled {
         provider: credential.provider,
         enabled: true,
@@ -1139,12 +1136,8 @@ async fn clear_provider_credential(
         state.session_store_failed(error.to_string());
         return;
     }
-    match sessions.list_providers() {
-        Ok(providers) => state.install_providers(providers),
-        Err(error) => {
-            state.session_store_failed(error.to_string());
-            return;
-        }
+    if !try_install_provider_records(state, sessions) {
+        return;
     }
     state.provider_logged_out(provider);
 }
@@ -1160,10 +1153,7 @@ async fn apply_provider_enablement(
         state.session_store_failed(error.to_string());
         return;
     }
-    match sessions.list_providers() {
-        Ok(providers) => state.install_providers(providers),
-        Err(error) => state.session_store_failed(error.to_string()),
-    }
+    install_provider_records(state, sessions);
     if !enabled {
         backends.stop_provider(provider).await;
         state.provider_disabled(provider);
@@ -1176,12 +1166,21 @@ async fn apply_provider_enablement(
         state.provider_start_failed(provider, &display_name, &error.to_string());
         return;
     }
+    match sessions.list_model_options(provider) {
+        Ok(profiles) => state.install_model_option_profiles(provider, profiles),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
     match sessions.list_models(provider) {
         Ok(models) => state.install_cached_models(models),
         Err(error) => state.session_store_failed(error.to_string()),
     }
     let _ = backends
-        .send(provider, BackendCommand::Reload { session_id: None })
+        .send(
+            provider,
+            BackendCommand::Reload {
+                provider_session_id: None,
+            },
+        )
         .await;
 }
 
@@ -1195,7 +1194,9 @@ fn apply_configuration_reload(
         Ok((agent_count, skill_count)) => {
             state.configuration_reloaded(agent_count, skill_count, reload_backend);
             if reload_backend {
-                pending.push_front(Effect::Backend(BackendCommand::Reload { session_id }));
+                pending.push_front(Effect::Backend(BackendCommand::Reload {
+                    provider_session_id: session_id,
+                }));
             }
         }
         Err(error) => state.configuration_reload_failed(&error),
@@ -1277,12 +1278,10 @@ fn save_web_config_effect(
         state.session_store_failed(error.to_string());
         return;
     }
-    let Ok(mut shared) = backends.web_config.write() else {
-        state.session_store_failed("browser settings lock is unavailable".to_owned());
+    if let Err(error) = replace_shared_config(&backends.web_config, config.clone(), "browser") {
+        state.session_store_failed(error);
         return;
-    };
-    *shared = config.clone();
-    drop(shared);
+    }
     state.install_web_config(config);
     state.set_status("Browser add-on settings saved.");
 }
@@ -1297,14 +1296,20 @@ fn save_vision_config_effect(
         state.session_store_failed(error.to_string());
         return;
     }
-    let Ok(mut shared) = backends.vision_config.write() else {
-        state.session_store_failed("vision settings lock is unavailable".to_owned());
+    if let Err(error) = replace_shared_config(&backends.vision_config, config.clone(), "vision") {
+        state.session_store_failed(error);
         return;
-    };
-    *shared = config.clone();
-    drop(shared);
+    }
     state.install_vision_config(config);
     state.set_status("Vision add-on settings saved.");
+}
+
+fn replace_shared_config<T>(shared: &RwLock<T>, config: T, name: &str) -> Result<(), String> {
+    let mut current = shared
+        .write()
+        .map_err(|_| format!("{name} settings lock is unavailable"))?;
+    *current = config;
+    Ok(())
 }
 
 fn save_terminal_image_mode_effect(
@@ -1642,6 +1647,8 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
             Some(ControlAction::Close) => state.close_model_picker(),
             Some(ControlAction::Previous) => state.picker_move(-1),
             Some(ControlAction::Next) => state.picker_move(1),
+            Some(ControlAction::MoveLeft) => state.picker_adjust(-1),
+            Some(ControlAction::MoveRight) => state.picker_adjust(1),
             Some(ControlAction::Backspace) => state.picker_backspace(),
             Some(ControlAction::Clear) => {
                 if let Some(picker) = &mut state.model_picker {
@@ -2510,7 +2517,7 @@ first_message = "Inspect the change."
         assert!(matches!(
             effects.as_slice(),
             [Effect::Backend(crate::backend::BackendCommand::SteerTurn {
-                session_id,
+                provider_session_id: session_id,
                 turn_id,
                 prompt,
                 ..

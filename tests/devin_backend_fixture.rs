@@ -20,7 +20,7 @@ async fn devin_acp_streams_turn_tools_permissions_and_resume_history() -> TestRe
     verify_failure_and_steering(&mut backend, &session_id).await?;
     verify_resume_and_cancellation(&mut backend, &session_id).await?;
     backend.commands.send(BackendCommand::Shutdown).await?;
-    timeout(Duration::from_secs(5), backend.join()).await?;
+    timeout(Duration::from_secs(5), backend.join()).await??;
     Ok(())
 }
 
@@ -56,7 +56,9 @@ async fn verify_identity(backend: &mut BackendHandle) -> TestResult {
 async fn configure_models(backend: &mut BackendHandle) -> TestResult<String> {
     backend
         .commands
-        .send(BackendCommand::Reload { session_id: None })
+        .send(BackendCommand::Reload {
+            provider_session_id: None,
+        })
         .await?;
     let session_id = match next_event(backend).await? {
         BackendEvent::SessionCreated {
@@ -76,7 +78,7 @@ async fn configure_models(backend: &mut BackendHandle) -> TestResult<String> {
     backend
         .commands
         .send(BackendCommand::SetSessionModel {
-            session_id: session_id.clone(),
+            provider_session_id: session_id.clone(),
             model: "devin-second-model".to_owned(),
         })
         .await?;
@@ -88,7 +90,7 @@ async fn configure_models(backend: &mut BackendHandle) -> TestResult<String> {
     backend
         .commands
         .send(BackendCommand::Reload {
-            session_id: Some(session_id.clone()),
+            provider_session_id: Some(session_id.clone()),
         })
         .await?;
     assert!(matches!(
@@ -102,7 +104,7 @@ async fn verify_successful_turn(backend: &mut BackendHandle, session_id: &str) -
     backend
         .commands
         .send(BackendCommand::StartTurn {
-            session_id: session_id.to_owned(),
+            provider_session_id: session_id.to_owned(),
             client_id: "devin-turn-1".to_owned(),
             prompt: "hello devin".to_owned(),
             attachments: Vec::new(),
@@ -147,7 +149,7 @@ async fn verify_failure_and_steering(backend: &mut BackendHandle, session_id: &s
     backend
         .commands
         .send(BackendCommand::StartTurn {
-            session_id: session_id.to_owned(),
+            provider_session_id: session_id.to_owned(),
             client_id: "devin-turn-failed".to_owned(),
             prompt: "fail prompt".to_owned(),
             attachments: Vec::new(),
@@ -175,7 +177,7 @@ async fn verify_failure_and_steering(backend: &mut BackendHandle, session_id: &s
     backend
         .commands
         .send(BackendCommand::SteerTurn {
-            session_id: session_id.to_owned(),
+            provider_session_id: session_id.to_owned(),
             turn_id: "devin-turn-1".to_owned(),
             client_id: "steer".to_owned(),
             prompt: "unsupported".to_owned(),
@@ -217,7 +219,7 @@ async fn verify_resume_and_cancellation(
     backend
         .commands
         .send(BackendCommand::StartTurn {
-            session_id: session_id.to_owned(),
+            provider_session_id: session_id.to_owned(),
             client_id: "devin-turn-cancel".to_owned(),
             prompt: "wait for cancel".to_owned(),
             attachments: Vec::new(),
@@ -231,7 +233,7 @@ async fn verify_resume_and_cancellation(
     backend
         .commands
         .send(BackendCommand::InterruptTurn {
-            session_id: session_id.to_owned(),
+            provider_session_id: session_id.to_owned(),
             turn_id: "devin-turn-cancel".to_owned(),
         })
         .await?;
@@ -293,7 +295,7 @@ async fn cached_model_selection_is_applied_before_first_prompt() -> TestResult {
     ));
 
     backend.commands.send(BackendCommand::Shutdown).await?;
-    timeout(Duration::from_secs(5), backend.join()).await?;
+    timeout(Duration::from_secs(5), backend.join()).await??;
     Ok(())
 }
 

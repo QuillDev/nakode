@@ -9,9 +9,9 @@ use crate::{
     agent::{AgentCatalog, AgentDefinition},
     backend::{
         ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent, BackendOperation,
-        CODEX_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus, ModelInfo,
+        CODEX_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus, ModelInfo, ModelOptions,
         NormalizedItem, PromptAttachment, QuestionRequest, SessionHistoryItem, TodoPhase,
-        TurnOutcome,
+        TurnOutcome, display_qualified_model_name,
     },
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
@@ -146,11 +146,20 @@ struct PendingSteer {
     editor_revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelPickerStage {
+    Models,
+    Options,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelPicker {
     pub filter: String,
     pub selected: usize,
     pub scope: ModelSelectionScope,
+    pub stage: ModelPickerStage,
+    pub option_selected: usize,
+    pub options: ModelOptions,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -603,6 +612,11 @@ pub enum Effect {
         provider: String,
         model: String,
     },
+    SaveModelOptions {
+        provider: String,
+        model: String,
+        options: ModelOptions,
+    },
     PersistSubagent(SubagentRecord),
     LoadSubagents(String),
     UpdateSessionModel {
@@ -637,6 +651,8 @@ pub struct AppState {
     pub queue_selection: Option<usize>,
     pub models: Vec<ModelInfo>,
     pub selected_model: Option<String>,
+    pub model_options: HashMap<String, ModelOptions>,
+    default_model_options: ModelOptions,
     session_model_override: bool,
     pub model_picker: Option<ModelPicker>,
     pub session_picker: Option<SessionPicker>,
@@ -688,6 +704,25 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn install_model_options(&mut self, provider: &str, model: &str, options: ModelOptions) {
+        self.model_options
+            .insert(format!("{provider}/{model}"), options);
+    }
+
+    pub fn install_model_option_profiles(
+        &mut self,
+        provider: &str,
+        profiles: Vec<(String, ModelOptions)>,
+    ) {
+        for (model, options) in profiles {
+            self.install_model_options(provider, &model, options);
+        }
+    }
+
+    pub fn set_default_model_options(&mut self, options: ModelOptions) {
+        self.default_model_options = options;
+    }
+
     pub fn install_terminal_image_mode(&mut self, mode: TerminalImageMode) {
         self.terminal_image_mode = mode;
         if mode == TerminalImageMode::Off {
@@ -782,7 +817,7 @@ impl AppState {
         }
     }
 
-    pub fn settings_cycle_backend(&mut self, delta: isize) {
+    pub fn settings_cycle_web_backend(&mut self, delta: isize) {
         let Some(settings) = &mut self.settings else {
             return;
         };
@@ -819,14 +854,13 @@ impl AppState {
         else {
             return Vec::new();
         };
-        self.set_status("Terminal image setting saved; changes apply on next launch.");
         vec![Effect::SaveTerminalImageMode(mode)]
     }
 
     pub fn settings_cycle_choice(&mut self, delta: isize) -> Vec<Effect> {
         match self.settings.as_ref().map(|settings| settings.view) {
             Some(SettingsView::WebBrowsing) => {
-                self.settings_cycle_backend(delta);
+                self.settings_cycle_web_backend(delta);
                 self.save_web_settings()
             }
             Some(SettingsView::TerminalImages) => {
@@ -843,7 +877,7 @@ impl AppState {
             .as_ref()
             .is_some_and(|settings| settings.view == SettingsView::WebBrowsing)
         {
-            self.settings_cycle_backend(1);
+            self.settings_cycle_web_backend(1);
             return self.save_web_settings();
         }
         if let Some(settings) = &mut self.settings
@@ -1063,6 +1097,11 @@ impl AppState {
             queue_selection: None,
             models: Vec::new(),
             selected_model: initial_model.clone(),
+            model_options: HashMap::new(),
+            default_model_options: ModelOptions {
+                reasoning_effort: Some("medium".to_owned()),
+                fast_mode: false,
+            },
             session_model_override: initial_model.is_some(),
             model_picker: None,
             session_picker: None,
@@ -2273,7 +2312,7 @@ impl AppState {
         );
         self.set_status("Compressing the current chat context…");
         vec![Effect::Backend(BackendCommand::CompactSession {
-            session_id,
+            provider_session_id: session_id,
             compaction_id,
         })]
     }
@@ -2421,7 +2460,7 @@ impl AppState {
         });
         self.set_status("Sending steering guidance…");
         vec![Effect::Backend(BackendCommand::SteerTurn {
-            session_id: provider_session_id,
+            provider_session_id,
             turn_id,
             client_id: id,
             prompt: self
@@ -2448,7 +2487,7 @@ impl AppState {
             let turn_id = compaction.turn_id.clone();
             self.set_status("Interrupting context compression…");
             effects.push(Effect::Backend(BackendCommand::InterruptTurn {
-                session_id: provider_session_id,
+                provider_session_id,
                 turn_id,
             }));
             return effects;
@@ -2485,7 +2524,7 @@ impl AppState {
             )
         };
         effects.push(Effect::Backend(BackendCommand::InterruptTurn {
-            session_id: provider_session_id,
+            provider_session_id,
             turn_id: active.id.clone(),
         }));
         effects
@@ -2562,8 +2601,57 @@ impl AppState {
             self.creating_session = Some(());
         }
         vec![Effect::Backend(BackendCommand::Reload {
-            session_id: self.provider_session_id.clone(),
+            provider_session_id: self.provider_session_id.clone(),
         })]
+    }
+
+    #[must_use]
+    pub fn selected_model_display_name(&self) -> Option<String> {
+        let selected = self.selected_model.as_deref()?;
+        Some(
+            self.models
+                .iter()
+                .find(|model| model.qualified_id() == selected)
+                .map_or_else(
+                    || display_qualified_model_name(selected),
+                    ModelInfo::display_name,
+                ),
+        )
+    }
+
+    #[must_use]
+    pub fn model_uses_fast_mode(&self, model: &ModelInfo) -> bool {
+        self.model_options_for(model).fast_mode
+    }
+
+    #[must_use]
+    pub fn selected_model_uses_fast_mode(&self) -> bool {
+        self.selected_model
+            .as_deref()
+            .is_some_and(|selected| self.model_options_for_qualified(selected).fast_mode)
+    }
+
+    fn model_options_for_qualified(&self, qualified: &str) -> ModelOptions {
+        self.model_options
+            .get(qualified)
+            .or_else(|| {
+                qualified
+                    .split_once('/')
+                    .and_then(|(provider, _)| self.model_options.get(&format!("{provider}/*")))
+            })
+            .cloned()
+            .unwrap_or_else(|| self.default_model_options.clone())
+    }
+
+    fn model_options_for(&self, model: &ModelInfo) -> ModelOptions {
+        self.model_options_for_qualified(&model.qualified_id())
+    }
+
+    fn selected_model_options(&self) -> ModelOptions {
+        self.selected_model.as_ref().map_or_else(
+            || self.default_model_options.clone(),
+            |selected| self.model_options_for_qualified(selected),
+        )
     }
 
     fn show_model_picker(&mut self, scope: ModelSelectionScope) {
@@ -2582,16 +2670,31 @@ impl AppState {
                     .position(|model| &model.qualified_id() == selected)
             })
             .unwrap_or(0);
+        let options = self
+            .models
+            .iter()
+            .filter(|model| {
+                scope != ModelSelectionScope::Vision || model.provider == CODEX_PROVIDER
+            })
+            .nth(selected)
+            .map_or_else(
+                || self.default_model_options.clone(),
+                |model| self.model_options_for(model),
+            );
         self.model_picker = Some(ModelPicker {
             filter: String::new(),
             selected,
             scope,
+            stage: ModelPickerStage::Models,
+            option_selected: 0,
+            options,
         });
         self.pending_model_picker = None;
     }
 
     pub fn picker_insert(&mut self, character: char) {
         if let Some(picker) = &mut self.model_picker
+            && picker.stage == ModelPickerStage::Models
             && !character.is_control()
         {
             picker.filter.push(character);
@@ -2600,13 +2703,21 @@ impl AppState {
     }
 
     pub fn picker_backspace(&mut self) {
-        if let Some(picker) = &mut self.model_picker {
+        if let Some(picker) = &mut self.model_picker
+            && picker.stage == ModelPickerStage::Models
+        {
             picker.filter.pop();
             picker.selected = 0;
         }
     }
 
     pub fn picker_move(&mut self, delta: isize) {
+        if let Some(picker) = &mut self.model_picker
+            && picker.stage == ModelPickerStage::Options
+        {
+            picker.option_selected = offset_index(picker.option_selected, 2, delta);
+            return;
+        }
         let count = self.filtered_models().len();
         let Some(picker) = &mut self.model_picker else {
             return;
@@ -2618,6 +2729,29 @@ impl AppState {
         picker.selected = offset_index(picker.selected, count, delta);
     }
 
+    pub fn picker_adjust(&mut self, delta: isize) {
+        let Some(picker) = &mut self.model_picker else {
+            return;
+        };
+        if picker.stage != ModelPickerStage::Options {
+            return;
+        }
+        if picker.option_selected == 0 {
+            const EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
+            let current = picker
+                .options
+                .reasoning_effort
+                .as_deref()
+                .and_then(|effort| EFFORTS.iter().position(|candidate| *candidate == effort))
+                .unwrap_or(2);
+            picker.options.reasoning_effort =
+                Some(EFFORTS[offset_index(current, EFFORTS.len(), delta)].to_owned());
+        } else if delta != 0 {
+            picker.options.fast_mode = !picker.options.fast_mode;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     pub fn picker_select(&mut self) -> Vec<Effect> {
         let filtered = self.filtered_models();
         let selected = self
@@ -2631,6 +2765,22 @@ impl AppState {
                 .model_picker
                 .as_ref()
                 .map_or(ModelSelectionScope::Session, |picker| picker.scope);
+            let stage = self
+                .model_picker
+                .as_ref()
+                .map_or(ModelPickerStage::Models, |picker| picker.stage);
+            if scope == ModelSelectionScope::Default
+                && selected.provider == CODEX_PROVIDER
+                && stage == ModelPickerStage::Models
+            {
+                let options = self.model_options_for(&selected);
+                if let Some(picker) = &mut self.model_picker {
+                    picker.stage = ModelPickerStage::Options;
+                    picker.option_selected = 0;
+                    picker.options = options;
+                }
+                return Vec::new();
+            }
             if scope == ModelSelectionScope::Vision {
                 return self.select_vision_model(&selected);
             }
@@ -2670,8 +2820,17 @@ impl AppState {
                     );
                 }
             }
+            let selected_options = if stage == ModelPickerStage::Options {
+                self.model_picker.as_ref().map_or_else(
+                    || self.model_options_for(&selected),
+                    |picker| picker.options.clone(),
+                )
+            } else {
+                self.model_options_for(&selected)
+            };
             let active = self.active_turn.is_some();
             let qualified = selected.qualified_id();
+            let display = selected.display_name();
             self.selected_model = Some(qualified.clone());
             self.session_model_override = scope == ModelSelectionScope::Session;
             if scope == ModelSelectionScope::Default {
@@ -2682,13 +2841,13 @@ impl AppState {
                 }
             }
             self.status_message = if provider_changed && self.pending_handoff.is_some() {
-                format!("Selected {qualified}. The next message includes a continuity handoff.")
+                format!("Selected {display}. The next message includes a continuity handoff.")
             } else if active {
-                format!("Next model: {qualified}. The active turn is unchanged.")
+                format!("Next model: {display}. The active turn is unchanged.")
             } else if scope == ModelSelectionScope::Default {
-                format!("Default model: {qualified}.")
+                format!("Default model: {display}.")
             } else {
-                format!("Selected model: {qualified}.")
+                format!("Selected model: {display}.")
             };
             self.model_picker = None;
             let mut effects = Vec::new();
@@ -2697,6 +2856,18 @@ impl AppState {
                     provider: selected.provider.clone(),
                     model: selected.id.clone(),
                 });
+                if selected.provider == CODEX_PROVIDER {
+                    self.install_model_options(
+                        &selected.provider,
+                        &selected.id,
+                        selected_options.clone(),
+                    );
+                    effects.push(Effect::SaveModelOptions {
+                        provider: selected.provider.clone(),
+                        model: selected.id.clone(),
+                        options: selected_options.clone(),
+                    });
+                }
             }
             if self
                 .backend_capabilities
@@ -2705,9 +2876,15 @@ impl AppState {
                 && let Some(session_id) = self.provider_session_id.clone()
             {
                 effects.push(Effect::Backend(BackendCommand::SetSessionModel {
-                    session_id,
+                    provider_session_id: session_id.clone(),
                     model: selected.id,
                 }));
+                if selected.provider == CODEX_PROVIDER {
+                    effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
+                        provider_session_id: session_id,
+                        options: selected_options,
+                    }));
+                }
             } else if let Some(session_id) = self.session_id.clone() {
                 effects.push(Effect::UpdateSessionModel {
                     session_id,
@@ -2723,7 +2900,7 @@ impl AppState {
         let qualified = selected.qualified_id();
         self.vision_config.model = Some(qualified.clone());
         self.model_picker = None;
-        self.status_message = format!("Vision model: {qualified}.");
+        self.status_message = format!("Vision model: {}.", selected.display_name());
         vec![Effect::SaveVisionConfig(self.vision_config.clone())]
     }
 
@@ -2739,7 +2916,9 @@ impl AppState {
                 let vision_model =
                     picker.scope != ModelSelectionScope::Vision || model.provider == CODEX_PROVIDER;
                 vision_model
-                    && (filter.is_empty() || model.qualified_id().to_lowercase().contains(&filter))
+                    && (filter.is_empty()
+                        || model.qualified_id().to_lowercase().contains(&filter)
+                        || model.display_name().to_lowercase().contains(&filter))
             })
             .collect()
     }
@@ -2851,28 +3030,22 @@ impl AppState {
         }
         match &event {
             BackendEvent::Ready(identity) => {
-                self.provider_contexts.insert(
-                    provider.to_owned(),
-                    ProviderContext {
-                        name: identity.display_name.clone(),
-                        capabilities: identity.capabilities.clone(),
-                        connection: ConnectionState::Ready {
-                            server: identity.display_name.clone(),
-                        },
-                        provider_session_id: self
-                            .provider_contexts
-                            .get(provider)
-                            .and_then(|context| context.provider_session_id.clone()),
-                        session_id: self
-                            .provider_contexts
-                            .get(provider)
-                            .and_then(|context| context.session_id.clone()),
-                        context_usage: self
-                            .provider_contexts
-                            .get(provider)
-                            .and_then(|context| context.context_usage),
-                    },
-                );
+                let context = self
+                    .provider_contexts
+                    .entry(provider.to_owned())
+                    .or_insert_with(|| ProviderContext {
+                        name: String::new(),
+                        capabilities: BackendCapabilities::default(),
+                        connection: ConnectionState::Starting,
+                        provider_session_id: None,
+                        session_id: None,
+                        context_usage: None,
+                    });
+                context.name.clone_from(&identity.display_name);
+                context.capabilities = identity.capabilities.clone();
+                context.connection = ConnectionState::Ready {
+                    server: identity.display_name.clone(),
+                };
                 if self.backend_provider.is_empty() && !self.provider_is_authenticating(provider) {
                     provider.clone_into(&mut self.backend_provider);
                     self.backend_name.clone_from(&identity.display_name);
@@ -2883,10 +3056,11 @@ impl AppState {
                 }
             }
             BackendEvent::Models(models) => {
-                let mut models = models.clone();
-                for model in &mut models {
-                    provider.clone_into(&mut model.provider);
+                if models.iter().any(|model| model.provider != provider) {
+                    self.diagnostic_count += 1;
+                    return Vec::new();
                 }
+                let models = models.clone();
                 if !models.is_empty() {
                     self.install_models(models.clone());
                 }
@@ -3304,7 +3478,11 @@ impl AppState {
             let qualified = self.qualify_active_model(model);
             if self.selected_model.as_deref() != Some(qualified.as_str()) {
                 self.selected_model = Some(qualified.clone());
-                self.status_message = format!("{} selected model {qualified}.", self.backend_name);
+                self.status_message = format!(
+                    "{} selected model {}.",
+                    self.backend_name,
+                    display_qualified_model_name(&qualified)
+                );
             }
         }
         let Some(prompt) = self.pending_session_prompt.take() else {
@@ -3317,6 +3495,12 @@ impl AppState {
             title: prompt.text.clone(),
             model: self.selected_model.clone(),
         }];
+        if self.backend_provider == CODEX_PROVIDER {
+            effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
+                provider_session_id: provider_session_id.clone(),
+                options: self.selected_model_options(),
+            }));
+        }
         effects.extend(self.start_prompt_on_session(prompt, provider_session_id));
         effects
     }
@@ -3715,7 +3899,7 @@ impl AppState {
         self.starting_turn = Some(prompt.clone());
         self.set_status("Starting turn…");
         vec![Effect::Backend(BackendCommand::StartTurn {
-            session_id: provider_session_id,
+            provider_session_id,
             client_id: prompt.id,
             prompt: wire_text,
             attachments: prompt.attachments,
@@ -4144,7 +4328,7 @@ impl AppState {
             .join("\n");
         let model = self.selected_model.as_ref().map_or_else(
             || format!("{}/provider-default", self.backend_provider),
-            |model| format!("{}/{}", self.backend_provider, model),
+            Clone::clone,
         );
         format!(
             "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode invocation is available through the native shell. It is a Nakode control-plane command, not a provider tool.\nAvailable agents:\n{}\nTo delegate a concrete bounded task, execute the matching absolute-path command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed above. Use only these Nakode commands for delegation; do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one command per task concurrently using the provider's native shell facilities. Keep each objective distinct and bounded. Each command returns its own agent result on stdout when that child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
@@ -4448,11 +4632,7 @@ impl AppState {
         execution.run.provider_session_id = Some(provider_session_id.clone());
         execution.run.status = SubagentStatus::Working;
         "Working…".clone_into(&mut execution.run.latest_activity);
-        let prompt = format!(
-            "# Agent role instructions\n\n{}\n\n{}",
-            execution.definition.system_prompt.trim(),
-            execution.definition.initial_prompt(&execution.task)
-        );
+        let prompt = execution.definition.initial_prompt(&execution.task);
         let model = execution.model_targets[execution.model_target_index]
             .model
             .clone();
@@ -4460,7 +4640,7 @@ impl AppState {
         vec![Effect::SubagentBackend {
             run_id: run_id.to_owned(),
             command: BackendCommand::StartTurn {
-                session_id: provider_session_id,
+                provider_session_id,
                 client_id: format!("{run_id}-prompt"),
                 prompt,
                 attachments: Vec::new(),
@@ -5001,8 +5181,8 @@ mod tests {
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
             BackendIdentity, BackendOperation, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport,
             CompactionReason, DEVIN_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo,
-            NormalizedItem, PromptAttachment, PromptImage, QuestionOption, QuestionRequest,
-            SessionHistoryItem, TodoItem, TodoPhase, TodoStatus, TurnOutcome,
+            ModelOptions, NormalizedItem, PromptAttachment, PromptImage, QuestionOption,
+            QuestionRequest, SessionHistoryItem, TodoItem, TodoPhase, TodoStatus, TurnOutcome,
         },
         session::{SessionRecord, SubagentRecord},
         skill::SkillCatalog,
@@ -5200,7 +5380,7 @@ model = "openai-codex/model-a"
 
         let [
             Effect::Backend(BackendCommand::CompactSession {
-                session_id,
+                provider_session_id: session_id,
                 compaction_id,
             }),
         ] = effects.as_slice()
@@ -5242,7 +5422,7 @@ model = "openai-codex/model-a"
         assert!(matches!(
             interrupt.as_slice(),
             [Effect::Backend(BackendCommand::InterruptTurn {
-                session_id,
+                provider_session_id: session_id,
                 turn_id,
             })] if session_id == "native-session" && turn_id == &compaction_id
         ));
@@ -5375,7 +5555,9 @@ model = "openai-codex/model-a"
 
         assert!(matches!(
             state.open_model_picker().as_slice(),
-            [Effect::Backend(BackendCommand::Reload { session_id: None })]
+            [Effect::Backend(BackendCommand::Reload {
+                provider_session_id: None
+            })]
         ));
         assert!(state.status_message.contains("Loading Devin models"));
         assert!(state.open_model_picker().is_empty());
@@ -5399,7 +5581,10 @@ model = "openai-codex/model-a"
         state.picker_move(1);
         assert!(matches!(
             state.picker_select().as_slice(),
-            [Effect::Backend(BackendCommand::SetSessionModel { session_id, model })]
+            [Effect::Backend(BackendCommand::SetSessionModel {
+                provider_session_id: session_id,
+                model
+            })]
                 if session_id == "devin-session" && model == "model-b"
         ));
 
@@ -5531,7 +5716,11 @@ model = "openai-codex/model-a"
         });
         assert!(matches!(
             effects.as_slice(),
-            [Effect::PersistSession { .. }, Effect::Backend(_)]
+            [
+                Effect::PersistSession { .. },
+                Effect::Backend(BackendCommand::SetSessionOptions { .. }),
+                Effect::Backend(BackendCommand::StartTurn { .. })
+            ]
         ));
     }
 
@@ -6293,11 +6482,28 @@ model = "openai-codex/model-a"
             Some(super::ModelSelectionScope::Default)
         );
         state.picker_move(1);
+        assert!(state.picker_select().is_empty());
+        assert_eq!(
+            state.model_picker.as_ref().map(|picker| picker.stage),
+            Some(super::ModelPickerStage::Options)
+        );
+        state.picker_adjust(1);
+        state.picker_move(1);
+        state.picker_adjust(1);
+        let effects = state.picker_select();
         assert!(matches!(
-            state.picker_select().as_slice(),
-            [Effect::SetDefaultModel { provider, model }]
-                if provider == CODEX_PROVIDER && model == "model-b"
+            effects.as_slice(),
+            [
+                Effect::SetDefaultModel { provider, model },
+                Effect::SaveModelOptions { .. }
+            ] if provider == CODEX_PROVIDER && model == "model-b"
         ));
+        let model_b_options = state
+            .model_options
+            .get("openai-codex/model-b")
+            .expect("model-b options");
+        assert_eq!(model_b_options.reasoning_effort.as_deref(), Some("high"));
+        assert!(model_b_options.fast_mode);
 
         state.editor.set_text("/new");
         let _ = state.submit_editor();
@@ -6308,6 +6514,40 @@ model = "openai-codex/model-a"
     }
 
     #[test]
+    fn models_picker_loads_options_for_the_selected_model() {
+        let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "model-b".to_owned(),
+            is_default: false,
+        });
+        state.install_model_options(
+            CODEX_PROVIDER,
+            "model-a",
+            ModelOptions {
+                reasoning_effort: Some("high".to_owned()),
+                fast_mode: true,
+            },
+        );
+        state.install_model_options(
+            CODEX_PROVIDER,
+            "model-b",
+            ModelOptions {
+                reasoning_effort: Some("low".to_owned()),
+                fast_mode: false,
+            },
+        );
+        state.editor.set_text("/models");
+        state.submit_editor();
+        state.picker_move(1);
+        state.picker_select();
+
+        let picker = state.model_picker.as_ref().expect("options picker");
+        assert_eq!(picker.options.reasoning_effort.as_deref(), Some("low"));
+        assert!(!picker.options.fast_mode);
+    }
+
+    #[test]
     fn switch_command_applies_only_to_the_current_session() {
         let mut state = ready_state();
         state.models.push(ModelInfo {
@@ -6315,6 +6555,19 @@ model = "openai-codex/model-a"
             id: "model-b".to_owned(),
             is_default: false,
         });
+        state.backend_capabilities.session_model_config = CapabilitySupport::Supported;
+        state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "thread-1".to_owned(),
+            model: "model-a".to_owned(),
+        });
+        state.install_model_options(
+            CODEX_PROVIDER,
+            "model-b",
+            ModelOptions {
+                reasoning_effort: Some("low".to_owned()),
+                fast_mode: true,
+            },
+        );
         state.editor.set_text("/switch");
 
         assert!(state.submit_editor().is_empty());
@@ -6323,7 +6576,16 @@ model = "openai-codex/model-a"
             Some(super::ModelSelectionScope::Session)
         );
         state.picker_move(1);
-        assert!(state.picker_select().is_empty());
+        let effects = state.picker_select();
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Backend(BackendCommand::SetSessionModel { model, .. }),
+                Effect::Backend(BackendCommand::SetSessionOptions { options, .. })
+            ] if model == "model-b"
+                && options.reasoning_effort.as_deref() == Some("low")
+                && options.fast_mode
+        ));
         assert_eq!(
             state.selected_model.as_deref(),
             Some("openai-codex/model-b")
@@ -6357,7 +6619,7 @@ model = "openai-codex/model-a"
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Models(vec![ModelInfo {
-                provider: String::new(),
+                provider: CODEX_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
             }]),
@@ -6365,7 +6627,7 @@ model = "openai-codex/model-a"
         state.handle_provider_backend(
             DEVIN_PROVIDER,
             BackendEvent::Models(vec![ModelInfo {
-                provider: String::new(),
+                provider: DEVIN_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
             }]),
@@ -6405,7 +6667,7 @@ model = "openai-codex/model-a"
             state.handle_provider_backend(
                 provider,
                 BackendEvent::Models(vec![ModelInfo {
-                    provider: String::new(),
+                    provider: provider.to_owned(),
                     id: "shared".to_owned(),
                     is_default: true,
                 }]),
@@ -6514,7 +6776,9 @@ model = "openai-codex/model-a"
             [Effect::SubagentBackend {
                 command: BackendCommand::StartTurn { prompt, .. },
                 ..
-            }] if prompt.contains("Inspect the delegated question") && prompt.contains("Map auth")
+            }] if prompt.contains("Inspect the delegated question")
+                && prompt.contains("Map auth")
+                && !prompt.contains("Explore carefully")
         ));
         run_id
     }
@@ -6524,7 +6788,7 @@ model = "openai-codex/model-a"
         let mut state = ready_state();
         state.install_agents(explorer_catalog());
         state.set_nakode_executable(Path::new("/opt/nakode/bin/nakode"));
-        state.selected_model = Some("model-a".to_owned());
+        state.selected_model = Some("openai-codex/model-a".to_owned());
         state.editor.set_text("Start work");
 
         let effects = state.submit_editor();
@@ -6876,7 +7140,7 @@ model = "openai-codex/model-a"
                 Effect::CompleteAgentRequest { success: false, .. },
                 Effect::StopSubagent(stopped_run),
                 Effect::Backend(BackendCommand::InterruptTurn {
-                    session_id,
+                    provider_session_id: session_id,
                     turn_id,
                 }),
             ] if stopped_run == &run_id

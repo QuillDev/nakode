@@ -9,6 +9,20 @@ pub const CODEX_PROVIDER: &str = "openai-codex";
 pub const DEVIN_PROVIDER: &str = "devin-acp";
 pub const CURSOR_PROVIDER: &str = "cursor-sdk";
 
+pub(crate) async fn request_failed(
+    events: &mpsc::Sender<BackendEvent>,
+    operation: BackendOperation,
+    message: impl Into<String>,
+) {
+    let _ = events
+        .send(BackendEvent::RequestFailed {
+            operation,
+            code: -1,
+            message: message.into(),
+        })
+        .await;
+}
+
 /// Features declared by the active provider adapter.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CapabilitySupport {
@@ -47,6 +61,12 @@ pub struct BackendIdentity {
     pub capabilities: BackendCapabilities,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModelOptions {
+    pub reasoning_effort: Option<String>,
+    pub fast_mode: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInfo {
     pub provider: String,
@@ -58,6 +78,76 @@ impl ModelInfo {
     #[must_use]
     pub fn qualified_id(&self) -> String {
         format!("{}/{}", self.provider, self.id)
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        display_model_name(&self.provider, &self.id)
+    }
+}
+
+/// Converts a provider model identifier into a human-readable display name while
+/// preserving the original identifier for all provider requests and persistence.
+#[must_use]
+pub fn display_model_name(provider: &str, model: &str) -> String {
+    let parts = model
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if provider == DEVIN_PROVIDER
+        && parts.len() >= 3
+        && parts[0].eq_ignore_ascii_case("swe")
+        && parts[1].chars().all(|character| character.is_ascii_digit())
+        && parts[2].chars().all(|character| character.is_ascii_digit())
+    {
+        let mut display = vec!["SWE".to_owned(), format!("{}.{}", parts[1], parts[2])];
+        display.extend(
+            parts[3..]
+                .iter()
+                .map(|part| display_model_part(provider, part)),
+        );
+        return display.join(" ");
+    }
+    parts
+        .into_iter()
+        .map(|part| display_model_part(provider, part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[must_use]
+pub fn display_qualified_model_name(qualified: &str) -> String {
+    qualified.split_once('/').map_or_else(
+        || display_model_name("", qualified),
+        |(provider, model)| display_model_name(provider, model),
+    )
+}
+
+fn display_model_part(provider: &str, part: &str) -> String {
+    let lower = part.to_ascii_lowercase();
+    match (provider, lower.as_str()) {
+        (_, "gpt") => "GPT".to_owned(),
+        (DEVIN_PROVIDER, "swe") => "SWE".to_owned(),
+        (_, "ai") => "AI".to_owned(),
+        _ if part
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.') =>
+        {
+            part.to_owned()
+        }
+        _ if lower.starts_with('o')
+            && lower[1..]
+                .chars()
+                .all(|character| character.is_ascii_digit()) =>
+        {
+            lower
+        }
+        _ => {
+            let mut characters = lower.chars();
+            characters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(characters).collect()
+            })
+        }
     }
 }
 
@@ -372,32 +462,36 @@ pub enum BackendCommand {
         provider_session_id: String,
     },
     StartTurn {
-        session_id: String,
+        provider_session_id: String,
         client_id: String,
         prompt: String,
         attachments: Vec<PromptAttachment>,
         model: Option<String>,
     },
     SteerTurn {
-        session_id: String,
+        provider_session_id: String,
         turn_id: String,
         client_id: String,
         prompt: String,
     },
     InterruptTurn {
-        session_id: String,
+        provider_session_id: String,
         turn_id: String,
     },
     CompactSession {
-        session_id: String,
+        provider_session_id: String,
         compaction_id: String,
     },
     SetSessionModel {
-        session_id: String,
+        provider_session_id: String,
         model: String,
     },
+    SetSessionOptions {
+        provider_session_id: String,
+        options: ModelOptions,
+    },
     Reload {
-        session_id: Option<String>,
+        provider_session_id: Option<String>,
     },
     ResolveApproval {
         id: Value,
@@ -475,8 +569,13 @@ impl BackendHandle {
         }
     }
 
-    pub async fn join(self) {
-        let _ = self.task.await;
+    /// Waits for the provider supervisor to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the supervisor task's cancellation or panic error.
+    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
+        self.task.await
     }
 
     pub(crate) fn into_parts(
@@ -487,5 +586,27 @@ impl BackendHandle {
         JoinHandle<()>,
     ) {
         (self.commands, self.events, self.task)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CODEX_PROVIDER, DEVIN_PROVIDER, display_model_name};
+
+    #[test]
+    fn model_ids_are_normalized_for_display_without_changing_provider_ids() {
+        assert_eq!(
+            display_model_name(CODEX_PROVIDER, "gpt-5.6-sol"),
+            "GPT 5.6 Sol"
+        );
+        assert_eq!(
+            display_model_name(CODEX_PROVIDER, "gpt-5.1-codex-mini"),
+            "GPT 5.1 Codex Mini"
+        );
+        assert_eq!(
+            display_model_name(DEVIN_PROVIDER, "swe-1-6-fast"),
+            "SWE 1.6 Fast"
+        );
+        assert_eq!(display_model_name(CODEX_PROVIDER, "o3"), "o3");
     }
 }

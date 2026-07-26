@@ -94,15 +94,14 @@ impl EvalTool {
             .get("reset")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let mut kernel = {
-            let mut kernels = self.kernels.lock().await;
-            let previous = kernels.remove(&key);
-            if reset && let Some(mut previous) = previous {
+        let previous = self.kernels.lock().await.remove(&key);
+        let mut kernel = if reset {
+            if let Some(mut previous) = previous {
                 previous.stop().await;
-                None
-            } else {
-                previous
             }
+            None
+        } else {
+            previous
         };
         if kernel.is_none() {
             kernel = Some(EvalKernel::spawn(language, workspace)?);

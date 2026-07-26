@@ -13,12 +13,12 @@ use crate::{
     backend::{
         BackendCapabilities, BackendCommand, BackendError, BackendEvent, BackendHandle,
         BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, ModelInfo,
-        TurnOutcome,
+        ModelOptions, TurnOutcome, request_failed,
     },
     runtime::{
         AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
         InferenceFailure, InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest,
-        RuntimeSession, RuntimeSessionStore, ToolCall,
+        RuntimeSession, RuntimeSessionStore, ToolCall, TurnError, set_session_model,
     },
 };
 
@@ -215,6 +215,7 @@ impl crate::vision::VisionService for CodexVisionService {
                 }],
                 tools: Vec::new(),
                 reasoning_effort: Some("low".to_owned()),
+                fast_mode: false,
             };
             let (events, mut event_rx) = mpsc::channel(32);
             let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
@@ -427,6 +428,7 @@ async fn run_supervisor(
         .clone()
         .map(|database| RuntimeSessionStore::new(database, CODEX_PROVIDER));
     let mut sessions = HashMap::<String, RuntimeSession>::new();
+    let mut pending_options = HashMap::<String, ModelOptions>::new();
     let mut active: Option<ActiveTurn> = None;
     let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedTurn>(8);
 
@@ -443,6 +445,7 @@ async fn run_supervisor(
                     credential: credential.as_ref(),
                     runtime: runtime.as_ref(),
                     sessions: &mut sessions,
+                    pending_options: &mut pending_options,
                     active: &mut active,
                     completed: &completed_tx,
                     events: &events,
@@ -451,7 +454,11 @@ async fn run_supervisor(
                 handle_command(command, &mut context).await;
             }
             completed = completed_rx.recv() => {
-                let Some(completed) = completed else { break };
+                let Some(mut completed) = completed else { break };
+                if let Some(options) = pending_options.remove(&completed.session.id) {
+                    completed.session.reasoning_effort = options.reasoning_effort;
+                    completed.session.fast_mode = options.fast_mode;
+                }
                 if let Some(store) = &session_store
                     && let Err(error) = store.save(&completed.session)
                 {
@@ -468,8 +475,8 @@ async fn run_supervisor(
                 if completed.kind == CompletedWorkKind::Turn {
                     let (outcome, error) = match completed.result {
                         Ok(()) => (TurnOutcome::Completed, None),
-                        Err(error) if error == "turn interrupted" => (TurnOutcome::Interrupted, None),
-                        Err(error) => (TurnOutcome::Failed, Some(error)),
+                        Err(TurnError::Interrupted) => (TurnOutcome::Interrupted, None),
+                        Err(error) => (TurnOutcome::Failed, Some(error.to_string())),
                     };
                     let _ = events.send(BackendEvent::TurnCompleted {
                         turn_id: completed.turn_id,
@@ -483,6 +490,7 @@ async fn run_supervisor(
 }
 
 struct ActiveTurn {
+    session_id: String,
     turn_id: String,
     cancellation: CancellationToken,
 }
@@ -496,7 +504,7 @@ enum CompletedWorkKind {
 struct CompletedTurn {
     turn_id: String,
     session: RuntimeSession,
-    result: Result<(), String>,
+    result: Result<(), TurnError>,
     kind: CompletedWorkKind,
 }
 
@@ -505,12 +513,14 @@ struct CommandContext<'a> {
     credential: Option<&'a CodexCredential>,
     runtime: Option<&'a AgentRuntime>,
     sessions: &'a mut HashMap<String, RuntimeSession>,
+    pending_options: &'a mut HashMap<String, ModelOptions>,
     active: &'a mut Option<ActiveTurn>,
     completed: &'a mpsc::Sender<CompletedTurn>,
     events: &'a mpsc::Sender<BackendEvent>,
     session_store: Option<&'a RuntimeSessionStore>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_>) {
     match command {
         BackendCommand::BeginAuthentication => {
@@ -538,14 +548,10 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::StartSession {
             model,
             instructions,
-        } => {
-            start_session(model, instructions, context).await;
-        }
+        } => start_session(model, instructions, context).await,
         BackendCommand::ResumeSession {
             provider_session_id,
-        } => {
-            resume_session(provider_session_id, context).await;
-        }
+        } => resume_session(provider_session_id, context).await,
         BackendCommand::UnsubscribeSession {
             provider_session_id,
         } => {
@@ -553,37 +559,53 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             let _ = context.events.send(BackendEvent::SessionUnsubscribed).await;
         }
         BackendCommand::CompactSession {
-            session_id,
+            provider_session_id,
             compaction_id,
-        } => compact_session(session_id, compaction_id, context).await,
-        BackendCommand::SetSessionModel { session_id, model } => {
-            if let Some(session) = context.sessions.get_mut(&session_id) {
-                if session.model != model {
-                    session.context_window = None;
-                }
-                session.model = model;
-                if let Some(store) = context.session_store
-                    && let Err(error) = store.save(session)
-                {
-                    request_failed(context.events, BackendOperation::SetSessionModel, error).await;
-                }
-            } else {
-                request_failed(
-                    context.events,
-                    BackendOperation::SetSessionModel,
-                    "unknown native session",
-                )
-                .await;
+        } => compact_session(provider_session_id, compaction_id, context).await,
+        BackendCommand::SetSessionModel {
+            provider_session_id,
+            model,
+        } => {
+            if let Err(error) = set_session_model(
+                context.sessions,
+                context.session_store,
+                &provider_session_id,
+                model,
+            ) {
+                request_failed(context.events, BackendOperation::SetSessionModel, error).await;
+            }
+        }
+        BackendCommand::SetSessionOptions {
+            provider_session_id,
+            options,
+        } => {
+            if let Err(error) = set_session_options(
+                context.sessions,
+                context.pending_options,
+                context.active.as_ref(),
+                context.session_store,
+                &provider_session_id,
+                options,
+            ) {
+                request_failed(context.events, BackendOperation::SetSessionModel, error).await;
             }
         }
         BackendCommand::StartTurn {
-            session_id,
+            provider_session_id,
             client_id,
             prompt,
             attachments,
             model,
         } => {
-            start_turn(session_id, client_id, prompt, attachments, model, context).await;
+            start_turn(
+                provider_session_id,
+                client_id,
+                prompt,
+                attachments,
+                model,
+                context,
+            )
+            .await;
         }
         BackendCommand::InterruptTurn { turn_id, .. } => {
             if let Some(active) = context
@@ -610,6 +632,29 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         }
         BackendCommand::ResolveApproval { .. } | BackendCommand::Shutdown => {}
     }
+}
+
+fn set_session_options(
+    sessions: &mut HashMap<String, RuntimeSession>,
+    pending_options: &mut HashMap<String, ModelOptions>,
+    active: Option<&ActiveTurn>,
+    store: Option<&RuntimeSessionStore>,
+    session_id: &str,
+    options: ModelOptions,
+) -> Result<(), String> {
+    let Some(session) = sessions.get_mut(session_id) else {
+        if active.is_some_and(|active| active.session_id == session_id) {
+            pending_options.insert(session_id.to_owned(), options);
+            return Ok(());
+        }
+        return Err("unknown native session".to_owned());
+    };
+    session.reasoning_effort = options.reasoning_effort;
+    session.fast_mode = options.fast_mode;
+    if let Some(store) = store {
+        store.save(session)?;
+    }
+    Ok(())
 }
 
 async fn compact_session(
@@ -646,6 +691,7 @@ async fn compact_session(
     };
     let cancellation = CancellationToken::new();
     *context.active = Some(ActiveTurn {
+        session_id: session.id.clone(),
         turn_id: compaction_id.clone(),
         cancellation: cancellation.clone(),
     });
@@ -655,7 +701,8 @@ async fn compact_session(
     tokio::spawn(async move {
         let result = runtime
             .force_compact(&mut session, &compaction_id, &events, cancellation)
-            .await;
+            .await
+            .map_err(TurnError::from);
         let _ = completed
             .send(CompletedTurn {
                 turn_id: compaction_id,
@@ -720,6 +767,7 @@ async fn start_turn(
     }
     let cancellation = CancellationToken::new();
     *context.active = Some(ActiveTurn {
+        session_id: session.id.clone(),
         turn_id: client_id.clone(),
         cancellation: cancellation.clone(),
     });
@@ -900,20 +948,6 @@ fn native_capabilities() -> BackendCapabilities {
     }
 }
 
-async fn request_failed(
-    events: &mpsc::Sender<BackendEvent>,
-    operation: BackendOperation,
-    message: impl Into<String>,
-) {
-    let _ = events
-        .send(BackendEvent::RequestFailed {
-            operation,
-            code: -1,
-            message: message.into(),
-        })
-        .await;
-}
-
 async fn discover_models(
     config: &BackendConfig,
     credential: &CodexCredential,
@@ -1025,7 +1059,7 @@ fn codex_request_body(request: &InferenceRequest) -> Value {
             })
         })
         .collect::<Vec<_>>();
-    json!({
+    let mut body = json!({
         "model": request.model,
         "input": input,
         "instructions": request.instructions,
@@ -1040,7 +1074,11 @@ fn codex_request_body(request: &InferenceRequest) -> Value {
         "stream": true,
         "store": false,
         "prompt_cache_key": request.session_id
-    })
+    });
+    if request.fast_mode {
+        body["service_tier"] = Value::String("priority".to_owned());
+    }
+    body
 }
 
 fn conversation_input(item: &ConversationItem) -> Vec<Value> {
@@ -1148,6 +1186,7 @@ async fn parse_codex_sse(
     let mut stream = response.bytes_stream();
     let mut pending = String::new();
     let mut output = InferenceOutput::default();
+    let mut completed = false;
     loop {
         let chunk = tokio::select! {
             chunk = stream.next() => chunk,
@@ -1172,22 +1211,36 @@ async fn parse_codex_sse(
                 continue;
             };
             if data == "[DONE]" {
+                completed = true;
                 continue;
             }
             let event: Value = serde_json::from_str(data).map_err(|error| {
                 InferenceAttemptError::terminal(format!("invalid Codex event: {error}"))
             })?;
-            if let Err(message) = apply_codex_event(&event, &events, &mut output).await {
-                let retryable = output.text.is_empty()
-                    && output.reasoning.is_empty()
-                    && retryable_stream_message(&message);
-                return Err(InferenceAttemptError {
-                    message,
-                    retryable,
-                    retry_after: None,
-                });
+            match apply_codex_event(&event, &events, &mut output).await {
+                Ok(event_completed) => completed |= event_completed,
+                Err(message) => {
+                    let retryable = output.text.is_empty()
+                        && output.reasoning.is_empty()
+                        && retryable_stream_message(&message);
+                    return Err(InferenceAttemptError {
+                        message,
+                        retryable,
+                        retry_after: None,
+                    });
+                }
             }
         }
+    }
+    if !pending.is_empty() {
+        return Err(InferenceAttemptError::terminal(
+            "Codex stream ended in the middle of an event",
+        ));
+    }
+    if !completed {
+        return Err(InferenceAttemptError::terminal(
+            "Codex stream ended before a completion marker",
+        ));
     }
     Ok(output)
 }
@@ -1196,12 +1249,12 @@ async fn apply_codex_event(
     event: &Value,
     events: &mpsc::Sender<InferenceEvent>,
     output: &mut InferenceOutput,
-) -> Result<(), String> {
-    match event
+) -> Result<bool, String> {
+    let event_type = event
         .get("type")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-    {
+        .unwrap_or_default();
+    match event_type {
         "response.created" => {
             output.response_id = event
                 .pointer("/response/id")
@@ -1288,7 +1341,7 @@ async fn apply_codex_event(
         }
         _ => {}
     }
-    Ok(())
+    Ok(event_type == "response.completed")
 }
 
 fn codex_error_message(event: &Value, fallback: &str) -> String {
@@ -1625,6 +1678,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_native_streams_without_a_completion_marker() {
+        let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n";
+        let (base_url, server) = serve_once("text/event-stream", body).await;
+        let response = Client::new()
+            .get(base_url)
+            .send()
+            .await
+            .expect("mock stream response");
+        let (events, _receiver) = mpsc::channel(1);
+
+        let error = parse_codex_sse(response, events, CancellationToken::new())
+            .await
+            .expect_err("truncated stream must fail");
+        server.await.expect("mock server task");
+
+        assert!(error.message.contains("before a completion marker"));
+    }
+
+    #[tokio::test]
+    async fn rejects_native_streams_ending_mid_event() {
+        let (base_url, server) =
+            serve_once("text/event-stream", "data: {\"type\":\"response.created\"").await;
+        let response = Client::new()
+            .get(base_url)
+            .send()
+            .await
+            .expect("mock stream response");
+        let (events, _receiver) = mpsc::channel(1);
+
+        let error = parse_codex_sse(response, events, CancellationToken::new())
+            .await
+            .expect_err("partial event must fail");
+        server.await.expect("mock server task");
+
+        assert!(error.message.contains("middle of an event"));
+    }
+
+    #[tokio::test]
     async fn distinguishes_summary_updates_from_reasoning_trace_deltas() {
         let (events, mut receiver) = mpsc::channel(2);
         let mut output = InferenceOutput::default();
@@ -1846,7 +1937,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "read", "write", "edit", "bash", "glob", "grep", "eval", "ask", "todo"
+                "read", "write", "edit", "bash", "grep", "find", "ls", "eval", "ask", "todo"
             ]
         );
         assert!(!names.contains(&"task"));
@@ -1908,6 +1999,63 @@ mod tests {
 
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn session_options_apply_immediately_or_queue_behind_an_active_turn() {
+        let session = RuntimeSession::new("gpt-native".to_owned(), String::new());
+        let session_id = session.id.clone();
+        let mut sessions = HashMap::from([(session_id.clone(), session)]);
+        let mut pending = HashMap::new();
+        set_session_options(
+            &mut sessions,
+            &mut pending,
+            None,
+            None,
+            &session_id,
+            ModelOptions {
+                reasoning_effort: Some("high".to_owned()),
+                fast_mode: true,
+            },
+        )
+        .expect("apply options");
+        let configured = sessions.get(&session_id).expect("configured session");
+        assert_eq!(configured.reasoning_effort.as_deref(), Some("high"));
+        assert!(configured.fast_mode);
+
+        let active_session = sessions.remove(&session_id).expect("active session");
+        let active = ActiveTurn {
+            session_id: session_id.clone(),
+            turn_id: "turn-1".to_owned(),
+            cancellation: CancellationToken::new(),
+        };
+        set_session_options(
+            &mut sessions,
+            &mut pending,
+            Some(&active),
+            None,
+            &session_id,
+            ModelOptions {
+                reasoning_effort: Some("low".to_owned()),
+                fast_mode: false,
+            },
+        )
+        .expect("queue options");
+        assert_eq!(
+            pending
+                .get(&session_id)
+                .and_then(|options| options.reasoning_effort.as_deref()),
+            Some("low")
+        );
+        drop(active_session);
+    }
+
+    #[test]
+    fn fast_mode_requests_priority_service_tier() {
+        let mut request = test_request();
+        assert!(codex_request_body(&request).get("service_tier").is_none());
+        request.fast_mode = true;
+        assert_eq!(codex_request_body(&request)["service_tier"], "priority");
     }
 
     #[tokio::test]
@@ -2024,6 +2172,7 @@ mod tests {
             }],
             tools: Vec::new(),
             reasoning_effort: None,
+            fast_mode: false,
         }
     }
 }

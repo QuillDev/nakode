@@ -331,7 +331,7 @@ async fn run_supervisor(input: SupervisorInput) {
                     Ok(Some(line)) if line.trim().is_empty() => {}
                     Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
                         Ok(message) => {
-                            if process_message(
+                            if dispatch_acp_message(
                                 message,
                                 &mut stdin,
                                 &events,
@@ -521,12 +521,13 @@ async fn handle_command(
             )
             .await
         }
-        BackendCommand::Reload { session_id } => {
-            reload_models(session_id, stdin, events, workspace, runtime).await
-        }
-        BackendCommand::SetSessionModel { session_id, model } => {
-            set_session_model(session_id, model, stdin, events, runtime).await
-        }
+        BackendCommand::Reload {
+            provider_session_id,
+        } => reload_models(provider_session_id, stdin, events, workspace, runtime).await,
+        BackendCommand::SetSessionModel {
+            provider_session_id,
+            model,
+        } => set_session_model(provider_session_id, model, stdin, events, runtime).await,
         BackendCommand::ResumeSession {
             provider_session_id,
         } => resume_session(provider_session_id, stdin, events, workspace, runtime).await,
@@ -561,10 +562,13 @@ async fn handle_command(
                 .await;
             Ok(())
         }
-        BackendCommand::InterruptTurn { session_id, .. } => {
+        BackendCommand::InterruptTurn {
+            provider_session_id,
+            ..
+        } => {
             write_json(
                 stdin,
-                &notification("session/cancel", &json!({"sessionId": session_id})),
+                &notification("session/cancel", &json!({"sessionId": provider_session_id})),
             )
             .await?;
             let _ = events.send(BackendEvent::InterruptAccepted).await;
@@ -581,6 +585,7 @@ async fn handle_command(
             Ok(())
         }
         BackendCommand::ResolveApproval { .. }
+        | BackendCommand::SetSessionOptions { .. }
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::Shutdown => Ok(()),
     }
@@ -638,7 +643,7 @@ async fn start_turn_command(
     runtime: &mut AcpRuntime,
 ) -> std::io::Result<()> {
     let BackendCommand::StartTurn {
-        session_id,
+        provider_session_id,
         client_id,
         prompt,
         attachments,
@@ -648,7 +653,7 @@ async fn start_turn_command(
         unreachable!("start_turn_command requires a start-turn command")
     };
     start_turn(
-        session_id,
+        provider_session_id,
         client_id,
         prompt,
         attachments,
@@ -797,7 +802,7 @@ async fn resume_session(
     .await
 }
 
-async fn process_method(
+async fn handle_acp_method(
     message: &Value,
     stdin: &mut ChildStdin,
     events: &mpsc::Sender<BackendEvent>,
@@ -825,7 +830,7 @@ async fn process_method(
     Ok(())
 }
 
-async fn init(
+async fn handle_acp_initialize_response(
     result: &Value,
     events: &mpsc::Sender<BackendEvent>,
     capabilities: &mut AcpCapabilities,
@@ -1046,14 +1051,14 @@ async fn handle_completed_turn(
         .map_err(|_| ())
 }
 
-async fn process_message(
+async fn dispatch_acp_message(
     message: Value,
     stdin: &mut ChildStdin,
     events: &mpsc::Sender<BackendEvent>,
     runtime: &mut AcpRuntime,
 ) -> Result<(), ()> {
     if message.get("method").and_then(Value::as_str).is_some() {
-        return process_method(&message, stdin, events, runtime).await;
+        return handle_acp_method(&message, stdin, events, runtime).await;
     }
     let AcpRuntime {
         pending,
@@ -1095,7 +1100,9 @@ async fn process_message(
     }
     let result = message.get("result").cloned().unwrap_or(Value::Null);
     match request.kind {
-        PendingKind::Initialize => init(&result, events, capabilities, initialized).await?,
+        PendingKind::Initialize => {
+            handle_acp_initialize_response(&result, events, capabilities, initialized).await?;
+        }
         PendingKind::StartSession { requested_model } => {
             handle_started_session(
                 requested_model,

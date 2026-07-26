@@ -1023,6 +1023,7 @@ fn active_modal(state: &AppState) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn effect_view(effect: &Effect) -> Value {
     match effect {
         Effect::Backend(command) => backend_command_view(command),
@@ -1091,6 +1092,17 @@ fn effect_view(effect: &Effect) -> Value {
         Effect::SetDefaultModel { provider, model } => {
             json!({"type": "set_default_model", "provider": provider, "model": model})
         }
+        Effect::SaveModelOptions {
+            provider,
+            model,
+            options,
+        } => json!({
+            "type": "save_model_options",
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": options.reasoning_effort,
+            "fast_mode": options.fast_mode
+        }),
         Effect::PersistSubagent(record) => {
             json!({"type": "persist_subagent", "id": record.id})
         }
@@ -1140,54 +1152,68 @@ fn backend_command_view(command: &BackendCommand) -> Value {
             "provider_session_id": provider_session_id
         }),
         BackendCommand::StartTurn {
-            session_id,
+            provider_session_id,
             client_id,
             prompt,
             attachments,
             model,
         } => json!({
             "type": "backend:start_turn",
-            "provider_session_id": session_id,
+            "provider_session_id": provider_session_id,
             "client_id": client_id,
             "prompt": prompt,
             "attachment_count": attachments.len(),
             "model": model
         }),
         BackendCommand::SteerTurn {
-            session_id,
+            provider_session_id,
             turn_id,
             prompt,
             ..
         } => json!({
             "type": "backend:steer_turn",
-            "provider_session_id": session_id,
+            "provider_session_id": provider_session_id,
             "turn_id": turn_id,
             "prompt": prompt
         }),
         BackendCommand::InterruptTurn {
-            session_id,
+            provider_session_id,
             turn_id,
         } => json!({
             "type": "backend:interrupt_turn",
-            "provider_session_id": session_id,
+            "provider_session_id": provider_session_id,
             "turn_id": turn_id
         }),
         BackendCommand::CompactSession {
-            session_id,
+            provider_session_id,
             compaction_id,
         } => json!({
             "type": "backend:compact_session",
-            "provider_session_id": session_id,
+            "provider_session_id": provider_session_id,
             "compaction_id": compaction_id
         }),
-        BackendCommand::SetSessionModel { session_id, model } => json!({
+        BackendCommand::SetSessionModel {
+            provider_session_id,
+            model,
+        } => json!({
             "type": "backend:set_session_model",
-            "provider_session_id": session_id,
+            "provider_session_id": provider_session_id,
             "model": model
         }),
-        BackendCommand::Reload { session_id } => json!({
+        BackendCommand::SetSessionOptions {
+            provider_session_id,
+            options,
+        } => json!({
+            "type": "backend:set_session_options",
+            "provider_session_id": provider_session_id,
+            "reasoning_effort": options.reasoning_effort,
+            "fast_mode": options.fast_mode
+        }),
+        BackendCommand::Reload {
+            provider_session_id,
+        } => json!({
             "type": "backend:reload",
-            "provider_session_id": session_id
+            "provider_session_id": provider_session_id
         }),
         BackendCommand::ResolveApproval { id, decision } => json!({
             "type": "backend:resolve_approval",

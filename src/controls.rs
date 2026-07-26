@@ -367,6 +367,8 @@ const KEY_CONTROLS: &[KeyControl] = &[
     control!(ModelPicker, Close, KeyCode::Esc, Any),
     control!(ModelPicker, Previous, KeyCode::Up, Any),
     control!(ModelPicker, Next, KeyCode::Down, Any),
+    control!(ModelPicker, MoveLeft, KeyCode::Left, Any),
+    control!(ModelPicker, MoveRight, KeyCode::Right, Any),
     control!(ModelPicker, Backspace, KeyCode::Backspace, Any),
     control!(ModelPicker, Clear, KeyCode::Char('u'), Control),
     control!(ProviderList, Close, KeyCode::Esc, Any),

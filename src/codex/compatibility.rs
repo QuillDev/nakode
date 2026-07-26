@@ -228,7 +228,7 @@ async fn run_supervisor(input: SupervisorInput) {
                     Ok(Some(line)) => {
                         match parse_message(&line) {
                             Ok(message) => {
-                                if process_message(
+                                if dispatch_codex_rpc_message(
                                     message,
                                     &mut stdin,
                                     &events,
@@ -388,6 +388,7 @@ fn requires_initialization(command: &BackendCommand) -> bool {
             | BackendCommand::InterruptTurn { .. }
             | BackendCommand::Reload { .. }
             | BackendCommand::SetSessionModel { .. }
+            | BackendCommand::SetSessionOptions { .. }
     )
 }
 
@@ -413,6 +414,7 @@ async fn handle_command(
     }
     match command {
         BackendCommand::SetSessionModel { .. }
+        | BackendCommand::SetSessionOptions { .. }
         | BackendCommand::ResolveApproval { .. }
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::Shutdown => return Ok(()),
@@ -461,7 +463,7 @@ fn command_request(
             json!({"threadId": provider_session_id}),
         ),
         BackendCommand::StartTurn {
-            session_id,
+            provider_session_id,
             client_id,
             prompt,
             attachments,
@@ -471,7 +473,7 @@ fn command_request(
             "turn/start",
             with_optional_model(
                 json!({
-                    "threadId": session_id,
+                    "threadId": provider_session_id,
                     "clientUserMessageId": client_id,
                     "input": codex_turn_input(&prompt, attachments),
                 }),
@@ -479,7 +481,7 @@ fn command_request(
             ),
         ),
         BackendCommand::SteerTurn {
-            session_id,
+            provider_session_id,
             turn_id,
             client_id,
             prompt,
@@ -487,7 +489,7 @@ fn command_request(
             BackendOperation::SteerTurn,
             "turn/steer",
             json!({
-                "threadId": session_id,
+                "threadId": provider_session_id,
                 "expectedTurnId": turn_id,
                 "clientUserMessageId": client_id,
                 "input": [{
@@ -498,12 +500,12 @@ fn command_request(
             }),
         ),
         BackendCommand::InterruptTurn {
-            session_id,
+            provider_session_id,
             turn_id,
         } => (
             BackendOperation::InterruptTurn,
             "turn/interrupt",
-            json!({"threadId": session_id, "turnId": turn_id}),
+            json!({"threadId": provider_session_id, "turnId": turn_id}),
         ),
         BackendCommand::BeginAuthentication => (
             BackendOperation::Authenticate,
@@ -511,6 +513,7 @@ fn command_request(
             json!({"type": "chatgptDeviceCode"}),
         ),
         BackendCommand::SetSessionModel { .. }
+        | BackendCommand::SetSessionOptions { .. }
         | BackendCommand::CompactSession { .. }
         | BackendCommand::ResolveApproval { .. }
         | BackendCommand::ResolveQuestion { .. }
@@ -541,7 +544,7 @@ fn codex_turn_input(
     input
 }
 
-async fn process_message(
+async fn dispatch_codex_rpc_message(
     message: RpcMessage,
     stdin: &mut ChildStdin,
     events: &mpsc::Sender<BackendEvent>,
@@ -550,7 +553,7 @@ async fn process_message(
     initialized: &mut bool,
 ) -> Result<(), ()> {
     if let Some(method) = message.method {
-        process_incoming_method(
+        handle_codex_server_method(
             &method,
             message.params.unwrap_or(Value::Null),
             message.id,
@@ -593,7 +596,7 @@ async fn process_message(
     }
 
     let result = message.result.unwrap_or(Value::Null);
-    process_response(
+    handle_codex_rpc_response(
         request.operation,
         result,
         stdin,
@@ -605,7 +608,7 @@ async fn process_message(
     .await
 }
 
-async fn process_incoming_method(
+async fn handle_codex_server_method(
     method: &str,
     params: Value,
     id: Option<Value>,
@@ -668,7 +671,7 @@ fn authentication_completed_event(params: &Value) -> BackendEvent {
     }
 }
 
-async fn process_response(
+async fn handle_codex_rpc_response(
     operation: BackendOperation,
     result: Value,
     stdin: &mut ChildStdin,
