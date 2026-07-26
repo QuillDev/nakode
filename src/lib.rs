@@ -5,7 +5,7 @@ pub mod clipboard;
 pub mod codex;
 pub mod commands;
 pub mod config;
-pub mod control;
+pub mod control_service;
 pub mod controls;
 pub mod credential;
 pub mod cursor;

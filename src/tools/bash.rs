@@ -8,7 +8,6 @@ use tokio_util::sync::CancellationToken;
 use super::{
     Tool, ToolContext, ToolFuture, ToolResult,
     hypa::{RewriteDecision, rewrite_command},
-    optional_u64,
     process::{ProcessRequest, ProcessResult, run_process},
     required_string, resolve_workspace_path,
 };
@@ -20,15 +19,15 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash",
-            description: "Run a command or short pipeline with merged output. When Hypa is installed, eligible non-PTY commands are automatically rewritten for deterministic output compression. Use cwd instead of cd, env for values needing shell escaping, and pty only for real terminal semantics. Use grep/glob/read instead of shell search or directory listing.",
+            description: "Execute a shell command in the workspace and return stdout and stderr. Use read, grep, find, and ls for file exploration. Commands have no deadline unless timeout is supplied.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string"},
+                    "command": {"type": "string", "description": "Shell command to execute"},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}},
-                    "timeout": {"type": "number", "minimum": 0, "maximum": 3600, "description": "Seconds; 0 disables the deadline"},
-                    "cwd": {"type": "string", "description": "Working directory"},
-                    "pty": {"type": "boolean", "description": "Run with terminal semantics"}
+                    "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600, "description": "Optional timeout in seconds"},
+                    "cwd": {"type": "string", "description": "Workspace-relative working directory"},
+                    "pty": {"type": "boolean", "description": "Use terminal semantics; defaults to false"}
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -68,8 +67,16 @@ async fn run_shell(
     cancellation: &CancellationToken,
 ) -> Result<ToolResult, String> {
     let requested_command = required_string(arguments, "command")?;
-    let requested_timeout = optional_u64(arguments, "timeout", 120)?.min(3_600);
-    let timeout = (requested_timeout > 0).then(|| Duration::from_secs(requested_timeout));
+    let requested_timeout = arguments
+        .get("timeout")
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|seconds| seconds.is_finite() && *seconds > 0.0 && *seconds <= 3_600.0)
+                .ok_or_else(|| "bash timeout must be between 0 and 3600 seconds".to_owned())
+        })
+        .transpose()?;
+    let timeout = requested_timeout.map(Duration::from_secs_f64);
     let run_directory = arguments.get("cwd").and_then(Value::as_str).map_or_else(
         || Ok(workspace.to_path_buf()),
         |path| resolve_workspace_path(workspace, path),
@@ -124,15 +131,22 @@ async fn run_shell(
         .await?
     };
     if result.success {
-        return Ok(ToolResult::success(result.output));
+        return Ok(ToolResult::success(if result.output.is_empty() {
+            "(no output)".to_owned()
+        } else {
+            result.output
+        }));
     }
     let reason = if result.interrupted {
         "command interrupted".to_owned()
     } else if result.timed_out {
-        format!("command timed out after {requested_timeout} seconds")
+        format!(
+            "Command timed out after {} seconds",
+            requested_timeout.unwrap_or_default()
+        )
     } else {
         format!(
-            "command exited with {}",
+            "Command exited with code {}",
             result
                 .exit_code
                 .map_or_else(|| "unknown status".to_owned(), |code| code.to_string())

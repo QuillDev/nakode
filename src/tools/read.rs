@@ -1,11 +1,16 @@
+use std::fmt::Write;
+
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Tool, ToolConcurrency, ToolContext, ToolFuture, ToolResult, required_string,
-    resolve_workspace_path, truncate_output,
+    Tool, ToolConcurrency, ToolContext, ToolFuture, ToolResult, optional_u64,
+    resolve_workspace_path,
+    truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, truncate_head},
 };
 use crate::runtime::ToolDefinition;
+
+const MAX_FILE_READ_BYTES: u64 = 8 * 1024 * 1024;
 
 pub struct ReadTool;
 
@@ -13,11 +18,24 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read",
-            description: "Read local files and directories through one path or a semicolon-delimited list. Append :N, :N-M, :N+K, :N-, comma-separated ranges, or :raw to select file content. Parallelize independent reads and re-read only the ranges named by a truncation notice.",
+            description: "Read one UTF-8 text file. Output is limited to 2000 lines or 50 KB. Use offset and limit for large files, and issue parallel read calls for independent files or ranges.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Local path, optional inline selector, or semicolon-delimited list"}
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative path to the file"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "First line to read, one-indexed; defaults to 1"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum lines to read"
+                    }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -26,11 +44,21 @@ impl Tool for ReadTool {
     }
 
     fn summarize(&self, arguments: &Value) -> String {
-        arguments
+        let path = arguments
             .get("path")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
+            .unwrap_or_default();
+        match (
+            arguments.get("offset").and_then(Value::as_u64),
+            arguments.get("limit").and_then(Value::as_u64),
+        ) {
+            (None, None) => path.to_owned(),
+            (offset, limit) => format!(
+                "{path}:{}+{}",
+                offset.unwrap_or(1),
+                limit.map_or_else(|| "all".to_owned(), |limit| limit.to_string())
+            ),
+        }
     }
 
     fn concurrency(&self) -> ToolConcurrency {
@@ -47,11 +75,7 @@ impl Tool for ReadTool {
             if cancellation.is_cancelled() {
                 return ToolResult::failure("read interrupted");
             }
-            let result = match required_string(&arguments, "path") {
-                Ok(supplied) => read_targets(context.workspace, supplied).await,
-                Err(error) => Err(error),
-            };
-            match result {
+            match read_file(context.workspace, &arguments, cancellation).await {
                 Ok(output) => ToolResult::success(output),
                 Err(error) => ToolResult::failure(error),
             }
@@ -59,238 +83,139 @@ impl Tool for ReadTool {
     }
 }
 
-async fn read_targets(workspace: &std::path::Path, supplied: &str) -> Result<String, String> {
-    let targets = supplied
-        .split(';')
-        .map(str::trim)
-        .filter(|target| !target.is_empty())
-        .collect::<Vec<_>>();
-    if targets.is_empty() {
-        return Err("read path must contain at least one target".to_owned());
-    }
-    if targets.len() == 1 {
-        return read_target(workspace, targets[0]).await;
-    }
-    let results =
-        futures_util::future::join_all(targets.iter().map(|target| read_target(workspace, target)))
-            .await;
-    let mut rendered = Vec::with_capacity(results.len());
-    for (target, result) in targets.into_iter().zip(results) {
-        rendered.push(format!("# {target}\n{}", result?));
-    }
-    Ok(truncate_output(rendered.join("\n\n").into_bytes()))
-}
-
-const MAX_FILE_READ_BYTES: u64 = 8 * 1024 * 1024;
-
-async fn read_target(workspace: &std::path::Path, supplied: &str) -> Result<String, String> {
-    let (path, selector) = resolve_read_target(workspace, supplied).await?;
+async fn read_file(
+    workspace: &std::path::Path,
+    arguments: &Value,
+    cancellation: &CancellationToken,
+) -> Result<String, String> {
+    let supplied = super::required_string(arguments, "path")?;
+    let path = resolve_workspace_path(workspace, supplied)?;
     let metadata = tokio::fs::metadata(&path)
         .await
-        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        .map_err(|error| format!("could not read {supplied}: {error}"))?;
     if metadata.is_dir() {
-        return list_directory(&path).await;
+        return Err(format!("{supplied} is a directory; use ls to list it"));
     }
     if metadata.len() > MAX_FILE_READ_BYTES {
         return Err(format!(
-            "{} is {} bytes; read is limited to {MAX_FILE_READ_BYTES} bytes",
-            path.display(),
+            "{supplied} is {} bytes; read is limited to {MAX_FILE_READ_BYTES} bytes",
             metadata.len()
         ));
     }
     let contents = tokio::fs::read(&path)
         .await
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        .map_err(|error| format!("could not read {supplied}: {error}"))?;
+    if cancellation.is_cancelled() {
+        return Err("read interrupted".to_owned());
+    }
     if contents.contains(&0) {
-        return Err(format!("{} appears to be binary", path.display()));
-    }
-    let text = String::from_utf8(contents)
-        .map_err(|_| format!("{} is not valid UTF-8", path.display()))?;
-    Ok(render_text(&text, selector))
-}
-
-const DEFAULT_MAX_LINES: usize = 400;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ReadSelector {
-    Default,
-    Raw,
-    Ranges(Vec<(usize, Option<usize>)>),
-}
-
-async fn resolve_read_target(
-    workspace: &std::path::Path,
-    supplied: &str,
-) -> Result<(std::path::PathBuf, ReadSelector), String> {
-    let literal = resolve_workspace_path(workspace, supplied)?;
-    if tokio::fs::metadata(&literal).await.is_ok() {
-        return Ok((literal, ReadSelector::Default));
-    }
-    let Some((path, selector)) = supplied.rsplit_once(':') else {
-        return Ok((literal, ReadSelector::Default));
-    };
-    let selector = parse_selector(selector)?;
-    Ok((resolve_workspace_path(workspace, path)?, selector))
-}
-
-fn parse_selector(input: &str) -> Result<ReadSelector, String> {
-    if input.eq_ignore_ascii_case("raw") {
-        return Ok(ReadSelector::Raw);
-    }
-    let ranges = input
-        .split(',')
-        .map(parse_range)
-        .collect::<Result<Vec<_>, _>>()?;
-    if ranges.is_empty() {
-        return Err("read selector must not be empty".to_owned());
-    }
-    Ok(ReadSelector::Ranges(ranges))
-}
-
-fn parse_range(input: &str) -> Result<(usize, Option<usize>), String> {
-    let input = input.strip_prefix(['L', 'l']).unwrap_or(input);
-    if let Some((start, count)) = input.split_once('+') {
-        let start = parse_line_number(start)?;
-        let count = parse_line_number(count)?;
-        return Ok((start, Some(start.saturating_add(count).saturating_sub(1))));
-    }
-    if let Some((start, end)) = input.split_once(['-', '.']) {
-        let start = parse_line_number(start)?;
-        if end.is_empty() || end == "." {
-            return Ok((start, None));
-        }
-        let end = end.strip_prefix('.').unwrap_or(end);
-        let end = parse_line_number(end)?;
-        if end < start {
-            return Err(format!("invalid read range {input}: end precedes start"));
-        }
-        return Ok((start, Some(end)));
-    }
-    Ok((parse_line_number(input)?, None))
-}
-
-fn parse_line_number(input: &str) -> Result<usize, String> {
-    input
-        .parse::<usize>()
-        .ok()
-        .filter(|line| *line > 0)
-        .ok_or_else(|| format!("invalid read line selector {input}"))
-}
-
-fn render_text(text: &str, selector: ReadSelector) -> String {
-    if selector == ReadSelector::Raw {
-        return truncate_output(text.as_bytes().to_vec());
-    }
-    let lines = text.lines().collect::<Vec<_>>();
-    let is_default = selector == ReadSelector::Default;
-    let ranges = match selector {
-        ReadSelector::Default => vec![(1, Some(DEFAULT_MAX_LINES))],
-        ReadSelector::Ranges(ranges) => ranges,
-        ReadSelector::Raw => unreachable!("raw reads return before range rendering"),
-    };
-    let mut output = Vec::new();
-    for (start, end) in ranges {
-        let end = end.unwrap_or(lines.len()).min(lines.len());
-        for line_number in start..=end {
-            if let Some(line) = lines.get(line_number.saturating_sub(1)) {
-                output.push(format!("{line_number}|{line}"));
-            }
-        }
-    }
-    if is_default && lines.len() > DEFAULT_MAX_LINES {
-        output.push(format!(
-            "[Showing lines 1-{DEFAULT_MAX_LINES} of {}. Read the next range with path:{}-{}.]",
-            lines.len(),
-            DEFAULT_MAX_LINES + 1,
-            (DEFAULT_MAX_LINES * 2).min(lines.len())
+        return Err(format!(
+            "{supplied} appears to be binary; use vision for supported images"
         ));
     }
-    truncate_output(output.join("\n").into_bytes())
-}
-
-async fn list_directory(path: &std::path::Path) -> Result<String, String> {
-    let mut directory = tokio::fs::read_dir(path)
-        .await
-        .map_err(|error| format!("failed to list {}: {error}", path.display()))?;
-    let mut entries = Vec::new();
-    while let Some(entry) = directory
-        .next_entry()
-        .await
-        .map_err(|error| format!("failed to list {}: {error}", path.display()))?
-    {
-        let file_type = entry
-            .file_type()
-            .await
-            .map_err(|error| format!("failed to inspect {}: {error}", entry.path().display()))?;
-        let suffix = if file_type.is_dir() { "/" } else { "" };
-        entries.push(format!("{}{suffix}", entry.file_name().to_string_lossy()));
+    let text = String::from_utf8(contents).map_err(|_| format!("{supplied} is not valid UTF-8"))?;
+    let lines = text.split('\n').collect::<Vec<_>>();
+    let total_lines = lines.len();
+    let offset = usize::try_from(optional_u64(arguments, "offset", 1)?)
+        .unwrap_or(1)
+        .max(1);
+    if offset > total_lines {
+        return Err(format!(
+            "offset {offset} is beyond the end of {supplied} ({total_lines} lines)"
+        ));
     }
-    entries.sort_unstable();
-    Ok(truncate_output(entries.join("\n").into_bytes()))
+    let start = offset - 1;
+    let requested_limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|limit| usize::try_from(limit).ok());
+    let end = requested_limit.map_or(total_lines, |limit| {
+        start.saturating_add(limit).min(total_lines)
+    });
+    let selected = lines[start..end].join("\n");
+    let truncation = truncate_head(&selected, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    if truncation.first_line_exceeds_limit {
+        return Ok(format!(
+            "[Line {offset} exceeds the {DEFAULT_MAX_BYTES}-byte read limit. Use bash with a byte-bounded command to inspect it.]"
+        ));
+    }
+    let mut output = truncation.content;
+    let displayed_end = offset
+        .saturating_add(truncation.output_lines)
+        .saturating_sub(1);
+    if let Some(truncated_by) = truncation.truncated_by {
+        let reason = match truncated_by {
+            TruncatedBy::Lines => format!("{DEFAULT_MAX_LINES} line limit"),
+            TruncatedBy::Bytes => format!("{DEFAULT_MAX_BYTES}-byte limit"),
+        };
+        let _ = write!(
+            output,
+            "\n\n[Showing lines {offset}-{displayed_end} of {total_lines} ({reason}). Use offset={} to continue.]",
+            displayed_end + 1
+        );
+    } else if end < total_lines {
+        let _ = write!(
+            output,
+            "\n\n[{} more lines in file. Use offset={} to continue.]",
+            total_lines - end,
+            end + 1
+        );
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MAX_LINES, ReadSelector, parse_selector, read_targets, render_text};
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
 
-    #[test]
-    fn selectors_use_one_based_inclusive_omp_forms() {
-        assert_eq!(
-            parse_selector("3").expect("open range"),
-            ReadSelector::Ranges(vec![(3, None)])
-        );
-        assert_eq!(
-            parse_selector("2-4,8+2").expect("range list"),
-            ReadSelector::Ranges(vec![(2, Some(4)), (8, Some(9))])
-        );
-        assert_eq!(
-            render_text(
-                "one\ntwo\nthree\nfour",
-                parse_selector("2-3").expect("selector")
-            ),
-            "2|two\n3|three"
-        );
-    }
+    #[tokio::test]
+    async fn reads_a_typed_line_window_without_line_prefixes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("file.txt"), "one\ntwo\nthree\nfour")
+            .expect("fixture");
 
-    #[test]
-    fn default_reads_are_bounded_to_four_hundred_lines() {
-        let text = (1..=500)
-            .map(|line| format!("line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let rendered = render_text(&text, ReadSelector::Default);
+        let output = super::read_file(
+            workspace.path(),
+            &json!({"path": "file.txt", "offset": 2, "limit": 2}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("read");
 
-        assert_eq!(DEFAULT_MAX_LINES, 400);
-        assert!(rendered.contains("400|line 400"));
-        assert!(!rendered.contains("401|line 401"));
-        assert!(rendered.contains("Showing lines 1-400 of 500"));
+        assert_eq!(
+            output,
+            "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]"
+        );
     }
 
     #[tokio::test]
-    async fn oversized_files_are_rejected_before_loading() {
-        let directory = tempfile::tempdir().expect("workspace");
-        let path = directory.path().join("large.txt");
-        let file = std::fs::File::create(&path).expect("large fixture");
-        file.set_len(super::MAX_FILE_READ_BYTES + 1)
-            .expect("size fixture");
+    async fn directories_point_to_ls() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let error = super::read_file(
+            workspace.path(),
+            &json!({"path": "."}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("directory read");
 
-        let error = read_targets(directory.path(), "large.txt")
-            .await
-            .expect_err("oversized file must fail");
-        assert!(error.contains("read is limited"));
+        assert!(error.contains("use ls"));
     }
 
     #[tokio::test]
-    async fn semicolon_delimited_reads_return_each_named_target() {
-        let directory = tempfile::tempdir().expect("workspace");
-        std::fs::write(directory.path().join("one.txt"), "one\n").expect("write one");
-        std::fs::write(directory.path().join("two.txt"), "two\n").expect("write two");
+    async fn offset_past_the_end_is_explicit() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("file.txt"), "one").expect("fixture");
 
-        let output = read_targets(directory.path(), "one.txt;two.txt")
-            .await
-            .expect("multi read");
+        let error = super::read_file(
+            workspace.path(),
+            &json!({"path": "file.txt", "offset": 2}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("invalid offset");
 
-        assert!(output.contains("# one.txt\n1|one"));
-        assert!(output.contains("# two.txt\n1|two"));
+        assert!(error.contains("beyond the end"));
     }
 }

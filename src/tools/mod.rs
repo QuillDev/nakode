@@ -3,12 +3,14 @@ mod bash;
 mod browser;
 mod edit;
 mod eval;
-mod glob;
+mod find;
 mod grep;
 mod hypa;
+mod ls;
 mod process;
 mod read;
 mod todo;
+mod truncate;
 mod vision;
 mod write;
 
@@ -24,7 +26,7 @@ use crate::{
 };
 
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
-pub const MAX_MODEL_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
+pub const MAX_MODEL_TOOL_OUTPUT_BYTES: usize = truncate::DEFAULT_MAX_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolConcurrency {
@@ -69,6 +71,9 @@ impl ToolResult {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     fn summarize(&self, arguments: &Value) -> String;
+    fn prepare_arguments(&self, arguments: Value) -> Value {
+        arguments
+    }
     fn available(&self) -> bool {
         true
     }
@@ -97,8 +102,9 @@ impl ToolRegistry {
                 Arc::new(write::WriteTool),
                 Arc::new(edit::EditTool),
                 Arc::new(bash::BashTool),
-                Arc::new(glob::GlobTool),
                 Arc::new(grep::GrepTool),
+                Arc::new(find::FindTool),
+                Arc::new(ls::LsTool),
                 Arc::new(eval::EvalTool::default()),
                 Arc::new(ask::AskTool),
                 Arc::new(todo::TodoTool),
@@ -143,6 +149,202 @@ impl ToolRegistry {
     pub(crate) fn testing(tools: Vec<Arc<dyn Tool>>) -> Self {
         Self { tools }
     }
+}
+
+pub(crate) fn prepare_and_validate(tool: &dyn Tool, arguments: Value) -> Result<Value, String> {
+    let mut arguments = tool.prepare_arguments(arguments);
+    let definition = tool.definition();
+    coerce_schema(&definition.parameters, &mut arguments);
+    validate_schema(&definition.parameters, &arguments, "arguments")
+        .map_err(|error| format!("invalid {} arguments: {error}", definition.name))?;
+    Ok(arguments)
+}
+
+fn coerce_schema(schema: &Value, value: &mut Value) {
+    if let Value::String(string) = value {
+        if schema_accepts(schema, "integer")
+            && let Ok(integer) = string.parse::<i64>()
+        {
+            *value = Value::from(integer);
+        } else if schema_accepts(schema, "number")
+            && let Ok(number) = string.parse::<f64>()
+            && let Some(number) = serde_json::Number::from_f64(number)
+        {
+            *value = Value::Number(number);
+        } else if schema_accepts(schema, "boolean")
+            && let Ok(boolean) = string.parse::<bool>()
+        {
+            *value = Value::Bool(boolean);
+        }
+    }
+    match value {
+        Value::Object(object) => {
+            let properties = schema.get("properties").and_then(Value::as_object);
+            for (name, value) in object {
+                let child_schema = properties
+                    .and_then(|properties| properties.get(name))
+                    .or_else(|| {
+                        schema
+                            .get("additionalProperties")
+                            .filter(|schema| schema.is_object())
+                    });
+                if let Some(child_schema) = child_schema {
+                    coerce_schema(child_schema, value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            if let Some(item_schema) = schema.get("items") {
+                for item in items {
+                    coerce_schema(item_schema, item);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn schema_accepts(schema: &Value, expected: &str) -> bool {
+    match schema.get("type") {
+        Some(Value::String(kind)) => kind == expected,
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
+fn validate_schema(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        return Err(format!(
+            "{path} must be one of {}",
+            Value::Array(allowed.clone())
+        ));
+    }
+    if let Some(types) = schema.get("type") {
+        let matches = match types {
+            Value::String(kind) => matches_type(kind, value),
+            Value::Array(kinds) => kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|kind| matches_type(kind, value)),
+            _ => true,
+        };
+        if !matches {
+            return Err(format!("{path} has the wrong type"));
+        }
+    }
+    match value {
+        Value::Object(object) => validate_object(schema, object, path)?,
+        Value::Array(items) => validate_array(schema, items, path)?,
+        Value::String(string) => validate_string(schema, string, path)?,
+        Value::Number(number) => validate_number(schema, number, path)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_string(schema: &Value, string: &str, path: &str) -> Result<(), String> {
+    if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
+        && string.chars().count() < usize::try_from(minimum).unwrap_or(usize::MAX)
+    {
+        return Err(format!(
+            "{path} must contain at least {minimum} character(s)"
+        ));
+    }
+    if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
+        && string.chars().count() > usize::try_from(maximum).unwrap_or(usize::MAX)
+    {
+        return Err(format!(
+            "{path} must contain at most {maximum} character(s)"
+        ));
+    }
+    Ok(())
+}
+
+fn matches_type(kind: &str, value: &Value) -> bool {
+    match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+fn validate_object(
+    schema: &Value,
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<(), String> {
+    let properties = schema.get("properties").and_then(Value::as_object);
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for name in required.iter().filter_map(Value::as_str) {
+            if !object.contains_key(name) {
+                return Err(format!("{path}.{name} is required"));
+            }
+        }
+    }
+    for (name, value) in object {
+        if let Some(property) = properties.and_then(|properties| properties.get(name)) {
+            validate_schema(property, value, &format!("{path}.{name}"))?;
+            continue;
+        }
+        match schema.get("additionalProperties") {
+            Some(Value::Bool(false)) => {
+                return Err(format!("{path}.{name} is not allowed"));
+            }
+            Some(additional @ Value::Object(_)) => {
+                validate_schema(additional, value, &format!("{path}.{name}"))?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_array(schema: &Value, items: &[Value], path: &str) -> Result<(), String> {
+    if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64)
+        && items.len() < usize::try_from(minimum).unwrap_or(usize::MAX)
+    {
+        return Err(format!("{path} must contain at least {minimum} item(s)"));
+    }
+    if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64)
+        && items.len() > usize::try_from(maximum).unwrap_or(usize::MAX)
+    {
+        return Err(format!("{path} must contain at most {maximum} item(s)"));
+    }
+    if let Some(item_schema) = schema.get("items") {
+        for (index, value) in items.iter().enumerate() {
+            validate_schema(item_schema, value, &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_number(schema: &Value, number: &serde_json::Number, path: &str) -> Result<(), String> {
+    let Some(number) = number.as_f64() else {
+        return Err(format!("{path} is not a finite number"));
+    };
+    if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
+        && number < minimum
+    {
+        return Err(format!("{path} must be at least {minimum}"));
+    }
+    if let Some(minimum) = schema.get("exclusiveMinimum").and_then(Value::as_f64)
+        && number <= minimum
+    {
+        return Err(format!("{path} must be greater than {minimum}"));
+    }
+    if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
+        && number > maximum
+    {
+        return Err(format!("{path} must be at most {maximum}"));
+    }
+    Ok(())
 }
 
 /// Reads a required, non-empty string argument.
@@ -288,7 +490,7 @@ mod tests {
 
     use super::{
         MAX_MODEL_TOOL_OUTPUT_BYTES, ToolContext, ToolRegistry, ToolResult, model_facing_output,
-        resolve_workspace_path,
+        prepare_and_validate, resolve_workspace_path,
     };
     use crate::{
         runtime::{QuestionBroker, RuntimeSession},
@@ -327,13 +529,13 @@ mod tests {
         assert_eq!(
             names,
             [
-                "read", "write", "edit", "bash", "glob", "grep", "eval", "ask", "todo"
+                "read", "write", "edit", "bash", "grep", "find", "ls", "eval", "ask", "todo"
             ]
         );
     }
 
     #[test]
-    fn base_tool_schemas_follow_the_omp_agent_facing_contracts() {
+    fn base_tool_schemas_use_simple_typed_agent_facing_contracts() {
         let definitions = ToolRegistry::base().definitions();
         let properties = |name: &str| {
             definitions
@@ -344,24 +546,50 @@ mod tests {
                 .expect("tool properties")
         };
 
-        assert_eq!(properties("read"), ["path"]);
+        assert_eq!(properties("read"), ["limit", "offset", "path"]);
         assert_eq!(properties("write"), ["content", "path"]);
         assert_eq!(properties("edit"), ["edits", "path"]);
         assert_eq!(
             properties("bash"),
             ["command", "cwd", "env", "pty", "timeout"]
         );
-        assert_eq!(properties("glob"), ["gitignore", "hidden", "limit", "path"]);
         assert_eq!(
             properties("grep"),
-            ["case", "gitignore", "path", "pattern", "skip"]
+            [
+                "context",
+                "glob",
+                "ignoreCase",
+                "limit",
+                "literal",
+                "path",
+                "pattern"
+            ]
         );
+        assert_eq!(properties("find"), ["limit", "path", "pattern"]);
+        assert_eq!(properties("ls"), ["limit", "path"]);
         assert_eq!(
             properties("eval"),
             ["code", "language", "reset", "timeout", "title"]
         );
         assert_eq!(properties("ask"), ["questions"]);
         assert_eq!(properties("todo"), ["items", "list", "op", "phase", "task"]);
+    }
+
+    #[test]
+    fn tool_arguments_are_prepared_coerced_and_validated_centrally() {
+        let registry = ToolRegistry::base();
+        let find = registry.find("find").expect("find tool");
+        let prepared =
+            prepare_and_validate(find.as_ref(), json!({"pattern": "*.rs", "limit": "3"}))
+                .expect("coerced arguments");
+        assert_eq!(prepared["limit"], 3);
+
+        let error = prepare_and_validate(
+            find.as_ref(),
+            json!({"pattern": "*.rs", "unexpected": true}),
+        )
+        .expect_err("unknown argument");
+        assert!(error.contains("arguments.unexpected is not allowed"));
     }
 
     #[test]
@@ -434,9 +662,13 @@ mod tests {
         assert!(!edit.failed, "{}", edit.output);
 
         for (name, arguments, expected) in [
-            ("read", json!({"path": "nested/file.txt"}), "1|after"),
-            ("glob", json!({"path": "**/*.txt"}), "nested/file.txt"),
-            ("grep", json!({"pattern": "search me"}), "# nested/file.txt"),
+            ("read", json!({"path": "nested/file.txt"}), "after"),
+            ("find", json!({"pattern": "**/*.txt"}), "nested/file.txt"),
+            (
+                "grep",
+                json!({"pattern": "search me"}),
+                "nested/file.txt:2: search me",
+            ),
         ] {
             let result = harness.execute(name, arguments).await;
             assert!(!result.failed, "{}", result.output);
@@ -593,21 +825,23 @@ mod tests {
 
     impl ToolHarness<'_> {
         async fn execute(&mut self, name: &str, arguments: Value) -> ToolResult {
-            self.registry
-                .find(name)
-                .expect("registered tool")
-                .execute(
-                    ToolContext {
-                        workspace: self.workspace,
-                        session: &mut self.session,
-                        backend_events: &self.events,
-                        turn_id: "turn-1",
-                        questions: &self.questions,
-                    },
-                    arguments,
-                    &self.cancellation,
-                )
-                .await
+            let tool = self.registry.find(name).expect("registered tool").clone();
+            let arguments = match prepare_and_validate(tool.as_ref(), arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => return ToolResult::failure(error),
+            };
+            tool.execute(
+                ToolContext {
+                    workspace: self.workspace,
+                    session: &mut self.session,
+                    backend_events: &self.events,
+                    turn_id: "turn-1",
+                    questions: &self.questions,
+                },
+                arguments,
+                &self.cancellation,
+            )
+            .await
         }
     }
 }

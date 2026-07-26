@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -51,10 +52,10 @@ impl UsageTotals {
     }
 
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn cache_rate_percent(&self) -> Option<f64> {
         (self.reported_input_tokens > 0).then(|| {
-            self.reported_cached_input_tokens as f64 * 100.0 / self.reported_input_tokens as f64
+            u64_to_f64(self.reported_cached_input_tokens) * 100.0
+                / u64_to_f64(self.reported_input_tokens)
         })
     }
 
@@ -153,7 +154,6 @@ pub fn run(options: &DiagnosticsOptions) -> Result<String, DiagnosticsError> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn collect(
     database: &Path,
     options: &DiagnosticsOptions,
@@ -192,57 +192,10 @@ fn collect(
                 source,
             }
         })?;
-        let mut totals = UsageTotals::default();
-        let mut latest_activity_ms = 0_u64;
-
-        for metric in &session.telemetry.inference {
-            if metric.started_at_ms < since_ms {
-                continue;
-            }
-            latest_activity_ms = latest_activity_ms.max(metric.started_at_ms);
-            let metric_totals = inference_totals(metric);
-            totals.add(&metric_totals);
-            daily
-                .entry((day_number(metric.started_at_ms), provider.clone()))
-                .or_default()
-                .add(&metric_totals);
-        }
-        for metric in &session.telemetry.tools {
-            if metric.started_at_ms < since_ms {
-                continue;
-            }
-            latest_activity_ms = latest_activity_ms.max(metric.started_at_ms);
-            let metric_totals = tool_totals(metric);
-            totals.add(&metric_totals);
-            daily
-                .entry((day_number(metric.started_at_ms), provider.clone()))
-                .or_default()
-                .add(&metric_totals);
-            let tool = tools
-                .entry((provider.clone(), metric.name.clone()))
-                .or_insert_with(|| ToolUsage {
-                    provider: provider.clone(),
-                    tool: metric.name.clone(),
-                    calls: 0,
-                    failures: 0,
-                    full_output_bytes: 0,
-                    model_output_bytes: 0,
-                    duration_ms: 0,
-                });
-            tool.calls += 1;
-            tool.failures += u64::from(metric.failed);
-            tool.full_output_bytes += usize_to_u64(metric.output_bytes);
-            tool.model_output_bytes += usize_to_u64(metric.model_output_bytes);
-            tool.duration_ms += metric.duration_ms;
-        }
-        if latest_activity_ms > 0 {
-            sessions.push(SessionUsage {
-                session_id,
-                provider,
-                model: session.model,
-                latest_activity_ms,
-                totals,
-            });
+        if let Some(usage) = aggregate_session(
+            provider, session_id, session, since_ms, &mut daily, &mut tools,
+        ) {
+            sessions.push(usage);
         }
     }
 
@@ -294,6 +247,73 @@ fn collect(
     })
 }
 
+fn aggregate_session(
+    provider: String,
+    session_id: String,
+    session: RuntimeSession,
+    since_ms: u64,
+    daily: &mut BTreeMap<(i64, String), UsageTotals>,
+    tools: &mut BTreeMap<(String, String), ToolUsage>,
+) -> Option<SessionUsage> {
+    let mut totals = UsageTotals::default();
+    let mut latest_activity_ms = 0_u64;
+    for metric in &session.telemetry.inference {
+        if metric.started_at_ms < since_ms {
+            continue;
+        }
+        latest_activity_ms = latest_activity_ms.max(metric.started_at_ms);
+        let metric_totals = inference_totals(metric);
+        totals.add(&metric_totals);
+        daily
+            .entry((day_number(metric.started_at_ms), provider.clone()))
+            .or_default()
+            .add(&metric_totals);
+    }
+    for metric in &session.telemetry.tools {
+        if metric.started_at_ms < since_ms {
+            continue;
+        }
+        latest_activity_ms = latest_activity_ms.max(metric.started_at_ms);
+        let metric_totals = tool_totals(metric);
+        totals.add(&metric_totals);
+        daily
+            .entry((day_number(metric.started_at_ms), provider.clone()))
+            .or_default()
+            .add(&metric_totals);
+        add_tool_usage(tools, &provider, metric);
+    }
+    (latest_activity_ms > 0).then_some(SessionUsage {
+        session_id,
+        provider,
+        model: session.model,
+        latest_activity_ms,
+        totals,
+    })
+}
+
+fn add_tool_usage(
+    tools: &mut BTreeMap<(String, String), ToolUsage>,
+    provider: &str,
+    metric: &crate::runtime::ToolMetric,
+) {
+    let tool = tools
+        .entry((provider.to_owned(), metric.name.clone()))
+        .or_insert_with(|| ToolUsage {
+            provider: provider.to_owned(),
+            tool: metric.name.clone(),
+            calls: 0,
+            failures: 0,
+            full_output_bytes: 0,
+            model_output_bytes: 0,
+            duration_ms: 0,
+        });
+    tool.calls += 1;
+    tool.failures += u64::from(metric.failed);
+    tool.full_output_bytes += usize_to_u64(metric.output_bytes);
+    tool.model_output_bytes += usize_to_u64(metric.model_output_bytes);
+    tool.duration_ms += metric.duration_ms;
+}
+
 fn inference_totals(metric: &crate::runtime::InferenceMetric) -> UsageTotals {
     UsageTotals {
         inference_rounds: u64::from(metric.kind == InferenceKind::Turn),
@@ -324,15 +344,16 @@ fn tool_totals(metric: &crate::runtime::ToolMetric) -> UsageTotals {
     }
 }
 
-#[allow(clippy::format_push_string)]
 fn render_text(report: &DiagnosticsReport) -> String {
     let mut output = String::new();
-    output.push_str(&format!(
-        "Nakode diagnostics · last {} days · {} active / {} scanned sessions\n",
+    writeln!(
+        output,
+        "Nakode diagnostics · last {} days · {} active / {} scanned sessions",
         report.period_days, report.sessions_with_activity, report.sessions_scanned
-    ));
+    )
+    .expect("writing to a String cannot fail");
     if let Some(provider) = &report.provider_filter {
-        output.push_str(&format!("Provider: {provider}\n"));
+        writeln!(output, "Provider: {provider}").expect("writing to a String cannot fail");
     }
     output.push('\n');
     append_totals(&mut output, &report.totals);
@@ -342,8 +363,9 @@ fn render_text(report: &DiagnosticsReport) -> String {
         "date        provider          rounds       input      cached    uncached      output\n",
     );
     for day in &report.daily {
-        output.push_str(&format!(
-            "{:<10}  {:<16}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}\n",
+        writeln!(
+            output,
+            "{:<10}  {:<16}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}",
             day.date_utc,
             day.provider,
             day.totals.inference_rounds,
@@ -351,7 +373,8 @@ fn render_text(report: &DiagnosticsReport) -> String {
             compact_number(day.totals.reported_cached_input_tokens),
             compact_number(day.totals.reported_uncached_input_tokens()),
             compact_number(day.totals.reported_output_tokens),
-        ));
+        )
+        .expect("writing to a String cannot fail");
     }
 
     output.push_str("\nTools by model-facing output\n");
@@ -359,8 +382,9 @@ fn render_text(report: &DiagnosticsReport) -> String {
         "provider          tool             calls   failed   model out    full out   duration\n",
     );
     for tool in &report.tools {
-        output.push_str(&format!(
-            "{:<16}  {:<14}  {:>6}  {:>7}  {:>10}  {:>10}  {:>9}\n",
+        writeln!(
+            output,
+            "{:<16}  {:<14}  {:>6}  {:>7}  {:>10}  {:>10}  {:>9}",
             tool.provider,
             tool.tool,
             tool.calls,
@@ -368,14 +392,16 @@ fn render_text(report: &DiagnosticsReport) -> String {
             format_bytes(tool.model_output_bytes),
             format_bytes(tool.full_output_bytes),
             format_duration(tool.duration_ms),
-        ));
+        )
+        .expect("writing to a String cannot fail");
     }
 
     output.push_str("\nHighest-input sessions\n");
     output.push_str("session       provider          model                 rounds       input      cached    uncached   tools\n");
     for session in &report.sessions {
-        output.push_str(&format!(
-            "{:<12}  {:<16}  {:<20}  {:>6}  {:>10}  {:>10}  {:>10}  {:>6}\n",
+        writeln!(
+            output,
+            "{:<12}  {:<16}  {:<20}  {:>6}  {:>10}  {:>10}  {:>10}  {:>6}",
             short_id(&session.session_id),
             session.provider,
             truncate(&session.model, 20),
@@ -384,7 +410,8 @@ fn render_text(report: &DiagnosticsReport) -> String {
             compact_number(session.totals.reported_cached_input_tokens),
             compact_number(session.totals.reported_uncached_input_tokens()),
             session.totals.executed_tool_calls,
-        ));
+        )
+        .expect("writing to a String cannot fail");
     }
     output.push_str("\nPrivacy: prompts, reasoning, arguments, outputs, titles, and credentials are excluded.\n");
     output
@@ -392,12 +419,12 @@ fn render_text(report: &DiagnosticsReport) -> String {
     output
 }
 
-#[allow(clippy::format_push_string)]
 fn append_totals(output: &mut String, totals: &UsageTotals) {
     let cache_rate = totals
         .cache_rate_percent()
         .map_or_else(|| "not reported".to_owned(), |rate| format!("{rate:.2}%"));
-    output.push_str(&format!(
+    write!(
+        output,
         "Inference rounds: {} ({} compactions, {} failed, {} retries)\n\
 Reported tokens: {} input · {} cached · {} uncached · {} output · {cache_rate} cache rate\n\
 Tool calls: {} executed · {} failed · {} model-facing output · {} full output\n\
@@ -416,7 +443,8 @@ Runtime: {} inference · {} tools\n",
         format_bytes(totals.full_tool_output_bytes),
         format_duration(totals.inference_duration_ms),
         format_duration(totals.tool_duration_ms),
-    ));
+    )
+    .expect("writing to a String cannot fail");
 }
 
 fn unix_time_ms() -> u64 {
@@ -447,42 +475,54 @@ fn format_utc_day(day: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn compact_number(value: u64) -> String {
     if value >= 1_000_000_000 {
-        format!("{:.2}B", value as f64 / 1_000_000_000.0)
+        format!("{}B", format_decimal(value, 1_000_000_000, 2))
     } else if value >= 1_000_000 {
-        format!("{:.2}M", value as f64 / 1_000_000.0)
+        format!("{}M", format_decimal(value, 1_000_000, 2))
     } else if value >= 1_000 {
-        format!("{:.1}K", value as f64 / 1_000.0)
+        format!("{}K", format_decimal(value, 1_000, 1))
     } else {
         value.to_string()
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn format_bytes(value: u64) -> String {
     if value >= 1_073_741_824 {
-        format!("{:.2} GiB", value as f64 / 1_073_741_824.0)
+        format!("{} GiB", format_decimal(value, 1_073_741_824, 2))
     } else if value >= 1_048_576 {
-        format!("{:.2} MiB", value as f64 / 1_048_576.0)
+        format!("{} MiB", format_decimal(value, 1_048_576, 2))
     } else if value >= 1_024 {
-        format!("{:.1} KiB", value as f64 / 1_024.0)
+        format!("{} KiB", format_decimal(value, 1_024, 1))
     } else {
         format!("{value} B")
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn format_duration(value_ms: u64) -> String {
     let seconds = value_ms / 1_000;
     if seconds >= 3_600 {
-        format!("{:.1} h", seconds as f64 / 3_600.0)
+        format!("{} h", format_decimal(seconds, 3_600, 1))
     } else if seconds >= 60 {
-        format!("{:.1} m", seconds as f64 / 60.0)
+        format!("{} m", format_decimal(seconds, 60, 1))
     } else {
-        format!("{:.1} s", value_ms as f64 / 1_000.0)
+        format!("{} s", format_decimal(value_ms, 1_000, 1))
     }
+}
+
+fn format_decimal(value: u64, divisor: u64, precision: u32) -> String {
+    let scale = 10_u128.pow(precision);
+    let scaled = (u128::from(value) * scale + u128::from(divisor) / 2) / u128::from(divisor);
+    let whole = scaled / scale;
+    let fraction = scaled % scale;
+    let width = usize::try_from(precision).expect("format precision fits usize");
+    format!("{whole}.{fraction:0width$}")
+}
+
+fn u64_to_f64(value: u64) -> f64 {
+    let high = u32::try_from(value >> 32).expect("upper half fits u32");
+    let low = u32::try_from(value & u64::from(u32::MAX)).expect("lower half fits u32");
+    f64::from(high).mul_add(4_294_967_296.0, f64::from(low))
 }
 
 fn short_id(value: &str) -> &str {
@@ -517,11 +557,66 @@ mod tests {
     use crate::runtime::{InferenceMetric, InferenceUsage, RuntimeTelemetry, ToolMetric};
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn aggregates_daily_session_and_tool_usage_without_content() {
         let directory = tempfile::tempdir().expect("temp directory");
         let database = directory.path().join("sessions.sqlite3");
-        let connection = Connection::open(&database).expect("database");
+        write_session_fixture(&database);
+
+        let report = collect(
+            &database,
+            &DiagnosticsOptions {
+                days: 2,
+                session_limit: 10,
+                provider: None,
+                json: false,
+            },
+            2 * 86_400_000,
+        )
+        .expect("report");
+
+        assert_eq!(report.totals.reported_input_tokens, 1_000);
+        assert_eq!(report.totals.reported_cached_input_tokens, 750);
+        assert_eq!(report.totals.reported_uncached_input_tokens(), 250);
+        assert_eq!(report.totals.executed_tool_calls, 1);
+        assert_eq!(report.tools[0].model_output_bytes, 16_384);
+        assert_eq!(report.daily[0].date_utc, "1970-01-02");
+        let rendered = render_text(&report);
+        assert!(!rendered.contains("private instructions"));
+        assert!(!rendered.contains("turn-private-id"));
+        assert!(!rendered.contains("response-private-id"));
+        assert!(!rendered.contains("call-private-id"));
+
+        let provider_filtered = collect(
+            &database,
+            &DiagnosticsOptions {
+                days: 2,
+                session_limit: 10,
+                provider: Some("devin-acp".to_owned()),
+                json: false,
+            },
+            2 * 86_400_000,
+        )
+        .expect("provider-filtered report");
+        assert_eq!(provider_filtered.sessions_scanned, 0);
+        assert_eq!(provider_filtered.totals.reported_input_tokens, 0);
+
+        let age_filtered = collect(
+            &database,
+            &DiagnosticsOptions {
+                days: 1,
+                session_limit: 10,
+                provider: None,
+                json: false,
+            },
+            3 * 86_400_000,
+        )
+        .expect("age-filtered report");
+        assert_eq!(age_filtered.sessions_with_activity, 0);
+        assert_eq!(age_filtered.totals.reported_input_tokens, 0);
+    }
+
+    fn write_session_fixture(database: &Path) {
+        let connection = Connection::open(database).expect("database");
         connection
             .execute_batch(
                 "CREATE TABLE native_runtime_sessions (
@@ -576,58 +671,6 @@ mod tests {
             )
             .expect("insert");
         drop(connection);
-
-        let report = collect(
-            &database,
-            &DiagnosticsOptions {
-                days: 2,
-                session_limit: 10,
-                provider: None,
-                json: false,
-            },
-            2 * 86_400_000,
-        )
-        .expect("report");
-
-        assert_eq!(report.totals.reported_input_tokens, 1_000);
-        assert_eq!(report.totals.reported_cached_input_tokens, 750);
-        assert_eq!(report.totals.reported_uncached_input_tokens(), 250);
-        assert_eq!(report.totals.executed_tool_calls, 1);
-        assert_eq!(report.tools[0].model_output_bytes, 16_384);
-        assert_eq!(report.daily[0].date_utc, "1970-01-02");
-        let rendered = render_text(&report);
-        assert!(!rendered.contains("private instructions"));
-        assert!(!rendered.contains("turn-private-id"));
-        assert!(!rendered.contains("response-private-id"));
-        assert!(!rendered.contains("call-private-id"));
-
-        let provider_filtered = collect(
-            &database,
-            &DiagnosticsOptions {
-                days: 2,
-                session_limit: 10,
-                provider: Some("devin-acp".to_owned()),
-                json: false,
-            },
-            2 * 86_400_000,
-        )
-        .expect("provider-filtered report");
-        assert_eq!(provider_filtered.sessions_scanned, 0);
-        assert_eq!(provider_filtered.totals.reported_input_tokens, 0);
-
-        let age_filtered = collect(
-            &database,
-            &DiagnosticsOptions {
-                days: 1,
-                session_limit: 10,
-                provider: None,
-                json: false,
-            },
-            3 * 86_400_000,
-        )
-        .expect("age-filtered report");
-        assert_eq!(age_filtered.sessions_with_activity, 0);
-        assert_eq!(age_filtered.totals.reported_input_tokens, 0);
     }
 
     #[test]

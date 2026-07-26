@@ -14,17 +14,17 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{client, protocol};
+use super::{compatibility, protocol};
 use crate::{
     backend::{
         BackendCapabilities, BackendCommand, BackendError, BackendEvent, BackendHandle,
         BackendIdentity, BackendOperation, CapabilitySupport, DEVIN_PROVIDER, ModelInfo,
-        TurnOutcome,
+        TurnOutcome, request_failed,
     },
     runtime::{
         AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
         InferenceFailure, InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest,
-        RuntimeSession, RuntimeSessionStore, ToolCall,
+        RuntimeSession, RuntimeSessionStore, ToolCall, TurnError, set_session_model,
     },
 };
 
@@ -275,8 +275,8 @@ async fn run_supervisor(
                 if completed.kind == CompletedWorkKind::Turn {
                     let (outcome, error) = match completed.result {
                         Ok(()) => (TurnOutcome::Completed, None),
-                        Err(error) if error == "turn interrupted" => (TurnOutcome::Interrupted, None),
-                        Err(error) => (TurnOutcome::Failed, Some(error)),
+                        Err(TurnError::Interrupted) => (TurnOutcome::Interrupted, None),
+                        Err(error) => (TurnOutcome::Failed, Some(error.to_string())),
                     };
                     let _ = events.send(BackendEvent::TurnCompleted {
                         turn_id: completed.turn_id,
@@ -303,7 +303,7 @@ enum CompletedWorkKind {
 struct CompletedTurn {
     turn_id: String,
     session: RuntimeSession,
-    result: Result<(), String>,
+    result: Result<(), TurnError>,
     kind: CompletedWorkKind,
 }
 
@@ -321,7 +321,7 @@ struct CommandContext<'a> {
 async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_>) {
     match command {
         BackendCommand::BeginAuthentication => {
-            tokio::spawn(client::authenticate_native(context.events.clone()));
+            tokio::spawn(compatibility::authenticate_native(context.events.clone()));
         }
         BackendCommand::Reload { .. } => match context.api_key {
             Some(api_key) => match discover_models(context.config, api_key).await {
@@ -345,14 +345,10 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::StartSession {
             model,
             instructions,
-        } => {
-            start_session(model, instructions, context).await;
-        }
+        } => start_session(model, instructions, context).await,
         BackendCommand::ResumeSession {
             provider_session_id,
-        } => {
-            resume_session(provider_session_id, context).await;
-        }
+        } => resume_session(provider_session_id, context).await,
         BackendCommand::UnsubscribeSession {
             provider_session_id,
         } => {
@@ -360,37 +356,38 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             let _ = context.events.send(BackendEvent::SessionUnsubscribed).await;
         }
         BackendCommand::CompactSession {
-            session_id,
+            provider_session_id,
             compaction_id,
-        } => compact_session(session_id, compaction_id, context).await,
-        BackendCommand::SetSessionModel { session_id, model } => {
-            if let Some(session) = context.sessions.get_mut(&session_id) {
-                if session.model != model {
-                    session.context_window = None;
-                }
-                session.model = model;
-                if let Some(store) = context.session_store
-                    && let Err(error) = store.save(session)
-                {
-                    request_failed(context.events, BackendOperation::SetSessionModel, error).await;
-                }
-            } else {
-                request_failed(
-                    context.events,
-                    BackendOperation::SetSessionModel,
-                    "unknown native session",
-                )
-                .await;
+        } => compact_session(provider_session_id, compaction_id, context).await,
+        BackendCommand::SetSessionModel {
+            provider_session_id,
+            model,
+        } => {
+            if let Err(error) = set_session_model(
+                context.sessions,
+                context.session_store,
+                &provider_session_id,
+                model,
+            ) {
+                request_failed(context.events, BackendOperation::SetSessionModel, error).await;
             }
         }
         BackendCommand::StartTurn {
-            session_id,
+            provider_session_id,
             client_id,
             prompt,
             attachments,
             model,
         } => {
-            start_turn(session_id, client_id, prompt, attachments, model, context).await;
+            start_turn(
+                provider_session_id,
+                client_id,
+                prompt,
+                attachments,
+                model,
+                context,
+            )
+            .await;
         }
         BackendCommand::InterruptTurn { turn_id, .. } => {
             if let Some(active) = context
@@ -415,7 +412,9 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                 runtime.resolve_question(&id, answer).await;
             }
         }
-        BackendCommand::ResolveApproval { .. } | BackendCommand::Shutdown => {}
+        BackendCommand::ResolveApproval { .. }
+        | BackendCommand::SetSessionOptions { .. }
+        | BackendCommand::Shutdown => {}
     }
 }
 
@@ -520,7 +519,8 @@ async fn compact_session(
     tokio::spawn(async move {
         let result = runtime
             .force_compact(&mut session, &compaction_id, &events, cancellation)
-            .await;
+            .await
+            .map_err(TurnError::from);
         let _ = completed
             .send(CompletedTurn {
                 turn_id: compaction_id,
@@ -704,20 +704,6 @@ fn native_capabilities() -> BackendCapabilities {
         mcp: CapabilitySupport::Unsupported,
         close_session: CapabilitySupport::Supported,
     }
-}
-
-async fn request_failed(
-    events: &mpsc::Sender<BackendEvent>,
-    operation: BackendOperation,
-    message: impl Into<String>,
-) {
-    let _ = events
-        .send(BackendEvent::RequestFailed {
-            operation,
-            code: -1,
-            message: message.into(),
-        })
-        .await;
 }
 
 async fn discover_models(
@@ -1001,9 +987,8 @@ async fn parse_connect_stream(
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
     let mut output = InferenceOutput::default();
-    let mut tool_arguments = HashMap::<String, String>::new();
-    let mut tool_names = HashMap::<String, String>::new();
-    let mut active_tool_id = None;
+    let mut tools = ToolCallAccumulator::default();
+    let mut completed = false;
     loop {
         let chunk = tokio::select! {
             chunk = stream.next() => chunk,
@@ -1024,6 +1009,7 @@ async fn parse_connect_stream(
             let payload = pending[5..length + 5].to_vec();
             pending.drain(..length + 5);
             if flags & CONNECT_END_STREAM != 0 {
+                completed = true;
                 let trailer = decode_frame_payload(flags, &payload)?;
                 let text = String::from_utf8_lossy(&trailer);
                 if text.contains("\"error\"") {
@@ -1055,36 +1041,66 @@ async fn parse_connect_stream(
                     .map_err(|_| "inference event receiver closed".to_owned())?;
             }
             for tool in message.delta_tool_calls {
-                let tool_id = if tool.id.is_empty() {
-                    let Some(active_id) = active_tool_id.clone() else {
-                        continue;
-                    };
-                    active_id
-                } else {
-                    active_tool_id = Some(tool.id.clone());
-                    tool.id
-                };
-                if !tool.name.is_empty() {
-                    tool_names.insert(tool_id.clone(), tool.name);
-                }
-                let current = tool_arguments.entry(tool_id).or_default();
-                if tool.arguments_json.starts_with(current.as_str()) {
-                    *current = tool.arguments_json;
-                } else {
-                    current.push_str(&tool.arguments_json);
-                }
+                tools.push(tool);
             }
         }
     }
-    output.tool_calls = tool_arguments
-        .into_iter()
-        .map(|(id, arguments)| ToolCall {
-            name: tool_names.remove(&id).unwrap_or_default(),
-            id,
-            arguments: serde_json::from_str(&arguments).unwrap_or_else(|_| json!({})),
-        })
-        .collect();
+    if !pending.is_empty() {
+        return Err("Devin stream ended in the middle of a frame".to_owned());
+    }
+    if !completed {
+        return Err("Devin stream ended before an end-stream frame".to_owned());
+    }
+    output.tool_calls = tools.finish();
     Ok(output)
+}
+
+#[derive(Default)]
+struct ToolCallAccumulator {
+    order: Vec<String>,
+    arguments: HashMap<String, String>,
+    names: HashMap<String, String>,
+    active_id: Option<String>,
+}
+
+impl ToolCallAccumulator {
+    fn push(&mut self, tool: protocol::ChatToolCall) {
+        let id = if tool.id.is_empty() {
+            let Some(active_id) = self.active_id.clone() else {
+                return;
+            };
+            active_id
+        } else {
+            self.active_id = Some(tool.id.clone());
+            tool.id
+        };
+        if !self.arguments.contains_key(&id) {
+            self.order.push(id.clone());
+        }
+        if !tool.name.is_empty() {
+            self.names.insert(id.clone(), tool.name);
+        }
+        let current = self.arguments.entry(id).or_default();
+        if tool.arguments_json.starts_with(current.as_str()) {
+            *current = tool.arguments_json;
+        } else {
+            current.push_str(&tool.arguments_json);
+        }
+    }
+
+    fn finish(mut self) -> Vec<ToolCall> {
+        self.order
+            .into_iter()
+            .map(|id| {
+                let arguments = self.arguments.remove(&id).unwrap_or_default();
+                ToolCall {
+                    name: self.names.remove(&id).unwrap_or_default(),
+                    id,
+                    arguments: serde_json::from_str(&arguments).unwrap_or_else(|_| json!({})),
+                }
+            })
+            .collect()
+    }
 }
 
 fn decode_frame_payload(flags: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -1197,7 +1213,7 @@ mod tests {
         assert_eq!(
             tool_names,
             [
-                "read", "write", "edit", "bash", "glob", "grep", "eval", "ask", "todo"
+                "read", "write", "edit", "bash", "grep", "find", "ls", "eval", "ask", "todo"
             ]
         );
         assert!(!tool_names.contains(&"task"));
@@ -1236,6 +1252,36 @@ mod tests {
         assert_eq!(prompts[0].prompt, "bounded model output");
     }
 
+    #[test]
+    fn streamed_tool_calls_preserve_first_seen_order() {
+        let mut tools = ToolCallAccumulator::default();
+        tools.push(protocol::ChatToolCall {
+            id: "second".to_owned(),
+            name: "write".to_owned(),
+            arguments_json: "{\"path\":".to_owned(),
+        });
+        tools.push(protocol::ChatToolCall {
+            id: "first".to_owned(),
+            name: "read".to_owned(),
+            arguments_json: "{\"path\":\"src/lib.rs\"}".to_owned(),
+        });
+        tools.push(protocol::ChatToolCall {
+            id: "second".to_owned(),
+            name: String::new(),
+            arguments_json: "{\"path\":\"README.md\"}".to_owned(),
+        });
+
+        let tools = tools.finish();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.id.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+        assert_eq!(tools[0].arguments["path"], "README.md");
+    }
+
     fn test_request() -> InferenceRequest {
         InferenceRequest {
             session_id: "session-1".to_owned(),
@@ -1247,6 +1293,7 @@ mod tests {
             }],
             tools: Vec::new(),
             reasoning_effort: None,
+            fast_mode: false,
         }
     }
 }
