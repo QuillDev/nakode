@@ -36,17 +36,21 @@ Nakode currently supports:
 - **Devin**
 - **Cursor**
 - **Kimi For Coding**
+- **GLM Coding Plan (z.ai)**
 
 Providers are disabled on a fresh installation. Start Nakode, open
 `/providers`, and sign in to the providers you want to use. Press `F2` to browse
 and select from their available models.
 
-Nakode does not require the separate Codex, Devin, or Kimi applications. Cursor uses
-its local TypeScript SDK and requires Node.js 22.13 or newer plus npm. Cursor and
-Kimi setup in `/providers` includes an API-key field and a link to the provider's
+Nakode does not require the separate Codex, Devin, Kimi, or z.ai applications. Cursor uses
+its local TypeScript SDK and requires Node.js 22.13 or newer plus npm. Cursor, Kimi,
+and GLM setup in `/providers` includes an API-key field and a link to the provider's
 API-key dashboard. Kimi requires a [Kimi Coding Plan](https://www.kimi.com/code/)
 API key; Moonshot Platform API keys are a separate product and are not
-interchangeable. No single provider defines Nakode's workflow or session model.
+interchangeable. GLM requires a [z.ai GLM Coding Plan](https://z.ai/subscribe)
+API key and uses the plan's dedicated Coding API endpoint; Team Plan members must
+use their Team Plan key. No single provider defines Nakode's workflow or session
+model.
 
 ## Installation
 
@@ -93,6 +97,45 @@ nakode --workspace /path/to/project
 Then use `/settings` to manage general preferences, agents, models, providers,
 and optional add-ons. The settings menu is searchable. `/providers`, `/agents`,
 and `/models` remain available as direct shortcuts.
+
+## Personalities and Soul
+
+Nakode can append user-specific guidance to every newly created native agent
+session. By default it looks in the platform configuration directory for
+`personalities.toml` and an optional `SOUL.md` (for example,
+`~/.config/nakode/` on Linux). It never creates either file.
+
+`personalities.toml` supports a global default and provider-qualified,
+per-model overrides:
+
+```toml
+default = """
+Be warm, direct, and explain important tradeoffs.
+"""
+
+[models]
+"openai-codex/gpt-5.4" = """
+Prefer terse answers and make implementation decisions confidently.
+"""
+"zai-coding/glm-4.7" = """
+Show a short plan before changing code.
+"""
+```
+
+An exact model entry replaces the default personality for that model. Models
+without an entry use `default`. Empty values are ignored. Model keys must use
+the canonical `provider/model` form.
+
+`SOUL.md` describes who the agent is—identity, enduring preferences, and style
+controls. When present, it is always appended independently of the selected
+personality, including for delegated agents. Personality and Soul content is
+materialized when a provider-native session is created. After editing either
+file, use `/reload`; the new content affects newly created sessions rather than
+already-running or resumed sessions.
+
+Use `--personalities PATH` / `NAKODE_PERSONALITIES` and `--soul PATH` /
+`NAKODE_SOUL` to select other files. Relative explicit paths are resolved from
+the workspace. Explicit paths must exist; the default files are optional.
 
 ## Terminal image previews
 

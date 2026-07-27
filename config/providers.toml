@@ -11,5 +11,9 @@ slug = "kimi-coding"
 display_name = "Kimi For Coding"
 
 [[providers]]
+slug = "zai-coding"
+display_name = "GLM Coding Plan (z.ai)"
+
+[[providers]]
 slug = "devin-acp"
 display_name = "Devin"
