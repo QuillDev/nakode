@@ -21,7 +21,9 @@ use crate::{
     credential::{
         Credential, CredentialError, CredentialStore, SecretValue, SqliteCredentialStore,
     },
-    cursor, devin, kimi, render,
+    cursor, devin, glm, kimi,
+    personality::{PromptAddenda, PromptAddendaError},
+    render,
     selection::ScreenPoint,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
     skill::{SkillCatalog, SkillCatalogError},
@@ -41,6 +43,8 @@ pub enum AppError {
     Agents(#[from] AgentCatalogError),
     #[error(transparent)]
     Skills(#[from] SkillCatalogError),
+    #[error(transparent)]
+    PromptAddenda(#[from] PromptAddendaError),
     #[error(transparent)]
     Credential(#[from] CredentialError),
     #[error(transparent)]
@@ -185,6 +189,19 @@ impl BackendRegistry {
             crate::backend::KIMI_PROVIDER => {
                 kimi::spawn(
                     kimi::BackendConfig::native(self.config.workspace.clone())
+                        .with_credential(credential)
+                        .with_compaction_threshold_percent(usize::from(
+                            self.config.compaction_threshold_percent,
+                        ))
+                        .with_session_database(self.session_database.clone())
+                        .with_web_config(Arc::clone(&self.web_config))
+                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
+                )
+                .await?
+            }
+            crate::backend::GLM_PROVIDER => {
+                glm::spawn(
+                    glm::BackendConfig::native(self.config.workspace.clone())
                         .with_credential(credential)
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
@@ -415,7 +432,10 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let (providers, mut backends) = start_backends(&config, &sessions, &credentials).await?;
     let agents = AgentCatalog::load(&config.agents)?;
     let skills = SkillCatalog::load(&config.workspace)?;
+    let prompt_addenda =
+        PromptAddenda::load(config.personalities.as_deref(), config.soul.as_deref())?;
     let mut state = initial_state(&config, &providers, &backends, agents, skills);
+    state.install_prompt_addenda(prompt_addenda);
     let image_mode = sessions.load_terminal_image_mode()?;
     state.install_terminal_image_mode(image_mode);
     state.set_nakode_executable(&nakode_executable);
@@ -1223,6 +1243,9 @@ fn reload_local_configuration(state: &mut AppState) -> Result<(usize, usize), St
         .map_err(|error| format!("could not reload skills: {error}"))?;
     let agent_count = agents.definitions().len();
     let skill_count = skills.definitions().len();
+    state
+        .reload_prompt_addenda()
+        .map_err(|error| format!("could not reload personalities or Soul: {error}"))?;
     state.install_agents(agents);
     state.install_skills(skills);
     Ok((agent_count, skill_count))

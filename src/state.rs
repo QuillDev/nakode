@@ -16,6 +16,7 @@ use crate::{
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
     handoff::HandoffPackage,
+    personality::PromptAddenda,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
     session::{ProviderRecord, SessionRecord, SubagentRecord},
     skill::{Skill, SkillCatalog},
@@ -690,6 +691,7 @@ pub struct AppState {
     pending_clipboard: Option<String>,
     agents: AgentCatalog,
     skills: SkillCatalog,
+    prompt_addenda: PromptAddenda,
     agent_directory: PathBuf,
     subagent_executions: HashMap<String, SubagentExecution>,
     subagent_chats: HashMap<String, SubagentChat>,
@@ -1139,6 +1141,7 @@ impl AppState {
             pending_clipboard: None,
             agents: AgentCatalog::default(),
             skills: SkillCatalog::default(),
+            prompt_addenda: PromptAddenda::default(),
             agent_directory: PathBuf::from(".nakode/agents"),
             subagent_executions: HashMap::new(),
             subagent_chats: HashMap::new(),
@@ -1180,6 +1183,20 @@ impl AppState {
             picker.selected = picker.selected.min(picker.agents.len().saturating_sub(1));
             picker.editor = None;
         }
+    }
+
+    pub fn install_prompt_addenda(&mut self, prompt_addenda: PromptAddenda) {
+        self.prompt_addenda = prompt_addenda;
+    }
+
+    /// Reloads personality and Soul content from their original sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either source can no longer be read or parsed.
+    pub fn reload_prompt_addenda(&mut self) -> Result<(), crate::personality::PromptAddendaError> {
+        self.prompt_addenda = self.prompt_addenda.reload()?;
+        Ok(())
     }
 
     pub fn install_skills(&mut self, skills: SkillCatalog) {
@@ -4344,13 +4361,15 @@ impl AppState {
             || format!("{}/provider-default", self.backend_provider),
             Clone::clone,
         );
-        format!(
+        let base = format!(
             "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode invocation is available through the native shell. It is a Nakode control-plane command, not a provider tool.\nAvailable agents:\n{}\nTo delegate a concrete bounded task, execute the matching absolute-path command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed above. Use only these Nakode commands for delegation; do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one command per task concurrently using the provider's native shell facilities. Keep each objective distinct and bounded. Each command returns its own agent result on stdout when that child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
             self.nakode_session_id,
             model,
             self.backend_provider,
             if agents.is_empty() { "- none" } else { &agents },
-        )
+        );
+        self.prompt_addenda
+            .apply(&base, self.selected_model.as_deref())
     }
 
     pub fn subagent_launch_failed(&mut self, run_id: &str, message: String) -> Vec<Effect> {
@@ -4619,15 +4638,21 @@ impl AppState {
     }
 
     fn start_subagent_session(&mut self, run_id: &str) -> Vec<Effect> {
+        let prompt_addenda = self.prompt_addenda.clone();
         let Some(execution) = self.subagent_executions.get_mut(run_id) else {
             return Vec::new();
         };
         execution.run.status = SubagentStatus::Starting;
         "Creating native session…".clone_into(&mut execution.run.latest_activity);
-        let model = execution.model_targets[execution.model_target_index]
-            .model
-            .clone();
-        let instructions = Some(execution.definition.system_prompt.clone());
+        let target = &execution.model_targets[execution.model_target_index];
+        let model = target.model.clone();
+        let qualified_model = model
+            .as_ref()
+            .map(|model| format!("{}/{model}", target.provider));
+        let instructions = Some(prompt_addenda.apply(
+            &execution.definition.system_prompt,
+            qualified_model.as_deref(),
+        ));
         self.sync_subagent(run_id);
         vec![Effect::SubagentBackend {
             run_id: run_id.to_owned(),
@@ -5208,6 +5233,7 @@ mod tests {
             ModelOptions, NormalizedItem, PromptAttachment, PromptImage, QuestionOption,
             QuestionRequest, SessionHistoryItem, TodoItem, TodoPhase, TodoStatus, TurnOutcome,
         },
+        personality::PromptAddenda,
         session::{SessionRecord, SubagentRecord},
         skill::SkillCatalog,
         transcript::{EntryKind, EntryStatus, TranscriptEntry},
@@ -5215,6 +5241,30 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus};
+
+    #[test]
+    fn primary_system_instructions_include_model_personality_and_soul() {
+        let directory = tempdir().expect("config directory");
+        let personalities = directory.path().join("personalities.toml");
+        let soul = directory.path().join("SOUL.md");
+        fs::write(
+            &personalities,
+            "default = \"Default personality\"\n[models]\n\"openai-codex/model-a\" = \"Model A personality\"\n",
+        )
+        .expect("personalities");
+        fs::write(&soul, "Agent identity").expect("soul");
+        let mut state = ready_state();
+        state.selected_model = Some("openai-codex/model-a".to_owned());
+        state.install_prompt_addenda(
+            PromptAddenda::load(Some(&personalities), Some(&soul)).expect("addenda"),
+        );
+
+        let instructions = state.nakode_system_instructions();
+        assert!(instructions.contains("[Nakode System Instructions]"));
+        assert!(instructions.contains("[Personality]\nModel A personality"));
+        assert!(!instructions.contains("Default personality"));
+        assert!(instructions.contains("[Soul]\nAgent identity"));
+    }
 
     fn explorer_catalog() -> AgentCatalog {
         let directory = tempdir().expect("agent directory");
@@ -6781,6 +6831,54 @@ model = "openai-codex/model-a"
         assert_eq!(displayed_user.body, "What is my name?");
     }
 
+    #[test]
+    fn subagent_system_instructions_include_model_personality_and_soul() {
+        let directory = tempdir().expect("config directory");
+        let personalities = directory.path().join("personalities.toml");
+        let soul = directory.path().join("SOUL.md");
+        fs::write(
+            &personalities,
+            "default = \"Default personality\"\n[models]\n\"openai-codex/model-a\" = \"Explorer personality\"\n",
+        )
+        .expect("personalities");
+        fs::write(&soul, "Shared identity").expect("soul");
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        state.install_prompt_addenda(
+            PromptAddenda::load(Some(&personalities), Some(&soul)).expect("addenda"),
+        );
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 42,
+            agent: "explorer".to_owned(),
+            task: "Map auth".to_owned(),
+        });
+        let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
+            panic!("expected a subagent launch");
+        };
+
+        let effects = state.handle_subagent_backend(
+            run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SubagentBackend {
+                command: BackendCommand::StartSession {
+                    instructions: Some(instructions),
+                    ..
+                },
+                ..
+            }] if instructions.contains("Explore carefully")
+                && instructions.contains("[Personality]\nExplorer personality")
+                && instructions.contains("[Soul]\nShared identity")
+        ));
+    }
+
     fn begin_mocked_subagent(state: &mut AppState) -> String {
         let effects = state.invoke_agent(&AgentRequest {
             id: 42,
@@ -7301,6 +7399,32 @@ model = "openai-codex/model-a"
                 if provider == crate::backend::KIMI_PROVIDER
                     && kind == "kimi_coding_api_key"
                     && metadata == &serde_json::json!({"api_key":"kimi-secret"})
+        ));
+    }
+
+    #[test]
+    fn glm_setup_uses_coding_plan_console_and_credential_kind() {
+        let mut state = ready_state();
+        state.install_providers(vec![crate::session::ProviderRecord {
+            provider: crate::backend::GLM_PROVIDER.to_owned(),
+            display_name: "GLM Coding Plan (z.ai)".to_owned(),
+            enabled: false,
+            credential: None,
+        }]);
+        state.open_provider_details();
+
+        assert!(matches!(
+            state.open_provider_authentication_url().as_slice(),
+            [Effect::OpenUrl(url)] if url == "https://z.ai/manage-apikey/apikey-list"
+        ));
+        assert!(state.toggle_provider().is_empty());
+        state.provider_api_key_insert_str(" zai-secret ");
+        assert!(matches!(
+            state.submit_provider_api_key().as_slice(),
+            [Effect::SaveProviderCredential { provider, kind, metadata }]
+                if provider == crate::backend::GLM_PROVIDER
+                    && kind == "zai_coding_api_key"
+                    && metadata == &serde_json::json!({"api_key":"zai-secret"})
         ));
     }
 

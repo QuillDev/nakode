@@ -52,6 +52,16 @@ pub struct Config {
     )]
     pub openai_reasoning_effort: OpenAiReasoningEffort,
 
+    /// Optional personalities TOML file. Defaults to the user-specific
+    /// `personalities.toml` in Nakode's configuration directory.
+    #[arg(long, env = "NAKODE_PERSONALITIES")]
+    pub personalities: Option<PathBuf>,
+
+    /// Optional Soul Markdown file. Defaults to the user-specific `SOUL.md` in
+    /// Nakode's configuration directory; no file is created automatically.
+    #[arg(long, env = "NAKODE_SOUL")]
+    pub soul: Option<PathBuf>,
+
     /// Directory containing predefined TOML agent definitions.
     #[arg(long, env = "NAKODE_AGENTS", default_value = ".nakode/agents")]
     pub agents: PathBuf,
@@ -236,6 +246,16 @@ impl Config {
                 configured
             };
         }
+        if let Some(path) = &self.personalities
+            && path.is_relative()
+        {
+            self.personalities = Some(self.workspace.join(path));
+        }
+        if let Some(path) = &self.soul
+            && path.is_relative()
+        {
+            self.soul = Some(self.workspace.join(path));
+        }
         self.scrollback = self.scrollback.max(100);
         self.model = self
             .model
@@ -276,6 +296,26 @@ mod tests {
     fn backend_flag_is_not_part_of_the_cli() {
         assert!(Config::try_parse_from(["nakode", "--backend", "devin"]).is_err());
         assert!(Config::try_parse_from(["nakode"]).is_ok());
+    }
+
+    #[test]
+    fn personality_and_soul_paths_are_configurable() {
+        let config = Config::try_parse_from([
+            "nakode",
+            "--personalities",
+            "prompts.toml",
+            "--soul",
+            "identity.md",
+        ])
+        .expect("prompt addendum flags");
+        assert_eq!(
+            config.personalities.as_deref(),
+            Some(std::path::Path::new("prompts.toml"))
+        );
+        assert_eq!(
+            config.soul.as_deref(),
+            Some(std::path::Path::new("identity.md"))
+        );
     }
 
     #[test]

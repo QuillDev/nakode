@@ -9,6 +9,7 @@ pub const CODEX_PROVIDER: &str = "openai-codex";
 pub const DEVIN_PROVIDER: &str = "devin-acp";
 pub const CURSOR_PROVIDER: &str = "cursor-sdk";
 pub const KIMI_PROVIDER: &str = "kimi-coding";
+pub const GLM_PROVIDER: &str = "zai-coding";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApiKeyProviderSetup {
@@ -29,6 +30,11 @@ pub fn api_key_provider_setup(provider: &str) -> Option<ApiKeyProviderSetup> {
             dashboard_url: "https://www.kimi.com/code/console",
             credential_kind: "kimi_coding_api_key",
             display_name: "Kimi",
+        }),
+        GLM_PROVIDER => Some(ApiKeyProviderSetup {
+            dashboard_url: "https://z.ai/manage-apikey/apikey-list",
+            credential_kind: "zai_coding_api_key",
+            display_name: "GLM Coding Plan",
         }),
         _ => None,
     }
