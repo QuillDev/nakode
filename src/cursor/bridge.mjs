@@ -5,6 +5,8 @@ import { createInterface } from "node:readline";
 const agents = new Map();
 const runs = new Map();
 const instructions = new Map();
+const sessionOptions = new Map();
+const discoveredModels = new Map();
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
 function errorMessage(error) {
@@ -54,12 +56,45 @@ function nakodeTools() {
   };
 }
 
+function rememberModels(models) {
+  for (const model of models) discoveredModels.set(model.id, model);
+  return models;
+}
+
+function modelSupportsFastMode(modelId) {
+  const model = discoveredModels.get(modelId);
+  if (model) {
+    return model.parameters?.some((parameter) =>
+      parameter.id === "fast" && parameter.values?.some(({ value }) => value === "true")
+    ) ?? false;
+  }
+  // Model discovery normally precedes a run. Keep known Cursor fast-capable
+  // families usable if a resumed session sends before the catalog is loaded.
+  return modelId.startsWith("composer-") || modelId.startsWith("grok-4.5");
+}
+
+function modelSelection(modelId, fastMode) {
+  const selection = { id: modelId };
+  if (fastMode && modelSupportsFastMode(modelId)) {
+    selection.params = [{ id: "fast", value: "true" }];
+  }
+  return selection;
+}
+
+function serializeModels(models) {
+  return models.map((model, index) => ({
+    id: model.id,
+    isDefault: model.id === "auto" || (index === 0 && !models.some((item) => item.id === "auto")),
+    supportsFastMode: modelSupportsFastMode(model.id),
+  }));
+}
+
 async function createAgent(command) {
   const options = {
     apiKey: command.apiKey,
     local: { cwd: command.workspace, customTools: nakodeTools() },
   };
-  if (command.model) options.model = { id: command.model };
+  if (command.model) options.model = modelSelection(command.model, false);
   const agent = await Agent.create(options);
   agents.set(agent.agentId, agent);
   if (command.instructions) instructions.set(agent.agentId, command.instructions);
@@ -91,7 +126,11 @@ async function sendTurn(command) {
       if (update.type === "thinking-delta") write({ event: "delta", turnId: command.turnId, kind: "reasoning", text: update.text });
     },
   };
-  if (command.model) options.model = { id: command.model };
+  const modelId = command.model ?? agent.model?.id;
+  if (modelId) {
+    const fastMode = sessionOptions.get(command.sessionId)?.fastMode ?? false;
+    options.model = modelSelection(modelId, fastMode);
+  }
   const run = await agent.send(prompt, options);
   runs.set(command.turnId, run);
   write({ event: "turn_started", turnId: command.turnId, runId: run.id });
@@ -123,13 +162,17 @@ async function sendTurn(command) {
 async function handle(command) {
   switch (command.method) {
     case "models": {
-      const models = await Cursor.models.list({ apiKey: command.apiKey });
-      write({ event: "models", requestId: command.requestId, models: models.map((model, index) => ({ id: model.id, isDefault: model.id === "auto" || (index === 0 && !models.some((item) => item.id === "auto")) })) });
+      const models = rememberModels(await Cursor.models.list({ apiKey: command.apiKey }));
+      write({ event: "models", requestId: command.requestId, models: serializeModels(models) });
       break;
     }
     case "create": await createAgent(command); break;
     case "resume": await resumeAgent(command); break;
     case "send": await sendTurn(command); break;
+    case "set_options": {
+      sessionOptions.set(command.sessionId, { fastMode: command.fastMode === true });
+      break;
+    }
     case "cancel": {
       const run = runs.get(command.turnId);
       if (run) await run.cancel();
@@ -141,14 +184,15 @@ async function handle(command) {
       if (agent) await agent[Symbol.asyncDispose]();
       agents.delete(command.sessionId);
       instructions.delete(command.sessionId);
+      sessionOptions.delete(command.sessionId);
       write({ event: "session_closed", requestId: command.requestId, sessionId: command.sessionId });
       break;
     }
     case "reload": {
       const agent = command.sessionId ? agents.get(command.sessionId) : undefined;
       if (agent) await agent.reload();
-      const models = await Cursor.models.list({ apiKey: command.apiKey });
-      write({ event: "models", requestId: command.requestId, models: models.map((model, index) => ({ id: model.id, isDefault: model.id === "auto" || (index === 0 && !models.some((item) => item.id === "auto")) })) });
+      const models = rememberModels(await Cursor.models.list({ apiKey: command.apiKey }));
+      write({ event: "models", requestId: command.requestId, models: serializeModels(models) });
       break;
     }
     case "shutdown": {

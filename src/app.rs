@@ -26,6 +26,7 @@ use crate::{
     render,
     selection::ScreenPoint,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
+    shell::{ShellEvent, ShellProcesses},
     skill::{SkillCatalog, SkillCatalogError},
     state::{AgentBrowserStatus, AppState, ApprovalDecision, Effect},
     terminal::{TerminalSession, Tui},
@@ -708,6 +709,7 @@ async fn run_loop(
     let mut backend_open = true;
     let mut dirty = true;
     let mut agent_requests = HashMap::<u64, IncomingInvocation>::new();
+    let mut shell_processes = ShellProcesses::new();
 
     if let Some(reporter) = &mut herdr {
         reporter.sync(state);
@@ -720,7 +722,7 @@ async fn run_loop(
                     Some(Ok(event)) => {
                         let effects = handle_terminal_event(state, event);
                         flush_pending_clipboard(terminal, state);
-                        if apply_effects(state, effects, backends, persistence, &mut agent_requests).await {
+                        if apply_effects(state, effects, backends, persistence, &mut agent_requests, &mut shell_processes).await {
                             break;
                         }
                         dirty = true;
@@ -743,13 +745,19 @@ async fn run_loop(
                     if should_chime {
                         crate::terminal::ring_bell(terminal.backend_mut())?;
                     }
-                    if apply_effects(state, effects, backends, persistence, &mut agent_requests).await {
+                    if apply_effects(state, effects, backends, persistence, &mut agent_requests, &mut shell_processes).await {
                         break;
                     }
                     dirty = true;
                 } else {
                     backend_open = false;
                     state.set_status("All provider event channels closed.");
+                    dirty = true;
+                }
+            }
+            shell_event = shell_processes.events.recv() => {
+                if let Some(event) = shell_event {
+                    handle_shell_event(state, event);
                     dirty = true;
                 }
             }
@@ -760,7 +768,7 @@ async fn run_loop(
                         let invocation = crate::state::AgentRequest { id, agent: request.invocation.agent.clone(), task: request.invocation.task.clone() };
                         agent_requests.insert(id, request);
                         let effects = state.invoke_agent(&invocation);
-                        if apply_effects(state, effects, backends, persistence, &mut agent_requests).await { break; }
+                        if apply_effects(state, effects, backends, persistence, &mut agent_requests, &mut shell_processes).await { break; }
                     } else {
                         request.respond(AgentResponse { success: false, result: "Nakode session id does not match this TUI.".to_owned() });
                     }
@@ -794,7 +802,21 @@ async fn run_loop(
         }
     }
 
+    shell_processes.shutdown().await;
     Ok(())
+}
+
+fn handle_shell_event(state: &mut AppState, event: ShellEvent) {
+    match event {
+        ShellEvent::Output { id, output } => state.shell_output(&id, &output),
+        ShellEvent::Finished {
+            id,
+            output,
+            exit_code,
+            interrupted,
+        } => state.shell_finished(&id, &output, exit_code, interrupted),
+        ShellEvent::Failed { id, message } => state.shell_failed(&id, &message),
+    }
 }
 
 fn is_fatal_provider_error(message: &str) -> bool {
@@ -834,6 +856,7 @@ async fn apply_effects(
     backends: &mut BackendRegistry,
     persistence: &PersistenceServices<'_>,
     agent_requests: &mut HashMap<u64, IncomingInvocation>,
+    shell_processes: &mut ShellProcesses,
 ) -> bool {
     let sessions = persistence.sessions;
     let credentials = persistence.credentials;
@@ -841,6 +864,9 @@ async fn apply_effects(
     while let Some(effect) = pending.pop_front() {
         match effect {
             Effect::Backend(command) => send_backend_command(state, backends, command).await,
+            Effect::RunShell { id, command } => {
+                shell_processes.spawn(PathBuf::from(&state.workspace), id, command);
+            }
             Effect::SpawnSubagent { run_id, provider } => {
                 spawn_subagent(state, backends, &mut pending, &run_id, &provider).await;
             }
@@ -1261,7 +1287,23 @@ fn save_agent_definition(
         catalog.save(&directory, definition, previous_slug)?;
         AgentCatalog::load(&directory)
     });
-    install_changed_agent_catalog(state, result, "Agent archetype saved.");
+    match result {
+        Ok(catalog) => {
+            let editor = state
+                .agent_picker
+                .as_ref()
+                .and_then(|picker| picker.editor.clone());
+            state.install_agents(catalog);
+            if let Some(mut editor) = editor {
+                editor.original_slug = Some(definition.slug.clone());
+                if let Some(picker) = &mut state.agent_picker {
+                    picker.editor = Some(editor);
+                }
+            }
+            state.set_status("Agent changes saved.");
+        }
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
 }
 
 fn delete_agent_definition(state: &mut AppState, slug: &str) {
@@ -1404,7 +1446,7 @@ pub(crate) fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<E
                 .as_ref()
                 .is_some_and(|picker| picker.editor.is_some())
             {
-                state.agent_editor_insert_str(&text);
+                return state.agent_editor_insert_str(&text);
             } else if state.settings.is_some() {
                 for character in text.chars() {
                     state.settings_insert(character);
@@ -1887,21 +1929,60 @@ fn handle_agent_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 }
 
 fn handle_agent_editor_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    if state.agent_model_options_are_open() {
+        match controls::resolve(ControlContext::ModelPicker, key) {
+            Some(ControlAction::Select) => return state.apply_agent_model_options(),
+            Some(ControlAction::Close) => {
+                state.cancel_agent_edit();
+            }
+            Some(ControlAction::MoveLeft) => state.adjust_agent_model_options(-1),
+            Some(ControlAction::MoveRight) => state.adjust_agent_model_options(1),
+            _ => {}
+        }
+        return Vec::new();
+    }
+    if state.agent_model_dropdown_is_open() {
+        return handle_searchable_dropdown_key(state, key);
+    }
     match controls::resolve(ControlContext::AgentEditor, key) {
         Some(ControlAction::Previous) => state.agent_editor_move(-1),
         Some(ControlAction::Close) => {
             state.cancel_agent_edit();
         }
-        Some(ControlAction::Save) => return state.save_agent_edit(),
+        Some(ControlAction::Open) => state.open_agent_model_dropdown(),
         Some(ControlAction::Next) => state.agent_editor_move(1),
-        Some(ControlAction::Backspace) => state.agent_editor_backspace(),
+        Some(ControlAction::Backspace) => return state.agent_editor_backspace(),
         None => {
             if let KeyCode::Char(character) = key.code
                 && !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER)
             {
-                state.agent_editor_insert(character);
+                return state.agent_editor_insert(character);
+            }
+        }
+        Some(_) => {}
+    }
+    Vec::new()
+}
+
+fn handle_searchable_dropdown_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    match controls::resolve(ControlContext::SearchableDropdown, key) {
+        Some(ControlAction::Select) => return state.select_agent_model_dropdown(),
+        Some(ControlAction::Close) => {
+            state.cancel_agent_edit();
+        }
+        Some(ControlAction::Previous) => state.agent_model_dropdown_move(-1),
+        Some(ControlAction::Next) => state.agent_model_dropdown_move(1),
+        Some(ControlAction::Backspace) => return state.agent_editor_backspace(),
+        Some(ControlAction::Clear) => state.clear_agent_model_dropdown_query(),
+        None => {
+            if let KeyCode::Char(character) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER)
+            {
+                return state.agent_editor_insert(character);
             }
         }
         Some(_) => {}
@@ -1977,9 +2058,109 @@ mod tests {
         backend::{BackendEvent, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, TurnOutcome},
         render,
         session::ProviderRecord,
-        state::{ActiveTurn, AgentRequest, AppState, ConnectionState, Effect},
+        state::{ActiveTurn, AgentEditorField, AgentRequest, AppState, ConnectionState, Effect},
         transcript::{EntryKind, EntryStatus},
     };
+
+    #[test]
+    fn valid_agent_text_edits_emit_autosave_without_a_shortcut() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.open_agent_picker();
+        state.edit_selected_agent();
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = AgentEditorField::Description;
+
+        let effects = super::handle_agent_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(effects.as_slice(), [Effect::SaveAgent { .. }]));
+    }
+
+    #[test]
+    fn successful_agent_autosave_keeps_the_editor_open() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let agent_directory = workspace.path().join(".nakode/agents");
+        let mut state = AppState::new(workspace.path().to_string_lossy(), None, 100);
+        state.set_agent_directory(agent_directory.clone());
+        state.open_agent_picker();
+        state.edit_selected_agent();
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = AgentEditorField::Description;
+        let effects = state.agent_editor_insert('!');
+        let [
+            Effect::SaveAgent {
+                definition,
+                previous_slug,
+                ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("expected agent save");
+        };
+        let definition = definition.clone();
+        let previous_slug = previous_slug.clone();
+
+        super::save_agent_definition(&mut state, &definition, previous_slug.as_deref());
+
+        let editor = state
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .expect("autosave should preserve the editor");
+        assert_eq!(
+            editor.original_slug.as_deref(),
+            Some(definition.slug.as_str())
+        );
+        assert!(agent_directory.join("explorer.toml").is_file());
+        assert_eq!(state.status_message, "Agent changes saved.");
+    }
+
+    #[test]
+    fn enter_on_agent_model_field_opens_searchable_selection_menu() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.models = vec![crate::backend::ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "gpt-5.6-sol".to_owned(),
+            is_default: true,
+        }];
+        state.open_agent_picker();
+        state.edit_selected_agent();
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = AgentEditorField::Model;
+
+        super::handle_agent_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(state.agent_model_dropdown_is_open());
+        let dropdown = state
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .and_then(|editor| editor.model_dropdown.as_ref())
+            .expect("model dropdown");
+        assert!(
+            dropdown
+                .items
+                .iter()
+                .any(|option| { option.search_text().contains("openai-codex/gpt-5.6-sol") })
+        );
+    }
 
     #[test]
     fn fatal_provider_quota_errors_open_a_cooldown_for_new_workers() {
@@ -2579,6 +2760,42 @@ first_message = "Inspect the change."
         state.editor.insert_char('$');
 
         assert_eq!(state.editor.text(), "^one |two$");
+    }
+
+    #[test]
+    fn terminal_compatible_editing_shortcuts_navigate_and_delete() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("one two");
+
+        // Legacy Option+Left is commonly reported as Esc-b (Alt+B).
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+        );
+        state.editor.insert_char('|');
+        // Some Kitty-protocol terminals report Command as META.
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::META));
+        state.editor.insert_char('^');
+        // Terminal profiles commonly encode Command+Right as Ctrl+E.
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        );
+        state.editor.insert_char('$');
+
+        assert_eq!(state.editor.text(), "^one |two$");
+
+        // Command+Delete and Option+Delete may arrive as Ctrl+U/Ctrl+W.
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.editor.text(), "^one |two");
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(state.editor.is_blank());
     }
 
     #[test]

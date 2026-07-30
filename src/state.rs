@@ -9,14 +9,15 @@ use crate::{
     agent::{AgentCatalog, AgentDefinition},
     backend::{
         ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent, BackendOperation,
-        CODEX_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus, ModelInfo, ModelOptions,
-        NormalizedItem, PromptAttachment, QuestionRequest, SessionHistoryItem, TodoPhase,
-        TurnOutcome, display_qualified_model_name,
+        CODEX_PROVIDER, CURSOR_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus,
+        ModelInfo, ModelOptions, NormalizedItem, PromptAttachment, QuestionRequest,
+        SessionHistoryItem, TodoPhase, TurnOutcome, display_qualified_model_name,
     },
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
     handoff::HandoffPackage,
     personality::PromptAddenda,
+    searchable_dropdown::SearchableDropdown,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
     session::{ProviderRecord, SessionRecord, SubagentRecord},
     skill::{Skill, SkillCatalog},
@@ -26,6 +27,21 @@ use crate::{
 };
 
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
+
+fn supports_model_options(provider: &str) -> bool {
+    matches!(provider, CODEX_PROVIDER | CURSOR_PROVIDER)
+}
+
+fn model_supports_options(model: &ModelInfo) -> bool {
+    if model.provider == CODEX_PROVIDER {
+        return true;
+    }
+    if model.provider != CURSOR_PROVIDER {
+        return false;
+    }
+    let id = model.id.to_ascii_lowercase();
+    id.starts_with("composer-") || id.starts_with("grok-4.5")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PromptCompletion<'a> {
@@ -161,6 +177,7 @@ pub struct ModelPicker {
     pub stage: ModelPickerStage,
     pub option_selected: usize,
     pub options: ModelOptions,
+    pub options_fast_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,6 +278,43 @@ impl AgentEditorField {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentModelOption {
+    Inherit,
+    Model(ModelInfo),
+}
+
+impl AgentModelOption {
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Inherit => "Inherit parent model".to_owned(),
+            Self::Model(model) => model.display_name(),
+        }
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Inherit => "uses the parent session model".to_owned(),
+            Self::Model(model) => model.qualified_id(),
+        }
+    }
+
+    #[must_use]
+    pub fn search_text(&self) -> String {
+        format!("{} {}", self.label(), self.detail())
+    }
+
+    #[must_use]
+    fn qualified_id(&self) -> Option<String> {
+        match self {
+            Self::Inherit => None,
+            Self::Model(model) => Some(model.qualified_id()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentEditor {
     pub original_slug: Option<String>,
     pub field: AgentEditorField,
@@ -270,6 +324,9 @@ pub struct AgentEditor {
     pub first_message: String,
     pub model: String,
     pub fallback_models: String,
+    pub fast_mode: bool,
+    pub pending_fast_mode: Option<bool>,
+    pub model_dropdown: Option<SearchableDropdown<AgentModelOption>>,
 }
 
 impl AgentEditor {
@@ -283,6 +340,9 @@ impl AgentEditor {
             first_message: String::new(),
             model: String::new(),
             fallback_models: String::new(),
+            fast_mode: false,
+            pending_fast_mode: None,
+            model_dropdown: None,
         }
     }
 
@@ -296,6 +356,9 @@ impl AgentEditor {
             first_message: definition.first_message.clone(),
             model: definition.model.clone().unwrap_or_default(),
             fallback_models: definition.fallback_models.join(", "),
+            fast_mode: definition.fast_mode,
+            pending_fast_mode: None,
+            model_dropdown: None,
         }
     }
 
@@ -324,6 +387,7 @@ impl AgentEditor {
                 .filter(|model| !model.is_empty())
                 .map(str::to_owned)
                 .collect(),
+            fast_mode: self.fast_mode,
         }
     }
 }
@@ -563,6 +627,10 @@ pub struct AgentRequest {
 #[derive(Clone, Debug)]
 pub enum Effect {
     Backend(BackendCommand),
+    RunShell {
+        id: String,
+        command: String,
+    },
     SpawnSubagent {
         run_id: String,
         provider: String,
@@ -655,6 +723,7 @@ pub struct AppState {
     pub model_options: HashMap<String, ModelOptions>,
     default_model_options: ModelOptions,
     session_model_override: bool,
+    session_model_options_override: Option<(String, ModelOptions)>,
     pub model_picker: Option<ModelPicker>,
     pub session_picker: Option<SessionPicker>,
     pub provider_picker: Option<ProviderPicker>,
@@ -1105,6 +1174,7 @@ impl AppState {
                 fast_mode: false,
             },
             session_model_override: initial_model.is_some(),
+            session_model_options_override: None,
             model_picker: None,
             session_picker: None,
             provider_picker: None,
@@ -1275,7 +1345,174 @@ impl AppState {
         let Some(picker) = &mut self.agent_picker else {
             return false;
         };
-        picker.editor.take().is_some()
+        let Some(editor) = &mut picker.editor else {
+            return false;
+        };
+        if editor.pending_fast_mode.take().is_some() {
+            return true;
+        }
+        if editor.model_dropdown.take().is_some() {
+            return true;
+        }
+        picker.editor = None;
+        true
+    }
+
+    #[must_use]
+    pub fn agent_model_options_are_open(&self) -> bool {
+        self.agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .is_some_and(|editor| editor.pending_fast_mode.is_some())
+    }
+
+    pub fn adjust_agent_model_options(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(fast_mode) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .and_then(|editor| editor.pending_fast_mode.as_mut())
+        {
+            *fast_mode = !*fast_mode;
+        }
+    }
+
+    pub fn apply_agent_model_options(&mut self) -> Vec<Effect> {
+        let Some(editor) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+        else {
+            return Vec::new();
+        };
+        if let Some(fast_mode) = editor.pending_fast_mode.take() {
+            editor.fast_mode = fast_mode;
+        }
+        self.autosave_agent_edit()
+    }
+
+    #[must_use]
+    pub fn agent_model_dropdown_is_open(&self) -> bool {
+        self.agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .is_some_and(|editor| editor.model_dropdown.is_some())
+    }
+
+    pub fn open_agent_model_dropdown(&mut self) {
+        let Some((field, current)) = self
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .map(|editor| (editor.field, editor.model.trim().to_owned()))
+        else {
+            return;
+        };
+        if field != AgentEditorField::Model {
+            return;
+        }
+
+        let mut items = vec![AgentModelOption::Inherit];
+        items.extend(self.models.iter().cloned().map(AgentModelOption::Model));
+        if !current.is_empty()
+            && !items
+                .iter()
+                .any(|option| option.qualified_id().as_deref() == Some(current.as_str()))
+            && let Some((provider, id)) = current.split_once('/')
+            && !provider.is_empty()
+            && !id.is_empty()
+        {
+            items.push(AgentModelOption::Model(ModelInfo {
+                provider: provider.to_owned(),
+                id: id.to_owned(),
+                is_default: false,
+            }));
+        }
+        let selected = items
+            .iter()
+            .position(|option| option.qualified_id().as_deref() == Some(current.as_str()))
+            .unwrap_or(0);
+        if let Some(editor) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+        {
+            editor.model_dropdown = Some(SearchableDropdown::with_selected(items, selected));
+        }
+    }
+
+    pub fn agent_model_dropdown_move(&mut self, delta: isize) {
+        if let Some(dropdown) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .and_then(|editor| editor.model_dropdown.as_mut())
+        {
+            dropdown.move_selection(delta, AgentModelOption::search_text);
+        }
+    }
+
+    pub fn select_agent_model_dropdown(&mut self) -> Vec<Effect> {
+        let selected = self
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .and_then(|editor| editor.model_dropdown.as_ref())
+            .and_then(|dropdown| {
+                dropdown
+                    .selected_item(AgentModelOption::search_text)
+                    .cloned()
+            });
+        let Some(selected) = selected else {
+            return Vec::new();
+        };
+        let supports_fast_mode = match &selected {
+            AgentModelOption::Model(model) => {
+                model.provider == CURSOR_PROVIDER && model_supports_options(model)
+            }
+            AgentModelOption::Inherit => self
+                .selected_model
+                .as_deref()
+                .and_then(|qualified| {
+                    self.models
+                        .iter()
+                        .find(|model| model.qualified_id() == qualified)
+                })
+                .is_some_and(|model| {
+                    model.provider == CURSOR_PROVIDER && model_supports_options(model)
+                }),
+        };
+        if let Some(editor) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+        {
+            editor.model = selected.qualified_id().unwrap_or_default();
+            editor.model_dropdown = None;
+            editor.pending_fast_mode = supports_fast_mode.then_some(editor.fast_mode);
+            if !supports_fast_mode {
+                editor.fast_mode = false;
+            }
+        }
+        if supports_fast_mode {
+            Vec::new()
+        } else {
+            self.autosave_agent_edit()
+        }
+    }
+
+    pub fn clear_agent_model_dropdown_query(&mut self) {
+        if let Some(dropdown) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .and_then(|editor| editor.model_dropdown.as_mut())
+        {
+            dropdown.clear();
+        }
     }
 
     pub fn agent_editor_move(&mut self, delta: isize) {
@@ -1294,37 +1531,70 @@ impl AppState {
             AgentEditorField::ALL[offset_index(index, AgentEditorField::ALL.len(), delta)];
     }
 
-    pub fn agent_editor_insert(&mut self, character: char) {
+    pub fn agent_editor_insert(&mut self, character: char) -> Vec<Effect> {
+        let mut edited_field = false;
         if let Some(editor) = self
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
         {
-            editor.value_mut().push(character);
+            if let Some(dropdown) = &mut editor.model_dropdown {
+                dropdown.insert(character);
+            } else {
+                editor.value_mut().push(character);
+                edited_field = true;
+            }
+        }
+        if edited_field {
+            self.autosave_agent_edit()
+        } else {
+            Vec::new()
         }
     }
 
-    pub fn agent_editor_insert_str(&mut self, text: &str) {
+    pub fn agent_editor_insert_str(&mut self, text: &str) -> Vec<Effect> {
+        let mut edited_field = false;
         if let Some(editor) = self
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
         {
-            editor.value_mut().push_str(text);
+            if let Some(dropdown) = &mut editor.model_dropdown {
+                dropdown.insert_str(text);
+            } else {
+                editor.value_mut().push_str(text);
+                edited_field = true;
+            }
+        }
+        if edited_field {
+            self.autosave_agent_edit()
+        } else {
+            Vec::new()
         }
     }
 
-    pub fn agent_editor_backspace(&mut self) {
+    pub fn agent_editor_backspace(&mut self) -> Vec<Effect> {
+        let mut edited_field = false;
         if let Some(editor) = self
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
         {
-            editor.value_mut().pop();
+            if let Some(dropdown) = &mut editor.model_dropdown {
+                dropdown.backspace();
+            } else {
+                editor.value_mut().pop();
+                edited_field = true;
+            }
+        }
+        if edited_field {
+            self.autosave_agent_edit()
+        } else {
+            Vec::new()
         }
     }
 
-    pub fn save_agent_edit(&mut self) -> Vec<Effect> {
+    fn autosave_agent_edit(&self) -> Vec<Effect> {
         let Some(editor) = self
             .agent_picker
             .as_ref()
@@ -1332,8 +1602,12 @@ impl AppState {
         else {
             return Vec::new();
         };
+        let definition = editor.definition();
+        if AgentCatalog::validate_definition(&definition).is_err() {
+            return Vec::new();
+        }
         vec![Effect::SaveAgent {
-            definition: editor.definition(),
+            definition,
             previous_slug: editor.original_slug.clone(),
         }]
     }
@@ -2206,12 +2480,20 @@ impl AppState {
         self.status_message = format!("Inserted {replacement}.");
     }
 
+    #[must_use]
+    pub fn is_shell_mode(&self) -> bool {
+        self.editor.text().starts_with('!')
+    }
+
     pub fn submit_editor(&mut self) -> Vec<Effect> {
         if self.editor.is_blank() {
             self.set_status("Write a message before sending.");
             return Vec::new();
         }
         let editor_text = self.editor.text();
+        if let Some(effects) = self.submit_shell_editor(&editor_text) {
+            return effects;
+        }
         if let Some(command) = commands::parse_prompt_command(&editor_text) {
             match command {
                 ParsedPromptCommand::Agents => {
@@ -2297,6 +2579,30 @@ impl AppState {
         }
     }
 
+    fn submit_shell_editor(&mut self, editor_text: &str) -> Option<Vec<Effect>> {
+        let command = editor_text.strip_prefix('!')?;
+        if command.trim().is_empty() {
+            self.set_status("Write a shell command after !.");
+            return Some(Vec::new());
+        }
+        if !self.draft_attachments.is_empty() {
+            self.set_status("Attachments cannot be used with shell commands.");
+            return Some(Vec::new());
+        }
+        let command = command.to_owned();
+        let id = self.next_id("shell");
+        self.editor.clear();
+        self.transcript.upsert(
+            id.clone(),
+            EntryKind::System,
+            format!("$ {}", command.trim()),
+            "",
+            EntryStatus::Running,
+        );
+        self.status_message = format!("Running {}…", command.trim());
+        Some(vec![Effect::RunShell { id, command }])
+    }
+
     fn compress_session_context(&mut self) -> Vec<Effect> {
         if !self.connection.is_ready() {
             self.set_status("The backend is not ready; context cannot be compressed.");
@@ -2366,6 +2672,7 @@ impl AppState {
         let previous = self.provider_session_id.take();
         self.session_id = None;
         self.session_model_override = false;
+        self.session_model_options_override = None;
         self.selected_model = self.default_model();
         self.active_turn = None;
         self.context_usage = None;
@@ -2427,8 +2734,9 @@ impl AppState {
     }
 
     pub fn submit_or_steer_editor(&mut self) -> Vec<Effect> {
-        let is_prompt_command = commands::parse_prompt_command(&self.editor.text()).is_some();
-        if self.active_turn.is_some() && !is_prompt_command {
+        let is_local_command =
+            self.is_shell_mode() || commands::parse_prompt_command(&self.editor.text()).is_some();
+        if self.active_turn.is_some() && !is_local_command {
             self.steer_editor()
         } else {
             self.submit_editor()
@@ -2648,9 +2956,7 @@ impl AppState {
 
     #[must_use]
     pub fn selected_model_uses_fast_mode(&self) -> bool {
-        self.selected_model
-            .as_deref()
-            .is_some_and(|selected| self.model_options_for_qualified(selected).fast_mode)
+        self.selected_model.is_some() && self.selected_model_options().fast_mode
     }
 
     fn model_options_for_qualified(&self, qualified: &str) -> ModelOptions {
@@ -2670,6 +2976,12 @@ impl AppState {
     }
 
     fn selected_model_options(&self) -> ModelOptions {
+        if let Some(selected) = self.selected_model.as_deref()
+            && let Some((override_model, options)) = &self.session_model_options_override
+            && override_model == selected
+        {
+            return options.clone();
+        }
         self.selected_model.as_ref().map_or_else(
             || self.default_model_options.clone(),
             |selected| self.model_options_for_qualified(selected),
@@ -2710,6 +3022,7 @@ impl AppState {
             stage: ModelPickerStage::Models,
             option_selected: 0,
             options,
+            options_fast_only: false,
         });
         self.pending_model_picker = None;
     }
@@ -2737,7 +3050,8 @@ impl AppState {
         if let Some(picker) = &mut self.model_picker
             && picker.stage == ModelPickerStage::Options
         {
-            picker.option_selected = offset_index(picker.option_selected, 2, delta);
+            let option_count = if picker.options_fast_only { 1 } else { 2 };
+            picker.option_selected = offset_index(picker.option_selected, option_count, delta);
             return;
         }
         let count = self.filtered_models().len();
@@ -2758,7 +3072,11 @@ impl AppState {
         if picker.stage != ModelPickerStage::Options {
             return;
         }
-        if picker.option_selected == 0 {
+        if picker.options_fast_only {
+            if delta != 0 {
+                picker.options.fast_mode = !picker.options.fast_mode;
+            }
+        } else if picker.option_selected == 0 {
             const EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
             let current = picker
                 .options
@@ -2791,15 +3109,20 @@ impl AppState {
                 .model_picker
                 .as_ref()
                 .map_or(ModelPickerStage::Models, |picker| picker.stage);
-            if scope == ModelSelectionScope::Default
-                && selected.provider == CODEX_PROVIDER
+            if scope != ModelSelectionScope::Vision
+                && model_supports_options(&selected)
                 && stage == ModelPickerStage::Models
             {
-                let options = self.model_options_for(&selected);
+                let mut options = self.model_options_for(&selected);
+                let fast_only = selected.provider == CURSOR_PROVIDER;
+                if fast_only {
+                    options.reasoning_effort = None;
+                }
                 if let Some(picker) = &mut self.model_picker {
                     picker.stage = ModelPickerStage::Options;
                     picker.option_selected = 0;
                     picker.options = options;
+                    picker.options_fast_only = fast_only;
                 }
                 return Vec::new();
             }
@@ -2855,6 +3178,8 @@ impl AppState {
             let display = selected.display_name();
             self.selected_model = Some(qualified.clone());
             self.session_model_override = scope == ModelSelectionScope::Session;
+            self.session_model_options_override = (scope == ModelSelectionScope::Session)
+                .then(|| (qualified.clone(), selected_options.clone()));
             if scope == ModelSelectionScope::Default {
                 for model in &mut self.models {
                     if model.provider == selected.provider {
@@ -2878,7 +3203,7 @@ impl AppState {
                     provider: selected.provider.clone(),
                     model: selected.id.clone(),
                 });
-                if selected.provider == CODEX_PROVIDER {
+                if model_supports_options(&selected) {
                     self.install_model_options(
                         &selected.provider,
                         &selected.id,
@@ -2898,20 +3223,22 @@ impl AppState {
                 && let Some(session_id) = self.provider_session_id.clone()
             {
                 effects.push(Effect::Backend(BackendCommand::SetSessionModel {
-                    provider_session_id: session_id.clone(),
-                    model: selected.id,
+                    provider_session_id: session_id,
+                    model: selected.id.clone(),
                 }));
-                if selected.provider == CODEX_PROVIDER {
-                    effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
-                        provider_session_id: session_id,
-                        options: selected_options,
-                    }));
-                }
             } else if let Some(session_id) = self.session_id.clone() {
                 effects.push(Effect::UpdateSessionModel {
                     session_id,
                     model: Some(qualified),
                 });
+            }
+            if model_supports_options(&selected)
+                && let Some(provider_session_id) = self.provider_session_id.clone()
+            {
+                effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
+                    provider_session_id,
+                    options: selected_options,
+                }));
             }
             return effects;
         }
@@ -3517,7 +3844,7 @@ impl AppState {
             title: prompt.text.clone(),
             model: self.selected_model.clone(),
         }];
-        if self.backend_provider == CODEX_PROVIDER {
+        if supports_model_options(&self.backend_provider) {
             effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
                 provider_session_id: provider_session_id.clone(),
                 options: self.selected_model_options(),
@@ -3539,10 +3866,12 @@ impl AppState {
         if provider_session_id.is_empty() {
             return self.protocol_problem("session resume returned an empty provider id");
         }
+        let provider_session_id_for_options = provider_session_id.clone();
         self.provider_session_id = Some(provider_session_id);
         self.session_id = Some(session.id.clone());
         self.context_usage = None;
         self.context_compaction = None;
+        self.session_model_options_override = None;
         if !model.is_empty() {
             self.selected_model = Some(self.qualify_active_model(model));
             self.session_model_override = true;
@@ -3550,10 +3879,17 @@ impl AppState {
         self.install_history(history);
         self.install_subagents(Vec::new());
         self.status_message = format!("Resumed session {}.", short_id(&session.id));
-        vec![
+        let mut effects = vec![
             Effect::TouchSession(session.id.clone()),
             Effect::LoadSubagents(session.id),
-        ]
+        ];
+        if self.backend_provider == CURSOR_PROVIDER {
+            effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
+                provider_session_id: provider_session_id_for_options,
+                options: self.selected_model_options(),
+            }));
+        }
+        effects
     }
 
     fn context_compaction_started(
@@ -4405,8 +4741,8 @@ impl AppState {
             BackendEvent::Ready(_) => self.start_subagent_session(run_id),
             BackendEvent::SessionCreated {
                 provider_session_id,
-                ..
-            } => self.start_subagent_turn(run_id, provider_session_id),
+                model,
+            } => self.start_subagent_turn(run_id, provider_session_id, &model),
             BackendEvent::ItemDelta {
                 turn_id,
                 item_id,
@@ -4663,7 +4999,30 @@ impl AppState {
         }]
     }
 
-    fn start_subagent_turn(&mut self, run_id: &str, provider_session_id: String) -> Vec<Effect> {
+    fn start_subagent_turn(
+        &mut self,
+        run_id: &str,
+        provider_session_id: String,
+        reported_model: &str,
+    ) -> Vec<Effect> {
+        let Some((target, agent_fast_mode)) =
+            self.subagent_executions.get(run_id).map(|execution| {
+                (
+                    execution.model_targets[execution.model_target_index].clone(),
+                    execution.definition.fast_mode,
+                )
+            })
+        else {
+            return Vec::new();
+        };
+        let model = target.model.clone();
+        let options_model = model
+            .as_deref()
+            .or((!reported_model.is_empty()).then_some(reported_model));
+        let mut options = options_model
+            .map(|model| self.model_options_for_qualified(&format!("{}/{model}", target.provider)))
+            .unwrap_or_default();
+        options.fast_mode |= agent_fast_mode;
         let Some(execution) = self.subagent_executions.get_mut(run_id) else {
             return Vec::new();
         };
@@ -4672,11 +5031,18 @@ impl AppState {
         execution.run.status = SubagentStatus::Working;
         "Working…".clone_into(&mut execution.run.latest_activity);
         let prompt = execution.definition.initial_prompt(&execution.task);
-        let model = execution.model_targets[execution.model_target_index]
-            .model
-            .clone();
         self.sync_subagent(run_id);
-        vec![Effect::SubagentBackend {
+        let mut effects = Vec::new();
+        if target.provider == CURSOR_PROVIDER {
+            effects.push(Effect::SubagentBackend {
+                run_id: run_id.to_owned(),
+                command: BackendCommand::SetSessionOptions {
+                    provider_session_id: provider_session_id.clone(),
+                    options,
+                },
+            });
+        }
+        effects.push(Effect::SubagentBackend {
             run_id: run_id.to_owned(),
             command: BackendCommand::StartTurn {
                 provider_session_id,
@@ -4685,7 +5051,8 @@ impl AppState {
                 attachments: Vec::new(),
                 model,
             },
-        }]
+        });
+        effects
     }
 
     fn record_subagent_delta(
@@ -5030,6 +5397,7 @@ impl AppState {
                 .is_supported())
         {
             self.session_model_override = false;
+            self.session_model_options_override = None;
             self.selected_model = self.default_model();
         }
     }
@@ -5045,6 +5413,44 @@ impl AppState {
                     .find(|model| model.provider == self.backend_provider)
             })
             .map(ModelInfo::qualified_id)
+    }
+
+    pub fn shell_output(&mut self, id: &str, output: &str) {
+        self.transcript
+            .replace_body(id, output, EntryStatus::Running);
+        self.scroll_from_bottom = 0;
+    }
+
+    pub fn shell_finished(
+        &mut self,
+        id: &str,
+        output: &str,
+        exit_code: Option<i32>,
+        interrupted: bool,
+    ) {
+        let status = if interrupted {
+            EntryStatus::Interrupted
+        } else if exit_code == Some(0) {
+            EntryStatus::Complete
+        } else {
+            EntryStatus::Failed
+        };
+        self.transcript.replace_body(id, output, status);
+        self.status_message = if interrupted {
+            "Shell command interrupted.".to_owned()
+        } else if let Some(exit_code) = exit_code {
+            format!("Shell command exited with code {exit_code}.")
+        } else {
+            "Shell command ended without an exit code.".to_owned()
+        };
+        self.scroll_from_bottom = 0;
+    }
+
+    pub fn shell_failed(&mut self, id: &str, message: &str) {
+        self.transcript
+            .replace_body(id, message, EntryStatus::Failed);
+        message.clone_into(&mut self.status_message);
+        self.scroll_from_bottom = 0;
     }
 
     fn protocol_problem(&mut self, message: &str) -> Vec<Effect> {
@@ -5240,7 +5646,10 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus};
+    use super::{
+        AgentEditorField, AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus,
+        model_supports_options,
+    };
 
     #[test]
     fn primary_system_instructions_include_model_personality_and_soul() {
@@ -5308,6 +5717,140 @@ model = "openai-codex/model-a"
             is_default: true,
         }]));
         state
+    }
+
+    #[test]
+    fn leading_bang_submits_a_local_shell_command_without_a_backend_turn() {
+        let mut state = ready_state();
+        state.editor.set_text("!./install.sh --check");
+        assert!(state.is_shell_mode());
+
+        let effects = state.submit_editor();
+        let [Effect::RunShell { id, command }] = effects.as_slice() else {
+            panic!("expected a shell effect");
+        };
+        assert_eq!(command, "./install.sh --check");
+        assert!(state.editor.is_blank());
+        let entry = state.transcript.entries().last().expect("shell entry");
+        assert_eq!(entry.key.as_deref(), Some(id.as_str()));
+        assert_eq!(entry.title, "$ ./install.sh --check");
+        assert_eq!(entry.kind, EntryKind::System);
+        assert_eq!(entry.status, EntryStatus::Running);
+    }
+
+    #[test]
+    fn shell_command_runs_locally_while_an_agent_turn_is_active() {
+        let mut state = ready_state();
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: None,
+            cancelling: false,
+        });
+        state.editor.set_text("!pwd");
+
+        assert!(matches!(
+            state.submit_or_steer_editor().as_slice(),
+            [Effect::RunShell { command, .. }] if command == "pwd"
+        ));
+    }
+
+    #[test]
+    fn shell_output_updates_the_ephemeral_transcript_entry() {
+        let mut state = ready_state();
+        state.editor.set_text("!printf hello");
+        let effects = state.submit_editor();
+        let [Effect::RunShell { id, .. }] = effects.as_slice() else {
+            panic!("expected a shell effect");
+        };
+
+        state.shell_output(id, "hel");
+        state.shell_output(id, "hello");
+        state.shell_finished(id, "hello", Some(0), false);
+
+        let entry = state.transcript.entries().last().expect("shell entry");
+        assert_eq!(entry.body, "hello");
+        assert_eq!(entry.status, EntryStatus::Complete);
+        assert_eq!(state.status_message, "Shell command exited with code 0.");
+    }
+
+    #[test]
+    fn empty_shell_command_keeps_the_draft() {
+        let mut state = ready_state();
+        state.editor.set_text("!  ");
+
+        assert!(state.submit_editor().is_empty());
+        assert_eq!(state.editor.text(), "!  ");
+        assert_eq!(state.status_message, "Write a shell command after !.");
+    }
+
+    #[test]
+    fn cursor_agent_model_selection_opens_shared_fast_mode_options() {
+        let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CURSOR_PROVIDER.to_owned(),
+            id: "composer-2.5".to_owned(),
+            is_default: true,
+        });
+        state.open_agent_picker();
+        state.edit_selected_agent();
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = AgentEditorField::Model;
+
+        state.open_agent_model_dropdown();
+        state.agent_editor_insert_str("composer");
+        state.select_agent_model_dropdown();
+        assert!(state.agent_model_options_are_open());
+        state.adjust_agent_model_options(1);
+        let effects = state.apply_agent_model_options();
+        assert!(!state.agent_model_options_are_open());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SaveAgent { definition, .. }]
+                if definition.model.as_deref() == Some("cursor-sdk/composer-2.5")
+                && definition.fast_mode
+        ));
+    }
+
+    #[test]
+    fn agent_model_dropdown_searches_catalog_and_applies_selection() {
+        let mut state = ready_state();
+        state.open_agent_picker();
+        state.edit_selected_agent();
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = AgentEditorField::Model;
+
+        state.open_agent_model_dropdown();
+        assert!(state.agent_model_dropdown_is_open());
+        state.agent_editor_insert_str("model a");
+        state.select_agent_model_dropdown();
+        let editor = state
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .expect("agent editor");
+        assert_eq!(editor.model, "openai-codex/model-a");
+        assert!(editor.model_dropdown.is_none());
+
+        state.open_agent_model_dropdown();
+        state.agent_editor_insert_str("inherit");
+        state.select_agent_model_dropdown();
+        assert_eq!(
+            state
+                .agent_picker
+                .as_ref()
+                .and_then(|picker| picker.editor.as_ref())
+                .expect("agent editor")
+                .model,
+            ""
+        );
     }
 
     fn install_review_skill(state: &mut AppState) {
@@ -6551,6 +7094,7 @@ model = "openai-codex/model-a"
         let _ = state.open_model_picker();
         state.picker_move(1);
         let _ = state.picker_select();
+        let _ = state.picker_select();
 
         assert_eq!(
             state.selected_model.as_deref(),
@@ -6610,6 +7154,92 @@ model = "openai-codex/model-a"
             state.selected_model.as_deref(),
             Some("openai-codex/model-b")
         );
+    }
+
+    #[test]
+    fn cursor_model_options_are_limited_to_fast_capable_families() {
+        let cursor_model = |id: &str| ModelInfo {
+            provider: CURSOR_PROVIDER.to_owned(),
+            id: id.to_owned(),
+            is_default: false,
+        };
+
+        assert!(model_supports_options(&cursor_model("composer-2.5")));
+        assert!(model_supports_options(&cursor_model("grok-4.5")));
+        assert!(!model_supports_options(&cursor_model("claude-4.6-opus")));
+    }
+
+    #[test]
+    fn cursor_models_can_persist_fast_mode_as_their_default() {
+        let mut state = ready_state();
+        state.backend_provider = CURSOR_PROVIDER.to_owned();
+        state.backend_name = "Cursor".to_owned();
+        state.models = vec![ModelInfo {
+            provider: CURSOR_PROVIDER.to_owned(),
+            id: "composer-2.5".to_owned(),
+            is_default: true,
+        }];
+        state.selected_model = Some("cursor-sdk/composer-2.5".to_owned());
+        state.editor.set_text("/models");
+
+        assert!(state.submit_editor().is_empty());
+        assert!(state.picker_select().is_empty());
+        let picker = state.model_picker.as_ref().expect("Cursor options picker");
+        assert_eq!(picker.stage, super::ModelPickerStage::Options);
+        assert!(picker.options_fast_only);
+        assert!(picker.options.reasoning_effort.is_none());
+
+        state.picker_adjust(1);
+        let effects = state.picker_select();
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::SetDefaultModel { provider, model },
+                Effect::SaveModelOptions { options, .. }
+            ] if provider == CURSOR_PROVIDER
+                && model == "composer-2.5"
+                && options.fast_mode
+                && options.reasoning_effort.is_none()
+        ));
+        assert!(state.selected_model_uses_fast_mode());
+    }
+
+    #[test]
+    fn switch_uses_the_shared_cursor_fast_mode_selector() {
+        let mut state = ready_state();
+        state.backend_provider = CURSOR_PROVIDER.to_owned();
+        state.backend_name = "Cursor".to_owned();
+        state.backend_capabilities.session_model_config = CapabilitySupport::Supported;
+        state.models = vec![ModelInfo {
+            provider: CURSOR_PROVIDER.to_owned(),
+            id: "composer-2.5".to_owned(),
+            is_default: true,
+        }];
+        state.selected_model = Some("cursor-sdk/composer-2.5".to_owned());
+        state.provider_session_id = Some("cursor-session-1".to_owned());
+        state.editor.set_text("/switch");
+
+        assert!(state.submit_editor().is_empty());
+        assert!(state.picker_select().is_empty());
+        let picker = state.model_picker.as_ref().expect("Cursor options picker");
+        assert_eq!(picker.scope, super::ModelSelectionScope::Session);
+        assert_eq!(picker.stage, super::ModelPickerStage::Options);
+        assert!(picker.options_fast_only);
+
+        state.picker_adjust(1);
+        let effects = state.picker_select();
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Backend(BackendCommand::SetSessionModel { model, .. }),
+                Effect::Backend(BackendCommand::SetSessionOptions { options, .. })
+            ] if model == "composer-2.5" && options.fast_mode
+        ));
+        assert!(state.selected_model_uses_fast_mode());
+
+        state.editor.set_text("/new");
+        let _ = state.submit_editor();
+        assert!(!state.selected_model_uses_fast_mode());
     }
 
     #[test]
@@ -6675,6 +7305,11 @@ model = "openai-codex/model-a"
             Some(super::ModelSelectionScope::Session)
         );
         state.picker_move(1);
+        assert!(state.picker_select().is_empty());
+        assert_eq!(
+            state.model_picker.as_ref().map(|picker| picker.stage),
+            Some(super::ModelPickerStage::Options)
+        );
         let effects = state.picker_select();
         assert!(matches!(
             effects.as_slice(),
@@ -6829,6 +7464,78 @@ model = "openai-codex/model-a"
             .find(|entry| entry.kind == crate::transcript::EntryKind::User)
             .expect("displayed user prompt");
         assert_eq!(displayed_user.body, "What is my name?");
+    }
+
+    #[test]
+    fn cursor_subagent_applies_saved_fast_mode_before_its_first_turn() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("cursor-explorer.toml"),
+            r#"
+slug = "cursor-explorer"
+description = "Explores with Cursor"
+system_prompt = "Explore carefully."
+first_message = "Inspect the delegated question."
+model = "cursor-sdk/composer-2.5"
+fast_mode = true
+"#,
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 42,
+            agent: "cursor-explorer".to_owned(),
+            task: "Map auth".to_owned(),
+        });
+        let [Effect::SpawnSubagent { run_id, provider }] = effects.as_slice() else {
+            panic!("expected Cursor subagent launch");
+        };
+        assert_eq!(provider, CURSOR_PROVIDER);
+        let run_id = run_id.clone();
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CURSOR_PROVIDER.to_owned(),
+                display_name: "Cursor".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SubagentBackend {
+                command: BackendCommand::StartSession { model: Some(model), .. },
+                ..
+            }] if model == "composer-2.5"
+        ));
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "cursor-child".to_owned(),
+                model: "composer-2.5".to_owned(),
+            },
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::SubagentBackend {
+                    command: BackendCommand::SetSessionOptions {
+                        provider_session_id,
+                        options,
+                    },
+                    ..
+                },
+                Effect::SubagentBackend {
+                    command: BackendCommand::StartTurn { model: Some(model), .. },
+                    ..
+                }
+            ] if provider_session_id == "cursor-child"
+                && options.fast_mode
+                && model == "composer-2.5"
+        ));
     }
 
     #[test]

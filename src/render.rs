@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     backend::{ApprovalRequest, TodoStatus},
@@ -538,14 +539,22 @@ fn render_subagent_modal(frame: &mut Frame<'_>, area: Rect, state: &mut AppState
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<Position> {
+    let composer_label = if state.is_shell_mode() {
+        " Shell "
+    } else {
+        " Nako "
+    };
     let mut title = if state.is_busy() {
         vec![
             Span::raw(" "),
             Span::styled(spinner_frame(), Style::default().fg(ACCENT_BRIGHT)),
-            Span::styled(" Nako ", Style::default().fg(TEXT).bold()),
+            Span::styled(composer_label, Style::default().fg(TEXT).bold()),
         ]
     } else {
-        vec![Span::styled(" Nako ", Style::default().fg(TEXT).bold())]
+        vec![Span::styled(
+            composer_label,
+            Style::default().fg(TEXT).bold(),
+        )]
     };
     if let Some(usage) = state.context_usage
         && let Some(label) = context_usage_label(usage.estimated_tokens, usage.context_window)
@@ -1094,12 +1103,123 @@ fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Paragraph::new(lines).block(overlay_block(" Agents ", ACCENT)),
         popup,
     );
+    if let Some(dropdown) = picker
+        .editor
+        .as_ref()
+        .and_then(|editor| editor.model_dropdown.as_ref())
+    {
+        let dropdown_popup = centered(area, 68, 18);
+        render_searchable_dropdown(
+            frame,
+            dropdown_popup,
+            dropdown,
+            " Select Agent Model ",
+            "No matching models",
+            crate::state::AgentModelOption::search_text,
+            |option, selected| {
+                Line::from(vec![
+                    Span::styled(
+                        if selected { "› " } else { "  " },
+                        Style::default().fg(if selected { ACCENT } else { MUTED }),
+                    ),
+                    Span::styled(
+                        option.label(),
+                        Style::default()
+                            .fg(if selected { TEXT } else { MUTED })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(format!("  {}", option.detail()), Style::default().fg(MUTED)),
+                ])
+            },
+        );
+    } else if let Some(fast_mode) = picker
+        .editor
+        .as_ref()
+        .and_then(|editor| editor.pending_fast_mode)
+    {
+        render_model_options_popup(
+            frame,
+            centered(area, 72, 18),
+            &crate::backend::ModelOptions {
+                reasoning_effort: None,
+                fast_mode,
+            },
+            0,
+            true,
+            "Configure this agent's Cursor model",
+        );
+    }
+}
+
+fn render_searchable_dropdown<T, S, R>(
+    frame: &mut Frame<'_>,
+    popup: Rect,
+    dropdown: &crate::searchable_dropdown::SearchableDropdown<T>,
+    title: &str,
+    empty_message: &str,
+    search_text: S,
+    row: R,
+) where
+    S: Fn(&T) -> String,
+    R: Fn(&T, bool) -> Line<'static>,
+{
+    frame.render_widget(Clear, popup);
+    let filtered = dropdown.filtered_items(search_text);
+    let visible_rows = usize::from(popup.height.saturating_sub(6)).max(1);
+    let start = dropdown
+        .selected
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(filtered.len().saturating_sub(visible_rows));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(ACCENT_BRIGHT).bold()),
+            Span::styled(&dropdown.query, Style::default().fg(TEXT)),
+        ])
+        .style(Style::default().bg(SURFACE_RAISED)),
+        Line::default(),
+    ];
+    if filtered.is_empty() {
+        lines.push(Line::styled(
+            empty_message.to_owned(),
+            Style::default().fg(DANGER),
+        ));
+    } else {
+        lines.extend(
+            filtered
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible_rows)
+                .map(|(index, item)| row(item, index == dropdown.selected)),
+        );
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "Type to search · ↑/↓ select · Enter apply · Esc cancel",
+        Style::default().fg(MUTED),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines).block(overlay_block(title.to_owned(), ACCENT)),
+        popup,
+    );
+    let query_width =
+        u16::try_from(UnicodeWidthStr::width(dropdown.query.as_str())).unwrap_or(u16::MAX);
+    let input_start = popup.x.saturating_add(1).saturating_add(8);
+    let input_end = popup.right().saturating_sub(2);
+    frame.set_cursor_position(Position::new(
+        input_start.saturating_add(query_width).min(input_end),
+        popup.y.saturating_add(1),
+    ));
 }
 
 fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
-            "Tab/↑/↓ field · type or paste · Ctrl+S save · Esc cancel",
+            "Tab/↑/↓ field · type or paste · Enter choose model · changes save automatically · Esc close",
             Style::default().fg(MUTED),
         ),
         Line::default(),
@@ -1138,8 +1258,12 @@ fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> 
         lines.push(Line::default());
     }
     lines.push(Line::styled(
-        "Models use provider/model; separate fallbacks with commas.",
-        Style::default().fg(MUTED),
+        if editor.fast_mode {
+            "Models use provider/model; fallbacks use commas · ⚡ Fast mode enabled"
+        } else {
+            "Models use provider/model; separate fallbacks with commas."
+        },
+        Style::default().fg(if editor.fast_mode { ACCENT } else { MUTED }),
     ));
     lines
 }
@@ -1165,6 +1289,11 @@ fn agent_list_lines(picker: &crate::state::AgentPicker) -> Vec<Line<'static>> {
             .chain(agent.fallback_models.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" → ");
+        let models = if agent.fast_mode {
+            format!("{models}  ⚡ fast")
+        } else {
+            models
+        };
         lines.push(Line::styled(
             format!("    {models}"),
             Style::default().fg(if selected { ACCENT_DEEP } else { MUTED }),
@@ -1646,68 +1775,91 @@ fn relative_time(timestamp: i64) -> String {
     }
 }
 
+fn render_model_options_popup(
+    frame: &mut Frame<'_>,
+    popup: Rect,
+    options: &crate::backend::ModelOptions,
+    option_selected: usize,
+    fast_only: bool,
+    description: &str,
+) {
+    frame.render_widget(Clear, popup);
+    let effort = options.reasoning_effort.as_deref().unwrap_or("medium");
+    let fast = if options.fast_mode { "⚡ on" } else { "off" };
+    let option_line = |index: usize, label: &str, value: &str| {
+        let selected = option_selected == index;
+        Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(if selected { ACCENT } else { MUTED }),
+            ),
+            Span::styled(
+                format!("{label}: "),
+                Style::default()
+                    .fg(if selected { TEXT } else { MUTED })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(
+                value.to_owned(),
+                Style::default().fg(if selected { ACCENT } else { MUTED }),
+            ),
+        ])
+    };
+    let mut lines = vec![
+        Line::styled(description.to_owned(), Style::default().fg(MUTED)),
+        Line::default(),
+    ];
+    if fast_only {
+        lines.push(option_line(0, "Fast mode", fast));
+    } else {
+        lines.push(option_line(0, "Reasoning effort", effort));
+        lines.push(option_line(1, "Fast mode", fast));
+    }
+    lines.extend([
+        Line::default(),
+        Line::styled(
+            "↑/↓ select · ←/→ change · Enter apply · Esc cancel",
+            Style::default().fg(MUTED),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Model Options "),
+            )
+            .style(Style::default().bg(SURFACE)),
+        popup,
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let popup = centered(area, 72, 18);
     frame.render_widget(Clear, popup);
     let picker = state.model_picker.as_ref().expect("picker checked");
     if picker.stage == crate::state::ModelPickerStage::Options {
-        let effort = picker
-            .options
-            .reasoning_effort
-            .as_deref()
-            .unwrap_or("medium");
-        let fast = if picker.options.fast_mode {
-            "⚡ on"
-        } else {
-            "off"
-        };
-        let option_line = |index: usize, label: &str, value: &str| {
-            let selected = picker.option_selected == index;
-            Line::from(vec![
-                Span::styled(
-                    if selected { "› " } else { "  " },
-                    Style::default().fg(if selected { ACCENT } else { MUTED }),
-                ),
-                Span::styled(
-                    format!("{label}: "),
-                    Style::default()
-                        .fg(if selected { TEXT } else { MUTED })
-                        .add_modifier(if selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(
-                    value.to_owned(),
-                    Style::default().fg(if selected { ACCENT } else { MUTED }),
-                ),
-            ])
-        };
-        let lines = vec![
-            Line::styled(
-                "Configure the OpenAI model default",
-                Style::default().fg(MUTED),
-            ),
-            Line::default(),
-            option_line(0, "Reasoning effort", effort),
-            option_line(1, "Fast mode", fast),
-            Line::default(),
-            Line::styled(
-                "↑/↓ select · ←/→ change · Enter apply · Esc cancel",
-                Style::default().fg(MUTED),
-            ),
-        ];
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Model Options "),
-                )
-                .style(Style::default().bg(SURFACE)),
+        render_model_options_popup(
+            frame,
             popup,
+            &picker.options,
+            picker.option_selected,
+            picker.options_fast_only,
+            match (picker.scope, picker.options_fast_only) {
+                (crate::state::ModelSelectionScope::Session, true) => {
+                    "Configure this session's Cursor model"
+                }
+                (crate::state::ModelSelectionScope::Session, false) => {
+                    "Configure this session's OpenAI model"
+                }
+                (_, true) => "Configure the Cursor model default",
+                (_, false) => "Configure the OpenAI model default",
+            },
         );
         return;
     }
@@ -1926,6 +2078,28 @@ mod tests {
     }
 
     #[test]
+    fn composer_identifies_shell_mode_for_a_leading_bang() {
+        let backend = TestBackend::new(80, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("!printf hello");
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render shell composer");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Shell"));
+        assert!(rendered.contains("!printf hello"));
+    }
+
+    #[test]
     fn addons_settings_render_terminal_image_choice() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
@@ -2102,6 +2276,39 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("MODEL GPT 5.6 Sol ⚡"));
+    }
+
+    #[test]
+    fn switch_options_popup_exposes_cursor_fast_mode_for_this_session() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.model_picker = Some(crate::state::ModelPicker {
+            filter: String::new(),
+            selected: 0,
+            scope: crate::state::ModelSelectionScope::Session,
+            stage: crate::state::ModelPickerStage::Options,
+            option_selected: 0,
+            options: ModelOptions {
+                reasoning_effort: None,
+                fast_mode: false,
+            },
+            options_fast_only: true,
+        });
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render switch options");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Model Options"));
+        assert!(rendered.contains("Configure this session's Cursor model"));
+        assert!(rendered.contains("Fast mode"));
     }
 
     #[test]
@@ -2578,7 +2785,64 @@ mod tests {
         assert!(editor.contains("System prompt"));
         assert!(editor.contains("First message"));
         assert!(editor.contains("Fallbacks"));
-        assert!(editor.contains("Ctrl+S save"));
+        assert!(editor.contains("Enter choose model"));
+        assert!(editor.contains("changes save automatically"));
+
+        state.models = vec![
+            crate::backend::ModelInfo {
+                provider: "openai-codex".to_owned(),
+                id: "gpt-5.6-sol".to_owned(),
+                is_default: true,
+            },
+            crate::backend::ModelInfo {
+                provider: crate::backend::CURSOR_PROVIDER.to_owned(),
+                id: "composer-2.5".to_owned(),
+                is_default: true,
+            },
+        ];
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = crate::state::AgentEditorField::Model;
+        state.open_agent_model_dropdown();
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render agent model dropdown");
+        let dropdown = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(dropdown.contains("Select Agent Model"));
+        assert!(dropdown.contains("Inherit parent model"));
+        assert!(dropdown.contains("GPT 5.6 Sol"));
+        assert!(
+            terminal.backend().cursor_visible(),
+            "the dropdown should focus its search input even when a model row is selected"
+        );
+        let cursor = terminal.backend().cursor_position();
+        assert_eq!(cursor.y, 7);
+        assert_eq!(cursor.x, 25);
+
+        state.agent_editor_insert_str("composer");
+        state.select_agent_model_dropdown();
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render agent model options");
+        let options = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(options.contains("Model Options"));
+        assert!(options.contains("Configure this agent's Cursor model"));
+        assert!(options.contains("Fast mode"));
     }
 
     #[test]

@@ -282,6 +282,14 @@ impl Transcript {
         }
     }
 
+    pub fn replace_body(&mut self, key: &str, body: &str, status: EntryStatus) {
+        if let Some(index) = self.item_indices.get(key).copied() {
+            body.clone_into(&mut self.entries[index].body);
+            self.entries[index].status = status;
+            self.changed();
+        }
+    }
+
     pub fn move_before(&mut self, key: &str, anchor: &str) {
         let Some(index) = self.item_indices.get(key).copied() else {
             return;

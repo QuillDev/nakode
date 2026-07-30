@@ -68,6 +68,7 @@ struct BridgeRequest {
     payload: Value,
 }
 
+#[derive(Debug)]
 struct UnsupportedCommand {
     operation: BackendOperation,
     message: &'static str,
@@ -427,12 +428,19 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         BackendCommand::Reload {
             provider_session_id,
         } => ("reload", json!({"sessionId":provider_session_id})),
-        BackendCommand::SetSessionModel { .. } | BackendCommand::SetSessionOptions { .. } => {
+        BackendCommand::SetSessionModel { .. } => {
             return Err(UnsupportedCommand {
                 operation: BackendOperation::SetSessionModel,
                 message: "Cursor applies model changes on the next turn",
             });
         }
+        BackendCommand::SetSessionOptions {
+            provider_session_id,
+            options,
+        } => (
+            "set_options",
+            json!({"sessionId":provider_session_id,"fastMode":options.fast_mode}),
+        ),
         BackendCommand::CompactSession { .. } => {
             return Err(UnsupportedCommand {
                 operation: BackendOperation::CompactSession,
@@ -684,6 +692,7 @@ fn operation_for_method(method: &str) -> BackendOperation {
         "resume" => BackendOperation::ResumeSession,
         "close" => BackendOperation::UnsubscribeSession,
         "reload" | "models" => BackendOperation::Reload,
+        "set_options" => BackendOperation::SetSessionModel,
         "cancel" => BackendOperation::InterruptTurn,
         _ => BackendOperation::StartTurn,
     }
@@ -707,12 +716,33 @@ mod tests {
     #[test]
     fn bridge_injects_only_the_nakode_coordination_tool() {
         assert!(BRIDGE_SOURCE.contains("nakode_agent:"));
+        assert!(BRIDGE_SOURCE.contains("params = [{ id: \"fast\", value: \"true\" }]"));
+        assert!(BRIDGE_SOURCE.contains("modelId.startsWith(\"grok-4.5\")"));
+        assert!(BRIDGE_SOURCE.contains("modelId.startsWith(\"composer-\")"));
+        assert!(BRIDGE_SOURCE.contains("command.model ?? agent.model?.id"));
         assert!(!BRIDGE_SOURCE.contains("customTools: {\n      read:"));
         for name in [
             "read", "write", "edit", "bash", "grep", "find", "ls", "eval", "ask", "todo",
         ] {
             assert!(!BRIDGE_SOURCE.contains(&format!("      {name}: {{")));
         }
+    }
+
+    #[test]
+    fn cursor_session_options_are_forwarded_to_the_bridge() {
+        let request = bridge_request(BackendCommand::SetSessionOptions {
+            provider_session_id: "cursor-session".to_owned(),
+            options: crate::backend::ModelOptions {
+                reasoning_effort: None,
+                fast_mode: true,
+            },
+        })
+        .expect("supported options")
+        .expect("bridge request");
+
+        assert_eq!(request.method, "set_options");
+        assert_eq!(request.payload["sessionId"], "cursor-session");
+        assert_eq!(request.payload["fastMode"], true);
     }
 
     #[test]

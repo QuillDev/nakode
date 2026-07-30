@@ -15,6 +15,7 @@ pub enum ControlContext {
     ProviderCredential,
     AgentList,
     AgentEditor,
+    SearchableDropdown,
     Settings,
     Subagent,
 }
@@ -75,7 +76,6 @@ pub enum ControlAction {
     Focus,
     Open,
     Create,
-    Save,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -294,6 +294,10 @@ const KEY_CONTROLS: &[KeyControl] = &[
         "Ctrl/Cmd+Backspace",
         "delete to the line start"
     ),
+    // Some terminals encode the standard macOS/shell editing shortcuts as
+    // control characters instead of reporting the original modified key.
+    control!(Global, BackspaceWord, KeyCode::Char('w'), Control),
+    control!(Global, BackspaceLine, KeyCode::Char('u'), Control),
     control!(Global, Backspace, KeyCode::Backspace, None),
     control!(Global, Delete, KeyCode::Delete, None),
     control!(Global, InsertTab, KeyCode::Tab, None),
@@ -307,6 +311,9 @@ const KEY_CONTROLS: &[KeyControl] = &[
         "move by word"
     ),
     control!(Navigation, MoveWordRight, KeyCode::Right, Alt),
+    // Legacy terminals commonly send Esc-b/Esc-f for Option+Left/Right.
+    control!(Navigation, MoveWordLeft, KeyCode::Char('b'), Alt),
+    control!(Navigation, MoveWordRight, KeyCode::Char('f'), Alt),
     control!(
         Navigation,
         MoveLineStart,
@@ -317,6 +324,9 @@ const KEY_CONTROLS: &[KeyControl] = &[
         "move to the line edge"
     ),
     control!(Navigation, MoveLineEnd, KeyCode::Right, Boundary),
+    // Terminal profiles often map Command+Left/Right to Ctrl+A/Ctrl+E.
+    control!(Navigation, MoveLineStart, KeyCode::Char('a'), Control),
+    control!(Navigation, MoveLineEnd, KeyCode::Char('e'), Control),
     control!(
         Navigation,
         MoveDocumentStart,
@@ -396,10 +406,16 @@ const KEY_CONTROLS: &[KeyControl] = &[
     control!(AgentEditor, Previous, KeyCode::Up, Any),
     control!(AgentEditor, Previous, KeyCode::Tab, Shift),
     control!(AgentEditor, Close, KeyCode::Esc, Any),
-    control!(AgentEditor, Save, KeyCode::Char('s'), Control),
+    control!(AgentEditor, Open, KeyCode::Enter, Any),
     control!(AgentEditor, Next, KeyCode::Tab, None),
     control!(AgentEditor, Next, KeyCode::Down, Any),
     control!(AgentEditor, Backspace, KeyCode::Backspace, Any),
+    control!(SearchableDropdown, Select, KeyCode::Enter, Any),
+    control!(SearchableDropdown, Close, KeyCode::Esc, Any),
+    control!(SearchableDropdown, Previous, KeyCode::Up, Any),
+    control!(SearchableDropdown, Next, KeyCode::Down, Any),
+    control!(SearchableDropdown, Backspace, KeyCode::Backspace, Any),
+    control!(SearchableDropdown, Clear, KeyCode::Char('u'), Control),
     control!(Settings, Close, KeyCode::Esc, Any),
     control!(Settings, Select, KeyCode::Enter, Any),
     control!(Settings, Previous, KeyCode::Up, Any),
@@ -478,12 +494,16 @@ impl ModifierMatch {
                     | KeyModifiers::ALT
                     | KeyModifiers::SHIFT
                     | KeyModifiers::SUPER
-                    | KeyModifiers::HYPER,
+                    | KeyModifiers::HYPER
+                    | KeyModifiers::META,
             ),
             Self::Control => modifiers.contains(KeyModifiers::CONTROL),
             Self::Alt => modifiers.contains(KeyModifiers::ALT),
             Self::Shift => modifiers.contains(KeyModifiers::SHIFT),
-            Self::Boundary => modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER),
+            // A few Kitty-protocol terminals report Command as META rather than
+            // SUPER. Treat both as a prompt/line boundary modifier.
+            Self::Boundary => modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META),
         }
     }
 }

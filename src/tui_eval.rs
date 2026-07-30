@@ -1027,6 +1027,9 @@ fn active_modal(state: &AppState) -> String {
 fn effect_view(effect: &Effect) -> Value {
     match effect {
         Effect::Backend(command) => backend_command_view(command),
+        Effect::RunShell { id, command } => {
+            json!({"type": "run_shell", "id": id, "command": command})
+        }
         Effect::SpawnSubagent { run_id, provider } => {
             json!({"type": "spawn_subagent", "run_id": run_id, "provider": provider})
         }
