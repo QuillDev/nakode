@@ -26,11 +26,11 @@ use crate::{
     personality::{PromptAddenda, PromptAddendaError},
     render,
     selection::ScreenPoint,
-    service::ServiceEngine,
+    service::{ServiceEngine, ServiceEvent, ServiceSubscription},
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
     shell::{ShellEvent, ShellProcesses},
     skill::{SkillCatalog, SkillCatalogError},
-    state::{AgentBrowserStatus, AppState, ApprovalDecision, Effect},
+    state::{AgentBrowserStatus, AppState, ApprovalDecision, ClientPresentationState, Effect},
     terminal::{TerminalSession, Tui},
 };
 
@@ -87,33 +87,95 @@ struct PersistenceServices<'a> {
     credentials: &'a dyn CredentialStore,
 }
 
-struct ServiceHost<'a> {
+/// In-process implementation of the service client boundary.
+///
+/// Canonical state and effect executors stay behind this type. Presentation is
+/// extracted from the engine between calls, and rendering receives a disposable
+/// projection assembled from a fresh server view plus that local presentation.
+/// Checkpoint 7 replaces this adapter with the framed out-of-process transport.
+struct InProcessServiceClient<'a> {
     engine: ServiceEngine,
     backends: BackendRegistry,
     persistence: PersistenceServices<'a>,
     agent_requests: HashMap<u64, IncomingInvocation>,
     shell_processes: ShellProcesses,
+    presentation: ClientPresentationState,
+    subscription: ServiceSubscription,
+    observed_revision: u64,
 }
 
-impl<'a> ServiceHost<'a> {
+impl<'a> InProcessServiceClient<'a> {
     fn new(
-        engine: ServiceEngine,
+        mut engine: ServiceEngine,
         backends: BackendRegistry,
         persistence: PersistenceServices<'a>,
     ) -> Self {
+        let presentation = std::mem::take(&mut engine.state_mut().client);
+        let observed_revision = engine.snapshot().revision;
+        let subscription = engine.subscribe();
         Self {
             engine,
             backends,
             persistence,
             agent_requests: HashMap::new(),
             shell_processes: ShellProcesses::new(),
+            presentation,
+            subscription,
+            observed_revision,
         }
     }
 
     fn handle_terminal(&mut self, event: Event) -> Vec<Effect> {
+        self.install_presentation();
         let effects = handle_terminal_event(self.engine.state_mut(), event);
+        self.extract_presentation();
         self.engine.note_state_change();
         effects
+    }
+
+    fn flush_clipboard(&mut self, terminal: &mut Tui) {
+        self.install_presentation();
+        flush_pending_clipboard(terminal, self.engine.state_mut());
+        self.extract_presentation();
+    }
+
+    fn projection(&mut self) -> AppState {
+        self.synchronize();
+        let mut projection = self.engine.state().clone();
+        projection.client = self.presentation.clone();
+        projection
+    }
+
+    fn synchronize(&mut self) {
+        loop {
+            match self.subscription.try_recv() {
+                Ok(ServiceEvent::StateChanged { revision }) => {
+                    self.observed_revision = revision;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    self.observed_revision = self.engine.snapshot().revision;
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    self.subscription = self.engine.subscribe();
+                    self.observed_revision = self.engine.snapshot().revision;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn update_projection(&mut self, projection: AppState) {
+        self.presentation = projection.client;
+    }
+
+    fn install_presentation(&mut self) {
+        self.engine.state_mut().client = std::mem::take(&mut self.presentation);
+    }
+
+    fn extract_presentation(&mut self) {
+        self.presentation = std::mem::take(&mut self.engine.state_mut().client);
     }
 
     fn provider_channels_closed(&mut self) {
@@ -151,8 +213,23 @@ impl<'a> ServiceHost<'a> {
         Some(self.engine.invoke_agent(&invocation))
     }
 
+    fn handle_provider_backend(&mut self, provider: &str, event: BackendEvent) -> Vec<Effect> {
+        self.install_presentation();
+        let effects = self.engine.handle_provider_backend(provider, event);
+        self.extract_presentation();
+        effects
+    }
+
+    fn handle_subagent_backend(&mut self, run_id: &str, event: BackendEvent) -> Vec<Effect> {
+        self.install_presentation();
+        let effects = self.engine.handle_subagent_backend(run_id, event);
+        self.extract_presentation();
+        effects
+    }
+
     async fn apply(&mut self, effects: Vec<Effect>) -> bool {
-        apply_effects(
+        self.install_presentation();
+        let quit = apply_effects(
             self.engine.state_mut(),
             effects,
             &mut self.backends,
@@ -160,7 +237,9 @@ impl<'a> ServiceHost<'a> {
             &mut self.agent_requests,
             &mut self.shell_processes,
         )
-        .await
+        .await;
+        self.extract_presentation();
+        quit
     }
 
     async fn shutdown(mut self) -> ServiceEngine {
@@ -170,7 +249,7 @@ impl<'a> ServiceHost<'a> {
     }
 }
 
-impl Deref for ServiceHost<'_> {
+impl Deref for InProcessServiceClient<'_> {
     type Target = AppState;
 
     fn deref(&self) -> &Self::Target {
@@ -178,7 +257,7 @@ impl Deref for ServiceHost<'_> {
     }
 }
 
-impl DerefMut for ServiceHost<'_> {
+impl DerefMut for InProcessServiceClient<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.engine.state_mut()
     }
@@ -604,7 +683,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         sessions: &sessions,
         credentials: &credentials,
     };
-    let mut host = ServiceHost::new(service, backends, persistence);
+    let mut host = InProcessServiceClient::new(service, backends, persistence);
     let loop_result = {
         let mut interactive = InteractiveServices {
             control: &mut control,
@@ -824,7 +903,7 @@ fn quote_command_argument(argument: &Path) -> String {
 
 async fn run_loop(
     terminal: &mut Tui,
-    host: &mut ServiceHost<'_>,
+    host: &mut InProcessServiceClient<'_>,
     interactive: &mut InteractiveServices<'_>,
     mut herdr: Option<&mut crate::herdr::Reporter>,
 ) -> io::Result<()> {
@@ -844,7 +923,7 @@ async fn run_loop(
                 match input_event {
                     Some(Ok(event)) => {
                         let effects = host.handle_terminal(event);
-                        flush_pending_clipboard(terminal, host);
+                        host.flush_clipboard(terminal);
                         if host.apply(effects).await {
                             break;
                         }
@@ -862,8 +941,8 @@ async fn run_loop(
                     host.backends.observe_provider_event(&source, &event);
                     let should_chime = should_chime_for_backend_event(&source, &event);
                     let effects = match source {
-                        BackendSource::Primary(provider) => host.engine.handle_provider_backend(&provider, event),
-                        BackendSource::Subagent(run_id) => host.engine.handle_subagent_backend(&run_id, event),
+                        BackendSource::Primary(provider) => host.handle_provider_backend(&provider, event),
+                        BackendSource::Subagent(run_id) => host.handle_subagent_backend(&run_id, event),
                     };
                     if should_chime {
                         crate::terminal::ring_bell(terminal.backend_mut())?;
@@ -900,13 +979,15 @@ async fn run_loop(
             }
             _ = render_tick.tick() => {
                 if dirty || host.is_busy() {
+                    let mut projection = host.projection();
                     terminal.draw(|frame| {
                         render::draw_with_images(
                             frame,
-                            host,
+                            &mut projection,
                             interactive.image_renderer.as_deref_mut(),
                         );
                     })?;
+                    host.update_projection(projection);
                     dirty = false;
                 }
             }

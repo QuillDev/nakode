@@ -560,18 +560,18 @@ pub struct SubagentRun {
     pub latest_activity: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ReasoningSummaryTracker {
     turns: HashMap<String, ReasoningSummaryTurn>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ReasoningSummaryTurn {
     latest_item: Option<String>,
     streams: HashMap<String, ReasoningSummaryStream>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ReasoningSummaryStream {
     index: usize,
     text: String,
@@ -630,7 +630,7 @@ impl ReasoningSummaryTracker {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SubagentChat {
     transcript: Transcript,
     reasoning_summaries: ReasoningSummaryTracker,
@@ -771,7 +771,7 @@ enum MenuSnapshot {
 }
 
 /// State owned by one interactive client rather than the Nakode service.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ClientPresentationState {
     pub editor: EditorState,
     draft_attachments: Vec<PromptAttachment>,
@@ -797,7 +797,7 @@ pub struct ClientPresentationState {
     api_key_input_hit_region: Option<ApiKeyInputHitRegion>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AppState {
     pub client: ClientPresentationState,
     pub connection: ConnectionState,

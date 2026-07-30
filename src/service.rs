@@ -74,6 +74,15 @@ impl ServiceSubscription {
     pub async fn recv(&mut self) -> Result<ServiceEvent, broadcast::error::RecvError> {
         self.receiver.recv().await
     }
+
+    /// Receives one event without waiting.
+    ///
+    /// # Errors
+    /// Returns empty, lagged, or closed according to the bounded subscriber
+    /// queue state.
+    pub fn try_recv(&mut self) -> Result<ServiceEvent, broadcast::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
