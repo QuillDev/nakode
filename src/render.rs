@@ -1024,7 +1024,11 @@ fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &mut AppStat
     frame.render_widget(Clear, popup);
     let mut lines = vec![
         Line::styled(
-            "↑/↓ select · Enter details · Esc close",
+            if state.current_menu_has_parent() {
+                "↑/↓ select · Enter details · Esc back"
+            } else {
+                "↑/↓ select · Enter details · Esc close"
+            },
             Style::default().fg(MUTED),
         ),
         Line::default(),
@@ -1097,7 +1101,7 @@ fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let lines = if let Some(editor) = &picker.editor {
         agent_editor_lines(editor)
     } else {
-        agent_list_lines(picker)
+        agent_list_lines(picker, state.current_menu_has_parent())
     };
     frame.render_widget(
         Paragraph::new(lines).block(overlay_block(" Agents ", ACCENT)),
@@ -1219,7 +1223,7 @@ fn render_searchable_dropdown<T, S, R>(
 fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
-            "Tab/↑/↓ field · type or paste · Enter choose model · changes save automatically · Esc close",
+            "Tab/↑/↓ field · type or paste · Enter choose model · changes save automatically · Esc back",
             Style::default().fg(MUTED),
         ),
         Line::default(),
@@ -1268,10 +1272,14 @@ fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> 
     lines
 }
 
-fn agent_list_lines(picker: &crate::state::AgentPicker) -> Vec<Line<'static>> {
+fn agent_list_lines(picker: &crate::state::AgentPicker, has_parent: bool) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
-            "↑/↓ select · Enter edit · n new · d delete · Esc close",
+            if has_parent {
+                "↑/↓ select · Enter edit · n new · d delete · Esc back"
+            } else {
+                "↑/↓ select · Enter edit · n new · d delete · Esc close"
+            },
             Style::default().fg(MUTED),
         ),
         Line::default(),
@@ -1822,7 +1830,7 @@ fn render_model_options_popup(
     lines.extend([
         Line::default(),
         Line::styled(
-            "↑/↓ select · ←/→ change · Enter apply · Esc cancel",
+            "↑/↓ select · ←/→ change · Enter apply · Esc back",
             Style::default().fg(MUTED),
         ),
     ]);
@@ -1917,7 +1925,11 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
     lines.push(Line::default());
     lines.push(Line::styled(
-        "Type to filter · ↑/↓ select · Enter apply · Esc cancel",
+        if state.current_menu_has_parent() {
+            "Type to filter · ↑/↓ select · Enter apply · Esc back"
+        } else {
+            "Type to filter · ↑/↓ select · Enter apply · Esc cancel"
+        },
         Style::default().fg(MUTED),
     ));
 
@@ -2025,6 +2037,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use crate::{
+        agent::AgentCatalog,
         backend::{
             BackendCapabilities, BackendEvent, BackendIdentity, CODEX_PROVIDER, CURSOR_PROVIDER,
             CapabilitySupport, DEVIN_PROVIDER, ModelInfo, ModelOptions, TodoItem, TodoPhase,
@@ -2036,6 +2049,20 @@ mod tests {
             LineTone, MarkdownModifier, MarkdownSpan, MarkdownStyle, MarkdownTone, ProjectedLine,
         },
     };
+
+    fn install_test_agent(state: &mut AppState) {
+        let directory = tempfile::tempdir().expect("agent directory");
+        std::fs::write(
+            directory.path().join("explorer.toml"),
+            r#"slug = "explorer"
+description = "Explores code context"
+system_prompt = "Explore carefully."
+first_message = "Inspect the delegated question."
+"#,
+        )
+        .expect("agent fixture");
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+    }
 
     #[test]
     fn main_view_renders_into_a_test_backend() {
@@ -2439,6 +2466,7 @@ mod tests {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
+        install_test_agent(&mut state);
         state.invoke_agent(&AgentRequest {
             id: 1,
             agent: "explorer".to_owned(),
@@ -2467,6 +2495,7 @@ mod tests {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
+        install_test_agent(&mut state);
         let effects = state.invoke_agent(&AgentRequest {
             id: 1,
             agent: "explorer".to_owned(),
@@ -2505,6 +2534,7 @@ mod tests {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
+        install_test_agent(&mut state);
         state.invoke_agent(&AgentRequest {
             id: 1,
             agent: "explorer".to_owned(),
@@ -2753,7 +2783,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_menu_shows_archetypes_and_all_editable_configuration_fields() {
+    fn agent_menu_starts_empty_and_shows_all_editable_configuration_fields() {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
@@ -2769,9 +2799,9 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(list.contains("explorer"));
+        assert!(list.contains("No agent archetypes configured"));
 
-        state.edit_selected_agent();
+        state.create_agent();
         terminal
             .draw(|frame| super::draw(frame, &mut state))
             .expect("render agent editor");

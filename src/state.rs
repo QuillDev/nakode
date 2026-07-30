@@ -440,6 +440,46 @@ pub enum SettingsView {
     TerminalImages,
 }
 
+/// A reusable history for hierarchical menus. Callers store the complete node
+/// state needed to restore focus rather than reconstructing a parent menu.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MenuHistory<T> {
+    previous: Vec<T>,
+}
+
+impl<T> Default for MenuHistory<T> {
+    fn default() -> Self {
+        Self {
+            previous: Vec::new(),
+        }
+    }
+}
+
+impl<T> MenuHistory<T> {
+    fn push(&mut self, node: T) {
+        self.previous.push(node);
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.previous.pop()
+    }
+
+    fn clear(&mut self) {
+        self.previous.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.previous.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SettingsNode {
+    view: SettingsView,
+    selected: usize,
+    addon_field: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentBrowserStatus {
     Checking,
@@ -457,9 +497,31 @@ pub struct SettingsState {
     pub terminal_images: TerminalImageMode,
     pub addon_field: usize,
     pub agent_browser_status: AgentBrowserStatus,
+    history: MenuHistory<SettingsNode>,
 }
 
 impl SettingsState {
+    fn enter(&mut self, view: SettingsView, selected: usize, addon_field: usize) {
+        self.history.push(SettingsNode {
+            view: self.view,
+            selected: self.selected,
+            addon_field: self.addon_field,
+        });
+        self.view = view;
+        self.selected = selected;
+        self.addon_field = addon_field;
+    }
+
+    fn back(&mut self) -> bool {
+        let Some(node) = self.history.pop() else {
+            return false;
+        };
+        self.view = node.view;
+        self.selected = node.selected;
+        self.addon_field = node.addon_field;
+        true
+    }
+
     #[must_use]
     pub fn filtered_sections(&self) -> Vec<SettingsSection> {
         let query = self.query.to_ascii_lowercase();
@@ -700,6 +762,11 @@ pub enum Effect {
     Quit,
 }
 
+#[derive(Clone, Debug)]
+enum MenuSnapshot {
+    Settings(SettingsState),
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub connection: ConnectionState,
@@ -729,6 +796,7 @@ pub struct AppState {
     pub provider_picker: Option<ProviderPicker>,
     pub agent_picker: Option<AgentPicker>,
     pub settings: Option<SettingsState>,
+    menu_history: MenuHistory<MenuSnapshot>,
     command_completion_selection: usize,
     pending_model_picker: Option<ModelSelectionScope>,
     pub show_help: bool,
@@ -833,12 +901,51 @@ impl AppState {
             terminal_images: self.terminal_image_mode,
             addon_field: 0,
             agent_browser_status: AgentBrowserStatus::Checking,
+            history: MenuHistory::default(),
         });
+        self.menu_history.clear();
         self.set_status("Settings opened.");
     }
 
     pub fn close_settings(&mut self) {
         self.settings = None;
+        self.restore_previous_menu();
+    }
+
+    pub fn close_all_menus(&mut self) {
+        self.model_picker = None;
+        self.session_picker = None;
+        self.provider_picker = None;
+        self.agent_picker = None;
+        self.settings = None;
+        self.pending_model_picker = None;
+        self.menu_history.clear();
+    }
+
+    #[must_use]
+    pub fn current_menu_has_parent(&self) -> bool {
+        !self.menu_history.is_empty()
+    }
+
+    fn suspend_settings(&mut self) {
+        if let Some(settings) = self.settings.take() {
+            self.menu_history.push(MenuSnapshot::Settings(settings));
+        }
+    }
+
+    fn restore_previous_menu(&mut self) -> bool {
+        let Some(menu) = self.menu_history.pop() else {
+            return false;
+        };
+        match menu {
+            MenuSnapshot::Settings(mut settings) => {
+                settings.web = self.web_config.clone();
+                settings.vision = self.vision_config.clone();
+                settings.terminal_images = self.terminal_image_mode;
+                self.settings = Some(settings);
+            }
+        }
+        true
     }
 
     pub fn settings_insert(&mut self, character: char) {
@@ -954,18 +1061,16 @@ impl AppState {
         if let Some(settings) = &mut self.settings
             && settings.view == SettingsView::Addons
         {
-            match settings.selected {
-                0 => {
-                    settings.view = SettingsView::WebBrowsing;
-                    settings.addon_field = 0;
-                    settings.agent_browser_status = AgentBrowserStatus::Checking;
-                    return vec![Effect::CheckAgentBrowser];
-                }
-                1 => settings.view = SettingsView::Vision,
-                _ => settings.view = SettingsView::TerminalImages,
+            let (view, effects) = match settings.selected {
+                0 => (SettingsView::WebBrowsing, vec![Effect::CheckAgentBrowser]),
+                1 => (SettingsView::Vision, Vec::new()),
+                _ => (SettingsView::TerminalImages, Vec::new()),
+            };
+            settings.enter(view, 0, 0);
+            if view == SettingsView::WebBrowsing {
+                settings.agent_browser_status = AgentBrowserStatus::Checking;
             }
-            settings.addon_field = 0;
-            return Vec::new();
+            return effects;
         }
         if self
             .settings
@@ -980,16 +1085,20 @@ impl AppState {
             .as_ref()
             .is_some_and(|settings| settings.view == SettingsView::Vision)
         {
-            self.settings = None;
-            return self.open_vision_model_picker();
+            self.suspend_settings();
+            let effects = self.open_vision_model_picker();
+            if self.model_picker.is_none() {
+                self.restore_previous_menu();
+            }
+            return effects;
         }
         let section = self
             .settings
             .as_ref()
             .and_then(|settings| settings.filtered_sections().get(settings.selected).copied());
-        self.settings = None;
         match section {
             Some(SettingsSection::General) => {
+                self.suspend_settings();
                 self.provider_picker = Some(ProviderPicker {
                     providers: Vec::new(),
                     selected: 0,
@@ -1000,14 +1109,21 @@ impl AppState {
                 vec![Effect::ListProviders]
             }
             Some(SettingsSection::Agents) => {
+                self.suspend_settings();
                 self.open_agent_picker();
                 Vec::new()
             }
-            Some(SettingsSection::Models) => self.open_default_model_picker(),
+            Some(SettingsSection::Models) => {
+                self.suspend_settings();
+                let effects = self.open_default_model_picker();
+                if self.model_picker.is_none() && self.pending_model_picker.is_none() {
+                    self.restore_previous_menu();
+                }
+                effects
+            }
             Some(SettingsSection::Addons) => {
-                self.open_settings();
                 if let Some(settings) = &mut self.settings {
-                    settings.view = SettingsView::Addons;
+                    settings.enter(SettingsView::Addons, 0, 0);
                 }
                 Vec::new()
             }
@@ -1035,41 +1151,16 @@ impl AppState {
         let Some(view) = self.settings.as_ref().map(|settings| settings.view) else {
             return Vec::new();
         };
-        match view {
-            SettingsView::Menu => {
-                self.settings = None;
-                Vec::new()
-            }
-            SettingsView::Addons => {
-                if let Some(settings) = &mut self.settings {
-                    settings.view = SettingsView::Menu;
-                    settings.selected = 0;
-                }
-                Vec::new()
-            }
-            SettingsView::Vision => {
-                if let Some(settings) = &mut self.settings {
-                    settings.view = SettingsView::Addons;
-                    settings.selected = 1;
-                }
-                Vec::new()
-            }
-            SettingsView::TerminalImages => {
-                if let Some(settings) = &mut self.settings {
-                    settings.view = SettingsView::Addons;
-                    settings.selected = 2;
-                }
-                Vec::new()
-            }
-            SettingsView::WebBrowsing => {
-                let effects = self.save_web_settings();
-                if let Some(settings) = &mut self.settings {
-                    settings.view = SettingsView::Addons;
-                    settings.selected = 0;
-                }
-                effects
-            }
+        let mut effects = Vec::new();
+        if view == SettingsView::WebBrowsing {
+            effects = self.save_web_settings();
         }
+        if self.settings.as_mut().is_some_and(SettingsState::back) {
+            return effects;
+        }
+        self.settings = None;
+        self.restore_previous_menu();
+        effects
     }
 
     pub fn set_agent_browser_status(&mut self, status: AgentBrowserStatus) {
@@ -1180,6 +1271,7 @@ impl AppState {
             provider_picker: None,
             agent_picker: None,
             settings: None,
+            menu_history: MenuHistory::default(),
             command_completion_selection: 0,
             pending_model_picker: None,
             show_help: false,
@@ -1314,7 +1406,9 @@ impl AppState {
 
     pub fn close_agent_picker(&mut self) {
         self.agent_picker = None;
-        self.set_status("Agent settings closed.");
+        if !self.restore_previous_menu() {
+            self.set_status("Agent settings closed.");
+        }
     }
 
     pub fn agent_picker_move(&mut self, delta: isize) {
@@ -2025,7 +2119,9 @@ impl AppState {
 
     pub fn close_provider_picker(&mut self) {
         self.provider_picker = None;
-        self.set_status("Provider settings closed.");
+        if !self.restore_previous_menu() {
+            self.set_status("Provider settings closed.");
+        }
     }
 
     pub fn toggle_provider(&mut self) -> Vec<Effect> {
@@ -3196,7 +3292,7 @@ impl AppState {
             } else {
                 format!("Selected model: {display}.")
             };
-            self.model_picker = None;
+            self.finish_model_picker();
             let mut effects = Vec::new();
             if scope == ModelSelectionScope::Default {
                 effects.push(Effect::SetDefaultModel {
@@ -3248,7 +3344,10 @@ impl AppState {
     fn select_vision_model(&mut self, selected: &ModelInfo) -> Vec<Effect> {
         let qualified = selected.qualified_id();
         self.vision_config.model = Some(qualified.clone());
-        self.model_picker = None;
+        self.finish_model_picker();
+        if let Some(settings) = &mut self.settings {
+            settings.vision = self.vision_config.clone();
+        }
         self.status_message = format!("Vision model: {}.", selected.display_name());
         vec![Effect::SaveVisionConfig(self.vision_config.clone())]
     }
@@ -3272,9 +3371,23 @@ impl AppState {
             .collect()
     }
 
-    pub fn close_model_picker(&mut self) {
+    fn finish_model_picker(&mut self) {
         self.model_picker = None;
-        self.set_status("Model selection cancelled.");
+        self.restore_previous_menu();
+    }
+
+    pub fn close_model_picker(&mut self) {
+        if let Some(picker) = &mut self.model_picker
+            && picker.stage == ModelPickerStage::Options
+        {
+            picker.stage = ModelPickerStage::Models;
+            picker.option_selected = 0;
+            return;
+        }
+        self.finish_model_picker();
+        if self.settings.is_none() {
+            self.set_status("Model selection cancelled.");
+        }
     }
 
     pub fn move_queue_selection(&mut self, delta: isize) {
@@ -3787,11 +3900,14 @@ impl AppState {
 
     fn handle_models(&mut self, models: Vec<ModelInfo>) -> Vec<Effect> {
         if models.is_empty() {
-            self.pending_model_picker = None;
+            let was_opening_menu = self.pending_model_picker.take().is_some();
             if self.models.is_empty() {
                 self.install_models(models);
             } else {
                 self.set_status("Model refresh returned no choices; kept the cached catalog.");
+            }
+            if was_opening_menu {
+                self.restore_previous_menu();
             }
             return Vec::new();
         }
@@ -4526,7 +4642,10 @@ impl AppState {
             }
             BackendOperation::Reload => {
                 self.creating_session = None;
-                self.pending_model_picker = None;
+                let was_opening_menu = self.pending_model_picker.take().is_some();
+                if was_opening_menu {
+                    self.restore_previous_menu();
+                }
             }
             BackendOperation::ResumeSession => {
                 self.resuming_session = None;
@@ -5691,6 +5810,23 @@ model = "openai-codex/model-a"
         AgentCatalog::load(directory.path()).expect("agent catalog")
     }
 
+    fn routed_explorer_catalog() -> AgentCatalog {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("explorer.toml"),
+            r#"
+slug = "explorer"
+description = "Explores code context"
+system_prompt = "Explore carefully and report concrete context."
+first_message = "Inspect the delegated question."
+model = "devin-acp/swe-1-7-lightning"
+fallback_models = ["openai-codex/gpt-5.6-luna"]
+"#,
+        )
+        .expect("agent definition");
+        AgentCatalog::load(directory.path()).expect("agent catalog")
+    }
+
     fn ready_state() -> AppState {
         let mut state = AppState::new("/tmp/project", None, 100);
         state.handle_backend(BackendEvent::Ready(BackendIdentity {
@@ -5786,6 +5922,7 @@ model = "openai-codex/model-a"
     #[test]
     fn cursor_agent_model_selection_opens_shared_fast_mode_options() {
         let mut state = ready_state();
+        state.install_agents(explorer_catalog());
         state.models.push(ModelInfo {
             provider: CURSOR_PROVIDER.to_owned(),
             id: "composer-2.5".to_owned(),
@@ -5818,6 +5955,7 @@ model = "openai-codex/model-a"
     #[test]
     fn agent_model_dropdown_searches_catalog_and_applies_selection() {
         let mut state = ready_state();
+        state.install_agents(explorer_catalog());
         state.open_agent_picker();
         state.edit_selected_agent();
         state
@@ -6783,6 +6921,99 @@ model = "openai-codex/model-a"
     }
 
     #[test]
+    fn settings_child_menus_restore_the_exact_parent_node() {
+        let mut state = ready_state();
+
+        state.open_settings();
+        assert!(matches!(
+            state.select_setting().as_slice(),
+            [Effect::ListProviders]
+        ));
+        assert!(state.settings.is_none());
+        state.close_provider_picker();
+        assert_eq!(
+            state
+                .settings
+                .as_ref()
+                .map(|settings| (settings.view, settings.selected)),
+            Some((super::SettingsView::Menu, 0))
+        );
+
+        state.settings_move(1);
+        assert!(state.select_setting().is_empty());
+        assert!(state.settings.is_none());
+        state.close_agent_picker();
+        assert_eq!(
+            state
+                .settings
+                .as_ref()
+                .map(|settings| (settings.view, settings.selected)),
+            Some((super::SettingsView::Menu, 1))
+        );
+
+        state.settings_move(1);
+        assert!(state.select_setting().is_empty());
+        assert!(state.model_picker.is_some());
+        state.close_model_picker();
+        assert_eq!(
+            state
+                .settings
+                .as_ref()
+                .map(|settings| (settings.view, settings.selected)),
+            Some((super::SettingsView::Menu, 2))
+        );
+
+        state.settings_move(1);
+        assert!(state.select_setting().is_empty());
+        state.settings_move(1);
+        assert!(state.select_setting().is_empty());
+        assert_eq!(
+            state.settings.as_ref().map(|settings| settings.view),
+            Some(super::SettingsView::Vision)
+        );
+        assert!(state.select_setting().is_empty());
+        assert!(state.model_picker.is_some());
+        state.close_model_picker();
+        assert_eq!(
+            state.settings.as_ref().map(|settings| settings.view),
+            Some(super::SettingsView::Vision)
+        );
+
+        assert!(state.settings_back().is_empty());
+        assert_eq!(
+            state
+                .settings
+                .as_ref()
+                .map(|settings| (settings.view, settings.selected)),
+            Some((super::SettingsView::Addons, 1))
+        );
+        assert!(state.settings_back().is_empty());
+        assert_eq!(
+            state
+                .settings
+                .as_ref()
+                .map(|settings| (settings.view, settings.selected)),
+            Some((super::SettingsView::Menu, 3))
+        );
+    }
+
+    #[test]
+    fn model_options_escape_returns_to_model_list_before_parent_menu() {
+        let mut state = ready_state();
+        assert!(state.open_model_picker().is_empty());
+        let picker = state.model_picker.as_mut().expect("model picker");
+        picker.stage = super::ModelPickerStage::Options;
+
+        state.close_model_picker();
+        assert_eq!(
+            state.model_picker.as_ref().map(|picker| picker.stage),
+            Some(super::ModelPickerStage::Models)
+        );
+        state.close_model_picker();
+        assert!(state.model_picker.is_none());
+    }
+
+    #[test]
     fn terminal_image_setting_cycles_and_emits_persistence_effect() {
         let mut state = ready_state();
         state.open_settings();
@@ -7710,6 +7941,7 @@ fast_mode = true
     #[test]
     fn configured_explorer_routes_to_devin_lightning() {
         let mut state = ready_state();
+        state.install_agents(routed_explorer_catalog());
         let effects = state.invoke_agent(&AgentRequest {
             id: 1,
             agent: "explorer".to_owned(),
@@ -7744,6 +7976,7 @@ fast_mode = true
     #[test]
     fn configured_explorer_falls_back_to_codex_luna() {
         let mut state = ready_state();
+        state.install_agents(routed_explorer_catalog());
         let effects = state.invoke_agent(&AgentRequest {
             id: 1,
             agent: "explorer".to_owned(),
@@ -7789,6 +8022,7 @@ fast_mode = true
     #[test]
     fn explorer_falls_back_when_native_session_creation_fails() {
         let mut state = ready_state();
+        state.install_agents(routed_explorer_catalog());
         let effects = state.invoke_agent(&AgentRequest {
             id: 1,
             agent: "explorer".to_owned(),

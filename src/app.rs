@@ -1678,10 +1678,7 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
     }
 
     if controls::resolve(ControlContext::Global, key) == Some(ControlAction::ToggleHelp) {
-        state.model_picker = None;
-        state.session_picker = None;
-        state.agent_picker = None;
-        state.settings = None;
+        state.close_all_menus();
         state.show_help = true;
         return Some(Vec::new());
     }
@@ -2055,6 +2052,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use crate::{
+        agent::AgentCatalog,
         backend::{BackendEvent, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, TurnOutcome},
         render,
         session::ProviderRecord,
@@ -2062,11 +2060,38 @@ mod tests {
         transcript::{EntryKind, EntryStatus},
     };
 
+    fn install_test_agent(state: &mut AppState) {
+        let directory = tempfile::tempdir().expect("agent directory");
+        std::fs::write(
+            directory.path().join("explorer.toml"),
+            r#"slug = "explorer"
+description = "Explores code context"
+system_prompt = "Explore carefully."
+first_message = "Inspect the delegated question."
+"#,
+        )
+        .expect("agent fixture");
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+    }
+
+    fn open_valid_agent_editor(state: &mut AppState) {
+        state.open_agent_picker();
+        state.create_agent();
+        let editor = state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor");
+        editor.slug = "explorer".to_owned();
+        editor.description = "Explores code context".to_owned();
+        editor.system_prompt = "Explore carefully.".to_owned();
+        editor.first_message = "Inspect the delegated question.".to_owned();
+    }
+
     #[test]
     fn valid_agent_text_edits_emit_autosave_without_a_shortcut() {
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.open_agent_picker();
-        state.edit_selected_agent();
+        open_valid_agent_editor(&mut state);
         state
             .agent_picker
             .as_mut()
@@ -2088,8 +2113,7 @@ mod tests {
         let agent_directory = workspace.path().join(".nakode/agents");
         let mut state = AppState::new(workspace.path().to_string_lossy(), None, 100);
         state.set_agent_directory(agent_directory.clone());
-        state.open_agent_picker();
-        state.edit_selected_agent();
+        open_valid_agent_editor(&mut state);
         state
             .agent_picker
             .as_mut()
@@ -2133,8 +2157,7 @@ mod tests {
             id: "gpt-5.6-sol".to_owned(),
             is_default: true,
         }];
-        state.open_agent_picker();
-        state.edit_selected_agent();
+        open_valid_agent_editor(&mut state);
         state
             .agent_picker
             .as_mut()
@@ -2498,6 +2521,7 @@ first_message = "Inspect the change."
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
+        install_test_agent(&mut state);
         state.invoke_agent(&AgentRequest {
             id: 1,
             agent: "explorer".to_owned(),
@@ -2606,6 +2630,7 @@ first_message = "Inspect the change."
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
+        install_test_agent(&mut state);
         state.invoke_agent(&AgentRequest {
             id: 1,
             agent: "explorer".to_owned(),
@@ -2882,6 +2907,23 @@ first_message = "Inspect the change."
                 if provider == CURSOR_PROVIDER
                     && metadata == &serde_json::json!({"api_key":"cursor-pasted-key"})
         ));
+    }
+
+    #[test]
+    fn escape_from_a_menu_opened_through_settings_returns_to_settings() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.open_settings();
+        assert!(matches!(
+            state.select_setting().as_slice(),
+            [Effect::ListProviders]
+        ));
+
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.provider_picker.is_none());
+        assert!(state.settings.is_some());
+
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.settings.is_none());
     }
 
     #[test]
