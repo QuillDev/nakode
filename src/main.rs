@@ -1,7 +1,9 @@
 use nakode::{
     app,
     config::{Config, NakodeCommand, ServiceAction},
-    control_service, diagnostics, tui_eval, update,
+    control_service, diagnostics,
+    service_protocol::AgentInvocation,
+    tui_eval, update,
 };
 
 #[tokio::main]
@@ -41,7 +43,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             let response = control_service::invoke_via_service(
                 &config.workspace,
-                &control_service::AgentInvocation {
+                &AgentInvocation {
                     agent: agent_slug,
                     session_id,
                     task,

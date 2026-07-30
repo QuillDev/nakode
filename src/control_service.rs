@@ -15,6 +15,11 @@ use tokio::{
     sync::Mutex,
 };
 
+pub use crate::service_protocol::{AgentInvocation, AgentResponse};
+use crate::service_protocol::{
+    ClientCommand, ClientRequest, CommandResult, ServiceResponse as ClientResponse,
+};
+
 const SERVICE_START_ATTEMPTS: usize = 40;
 const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
 const REGISTRATION_INTERVAL: Duration = Duration::from_secs(1);
@@ -49,19 +54,8 @@ pub enum ControlError {
     ServiceRejected(String),
     #[error("unexpected response from the Nakode control service")]
     UnexpectedServiceResponse,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct AgentInvocation {
-    pub agent: String,
-    pub session_id: String,
-    pub task: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct AgentResponse {
-    pub success: bool,
-    pub result: String,
+    #[error(transparent)]
+    Protocol(#[from] crate::service_protocol::ProtocolError),
 }
 
 pub struct IncomingInvocation {
@@ -208,24 +202,38 @@ async fn handle_tui_connection(
     if BufReader::new(reader).read_line(&mut line).await.is_err() {
         return;
     }
-    let Ok(invocation) = serde_json::from_str(&line) else {
-        return;
+    let request: ClientRequest = match serde_json::from_str(&line) {
+        Ok(request) => request,
+        Err(_) => return,
     };
-    let (response, receive) = tokio::sync::oneshot::channel();
-    if tx
-        .send(IncomingInvocation {
-            id,
-            invocation,
-            response,
-        })
-        .await
-        .is_err()
-    {
-        return;
-    }
-    if let Ok(response) = receive.await
-        && let Ok(encoded) = serde_json::to_string(&response)
-    {
+    let request_id = request.request_id.clone();
+    let result = match request.validate() {
+        Ok(()) => match request.command {
+            ClientCommand::InvokeAgent(invocation) => {
+                let (response, receive) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(IncomingInvocation {
+                        id,
+                        invocation,
+                        response,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                match receive.await {
+                    Ok(response) => CommandResult::Agent(response),
+                    Err(_) => return,
+                }
+            }
+        },
+        Err(error) => CommandResult::Rejected {
+            message: error.to_string(),
+        },
+    };
+    let response = ClientResponse::new(request_id, result);
+    if let Ok(encoded) = serde_json::to_string(&response) {
         let _ = writer.write_all(encoded.as_bytes()).await;
         let _ = writer.write_all(b"\n").await;
     }
@@ -236,6 +244,29 @@ async fn handle_tui_connection(
 /// # Errors
 /// Returns an error when the TUI cannot be reached or exchanges an invalid response.
 pub async fn invoke(
+    path: &Path,
+    invocation: &AgentInvocation,
+) -> Result<AgentResponse, ControlError> {
+    let request = ClientRequest::new(ClientCommand::InvokeAgent(invocation.clone()));
+    invoke_request(path, &request).await
+}
+
+async fn invoke_request(
+    path: &Path,
+    request: &ClientRequest,
+) -> Result<AgentResponse, ControlError> {
+    let response: ClientResponse = exchange(path, request).await?;
+    response.validate_for(request)?;
+    Ok(match response.result {
+        CommandResult::Agent(response) => response,
+        CommandResult::Rejected { message } => AgentResponse {
+            success: false,
+            result: message,
+        },
+    })
+}
+
+async fn invoke_legacy(
     path: &Path,
     invocation: &AgentInvocation,
 ) -> Result<AgentResponse, ControlError> {
@@ -257,7 +288,7 @@ pub async fn invoke_via_service(
         Err(service_error) => {
             let compatibility_path = client_socket_path(workspace);
             if compatibility_path.exists() {
-                invoke(&compatibility_path, invocation).await
+                invoke_legacy(&compatibility_path, invocation).await
             } else {
                 Err(service_error)
             }
@@ -649,6 +680,10 @@ mod tests {
         AgentInvocation, AgentResponse, ControlError, ControlServer, ServiceRequest,
         client_socket_path, expect_ok, invoke, invoke_at, register_at, run_service_at, socket_path,
     };
+    use crate::service_protocol::{
+        ClientCommand, ClientRequest, CommandResult, SERVICE_PROTOCOL_VERSION,
+        ServiceResponse as ClientResponse,
+    };
 
     #[test]
     fn client_socket_falls_back_to_the_legacy_workspace_path() {
@@ -663,6 +698,30 @@ mod tests {
             socket_path(directory.path()),
             directory.path().join(".nakode/control.sock")
         );
+    }
+
+    #[tokio::test]
+    async fn incompatible_client_protocol_is_rejected_without_invocation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("control.sock");
+        let mut server = ControlServer::bind(&path).await.expect("control server");
+        let request = ClientRequest {
+            version: SERVICE_PROTOCOL_VERSION + 1,
+            request_id: "request-7".to_owned(),
+            command: ClientCommand::InvokeAgent(invocation("session-7", "Review auth")),
+        };
+
+        let response: ClientResponse = super::exchange(&path, &request)
+            .await
+            .expect("protocol response");
+
+        assert_eq!(response.request_id, request.request_id);
+        assert!(matches!(
+            response.result,
+            CommandResult::Rejected { message } if message.contains("unsupported Nakode service protocol version")
+        ));
+        assert!(server.requests.try_recv().is_err());
+        server.shutdown();
     }
 
     #[tokio::test]

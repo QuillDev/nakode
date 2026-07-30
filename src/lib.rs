@@ -24,6 +24,7 @@ pub mod render;
 pub mod runtime;
 pub mod searchable_dropdown;
 pub mod selection;
+pub mod service_protocol;
 pub mod session;
 mod shell;
 pub mod skill;
