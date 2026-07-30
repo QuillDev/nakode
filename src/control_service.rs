@@ -227,6 +227,9 @@ async fn handle_tui_connection(
                     Err(_) => return,
                 }
             }
+            ClientCommand::Domain(_) => CommandResult::Rejected {
+                message: "domain commands require the service engine transport".to_owned(),
+            },
         },
         Err(error) => CommandResult::Rejected {
             message: error.to_string(),
@@ -259,6 +262,10 @@ async fn invoke_request(
     response.validate_for(request)?;
     Ok(match response.result {
         CommandResult::Agent(response) => response,
+        CommandResult::Accepted => AgentResponse {
+            success: false,
+            result: "unexpected command acknowledgement".to_owned(),
+        },
         CommandResult::Rejected { message } => AgentResponse {
             success: false,
             result: message,

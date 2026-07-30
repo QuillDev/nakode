@@ -72,7 +72,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             height,
         })?,
         Some(NakodeCommand::Update) => unreachable!("update commands return before dispatch"),
-        None => app::run(config).await?,
+        None => Box::pin(app::run(config)).await?,
     }
     Ok(())
 }

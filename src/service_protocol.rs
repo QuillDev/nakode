@@ -1,8 +1,7 @@
 //! Transport-neutral messages exchanged between Nakode clients and the service.
 //!
-//! The current service only implements agent invocation. Additional client
-//! commands, queries, snapshots, and subscription events belong in this module
-//! as ownership moves out of the TUI. Transport framing and legacy TUI routing
+//! Commands, queries, snapshots, and subscription events in this module are
+//! semantic service messages. Transport framing and client presentation types
 //! remain separate concerns.
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +38,97 @@ impl ClientRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientCommand {
     InvokeAgent(AgentInvocation),
+    Domain(DomainCommand),
+}
+
+/// Transport-neutral mutations accepted by the canonical service engine.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum DomainCommand {
+    SubmitPrompt {
+        text: String,
+    },
+    EnqueuePrompt {
+        text: String,
+    },
+    Steer {
+        text: String,
+    },
+    Interrupt,
+    ResolveApproval {
+        decision: ApprovalChoice,
+    },
+    ResolveQuestion {
+        answers: Vec<String>,
+    },
+    SelectModel {
+        provider: String,
+        model: String,
+    },
+    ResumeSession {
+        session_id: String,
+    },
+    NewSession,
+    SetProviderEnabled {
+        provider: String,
+        enabled: bool,
+    },
+    AuthenticateProvider {
+        provider: String,
+    },
+    SetProviderCredential {
+        provider: String,
+        kind: String,
+        secret: String,
+    },
+    ClearProviderCredential {
+        provider: String,
+    },
+    SaveAgent {
+        agent: AgentDefinition,
+    },
+    DeleteAgent {
+        slug: String,
+    },
+    UpdateSettings {
+        patch: SettingsPatch,
+    },
+    QuitSession,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalChoice {
+    Once,
+    Always,
+    Reject,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentDefinition {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub prompt: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "setting", content = "value", rename_all = "snake_case")]
+pub enum SettingsPatch {
+    DefaultModel {
+        provider: String,
+        model: String,
+    },
+    ModelOptions {
+        provider: String,
+        model: String,
+        options: serde_json::Value,
+    },
+    Web(serde_json::Value),
+    Vision(serde_json::Value),
+    TerminalImages(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -86,6 +176,7 @@ impl ServiceResponse {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandResult {
     Agent(AgentResponse),
+    Accepted,
     Rejected { message: String },
 }
 

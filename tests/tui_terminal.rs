@@ -6,6 +6,7 @@ use std::{
     io::{self, Read},
     path::Path,
     process::Command,
+    sync::{LazyLock, Mutex},
     thread,
     time::Duration,
 };
@@ -13,8 +14,11 @@ use std::{
 use nakode::pty::PtySession;
 use portable_pty::PtySize;
 
+static TUI_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 #[test]
 fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
+    let _guard = TUI_TEST_LOCK.lock().expect("TUI test lock");
     let temp = tempfile::tempdir()?;
     let control_directory = temp.path().join("control");
     let mut session = spawn_tui(temp.path(), &control_directory)?;
@@ -85,6 +89,7 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn multiple_tuis_share_one_control_service() -> Result<(), Box<dyn Error>> {
+    let _guard = TUI_TEST_LOCK.lock().expect("TUI test lock");
     let temp = tempfile::tempdir()?;
     let control_directory = temp.path().join("control");
     let mut first = spawn_tui(temp.path(), &control_directory)?;

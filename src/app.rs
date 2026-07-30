@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io::{self, Write},
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::{Duration, Instant},
@@ -80,9 +81,107 @@ struct BackendRegistry {
     vision_service: Option<crate::vision::SharedVisionService>,
 }
 
+#[derive(Clone, Copy)]
 struct PersistenceServices<'a> {
     sessions: &'a dyn SessionRepository,
     credentials: &'a dyn CredentialStore,
+}
+
+struct ServiceHost<'a> {
+    engine: ServiceEngine,
+    backends: BackendRegistry,
+    persistence: PersistenceServices<'a>,
+    agent_requests: HashMap<u64, IncomingInvocation>,
+    shell_processes: ShellProcesses,
+}
+
+impl<'a> ServiceHost<'a> {
+    fn new(
+        engine: ServiceEngine,
+        backends: BackendRegistry,
+        persistence: PersistenceServices<'a>,
+    ) -> Self {
+        Self {
+            engine,
+            backends,
+            persistence,
+            agent_requests: HashMap::new(),
+            shell_processes: ShellProcesses::new(),
+        }
+    }
+
+    fn handle_terminal(&mut self, event: Event) -> Vec<Effect> {
+        let effects = handle_terminal_event(self.engine.state_mut(), event);
+        self.engine.note_state_change();
+        effects
+    }
+
+    fn provider_channels_closed(&mut self) {
+        self.engine
+            .state_mut()
+            .set_status("All provider event channels closed.");
+        self.engine.note_state_change();
+    }
+
+    fn handle_shell(&mut self, event: ShellEvent) {
+        handle_shell_event(self.engine.state_mut(), event);
+        self.engine.note_state_change();
+    }
+
+    fn request_shutdown(&mut self) {
+        self.engine.state_mut().should_quit = true;
+        self.engine.note_state_change();
+    }
+
+    fn handle_invocation(&mut self, request: IncomingInvocation) -> Option<Vec<Effect>> {
+        if request.invocation.session_id != self.engine.state().nakode_session_id {
+            request.respond(AgentResponse {
+                success: false,
+                result: "Nakode session id does not match this TUI.".to_owned(),
+            });
+            return None;
+        }
+        let id = request.id;
+        let invocation = crate::state::AgentRequest {
+            id,
+            agent: request.invocation.agent.clone(),
+            task: request.invocation.task.clone(),
+        };
+        self.agent_requests.insert(id, request);
+        Some(self.engine.invoke_agent(&invocation))
+    }
+
+    async fn apply(&mut self, effects: Vec<Effect>) -> bool {
+        apply_effects(
+            self.engine.state_mut(),
+            effects,
+            &mut self.backends,
+            &self.persistence,
+            &mut self.agent_requests,
+            &mut self.shell_processes,
+        )
+        .await
+    }
+
+    async fn shutdown(mut self) -> ServiceEngine {
+        self.shell_processes.shutdown().await;
+        self.backends.shutdown().await;
+        self.engine
+    }
+}
+
+impl Deref for ServiceHost<'_> {
+    type Target = AppState;
+
+    fn deref(&self) -> &Self::Target {
+        self.engine.state()
+    }
+}
+
+impl DerefMut for ServiceHost<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.engine.state_mut()
+    }
 }
 
 struct InteractiveServices<'a> {
@@ -447,7 +546,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let sessions = SqliteSessionRepository::open_default()?;
     let session_database = sessions.database_path().to_path_buf();
     let credentials = SqliteCredentialStore::open(&session_database)?;
-    let (providers, mut backends) = start_backends(&config, &sessions, &credentials).await?;
+    let (providers, backends) = start_backends(&config, &sessions, &credentials).await?;
     let agents = AgentCatalog::load(&config.agents)?;
     let skills = SkillCatalog::load(&config.workspace)?;
     let prompt_addenda =
@@ -505,6 +604,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         sessions: &sessions,
         credentials: &credentials,
     };
+    let mut host = ServiceHost::new(service, backends, persistence);
     let loop_result = {
         let mut interactive = InteractiveServices {
             control: &mut control,
@@ -513,9 +613,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         };
         run_loop(
             terminal.terminal_mut(),
-            &mut service,
-            &mut backends,
-            &persistence,
+            &mut host,
             &mut interactive,
             herdr.as_mut(),
         )
@@ -526,7 +624,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         reporter.shutdown().await;
     }
     let restore_result = terminal.restore();
-    backends.shutdown().await;
+    let service = host.shutdown().await;
     registration.shutdown().await;
     control.shutdown();
 
@@ -726,9 +824,7 @@ fn quote_command_argument(argument: &Path) -> String {
 
 async fn run_loop(
     terminal: &mut Tui,
-    state: &mut AppState,
-    backends: &mut BackendRegistry,
-    persistence: &PersistenceServices<'_>,
+    host: &mut ServiceHost<'_>,
     interactive: &mut InteractiveServices<'_>,
     mut herdr: Option<&mut crate::herdr::Reporter>,
 ) -> io::Result<()> {
@@ -737,11 +833,9 @@ async fn run_loop(
     render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut backend_open = true;
     let mut dirty = true;
-    let mut agent_requests = HashMap::<u64, IncomingInvocation>::new();
-    let mut shell_processes = ShellProcesses::new();
 
     if let Some(reporter) = &mut herdr {
-        reporter.sync(state);
+        reporter.sync(host);
     }
 
     loop {
@@ -749,71 +843,67 @@ async fn run_loop(
             input_event = input.next() => {
                 match input_event {
                     Some(Ok(event)) => {
-                        let effects = handle_terminal_event(state, event);
-                        flush_pending_clipboard(terminal, state);
-                        if apply_effects(state, effects, backends, persistence, &mut agent_requests, &mut shell_processes).await {
+                        let effects = host.handle_terminal(event);
+                        flush_pending_clipboard(terminal, host);
+                        if host.apply(effects).await {
                             break;
                         }
                         dirty = true;
                     }
                     Some(Err(error)) => return Err(error),
                     None => {
-                        state.should_quit = true;
+                        host.request_shutdown();
                         break;
                     }
                 }
             }
-            backend_event = backends.events.recv(), if backend_open => {
+            backend_event = host.backends.events.recv(), if backend_open => {
                 if let Some((source, event)) = backend_event {
-                    backends.observe_provider_event(&source, &event);
+                    host.backends.observe_provider_event(&source, &event);
                     let should_chime = should_chime_for_backend_event(&source, &event);
                     let effects = match source {
-                        BackendSource::Primary(provider) => state.handle_provider_backend(&provider, event),
-                        BackendSource::Subagent(run_id) => state.handle_subagent_backend(&run_id, event),
+                        BackendSource::Primary(provider) => host.engine.handle_provider_backend(&provider, event),
+                        BackendSource::Subagent(run_id) => host.engine.handle_subagent_backend(&run_id, event),
                     };
                     if should_chime {
                         crate::terminal::ring_bell(terminal.backend_mut())?;
                     }
-                    if apply_effects(state, effects, backends, persistence, &mut agent_requests, &mut shell_processes).await {
+                    if host.apply(effects).await {
                         break;
                     }
                     dirty = true;
                 } else {
                     backend_open = false;
-                    state.set_status("All provider event channels closed.");
+                    host.provider_channels_closed();
                     dirty = true;
                 }
             }
-            shell_event = shell_processes.events.recv() => {
+            shell_event = host.shell_processes.events.recv() => {
                 if let Some(event) = shell_event {
-                    handle_shell_event(state, event);
+                    host.handle_shell(event);
                     dirty = true;
                 }
             }
             request = interactive.control.requests.recv() => {
                 if let Some(request) = request {
-                    if request.invocation.session_id == state.nakode_session_id {
-                        let id = request.id;
-                        let invocation = crate::state::AgentRequest { id, agent: request.invocation.agent.clone(), task: request.invocation.task.clone() };
-                        agent_requests.insert(id, request);
-                        let effects = state.invoke_agent(&invocation);
-                        if apply_effects(state, effects, backends, persistence, &mut agent_requests, &mut shell_processes).await { break; }
-                    } else {
-                        request.respond(AgentResponse { success: false, result: "Nakode session id does not match this TUI.".to_owned() });
+                    if let Some(effects) = host.handle_invocation(request)
+                        && host.apply(effects).await
+                    {
+                        break;
                     }
                     dirty = true;
                 }
             }
             () = interactive.signals.recv() => {
-                state.should_quit = true;
+                host.request_shutdown();
                 break;
             }
             _ = render_tick.tick() => {
-                if dirty || state.is_busy() {
+                if dirty || host.is_busy() {
                     terminal.draw(|frame| {
                         render::draw_with_images(
                             frame,
-                            state,
+                            host,
                             interactive.image_renderer.as_deref_mut(),
                         );
                     })?;
@@ -823,15 +913,14 @@ async fn run_loop(
         }
 
         if let Some(reporter) = &mut herdr {
-            reporter.sync(state);
+            reporter.sync(host);
         }
 
-        if state.should_quit {
+        if host.should_quit {
             break;
         }
     }
 
-    shell_processes.shutdown().await;
     Ok(())
 }
 

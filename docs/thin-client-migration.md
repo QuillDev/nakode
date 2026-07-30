@@ -35,10 +35,10 @@ checkpoint may introduce a second long-term source of domain truth.
 
 ## 4. Move execution behind the engine
 
-- [ ] Move backend registry, provider event reduction, persistence effects,
+- [x] Move backend registry, provider event reduction, persistence effects,
       tools, shell supervision, and subagent supervision behind the engine.
-- [ ] Define typed service commands for every domain-changing TUI action.
-- [ ] Remove direct state mutation from the interactive application loop.
+- [x] Define typed service commands for every domain-changing TUI action.
+- [x] Remove direct state mutation from the interactive application loop.
 
 ## 5. Snapshots, revisions, and subscriptions
 
