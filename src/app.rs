@@ -2582,6 +2582,42 @@ first_message = "Inspect the change."
     }
 
     #[test]
+    fn terminal_compatible_editing_shortcuts_navigate_and_delete() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("one two");
+
+        // Legacy Option+Left is commonly reported as Esc-b (Alt+B).
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+        );
+        state.editor.insert_char('|');
+        // Some Kitty-protocol terminals report Command as META.
+        super::handle_key(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::META));
+        state.editor.insert_char('^');
+        // Terminal profiles commonly encode Command+Right as Ctrl+E.
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        );
+        state.editor.insert_char('$');
+
+        assert_eq!(state.editor.text(), "^one |two$");
+
+        // Command+Delete and Option+Delete may arrive as Ctrl+U/Ctrl+W.
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.editor.text(), "^one |two");
+        super::handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(state.editor.is_blank());
+    }
+
+    #[test]
     fn modified_backspace_deletes_by_word_and_line() {
         let mut state = AppState::new("/tmp/project", None, 100);
         state.editor.set_text("one two");
