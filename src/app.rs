@@ -25,6 +25,7 @@ use crate::{
     personality::{PromptAddenda, PromptAddendaError},
     render,
     selection::ScreenPoint,
+    service::ServiceEngine,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
     shell::{ShellEvent, ShellProcesses},
     skill::{SkillCatalog, SkillCatalogError},
@@ -475,9 +476,10 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             .await;
     }
     state.set_startup_resume(config.resume);
+    let mut service = ServiceEngine::new(state);
 
     let (mut control, registration) =
-        match start_tui_control(&nakode_executable, &state.nakode_session_id).await {
+        match start_tui_control(&nakode_executable, &service.nakode_session_id).await {
             Ok(control) => control,
             Err(error) => {
                 backends.shutdown().await;
@@ -494,7 +496,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         }
     };
     let mut image_renderer = crate::terminal_image::TerminalImageRenderer::detect(image_mode);
-    state
+    service
         .transcript
         .set_image_previews_enabled(image_renderer.is_some());
     let mut herdr = crate::herdr::Reporter::from_environment();
@@ -511,7 +513,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         };
         run_loop(
             terminal.terminal_mut(),
-            &mut state,
+            &mut service,
             &mut backends,
             &persistence,
             &mut interactive,
@@ -531,7 +533,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     loop_result?;
     restore_result.map_err(AppError::Terminal)?;
 
-    print_resume_hint(&nakode_executable, &state).map_err(AppError::Terminal)
+    print_resume_hint(&nakode_executable, &service).map_err(AppError::Terminal)
 }
 
 fn initial_state(
