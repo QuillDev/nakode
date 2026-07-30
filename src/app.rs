@@ -1887,14 +1887,42 @@ fn handle_agent_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 }
 
 fn handle_agent_editor_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    if state.agent_model_dropdown_is_open() {
+        return handle_searchable_dropdown_key(state, key);
+    }
     match controls::resolve(ControlContext::AgentEditor, key) {
         Some(ControlAction::Previous) => state.agent_editor_move(-1),
         Some(ControlAction::Close) => {
             state.cancel_agent_edit();
         }
+        Some(ControlAction::Open) => state.open_agent_model_dropdown(),
         Some(ControlAction::Save) => return state.save_agent_edit(),
         Some(ControlAction::Next) => state.agent_editor_move(1),
         Some(ControlAction::Backspace) => state.agent_editor_backspace(),
+        None => {
+            if let KeyCode::Char(character) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER)
+            {
+                state.agent_editor_insert(character);
+            }
+        }
+        Some(_) => {}
+    }
+    Vec::new()
+}
+
+fn handle_searchable_dropdown_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    match controls::resolve(ControlContext::SearchableDropdown, key) {
+        Some(ControlAction::Select) => state.select_agent_model_dropdown(),
+        Some(ControlAction::Close) => {
+            state.cancel_agent_edit();
+        }
+        Some(ControlAction::Previous) => state.agent_model_dropdown_move(-1),
+        Some(ControlAction::Next) => state.agent_model_dropdown_move(1),
+        Some(ControlAction::Backspace) => state.agent_editor_backspace(),
+        Some(ControlAction::Clear) => state.clear_agent_model_dropdown_query(),
         None => {
             if let KeyCode::Char(character) = key.code
                 && !key
@@ -1977,9 +2005,46 @@ mod tests {
         backend::{BackendEvent, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, TurnOutcome},
         render,
         session::ProviderRecord,
-        state::{ActiveTurn, AgentRequest, AppState, ConnectionState, Effect},
+        state::{ActiveTurn, AgentEditorField, AgentRequest, AppState, ConnectionState, Effect},
         transcript::{EntryKind, EntryStatus},
     };
+
+    #[test]
+    fn enter_on_agent_model_field_opens_searchable_selection_menu() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.models = vec![crate::backend::ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "gpt-5.6-sol".to_owned(),
+            is_default: true,
+        }];
+        state.open_agent_picker();
+        state.edit_selected_agent();
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = AgentEditorField::Model;
+
+        super::handle_agent_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(state.agent_model_dropdown_is_open());
+        let dropdown = state
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .and_then(|editor| editor.model_dropdown.as_ref())
+            .expect("model dropdown");
+        assert!(
+            dropdown
+                .items
+                .iter()
+                .any(|option| { option.search_text().contains("openai-codex/gpt-5.6-sol") })
+        );
+    }
 
     #[test]
     fn fatal_provider_quota_errors_open_a_cooldown_for_new_workers() {

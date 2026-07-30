@@ -21,6 +21,7 @@ pub mod personality;
 pub mod pty;
 pub mod render;
 pub mod runtime;
+pub mod searchable_dropdown;
 pub mod selection;
 pub mod session;
 pub mod skill;

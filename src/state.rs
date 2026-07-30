@@ -17,6 +17,7 @@ use crate::{
     editor::EditorState,
     handoff::HandoffPackage,
     personality::PromptAddenda,
+    searchable_dropdown::SearchableDropdown,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
     session::{ProviderRecord, SessionRecord, SubagentRecord},
     skill::{Skill, SkillCatalog},
@@ -261,6 +262,43 @@ impl AgentEditorField {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentModelOption {
+    Inherit,
+    Model(ModelInfo),
+}
+
+impl AgentModelOption {
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Inherit => "Inherit parent model".to_owned(),
+            Self::Model(model) => model.display_name(),
+        }
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Inherit => "uses the parent session model".to_owned(),
+            Self::Model(model) => model.qualified_id(),
+        }
+    }
+
+    #[must_use]
+    pub fn search_text(&self) -> String {
+        format!("{} {}", self.label(), self.detail())
+    }
+
+    #[must_use]
+    fn qualified_id(&self) -> Option<String> {
+        match self {
+            Self::Inherit => None,
+            Self::Model(model) => Some(model.qualified_id()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentEditor {
     pub original_slug: Option<String>,
     pub field: AgentEditorField,
@@ -270,6 +308,7 @@ pub struct AgentEditor {
     pub first_message: String,
     pub model: String,
     pub fallback_models: String,
+    pub model_dropdown: Option<SearchableDropdown<AgentModelOption>>,
 }
 
 impl AgentEditor {
@@ -283,6 +322,7 @@ impl AgentEditor {
             first_message: String::new(),
             model: String::new(),
             fallback_models: String::new(),
+            model_dropdown: None,
         }
     }
 
@@ -296,6 +336,7 @@ impl AgentEditor {
             first_message: definition.first_message.clone(),
             model: definition.model.clone().unwrap_or_default(),
             fallback_models: definition.fallback_models.join(", "),
+            model_dropdown: None,
         }
     }
 
@@ -1275,7 +1316,110 @@ impl AppState {
         let Some(picker) = &mut self.agent_picker else {
             return false;
         };
-        picker.editor.take().is_some()
+        let Some(editor) = &mut picker.editor else {
+            return false;
+        };
+        if editor.model_dropdown.take().is_some() {
+            return true;
+        }
+        picker.editor = None;
+        true
+    }
+
+    #[must_use]
+    pub fn agent_model_dropdown_is_open(&self) -> bool {
+        self.agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .is_some_and(|editor| editor.model_dropdown.is_some())
+    }
+
+    pub fn open_agent_model_dropdown(&mut self) {
+        let Some((field, current)) = self
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .map(|editor| (editor.field, editor.model.trim().to_owned()))
+        else {
+            return;
+        };
+        if field != AgentEditorField::Model {
+            return;
+        }
+
+        let mut items = vec![AgentModelOption::Inherit];
+        items.extend(self.models.iter().cloned().map(AgentModelOption::Model));
+        if !current.is_empty()
+            && !items
+                .iter()
+                .any(|option| option.qualified_id().as_deref() == Some(current.as_str()))
+            && let Some((provider, id)) = current.split_once('/')
+            && !provider.is_empty()
+            && !id.is_empty()
+        {
+            items.push(AgentModelOption::Model(ModelInfo {
+                provider: provider.to_owned(),
+                id: id.to_owned(),
+                is_default: false,
+            }));
+        }
+        let selected = items
+            .iter()
+            .position(|option| option.qualified_id().as_deref() == Some(current.as_str()))
+            .unwrap_or(0);
+        if let Some(editor) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+        {
+            editor.model_dropdown = Some(SearchableDropdown::with_selected(items, selected));
+        }
+    }
+
+    pub fn agent_model_dropdown_move(&mut self, delta: isize) {
+        if let Some(dropdown) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .and_then(|editor| editor.model_dropdown.as_mut())
+        {
+            dropdown.move_selection(delta, AgentModelOption::search_text);
+        }
+    }
+
+    pub fn select_agent_model_dropdown(&mut self) {
+        let selected = self
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .and_then(|editor| editor.model_dropdown.as_ref())
+            .and_then(|dropdown| {
+                dropdown
+                    .selected_item(AgentModelOption::search_text)
+                    .cloned()
+            });
+        let Some(selected) = selected else {
+            return;
+        };
+        if let Some(editor) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+        {
+            editor.model = selected.qualified_id().unwrap_or_default();
+            editor.model_dropdown = None;
+        }
+    }
+
+    pub fn clear_agent_model_dropdown_query(&mut self) {
+        if let Some(dropdown) = self
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .and_then(|editor| editor.model_dropdown.as_mut())
+        {
+            dropdown.clear();
+        }
     }
 
     pub fn agent_editor_move(&mut self, delta: isize) {
@@ -1300,7 +1444,11 @@ impl AppState {
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
         {
-            editor.value_mut().push(character);
+            if let Some(dropdown) = &mut editor.model_dropdown {
+                dropdown.insert(character);
+            } else {
+                editor.value_mut().push(character);
+            }
         }
     }
 
@@ -1310,7 +1458,11 @@ impl AppState {
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
         {
-            editor.value_mut().push_str(text);
+            if let Some(dropdown) = &mut editor.model_dropdown {
+                dropdown.insert_str(text);
+            } else {
+                editor.value_mut().push_str(text);
+            }
         }
     }
 
@@ -1320,7 +1472,11 @@ impl AppState {
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
         {
-            editor.value_mut().pop();
+            if let Some(dropdown) = &mut editor.model_dropdown {
+                dropdown.backspace();
+            } else {
+                editor.value_mut().pop();
+            }
         }
     }
 
@@ -5240,7 +5396,9 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus};
+    use super::{
+        AgentEditorField, AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus,
+    };
 
     #[test]
     fn primary_system_instructions_include_model_personality_and_soul() {
@@ -5308,6 +5466,44 @@ model = "openai-codex/model-a"
             is_default: true,
         }]));
         state
+    }
+
+    #[test]
+    fn agent_model_dropdown_searches_catalog_and_applies_selection() {
+        let mut state = ready_state();
+        state.open_agent_picker();
+        state.edit_selected_agent();
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = AgentEditorField::Model;
+
+        state.open_agent_model_dropdown();
+        assert!(state.agent_model_dropdown_is_open());
+        state.agent_editor_insert_str("model a");
+        state.select_agent_model_dropdown();
+        let editor = state
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .expect("agent editor");
+        assert_eq!(editor.model, "openai-codex/model-a");
+        assert!(editor.model_dropdown.is_none());
+
+        state.open_agent_model_dropdown();
+        state.agent_editor_insert_str("inherit");
+        state.select_agent_model_dropdown();
+        assert_eq!(
+            state
+                .agent_picker
+                .as_ref()
+                .and_then(|picker| picker.editor.as_ref())
+                .expect("agent editor")
+                .model,
+            ""
+        );
     }
 
     fn install_review_skill(state: &mut AppState) {

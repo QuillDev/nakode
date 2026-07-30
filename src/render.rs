@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     backend::{ApprovalRequest, TodoStatus},
@@ -1094,12 +1095,107 @@ fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Paragraph::new(lines).block(overlay_block(" Agents ", ACCENT)),
         popup,
     );
+    if let Some(dropdown) = picker
+        .editor
+        .as_ref()
+        .and_then(|editor| editor.model_dropdown.as_ref())
+    {
+        let dropdown_popup = centered(area, 68, 18);
+        render_searchable_dropdown(
+            frame,
+            dropdown_popup,
+            dropdown,
+            " Select Agent Model ",
+            "No matching models",
+            crate::state::AgentModelOption::search_text,
+            |option, selected| {
+                Line::from(vec![
+                    Span::styled(
+                        if selected { "› " } else { "  " },
+                        Style::default().fg(if selected { ACCENT } else { MUTED }),
+                    ),
+                    Span::styled(
+                        option.label(),
+                        Style::default()
+                            .fg(if selected { TEXT } else { MUTED })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(format!("  {}", option.detail()), Style::default().fg(MUTED)),
+                ])
+            },
+        );
+    }
+}
+
+fn render_searchable_dropdown<T, S, R>(
+    frame: &mut Frame<'_>,
+    popup: Rect,
+    dropdown: &crate::searchable_dropdown::SearchableDropdown<T>,
+    title: &str,
+    empty_message: &str,
+    search_text: S,
+    row: R,
+) where
+    S: Fn(&T) -> String,
+    R: Fn(&T, bool) -> Line<'static>,
+{
+    frame.render_widget(Clear, popup);
+    let filtered = dropdown.filtered_items(search_text);
+    let visible_rows = usize::from(popup.height.saturating_sub(6)).max(1);
+    let start = dropdown
+        .selected
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(filtered.len().saturating_sub(visible_rows));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(ACCENT_BRIGHT).bold()),
+            Span::styled(&dropdown.query, Style::default().fg(TEXT)),
+        ])
+        .style(Style::default().bg(SURFACE_RAISED)),
+        Line::default(),
+    ];
+    if filtered.is_empty() {
+        lines.push(Line::styled(
+            empty_message.to_owned(),
+            Style::default().fg(DANGER),
+        ));
+    } else {
+        lines.extend(
+            filtered
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible_rows)
+                .map(|(index, item)| row(item, index == dropdown.selected)),
+        );
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "Type to search · ↑/↓ select · Enter apply · Esc cancel",
+        Style::default().fg(MUTED),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines).block(overlay_block(title.to_owned(), ACCENT)),
+        popup,
+    );
+    let query_width =
+        u16::try_from(UnicodeWidthStr::width(dropdown.query.as_str())).unwrap_or(u16::MAX);
+    let input_start = popup.x.saturating_add(1).saturating_add(8);
+    let input_end = popup.right().saturating_sub(2);
+    frame.set_cursor_position(Position::new(
+        input_start.saturating_add(query_width).min(input_end),
+        popup.y.saturating_add(1),
+    ));
 }
 
 fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
-            "Tab/↑/↓ field · type or paste · Ctrl+S save · Esc cancel",
+            "Tab/↑/↓ field · type or paste · Enter choose model · Ctrl+S save · Esc cancel",
             Style::default().fg(MUTED),
         ),
         Line::default(),
@@ -2578,7 +2674,41 @@ mod tests {
         assert!(editor.contains("System prompt"));
         assert!(editor.contains("First message"));
         assert!(editor.contains("Fallbacks"));
+        assert!(editor.contains("Enter choose model"));
         assert!(editor.contains("Ctrl+S save"));
+
+        state.models = vec![crate::backend::ModelInfo {
+            provider: "openai-codex".to_owned(),
+            id: "gpt-5.6-sol".to_owned(),
+            is_default: true,
+        }];
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = crate::state::AgentEditorField::Model;
+        state.open_agent_model_dropdown();
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render agent model dropdown");
+        let dropdown = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(dropdown.contains("Select Agent Model"));
+        assert!(dropdown.contains("Inherit parent model"));
+        assert!(dropdown.contains("GPT 5.6 Sol"));
+        assert!(
+            terminal.backend().cursor_visible(),
+            "the dropdown should focus its search input even when a model row is selected"
+        );
+        let cursor = terminal.backend().cursor_position();
+        assert_eq!(cursor.y, 7);
+        assert_eq!(cursor.x, 25);
     }
 
     #[test]
