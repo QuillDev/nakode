@@ -7,6 +7,7 @@ mod find;
 mod grep;
 mod hypa;
 mod ls;
+mod memory;
 mod process;
 mod read;
 mod todo;
@@ -126,6 +127,12 @@ impl ToolRegistry {
     ) -> Self {
         self.tools
             .push(Arc::new(vision::VisionTool::new(config, service)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_memory(mut self, service: crate::memory::SharedMemoryService) -> Self {
+        self.tools.extend(memory::tools(service));
         self
     }
 

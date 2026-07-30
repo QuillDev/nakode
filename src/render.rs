@@ -794,6 +794,7 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         crate::state::SettingsView::Addons => settings_addon_lines(settings),
         crate::state::SettingsView::WebBrowsing => settings_web_browsing_lines(settings),
         crate::state::SettingsView::Vision => settings_vision_lines(settings),
+        crate::state::SettingsView::Memory => settings_memory_lines(settings),
         crate::state::SettingsView::TerminalImages => settings_terminal_image_lines(settings),
     };
     frame.render_widget(
@@ -865,6 +866,7 @@ fn settings_addon_lines(settings: &crate::state::SettingsState) -> Vec<Line<'sta
                 .clone()
                 .unwrap_or_else(|| "Disabled".to_owned()),
         ),
+        ("Memory", settings.memory.backend.label().to_owned()),
         (
             "Terminal images",
             settings.terminal_images.label().to_owned(),
@@ -882,6 +884,74 @@ fn settings_addon_lines(settings: &crate::state::SettingsState) -> Vec<Line<'sta
         "Enter open · ↑/↓ select · Esc back",
         Style::default().fg(MUTED),
     ));
+    lines
+}
+
+fn settings_memory_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled("Memory", Style::default().fg(TEXT).bold()),
+        Line::default(),
+        settings_row(
+            "Provider",
+            settings.memory.backend.label(),
+            settings.addon_field == 0,
+        ),
+        Line::default(),
+    ];
+    if settings.memory.backend == crate::memory::MemoryBackend::Disabled {
+        lines.push(settings_status_row("Status", "Disabled", MUTED));
+    } else {
+        lines.push(settings_row(
+            "Executable",
+            &settings.memory.executable,
+            settings.addon_field == 1,
+        ));
+        lines.push(settings_row(
+            "Global bank",
+            &settings.memory.global_bank,
+            settings.addon_field == 2,
+        ));
+        lines.push(settings_row(
+            "Data directory",
+            if settings.memory.data_directory.is_empty() {
+                "Mnemosyne default"
+            } else {
+                &settings.memory.data_directory
+            },
+            settings.addon_field == 3,
+        ));
+        let (status, color) = if !settings.memory.configured() {
+            ("Setup required", WARNING)
+        } else if settings.memory.available() {
+            ("Available", SUCCESS)
+        } else {
+            ("Executable not detected", WARNING)
+        };
+        lines.push(Line::default());
+        lines.push(settings_status_row(
+            "Bank format",
+            "Up to 64 letters, numbers, hyphens, or underscores",
+            MUTED,
+        ));
+        lines.push(settings_status_row(
+            "Scopes",
+            "Project (managed) + global",
+            MUTED,
+        ));
+        lines.push(settings_status_row("Status", status, color));
+        lines.push(settings_status_row(
+            "Install",
+            "uv tool install 'mnemosyne-memory[mcp]'",
+            MUTED,
+        ));
+    }
+    lines.extend([
+        Line::default(),
+        Line::styled(
+            "←/→ provider · ↑/↓ field · type to edit · Esc save",
+            Style::default().fg(MUTED),
+        ),
+    ]);
     lines
 }
 
@@ -2062,6 +2132,36 @@ first_message = "Inspect the delegated question."
         )
         .expect("agent fixture");
         state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+    }
+
+    #[test]
+    fn memory_settings_render_provider_status_and_install_guidance() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.install_memory_config(crate::memory::MemoryConfig {
+            backend: crate::memory::MemoryBackend::Mnemosyne,
+            executable: "/missing/mnemosyne".into(),
+            global_bank: "my-global-memory".into(),
+            data_directory: String::new(),
+        });
+        state.open_settings();
+        let settings = state.settings.as_mut().expect("settings");
+        settings.view = crate::state::SettingsView::Memory;
+        let rendered = super::settings_memory_lines(settings)
+            .into_iter()
+            .flat_map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .chain(std::iter::once("\n".to_owned()))
+            })
+            .collect::<String>();
+        assert!(rendered.contains("Mnemosyne"));
+        assert!(rendered.contains("Global bank"));
+        assert!(rendered.contains("my-global-memory"));
+        assert!(!rendered.contains("Project bank"));
+        assert!(rendered.contains("Project (managed) + global"));
+        assert!(rendered.contains("Executable not detected"));
+        assert!(rendered.contains("mnemosyne-memory[mcp]"));
     }
 
     #[test]

@@ -73,6 +73,8 @@ struct BackendRegistry {
     provider_credentials: HashMap<String, serde_json::Value>,
     provider_cooldowns: HashMap<String, ProviderCooldown>,
     web_config: Arc<RwLock<crate::web::WebConfig>>,
+    memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
+    memory_service: crate::memory::SharedMemoryService,
     vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
     vision_service: Option<crate::vision::SharedVisionService>,
 }
@@ -100,6 +102,10 @@ impl BackendRegistry {
         read_shared_config(&self.web_config)
     }
 
+    fn current_memory_config(&self) -> crate::memory::MemoryConfig {
+        read_shared_config(&self.memory_config)
+    }
+
     fn current_vision_config(&self) -> crate::vision::VisionConfig {
         read_shared_config(&self.vision_config)
     }
@@ -110,6 +116,7 @@ impl BackendRegistry {
         session_database: PathBuf,
         provider_credentials: HashMap<String, serde_json::Value>,
         web_config: Arc<RwLock<crate::web::WebConfig>>,
+        memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
         vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
     ) -> Self {
         let (event_tx, events) = mpsc::channel(512);
@@ -139,6 +146,11 @@ impl BackendRegistry {
             provider_credentials,
             provider_cooldowns: HashMap::new(),
             web_config,
+            memory_config: Arc::clone(&memory_config),
+            memory_service: Arc::new(crate::memory::MemoryService::new(
+                memory_config,
+                crate::memory::project_bank(&config.workspace),
+            )),
             vision_config,
             vision_service,
         };
@@ -175,6 +187,7 @@ impl BackendRegistry {
                         ))
                         .with_session_database(self.session_database.clone())
                         .with_web_config(Arc::clone(&self.web_config))
+                        .with_memory(Arc::clone(&self.memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
@@ -196,6 +209,7 @@ impl BackendRegistry {
                         ))
                         .with_session_database(self.session_database.clone())
                         .with_web_config(Arc::clone(&self.web_config))
+                        .with_memory(Arc::clone(&self.memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
@@ -209,6 +223,7 @@ impl BackendRegistry {
                         ))
                         .with_session_database(self.session_database.clone())
                         .with_web_config(Arc::clone(&self.web_config))
+                        .with_memory(Arc::clone(&self.memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
@@ -222,6 +237,7 @@ impl BackendRegistry {
                         ))
                         .with_session_database(self.session_database.clone())
                         .with_web_config(Arc::clone(&self.web_config))
+                        .with_memory(Arc::clone(&self.memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
@@ -559,6 +575,7 @@ fn initial_state(
         fast_mode: false,
     });
     state.install_web_config(backends.current_web_config());
+    state.install_memory_config(backends.current_memory_config());
     state.install_vision_config(backends.current_vision_config());
     state.install_agents(agents);
     state.install_skills(skills);
@@ -582,6 +599,7 @@ async fn start_backends(
     let (provider_credentials, credential_failures) =
         load_provider_credentials(&providers, credentials);
     let web_config = shared_web_config(sessions)?;
+    let memory_config = shared_memory_config(sessions)?;
     let vision_config = shared_vision_config(sessions)?;
     let mut backends = BackendRegistry::spawn(
         config,
@@ -589,6 +607,7 @@ async fn start_backends(
         sessions.database_path().to_path_buf(),
         provider_credentials,
         web_config,
+        memory_config,
         vision_config,
     )
     .await;
@@ -638,6 +657,14 @@ fn shared_web_config(
 ) -> Result<Arc<RwLock<crate::web::WebConfig>>, SessionError> {
     sessions
         .load_web_config()
+        .map(|config| Arc::new(RwLock::new(config)))
+}
+
+fn shared_memory_config(
+    sessions: &dyn SessionRepository,
+) -> Result<Arc<RwLock<crate::memory::MemoryConfig>>, SessionError> {
+    sessions
+        .load_memory_config()
         .map(|config| Arc::new(RwLock::new(config)))
 }
 
@@ -952,6 +979,9 @@ async fn apply_effects(
             Effect::TouchSession(id) => touch_session(state, sessions, &id),
             Effect::SaveWebConfig(config) => {
                 save_web_config_effect(state, backends, sessions, config);
+            }
+            Effect::SaveMemoryConfig(config) => {
+                save_memory_config_effect(state, backends, sessions, config).await;
             }
             Effect::SaveVisionConfig(config) => {
                 save_vision_config_effect(state, backends, sessions, config);
@@ -1362,6 +1392,25 @@ fn save_web_config_effect(
     }
     state.install_web_config(config);
     state.set_status("Browser add-on settings saved.");
+}
+
+async fn save_memory_config_effect(
+    state: &mut AppState,
+    backends: &BackendRegistry,
+    sessions: &dyn SessionRepository,
+    config: crate::memory::MemoryConfig,
+) {
+    if let Err(error) = sessions.save_memory_config(&config) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    if let Err(error) = replace_shared_config(&backends.memory_config, config.clone(), "memory") {
+        state.session_store_failed(error);
+        return;
+    }
+    state.install_memory_config(config);
+    backends.memory_service.reset().await;
+    state.set_status("Memory add-on settings saved.");
 }
 
 fn save_vision_config_effect(
@@ -2197,6 +2246,9 @@ first_message = "Inspect the delegated question."
         .validated()
         .expect("validated config");
         let (event_tx, events) = tokio::sync::mpsc::channel(1);
+        let memory_config = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::memory::MemoryConfig::default(),
+        ));
         let mut registry = super::BackendRegistry {
             commands: HashMap::new(),
             subagent_commands: HashMap::new(),
@@ -2214,6 +2266,11 @@ first_message = "Inspect the delegated question."
             provider_cooldowns: HashMap::new(),
             web_config: std::sync::Arc::new(std::sync::RwLock::new(
                 crate::web::WebConfig::default(),
+            )),
+            memory_config: std::sync::Arc::clone(&memory_config),
+            memory_service: std::sync::Arc::new(crate::memory::MemoryService::new(
+                memory_config,
+                crate::memory::project_bank(directory.path()),
             )),
             vision_config: std::sync::Arc::new(std::sync::RwLock::new(
                 crate::vision::VisionConfig::default(),

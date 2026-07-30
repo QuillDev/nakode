@@ -14,6 +14,7 @@ pub use crate::backend::{CODEX_PROVIDER, DEVIN_PROVIDER};
 use crate::{
     backend::{ModelInfo, ModelOptions},
     credential::CredentialMetadata,
+    memory::{MemoryBackend, MemoryConfig},
     terminal_image::TerminalImageMode,
     transcript::{EntryKind, EntryStatus, TranscriptEntry},
     vision::VisionConfig,
@@ -237,6 +238,16 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when preference storage cannot be updated.
     fn save_web_config(&self, config: &WebConfig) -> Result<(), SessionError>;
+    /// Loads optional semantic-memory add-on preferences.
+    ///
+    /// # Errors
+    /// Returns an error when preference storage cannot be read.
+    fn load_memory_config(&self) -> Result<MemoryConfig, SessionError>;
+    /// Saves optional semantic-memory add-on preferences.
+    ///
+    /// # Errors
+    /// Returns an error when preference storage cannot be updated.
+    fn save_memory_config(&self, config: &MemoryConfig) -> Result<(), SessionError>;
     /// Loads optional vision add-on preferences.
     ///
     /// # Errors
@@ -524,6 +535,13 @@ fn seed_provider_catalog(connection: &Connection) -> Result<(), SessionError> {
            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
            backend TEXT NOT NULL,
            firecrawl_api_key TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS addon_memory_settings (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           backend TEXT NOT NULL,
+           executable TEXT NOT NULL,
+           global_bank TEXT NOT NULL,
+           data_directory TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS addon_vision_settings (
            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1008,6 +1026,63 @@ impl SessionRepository for SqliteSessionRepository {
         Ok(())
     }
 
+    fn load_memory_config(&self) -> Result<MemoryConfig, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let stored = connection
+            .query_row(
+                "SELECT backend, executable, global_bank, data_directory FROM addon_memory_settings WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((backend, executable, global_bank, data_directory)) = stored else {
+            return Ok(MemoryConfig::default());
+        };
+        let backend = match backend.as_str() {
+            "disabled" => MemoryBackend::Disabled,
+            "mnemosyne" => MemoryBackend::Mnemosyne,
+            _ => {
+                return Err(SessionError::InvalidStoredValue {
+                    field: "addon_memory_settings.backend",
+                    value: backend,
+                });
+            }
+        };
+        Ok(MemoryConfig {
+            backend,
+            executable,
+            global_bank,
+            data_directory,
+        })
+    }
+
+    fn save_memory_config(&self, config: &MemoryConfig) -> Result<(), SessionError> {
+        let backend = match config.backend {
+            MemoryBackend::Disabled => "disabled",
+            MemoryBackend::Mnemosyne => "mnemosyne",
+        };
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "INSERT INTO addon_memory_settings (singleton, backend, executable, global_bank, data_directory) VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(singleton) DO UPDATE SET backend = excluded.backend, executable = excluded.executable, global_bank = excluded.global_bank, data_directory = excluded.data_directory",
+            params![backend, config.executable, config.global_bank, config.data_directory],
+        )?;
+        Ok(())
+    }
+
     fn load_vision_config(&self) -> Result<VisionConfig, SessionError> {
         let connection = self
             .connection
@@ -1267,6 +1342,23 @@ mod tests {
         };
         store.save_web_config(&configured)?;
         assert_eq!(store.load_web_config()?, configured);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_addon_settings_are_optional_and_persisted() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        assert_eq!(store.load_memory_config()?, MemoryConfig::default());
+
+        let configured = MemoryConfig {
+            backend: MemoryBackend::Mnemosyne,
+            executable: "/opt/bin/mnemosyne".to_owned(),
+            global_bank: "my-global-memory".to_owned(),
+            data_directory: "/tmp/memory".to_owned(),
+        };
+        store.save_memory_config(&configured)?;
+        assert_eq!(store.load_memory_config()?, configured);
         Ok(())
     }
 

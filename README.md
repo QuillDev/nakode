@@ -190,6 +190,35 @@ Changes apply to the portable browser tool without restarting Nakode. Provider
 or tool functionality unrelated to web browsing remains available when either
 add-on is absent or disabled.
 
+## Optional memory
+
+Nakode can expose provider-neutral `memory_search` and `memory_store` tools through
+[Mnemosyne](https://github.com/mnemosyne-oss/mnemosyne). Memory is disabled by
+default and writes occur only when an agent explicitly calls `memory_store`; Nakode
+does not ingest transcripts automatically.
+
+Install Mnemosyne with its stdio MCP support in an isolated Python environment:
+
+```sh
+uv tool install 'mnemosyne-memory[mcp]'
+```
+
+Then open `/settings` → **Add-ons** → **Memory**, select **Mnemosyne**, confirm
+the executable, and choose the Mnemosyne bank used for global user memory.
+Semantic embeddings remain optional and can be installed with
+`mnemosyne-memory[mcp,embeddings]`. Nakode supervises local MCP processes and
+stores memories in Mnemosyne's SQLite data directory.
+
+Nakode manages a deterministic project bank for each workspace; project-bank names
+are internal and are not user settings. Every `memory_store` call must explicitly
+select `project` or `global` scope. `memory_search` searches both scopes by default,
+while allowing a caller to narrow a query to one scope.
+
+Memory tools are currently available to the portable-tool runtimes used by Codex,
+Devin, Kimi, and GLM. Cursor continues to work normally but does not receive these
+tools. Disabling memory, clearing a required field, or removing the executable
+removes the tools on the next inference request without affecting other providers.
+
 ## Skills
 
 Nakode discovers portable Agent Skills from these directories, with
