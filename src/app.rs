@@ -1287,7 +1287,23 @@ fn save_agent_definition(
         catalog.save(&directory, definition, previous_slug)?;
         AgentCatalog::load(&directory)
     });
-    install_changed_agent_catalog(state, result, "Agent archetype saved.");
+    match result {
+        Ok(catalog) => {
+            let editor = state
+                .agent_picker
+                .as_ref()
+                .and_then(|picker| picker.editor.clone());
+            state.install_agents(catalog);
+            if let Some(mut editor) = editor {
+                editor.original_slug = Some(definition.slug.clone());
+                if let Some(picker) = &mut state.agent_picker {
+                    picker.editor = Some(editor);
+                }
+            }
+            state.set_status("Agent changes saved.");
+        }
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
 }
 
 fn delete_agent_definition(state: &mut AppState, slug: &str) {
@@ -1430,7 +1446,7 @@ pub(crate) fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<E
                 .as_ref()
                 .is_some_and(|picker| picker.editor.is_some())
             {
-                state.agent_editor_insert_str(&text);
+                return state.agent_editor_insert_str(&text);
             } else if state.settings.is_some() {
                 for character in text.chars() {
                     state.settings_insert(character);
@@ -1913,6 +1929,18 @@ fn handle_agent_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 }
 
 fn handle_agent_editor_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    if state.agent_model_options_are_open() {
+        match controls::resolve(ControlContext::ModelPicker, key) {
+            Some(ControlAction::Select) => return state.apply_agent_model_options(),
+            Some(ControlAction::Close) => {
+                state.cancel_agent_edit();
+            }
+            Some(ControlAction::MoveLeft) => state.adjust_agent_model_options(-1),
+            Some(ControlAction::MoveRight) => state.adjust_agent_model_options(1),
+            _ => {}
+        }
+        return Vec::new();
+    }
     if state.agent_model_dropdown_is_open() {
         return handle_searchable_dropdown_key(state, key);
     }
@@ -1922,16 +1950,15 @@ fn handle_agent_editor_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.cancel_agent_edit();
         }
         Some(ControlAction::Open) => state.open_agent_model_dropdown(),
-        Some(ControlAction::Save) => return state.save_agent_edit(),
         Some(ControlAction::Next) => state.agent_editor_move(1),
-        Some(ControlAction::Backspace) => state.agent_editor_backspace(),
+        Some(ControlAction::Backspace) => return state.agent_editor_backspace(),
         None => {
             if let KeyCode::Char(character) = key.code
                 && !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER)
             {
-                state.agent_editor_insert(character);
+                return state.agent_editor_insert(character);
             }
         }
         Some(_) => {}
@@ -1941,13 +1968,13 @@ fn handle_agent_editor_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 
 fn handle_searchable_dropdown_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     match controls::resolve(ControlContext::SearchableDropdown, key) {
-        Some(ControlAction::Select) => state.select_agent_model_dropdown(),
+        Some(ControlAction::Select) => return state.select_agent_model_dropdown(),
         Some(ControlAction::Close) => {
             state.cancel_agent_edit();
         }
         Some(ControlAction::Previous) => state.agent_model_dropdown_move(-1),
         Some(ControlAction::Next) => state.agent_model_dropdown_move(1),
-        Some(ControlAction::Backspace) => state.agent_editor_backspace(),
+        Some(ControlAction::Backspace) => return state.agent_editor_backspace(),
         Some(ControlAction::Clear) => state.clear_agent_model_dropdown_query(),
         None => {
             if let KeyCode::Char(character) = key.code
@@ -1955,7 +1982,7 @@ fn handle_searchable_dropdown_key(state: &mut AppState, key: KeyEvent) -> Vec<Ef
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER)
             {
-                state.agent_editor_insert(character);
+                return state.agent_editor_insert(character);
             }
         }
         Some(_) => {}
@@ -2034,6 +2061,69 @@ mod tests {
         state::{ActiveTurn, AgentEditorField, AgentRequest, AppState, ConnectionState, Effect},
         transcript::{EntryKind, EntryStatus},
     };
+
+    #[test]
+    fn valid_agent_text_edits_emit_autosave_without_a_shortcut() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.open_agent_picker();
+        state.edit_selected_agent();
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = AgentEditorField::Description;
+
+        let effects = super::handle_agent_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(effects.as_slice(), [Effect::SaveAgent { .. }]));
+    }
+
+    #[test]
+    fn successful_agent_autosave_keeps_the_editor_open() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let agent_directory = workspace.path().join(".nakode/agents");
+        let mut state = AppState::new(workspace.path().to_string_lossy(), None, 100);
+        state.set_agent_directory(agent_directory.clone());
+        state.open_agent_picker();
+        state.edit_selected_agent();
+        state
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor")
+            .field = AgentEditorField::Description;
+        let effects = state.agent_editor_insert('!');
+        let [
+            Effect::SaveAgent {
+                definition,
+                previous_slug,
+                ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("expected agent save");
+        };
+        let definition = definition.clone();
+        let previous_slug = previous_slug.clone();
+
+        super::save_agent_definition(&mut state, &definition, previous_slug.as_deref());
+
+        let editor = state
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .expect("autosave should preserve the editor");
+        assert_eq!(
+            editor.original_slug.as_deref(),
+            Some(definition.slug.as_str())
+        );
+        assert!(agent_directory.join("explorer.toml").is_file());
+        assert_eq!(state.status_message, "Agent changes saved.");
+    }
 
     #[test]
     fn enter_on_agent_model_field_opens_searchable_selection_menu() {

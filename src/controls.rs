@@ -76,7 +76,6 @@ pub enum ControlAction {
     Focus,
     Open,
     Create,
-    Save,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -408,7 +407,6 @@ const KEY_CONTROLS: &[KeyControl] = &[
     control!(AgentEditor, Previous, KeyCode::Tab, Shift),
     control!(AgentEditor, Close, KeyCode::Esc, Any),
     control!(AgentEditor, Open, KeyCode::Enter, Any),
-    control!(AgentEditor, Save, KeyCode::Char('s'), Control),
     control!(AgentEditor, Next, KeyCode::Tab, None),
     control!(AgentEditor, Next, KeyCode::Down, Any),
     control!(AgentEditor, Backspace, KeyCode::Backspace, Any),

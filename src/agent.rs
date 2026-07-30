@@ -23,6 +23,8 @@ pub struct AgentDefinition {
     pub model: Option<String>,
     #[serde(default)]
     pub fallback_models: Vec<String>,
+    #[serde(default)]
+    pub fast_mode: bool,
 }
 
 impl AgentDefinition {
@@ -111,6 +113,14 @@ impl Default for AgentCatalog {
 }
 
 impl AgentCatalog {
+    /// Validates an agent definition before it is persisted.
+    ///
+    /// # Errors
+    /// Returns the same field and model validation errors used by catalog loading and saving.
+    pub fn validate_definition(definition: &AgentDefinition) -> Result<(), AgentCatalogError> {
+        validate(definition, "agent editor")
+    }
+
     /// Loads all TOML agent definitions from `directory` in filename order.
     ///
     /// Returns the shipped default catalog when `directory` does not exist. An existing empty
@@ -440,6 +450,7 @@ first_message = "Explore the migration."
             first_message: "Review the requested artifact.".to_owned(),
             model: Some("openai-codex/gpt-5".to_owned()),
             fallback_models: vec!["devin-acp/swe-1-7-lightning".to_owned()],
+            fast_mode: true,
         };
 
         catalog

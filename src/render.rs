@@ -1136,6 +1136,22 @@ fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 ])
             },
         );
+    } else if let Some(fast_mode) = picker
+        .editor
+        .as_ref()
+        .and_then(|editor| editor.pending_fast_mode)
+    {
+        render_model_options_popup(
+            frame,
+            centered(area, 72, 18),
+            &crate::backend::ModelOptions {
+                reasoning_effort: None,
+                fast_mode,
+            },
+            0,
+            true,
+            "Configure this agent's Cursor model",
+        );
     }
 }
 
@@ -1203,7 +1219,7 @@ fn render_searchable_dropdown<T, S, R>(
 fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
-            "Tab/↑/↓ field · type or paste · Enter choose model · Ctrl+S save · Esc cancel",
+            "Tab/↑/↓ field · type or paste · Enter choose model · changes save automatically · Esc close",
             Style::default().fg(MUTED),
         ),
         Line::default(),
@@ -1242,8 +1258,12 @@ fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> 
         lines.push(Line::default());
     }
     lines.push(Line::styled(
-        "Models use provider/model; separate fallbacks with commas.",
-        Style::default().fg(MUTED),
+        if editor.fast_mode {
+            "Models use provider/model; fallbacks use commas · ⚡ Fast mode enabled"
+        } else {
+            "Models use provider/model; separate fallbacks with commas."
+        },
+        Style::default().fg(if editor.fast_mode { ACCENT } else { MUTED }),
     ));
     lines
 }
@@ -1269,6 +1289,11 @@ fn agent_list_lines(picker: &crate::state::AgentPicker) -> Vec<Line<'static>> {
             .chain(agent.fallback_models.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" → ");
+        let models = if agent.fast_mode {
+            format!("{models}  ⚡ fast")
+        } else {
+            models
+        };
         lines.push(Line::styled(
             format!("    {models}"),
             Style::default().fg(if selected { ACCENT_DEEP } else { MUTED }),
@@ -1750,76 +1775,91 @@ fn relative_time(timestamp: i64) -> String {
     }
 }
 
+fn render_model_options_popup(
+    frame: &mut Frame<'_>,
+    popup: Rect,
+    options: &crate::backend::ModelOptions,
+    option_selected: usize,
+    fast_only: bool,
+    description: &str,
+) {
+    frame.render_widget(Clear, popup);
+    let effort = options.reasoning_effort.as_deref().unwrap_or("medium");
+    let fast = if options.fast_mode { "⚡ on" } else { "off" };
+    let option_line = |index: usize, label: &str, value: &str| {
+        let selected = option_selected == index;
+        Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(if selected { ACCENT } else { MUTED }),
+            ),
+            Span::styled(
+                format!("{label}: "),
+                Style::default()
+                    .fg(if selected { TEXT } else { MUTED })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(
+                value.to_owned(),
+                Style::default().fg(if selected { ACCENT } else { MUTED }),
+            ),
+        ])
+    };
+    let mut lines = vec![
+        Line::styled(description.to_owned(), Style::default().fg(MUTED)),
+        Line::default(),
+    ];
+    if fast_only {
+        lines.push(option_line(0, "Fast mode", fast));
+    } else {
+        lines.push(option_line(0, "Reasoning effort", effort));
+        lines.push(option_line(1, "Fast mode", fast));
+    }
+    lines.extend([
+        Line::default(),
+        Line::styled(
+            "↑/↓ select · ←/→ change · Enter apply · Esc cancel",
+            Style::default().fg(MUTED),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Model Options "),
+            )
+            .style(Style::default().bg(SURFACE)),
+        popup,
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let popup = centered(area, 72, 18);
     frame.render_widget(Clear, popup);
     let picker = state.model_picker.as_ref().expect("picker checked");
     if picker.stage == crate::state::ModelPickerStage::Options {
-        let effort = picker
-            .options
-            .reasoning_effort
-            .as_deref()
-            .unwrap_or("medium");
-        let fast = if picker.options.fast_mode {
-            "⚡ on"
-        } else {
-            "off"
-        };
-        let option_line = |index: usize, label: &str, value: &str| {
-            let selected = picker.option_selected == index;
-            Line::from(vec![
-                Span::styled(
-                    if selected { "› " } else { "  " },
-                    Style::default().fg(if selected { ACCENT } else { MUTED }),
-                ),
-                Span::styled(
-                    format!("{label}: "),
-                    Style::default()
-                        .fg(if selected { TEXT } else { MUTED })
-                        .add_modifier(if selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(
-                    value.to_owned(),
-                    Style::default().fg(if selected { ACCENT } else { MUTED }),
-                ),
-            ])
-        };
-        let description = if picker.options_fast_only {
-            "Configure the Cursor model default"
-        } else {
-            "Configure the OpenAI model default"
-        };
-        let mut lines = vec![
-            Line::styled(description, Style::default().fg(MUTED)),
-            Line::default(),
-        ];
-        if picker.options_fast_only {
-            lines.push(option_line(0, "Fast mode", fast));
-        } else {
-            lines.push(option_line(0, "Reasoning effort", effort));
-            lines.push(option_line(1, "Fast mode", fast));
-        }
-        lines.extend([
-            Line::default(),
-            Line::styled(
-                "↑/↓ select · ←/→ change · Enter apply · Esc cancel",
-                Style::default().fg(MUTED),
-            ),
-        ]);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Model Options "),
-                )
-                .style(Style::default().bg(SURFACE)),
+        render_model_options_popup(
+            frame,
             popup,
+            &picker.options,
+            picker.option_selected,
+            picker.options_fast_only,
+            match (picker.scope, picker.options_fast_only) {
+                (crate::state::ModelSelectionScope::Session, true) => {
+                    "Configure this session's Cursor model"
+                }
+                (crate::state::ModelSelectionScope::Session, false) => {
+                    "Configure this session's OpenAI model"
+                }
+                (_, true) => "Configure the Cursor model default",
+                (_, false) => "Configure the OpenAI model default",
+            },
         );
         return;
     }
@@ -2236,6 +2276,39 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("MODEL GPT 5.6 Sol ⚡"));
+    }
+
+    #[test]
+    fn switch_options_popup_exposes_cursor_fast_mode_for_this_session() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.model_picker = Some(crate::state::ModelPicker {
+            filter: String::new(),
+            selected: 0,
+            scope: crate::state::ModelSelectionScope::Session,
+            stage: crate::state::ModelPickerStage::Options,
+            option_selected: 0,
+            options: ModelOptions {
+                reasoning_effort: None,
+                fast_mode: false,
+            },
+            options_fast_only: true,
+        });
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render switch options");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Model Options"));
+        assert!(rendered.contains("Configure this session's Cursor model"));
+        assert!(rendered.contains("Fast mode"));
     }
 
     #[test]
@@ -2713,13 +2786,20 @@ mod tests {
         assert!(editor.contains("First message"));
         assert!(editor.contains("Fallbacks"));
         assert!(editor.contains("Enter choose model"));
-        assert!(editor.contains("Ctrl+S save"));
+        assert!(editor.contains("changes save automatically"));
 
-        state.models = vec![crate::backend::ModelInfo {
-            provider: "openai-codex".to_owned(),
-            id: "gpt-5.6-sol".to_owned(),
-            is_default: true,
-        }];
+        state.models = vec![
+            crate::backend::ModelInfo {
+                provider: "openai-codex".to_owned(),
+                id: "gpt-5.6-sol".to_owned(),
+                is_default: true,
+            },
+            crate::backend::ModelInfo {
+                provider: crate::backend::CURSOR_PROVIDER.to_owned(),
+                id: "composer-2.5".to_owned(),
+                is_default: true,
+            },
+        ];
         state
             .agent_picker
             .as_mut()
@@ -2747,6 +2827,22 @@ mod tests {
         let cursor = terminal.backend().cursor_position();
         assert_eq!(cursor.y, 7);
         assert_eq!(cursor.x, 25);
+
+        state.agent_editor_insert_str("composer");
+        state.select_agent_model_dropdown();
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render agent model options");
+        let options = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(options.contains("Model Options"));
+        assert!(options.contains("Configure this agent's Cursor model"));
+        assert!(options.contains("Fast mode"));
     }
 
     #[test]

@@ -719,6 +719,7 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("params = [{ id: \"fast\", value: \"true\" }]"));
         assert!(BRIDGE_SOURCE.contains("modelId.startsWith(\"grok-4.5\")"));
         assert!(BRIDGE_SOURCE.contains("modelId.startsWith(\"composer-\")"));
+        assert!(BRIDGE_SOURCE.contains("command.model ?? agent.model?.id"));
         assert!(!BRIDGE_SOURCE.contains("customTools: {\n      read:"));
         for name in [
             "read", "write", "edit", "bash", "grep", "find", "ls", "eval", "ask", "todo",

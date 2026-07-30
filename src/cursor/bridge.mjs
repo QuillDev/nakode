@@ -126,9 +126,10 @@ async function sendTurn(command) {
       if (update.type === "thinking-delta") write({ event: "delta", turnId: command.turnId, kind: "reasoning", text: update.text });
     },
   };
-  if (command.model) {
+  const modelId = command.model ?? agent.model?.id;
+  if (modelId) {
     const fastMode = sessionOptions.get(command.sessionId)?.fastMode ?? false;
-    options.model = modelSelection(command.model, fastMode);
+    options.model = modelSelection(modelId, fastMode);
   }
   const run = await agent.send(prompt, options);
   runs.set(command.turnId, run);
