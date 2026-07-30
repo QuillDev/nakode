@@ -3,15 +3,6 @@ use std::{collections::HashSet, fs, path::Path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const DEFAULT_AGENT_CONFIG_PATH: &str = "config/default-agents.toml";
-const DEFAULT_AGENT_CONFIG: &str = include_str!("../config/default-agents.toml");
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DefaultAgentConfig {
-    agents: Vec<AgentDefinition>,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDefinition {
@@ -101,15 +92,9 @@ pub enum AgentCatalogError {
     InvalidModel { slug: String, model: String },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct AgentCatalog {
     definitions: Vec<AgentDefinition>,
-}
-
-impl Default for AgentCatalog {
-    fn default() -> Self {
-        Self::from_default_config().expect("shipped default agent configuration must be valid")
-    }
 }
 
 impl AgentCatalog {
@@ -123,8 +108,7 @@ impl AgentCatalog {
 
     /// Loads all TOML agent definitions from `directory` in filename order.
     ///
-    /// Returns the shipped default catalog when `directory` does not exist. An existing empty
-    /// directory produces an empty catalog.
+    /// A missing or empty directory produces an empty catalog.
     ///
     /// # Errors
     /// Returns an error when a definition cannot be read or validated.
@@ -193,8 +177,7 @@ impl AgentCatalog {
 
     /// Persists `definition` into an authoritative workspace catalog.
     ///
-    /// If the catalog has not been customized yet, shipped definitions are
-    /// materialized first so editing one archetype does not discard the rest.
+    /// Creates the workspace catalog on the first saved definition.
     ///
     /// # Errors
     /// Returns an error when validation, serialization, or filesystem access fails.
@@ -241,28 +224,6 @@ impl AgentCatalog {
             write_definition(directory, definition)?;
         }
         Ok(())
-    }
-
-    fn from_default_config() -> Result<Self, AgentCatalogError> {
-        let config =
-            toml::from_str::<DefaultAgentConfig>(DEFAULT_AGENT_CONFIG).map_err(|source| {
-                AgentCatalogError::ParseDefinition {
-                    path: DEFAULT_AGENT_CONFIG_PATH.to_owned(),
-                    source,
-                }
-            })?;
-        let mut slugs = HashSet::new();
-        for definition in &config.agents {
-            validate(definition, DEFAULT_AGENT_CONFIG_PATH)?;
-            if !slugs.insert(definition.slug.clone()) {
-                return Err(AgentCatalogError::DuplicateSlug {
-                    slug: definition.slug.clone(),
-                });
-            }
-        }
-        Ok(Self {
-            definitions: config.agents,
-        })
     }
 }
 
@@ -379,22 +340,16 @@ first_message = "Inspect the requested context."
     }
 
     #[test]
-    fn missing_directory_uses_the_shipped_agent_configuration() {
+    fn missing_directory_has_no_agents() {
         let directory = tempdir().expect("temp directory");
         let catalog = AgentCatalog::load(&directory.path().join("missing")).expect("catalog");
 
-        assert_eq!(catalog.definitions().len(), 1);
-        let explorer = catalog.find("explorer").expect("configured explorer");
-        assert_eq!(explorer.provider("openai-codex"), "devin-acp");
-        assert_eq!(
-            explorer.provider_model().as_deref(),
-            Some("swe-1-7-lightning")
-        );
-        assert_eq!(explorer.fallback_models, ["openai-codex/gpt-5.6-luna"]);
+        assert!(catalog.definitions().is_empty());
+        assert!(catalog.find("explorer").is_none());
     }
 
     #[test]
-    fn workspace_definition_overrides_a_shipped_agent() {
+    fn workspace_definitions_are_loaded_without_presets() {
         let directory = tempdir().expect("temp directory");
         fs::write(
             directory.path().join("explorer.toml"),
@@ -421,10 +376,10 @@ first_message = "Explore the migration."
     }
 
     #[test]
-    fn deleting_a_shipped_agent_materializes_an_authoritative_empty_catalog() {
+    fn deleting_from_an_empty_catalog_keeps_it_empty() {
         let parent = tempdir().expect("temp directory");
         let directory = parent.path().join("agents");
-        let catalog = AgentCatalog::load(&directory).expect("default catalog");
+        let catalog = AgentCatalog::load(&directory).expect("empty catalog");
 
         catalog
             .delete(&directory, "explorer")
@@ -439,10 +394,10 @@ first_message = "Explore the migration."
     }
 
     #[test]
-    fn saves_a_custom_agent_without_discarding_initial_presets() {
+    fn saves_the_first_custom_agent() {
         let parent = tempdir().expect("temp directory");
         let directory = parent.path().join("agents");
-        let catalog = AgentCatalog::load(&directory).expect("default catalog");
+        let catalog = AgentCatalog::load(&directory).expect("empty catalog");
         let definition = AgentDefinition {
             slug: "reviewer".to_owned(),
             description: "Reviews a bounded change".to_owned(),
@@ -459,6 +414,6 @@ first_message = "Explore the migration."
 
         let loaded = AgentCatalog::load(&directory).expect("configured catalog");
         assert_eq!(loaded.find("reviewer"), Some(&definition));
-        assert!(loaded.find("explorer").is_some());
+        assert_eq!(loaded.definitions(), [definition]);
     }
 }
