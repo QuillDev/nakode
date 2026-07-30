@@ -24,6 +24,7 @@ pub mod runtime;
 pub mod searchable_dropdown;
 pub mod selection;
 pub mod session;
+mod shell;
 pub mod skill;
 pub mod state;
 pub mod terminal;

@@ -604,6 +604,10 @@ pub struct AgentRequest {
 #[derive(Clone, Debug)]
 pub enum Effect {
     Backend(BackendCommand),
+    RunShell {
+        id: String,
+        command: String,
+    },
     SpawnSubagent {
         run_id: String,
         provider: String,
@@ -2362,12 +2366,20 @@ impl AppState {
         self.status_message = format!("Inserted {replacement}.");
     }
 
+    #[must_use]
+    pub fn is_shell_mode(&self) -> bool {
+        self.editor.text().starts_with('!')
+    }
+
     pub fn submit_editor(&mut self) -> Vec<Effect> {
         if self.editor.is_blank() {
             self.set_status("Write a message before sending.");
             return Vec::new();
         }
         let editor_text = self.editor.text();
+        if let Some(effects) = self.submit_shell_editor(&editor_text) {
+            return effects;
+        }
         if let Some(command) = commands::parse_prompt_command(&editor_text) {
             match command {
                 ParsedPromptCommand::Agents => {
@@ -2451,6 +2463,30 @@ impl AppState {
             let prompt = self.take_editor_prompt();
             self.begin_prompt(prompt)
         }
+    }
+
+    fn submit_shell_editor(&mut self, editor_text: &str) -> Option<Vec<Effect>> {
+        let command = editor_text.strip_prefix('!')?;
+        if command.trim().is_empty() {
+            self.set_status("Write a shell command after !.");
+            return Some(Vec::new());
+        }
+        if !self.draft_attachments.is_empty() {
+            self.set_status("Attachments cannot be used with shell commands.");
+            return Some(Vec::new());
+        }
+        let command = command.to_owned();
+        let id = self.next_id("shell");
+        self.editor.clear();
+        self.transcript.upsert(
+            id.clone(),
+            EntryKind::System,
+            format!("$ {}", command.trim()),
+            "",
+            EntryStatus::Running,
+        );
+        self.status_message = format!("Running {}…", command.trim());
+        Some(vec![Effect::RunShell { id, command }])
     }
 
     fn compress_session_context(&mut self) -> Vec<Effect> {
@@ -2583,8 +2619,9 @@ impl AppState {
     }
 
     pub fn submit_or_steer_editor(&mut self) -> Vec<Effect> {
-        let is_prompt_command = commands::parse_prompt_command(&self.editor.text()).is_some();
-        if self.active_turn.is_some() && !is_prompt_command {
+        let is_local_command =
+            self.is_shell_mode() || commands::parse_prompt_command(&self.editor.text()).is_some();
+        if self.active_turn.is_some() && !is_local_command {
             self.steer_editor()
         } else {
             self.submit_editor()
@@ -5203,6 +5240,44 @@ impl AppState {
             .map(ModelInfo::qualified_id)
     }
 
+    pub fn shell_output(&mut self, id: &str, output: &str) {
+        self.transcript
+            .replace_body(id, output, EntryStatus::Running);
+        self.scroll_from_bottom = 0;
+    }
+
+    pub fn shell_finished(
+        &mut self,
+        id: &str,
+        output: &str,
+        exit_code: Option<i32>,
+        interrupted: bool,
+    ) {
+        let status = if interrupted {
+            EntryStatus::Interrupted
+        } else if exit_code == Some(0) {
+            EntryStatus::Complete
+        } else {
+            EntryStatus::Failed
+        };
+        self.transcript.replace_body(id, output, status);
+        self.status_message = if interrupted {
+            "Shell command interrupted.".to_owned()
+        } else if let Some(exit_code) = exit_code {
+            format!("Shell command exited with code {exit_code}.")
+        } else {
+            "Shell command ended without an exit code.".to_owned()
+        };
+        self.scroll_from_bottom = 0;
+    }
+
+    pub fn shell_failed(&mut self, id: &str, message: &str) {
+        self.transcript
+            .replace_body(id, message, EntryStatus::Failed);
+        message.clone_into(&mut self.status_message);
+        self.scroll_from_bottom = 0;
+    }
+
     fn protocol_problem(&mut self, message: &str) -> Vec<Effect> {
         self.diagnostic_count += 1;
         message.clone_into(&mut self.status_message);
@@ -5466,6 +5541,70 @@ model = "openai-codex/model-a"
             is_default: true,
         }]));
         state
+    }
+
+    #[test]
+    fn leading_bang_submits_a_local_shell_command_without_a_backend_turn() {
+        let mut state = ready_state();
+        state.editor.set_text("!./install.sh --check");
+        assert!(state.is_shell_mode());
+
+        let effects = state.submit_editor();
+        let [Effect::RunShell { id, command }] = effects.as_slice() else {
+            panic!("expected a shell effect");
+        };
+        assert_eq!(command, "./install.sh --check");
+        assert!(state.editor.is_blank());
+        let entry = state.transcript.entries().last().expect("shell entry");
+        assert_eq!(entry.key.as_deref(), Some(id.as_str()));
+        assert_eq!(entry.title, "$ ./install.sh --check");
+        assert_eq!(entry.kind, EntryKind::System);
+        assert_eq!(entry.status, EntryStatus::Running);
+    }
+
+    #[test]
+    fn shell_command_runs_locally_while_an_agent_turn_is_active() {
+        let mut state = ready_state();
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: None,
+            cancelling: false,
+        });
+        state.editor.set_text("!pwd");
+
+        assert!(matches!(
+            state.submit_or_steer_editor().as_slice(),
+            [Effect::RunShell { command, .. }] if command == "pwd"
+        ));
+    }
+
+    #[test]
+    fn shell_output_updates_the_ephemeral_transcript_entry() {
+        let mut state = ready_state();
+        state.editor.set_text("!printf hello");
+        let effects = state.submit_editor();
+        let [Effect::RunShell { id, .. }] = effects.as_slice() else {
+            panic!("expected a shell effect");
+        };
+
+        state.shell_output(id, "hel");
+        state.shell_output(id, "hello");
+        state.shell_finished(id, "hello", Some(0), false);
+
+        let entry = state.transcript.entries().last().expect("shell entry");
+        assert_eq!(entry.body, "hello");
+        assert_eq!(entry.status, EntryStatus::Complete);
+        assert_eq!(state.status_message, "Shell command exited with code 0.");
+    }
+
+    #[test]
+    fn empty_shell_command_keeps_the_draft() {
+        let mut state = ready_state();
+        state.editor.set_text("!  ");
+
+        assert!(state.submit_editor().is_empty());
+        assert_eq!(state.editor.text(), "!  ");
+        assert_eq!(state.status_message, "Write a shell command after !.");
     }
 
     #[test]

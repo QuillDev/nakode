@@ -26,6 +26,7 @@ use crate::{
     render,
     selection::ScreenPoint,
     session::{ProviderRecord, SessionError, SessionRepository, SqliteSessionRepository},
+    shell::{ShellEvent, ShellProcesses},
     skill::{SkillCatalog, SkillCatalogError},
     state::{AgentBrowserStatus, AppState, ApprovalDecision, Effect},
     terminal::{TerminalSession, Tui},
@@ -708,6 +709,7 @@ async fn run_loop(
     let mut backend_open = true;
     let mut dirty = true;
     let mut agent_requests = HashMap::<u64, IncomingInvocation>::new();
+    let mut shell_processes = ShellProcesses::new();
 
     if let Some(reporter) = &mut herdr {
         reporter.sync(state);
@@ -720,7 +722,7 @@ async fn run_loop(
                     Some(Ok(event)) => {
                         let effects = handle_terminal_event(state, event);
                         flush_pending_clipboard(terminal, state);
-                        if apply_effects(state, effects, backends, persistence, &mut agent_requests).await {
+                        if apply_effects(state, effects, backends, persistence, &mut agent_requests, &mut shell_processes).await {
                             break;
                         }
                         dirty = true;
@@ -743,13 +745,19 @@ async fn run_loop(
                     if should_chime {
                         crate::terminal::ring_bell(terminal.backend_mut())?;
                     }
-                    if apply_effects(state, effects, backends, persistence, &mut agent_requests).await {
+                    if apply_effects(state, effects, backends, persistence, &mut agent_requests, &mut shell_processes).await {
                         break;
                     }
                     dirty = true;
                 } else {
                     backend_open = false;
                     state.set_status("All provider event channels closed.");
+                    dirty = true;
+                }
+            }
+            shell_event = shell_processes.events.recv() => {
+                if let Some(event) = shell_event {
+                    handle_shell_event(state, event);
                     dirty = true;
                 }
             }
@@ -760,7 +768,7 @@ async fn run_loop(
                         let invocation = crate::state::AgentRequest { id, agent: request.invocation.agent.clone(), task: request.invocation.task.clone() };
                         agent_requests.insert(id, request);
                         let effects = state.invoke_agent(&invocation);
-                        if apply_effects(state, effects, backends, persistence, &mut agent_requests).await { break; }
+                        if apply_effects(state, effects, backends, persistence, &mut agent_requests, &mut shell_processes).await { break; }
                     } else {
                         request.respond(AgentResponse { success: false, result: "Nakode session id does not match this TUI.".to_owned() });
                     }
@@ -794,7 +802,21 @@ async fn run_loop(
         }
     }
 
+    shell_processes.shutdown().await;
     Ok(())
+}
+
+fn handle_shell_event(state: &mut AppState, event: ShellEvent) {
+    match event {
+        ShellEvent::Output { id, output } => state.shell_output(&id, &output),
+        ShellEvent::Finished {
+            id,
+            output,
+            exit_code,
+            interrupted,
+        } => state.shell_finished(&id, &output, exit_code, interrupted),
+        ShellEvent::Failed { id, message } => state.shell_failed(&id, &message),
+    }
 }
 
 fn is_fatal_provider_error(message: &str) -> bool {
@@ -834,6 +856,7 @@ async fn apply_effects(
     backends: &mut BackendRegistry,
     persistence: &PersistenceServices<'_>,
     agent_requests: &mut HashMap<u64, IncomingInvocation>,
+    shell_processes: &mut ShellProcesses,
 ) -> bool {
     let sessions = persistence.sessions;
     let credentials = persistence.credentials;
@@ -841,6 +864,9 @@ async fn apply_effects(
     while let Some(effect) = pending.pop_front() {
         match effect {
             Effect::Backend(command) => send_backend_command(state, backends, command).await,
+            Effect::RunShell { id, command } => {
+                shell_processes.spawn(PathBuf::from(&state.workspace), id, command);
+            }
             Effect::SpawnSubagent { run_id, provider } => {
                 spawn_subagent(state, backends, &mut pending, &run_id, &provider).await;
             }

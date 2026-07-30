@@ -539,14 +539,22 @@ fn render_subagent_modal(frame: &mut Frame<'_>, area: Rect, state: &mut AppState
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<Position> {
+    let composer_label = if state.is_shell_mode() {
+        " Shell "
+    } else {
+        " Nako "
+    };
     let mut title = if state.is_busy() {
         vec![
             Span::raw(" "),
             Span::styled(spinner_frame(), Style::default().fg(ACCENT_BRIGHT)),
-            Span::styled(" Nako ", Style::default().fg(TEXT).bold()),
+            Span::styled(composer_label, Style::default().fg(TEXT).bold()),
         ]
     } else {
-        vec![Span::styled(" Nako ", Style::default().fg(TEXT).bold())]
+        vec![Span::styled(
+            composer_label,
+            Style::default().fg(TEXT).bold(),
+        )]
     };
     if let Some(usage) = state.context_usage
         && let Some(label) = context_usage_label(usage.estimated_tokens, usage.context_window)
@@ -2019,6 +2027,28 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, super::BACKGROUND);
         assert_eq!(buffer[(0, 1)].symbol(), "╭");
         assert_eq!(buffer[(0, 1)].fg, super::BORDER);
+    }
+
+    #[test]
+    fn composer_identifies_shell_mode_for_a_leading_bang() {
+        let backend = TestBackend::new(80, 28);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.editor.set_text("!printf hello");
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render shell composer");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Shell"));
+        assert!(rendered.contains("!printf hello"));
     }
 
     #[test]
