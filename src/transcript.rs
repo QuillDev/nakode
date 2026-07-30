@@ -82,7 +82,7 @@ pub struct VisibleTranscript {
     pub first_line: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Transcript {
     entries: Vec<TranscriptEntry>,
     item_indices: HashMap<String, usize>,

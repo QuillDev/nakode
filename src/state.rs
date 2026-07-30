@@ -633,7 +633,6 @@ impl ReasoningSummaryTracker {
 #[derive(Debug)]
 struct SubagentChat {
     transcript: Transcript,
-    scroll_from_bottom: usize,
     reasoning_summaries: ReasoningSummaryTracker,
 }
 
@@ -771,8 +770,36 @@ enum MenuSnapshot {
     Settings(SettingsState),
 }
 
+/// State owned by one interactive client rather than the Nakode service.
+#[derive(Debug, Default)]
+pub struct ClientPresentationState {
+    pub editor: EditorState,
+    draft_attachments: Vec<PromptAttachment>,
+    pub queue_selection: Option<usize>,
+    pub model_picker: Option<ModelPicker>,
+    pub session_picker: Option<SessionPicker>,
+    pub provider_picker: Option<ProviderPicker>,
+    pub agent_picker: Option<AgentPicker>,
+    pub settings: Option<SettingsState>,
+    menu_history: MenuHistory<MenuSnapshot>,
+    command_completion_selection: usize,
+    pending_model_picker: Option<ModelSelectionScope>,
+    pub show_help: bool,
+    pub text_selection: Option<TextSelection>,
+    pub scroll_from_bottom: usize,
+    subagent_scroll_from_bottom: HashMap<String, usize>,
+    pub subagent_modal: Option<String>,
+    screen_snapshot: Option<ScreenSnapshot>,
+    pending_clipboard: Option<String>,
+    subagent_hit_regions: Vec<SubagentHitRegion>,
+    tool_toggle_hit_regions: Vec<ToolToggleHitRegion>,
+    oauth_link_hit_region: Option<OAuthLinkHitRegion>,
+    api_key_input_hit_region: Option<ApiKeyInputHitRegion>,
+}
+
 #[derive(Debug)]
 pub struct AppState {
+    pub client: ClientPresentationState,
     pub connection: ConnectionState,
     pub workspace: String,
     pub backend_provider: String,
@@ -784,37 +811,22 @@ pub struct AppState {
     pub active_turn: Option<ActiveTurn>,
     pub context_usage: Option<ContextUsageState>,
     pub context_compaction: Option<ContextCompactionState>,
-    pub editor: EditorState,
-    draft_attachments: Vec<PromptAttachment>,
     pub transcript: Transcript,
     pub queue: VecDeque<QueuedPrompt>,
-    pub queue_selection: Option<usize>,
     pub models: Vec<ModelInfo>,
     pub selected_model: Option<String>,
     pub model_options: HashMap<String, ModelOptions>,
     default_model_options: ModelOptions,
     session_model_override: bool,
     session_model_options_override: Option<(String, ModelOptions)>,
-    pub model_picker: Option<ModelPicker>,
-    pub session_picker: Option<SessionPicker>,
-    pub provider_picker: Option<ProviderPicker>,
-    pub agent_picker: Option<AgentPicker>,
-    pub settings: Option<SettingsState>,
-    menu_history: MenuHistory<MenuSnapshot>,
-    command_completion_selection: usize,
-    pending_model_picker: Option<ModelSelectionScope>,
-    pub show_help: bool,
-    pub text_selection: Option<TextSelection>,
     pub approvals: VecDeque<ApprovalRequest>,
     pub questions: VecDeque<QuestionPrompt>,
     pub todo_phases: Vec<TodoPhase>,
-    pub scroll_from_bottom: usize,
     pub status_message: String,
     pub diagnostic_count: usize,
     pub nakode_session_id: String,
     nakode_executable: String,
     pub subagents: Vec<SubagentRun>,
-    pub subagent_modal: Option<String>,
     pub should_quit: bool,
     creating_session: Option<()>,
     pending_session_prompt: Option<OutgoingPrompt>,
@@ -828,18 +840,12 @@ pub struct AppState {
     subagent_result_items: HashSet<String>,
     initial_model: Option<String>,
     next_local_id: u64,
-    screen_snapshot: Option<ScreenSnapshot>,
-    pending_clipboard: Option<String>,
     agents: AgentCatalog,
     skills: SkillCatalog,
     prompt_addenda: PromptAddenda,
     agent_directory: PathBuf,
     subagent_executions: HashMap<String, SubagentExecution>,
     subagent_chats: HashMap<String, SubagentChat>,
-    subagent_hit_regions: Vec<SubagentHitRegion>,
-    tool_toggle_hit_regions: Vec<ToolToggleHitRegion>,
-    oauth_link_hit_region: Option<OAuthLinkHitRegion>,
-    api_key_input_hit_region: Option<ApiKeyInputHitRegion>,
     transcript_limit: usize,
     web_config: WebConfig,
     memory_config: MemoryConfig,
@@ -872,7 +878,7 @@ impl AppState {
         if mode == TerminalImageMode::Off {
             self.transcript.set_image_previews_enabled(false);
         }
-        if let Some(settings) = &mut self.settings {
+        if let Some(settings) = &mut self.client.settings {
             settings.terminal_images = mode;
         }
     }
@@ -884,27 +890,27 @@ impl AppState {
 
     pub fn install_vision_config(&mut self, config: crate::vision::VisionConfig) {
         self.vision_config = config.clone();
-        if let Some(settings) = &mut self.settings {
+        if let Some(settings) = &mut self.client.settings {
             settings.vision = config;
         }
     }
 
     pub fn install_web_config(&mut self, config: WebConfig) {
         self.web_config = config.clone();
-        if let Some(settings) = &mut self.settings {
+        if let Some(settings) = &mut self.client.settings {
             settings.web = config;
         }
     }
 
     pub fn install_memory_config(&mut self, config: MemoryConfig) {
         self.memory_config = config.clone();
-        if let Some(settings) = &mut self.settings {
+        if let Some(settings) = &mut self.client.settings {
             settings.memory = config;
         }
     }
 
     pub fn open_settings(&mut self) {
-        self.settings = Some(SettingsState {
+        self.client.settings = Some(SettingsState {
             query: String::new(),
             selected: 0,
             view: SettingsView::Menu,
@@ -916,38 +922,40 @@ impl AppState {
             agent_browser_status: AgentBrowserStatus::Checking,
             history: MenuHistory::default(),
         });
-        self.menu_history.clear();
+        self.client.menu_history.clear();
         self.set_status("Settings opened.");
     }
 
     pub fn close_settings(&mut self) {
-        self.settings = None;
+        self.client.settings = None;
         self.restore_previous_menu();
     }
 
     pub fn close_all_menus(&mut self) {
-        self.model_picker = None;
-        self.session_picker = None;
-        self.provider_picker = None;
-        self.agent_picker = None;
-        self.settings = None;
-        self.pending_model_picker = None;
-        self.menu_history.clear();
+        self.client.model_picker = None;
+        self.client.session_picker = None;
+        self.client.provider_picker = None;
+        self.client.agent_picker = None;
+        self.client.settings = None;
+        self.client.pending_model_picker = None;
+        self.client.menu_history.clear();
     }
 
     #[must_use]
     pub fn current_menu_has_parent(&self) -> bool {
-        !self.menu_history.is_empty()
+        !self.client.menu_history.is_empty()
     }
 
     fn suspend_settings(&mut self) {
-        if let Some(settings) = self.settings.take() {
-            self.menu_history.push(MenuSnapshot::Settings(settings));
+        if let Some(settings) = self.client.settings.take() {
+            self.client
+                .menu_history
+                .push(MenuSnapshot::Settings(settings));
         }
     }
 
     fn restore_previous_menu(&mut self) -> bool {
-        let Some(menu) = self.menu_history.pop() else {
+        let Some(menu) = self.client.menu_history.pop() else {
             return false;
         };
         match menu {
@@ -955,14 +963,14 @@ impl AppState {
                 settings.web = self.web_config.clone();
                 settings.vision = self.vision_config.clone();
                 settings.terminal_images = self.terminal_image_mode;
-                self.settings = Some(settings);
+                self.client.settings = Some(settings);
             }
         }
         true
     }
 
     pub fn settings_insert(&mut self, character: char) {
-        if let Some(settings) = &mut self.settings {
+        if let Some(settings) = &mut self.client.settings {
             if settings.view == SettingsView::Menu {
                 settings.query.push(character);
             } else if settings.view == SettingsView::WebBrowsing
@@ -985,7 +993,7 @@ impl AppState {
     }
 
     pub fn settings_backspace(&mut self) {
-        if let Some(settings) = &mut self.settings {
+        if let Some(settings) = &mut self.client.settings {
             if settings.view == SettingsView::Menu {
                 settings.query.pop();
             } else if settings.view == SettingsView::WebBrowsing
@@ -1014,7 +1022,7 @@ impl AppState {
     }
 
     pub fn settings_move(&mut self, delta: isize) {
-        let Some(settings) = &mut self.settings else {
+        let Some(settings) = &mut self.client.settings else {
             return;
         };
         let length = match settings.view {
@@ -1037,7 +1045,7 @@ impl AppState {
     }
 
     pub fn settings_cycle_web_backend(&mut self, delta: isize) {
-        let Some(settings) = &mut self.settings else {
+        let Some(settings) = &mut self.client.settings else {
             return;
         };
         if settings.view != SettingsView::WebBrowsing || settings.addon_field != 0 {
@@ -1051,7 +1059,7 @@ impl AppState {
     }
 
     pub fn settings_cycle_memory_backend(&mut self, delta: isize) {
-        let Some(settings) = &mut self.settings else {
+        let Some(settings) = &mut self.client.settings else {
             return;
         };
         if settings.view != SettingsView::Memory || settings.addon_field != 0 {
@@ -1066,7 +1074,7 @@ impl AppState {
     }
 
     pub fn settings_cycle_terminal_images(&mut self, delta: isize) {
-        let Some(settings) = &mut self.settings else {
+        let Some(settings) = &mut self.client.settings else {
             return;
         };
         if settings.view != SettingsView::TerminalImages {
@@ -1082,6 +1090,7 @@ impl AppState {
 
     pub fn save_terminal_image_mode(&mut self) -> Vec<Effect> {
         let Some(mode) = self
+            .client
             .settings
             .as_ref()
             .map(|settings| settings.terminal_images)
@@ -1092,7 +1101,7 @@ impl AppState {
     }
 
     pub fn settings_cycle_choice(&mut self, delta: isize) -> Vec<Effect> {
-        match self.settings.as_ref().map(|settings| settings.view) {
+        match self.client.settings.as_ref().map(|settings| settings.view) {
             Some(SettingsView::WebBrowsing) => {
                 self.settings_cycle_web_backend(delta);
                 self.save_web_settings()
@@ -1111,6 +1120,7 @@ impl AppState {
 
     pub fn select_setting(&mut self) -> Vec<Effect> {
         if self
+            .client
             .settings
             .as_ref()
             .is_some_and(|settings| settings.view == SettingsView::WebBrowsing)
@@ -1118,20 +1128,21 @@ impl AppState {
             self.settings_cycle_web_backend(1);
             return self.save_web_settings();
         }
-        if self.settings.as_ref().is_some_and(|settings| {
+        if self.client.settings.as_ref().is_some_and(|settings| {
             settings.view == SettingsView::Memory && settings.addon_field == 0
         }) {
             self.settings_cycle_memory_backend(1);
             return self.save_memory_settings();
         }
         if self
+            .client
             .settings
             .as_ref()
             .is_some_and(|settings| settings.view == SettingsView::Memory)
         {
             return Vec::new();
         }
-        if let Some(settings) = &mut self.settings
+        if let Some(settings) = &mut self.client.settings
             && settings.view == SettingsView::Addons
         {
             let (view, effects) = match settings.selected {
@@ -1147,6 +1158,7 @@ impl AppState {
             return effects;
         }
         if self
+            .client
             .settings
             .as_ref()
             .is_some_and(|settings| settings.view == SettingsView::TerminalImages)
@@ -1155,25 +1167,27 @@ impl AppState {
             return self.save_terminal_image_mode();
         }
         if self
+            .client
             .settings
             .as_ref()
             .is_some_and(|settings| settings.view == SettingsView::Vision)
         {
             self.suspend_settings();
             let effects = self.open_vision_model_picker();
-            if self.model_picker.is_none() {
+            if self.client.model_picker.is_none() {
                 self.restore_previous_menu();
             }
             return effects;
         }
         let section = self
+            .client
             .settings
             .as_ref()
             .and_then(|settings| settings.filtered_sections().get(settings.selected).copied());
         match section {
             Some(SettingsSection::General) => {
                 self.suspend_settings();
-                self.provider_picker = Some(ProviderPicker {
+                self.client.provider_picker = Some(ProviderPicker {
                     providers: Vec::new(),
                     selected: 0,
                     loading: true,
@@ -1190,13 +1204,14 @@ impl AppState {
             Some(SettingsSection::Models) => {
                 self.suspend_settings();
                 let effects = self.open_default_model_picker();
-                if self.model_picker.is_none() && self.pending_model_picker.is_none() {
+                if self.client.model_picker.is_none() && self.client.pending_model_picker.is_none()
+                {
                     self.restore_previous_menu();
                 }
                 effects
             }
             Some(SettingsSection::Addons) => {
-                if let Some(settings) = &mut self.settings {
+                if let Some(settings) = &mut self.client.settings {
                     settings.enter(SettingsView::Addons, 0, 0);
                 }
                 Vec::new()
@@ -1207,6 +1222,7 @@ impl AppState {
 
     pub fn disable_vision_addon(&mut self) -> Vec<Effect> {
         if self
+            .client
             .settings
             .as_ref()
             .is_none_or(|settings| settings.view != SettingsView::Vision)
@@ -1214,7 +1230,7 @@ impl AppState {
             return Vec::new();
         }
         self.vision_config.model = None;
-        if let Some(settings) = &mut self.settings {
+        if let Some(settings) = &mut self.client.settings {
             settings.vision = self.vision_config.clone();
         }
         self.set_status("Vision add-on disabled.");
@@ -1222,7 +1238,7 @@ impl AppState {
     }
 
     pub fn settings_back(&mut self) -> Vec<Effect> {
-        let Some(view) = self.settings.as_ref().map(|settings| settings.view) else {
+        let Some(view) = self.client.settings.as_ref().map(|settings| settings.view) else {
             return Vec::new();
         };
         let effects = match view {
@@ -1230,22 +1246,27 @@ impl AppState {
             SettingsView::Memory => self.save_memory_settings(),
             _ => Vec::new(),
         };
-        if self.settings.as_mut().is_some_and(SettingsState::back) {
+        if self
+            .client
+            .settings
+            .as_mut()
+            .is_some_and(SettingsState::back)
+        {
             return effects;
         }
-        self.settings = None;
+        self.client.settings = None;
         self.restore_previous_menu();
         effects
     }
 
     pub fn set_agent_browser_status(&mut self, status: AgentBrowserStatus) {
-        if let Some(settings) = &mut self.settings {
+        if let Some(settings) = &mut self.client.settings {
             settings.agent_browser_status = status;
         }
     }
 
     pub fn save_web_settings(&mut self) -> Vec<Effect> {
-        let Some(settings) = &self.settings else {
+        let Some(settings) = &self.client.settings else {
             return Vec::new();
         };
         let config = settings.web.clone();
@@ -1254,7 +1275,7 @@ impl AppState {
     }
 
     pub fn save_memory_settings(&mut self) -> Vec<Effect> {
-        let Some(settings) = self.settings.as_ref() else {
+        let Some(settings) = self.client.settings.as_ref() else {
             return Vec::new();
         };
         let config = settings.memory.clone();
@@ -1272,15 +1293,17 @@ impl AppState {
             return;
         }
         for attachment in &attachments {
-            let text = self.editor.text();
+            let text = self.client.editor.text();
             if !text.is_empty() && !text.ends_with(char::is_whitespace) {
-                self.editor.insert_char(' ');
+                self.client.editor.insert_char(' ');
             }
-            self.editor.insert_str(&format!("[{}]", attachment.label));
-            self.editor.insert_char(' ');
+            self.client
+                .editor
+                .insert_str(&format!("[{}]", attachment.label));
+            self.client.editor.insert_char(' ');
         }
         let count = attachments.len();
-        self.draft_attachments.extend(attachments);
+        self.client.draft_attachments.extend(attachments);
         self.status_message = if count == 1 {
             "Attached 1 file.".to_owned()
         } else {
@@ -1325,6 +1348,7 @@ impl AppState {
             },
         );
         Self {
+            client: ClientPresentationState::default(),
             connection: ConnectionState::Starting,
             workspace: workspace.into(),
             backend_provider: provider,
@@ -1336,11 +1360,8 @@ impl AppState {
             active_turn: None,
             context_usage: None,
             context_compaction: None,
-            editor: EditorState::default(),
-            draft_attachments: Vec::new(),
             transcript,
             queue: VecDeque::new(),
-            queue_selection: None,
             models: Vec::new(),
             selected_model: initial_model.clone(),
             model_options: HashMap::new(),
@@ -1350,26 +1371,14 @@ impl AppState {
             },
             session_model_override: initial_model.is_some(),
             session_model_options_override: None,
-            model_picker: None,
-            session_picker: None,
-            provider_picker: None,
-            agent_picker: None,
-            settings: None,
-            menu_history: MenuHistory::default(),
-            command_completion_selection: 0,
-            pending_model_picker: None,
-            show_help: false,
-            text_selection: None,
             approvals: VecDeque::new(),
             questions: VecDeque::new(),
             todo_phases: Vec::new(),
-            scroll_from_bottom: 0,
             status_message: format!("Connecting to {backend_name}…"),
             diagnostic_count: 0,
             nakode_session_id: uuid::Uuid::now_v7().to_string(),
             nakode_executable: "nakode".to_owned(),
             subagents: Vec::new(),
-            subagent_modal: None,
             should_quit: false,
             creating_session: None,
             pending_session_prompt: None,
@@ -1383,18 +1392,12 @@ impl AppState {
             subagent_result_items: HashSet::new(),
             initial_model,
             next_local_id: 1,
-            screen_snapshot: None,
-            pending_clipboard: None,
             agents: AgentCatalog::default(),
             skills: SkillCatalog::default(),
             prompt_addenda: PromptAddenda::default(),
             agent_directory: PathBuf::from(".nakode/agents"),
             subagent_executions: HashMap::new(),
             subagent_chats: HashMap::new(),
-            subagent_hit_regions: Vec::new(),
-            tool_toggle_hit_regions: Vec::new(),
-            oauth_link_hit_region: None,
-            api_key_input_hit_region: None,
             transcript_limit: scrollback,
             web_config: WebConfig::default(),
             memory_config: MemoryConfig::default(),
@@ -1425,7 +1428,7 @@ impl AppState {
 
     pub fn install_agents(&mut self, agents: AgentCatalog) {
         self.agents = agents;
-        if let Some(picker) = &mut self.agent_picker {
+        if let Some(picker) = &mut self.client.agent_picker {
             picker.agents = self.agents.definitions().to_vec();
             picker.selected = picker.selected.min(picker.agents.len().saturating_sub(1));
             picker.editor = None;
@@ -1481,7 +1484,7 @@ impl AppState {
     }
 
     pub fn open_agent_picker(&mut self) {
-        self.agent_picker = Some(AgentPicker {
+        self.client.agent_picker = Some(AgentPicker {
             agents: self.agents.definitions().to_vec(),
             selected: 0,
             editor: None,
@@ -1490,14 +1493,14 @@ impl AppState {
     }
 
     pub fn close_agent_picker(&mut self) {
-        self.agent_picker = None;
+        self.client.agent_picker = None;
         if !self.restore_previous_menu() {
             self.set_status("Agent settings closed.");
         }
     }
 
     pub fn agent_picker_move(&mut self, delta: isize) {
-        let Some(picker) = &mut self.agent_picker else {
+        let Some(picker) = &mut self.client.agent_picker else {
             return;
         };
         if !picker.agents.is_empty() && picker.editor.is_none() {
@@ -1506,7 +1509,7 @@ impl AppState {
     }
 
     pub fn edit_selected_agent(&mut self) {
-        let Some(picker) = &mut self.agent_picker else {
+        let Some(picker) = &mut self.client.agent_picker else {
             return;
         };
         if let Some(definition) = picker.agents.get(picker.selected) {
@@ -1515,13 +1518,13 @@ impl AppState {
     }
 
     pub fn create_agent(&mut self) {
-        if let Some(picker) = &mut self.agent_picker {
+        if let Some(picker) = &mut self.client.agent_picker {
             picker.editor = Some(AgentEditor::new());
         }
     }
 
     pub fn cancel_agent_edit(&mut self) -> bool {
-        let Some(picker) = &mut self.agent_picker else {
+        let Some(picker) = &mut self.client.agent_picker else {
             return false;
         };
         let Some(editor) = &mut picker.editor else {
@@ -1539,7 +1542,8 @@ impl AppState {
 
     #[must_use]
     pub fn agent_model_options_are_open(&self) -> bool {
-        self.agent_picker
+        self.client
+            .agent_picker
             .as_ref()
             .and_then(|picker| picker.editor.as_ref())
             .is_some_and(|editor| editor.pending_fast_mode.is_some())
@@ -1550,6 +1554,7 @@ impl AppState {
             return;
         }
         if let Some(fast_mode) = self
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -1561,6 +1566,7 @@ impl AppState {
 
     pub fn apply_agent_model_options(&mut self) -> Vec<Effect> {
         let Some(editor) = self
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -1575,7 +1581,8 @@ impl AppState {
 
     #[must_use]
     pub fn agent_model_dropdown_is_open(&self) -> bool {
-        self.agent_picker
+        self.client
+            .agent_picker
             .as_ref()
             .and_then(|picker| picker.editor.as_ref())
             .is_some_and(|editor| editor.model_dropdown.is_some())
@@ -1583,6 +1590,7 @@ impl AppState {
 
     pub fn open_agent_model_dropdown(&mut self) {
         let Some((field, current)) = self
+            .client
             .agent_picker
             .as_ref()
             .and_then(|picker| picker.editor.as_ref())
@@ -1615,6 +1623,7 @@ impl AppState {
             .position(|option| option.qualified_id().as_deref() == Some(current.as_str()))
             .unwrap_or(0);
         if let Some(editor) = self
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -1625,6 +1634,7 @@ impl AppState {
 
     pub fn agent_model_dropdown_move(&mut self, delta: isize) {
         if let Some(dropdown) = self
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -1636,6 +1646,7 @@ impl AppState {
 
     pub fn select_agent_model_dropdown(&mut self) -> Vec<Effect> {
         let selected = self
+            .client
             .agent_picker
             .as_ref()
             .and_then(|picker| picker.editor.as_ref())
@@ -1665,6 +1676,7 @@ impl AppState {
                 }),
         };
         if let Some(editor) = self
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -1685,6 +1697,7 @@ impl AppState {
 
     pub fn clear_agent_model_dropdown_query(&mut self) {
         if let Some(dropdown) = self
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -1696,6 +1709,7 @@ impl AppState {
 
     pub fn agent_editor_move(&mut self, delta: isize) {
         let Some(editor) = self
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -1713,6 +1727,7 @@ impl AppState {
     pub fn agent_editor_insert(&mut self, character: char) -> Vec<Effect> {
         let mut edited_field = false;
         if let Some(editor) = self
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -1734,6 +1749,7 @@ impl AppState {
     pub fn agent_editor_insert_str(&mut self, text: &str) -> Vec<Effect> {
         let mut edited_field = false;
         if let Some(editor) = self
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -1755,6 +1771,7 @@ impl AppState {
     pub fn agent_editor_backspace(&mut self) -> Vec<Effect> {
         let mut edited_field = false;
         if let Some(editor) = self
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -1775,6 +1792,7 @@ impl AppState {
 
     fn autosave_agent_edit(&self) -> Vec<Effect> {
         let Some(editor) = self
+            .client
             .agent_picker
             .as_ref()
             .and_then(|picker| picker.editor.as_ref())
@@ -1792,7 +1810,8 @@ impl AppState {
     }
 
     pub fn delete_selected_agent(&mut self) -> Vec<Effect> {
-        self.agent_picker
+        self.client
+            .agent_picker
             .as_ref()
             .and_then(|picker| picker.agents.get(picker.selected))
             .map_or_else(Vec::new, |agent| {
@@ -1816,19 +1835,48 @@ impl AppState {
 
     #[must_use]
     pub fn selected_subagent_summary(&self) -> Option<(String, String)> {
-        let run_id = self.subagent_modal.as_deref()?;
+        let run_id = self.client.subagent_modal.as_deref()?;
         let run = self.subagents.iter().find(|run| run.id == run_id)?;
         Some((run.agent.clone(), run.objective.clone()))
     }
 
+    #[must_use]
+    pub fn selected_subagent_transcript(&self) -> Option<&Transcript> {
+        let run_id = self.client.subagent_modal.as_deref()?;
+        self.subagent_chats.get(run_id).map(|chat| &chat.transcript)
+    }
+
+    #[must_use]
+    pub fn selected_subagent_scroll(&self) -> usize {
+        self.client
+            .subagent_modal
+            .as_ref()
+            .and_then(|run_id| self.client.subagent_scroll_from_bottom.get(run_id))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn set_selected_subagent_scroll(&mut self, scroll: usize) {
+        if let Some(run_id) = self.client.subagent_modal.clone() {
+            self.client
+                .subagent_scroll_from_bottom
+                .insert(run_id, scroll);
+        }
+    }
+
     pub fn selected_subagent_transcript_mut(&mut self) -> Option<(&mut Transcript, &mut usize)> {
-        let run_id = self.subagent_modal.as_deref()?;
-        let chat = self.subagent_chats.get_mut(run_id)?;
-        Some((&mut chat.transcript, &mut chat.scroll_from_bottom))
+        let run_id = self.client.subagent_modal.clone()?;
+        let chat = self.subagent_chats.get_mut(&run_id)?;
+        let scroll = self
+            .client
+            .subagent_scroll_from_bottom
+            .entry(run_id)
+            .or_default();
+        Some((&mut chat.transcript, scroll))
     }
 
     pub fn set_subagent_hit_regions(&mut self, regions: Vec<(String, ScreenPoint, ScreenPoint)>) {
-        self.subagent_hit_regions = regions
+        self.client.subagent_hit_regions = regions
             .into_iter()
             .map(|(run_id, top_left, bottom_right)| SubagentHitRegion {
                 run_id,
@@ -1842,7 +1890,7 @@ impl AppState {
         &mut self,
         regions: Vec<(String, ScreenPoint, ScreenPoint)>,
     ) {
-        self.tool_toggle_hit_regions = regions
+        self.client.tool_toggle_hit_regions = regions
             .into_iter()
             .map(|(key, top_left, bottom_right)| ToolToggleHitRegion {
                 key,
@@ -1854,6 +1902,7 @@ impl AppState {
 
     pub fn toggle_tool_at(&mut self, point: ScreenPoint) -> bool {
         let Some(key) = self
+            .client
             .tool_toggle_hit_regions
             .iter()
             .find(|region| {
@@ -1867,7 +1916,7 @@ impl AppState {
             return false;
         };
         let toggles_history = key == TOOL_HISTORY_TOGGLE_KEY;
-        let transcript = if let Some(run_id) = self.subagent_modal.as_deref() {
+        let transcript = if let Some(run_id) = self.client.subagent_modal.as_deref() {
             let Some(chat) = self.subagent_chats.get_mut(run_id) else {
                 return false;
             };
@@ -1895,6 +1944,7 @@ impl AppState {
 
     pub fn open_subagent_at(&mut self, point: ScreenPoint) -> bool {
         let Some(run_id) = self
+            .client
             .subagent_hit_regions
             .iter()
             .find(|region| {
@@ -1907,7 +1957,7 @@ impl AppState {
         else {
             return false;
         };
-        self.subagent_modal = Some(run_id);
+        self.client.subagent_modal = Some(run_id);
         self.clear_text_selection();
         true
     }
@@ -1916,7 +1966,7 @@ impl AppState {
         &mut self,
         region: Option<(String, ScreenPoint, ScreenPoint)>,
     ) {
-        self.oauth_link_hit_region =
+        self.client.oauth_link_hit_region =
             region.map(|(url, top_left, bottom_right)| OAuthLinkHitRegion {
                 url,
                 top_left,
@@ -1926,7 +1976,8 @@ impl AppState {
 
     #[must_use]
     pub fn oauth_url_at(&self, point: ScreenPoint) -> Option<String> {
-        self.oauth_link_hit_region
+        self.client
+            .oauth_link_hit_region
             .as_ref()
             .filter(|region| {
                 point.column >= region.top_left.column
@@ -1938,7 +1989,7 @@ impl AppState {
     }
 
     pub fn set_api_key_input_hit_region(&mut self, region: Option<(ScreenPoint, ScreenPoint)>) {
-        self.api_key_input_hit_region =
+        self.client.api_key_input_hit_region =
             region.map(|(top_left, bottom_right)| ApiKeyInputHitRegion {
                 top_left,
                 bottom_right,
@@ -1946,7 +1997,7 @@ impl AppState {
     }
 
     pub fn focus_provider_api_key_at(&mut self, point: ScreenPoint) -> bool {
-        let contains = self.api_key_input_hit_region.is_some_and(|region| {
+        let contains = self.client.api_key_input_hit_region.is_some_and(|region| {
             point.column >= region.top_left.column
                 && point.column < region.bottom_right.column
                 && point.row >= region.top_left.row
@@ -1957,6 +2008,7 @@ impl AppState {
 
     pub fn focus_provider_api_key(&mut self) -> bool {
         let Some(ProviderAuthentication::ApiKeyInput { focused, .. }) = self
+            .client
             .provider_picker
             .as_mut()
             .and_then(|picker| picker.authentication.as_mut())
@@ -1981,12 +2033,12 @@ impl AppState {
             self.set_status("No provider authentication URL is available.");
             return Vec::new();
         };
-        self.pending_clipboard = Some(url);
+        self.client.pending_clipboard = Some(url);
         Vec::new()
     }
 
     fn provider_authentication_url(&self) -> Option<&str> {
-        let picker = self.provider_picker.as_ref()?;
+        let picker = self.client.provider_picker.as_ref()?;
         if !picker.showing_details {
             return None;
         }
@@ -2004,7 +2056,7 @@ impl AppState {
     }
 
     pub fn close_subagent_modal(&mut self) {
-        self.subagent_modal = None;
+        self.client.subagent_modal = None;
         self.clear_text_selection();
     }
 
@@ -2016,10 +2068,11 @@ impl AppState {
     }
 
     pub fn scroll_active_chat(&mut self, delta: isize) {
-        if self.subagent_modal.is_some() {
+        if self.client.subagent_modal.is_some() {
             self.scroll_subagent_modal(delta);
         } else {
-            self.scroll_from_bottom = self.scroll_from_bottom.saturating_add_signed(delta);
+            self.client.scroll_from_bottom =
+                self.client.scroll_from_bottom.saturating_add_signed(delta);
         }
     }
 
@@ -2030,10 +2083,10 @@ impl AppState {
     }
 
     pub fn reset_active_chat_scroll(&mut self) {
-        if self.subagent_modal.is_some() {
+        if self.client.subagent_modal.is_some() {
             self.reset_subagent_scroll();
         } else {
-            self.scroll_from_bottom = 0;
+            self.client.scroll_from_bottom = 0;
         }
     }
 
@@ -2042,7 +2095,7 @@ impl AppState {
     }
 
     pub fn install_sessions(&mut self, sessions: Vec<SessionRecord>) {
-        let picker = self.session_picker.get_or_insert(SessionPicker {
+        let picker = self.client.session_picker.get_or_insert(SessionPicker {
             sessions: Vec::new(),
             selected: 0,
             loading: false,
@@ -2061,8 +2114,9 @@ impl AppState {
         self.subagents.clear();
         self.subagent_executions.clear();
         self.subagent_chats.clear();
-        self.subagent_hit_regions.clear();
-        self.subagent_modal = None;
+        self.client.subagent_scroll_from_bottom.clear();
+        self.client.subagent_hit_regions.clear();
+        self.client.subagent_modal = None;
         for record in records {
             let mut status = record.status;
             let mut latest_activity = record.latest_activity;
@@ -2097,7 +2151,6 @@ impl AppState {
                 record.id,
                 SubagentChat {
                     transcript,
-                    scroll_from_bottom: 0,
                     reasoning_summaries: ReasoningSummaryTracker::default(),
                 },
             );
@@ -2105,7 +2158,7 @@ impl AppState {
     }
 
     pub fn session_store_failed(&mut self, message: impl Into<String>) {
-        if let Some(picker) = &mut self.session_picker {
+        if let Some(picker) = &mut self.client.session_picker {
             picker.loading = false;
         }
         self.resuming_session = None;
@@ -2113,7 +2166,7 @@ impl AppState {
     }
 
     pub fn install_providers(&mut self, providers: Vec<ProviderRecord>) {
-        let picker = self.provider_picker.get_or_insert(ProviderPicker {
+        let picker = self.client.provider_picker.get_or_insert(ProviderPicker {
             providers: Vec::new(),
             selected: 0,
             loading: false,
@@ -2126,7 +2179,7 @@ impl AppState {
     }
 
     pub fn provider_picker_move(&mut self, delta: isize) {
-        let Some(picker) = &mut self.provider_picker else {
+        let Some(picker) = &mut self.client.provider_picker else {
             return;
         };
         if picker.providers.is_empty() {
@@ -2136,7 +2189,7 @@ impl AppState {
     }
 
     pub fn open_provider_details(&mut self) {
-        let Some(picker) = &mut self.provider_picker else {
+        let Some(picker) = &mut self.client.provider_picker else {
             return;
         };
         if let Some(provider) = picker.providers.get(picker.selected) {
@@ -2153,7 +2206,7 @@ impl AppState {
     }
 
     pub fn close_provider_details(&mut self) -> bool {
-        let Some(picker) = &mut self.provider_picker else {
+        let Some(picker) = &mut self.client.provider_picker else {
             return false;
         };
         if !picker.showing_details {
@@ -2191,7 +2244,8 @@ impl AppState {
 
     #[must_use]
     pub fn provider_display_name(&self, provider: &str) -> String {
-        self.provider_picker
+        self.client
+            .provider_picker
             .as_ref()
             .and_then(|picker| {
                 picker
@@ -2203,14 +2257,14 @@ impl AppState {
     }
 
     pub fn close_provider_picker(&mut self) {
-        self.provider_picker = None;
+        self.client.provider_picker = None;
         if !self.restore_previous_menu() {
             self.set_status("Provider settings closed.");
         }
     }
 
     pub fn toggle_provider(&mut self) -> Vec<Effect> {
-        let Some(picker) = &mut self.provider_picker else {
+        let Some(picker) = &mut self.client.provider_picker else {
             return Vec::new();
         };
         let Some(provider) = picker.providers.get_mut(picker.selected) else {
@@ -2254,7 +2308,7 @@ impl AppState {
 
     #[must_use]
     pub fn provider_api_key_input_active(&self) -> bool {
-        self.provider_picker.as_ref().is_some_and(|picker| {
+        self.client.provider_picker.as_ref().is_some_and(|picker| {
             picker.showing_details
                 && matches!(
                     picker.authentication,
@@ -2268,6 +2322,7 @@ impl AppState {
             value,
             focused: true,
         }) = self
+            .client
             .provider_picker
             .as_mut()
             .and_then(|picker| picker.authentication.as_mut())
@@ -2288,6 +2343,7 @@ impl AppState {
             value,
             focused: true,
         }) = self
+            .client
             .provider_picker
             .as_mut()
             .and_then(|picker| picker.authentication.as_mut())
@@ -2297,7 +2353,7 @@ impl AppState {
     }
 
     pub fn submit_provider_api_key(&mut self) -> Vec<Effect> {
-        let Some(picker) = &mut self.provider_picker else {
+        let Some(picker) = &mut self.client.provider_picker else {
             return Vec::new();
         };
         let Some(provider) = picker.providers.get(picker.selected) else {
@@ -2329,7 +2385,7 @@ impl AppState {
     }
 
     pub fn cancel_provider_api_key_input(&mut self) -> bool {
-        let Some(picker) = &mut self.provider_picker else {
+        let Some(picker) = &mut self.client.provider_picker else {
             return false;
         };
         let Some(ProviderAuthentication::ApiKeyInput { value, focused }) =
@@ -2347,7 +2403,7 @@ impl AppState {
     }
 
     pub fn logout_provider(&mut self) -> Vec<Effect> {
-        let Some(picker) = &mut self.provider_picker else {
+        let Some(picker) = &mut self.client.provider_picker else {
             return Vec::new();
         };
         let Some(provider) = picker.providers.get(picker.selected) else {
@@ -2362,7 +2418,7 @@ impl AppState {
     }
 
     pub fn provider_logged_out(&mut self, provider: &str) {
-        if let Some(picker) = &mut self.provider_picker {
+        if let Some(picker) = &mut self.client.provider_picker {
             picker.authentication = None;
         }
         self.provider_contexts.remove(provider);
@@ -2379,7 +2435,7 @@ impl AppState {
     }
 
     pub fn provider_authentication_failed(&mut self, provider: &str, message: &str) {
-        if let Some(picker) = &mut self.provider_picker {
+        if let Some(picker) = &mut self.client.provider_picker {
             picker.authentication = None;
         }
         self.provider_contexts.remove(provider);
@@ -2390,7 +2446,7 @@ impl AppState {
     }
 
     fn provider_is_authenticating(&self, provider: &str) -> bool {
-        self.provider_picker.as_ref().is_some_and(|picker| {
+        self.client.provider_picker.as_ref().is_some_and(|picker| {
             picker.authentication.is_some()
                 && picker
                     .providers
@@ -2481,7 +2537,7 @@ impl AppState {
     }
 
     pub fn session_picker_move(&mut self, delta: isize) {
-        let Some(picker) = &mut self.session_picker else {
+        let Some(picker) = &mut self.client.session_picker else {
             return;
         };
         if picker.sessions.is_empty() {
@@ -2494,12 +2550,13 @@ impl AppState {
     }
 
     pub fn close_session_picker(&mut self) {
-        self.session_picker = None;
+        self.client.session_picker = None;
         self.set_status("Session selection cancelled.");
     }
 
     pub fn select_session(&mut self) -> Vec<Effect> {
         let session = self
+            .client
             .session_picker
             .as_ref()
             .and_then(|picker| picker.sessions.get(picker.selected))
@@ -2530,7 +2587,7 @@ impl AppState {
         self.pending_handoff = None;
         let old_provider_session = self.provider_session_id.clone();
         self.resuming_session = Some(session.clone());
-        self.session_picker = None;
+        self.client.session_picker = None;
         self.status_message = format!("Resuming session {}…", short_id(&session.id));
         let mut effects = Vec::new();
         if let Some(provider_session_id) =
@@ -2547,39 +2604,41 @@ impl AppState {
     }
 
     pub fn begin_text_selection(&mut self, point: ScreenPoint) {
-        self.text_selection = Some(TextSelection::new(point));
-        self.pending_clipboard = None;
+        self.client.text_selection = Some(TextSelection::new(point));
+        self.client.pending_clipboard = None;
     }
 
     pub fn update_text_selection(&mut self, point: ScreenPoint) {
-        if let Some(selection) = &mut self.text_selection {
+        if let Some(selection) = &mut self.client.text_selection {
             selection.update(point);
         }
     }
 
     pub fn finish_text_selection(&mut self, point: ScreenPoint) {
         self.update_text_selection(point);
-        self.pending_clipboard = self
+        self.client.pending_clipboard = self
+            .client
             .text_selection
             .filter(|selection| selection.is_range())
             .and_then(|selection| {
-                self.screen_snapshot
+                self.client
+                    .screen_snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.selected_text(selection))
             });
     }
 
     pub fn clear_text_selection(&mut self) {
-        self.text_selection = None;
-        self.pending_clipboard = None;
+        self.client.text_selection = None;
+        self.client.pending_clipboard = None;
     }
 
     pub fn set_screen_snapshot(&mut self, snapshot: ScreenSnapshot) {
-        self.screen_snapshot = Some(snapshot);
+        self.client.screen_snapshot = Some(snapshot);
     }
 
     pub fn take_pending_clipboard(&mut self) -> Option<String> {
-        self.pending_clipboard.take()
+        self.client.pending_clipboard.take()
     }
 
     pub fn clipboard_copied(&mut self, bytes: usize) {
@@ -2601,7 +2660,7 @@ impl AppState {
 
     #[must_use]
     pub fn command_completions(&self) -> Vec<PromptCompletion<'_>> {
-        let token = self.editor.token_before_cursor();
+        let token = self.client.editor.token_before_cursor();
         if let Some(prefix) = token.text.strip_prefix(crate::controls::SKILL_PREFIX) {
             let completions = self
                 .skills
@@ -2624,6 +2683,7 @@ impl AppState {
     pub fn selected_command_completion(&self) -> Option<PromptCompletion<'_>> {
         let completions = self.command_completions();
         let selected = self
+            .client
             .command_completion_selection
             .min(completions.len().saturating_sub(1));
         completions.get(selected).copied()
@@ -2633,22 +2693,23 @@ impl AppState {
     pub fn command_completion_is_exact(&self) -> bool {
         self.selected_command_completion()
             .is_some_and(|completion| {
-                completion.replacement() == self.editor.token_before_cursor().text
+                completion.replacement() == self.client.editor.token_before_cursor().text
             })
     }
 
     pub fn move_command_completion(&mut self, delta: isize) {
         let completion_count = self.command_completions().len();
         if completion_count == 0 {
-            self.command_completion_selection = 0;
+            self.client.command_completion_selection = 0;
             return;
         }
         let selected = self
+            .client
             .command_completion_selection
             .min(completion_count - 1)
             .saturating_add_signed(delta)
             .min(completion_count - 1);
-        self.command_completion_selection = selected;
+        self.client.command_completion_selection = selected;
     }
 
     pub fn accept_command_completion(&mut self) {
@@ -2656,52 +2717,52 @@ impl AppState {
             return;
         };
         let replacement = completion.replacement();
-        self.editor.replace_token_before_cursor(&replacement);
-        self.command_completion_selection = 0;
+        self.client.editor.replace_token_before_cursor(&replacement);
+        self.client.command_completion_selection = 0;
         self.status_message = format!("Inserted {replacement}.");
     }
 
     #[must_use]
     pub fn is_shell_mode(&self) -> bool {
-        self.editor.text().starts_with('!')
+        self.client.editor.text().starts_with('!')
     }
 
     pub fn submit_editor(&mut self) -> Vec<Effect> {
-        if self.editor.is_blank() {
+        if self.client.editor.is_blank() {
             self.set_status("Write a message before sending.");
             return Vec::new();
         }
-        let editor_text = self.editor.text();
+        let editor_text = self.client.editor.text();
         if let Some(effects) = self.submit_shell_editor(&editor_text) {
             return effects;
         }
         if let Some(command) = commands::parse_prompt_command(&editor_text) {
             match command {
                 ParsedPromptCommand::Agents => {
-                    self.editor.clear();
+                    self.client.editor.clear();
                     self.open_agent_picker();
                     return Vec::new();
                 }
                 ParsedPromptCommand::Settings => {
-                    self.editor.clear();
+                    self.client.editor.clear();
                     self.open_settings();
                     return Vec::new();
                 }
                 ParsedPromptCommand::Compress => {
-                    self.editor.clear();
+                    self.client.editor.clear();
                     return self.compress_session_context();
                 }
                 ParsedPromptCommand::Models => {
-                    self.editor.clear();
+                    self.client.editor.clear();
                     return self.open_default_model_picker();
                 }
                 ParsedPromptCommand::New => {
-                    self.editor.clear();
+                    self.client.editor.clear();
                     return self.new_session();
                 }
                 ParsedPromptCommand::Providers => {
-                    self.editor.clear();
-                    self.provider_picker = Some(ProviderPicker {
+                    self.client.editor.clear();
+                    self.client.provider_picker = Some(ProviderPicker {
                         providers: Vec::new(),
                         selected: 0,
                         loading: true,
@@ -2712,7 +2773,7 @@ impl AppState {
                     return vec![Effect::ListProviders];
                 }
                 ParsedPromptCommand::Reload => {
-                    self.editor.clear();
+                    self.client.editor.clear();
                     return self.reload_configuration();
                 }
                 ParsedPromptCommand::Resume(session_id) => {
@@ -2720,12 +2781,12 @@ impl AppState {
                         self.set_status("Cannot switch sessions while a turn is active.");
                         return Vec::new();
                     }
-                    self.editor.clear();
+                    self.client.editor.clear();
                     if let Some(session_id) = session_id {
                         self.status_message = format!("Looking up session {session_id}…");
                         return vec![Effect::ResolveSession(session_id.to_owned())];
                     }
-                    self.session_picker = Some(SessionPicker {
+                    self.client.session_picker = Some(SessionPicker {
                         sessions: Vec::new(),
                         selected: 0,
                         loading: true,
@@ -2734,7 +2795,7 @@ impl AppState {
                     return vec![Effect::ListSessions];
                 }
                 ParsedPromptCommand::Switch => {
-                    self.editor.clear();
+                    self.client.editor.clear();
                     return self.open_model_picker();
                 }
             }
@@ -2766,13 +2827,13 @@ impl AppState {
             self.set_status("Write a shell command after !.");
             return Some(Vec::new());
         }
-        if !self.draft_attachments.is_empty() {
+        if !self.client.draft_attachments.is_empty() {
             self.set_status("Attachments cannot be used with shell commands.");
             return Some(Vec::new());
         }
         let command = command.to_owned();
         let id = self.next_id("shell");
-        self.editor.clear();
+        self.client.editor.clear();
         self.transcript.upsert(
             id.clone(),
             EntryKind::System,
@@ -2869,12 +2930,13 @@ impl AppState {
         self.subagent_result_items.clear();
         self.approvals.clear();
         self.queue.clear();
-        self.queue_selection = None;
+        self.client.queue_selection = None;
         self.subagents.clear();
         self.subagent_executions.clear();
         self.subagent_chats.clear();
-        self.subagent_hit_regions.clear();
-        self.subagent_modal = None;
+        self.client.subagent_scroll_from_bottom.clear();
+        self.client.subagent_hit_regions.clear();
+        self.client.subagent_modal = None;
         self.transcript.clear();
         self.transcript.push(
             EntryKind::System,
@@ -2893,11 +2955,11 @@ impl AppState {
     }
 
     pub fn enqueue_editor(&mut self) -> Vec<Effect> {
-        if self.editor.is_blank() {
+        if self.client.editor.is_blank() {
             self.set_status("Write a message before queueing.");
             return Vec::new();
         }
-        if let Err(name) = self.skills.referenced(&self.editor.text()) {
+        if let Err(name) = self.skills.referenced(&self.client.editor.text()) {
             self.status_message = format!(
                 "Unknown skill /skill:{name}. Install it under .agents/skills or ~/.agents/skills."
             );
@@ -2909,14 +2971,14 @@ impl AppState {
 
         let prompt = self.take_editor_prompt();
         self.queue.push_back(prompt);
-        self.queue_selection = Some(self.queue.len() - 1);
+        self.client.queue_selection = Some(self.queue.len() - 1);
         self.status_message = format!("Queued message {}.", self.queue.len());
         Vec::new()
     }
 
     pub fn submit_or_steer_editor(&mut self) -> Vec<Effect> {
-        let is_local_command =
-            self.is_shell_mode() || commands::parse_prompt_command(&self.editor.text()).is_some();
+        let is_local_command = self.is_shell_mode()
+            || commands::parse_prompt_command(&self.client.editor.text()).is_some();
         if self.active_turn.is_some() && !is_local_command {
             self.steer_editor()
         } else {
@@ -2925,15 +2987,15 @@ impl AppState {
     }
 
     pub fn steer_editor(&mut self) -> Vec<Effect> {
-        if !self.draft_attachments.is_empty() {
+        if !self.client.draft_attachments.is_empty() {
             self.set_status("Attachments can be sent or queued, but not used for steering.");
             return Vec::new();
         }
-        if self.editor.is_blank() {
+        if self.client.editor.is_blank() {
             self.set_status("Write steering guidance first.");
             return Vec::new();
         }
-        if let Err(name) = self.skills.referenced(&self.editor.text()) {
+        if let Err(name) = self.skills.referenced(&self.client.editor.text()) {
             self.status_message = format!(
                 "Unknown skill /skill:{name}. Install it under .agents/skills or ~/.agents/skills."
             );
@@ -2962,12 +3024,12 @@ impl AppState {
         };
 
         let id = self.next_id("steer");
-        let text = self.editor.text();
+        let text = self.client.editor.text();
         self.pending_steer = Some(PendingSteer {
             id: id.clone(),
             text: text.clone(),
             turn_id: turn_id.clone(),
-            editor_revision: self.editor.revision(),
+            editor_revision: self.client.editor.revision(),
         });
         self.set_status("Sending steering guidance…");
         vec![Effect::Backend(BackendCommand::SteerTurn {
@@ -3087,7 +3149,7 @@ impl AppState {
     }
 
     fn open_model_picker_for(&mut self, scope: ModelSelectionScope) -> Vec<Effect> {
-        if self.pending_model_picker.is_some()
+        if self.client.pending_model_picker.is_some()
             || (self.creating_session.is_some() && self.provider_session_id.is_none())
         {
             self.status_message = format!("Loading {} models…", self.backend_name);
@@ -3101,7 +3163,7 @@ impl AppState {
             self.status_message = format!("{} does not expose model selection.", self.backend_name);
             return Vec::new();
         }
-        self.pending_model_picker = Some(scope);
+        self.client.pending_model_picker = Some(scope);
         self.status_message = format!("Loading {} models…", self.backend_name);
         if self
             .backend_capabilities
@@ -3196,7 +3258,7 @@ impl AppState {
                 || self.default_model_options.clone(),
                 |model| self.model_options_for(model),
             );
-        self.model_picker = Some(ModelPicker {
+        self.client.model_picker = Some(ModelPicker {
             filter: String::new(),
             selected,
             scope,
@@ -3205,11 +3267,11 @@ impl AppState {
             options,
             options_fast_only: false,
         });
-        self.pending_model_picker = None;
+        self.client.pending_model_picker = None;
     }
 
     pub fn picker_insert(&mut self, character: char) {
-        if let Some(picker) = &mut self.model_picker
+        if let Some(picker) = &mut self.client.model_picker
             && picker.stage == ModelPickerStage::Models
             && !character.is_control()
         {
@@ -3219,7 +3281,7 @@ impl AppState {
     }
 
     pub fn picker_backspace(&mut self) {
-        if let Some(picker) = &mut self.model_picker
+        if let Some(picker) = &mut self.client.model_picker
             && picker.stage == ModelPickerStage::Models
         {
             picker.filter.pop();
@@ -3228,7 +3290,7 @@ impl AppState {
     }
 
     pub fn picker_move(&mut self, delta: isize) {
-        if let Some(picker) = &mut self.model_picker
+        if let Some(picker) = &mut self.client.model_picker
             && picker.stage == ModelPickerStage::Options
         {
             let option_count = if picker.options_fast_only { 1 } else { 2 };
@@ -3236,7 +3298,7 @@ impl AppState {
             return;
         }
         let count = self.filtered_models().len();
-        let Some(picker) = &mut self.model_picker else {
+        let Some(picker) = &mut self.client.model_picker else {
             return;
         };
         if count == 0 {
@@ -3247,7 +3309,7 @@ impl AppState {
     }
 
     pub fn picker_adjust(&mut self, delta: isize) {
-        let Some(picker) = &mut self.model_picker else {
+        let Some(picker) = &mut self.client.model_picker else {
             return;
         };
         if picker.stage != ModelPickerStage::Options {
@@ -3276,6 +3338,7 @@ impl AppState {
     pub fn picker_select(&mut self) -> Vec<Effect> {
         let filtered = self.filtered_models();
         let selected = self
+            .client
             .model_picker
             .as_ref()
             .and_then(|picker| filtered.get(picker.selected))
@@ -3283,10 +3346,12 @@ impl AppState {
             .cloned();
         if let Some(selected) = selected {
             let scope = self
+                .client
                 .model_picker
                 .as_ref()
                 .map_or(ModelSelectionScope::Session, |picker| picker.scope);
             let stage = self
+                .client
                 .model_picker
                 .as_ref()
                 .map_or(ModelPickerStage::Models, |picker| picker.stage);
@@ -3299,7 +3364,7 @@ impl AppState {
                 if fast_only {
                     options.reasoning_effort = None;
                 }
-                if let Some(picker) = &mut self.model_picker {
+                if let Some(picker) = &mut self.client.model_picker {
                     picker.stage = ModelPickerStage::Options;
                     picker.option_selected = 0;
                     picker.options = options;
@@ -3347,7 +3412,7 @@ impl AppState {
                 }
             }
             let selected_options = if stage == ModelPickerStage::Options {
-                self.model_picker.as_ref().map_or_else(
+                self.client.model_picker.as_ref().map_or_else(
                     || self.model_options_for(&selected),
                     |picker| picker.options.clone(),
                 )
@@ -3430,7 +3495,7 @@ impl AppState {
         let qualified = selected.qualified_id();
         self.vision_config.model = Some(qualified.clone());
         self.finish_model_picker();
-        if let Some(settings) = &mut self.settings {
+        if let Some(settings) = &mut self.client.settings {
             settings.vision = self.vision_config.clone();
         }
         self.status_message = format!("Vision model: {}.", selected.display_name());
@@ -3439,7 +3504,7 @@ impl AppState {
 
     #[must_use]
     pub fn filtered_models(&self) -> Vec<&ModelInfo> {
-        let Some(picker) = &self.model_picker else {
+        let Some(picker) = &self.client.model_picker else {
             return self.models.iter().collect();
         };
         let filter = picker.filter.to_lowercase();
@@ -3457,12 +3522,12 @@ impl AppState {
     }
 
     fn finish_model_picker(&mut self) {
-        self.model_picker = None;
+        self.client.model_picker = None;
         self.restore_previous_menu();
     }
 
     pub fn close_model_picker(&mut self) {
-        if let Some(picker) = &mut self.model_picker
+        if let Some(picker) = &mut self.client.model_picker
             && picker.stage == ModelPickerStage::Options
         {
             picker.stage = ModelPickerStage::Models;
@@ -3470,28 +3535,28 @@ impl AppState {
             return;
         }
         self.finish_model_picker();
-        if self.settings.is_none() {
+        if self.client.settings.is_none() {
             self.set_status("Model selection cancelled.");
         }
     }
 
     pub fn move_queue_selection(&mut self, delta: isize) {
         if self.queue.is_empty() {
-            self.queue_selection = None;
+            self.client.queue_selection = None;
             return;
         }
-        let current = self.queue_selection.unwrap_or(0);
-        self.queue_selection = Some(offset_index(current, self.queue.len(), delta));
+        let current = self.client.queue_selection.unwrap_or(0);
+        self.client.queue_selection = Some(offset_index(current, self.queue.len(), delta));
     }
 
     pub fn remove_selected_queue_item(&mut self) {
-        let Some(index) = self.queue_selection else {
+        let Some(index) = self.client.queue_selection else {
             return;
         };
         if let Some(prompt) = self.queue.remove(index) {
             self.status_message = format!("Removed queued message {}.", prompt.id);
         }
-        self.queue_selection = if self.queue.is_empty() {
+        self.client.queue_selection = if self.queue.is_empty() {
             None
         } else {
             Some(index.min(self.queue.len() - 1))
@@ -3611,7 +3676,7 @@ impl AppState {
                 if !models.is_empty() {
                     self.install_models(models.clone());
                 }
-                if let Some(scope) = self.pending_model_picker
+                if let Some(scope) = self.client.pending_model_picker
                     && !self.models.is_empty()
                 {
                     self.show_model_picker(scope);
@@ -3694,7 +3759,7 @@ impl AppState {
                 user_code,
                 ..
             } => {
-                if let Some(picker) = &mut self.provider_picker {
+                if let Some(picker) = &mut self.client.provider_picker {
                     picker.authentication = Some(ProviderAuthentication::Challenge {
                         verification_url: verification_url.clone(),
                         user_code: user_code.clone(),
@@ -3704,7 +3769,7 @@ impl AppState {
                 Some(Vec::new())
             }
             BackendEvent::AuthenticationCompleted { kind, metadata } => {
-                if let Some(picker) = &mut self.provider_picker {
+                if let Some(picker) = &mut self.client.provider_picker {
                     picker.authentication = None;
                 }
                 self.set_status("Provider authentication completed.");
@@ -3985,7 +4050,7 @@ impl AppState {
 
     fn handle_models(&mut self, models: Vec<ModelInfo>) -> Vec<Effect> {
         if models.is_empty() {
-            let was_opening_menu = self.pending_model_picker.take().is_some();
+            let was_opening_menu = self.client.pending_model_picker.take().is_some();
             if self.models.is_empty() {
                 self.install_models(models);
             } else {
@@ -3998,7 +4063,7 @@ impl AppState {
         }
         let cached = models.clone();
         self.install_models(models);
-        if let Some(scope) = self.pending_model_picker {
+        if let Some(scope) = self.client.pending_model_picker {
             self.show_model_picker(scope);
         }
         let mut effects = vec![Effect::PersistModels {
@@ -4259,8 +4324,8 @@ impl AppState {
             self.set_status("A late steer response was ignored; the draft was preserved.");
             return;
         }
-        if self.editor.revision() == pending.editor_revision {
-            self.editor.clear();
+        if self.client.editor.revision() == pending.editor_revision {
+            self.client.editor.clear();
         }
         self.transcript.push(
             EntryKind::Steering,
@@ -4359,15 +4424,15 @@ impl AppState {
     }
 
     fn take_editor_prompt(&mut self) -> QueuedPrompt {
-        let text = self.editor.text();
+        let text = self.client.editor.text();
         let mut remaining_labels = HashMap::<String, usize>::new();
-        for attachment in &self.draft_attachments {
+        for attachment in &self.client.draft_attachments {
             let token = format!("[{}]", attachment.label);
             remaining_labels
                 .entry(token.clone())
                 .or_insert_with(|| text.matches(&token).count());
         }
-        let attachments = std::mem::take(&mut self.draft_attachments)
+        let attachments = std::mem::take(&mut self.client.draft_attachments)
             .into_iter()
             .filter(|attachment| {
                 let token = format!("[{}]", attachment.label);
@@ -4386,7 +4451,7 @@ impl AppState {
             text,
             attachments,
         };
-        self.editor.clear();
+        self.client.editor.clear();
         prompt
     }
 
@@ -4423,7 +4488,7 @@ impl AppState {
             EntryStatus::Complete,
         );
         self.transcript.set_stream_active(true);
-        self.scroll_from_bottom = 0;
+        self.client.scroll_from_bottom = 0;
 
         if let Some(provider_session_id) = self.provider_session_id.clone() {
             let persist = self.session_id.is_none().then(|| Effect::PersistSession {
@@ -4578,10 +4643,10 @@ impl AppState {
             return Vec::new();
         }
         let Some(prompt) = self.queue.pop_front() else {
-            self.queue_selection = None;
+            self.client.queue_selection = None;
             return Vec::new();
         };
-        self.queue_selection = if self.queue.is_empty() { None } else { Some(0) };
+        self.client.queue_selection = if self.queue.is_empty() { None } else { Some(0) };
         self.begin_prompt(prompt)
     }
 
@@ -4613,7 +4678,7 @@ impl AppState {
                 EntryStatus::Complete,
             );
         }
-        self.scroll_from_bottom = 0;
+        self.client.scroll_from_bottom = 0;
     }
 
     fn observe_item(&mut self, turn_id: &str, item: NormalizedItem, completed: bool) {
@@ -4727,7 +4792,7 @@ impl AppState {
             }
             BackendOperation::Reload => {
                 self.creating_session = None;
-                let was_opening_menu = self.pending_model_picker.take().is_some();
+                let was_opening_menu = self.client.pending_model_picker.take().is_some();
                 if was_opening_menu {
                     self.restore_previous_menu();
                 }
@@ -4776,9 +4841,11 @@ impl AppState {
         self.transcript
             .set_status(&format!("user:{}", prompt.id), EntryStatus::Failed);
         self.pending_handoff.clone_from(&prompt.handoff);
-        self.draft_attachments.clone_from(&prompt.attachments);
-        if self.editor.is_blank() {
-            self.editor.set_text(&prompt.text);
+        self.client
+            .draft_attachments
+            .clone_from(&prompt.attachments);
+        if self.client.editor.is_blank() {
+            self.client.editor.set_text(&prompt.text);
             self.status_message.push_str(" Draft restored.");
         } else {
             self.status_message
@@ -4851,7 +4918,6 @@ impl AppState {
             run_id.clone(),
             SubagentChat {
                 transcript,
-                scroll_from_bottom: 0,
                 reasoning_summaries: ReasoningSummaryTracker::default(),
             },
         );
@@ -5564,7 +5630,7 @@ impl AppState {
         self.models.sort_by_key(ModelInfo::qualified_id);
         if self.models.is_empty() {
             self.status_message = format!("{} returned an empty model catalog.", self.backend_name);
-            self.pending_model_picker = None;
+            self.client.pending_model_picker = None;
             return;
         }
 
@@ -5622,7 +5688,7 @@ impl AppState {
     pub fn shell_output(&mut self, id: &str, output: &str) {
         self.transcript
             .replace_body(id, output, EntryStatus::Running);
-        self.scroll_from_bottom = 0;
+        self.client.scroll_from_bottom = 0;
     }
 
     pub fn shell_finished(
@@ -5647,14 +5713,14 @@ impl AppState {
         } else {
             "Shell command ended without an exit code.".to_owned()
         };
-        self.scroll_from_bottom = 0;
+        self.client.scroll_from_bottom = 0;
     }
 
     pub fn shell_failed(&mut self, id: &str, message: &str) {
         self.transcript
             .replace_body(id, message, EntryStatus::Failed);
         message.clone_into(&mut self.status_message);
-        self.scroll_from_bottom = 0;
+        self.client.scroll_from_bottom = 0;
     }
 
     fn protocol_problem(&mut self, message: &str) -> Vec<Effect> {
@@ -5943,7 +6009,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     #[test]
     fn leading_bang_submits_a_local_shell_command_without_a_backend_turn() {
         let mut state = ready_state();
-        state.editor.set_text("!./install.sh --check");
+        state.client.editor.set_text("!./install.sh --check");
         assert!(state.is_shell_mode());
 
         let effects = state.submit_editor();
@@ -5951,7 +6017,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             panic!("expected a shell effect");
         };
         assert_eq!(command, "./install.sh --check");
-        assert!(state.editor.is_blank());
+        assert!(state.client.editor.is_blank());
         let entry = state.transcript.entries().last().expect("shell entry");
         assert_eq!(entry.key.as_deref(), Some(id.as_str()));
         assert_eq!(entry.title, "$ ./install.sh --check");
@@ -5967,7 +6033,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             model: None,
             cancelling: false,
         });
-        state.editor.set_text("!pwd");
+        state.client.editor.set_text("!pwd");
 
         assert!(matches!(
             state.submit_or_steer_editor().as_slice(),
@@ -5978,7 +6044,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     #[test]
     fn shell_output_updates_the_ephemeral_transcript_entry() {
         let mut state = ready_state();
-        state.editor.set_text("!printf hello");
+        state.client.editor.set_text("!printf hello");
         let effects = state.submit_editor();
         let [Effect::RunShell { id, .. }] = effects.as_slice() else {
             panic!("expected a shell effect");
@@ -5997,10 +6063,10 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     #[test]
     fn empty_shell_command_keeps_the_draft() {
         let mut state = ready_state();
-        state.editor.set_text("!  ");
+        state.client.editor.set_text("!  ");
 
         assert!(state.submit_editor().is_empty());
-        assert_eq!(state.editor.text(), "!  ");
+        assert_eq!(state.client.editor.text(), "!  ");
         assert_eq!(state.status_message, "Write a shell command after !.");
     }
 
@@ -6016,6 +6082,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.open_agent_picker();
         state.edit_selected_agent();
         state
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -6044,6 +6111,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.open_agent_picker();
         state.edit_selected_agent();
         state
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -6055,6 +6123,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.agent_editor_insert_str("model a");
         state.select_agent_model_dropdown();
         let editor = state
+            .client
             .agent_picker
             .as_ref()
             .and_then(|picker| picker.editor.as_ref())
@@ -6067,6 +6136,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.select_agent_model_dropdown();
         assert_eq!(
             state
+                .client
                 .agent_picker
                 .as_ref()
                 .and_then(|picker| picker.editor.as_ref())
@@ -6104,7 +6174,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             }),
         }]);
 
-        assert_eq!(state.editor.text(), "[Image] ");
+        assert_eq!(state.client.editor.text(), "[Image] ");
         let effects = state.submit_editor();
         let Effect::Backend(BackendCommand::StartTurn { attachments, .. }) =
             effects.last().unwrap()
@@ -6130,13 +6200,13 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn discovered_skills_complete_and_attach_to_wire_prompts() {
         let mut state = ready_state();
         install_review_skill(&mut state);
-        state.editor.set_text("Please use /skill:rev");
+        state.client.editor.set_text("Please use /skill:rev");
         let completion = state
             .selected_command_completion()
             .expect("skill completion");
         assert_eq!(completion.replacement(), "/skill:review");
         state.accept_command_completion();
-        assert_eq!(state.editor.text(), "Please use /skill:review");
+        assert_eq!(state.client.editor.text(), "Please use /skill:review");
 
         state.handle_backend(BackendEvent::SessionCreated {
             provider_session_id: "session-with-skills".to_owned(),
@@ -6158,9 +6228,9 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     #[test]
     fn unknown_skill_preserves_the_draft() {
         let mut state = ready_state();
-        state.editor.set_text("Use /skill:missing");
+        state.client.editor.set_text("Use /skill:missing");
         assert!(state.submit_editor().is_empty());
-        assert_eq!(state.editor.text(), "Use /skill:missing");
+        assert_eq!(state.client.editor.text(), "Use /skill:missing");
         assert!(
             state
                 .status_message
@@ -6194,14 +6264,14 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             model: None,
             cancelling: false,
         });
-        state.editor.set_text("steer");
+        state.client.editor.set_text("steer");
 
         assert!(state.steer_editor().is_empty());
-        assert_eq!(state.editor.text(), "steer");
+        assert_eq!(state.client.editor.text(), "steer");
         assert!(state.status_message.contains("does not support steering"));
 
         state.active_turn = None;
-        state.editor.set_text("/compress");
+        state.client.editor.set_text("/compress");
         assert!(state.submit_editor().is_empty());
         assert!(
             state
@@ -6214,7 +6284,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn compress_command_requests_manual_compaction_for_the_current_chat() {
         let mut state = ready_state();
         state.provider_session_id = Some("native-session".to_owned());
-        state.editor.set_text("/compress");
+        state.client.editor.set_text("/compress");
 
         let effects = state.submit_editor();
 
@@ -6237,7 +6307,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert_eq!(pending.turn_id, compaction_id);
         assert_eq!(pending.reason, CompactionReason::Manual);
         assert!(state.is_busy());
-        assert!(state.editor.text().is_empty());
+        assert!(state.client.editor.text().is_empty());
         assert!(state.transcript.entries().iter().any(|entry| {
             entry.key.as_deref() == Some(compaction_id.as_str())
                 && entry.title == "Compressing context"
@@ -6417,7 +6487,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 is_default: false,
             },
         ]));
-        assert!(state.model_picker.is_some());
+        assert!(state.client.model_picker.is_some());
         state.picker_move(1);
         assert!(matches!(
             state.picker_select().as_slice(),
@@ -6428,13 +6498,13 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 if session_id == "devin-session" && model == "model-b"
         ));
 
-        state.editor.set_text("/reload");
+        state.client.editor.set_text("/reload");
         assert!(matches!(
             state.submit_editor().as_slice(),
             [Effect::ReloadConfiguration]
         ));
 
-        state.editor.set_text("first real prompt");
+        state.client.editor.set_text("first real prompt");
         let effects = state.submit_editor();
         assert!(matches!(
             effects.as_slice(),
@@ -6464,16 +6534,16 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
         state.session_id = Some("nakode-session-1".to_owned());
-        state.editor.set_text("first");
+        state.client.editor.set_text("first");
         let first = state.submit_editor();
         assert!(matches!(first.as_slice(), [Effect::Backend(_)]));
         state.handle_backend(BackendEvent::TurnAccepted {
             turn_id: "turn-1".to_owned(),
         });
 
-        state.editor.set_text("second");
+        state.client.editor.set_text("second");
         state.submit_editor();
-        state.editor.set_text("third");
+        state.client.editor.set_text("third");
         state.submit_editor();
         assert_eq!(state.queue.len(), 2);
 
@@ -6498,16 +6568,16 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             model: Some("model-a".to_owned()),
             cancelling: false,
         });
-        state.editor.set_text("focus on tests");
+        state.client.editor.set_text("focus on tests");
 
         let effects = state.steer_editor();
         assert!(matches!(effects.as_slice(), [Effect::Backend(_)]));
-        assert_eq!(state.editor.text(), "focus on tests");
+        assert_eq!(state.client.editor.text(), "focus on tests");
 
         state.handle_backend(BackendEvent::SteerAccepted {
             turn_id: "turn-1".to_owned(),
         });
-        assert!(state.editor.is_blank());
+        assert!(state.client.editor.is_blank());
     }
 
     #[test]
@@ -6519,7 +6589,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             model: Some("model-a".to_owned()),
             cancelling: false,
         });
-        state.editor.set_text("too late");
+        state.client.editor.set_text("too late");
         state.steer_editor();
 
         state.handle_backend(BackendEvent::TurnCompleted {
@@ -6531,14 +6601,14 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             turn_id: "turn-1".to_owned(),
         });
 
-        assert_eq!(state.editor.text(), "too late");
+        assert_eq!(state.client.editor.text(), "too late");
         assert!(state.status_message.contains("late steer"));
     }
 
     #[test]
     fn session_start_timeout_preserves_the_pending_prompt() {
         let mut state = ready_state();
-        state.editor.set_text("first");
+        state.client.editor.set_text("first");
         state.submit_editor();
 
         let effects = state.handle_backend(BackendEvent::RequestFailed {
@@ -6548,7 +6618,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         });
         assert!(effects.is_empty());
         assert!(state.is_busy());
-        assert!(state.editor.is_blank());
+        assert!(state.client.editor.is_blank());
 
         let effects = state.handle_backend(BackendEvent::SessionCreated {
             provider_session_id: "thread-late".to_owned(),
@@ -6567,7 +6637,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     #[test]
     fn rejected_session_start_restores_the_draft() {
         let mut state = ready_state();
-        state.editor.set_text("first");
+        state.client.editor.set_text("first");
         state.submit_editor();
 
         state.handle_backend(BackendEvent::RequestFailed {
@@ -6577,7 +6647,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         });
 
         assert!(!state.is_busy());
-        assert_eq!(state.editor.text(), "first");
+        assert_eq!(state.client.editor.text(), "first");
         let user = state
             .transcript
             .entries()
@@ -6592,7 +6662,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         let mut state = ready_state();
         state.provider_session_id = Some("session-1".to_owned());
         state.session_id = Some("nakode-session-1".to_owned());
-        state.editor.set_text("fail prompt");
+        state.client.editor.set_text("fail prompt");
         state.submit_editor();
         state.handle_backend(BackendEvent::TurnAccepted {
             turn_id: "turn-failed".to_owned(),
@@ -6620,7 +6690,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn prompt_lifecycle_drives_the_nakode_stream_spinner() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
-        state.editor.set_text("inspect the project");
+        state.client.editor.set_text("inspect the project");
         state.submit_editor();
 
         let active = state.transcript.visible(80, 10, 0);
@@ -6657,9 +6727,9 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
         state.session_id = Some("nakode-session-1".to_owned());
-        state.editor.set_text("first");
+        state.client.editor.set_text("first");
         state.submit_editor();
-        state.editor.set_text("second");
+        state.client.editor.set_text("second");
         state.submit_editor();
 
         let effects = state.handle_backend(BackendEvent::RequestFailed {
@@ -6689,7 +6759,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn session_close_clears_all_busy_state() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
-        state.editor.set_text("first");
+        state.client.editor.set_text("first");
         state.submit_editor();
         assert!(state.is_busy());
 
@@ -6710,16 +6780,16 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             model: Some("model-a".to_owned()),
             cancelling: false,
         });
-        state.editor.set_text("focus");
+        state.client.editor.set_text("focus");
         state.steer_editor();
-        state.editor.insert_char('x');
-        state.editor.backspace();
+        state.client.editor.insert_char('x');
+        state.client.editor.backspace();
 
         state.handle_backend(BackendEvent::SteerAccepted {
             turn_id: "turn-1".to_owned(),
         });
 
-        assert_eq!(state.editor.text(), "focus");
+        assert_eq!(state.client.editor.text(), "focus");
     }
 
     #[test]
@@ -7014,10 +7084,11 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             state.select_setting().as_slice(),
             [Effect::ListProviders]
         ));
-        assert!(state.settings.is_none());
+        assert!(state.client.settings.is_none());
         state.close_provider_picker();
         assert_eq!(
             state
+                .client
                 .settings
                 .as_ref()
                 .map(|settings| (settings.view, settings.selected)),
@@ -7026,10 +7097,11 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
 
         state.settings_move(1);
         assert!(state.select_setting().is_empty());
-        assert!(state.settings.is_none());
+        assert!(state.client.settings.is_none());
         state.close_agent_picker();
         assert_eq!(
             state
+                .client
                 .settings
                 .as_ref()
                 .map(|settings| (settings.view, settings.selected)),
@@ -7038,10 +7110,11 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
 
         state.settings_move(1);
         assert!(state.select_setting().is_empty());
-        assert!(state.model_picker.is_some());
+        assert!(state.client.model_picker.is_some());
         state.close_model_picker();
         assert_eq!(
             state
+                .client
                 .settings
                 .as_ref()
                 .map(|settings| (settings.view, settings.selected)),
@@ -7053,20 +7126,21 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.settings_move(1);
         assert!(state.select_setting().is_empty());
         assert_eq!(
-            state.settings.as_ref().map(|settings| settings.view),
+            state.client.settings.as_ref().map(|settings| settings.view),
             Some(super::SettingsView::Vision)
         );
         assert!(state.select_setting().is_empty());
-        assert!(state.model_picker.is_some());
+        assert!(state.client.model_picker.is_some());
         state.close_model_picker();
         assert_eq!(
-            state.settings.as_ref().map(|settings| settings.view),
+            state.client.settings.as_ref().map(|settings| settings.view),
             Some(super::SettingsView::Vision)
         );
 
         assert!(state.settings_back().is_empty());
         assert_eq!(
             state
+                .client
                 .settings
                 .as_ref()
                 .map(|settings| (settings.view, settings.selected)),
@@ -7075,6 +7149,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert!(state.settings_back().is_empty());
         assert_eq!(
             state
+                .client
                 .settings
                 .as_ref()
                 .map(|settings| (settings.view, settings.selected)),
@@ -7086,16 +7161,20 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn model_options_escape_returns_to_model_list_before_parent_menu() {
         let mut state = ready_state();
         assert!(state.open_model_picker().is_empty());
-        let picker = state.model_picker.as_mut().expect("model picker");
+        let picker = state.client.model_picker.as_mut().expect("model picker");
         picker.stage = super::ModelPickerStage::Options;
 
         state.close_model_picker();
         assert_eq!(
-            state.model_picker.as_ref().map(|picker| picker.stage),
+            state
+                .client
+                .model_picker
+                .as_ref()
+                .map(|picker| picker.stage),
             Some(super::ModelPickerStage::Models)
         );
         state.close_model_picker();
-        assert!(state.model_picker.is_none());
+        assert!(state.client.model_picker.is_none());
     }
 
     #[test]
@@ -7107,7 +7186,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.settings_move(2);
         assert!(state.select_setting().is_empty());
         assert_eq!(
-            state.settings.as_ref().map(|settings| settings.view),
+            state.client.settings.as_ref().map(|settings| settings.view),
             Some(super::SettingsView::Memory)
         );
         assert!(matches!(
@@ -7122,6 +7201,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         ));
         assert_eq!(
             state
+                .client
                 .settings
                 .as_ref()
                 .map(|settings| (settings.view, settings.selected)),
@@ -7138,7 +7218,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.settings_move(3);
         assert!(state.select_setting().is_empty());
         assert_eq!(
-            state.settings.as_ref().map(|settings| settings.view),
+            state.client.settings.as_ref().map(|settings| settings.view),
             Some(super::SettingsView::TerminalImages)
         );
 
@@ -7150,6 +7230,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         ));
         assert_eq!(
             state
+                .client
                 .settings
                 .as_ref()
                 .map(|settings| settings.terminal_images),
@@ -7172,6 +7253,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert!(state.settings_back().is_empty());
         assert_eq!(
             state
+                .client
                 .settings
                 .as_ref()
                 .map(|settings| (settings.view, settings.selected)),
@@ -7182,21 +7264,21 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     #[test]
     fn slash_commands_are_not_sent_as_prompts() {
         let mut state = ready_state();
-        state.editor.set_text("/resume");
+        state.client.editor.set_text("/resume");
         assert!(matches!(
             state.submit_editor().as_slice(),
             [Effect::ListSessions]
         ));
-        assert!(state.session_picker.is_some());
+        assert!(state.client.session_picker.is_some());
 
         state.close_session_picker();
-        state.editor.set_text("/reload");
+        state.client.editor.set_text("/reload");
         assert!(matches!(
             state.submit_editor().as_slice(),
             [Effect::ReloadConfiguration]
         ));
 
-        state.editor.set_text("/resume abc123");
+        state.client.editor.set_text("/resume abc123");
         assert!(matches!(
             state.submit_editor().as_slice(),
             [Effect::ResolveSession(id)] if id == "abc123"
@@ -7207,33 +7289,34 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn configuration_commands_work_without_an_enabled_provider() {
         let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
 
-        state.editor.set_text("/providers");
+        state.client.editor.set_text("/providers");
         assert!(matches!(
             state.submit_editor().as_slice(),
             [Effect::ListProviders]
         ));
 
         state.close_provider_picker();
-        state.editor.set_text("/agents");
+        state.client.editor.set_text("/agents");
         assert!(state.submit_editor().is_empty());
-        assert!(state.agent_picker.is_some());
+        assert!(state.client.agent_picker.is_some());
 
         state.close_agent_picker();
-        state.editor.set_text("/reload");
+        state.client.editor.set_text("/reload");
         assert!(matches!(
             state.submit_editor().as_slice(),
             [Effect::ReloadConfiguration]
         ));
 
-        state.editor.set_text("/settings");
+        state.client.editor.set_text("/settings");
         assert!(state.submit_editor().is_empty());
-        let settings = state.settings.as_ref().expect("settings menu");
+        let settings = state.client.settings.as_ref().expect("settings menu");
         assert_eq!(settings.filtered_sections(), super::SettingsSection::ALL);
         state.settings_insert('w');
         state.settings_insert('e');
         state.settings_insert('b');
         assert_eq!(
             state
+                .client
                 .settings
                 .as_ref()
                 .expect("settings")
@@ -7245,7 +7328,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.settings_move(3);
         assert!(state.select_setting().is_empty());
         assert_eq!(
-            state.settings.as_ref().map(|settings| settings.view),
+            state.client.settings.as_ref().map(|settings| settings.view),
             Some(super::SettingsView::Addons)
         );
         assert!(matches!(
@@ -7253,7 +7336,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             [Effect::CheckAgentBrowser]
         ));
         assert_eq!(
-            state.settings.as_ref().map(|settings| settings.view),
+            state.client.settings.as_ref().map(|settings| settings.view),
             Some(super::SettingsView::WebBrowsing)
         );
         assert!(matches!(
@@ -7262,7 +7345,11 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 if config.backend == crate::web::WebBackend::AgentBrowser
         ));
         assert_eq!(
-            state.settings.as_ref().map(|settings| settings.web.backend),
+            state
+                .client
+                .settings
+                .as_ref()
+                .map(|settings| settings.web.backend),
             Some(crate::web::WebBackend::AgentBrowser)
         );
         assert!(matches!(
@@ -7274,6 +7361,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.settings_insert('k');
         assert_eq!(
             state
+                .client
                 .settings
                 .as_ref()
                 .map(|settings| settings.web.firecrawl_api_key.as_str()),
@@ -7394,7 +7482,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
 
         assert_eq!(state.subagents.len(), 1);
         assert_eq!(state.subagents[0].objective, "Map persistence");
-        state.subagent_modal = Some("agent-1".to_owned());
+        state.client.subagent_modal = Some("agent-1".to_owned());
         let (transcript, scroll) = state
             .selected_subagent_transcript_mut()
             .expect("restored subagent chat");
@@ -7464,17 +7552,25 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             id: "model-b".to_owned(),
             is_default: false,
         });
-        state.editor.set_text("/models");
+        state.client.editor.set_text("/models");
 
         assert!(state.submit_editor().is_empty());
         assert_eq!(
-            state.model_picker.as_ref().map(|picker| picker.scope),
+            state
+                .client
+                .model_picker
+                .as_ref()
+                .map(|picker| picker.scope),
             Some(super::ModelSelectionScope::Default)
         );
         state.picker_move(1);
         assert!(state.picker_select().is_empty());
         assert_eq!(
-            state.model_picker.as_ref().map(|picker| picker.stage),
+            state
+                .client
+                .model_picker
+                .as_ref()
+                .map(|picker| picker.stage),
             Some(super::ModelPickerStage::Options)
         );
         state.picker_adjust(1);
@@ -7495,7 +7591,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert_eq!(model_b_options.reasoning_effort.as_deref(), Some("high"));
         assert!(model_b_options.fast_mode);
 
-        state.editor.set_text("/new");
+        state.client.editor.set_text("/new");
         let _ = state.submit_editor();
         assert_eq!(
             state.selected_model.as_deref(),
@@ -7527,11 +7623,15 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             is_default: true,
         }];
         state.selected_model = Some("cursor-sdk/composer-2.5".to_owned());
-        state.editor.set_text("/models");
+        state.client.editor.set_text("/models");
 
         assert!(state.submit_editor().is_empty());
         assert!(state.picker_select().is_empty());
-        let picker = state.model_picker.as_ref().expect("Cursor options picker");
+        let picker = state
+            .client
+            .model_picker
+            .as_ref()
+            .expect("Cursor options picker");
         assert_eq!(picker.stage, super::ModelPickerStage::Options);
         assert!(picker.options_fast_only);
         assert!(picker.options.reasoning_effort.is_none());
@@ -7564,11 +7664,15 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         }];
         state.selected_model = Some("cursor-sdk/composer-2.5".to_owned());
         state.provider_session_id = Some("cursor-session-1".to_owned());
-        state.editor.set_text("/switch");
+        state.client.editor.set_text("/switch");
 
         assert!(state.submit_editor().is_empty());
         assert!(state.picker_select().is_empty());
-        let picker = state.model_picker.as_ref().expect("Cursor options picker");
+        let picker = state
+            .client
+            .model_picker
+            .as_ref()
+            .expect("Cursor options picker");
         assert_eq!(picker.scope, super::ModelSelectionScope::Session);
         assert_eq!(picker.stage, super::ModelPickerStage::Options);
         assert!(picker.options_fast_only);
@@ -7584,7 +7688,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         ));
         assert!(state.selected_model_uses_fast_mode());
 
-        state.editor.set_text("/new");
+        state.client.editor.set_text("/new");
         let _ = state.submit_editor();
         assert!(!state.selected_model_uses_fast_mode());
     }
@@ -7613,12 +7717,12 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 fast_mode: false,
             },
         );
-        state.editor.set_text("/models");
+        state.client.editor.set_text("/models");
         state.submit_editor();
         state.picker_move(1);
         state.picker_select();
 
-        let picker = state.model_picker.as_ref().expect("options picker");
+        let picker = state.client.model_picker.as_ref().expect("options picker");
         assert_eq!(picker.options.reasoning_effort.as_deref(), Some("low"));
         assert!(!picker.options.fast_mode);
     }
@@ -7644,17 +7748,25 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 fast_mode: true,
             },
         );
-        state.editor.set_text("/switch");
+        state.client.editor.set_text("/switch");
 
         assert!(state.submit_editor().is_empty());
         assert_eq!(
-            state.model_picker.as_ref().map(|picker| picker.scope),
+            state
+                .client
+                .model_picker
+                .as_ref()
+                .map(|picker| picker.scope),
             Some(super::ModelSelectionScope::Session)
         );
         state.picker_move(1);
         assert!(state.picker_select().is_empty());
         assert_eq!(
-            state.model_picker.as_ref().map(|picker| picker.stage),
+            state
+                .client
+                .model_picker
+                .as_ref()
+                .map(|picker| picker.stage),
             Some(super::ModelPickerStage::Options)
         );
         let effects = state.picker_select();
@@ -7672,7 +7784,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             Some("openai-codex/model-b")
         );
 
-        state.editor.set_text("/new");
+        state.client.editor.set_text("/new");
         let _ = state.submit_editor();
         assert_eq!(
             state.selected_model.as_deref(),
@@ -7781,7 +7893,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 && entry.body.contains("fresh provider-native session")
         }));
 
-        state.editor.set_text("What is my name?");
+        state.client.editor.set_text("What is my name?");
         assert!(matches!(
             state.submit_editor().as_slice(),
             [Effect::Backend(BackendCommand::StartSession { .. })]
@@ -7990,7 +8102,7 @@ fast_mode = true
         state.install_agents(explorer_catalog());
         state.set_nakode_executable(Path::new("/opt/nakode/bin/nakode"));
         state.selected_model = Some("openai-codex/model-a".to_owned());
-        state.editor.set_text("Start work");
+        state.client.editor.set_text("Start work");
 
         let effects = state.submit_editor();
         let [
@@ -8365,7 +8477,7 @@ fast_mode = true
     #[test]
     fn provider_menu_opens_details_before_toggling_state() {
         let mut state = ready_state();
-        state.editor.set_text("/providers");
+        state.client.editor.set_text("/providers");
         assert!(matches!(
             state.submit_editor().as_slice(),
             [Effect::ListProviders]
@@ -8384,6 +8496,7 @@ fast_mode = true
         state.open_provider_details();
         assert!(
             state
+                .client
                 .provider_picker
                 .as_ref()
                 .is_some_and(|picker| picker.showing_details)
@@ -8405,7 +8518,7 @@ fast_mode = true
     #[test]
     fn cursor_setup_collects_and_saves_an_api_key_without_starting_oauth() {
         let mut state = ready_state();
-        state.editor.set_text("/providers");
+        state.client.editor.set_text("/providers");
         let _ = state.submit_editor();
         state.install_providers(vec![crate::session::ProviderRecord {
             provider: CURSOR_PROVIDER.to_owned(),
@@ -8500,7 +8613,7 @@ fast_mode = true
         assert!(state.submit_provider_api_key().is_empty());
         assert!(state.provider_api_key_input_active());
         state.provider_api_key_insert_str("secret");
-        let debug = format!("{:?}", state.provider_picker);
+        let debug = format!("{:?}", state.client.provider_picker);
         assert!(!debug.contains("secret"));
         state.provider_api_key_backspace();
         assert!(state.cancel_provider_api_key_input());
@@ -8511,7 +8624,7 @@ fast_mode = true
     #[test]
     fn unconfigured_provider_starts_authentication_before_enablement() {
         let mut state = ready_state();
-        state.editor.set_text("/providers");
+        state.client.editor.set_text("/providers");
         let _ = state.submit_editor();
         state.install_providers(vec![crate::session::ProviderRecord {
             provider: CODEX_PROVIDER.to_owned(),
@@ -8527,6 +8640,7 @@ fast_mode = true
         ));
         assert!(matches!(
             state
+                .client
                 .provider_picker
                 .as_ref()
                 .and_then(|picker| picker.authentication.as_ref()),
@@ -8542,7 +8656,7 @@ fast_mode = true
             },
         );
         assert!(matches!(
-            state
+            state.client
                 .provider_picker
                 .as_ref()
                 .and_then(|picker| picker.authentication.as_ref()),

@@ -55,6 +55,17 @@ fn overlay_block<'a>(title: impl Into<Line<'a>>, border: Color) -> Block<'a> {
         .style(Style::default().bg(SURFACE).fg(TEXT))
 }
 
+#[derive(Default)]
+struct RenderOutput {
+    screen_snapshot: Option<ScreenSnapshot>,
+    scroll_from_bottom: usize,
+    selected_subagent_scroll: Option<usize>,
+    subagent_hit_regions: Vec<(String, ScreenPoint, ScreenPoint)>,
+    tool_toggle_hit_regions: Vec<(String, ScreenPoint, ScreenPoint)>,
+    oauth_link_hit_region: Option<(String, ScreenPoint, ScreenPoint)>,
+    api_key_input_hit_region: Option<(ScreenPoint, ScreenPoint)>,
+}
+
 pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     draw_with_images(frame, state, None);
 }
@@ -62,7 +73,31 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
 pub fn draw_with_images(
     frame: &mut Frame<'_>,
     state: &mut AppState,
+    image_renderer: Option<&mut TerminalImageRenderer>,
+) {
+    let mut output = RenderOutput {
+        scroll_from_bottom: state.client.scroll_from_bottom,
+        ..RenderOutput::default()
+    };
+    draw_immutable(frame, state, image_renderer, &mut output);
+    state.client.scroll_from_bottom = output.scroll_from_bottom;
+    if let Some(scroll) = output.selected_subagent_scroll {
+        state.set_selected_subagent_scroll(scroll);
+    }
+    if let Some(snapshot) = output.screen_snapshot {
+        state.set_screen_snapshot(snapshot);
+    }
+    state.set_subagent_hit_regions(output.subagent_hit_regions);
+    state.set_tool_toggle_hit_regions(output.tool_toggle_hit_regions);
+    state.set_oauth_link_hit_region(output.oauth_link_hit_region);
+    state.set_api_key_input_hit_region(output.api_key_input_hit_region);
+}
+
+fn draw_immutable(
+    frame: &mut Frame<'_>,
+    state: &AppState,
     mut image_renderer: Option<&mut TerminalImageRenderer>,
+    output: &mut RenderOutput,
 ) {
     let area = frame.area();
     if let Some(renderer) = image_renderer.as_deref_mut() {
@@ -95,7 +130,7 @@ pub fn draw_with_images(
         .split(area);
 
     render_header(frame, regions[0], state);
-    render_transcript(frame, regions[1], state, image_renderer);
+    render_transcript(frame, regions[1], state, image_renderer, output);
     if todo_height > 0 {
         render_todos(frame, regions[2], state);
     }
@@ -107,13 +142,13 @@ pub fn draw_with_images(
 
     let has_modal = state.questions.front().is_some()
         || state.approvals.front().is_some()
-        || state.show_help
-        || state.session_picker.is_some()
-        || state.provider_picker.is_some()
-        || state.agent_picker.is_some()
-        || state.settings.is_some()
-        || state.model_picker.is_some()
-        || state.subagent_modal.is_some();
+        || state.client.show_help
+        || state.client.session_picker.is_some()
+        || state.client.provider_picker.is_some()
+        || state.client.agent_picker.is_some()
+        || state.client.settings.is_some()
+        || state.client.model_picker.is_some()
+        || state.client.subagent_modal.is_some();
     if !has_modal {
         render_command_completions(frame, regions[4], state);
     }
@@ -122,20 +157,20 @@ pub fn draw_with_images(
         render_question(frame, area, question);
     } else if let Some(approval) = state.approvals.front() {
         render_approval(frame, area, approval);
-    } else if state.show_help {
+    } else if state.client.show_help {
         render_help(frame, area);
-    } else if state.session_picker.is_some() {
+    } else if state.client.session_picker.is_some() {
         render_session_picker(frame, area, state);
-    } else if state.provider_picker.is_some() {
-        render_provider_picker(frame, area, state);
-    } else if state.settings.is_some() {
+    } else if state.client.provider_picker.is_some() {
+        render_provider_picker(frame, area, state, output);
+    } else if state.client.settings.is_some() {
         render_settings(frame, area, state);
-    } else if state.agent_picker.is_some() {
+    } else if state.client.agent_picker.is_some() {
         render_agent_picker(frame, area, state);
-    } else if state.model_picker.is_some() {
+    } else if state.client.model_picker.is_some() {
         render_model_picker(frame, area, state);
-    } else if state.subagent_modal.is_some() {
-        render_subagent_modal(frame, area, state);
+    } else if state.client.subagent_modal.is_some() {
+        render_subagent_modal(frame, area, state, output);
     } else if let Some(position) = cursor {
         frame.set_cursor_position(position);
     }
@@ -144,19 +179,19 @@ pub fn draw_with_images(
         vec![bordered_inner(centered(area, 76, 16))]
     } else if state.approvals.front().is_some() {
         vec![bordered_inner(centered(area, 76, 12))]
-    } else if state.show_help {
+    } else if state.client.show_help {
         vec![bordered_inner(centered(area, 76, 26))]
-    } else if state.session_picker.is_some() {
+    } else if state.client.session_picker.is_some() {
         vec![bordered_inner(centered(area, 78, 18))]
-    } else if state.provider_picker.is_some() {
+    } else if state.client.provider_picker.is_some() {
         vec![bordered_inner(provider_picker_popup(area, state))]
-    } else if state.settings.is_some() {
+    } else if state.client.settings.is_some() {
         vec![bordered_inner(centered(area, 76, 22))]
-    } else if state.agent_picker.is_some() {
+    } else if state.client.agent_picker.is_some() {
         vec![bordered_inner(centered(area, 82, 24))]
-    } else if state.model_picker.is_some() {
+    } else if state.client.model_picker.is_some() {
         vec![bordered_inner(centered(area, 72, 18))]
-    } else if state.subagent_modal.is_some() {
+    } else if state.client.subagent_modal.is_some() {
         vec![bordered_inner(subagent_modal_popup(area))]
     } else {
         let mut selectable = vec![bordered_inner(regions[1]), bordered_inner(regions[4])];
@@ -168,11 +203,12 @@ pub fn draw_with_images(
         }
         selectable
     };
-    capture_and_highlight_selection(frame, state, area, selectable_regions);
+    capture_and_highlight_selection(frame, state, area, selectable_regions, output);
 }
 
 fn provider_picker_popup(area: Rect, state: &AppState) -> Rect {
     if state
+        .client
         .provider_picker
         .as_ref()
         .is_some_and(|picker| picker.showing_details)
@@ -185,11 +221,13 @@ fn provider_picker_popup(area: Rect, state: &AppState) -> Rect {
 
 fn capture_and_highlight_selection(
     frame: &mut Frame<'_>,
-    state: &mut AppState,
+    state: &AppState,
     area: Rect,
     selectable_regions: Vec<Rect>,
+    output: &mut RenderOutput,
 ) {
     let selection = state
+        .client
         .text_selection
         .filter(|selection| selection.is_range());
     let highlight_area = selection
@@ -213,7 +251,7 @@ fn capture_and_highlight_selection(
         }
         snapshot
     };
-    state.set_screen_snapshot(snapshot);
+    output.screen_snapshot = Some(snapshot);
 }
 
 fn bordered_inner(area: Rect) -> Rect {
@@ -285,19 +323,21 @@ struct TranscriptHitRegions {
 fn render_transcript(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &mut AppState,
+    state: &AppState,
     image_renderer: Option<&mut TerminalImageRenderer>,
+    output: &mut RenderOutput,
 ) {
+    let mut transcript = state.transcript.clone();
     let hit_regions = render_transcript_view(
         frame,
         area,
-        &mut state.transcript,
-        &mut state.scroll_from_bottom,
+        &mut transcript,
+        &mut output.scroll_from_bottom,
         Line::default(),
         image_renderer,
     );
-    state.set_subagent_hit_regions(hit_regions.subagents);
-    state.set_tool_toggle_hit_regions(hit_regions.tool_toggles);
+    output.subagent_hit_regions = hit_regions.subagents;
+    output.tool_toggle_hit_regions = hit_regions.tool_toggles;
 }
 
 fn render_transcript_view(
@@ -406,7 +446,7 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .iter()
         .enumerate()
         .map(|(index, prompt)| {
-            let selected = state.queue_selection == Some(index);
+            let selected = state.client.queue_selection == Some(index);
             let marker = if selected { "›" } else { " " };
             let summary = prompt.text.lines().next().unwrap_or_default();
             ListItem::new(Line::from(vec![
@@ -512,9 +552,13 @@ fn subagent_modal_popup(area: Rect) -> Rect {
     centered(area, 92, area.height.saturating_sub(4))
 }
 
-fn render_subagent_modal(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+fn render_subagent_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    output: &mut RenderOutput,
+) {
     let Some((agent, objective)) = state.selected_subagent_summary() else {
-        state.close_subagent_modal();
         return;
     };
     let popup = subagent_modal_popup(area);
@@ -529,13 +573,17 @@ fn render_subagent_modal(frame: &mut Frame<'_>, area: Rect, state: &mut AppState
             Style::default().fg(MUTED),
         ),
     ]);
-    let tool_toggles = if let Some((transcript, scroll)) = state.selected_subagent_transcript_mut()
-    {
-        render_transcript_view(frame, popup, transcript, scroll, title, None).tool_toggles
+    let tool_toggles = if let Some(transcript) = state.selected_subagent_transcript() {
+        let mut transcript = transcript.clone();
+        let mut scroll = state.selected_subagent_scroll();
+        let regions =
+            render_transcript_view(frame, popup, &mut transcript, &mut scroll, title, None);
+        output.selected_subagent_scroll = Some(scroll);
+        regions.tool_toggles
     } else {
         Vec::new()
     };
-    state.set_tool_toggle_hit_regions(tool_toggles);
+    output.tool_toggle_hit_regions = tool_toggles;
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<Position> {
@@ -565,7 +613,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Optio
     }
     let block = overlay_block(
         Line::from(title),
-        if state.is_busy() || !state.editor.is_blank() {
+        if state.is_busy() || !state.client.editor.is_blank() {
             ACCENT
         } else {
             BORDER
@@ -577,7 +625,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Optio
     if inner.width == 0 || inner.height == 0 {
         return None;
     }
-    let window = state.editor.window(inner.height, inner.width);
+    let window = state.client.editor.window(inner.height, inner.width);
     let lines = window
         .lines
         .into_iter()
@@ -788,7 +836,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
 fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let popup = centered(area, 76, 22);
     frame.render_widget(Clear, popup);
-    let settings = state.settings.as_ref().expect("settings checked");
+    let settings = state.client.settings.as_ref().expect("settings checked");
     let lines = match settings.view {
         crate::state::SettingsView::Menu => settings_menu_lines(settings),
         crate::state::SettingsView::Addons => settings_addon_lines(settings),
@@ -1081,13 +1129,22 @@ fn settings_row(label: &str, value: &str, selected: bool) -> Line<'static> {
     .style(Style::default().bg(if selected { SURFACE_RAISED } else { SURFACE }))
 }
 
-fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
-    state.set_oauth_link_hit_region(None);
-    state.set_api_key_input_hit_region(None);
-    let picker = state.provider_picker.as_ref().expect("picker checked");
+fn render_provider_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    output: &mut RenderOutput,
+) {
+    output.oauth_link_hit_region = None;
+    output.api_key_input_hit_region = None;
+    let picker = state
+        .client
+        .provider_picker
+        .as_ref()
+        .expect("picker checked");
     if picker.showing_details {
         let picker = picker.clone();
-        render_provider_details(frame, area, state, &picker);
+        render_provider_details(frame, area, state, &picker, output);
         return;
     }
     let popup = centered(area, 68, 14);
@@ -1167,7 +1224,7 @@ fn render_provider_picker(frame: &mut Frame<'_>, area: Rect, state: &mut AppStat
 fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let popup = centered(area, 82, 24);
     frame.render_widget(Clear, popup);
-    let picker = state.agent_picker.as_ref().expect("picker checked");
+    let picker = state.client.agent_picker.as_ref().expect("picker checked");
     let lines = if let Some(editor) = &picker.editor {
         agent_editor_lines(editor)
     } else {
@@ -1407,8 +1464,9 @@ fn agent_list_row(agent: &crate::agent::AgentDefinition, selected: bool) -> Line
 fn render_provider_details(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &mut AppState,
+    state: &AppState,
     picker: &crate::state::ProviderPicker,
+    output: &mut RenderOutput,
 ) {
     let popup = centered(area, 72, 32);
     frame.render_widget(Clear, popup);
@@ -1486,13 +1544,13 @@ fn render_provider_details(
         popup,
     );
     register_oauth_link(
-        state,
+        output,
         popup,
         authentication_url_line,
         picker.authentication.as_ref(),
         crate::backend::api_key_provider_setup(&provider.provider).map(|setup| setup.dashboard_url),
     );
-    register_api_key_input(state, popup, api_key_input_line);
+    register_api_key_input(output, popup, api_key_input_line);
 }
 
 fn append_provider_capabilities(
@@ -1527,7 +1585,7 @@ fn append_provider_capabilities(
     }
 }
 
-fn register_api_key_input(state: &mut AppState, popup: Rect, line: Option<usize>) {
+fn register_api_key_input(output: &mut RenderOutput, popup: Rect, line: Option<usize>) {
     let Some(line) = line else {
         return;
     };
@@ -1535,10 +1593,10 @@ fn register_api_key_input(state: &mut AppState, popup: Rect, line: Option<usize>
         .y
         .saturating_add(1)
         .saturating_add(u16::try_from(line).unwrap_or(u16::MAX));
-    state.set_api_key_input_hit_region(Some((
+    output.api_key_input_hit_region = Some((
         ScreenPoint::new(popup.x.saturating_add(1), row),
         ScreenPoint::new(popup.right().saturating_sub(1), row.saturating_add(1)),
-    )));
+    ));
 }
 
 fn append_provider_actions(lines: &mut Vec<Line<'_>>, has_credential: bool) {
@@ -1560,7 +1618,7 @@ fn append_provider_actions(lines: &mut Vec<Line<'_>>, has_credential: bool) {
 }
 
 fn register_oauth_link(
-    state: &mut AppState,
+    output: &mut RenderOutput,
     popup: Rect,
     line: Option<usize>,
     authentication: Option<&crate::state::ProviderAuthentication>,
@@ -1583,11 +1641,11 @@ fn register_oauth_link(
         .y
         .saturating_add(1)
         .saturating_add(u16::try_from(line).unwrap_or(u16::MAX));
-    state.set_oauth_link_hit_region(Some((
+    output.oauth_link_hit_region = Some((
         url,
         ScreenPoint::new(popup.x.saturating_add(1), row),
         ScreenPoint::new(popup.right().saturating_sub(1), row.saturating_add(1)),
-    )));
+    ));
 }
 
 fn append_provider_authentication<'a>(
@@ -1772,7 +1830,11 @@ fn render_question(frame: &mut Frame<'_>, area: Rect, prompt: &crate::state::Que
 fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let popup = centered(area, 78, 18);
     frame.render_widget(Clear, popup);
-    let picker = state.session_picker.as_ref().expect("picker checked");
+    let picker = state
+        .client
+        .session_picker
+        .as_ref()
+        .expect("picker checked");
     let mut lines = Vec::new();
     if picker.loading {
         lines.push(Line::styled(
@@ -1920,7 +1982,7 @@ fn render_model_options_popup(
 fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let popup = centered(area, 72, 18);
     frame.render_widget(Clear, popup);
-    let picker = state.model_picker.as_ref().expect("picker checked");
+    let picker = state.client.model_picker.as_ref().expect("picker checked");
     if picker.stage == crate::state::ModelPickerStage::Options {
         render_model_options_popup(
             frame,
@@ -2209,7 +2271,7 @@ first_message = "Inspect the delegated question."
         let backend = TestBackend::new(80, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("!printf hello");
+        state.client.editor.set_text("!printf hello");
 
         terminal
             .draw(|frame| super::draw(frame, &mut state))
@@ -2410,7 +2472,7 @@ first_message = "Inspect the delegated question."
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.model_picker = Some(crate::state::ModelPicker {
+        state.client.model_picker = Some(crate::state::ModelPicker {
             filter: String::new(),
             selected: 0,
             scope: crate::state::ModelSelectionScope::Session,
@@ -2691,7 +2753,7 @@ first_message = "Inspect the delegated question."
                 ..BackendCapabilities::default()
             },
         }));
-        state.editor.set_text("/providers");
+        state.client.editor.set_text("/providers");
         let _ = state.submit_editor();
         state.install_providers(vec![
             ProviderRecord {
@@ -2747,7 +2809,7 @@ first_message = "Inspect the delegated question."
         let backend = TestBackend::new(100, 34);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("/providers");
+        state.client.editor.set_text("/providers");
         let _ = state.submit_editor();
         state.install_providers(vec![ProviderRecord {
             provider: CURSOR_PROVIDER.to_owned(),
@@ -2805,7 +2867,7 @@ first_message = "Inspect the delegated question."
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("/providers");
+        state.client.editor.set_text("/providers");
         let _ = state.submit_editor();
         state.install_providers(vec![ProviderRecord {
             provider: CODEX_PROVIDER.to_owned(),
@@ -2816,6 +2878,7 @@ first_message = "Inspect the delegated question."
         state.open_provider_details();
 
         state
+            .client
             .provider_picker
             .as_mut()
             .expect("provider picker")
@@ -2863,7 +2926,7 @@ first_message = "Inspect the delegated question."
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.show_help = true;
+        state.client.show_help = true;
 
         terminal
             .draw(|frame| super::draw(frame, &mut state))
@@ -2931,6 +2994,7 @@ first_message = "Inspect the delegated question."
             },
         ];
         state
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -2980,7 +3044,7 @@ first_message = "Inspect the delegated question."
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("/");
+        state.client.editor.set_text("/");
 
         terminal
             .draw(|frame| super::draw(frame, &mut state))

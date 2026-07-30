@@ -1320,13 +1320,14 @@ fn save_agent_definition(
     match result {
         Ok(catalog) => {
             let editor = state
+                .client
                 .agent_picker
                 .as_ref()
                 .and_then(|picker| picker.editor.clone());
             state.install_agents(catalog);
             if let Some(mut editor) = editor {
                 editor.original_slug = Some(definition.slug.clone());
-                if let Some(picker) = &mut state.agent_picker {
+                if let Some(picker) = &mut state.client.agent_picker {
                     picker.editor = Some(editor);
                 }
             }
@@ -1491,26 +1492,27 @@ pub(crate) fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<E
             if state.provider_api_key_input_active() {
                 state.provider_api_key_insert_str(&text);
             } else if state
+                .client
                 .agent_picker
                 .as_ref()
                 .is_some_and(|picker| picker.editor.is_some())
             {
                 return state.agent_editor_insert_str(&text);
-            } else if state.settings.is_some() {
+            } else if state.client.settings.is_some() {
                 for character in text.chars() {
                     state.settings_insert(character);
                 }
-            } else if state.model_picker.is_none()
-                && state.session_picker.is_none()
-                && state.provider_picker.is_none()
-                && state.agent_picker.is_none()
-                && !state.show_help
+            } else if state.client.model_picker.is_none()
+                && state.client.session_picker.is_none()
+                && state.client.provider_picker.is_none()
+                && state.client.agent_picker.is_none()
+                && !state.client.show_help
                 && state.approvals.is_empty()
             {
                 if let Some(attachments) = clipboard::attachments_from_terminal_paste(&text) {
                     state.insert_attachments(attachments);
                 } else {
-                    state.editor.insert_str(&text);
+                    state.client.editor.insert_str(&text);
                     state.set_status("Pasted text into the draft.");
                 }
             }
@@ -1536,7 +1538,7 @@ pub(crate) fn handle_terminal_event(state: &mut AppState, event: Event) -> Vec<E
             }
             match action {
                 controls::MouseAction::PrimaryDown
-                    if state.subagent_modal.is_some() || !state.open_subagent_at(point) =>
+                    if state.client.subagent_modal.is_some() || !state.open_subagent_at(point) =>
                 {
                     state.begin_text_selection(point);
                 }
@@ -1586,7 +1588,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             Vec::new()
         }
         Some(ControlAction::Newline) => {
-            state.editor.insert_newline();
+            state.client.editor.insert_newline();
             Vec::new()
         }
         Some(ControlAction::Paste) => {
@@ -1617,23 +1619,23 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         Some(ControlAction::Submit) => state.submit_editor(),
         Some(ControlAction::SteerOrSubmit) => state.submit_or_steer_editor(),
         Some(ControlAction::BackspaceWord) => {
-            state.editor.delete_word_backward();
+            state.client.editor.delete_word_backward();
             Vec::new()
         }
         Some(ControlAction::BackspaceLine) => {
-            state.editor.delete_to_line_start();
+            state.client.editor.delete_to_line_start();
             Vec::new()
         }
         Some(ControlAction::Backspace) => {
-            state.editor.backspace();
+            state.client.editor.backspace();
             Vec::new()
         }
         Some(ControlAction::Delete) => {
-            state.editor.delete();
+            state.client.editor.delete();
             Vec::new()
         }
         Some(ControlAction::InsertTab) => {
-            state.editor.insert_char('\t');
+            state.client.editor.insert_char('\t');
             Vec::new()
         }
         None => {
@@ -1642,7 +1644,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER)
             {
-                state.editor.insert_char(character);
+                state.client.editor.insert_char(character);
             }
             Vec::new()
         }
@@ -1656,7 +1658,7 @@ fn paste_desktop_clipboard(state: &mut AppState) {
             state.insert_attachments(attachments);
         }
         Ok(clipboard::ClipboardPayload::Text(text)) => {
-            state.editor.insert_str(&text);
+            state.client.editor.insert_str(&text);
             state.set_status("Pasted text into the draft.");
         }
         Err(error) => state.set_status(&format!("Could not paste: {error}")),
@@ -1665,16 +1667,16 @@ fn paste_desktop_clipboard(state: &mut AppState) {
 
 fn handle_editor_navigation(state: &mut AppState, key: KeyEvent) -> bool {
     match controls::resolve(ControlContext::Navigation, key) {
-        Some(ControlAction::MoveWordLeft) => state.editor.move_word_left(),
-        Some(ControlAction::MoveWordRight) => state.editor.move_word_right(),
-        Some(ControlAction::MoveLineStart) => state.editor.move_home(),
-        Some(ControlAction::MoveLineEnd) => state.editor.move_end(),
-        Some(ControlAction::MoveDocumentStart) => state.editor.move_document_start(),
-        Some(ControlAction::MoveDocumentEnd) => state.editor.move_document_end(),
-        Some(ControlAction::MoveLeft) => state.editor.move_left(),
-        Some(ControlAction::MoveRight) => state.editor.move_right(),
-        Some(ControlAction::MoveUp) => state.editor.move_up(),
-        Some(ControlAction::MoveDown) => state.editor.move_down(),
+        Some(ControlAction::MoveWordLeft) => state.client.editor.move_word_left(),
+        Some(ControlAction::MoveWordRight) => state.client.editor.move_word_right(),
+        Some(ControlAction::MoveLineStart) => state.client.editor.move_home(),
+        Some(ControlAction::MoveLineEnd) => state.client.editor.move_end(),
+        Some(ControlAction::MoveDocumentStart) => state.client.editor.move_document_start(),
+        Some(ControlAction::MoveDocumentEnd) => state.client.editor.move_document_end(),
+        Some(ControlAction::MoveLeft) => state.client.editor.move_left(),
+        Some(ControlAction::MoveRight) => state.client.editor.move_right(),
+        Some(ControlAction::MoveUp) => state.client.editor.move_up(),
+        Some(ControlAction::MoveDown) => state.client.editor.move_down(),
         _ => return false,
     }
     true
@@ -1715,32 +1717,32 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
         });
     }
 
-    if state.subagent_modal.is_some() {
+    if state.client.subagent_modal.is_some() {
         return Some(handle_subagent_modal_key(state, key));
     }
 
-    if state.show_help {
+    if state.client.show_help {
         if controls::resolve(ControlContext::Help, key).is_some() {
-            state.show_help = false;
+            state.client.show_help = false;
         }
         return Some(Vec::new());
     }
 
     if controls::resolve(ControlContext::Global, key) == Some(ControlAction::ToggleHelp) {
         state.close_all_menus();
-        state.show_help = true;
+        state.client.show_help = true;
         return Some(Vec::new());
     }
 
-    if state.settings.is_some() {
+    if state.client.settings.is_some() {
         return Some(handle_settings_key(state, key));
     }
 
-    if state.agent_picker.is_some() {
+    if state.client.agent_picker.is_some() {
         return Some(handle_agent_picker_key(state, key));
     }
 
-    if state.session_picker.is_some() {
+    if state.client.session_picker.is_some() {
         return Some(
             match controls::resolve(ControlContext::SessionPicker, key) {
                 Some(ControlAction::Close) => {
@@ -1761,11 +1763,11 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
         );
     }
 
-    if state.provider_picker.is_some() {
+    if state.client.provider_picker.is_some() {
         return Some(handle_provider_picker_key(state, key));
     }
 
-    if state.model_picker.is_some() {
+    if state.client.model_picker.is_some() {
         match controls::resolve(ControlContext::ModelPicker, key) {
             Some(ControlAction::Select) => return Some(state.picker_select()),
             Some(ControlAction::Close) => state.close_model_picker(),
@@ -1775,7 +1777,7 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
             Some(ControlAction::MoveRight) => state.picker_adjust(1),
             Some(ControlAction::Backspace) => state.picker_backspace(),
             Some(ControlAction::Clear) => {
-                if let Some(picker) = &mut state.model_picker {
+                if let Some(picker) = &mut state.client.model_picker {
                     picker.filter.clear();
                     picker.selected = 0;
                 }
@@ -1897,6 +1899,7 @@ fn handle_settings_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 
 fn handle_provider_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let showing_details = state
+        .client
         .provider_picker
         .as_ref()
         .is_some_and(|picker| picker.showing_details);
@@ -1956,6 +1959,7 @@ fn handle_provider_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect
 
 fn handle_agent_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let editing = state
+        .client
         .agent_picker
         .as_ref()
         .is_some_and(|picker| picker.editor.is_some());
@@ -2127,6 +2131,7 @@ first_message = "Inspect the delegated question."
         state.open_agent_picker();
         state.create_agent();
         let editor = state
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -2142,6 +2147,7 @@ first_message = "Inspect the delegated question."
         let mut state = AppState::new("/tmp/project", None, 100);
         open_valid_agent_editor(&mut state);
         state
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -2164,6 +2170,7 @@ first_message = "Inspect the delegated question."
         state.set_agent_directory(agent_directory.clone());
         open_valid_agent_editor(&mut state);
         state
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -2186,6 +2193,7 @@ first_message = "Inspect the delegated question."
         super::save_agent_definition(&mut state, &definition, previous_slug.as_deref());
 
         let editor = state
+            .client
             .agent_picker
             .as_ref()
             .and_then(|picker| picker.editor.as_ref())
@@ -2208,6 +2216,7 @@ first_message = "Inspect the delegated question."
         }];
         open_valid_agent_editor(&mut state);
         state
+            .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
@@ -2221,6 +2230,7 @@ first_message = "Inspect the delegated question."
 
         assert!(state.agent_model_dropdown_is_open());
         let dropdown = state
+            .client
             .agent_picker
             .as_ref()
             .and_then(|picker| picker.editor.as_ref())
@@ -2399,17 +2409,18 @@ first_message = "Inspect the change."
 
         assert_eq!(agent_count, 1);
         assert!(skill_count >= 1);
-        state.editor.set_text("/skill:rev");
+        state.client.editor.set_text("/skill:rev");
         assert_eq!(
             state
                 .selected_command_completion()
                 .map(crate::state::PromptCompletion::replacement),
             Some("/skill:review".to_owned())
         );
-        state.editor.clear();
+        state.client.editor.clear();
         state.open_agent_picker();
         assert_eq!(
             state
+                .client
                 .agent_picker
                 .as_ref()
                 .and_then(|picker| picker.agents.first())
@@ -2422,11 +2433,11 @@ first_message = "Inspect the change."
     fn f1_toggles_help_without_editing_the_draft() {
         let mut state = AppState::new("/tmp/project", None, 100);
         super::handle_key(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
-        assert!(state.show_help);
-        assert!(state.editor.is_blank());
+        assert!(state.client.show_help);
+        assert!(state.client.editor.is_blank());
 
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!state.show_help);
+        assert!(!state.client.show_help);
     }
 
     #[test]
@@ -2609,10 +2620,10 @@ first_message = "Inspect the change."
                 modifiers: KeyModifiers::NONE,
             }),
         );
-        assert!(state.subagent_modal.is_some());
+        assert!(state.client.subagent_modal.is_some());
 
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(state.subagent_modal.is_none());
+        assert!(state.client.subagent_modal.is_none());
     }
 
     #[test]
@@ -2643,7 +2654,7 @@ first_message = "Inspect the change."
     #[test]
     fn provider_authentication_hotkeys_open_and_copy_the_full_url() {
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("/providers");
+        state.client.editor.set_text("/providers");
         let _ = state.submit_editor();
         state.install_providers(vec![ProviderRecord {
             provider: CODEX_PROVIDER.to_owned(),
@@ -2653,6 +2664,7 @@ first_message = "Inspect the change."
         }]);
         state.open_provider_details();
         state
+            .client
             .provider_picker
             .as_mut()
             .expect("provider picker")
@@ -2693,7 +2705,7 @@ first_message = "Inspect the change."
             agent: "explorer".to_owned(),
             task: "Map authentication".to_owned(),
         });
-        state.subagent_modal = Some(state.subagents[0].id.clone());
+        state.client.subagent_modal = Some(state.subagents[0].id.clone());
         let (transcript, _) = state
             .selected_subagent_transcript_mut()
             .expect("selected subagent transcript");
@@ -2726,7 +2738,7 @@ first_message = "Inspect the change."
             .selected_subagent_transcript_mut()
             .expect("selected subagent transcript");
         assert_eq!(*child_scroll, 3);
-        assert_eq!(state.scroll_from_bottom, 0);
+        assert_eq!(state.client.scroll_from_bottom, 0);
 
         super::handle_terminal_event(
             &mut state,
@@ -2752,20 +2764,20 @@ first_message = "Inspect the change."
                 modifiers: KeyModifiers::NONE,
             }),
         );
-        assert_eq!(state.scroll_from_bottom, 3);
+        assert_eq!(state.client.scroll_from_bottom, 3);
     }
 
     #[test]
     fn shift_enter_inserts_a_newline() {
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("first");
+        state.client.editor.set_text("first");
         super::handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
         );
-        state.editor.insert_str("second");
+        state.client.editor.insert_str("second");
 
-        assert_eq!(state.editor.text(), "first\nsecond");
+        assert_eq!(state.client.editor.text(), "first\nsecond");
     }
 
     #[test]
@@ -2779,14 +2791,14 @@ first_message = "Inspect the change."
             model: None,
             cancelling: false,
         });
-        state.editor.set_text("later");
+        state.client.editor.set_text("later");
 
         super::handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
 
-        assert!(state.editor.is_blank());
+        assert!(state.client.editor.is_blank());
         assert_eq!(
             state.queue.front().map(|prompt| prompt.text.as_str()),
             Some("later")
@@ -2807,12 +2819,12 @@ first_message = "Inspect the change."
             model: None,
             cancelling: false,
         });
-        state.editor.set_text("focus here");
+        state.client.editor.set_text("focus here");
 
         let effects =
             super::handle_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
 
-        assert_eq!(state.editor.text(), "focus here");
+        assert_eq!(state.client.editor.text(), "focus here");
         assert!(matches!(
             effects.as_slice(),
             [Effect::Backend(crate::backend::BackendCommand::SteerTurn {
@@ -2827,74 +2839,74 @@ first_message = "Inspect the change."
     #[test]
     fn modified_arrows_navigate_words_and_boundaries() {
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("one two");
+        state.client.editor.set_text("one two");
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
-        state.editor.insert_char('|');
+        state.client.editor.insert_char('|');
         super::handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
         );
-        state.editor.insert_char('^');
+        state.client.editor.insert_char('^');
         super::handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER),
         );
-        state.editor.insert_char('$');
+        state.client.editor.insert_char('$');
 
-        assert_eq!(state.editor.text(), "^one |two$");
+        assert_eq!(state.client.editor.text(), "^one |two$");
     }
 
     #[test]
     fn terminal_compatible_editing_shortcuts_navigate_and_delete() {
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("one two");
+        state.client.editor.set_text("one two");
 
         // Legacy Option+Left is commonly reported as Esc-b (Alt+B).
         super::handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
         );
-        state.editor.insert_char('|');
+        state.client.editor.insert_char('|');
         // Some Kitty-protocol terminals report Command as META.
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::META));
-        state.editor.insert_char('^');
+        state.client.editor.insert_char('^');
         // Terminal profiles commonly encode Command+Right as Ctrl+E.
         super::handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
         );
-        state.editor.insert_char('$');
+        state.client.editor.insert_char('$');
 
-        assert_eq!(state.editor.text(), "^one |two$");
+        assert_eq!(state.client.editor.text(), "^one |two$");
 
         // Command+Delete and Option+Delete may arrive as Ctrl+U/Ctrl+W.
         super::handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
         );
-        assert_eq!(state.editor.text(), "^one |two");
+        assert_eq!(state.client.editor.text(), "^one |two");
         super::handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
         );
-        assert!(state.editor.is_blank());
+        assert!(state.client.editor.is_blank());
     }
 
     #[test]
     fn modified_backspace_deletes_by_word_and_line() {
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("one two");
+        state.client.editor.set_text("one two");
         super::handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
         );
-        assert_eq!(state.editor.text(), "one ");
+        assert_eq!(state.client.editor.text(), "one ");
 
         super::handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER),
         );
-        assert!(state.editor.is_blank());
+        assert!(state.client.editor.is_blank());
     }
 
     #[test]
@@ -2903,31 +2915,31 @@ first_message = "Inspect the change."
         let help_key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
 
         super::handle_key(&mut state, help_key);
-        assert!(state.show_help);
+        assert!(state.client.show_help);
         super::handle_key(&mut state, help_key);
-        assert!(!state.show_help);
+        assert!(!state.client.show_help);
     }
 
     #[test]
     fn tab_completes_commands_only_where_their_placement_allows() {
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("/pro");
+        state.client.editor.set_text("/pro");
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(state.editor.text(), "/providers");
+        assert_eq!(state.client.editor.text(), "/providers");
 
-        state.editor.set_text("please /pro");
+        state.client.editor.set_text("please /pro");
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(state.editor.text(), "please /pro\t");
+        assert_eq!(state.client.editor.text(), "please /pro\t");
 
-        state.editor.set_text("please(/sk");
+        state.client.editor.set_text("please(/sk");
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(state.editor.text(), "please(/skill:");
+        assert_eq!(state.client.editor.text(), "please(/skill:");
     }
 
     #[test]
     fn cursor_provider_accepts_pasted_api_key_and_submits_it() {
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("/providers");
+        state.client.editor.set_text("/providers");
         let _ = state.submit_editor();
         state.install_providers(vec![ProviderRecord {
             provider: CURSOR_PROVIDER.to_owned(),
@@ -2976,17 +2988,17 @@ first_message = "Inspect the change."
         ));
 
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(state.provider_picker.is_none());
-        assert!(state.settings.is_some());
+        assert!(state.client.provider_picker.is_none());
+        assert!(state.client.settings.is_some());
 
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(state.settings.is_none());
+        assert!(state.client.settings.is_none());
     }
 
     #[test]
     fn provider_menu_enters_details_and_escape_returns_to_the_list() {
         let mut state = AppState::new("/tmp/project", None, 100);
-        state.editor.set_text("/providers");
+        state.client.editor.set_text("/providers");
         let _ = state.submit_editor();
         state.install_providers(vec![ProviderRecord {
             provider: CODEX_PROVIDER.to_owned(),
@@ -3005,6 +3017,7 @@ first_message = "Inspect the change."
         );
         assert!(
             state
+                .client
                 .provider_picker
                 .as_ref()
                 .is_some_and(|picker| picker.showing_details)
@@ -3028,14 +3041,15 @@ first_message = "Inspect the change."
         ));
 
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(state.provider_picker.is_some());
+        assert!(state.client.provider_picker.is_some());
         assert!(
             !state
+                .client
                 .provider_picker
                 .as_ref()
                 .is_some_and(|picker| picker.showing_details)
         );
         super::handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(state.provider_picker.is_none());
+        assert!(state.client.provider_picker.is_none());
     }
 }

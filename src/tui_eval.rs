@@ -963,7 +963,7 @@ impl StateView {
             turn: state.active_turn.as_ref().map(|turn| turn.id.clone()),
             modal: active_modal(state),
             status: state.status_message.clone(),
-            draft: state.editor.text(),
+            draft: state.client.editor.text(),
             queue_length: state.queue.len(),
             transcript: state
                 .transcript
@@ -998,13 +998,13 @@ fn active_modal(state: &AppState) -> String {
         "question".to_owned()
     } else if state.approvals.front().is_some() {
         "approval".to_owned()
-    } else if state.show_help {
+    } else if state.client.show_help {
         "help".to_owned()
-    } else if state.session_picker.is_some() {
+    } else if state.client.session_picker.is_some() {
         "sessions".to_owned()
-    } else if state.provider_picker.is_some() {
+    } else if state.client.provider_picker.is_some() {
         "providers".to_owned()
-    } else if let Some(settings) = &state.settings {
+    } else if let Some(settings) = &state.client.settings {
         match settings.view {
             SettingsView::Menu => "settings".to_owned(),
             SettingsView::Addons => "settings:addons".to_owned(),
@@ -1013,11 +1013,11 @@ fn active_modal(state: &AppState) -> String {
             SettingsView::Memory => "settings:memory".to_owned(),
             SettingsView::TerminalImages => "settings:terminal_images".to_owned(),
         }
-    } else if state.agent_picker.is_some() {
+    } else if state.client.agent_picker.is_some() {
         "agents".to_owned()
-    } else if state.model_picker.is_some() {
+    } else if state.client.model_picker.is_some() {
         "models".to_owned()
-    } else if state.subagent_modal.is_some() {
+    } else if state.client.subagent_modal.is_some() {
         "subagent".to_owned()
     } else {
         "none".to_owned()

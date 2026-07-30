@@ -16,13 +16,13 @@ checkpoint may introduce a second long-term source of domain truth.
 
 ## 2. Separate client presentation state from domain state
 
-- [ ] Introduce a TUI-owned presentation state type.
-- [ ] Move drafts/editor cursor, focus, scroll, selection, viewport, hit regions,
+- [x] Introduce a TUI-owned presentation state type.
+- [x] Move drafts/editor cursor, focus, scroll, selection, viewport, hit regions,
       and modal navigation into presentation state.
-- [ ] Make rendering consume immutable server view data plus mutable local
+- [x] Make rendering consume immutable server view data plus mutable local
       presentation data.
-- [ ] Ensure rendering cannot emit domain effects or mutate canonical state.
-- [ ] Update the headless TUI harness to distinguish local presentation actions
+- [x] Ensure rendering cannot emit domain effects or mutate canonical state.
+- [x] Update the headless TUI harness to distinguish local presentation actions
       from service commands.
 
 ## 3. Headless service engine
