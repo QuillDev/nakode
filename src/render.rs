@@ -1789,20 +1789,28 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 ),
             ])
         };
-        let lines = vec![
-            Line::styled(
-                "Configure the OpenAI model default",
-                Style::default().fg(MUTED),
-            ),
+        let description = if picker.options_fast_only {
+            "Configure the Cursor model default"
+        } else {
+            "Configure the OpenAI model default"
+        };
+        let mut lines = vec![
+            Line::styled(description, Style::default().fg(MUTED)),
             Line::default(),
-            option_line(0, "Reasoning effort", effort),
-            option_line(1, "Fast mode", fast),
+        ];
+        if picker.options_fast_only {
+            lines.push(option_line(0, "Fast mode", fast));
+        } else {
+            lines.push(option_line(0, "Reasoning effort", effort));
+            lines.push(option_line(1, "Fast mode", fast));
+        }
+        lines.extend([
             Line::default(),
             Line::styled(
                 "↑/↓ select · ←/→ change · Enter apply · Esc cancel",
                 Style::default().fg(MUTED),
             ),
-        ];
+        ]);
         frame.render_widget(
             Paragraph::new(lines)
                 .block(

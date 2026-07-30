@@ -9,9 +9,9 @@ use crate::{
     agent::{AgentCatalog, AgentDefinition},
     backend::{
         ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent, BackendOperation,
-        CODEX_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus, ModelInfo, ModelOptions,
-        NormalizedItem, PromptAttachment, QuestionRequest, SessionHistoryItem, TodoPhase,
-        TurnOutcome, display_qualified_model_name,
+        CODEX_PROVIDER, CURSOR_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus,
+        ModelInfo, ModelOptions, NormalizedItem, PromptAttachment, QuestionRequest,
+        SessionHistoryItem, TodoPhase, TurnOutcome, display_qualified_model_name,
     },
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
@@ -27,6 +27,21 @@ use crate::{
 };
 
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
+
+fn supports_model_options(provider: &str) -> bool {
+    matches!(provider, CODEX_PROVIDER | CURSOR_PROVIDER)
+}
+
+fn model_supports_options(model: &ModelInfo) -> bool {
+    if model.provider == CODEX_PROVIDER {
+        return true;
+    }
+    if model.provider != CURSOR_PROVIDER {
+        return false;
+    }
+    let id = model.id.to_ascii_lowercase();
+    id.starts_with("composer-") || id.starts_with("grok-4.5")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PromptCompletion<'a> {
@@ -162,6 +177,7 @@ pub struct ModelPicker {
     pub stage: ModelPickerStage,
     pub option_selected: usize,
     pub options: ModelOptions,
+    pub options_fast_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2903,6 +2919,7 @@ impl AppState {
             stage: ModelPickerStage::Models,
             option_selected: 0,
             options,
+            options_fast_only: false,
         });
         self.pending_model_picker = None;
     }
@@ -2930,7 +2947,8 @@ impl AppState {
         if let Some(picker) = &mut self.model_picker
             && picker.stage == ModelPickerStage::Options
         {
-            picker.option_selected = offset_index(picker.option_selected, 2, delta);
+            let option_count = if picker.options_fast_only { 1 } else { 2 };
+            picker.option_selected = offset_index(picker.option_selected, option_count, delta);
             return;
         }
         let count = self.filtered_models().len();
@@ -2951,7 +2969,11 @@ impl AppState {
         if picker.stage != ModelPickerStage::Options {
             return;
         }
-        if picker.option_selected == 0 {
+        if picker.options_fast_only {
+            if delta != 0 {
+                picker.options.fast_mode = !picker.options.fast_mode;
+            }
+        } else if picker.option_selected == 0 {
             const EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
             let current = picker
                 .options
@@ -2985,14 +3007,19 @@ impl AppState {
                 .as_ref()
                 .map_or(ModelPickerStage::Models, |picker| picker.stage);
             if scope == ModelSelectionScope::Default
-                && selected.provider == CODEX_PROVIDER
+                && model_supports_options(&selected)
                 && stage == ModelPickerStage::Models
             {
-                let options = self.model_options_for(&selected);
+                let mut options = self.model_options_for(&selected);
+                let fast_only = selected.provider == CURSOR_PROVIDER;
+                if fast_only {
+                    options.reasoning_effort = None;
+                }
                 if let Some(picker) = &mut self.model_picker {
                     picker.stage = ModelPickerStage::Options;
                     picker.option_selected = 0;
                     picker.options = options;
+                    picker.options_fast_only = fast_only;
                 }
                 return Vec::new();
             }
@@ -3071,7 +3098,7 @@ impl AppState {
                     provider: selected.provider.clone(),
                     model: selected.id.clone(),
                 });
-                if selected.provider == CODEX_PROVIDER {
+                if model_supports_options(&selected) {
                     self.install_model_options(
                         &selected.provider,
                         &selected.id,
@@ -3091,20 +3118,22 @@ impl AppState {
                 && let Some(session_id) = self.provider_session_id.clone()
             {
                 effects.push(Effect::Backend(BackendCommand::SetSessionModel {
-                    provider_session_id: session_id.clone(),
-                    model: selected.id,
+                    provider_session_id: session_id,
+                    model: selected.id.clone(),
                 }));
-                if selected.provider == CODEX_PROVIDER {
-                    effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
-                        provider_session_id: session_id,
-                        options: selected_options,
-                    }));
-                }
             } else if let Some(session_id) = self.session_id.clone() {
                 effects.push(Effect::UpdateSessionModel {
                     session_id,
                     model: Some(qualified),
                 });
+            }
+            if model_supports_options(&selected)
+                && let Some(provider_session_id) = self.provider_session_id.clone()
+            {
+                effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
+                    provider_session_id,
+                    options: selected_options,
+                }));
             }
             return effects;
         }
@@ -3710,7 +3739,7 @@ impl AppState {
             title: prompt.text.clone(),
             model: self.selected_model.clone(),
         }];
-        if self.backend_provider == CODEX_PROVIDER {
+        if supports_model_options(&self.backend_provider) {
             effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
                 provider_session_id: provider_session_id.clone(),
                 options: self.selected_model_options(),
@@ -3732,6 +3761,7 @@ impl AppState {
         if provider_session_id.is_empty() {
             return self.protocol_problem("session resume returned an empty provider id");
         }
+        let provider_session_id_for_options = provider_session_id.clone();
         self.provider_session_id = Some(provider_session_id);
         self.session_id = Some(session.id.clone());
         self.context_usage = None;
@@ -3743,10 +3773,17 @@ impl AppState {
         self.install_history(history);
         self.install_subagents(Vec::new());
         self.status_message = format!("Resumed session {}.", short_id(&session.id));
-        vec![
+        let mut effects = vec![
             Effect::TouchSession(session.id.clone()),
             Effect::LoadSubagents(session.id),
-        ]
+        ];
+        if self.backend_provider == CURSOR_PROVIDER {
+            effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
+                provider_session_id: provider_session_id_for_options,
+                options: self.selected_model_options(),
+            }));
+        }
+        effects
     }
 
     fn context_compaction_started(
@@ -5473,6 +5510,7 @@ mod tests {
 
     use super::{
         AgentEditorField, AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus,
+        model_supports_options,
     };
 
     #[test]
@@ -6945,6 +6983,54 @@ model = "openai-codex/model-a"
             state.selected_model.as_deref(),
             Some("openai-codex/model-b")
         );
+    }
+
+    #[test]
+    fn cursor_model_options_are_limited_to_fast_capable_families() {
+        let cursor_model = |id: &str| ModelInfo {
+            provider: CURSOR_PROVIDER.to_owned(),
+            id: id.to_owned(),
+            is_default: false,
+        };
+
+        assert!(model_supports_options(&cursor_model("composer-2.5")));
+        assert!(model_supports_options(&cursor_model("grok-4.5")));
+        assert!(!model_supports_options(&cursor_model("claude-4.6-opus")));
+    }
+
+    #[test]
+    fn cursor_models_can_persist_fast_mode_as_their_default() {
+        let mut state = ready_state();
+        state.backend_provider = CURSOR_PROVIDER.to_owned();
+        state.backend_name = "Cursor".to_owned();
+        state.models = vec![ModelInfo {
+            provider: CURSOR_PROVIDER.to_owned(),
+            id: "composer-2.5".to_owned(),
+            is_default: true,
+        }];
+        state.selected_model = Some("cursor-sdk/composer-2.5".to_owned());
+        state.editor.set_text("/models");
+
+        assert!(state.submit_editor().is_empty());
+        assert!(state.picker_select().is_empty());
+        let picker = state.model_picker.as_ref().expect("Cursor options picker");
+        assert_eq!(picker.stage, super::ModelPickerStage::Options);
+        assert!(picker.options_fast_only);
+        assert!(picker.options.reasoning_effort.is_none());
+
+        state.picker_adjust(1);
+        let effects = state.picker_select();
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::SetDefaultModel { provider, model },
+                Effect::SaveModelOptions { options, .. }
+            ] if provider == CURSOR_PROVIDER
+                && model == "composer-2.5"
+                && options.fast_mode
+                && options.reasoning_effort.is_none()
+        ));
+        assert!(state.selected_model_uses_fast_mode());
     }
 
     #[test]
