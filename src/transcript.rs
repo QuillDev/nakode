@@ -668,7 +668,17 @@ fn user_label(entry: &TranscriptEntry) -> &'static str {
 }
 
 fn tool_header(entry: &TranscriptEntry, status: &str, expanded: bool) -> (String, LineTone, bool) {
-    let title = entry.title.trim();
+    // Tool titles are rendered on a single row, but command summaries can contain
+    // literal newlines. Show only the first line; the tool can be expanded for
+    // additional information. Compact tabs and other inline whitespace on that line.
+    let title = entry
+        .title
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let normalized = title.to_ascii_lowercase();
     let generic = normalized == "tool output"
         || normalized == "tool result"
@@ -1098,6 +1108,30 @@ mod tests {
                 .iter()
                 .all(|line| !line.text.contains("command 1"))
         );
+    }
+
+    #[test]
+    fn multiline_tool_titles_show_only_the_first_line() {
+        let mut transcript = Transcript::new(100);
+        transcript.upsert(
+            "tool-1",
+            EntryKind::Tool,
+            "bash · set -euo pipefail\nsource ./stripe.sh\t&& run_update",
+            "done",
+            EntryStatus::Complete,
+        );
+
+        let visible = transcript.visible(120, 10, 0);
+        let header = visible
+            .lines
+            .iter()
+            .find(|line| {
+                line.source_key.as_deref() == Some("tool-1") && line.tone == LineTone::Tool
+            })
+            .expect("tool header");
+        assert_eq!(header.text, "▸ bash set -euo pipefail");
+        assert!(!header.text.contains("source ./stripe.sh"));
+        assert!(!header.text.contains('�'));
     }
 
     #[test]

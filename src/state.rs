@@ -16,6 +16,7 @@ use crate::{
     commands::{self, CommandSpec, ParsedPromptCommand},
     editor::EditorState,
     handoff::HandoffPackage,
+    memory::{MemoryBackend, MemoryConfig},
     personality::PromptAddenda,
     searchable_dropdown::SearchableDropdown,
     selection::{ScreenPoint, ScreenSnapshot, TextSelection},
@@ -437,6 +438,7 @@ pub enum SettingsView {
     Addons,
     WebBrowsing,
     Vision,
+    Memory,
     TerminalImages,
 }
 
@@ -494,6 +496,7 @@ pub struct SettingsState {
     pub view: SettingsView,
     pub web: WebConfig,
     pub vision: crate::vision::VisionConfig,
+    pub memory: MemoryConfig,
     pub terminal_images: TerminalImageMode,
     pub addon_field: usize,
     pub agent_browser_status: AgentBrowserStatus,
@@ -756,6 +759,7 @@ pub enum Effect {
     },
     TouchSession(String),
     SaveWebConfig(WebConfig),
+    SaveMemoryConfig(MemoryConfig),
     SaveVisionConfig(crate::vision::VisionConfig),
     SaveTerminalImageMode(TerminalImageMode),
     CheckAgentBrowser,
@@ -838,6 +842,7 @@ pub struct AppState {
     api_key_input_hit_region: Option<ApiKeyInputHitRegion>,
     transcript_limit: usize,
     web_config: WebConfig,
+    memory_config: MemoryConfig,
     vision_config: crate::vision::VisionConfig,
     terminal_image_mode: TerminalImageMode,
 }
@@ -891,6 +896,13 @@ impl AppState {
         }
     }
 
+    pub fn install_memory_config(&mut self, config: MemoryConfig) {
+        self.memory_config = config.clone();
+        if let Some(settings) = &mut self.settings {
+            settings.memory = config;
+        }
+    }
+
     pub fn open_settings(&mut self) {
         self.settings = Some(SettingsState {
             query: String::new(),
@@ -898,6 +910,7 @@ impl AppState {
             view: SettingsView::Menu,
             web: self.web_config.clone(),
             vision: self.vision_config.clone(),
+            memory: self.memory_config.clone(),
             terminal_images: self.terminal_image_mode,
             addon_field: 0,
             agent_browser_status: AgentBrowserStatus::Checking,
@@ -957,6 +970,15 @@ impl AppState {
                 && settings.web.backend == WebBackend::Firecrawl
             {
                 settings.web.firecrawl_api_key.push(character);
+            } else if settings.view == SettingsView::Memory
+                && settings.memory.backend == MemoryBackend::Mnemosyne
+            {
+                match settings.addon_field {
+                    1 => settings.memory.executable.push(character),
+                    2 => settings.memory.global_bank.push(character),
+                    3 => settings.memory.data_directory.push(character),
+                    _ => {}
+                }
             }
             settings.selected = 0;
         }
@@ -971,6 +993,21 @@ impl AppState {
                 && settings.web.backend == WebBackend::Firecrawl
             {
                 settings.web.firecrawl_api_key.pop();
+            } else if settings.view == SettingsView::Memory
+                && settings.memory.backend == MemoryBackend::Mnemosyne
+            {
+                match settings.addon_field {
+                    1 => {
+                        settings.memory.executable.pop();
+                    }
+                    2 => {
+                        settings.memory.global_bank.pop();
+                    }
+                    3 => {
+                        settings.memory.data_directory.pop();
+                    }
+                    _ => {}
+                }
             }
             settings.selected = 0;
         }
@@ -982,9 +1019,13 @@ impl AppState {
         };
         let length = match settings.view {
             SettingsView::Menu => settings.filtered_sections().len(),
-            SettingsView::Addons => 3,
+            SettingsView::Addons => 4,
+            SettingsView::Memory if settings.memory.backend == MemoryBackend::Mnemosyne => 4,
             SettingsView::WebBrowsing if settings.web.backend == WebBackend::Firecrawl => 2,
-            SettingsView::Vision | SettingsView::TerminalImages | SettingsView::WebBrowsing => 1,
+            SettingsView::Vision
+            | SettingsView::Memory
+            | SettingsView::TerminalImages
+            | SettingsView::WebBrowsing => 1,
         };
         if length > 0 {
             if settings.view == SettingsView::Menu || settings.view == SettingsView::Addons {
@@ -1007,6 +1048,21 @@ impl AppState {
             .position(|backend| *backend == settings.web.backend)
             .unwrap_or_default();
         settings.web.backend = WebBackend::ALL[offset_index(index, WebBackend::ALL.len(), delta)];
+    }
+
+    pub fn settings_cycle_memory_backend(&mut self, delta: isize) {
+        let Some(settings) = &mut self.settings else {
+            return;
+        };
+        if settings.view != SettingsView::Memory || settings.addon_field != 0 {
+            return;
+        }
+        let index = MemoryBackend::ALL
+            .iter()
+            .position(|backend| *backend == settings.memory.backend)
+            .unwrap_or_default();
+        settings.memory.backend =
+            MemoryBackend::ALL[offset_index(index, MemoryBackend::ALL.len(), delta)];
     }
 
     pub fn settings_cycle_terminal_images(&mut self, delta: isize) {
@@ -1041,6 +1097,10 @@ impl AppState {
                 self.settings_cycle_web_backend(delta);
                 self.save_web_settings()
             }
+            Some(SettingsView::Memory) => {
+                self.settings_cycle_memory_backend(delta);
+                self.save_memory_settings()
+            }
             Some(SettingsView::TerminalImages) => {
                 self.settings_cycle_terminal_images(delta);
                 self.save_terminal_image_mode()
@@ -1058,12 +1118,26 @@ impl AppState {
             self.settings_cycle_web_backend(1);
             return self.save_web_settings();
         }
+        if self.settings.as_ref().is_some_and(|settings| {
+            settings.view == SettingsView::Memory && settings.addon_field == 0
+        }) {
+            self.settings_cycle_memory_backend(1);
+            return self.save_memory_settings();
+        }
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.view == SettingsView::Memory)
+        {
+            return Vec::new();
+        }
         if let Some(settings) = &mut self.settings
             && settings.view == SettingsView::Addons
         {
             let (view, effects) = match settings.selected {
                 0 => (SettingsView::WebBrowsing, vec![Effect::CheckAgentBrowser]),
                 1 => (SettingsView::Vision, Vec::new()),
+                2 => (SettingsView::Memory, Vec::new()),
                 _ => (SettingsView::TerminalImages, Vec::new()),
             };
             settings.enter(view, 0, 0);
@@ -1151,10 +1225,11 @@ impl AppState {
         let Some(view) = self.settings.as_ref().map(|settings| settings.view) else {
             return Vec::new();
         };
-        let mut effects = Vec::new();
-        if view == SettingsView::WebBrowsing {
-            effects = self.save_web_settings();
-        }
+        let effects = match view {
+            SettingsView::WebBrowsing => self.save_web_settings(),
+            SettingsView::Memory => self.save_memory_settings(),
+            _ => Vec::new(),
+        };
         if self.settings.as_mut().is_some_and(SettingsState::back) {
             return effects;
         }
@@ -1176,6 +1251,15 @@ impl AppState {
         let config = settings.web.clone();
         self.set_status("Saving browser add-on settings…");
         vec![Effect::SaveWebConfig(config)]
+    }
+
+    pub fn save_memory_settings(&mut self) -> Vec<Effect> {
+        let Some(settings) = self.settings.as_ref() else {
+            return Vec::new();
+        };
+        let config = settings.memory.clone();
+        self.set_status("Saving memory add-on settings…");
+        vec![Effect::SaveMemoryConfig(config)]
     }
 
     pub fn set_status(&mut self, message: &str) {
@@ -1313,6 +1397,7 @@ impl AppState {
             api_key_input_hit_region: None,
             transcript_limit: scrollback,
             web_config: WebConfig::default(),
+            memory_config: MemoryConfig::default(),
             vision_config: crate::vision::VisionConfig::default(),
             terminal_image_mode: TerminalImageMode::default(),
         }
@@ -7014,12 +7099,43 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
-    fn terminal_image_setting_cycles_and_emits_persistence_effect() {
+    fn memory_setting_is_disabled_by_default_and_emits_provider_neutral_config() {
         let mut state = ready_state();
         state.open_settings();
         state.settings_move(3);
         assert!(state.select_setting().is_empty());
         state.settings_move(2);
+        assert!(state.select_setting().is_empty());
+        assert_eq!(
+            state.settings.as_ref().map(|settings| settings.view),
+            Some(super::SettingsView::Memory)
+        );
+        assert!(matches!(
+            state.select_setting().as_slice(),
+            [Effect::SaveMemoryConfig(config)]
+                if config.backend == crate::memory::MemoryBackend::Mnemosyne
+        ));
+        assert!(matches!(
+            state.settings_back().as_slice(),
+            [Effect::SaveMemoryConfig(config)]
+                if config.backend == crate::memory::MemoryBackend::Mnemosyne
+        ));
+        assert_eq!(
+            state
+                .settings
+                .as_ref()
+                .map(|settings| (settings.view, settings.selected)),
+            Some((super::SettingsView::Addons, 2))
+        );
+    }
+
+    #[test]
+    fn terminal_image_setting_cycles_and_emits_persistence_effect() {
+        let mut state = ready_state();
+        state.open_settings();
+        state.settings_move(3);
+        assert!(state.select_setting().is_empty());
+        state.settings_move(3);
         assert!(state.select_setting().is_empty());
         assert_eq!(
             state.settings.as_ref().map(|settings| settings.view),
@@ -7059,7 +7175,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .settings
                 .as_ref()
                 .map(|settings| (settings.view, settings.selected)),
-            Some((super::SettingsView::Addons, 2))
+            Some((super::SettingsView::Addons, 3))
         );
     }
 

@@ -1010,6 +1010,7 @@ fn active_modal(state: &AppState) -> String {
             SettingsView::Addons => "settings:addons".to_owned(),
             SettingsView::WebBrowsing => "settings:web".to_owned(),
             SettingsView::Vision => "settings:vision".to_owned(),
+            SettingsView::Memory => "settings:memory".to_owned(),
             SettingsView::TerminalImages => "settings:terminal_images".to_owned(),
         }
     } else if state.agent_picker.is_some() {
@@ -1119,6 +1120,7 @@ fn effect_view(effect: &Effect) -> Value {
             json!({"type": "touch_session", "session_id": session_id})
         }
         Effect::SaveWebConfig(_) => json!({"type": "save_web_config"}),
+        Effect::SaveMemoryConfig(_) => json!({"type": "save_memory_config"}),
         Effect::SaveVisionConfig(_) => json!({"type": "save_vision_config"}),
         Effect::SaveTerminalImageMode(mode) => {
             json!({

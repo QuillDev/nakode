@@ -263,6 +263,12 @@ impl AgentRuntime {
     }
 
     #[must_use]
+    pub fn with_memory(mut self, service: crate::memory::SharedMemoryService) -> Self {
+        self.tools = self.tools.with_memory(service);
+        self
+    }
+
+    #[must_use]
     pub fn with_vision(
         mut self,
         config: Arc<std::sync::RwLock<crate::vision::VisionConfig>>,
@@ -732,6 +738,7 @@ impl AgentRuntime {
             let is_read_only = self
                 .tools
                 .find(&tool_call.name)
+                .filter(|tool| tool.available())
                 .is_some_and(|tool| tool.concurrency() == ToolConcurrency::ReadOnly);
             if !is_read_only {
                 let executed = self
@@ -754,6 +761,7 @@ impl AgentRuntime {
             while pending.peek().is_some_and(|call| {
                 self.tools
                     .find(&call.name)
+                    .filter(|tool| tool.available())
                     .is_some_and(|tool| tool.concurrency() == ToolConcurrency::ReadOnly)
             }) {
                 batch.push(pending.next().expect("peeked read-only tool call"));
@@ -781,7 +789,12 @@ impl AgentRuntime {
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: &CancellationToken,
     ) -> Result<ExecutedTool, String> {
-        let Some(tool) = self.tools.find(&tool_call.name).cloned() else {
+        let Some(tool) = self
+            .tools
+            .find(&tool_call.name)
+            .filter(|tool| tool.available())
+            .cloned()
+        else {
             return Ok(ExecutedTool::unavailable(turn_id, &tool_call));
         };
         let title = tool_title(&tool_call, tool.as_ref());
@@ -823,11 +836,14 @@ impl AgentRuntime {
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: &CancellationToken,
     ) -> Result<ExecutedTool, String> {
-        let tool = self
+        let Some(tool) = self
             .tools
             .find(&tool_call.name)
+            .filter(|tool| tool.available())
             .cloned()
-            .expect("read-only calls were checked before batching");
+        else {
+            return Ok(ExecutedTool::unavailable(turn_id, &tool_call));
+        };
         let title = tool_title(&tool_call, tool.as_ref());
         send_tool_started(turn_id, &tool_call.id, &title, backend_events).await?;
         let started_at_ms = unix_time_ms();

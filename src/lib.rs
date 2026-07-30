@@ -17,6 +17,7 @@ pub mod handoff;
 mod herdr;
 pub mod kimi;
 mod markdown;
+pub mod memory;
 pub mod personality;
 pub mod pty;
 pub mod render;

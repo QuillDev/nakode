@@ -49,6 +49,7 @@ pub struct BackendConfig {
     web_config: Option<Arc<std::sync::RwLock<crate::web::WebConfig>>>,
     vision_config: Option<Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
     vision_service: Option<crate::vision::SharedVisionService>,
+    memory_service: Option<crate::memory::SharedMemoryService>,
 }
 
 impl BackendConfig {
@@ -64,6 +65,7 @@ impl BackendConfig {
             web_config: None,
             vision_config: None,
             vision_service: None,
+            memory_service: None,
         }
     }
 
@@ -96,6 +98,12 @@ impl BackendConfig {
     ) -> Self {
         self.vision_config = Some(config);
         self.vision_service = service;
+        self
+    }
+
+    #[must_use]
+    pub fn with_memory(mut self, service: crate::memory::SharedMemoryService) -> Self {
+        self.memory_service = Some(service);
         self
     }
 
@@ -222,6 +230,9 @@ async fn run_supervisor(
             .with_compaction_threshold_percent(config.compaction_threshold_percent);
         if let Some(web_config) = &config.web_config {
             runtime = runtime.with_web_config(Arc::clone(web_config));
+        }
+        if let Some(memory_service) = &config.memory_service {
+            runtime = runtime.with_memory(Arc::clone(memory_service));
         }
         if let Some(vision_config) = &config.vision_config {
             runtime = runtime.with_vision(
