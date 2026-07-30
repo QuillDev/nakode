@@ -42,12 +42,12 @@ checkpoint may introduce a second long-term source of domain truth.
 
 ## 5. Snapshots, revisions, and subscriptions
 
-- [ ] Define semantic client view snapshots independent of Ratatui/Crossterm.
-- [ ] Add monotonic service revisions and ordered server events.
-- [ ] Add subscribe, unsubscribe, fresh-snapshot, and resume-from-revision
+- [x] Define semantic client view snapshots independent of Ratatui/Crossterm.
+- [x] Add monotonic service revisions and ordered server events.
+- [x] Add subscribe, unsubscribe, fresh-snapshot, and resume-from-revision
       operations.
-- [ ] Add bounded subscriber queues so slow clients cannot block the engine.
-- [ ] Add command idempotency tracking and deterministic conflict responses.
+- [x] Add bounded subscriber queues so slow clients cannot block the engine.
+- [x] Add command idempotency tracking and deterministic conflict responses.
 
 ## 6. Thin TUI client
 
