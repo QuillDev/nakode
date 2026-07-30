@@ -51,11 +51,14 @@ checkpoint may introduce a second long-term source of domain truth.
 
 ## 6. Thin TUI client
 
-- [x] Replace direct reducer/backend/persistence calls with a service client.
-- [x] Render only semantic snapshots/events plus local presentation state.
-- [x] Translate controls into local presentation actions or typed service
+- [x] Separate the terminal-independent runtime owner from the in-process TUI
+      presentation adapter.
+- [ ] Replace direct reducer/backend/persistence calls with a service client.
+- [ ] Render only semantic snapshots/events plus local presentation state.
+- [ ] Translate controls into local presentation actions or typed service
       commands.
-- [x] Handle disconnect, reconnect, resubscribe, and snapshot replacement.
+- [ ] Handle disconnect, reconnect, resubscribe, and snapshot replacement over
+      the real client transport.
 - [x] Keep terminal and image lifecycle entirely in the TUI process.
 
 ## 7. Long-running out-of-process server

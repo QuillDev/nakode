@@ -87,6 +87,15 @@ struct PersistenceServices<'a> {
     credentials: &'a dyn CredentialStore,
 }
 
+/// Terminal-independent owner of canonical state and every effect executor.
+struct HeadlessServiceRuntime<'a> {
+    engine: ServiceEngine,
+    backends: BackendRegistry,
+    persistence: PersistenceServices<'a>,
+    agent_requests: HashMap<u64, IncomingInvocation>,
+    shell_processes: ShellProcesses,
+}
+
 /// In-process implementation of the service client boundary.
 ///
 /// Canonical state and effect executors stay behind this type. Presentation is
@@ -94,11 +103,7 @@ struct PersistenceServices<'a> {
 /// projection assembled from a fresh server view plus that local presentation.
 /// Checkpoint 7 replaces this adapter with the framed out-of-process transport.
 struct InProcessServiceClient<'a> {
-    engine: ServiceEngine,
-    backends: BackendRegistry,
-    persistence: PersistenceServices<'a>,
-    agent_requests: HashMap<u64, IncomingInvocation>,
-    shell_processes: ShellProcesses,
+    runtime: HeadlessServiceRuntime<'a>,
     presentation: ClientPresentationState,
     subscription: ServiceSubscription,
     observed_revision: u64,
@@ -114,11 +119,13 @@ impl<'a> InProcessServiceClient<'a> {
         let observed_revision = engine.snapshot().revision;
         let subscription = engine.subscribe();
         Self {
-            engine,
-            backends,
-            persistence,
-            agent_requests: HashMap::new(),
-            shell_processes: ShellProcesses::new(),
+            runtime: HeadlessServiceRuntime {
+                engine,
+                backends,
+                persistence,
+                agent_requests: HashMap::new(),
+                shell_processes: ShellProcesses::new(),
+            },
             presentation,
             subscription,
             observed_revision,
@@ -127,21 +134,21 @@ impl<'a> InProcessServiceClient<'a> {
 
     fn handle_terminal(&mut self, event: Event) -> Vec<Effect> {
         self.install_presentation();
-        let effects = handle_terminal_event(self.engine.state_mut(), event);
+        let effects = handle_terminal_event(self.runtime.engine.state_mut(), event);
         self.extract_presentation();
-        self.engine.note_state_change();
+        self.runtime.engine.note_state_change();
         effects
     }
 
     fn flush_clipboard(&mut self, terminal: &mut Tui) {
         self.install_presentation();
-        flush_pending_clipboard(terminal, self.engine.state_mut());
+        flush_pending_clipboard(terminal, self.runtime.engine.state_mut());
         self.extract_presentation();
     }
 
     fn projection(&mut self) -> AppState {
         self.synchronize();
-        let mut projection = self.engine.state().clone();
+        let mut projection = self.runtime.engine.state().clone();
         projection.client = self.presentation.clone();
         projection
     }
@@ -154,12 +161,12 @@ impl<'a> InProcessServiceClient<'a> {
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                    self.observed_revision = self.engine.snapshot().revision;
+                    self.observed_revision = self.runtime.engine.snapshot().revision;
                     break;
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                    self.subscription = self.engine.subscribe();
-                    self.observed_revision = self.engine.snapshot().revision;
+                    self.subscription = self.runtime.engine.subscribe();
+                    self.observed_revision = self.runtime.engine.snapshot().revision;
                     break;
                 }
             }
@@ -171,32 +178,33 @@ impl<'a> InProcessServiceClient<'a> {
     }
 
     fn install_presentation(&mut self) {
-        self.engine.state_mut().client = std::mem::take(&mut self.presentation);
+        self.runtime.engine.state_mut().client = std::mem::take(&mut self.presentation);
     }
 
     fn extract_presentation(&mut self) {
-        self.presentation = std::mem::take(&mut self.engine.state_mut().client);
+        self.presentation = std::mem::take(&mut self.runtime.engine.state_mut().client);
     }
 
     fn provider_channels_closed(&mut self) {
-        self.engine
+        self.runtime
+            .engine
             .state_mut()
             .set_status("All provider event channels closed.");
-        self.engine.note_state_change();
+        self.runtime.engine.note_state_change();
     }
 
     fn handle_shell(&mut self, event: ShellEvent) {
-        handle_shell_event(self.engine.state_mut(), event);
-        self.engine.note_state_change();
+        handle_shell_event(self.runtime.engine.state_mut(), event);
+        self.runtime.engine.note_state_change();
     }
 
     fn request_shutdown(&mut self) {
-        self.engine.state_mut().should_quit = true;
-        self.engine.note_state_change();
+        self.runtime.engine.state_mut().should_quit = true;
+        self.runtime.engine.note_state_change();
     }
 
     fn handle_invocation(&mut self, request: IncomingInvocation) -> Option<Vec<Effect>> {
-        if request.invocation.session_id != self.engine.state().nakode_session_id {
+        if request.invocation.session_id != self.runtime.engine.state().nakode_session_id {
             request.respond(AgentResponse {
                 success: false,
                 result: "Nakode session id does not match this TUI.".to_owned(),
@@ -209,20 +217,20 @@ impl<'a> InProcessServiceClient<'a> {
             agent: request.invocation.agent.clone(),
             task: request.invocation.task.clone(),
         };
-        self.agent_requests.insert(id, request);
-        Some(self.engine.invoke_agent(&invocation))
+        self.runtime.agent_requests.insert(id, request);
+        Some(self.runtime.engine.invoke_agent(&invocation))
     }
 
     fn handle_provider_backend(&mut self, provider: &str, event: BackendEvent) -> Vec<Effect> {
         self.install_presentation();
-        let effects = self.engine.handle_provider_backend(provider, event);
+        let effects = self.runtime.engine.handle_provider_backend(provider, event);
         self.extract_presentation();
         effects
     }
 
     fn handle_subagent_backend(&mut self, run_id: &str, event: BackendEvent) -> Vec<Effect> {
         self.install_presentation();
-        let effects = self.engine.handle_subagent_backend(run_id, event);
+        let effects = self.runtime.engine.handle_subagent_backend(run_id, event);
         self.extract_presentation();
         effects
     }
@@ -230,12 +238,12 @@ impl<'a> InProcessServiceClient<'a> {
     async fn apply(&mut self, effects: Vec<Effect>) -> bool {
         self.install_presentation();
         let quit = apply_effects(
-            self.engine.state_mut(),
+            self.runtime.engine.state_mut(),
             effects,
-            &mut self.backends,
-            &self.persistence,
-            &mut self.agent_requests,
-            &mut self.shell_processes,
+            &mut self.runtime.backends,
+            &self.runtime.persistence,
+            &mut self.runtime.agent_requests,
+            &mut self.runtime.shell_processes,
         )
         .await;
         self.extract_presentation();
@@ -243,9 +251,9 @@ impl<'a> InProcessServiceClient<'a> {
     }
 
     async fn shutdown(mut self) -> ServiceEngine {
-        self.shell_processes.shutdown().await;
-        self.backends.shutdown().await;
-        self.engine
+        self.runtime.shell_processes.shutdown().await;
+        self.runtime.backends.shutdown().await;
+        self.runtime.engine
     }
 }
 
@@ -253,13 +261,13 @@ impl Deref for InProcessServiceClient<'_> {
     type Target = AppState;
 
     fn deref(&self) -> &Self::Target {
-        self.engine.state()
+        self.runtime.engine.state()
     }
 }
 
 impl DerefMut for InProcessServiceClient<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.engine.state_mut()
+        self.runtime.engine.state_mut()
     }
 }
 
@@ -936,9 +944,9 @@ async fn run_loop(
                     }
                 }
             }
-            backend_event = host.backends.events.recv(), if backend_open => {
+            backend_event = host.runtime.backends.events.recv(), if backend_open => {
                 if let Some((source, event)) = backend_event {
-                    host.backends.observe_provider_event(&source, &event);
+                    host.runtime.backends.observe_provider_event(&source, &event);
                     let should_chime = should_chime_for_backend_event(&source, &event);
                     let effects = match source {
                         BackendSource::Primary(provider) => host.handle_provider_backend(&provider, event),
@@ -957,7 +965,7 @@ async fn run_loop(
                     dirty = true;
                 }
             }
-            shell_event = host.shell_processes.events.recv() => {
+            shell_event = host.runtime.shell_processes.events.recv() => {
                 if let Some(event) = shell_event {
                     host.handle_shell(event);
                     dirty = true;
