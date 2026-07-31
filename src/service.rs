@@ -15,7 +15,8 @@ use tokio::sync::broadcast;
 use crate::{
     backend::BackendEvent,
     service_protocol::{ClientCommand, ClientRequest, CommandResult, ProtocolError},
-    state::{AgentRequest, AppState, Effect},
+    session::{ProviderRecord, SessionRecord},
+    state::{AgentRequest, AppState, Effect, projection},
     transcript::{EntryKind, EntryStatus},
 };
 
@@ -140,6 +141,20 @@ impl ServiceEngine {
 
     pub const fn state_mut(&mut self) -> &mut AppState {
         &mut self.state
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub fn bootstrap_view(
+        &self,
+        providers: &[ProviderRecord],
+        sessions: &[SessionRecord],
+    ) -> nakode_protocol::BootstrapView {
+        projection::bootstrap(&self.state, self.revision, providers, sessions)
     }
 
     #[must_use]

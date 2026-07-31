@@ -3,6 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(crate) mod projection;
+
 pub use crate::{backend::ApprovalDecision, session::SubagentStatus};
 
 use crate::{
@@ -161,7 +163,7 @@ struct PendingSteer {
     id: String,
     text: String,
     turn_id: String,
-    editor_revision: u64,
+    editor_revision: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -550,6 +552,19 @@ struct ProviderContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum ProviderAuthenticationState {
+    Starting,
+    ApiKeyRequired {
+        dashboard_url: String,
+        credential_kind: String,
+    },
+    Challenge {
+        verification_url: String,
+        user_code: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubagentRun {
     pub id: String,
     pub agent: String,
@@ -688,6 +703,18 @@ pub struct AgentRequest {
     pub task: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum DomainCommandError {
+    #[error("invalid command: {0}")]
+    Invalid(String),
+    #[error("command conflicts with current state: {0}")]
+    Conflict(String),
+    #[error("resource was not found: {0}")]
+    NotFound(String),
+    #[error("capability is unsupported: {0}")]
+    Unsupported(String),
+}
+
 #[derive(Clone, Debug)]
 pub enum Effect {
     Backend(BackendCommand),
@@ -806,6 +833,7 @@ pub struct AppState {
     pub backend_name: String,
     pub backend_capabilities: BackendCapabilities,
     provider_contexts: HashMap<String, ProviderContext>,
+    provider_authentication: HashMap<String, ProviderAuthenticationState>,
     pub provider_session_id: Option<String>,
     pub session_id: Option<String>,
     pub active_turn: Option<ActiveTurn>,
@@ -851,6 +879,7 @@ pub struct AppState {
     memory_config: MemoryConfig,
     vision_config: crate::vision::VisionConfig,
     terminal_image_mode: TerminalImageMode,
+    agent_browser_status: AgentBrowserStatus,
 }
 
 impl AppState {
@@ -919,7 +948,7 @@ impl AppState {
             memory: self.memory_config.clone(),
             terminal_images: self.terminal_image_mode,
             addon_field: 0,
-            agent_browser_status: AgentBrowserStatus::Checking,
+            agent_browser_status: self.agent_browser_status.clone(),
             history: MenuHistory::default(),
         });
         self.client.menu_history.clear();
@@ -1260,6 +1289,7 @@ impl AppState {
     }
 
     pub fn set_agent_browser_status(&mut self, status: AgentBrowserStatus) {
+        self.agent_browser_status = status.clone();
         if let Some(settings) = &mut self.client.settings {
             settings.agent_browser_status = status;
         }
@@ -1355,6 +1385,7 @@ impl AppState {
             backend_name: backend_name.clone(),
             backend_capabilities: BackendCapabilities::default(),
             provider_contexts,
+            provider_authentication: HashMap::new(),
             provider_session_id: None,
             session_id: None,
             active_turn: None,
@@ -1403,6 +1434,7 @@ impl AppState {
             memory_config: MemoryConfig::default(),
             vision_config: crate::vision::VisionConfig::default(),
             terminal_image_mode: TerminalImageMode::default(),
+            agent_browser_status: AgentBrowserStatus::Unavailable,
         }
     }
 
@@ -2272,6 +2304,7 @@ impl AppState {
         };
         if provider.credential.is_none() {
             if let Some(setup) = crate::backend::api_key_provider_setup(&provider.provider) {
+                let provider_id = provider.provider.clone();
                 match &mut picker.authentication {
                     Some(ProviderAuthentication::ApiKeyInput { focused, .. }) => {
                         *focused = true;
@@ -2283,10 +2316,20 @@ impl AppState {
                         });
                     }
                 }
+                self.provider_authentication.insert(
+                    provider_id,
+                    ProviderAuthenticationState::ApiKeyRequired {
+                        dashboard_url: setup.dashboard_url.to_owned(),
+                        credential_kind: setup.credential_kind.to_owned(),
+                    },
+                );
                 self.set_status(&format!("Enter your {} API key.", setup.display_name));
                 return Vec::new();
             }
+            let provider_id = provider.provider.clone();
             picker.authentication = Some(ProviderAuthentication::Starting);
+            self.provider_authentication
+                .insert(provider_id, ProviderAuthenticationState::Starting);
             self.status_message = format!("Starting {} authentication…", provider.display_name);
             return vec![Effect::AuthenticateProvider(provider.provider.clone())];
         }
@@ -2376,6 +2419,8 @@ impl AppState {
         }
         let provider = provider.provider.clone();
         picker.authentication = Some(ProviderAuthentication::Starting);
+        self.provider_authentication
+            .insert(provider.clone(), ProviderAuthenticationState::Starting);
         self.set_status(&format!("Saving {} API key…", setup.display_name));
         vec![Effect::SaveProviderCredential {
             provider,
@@ -2422,6 +2467,7 @@ impl AppState {
             picker.authentication = None;
         }
         self.provider_contexts.remove(provider);
+        self.provider_authentication.remove(provider);
         if provider == self.backend_provider {
             self.connection = ConnectionState::Disconnected("logged out".to_owned());
             self.provider_session_id = None;
@@ -2439,6 +2485,7 @@ impl AppState {
             picker.authentication = None;
         }
         self.provider_contexts.remove(provider);
+        self.provider_authentication.remove(provider);
         if provider == self.backend_provider {
             self.context_usage = None;
         }
@@ -2446,13 +2493,7 @@ impl AppState {
     }
 
     fn provider_is_authenticating(&self, provider: &str) -> bool {
-        self.client.provider_picker.as_ref().is_some_and(|picker| {
-            picker.authentication.is_some()
-                && picker
-                    .providers
-                    .get(picker.selected)
-                    .is_some_and(|record| record.provider == provider)
-        })
+        self.provider_authentication.contains_key(provider)
     }
 
     pub fn provider_starting(&mut self, provider: &str, display_name: &str) {
@@ -2497,6 +2538,7 @@ impl AppState {
 
     pub fn provider_disabled(&mut self, provider: &str) {
         self.provider_contexts.remove(provider);
+        self.provider_authentication.remove(provider);
         let model_prefix = format!("{provider}/");
         self.models
             .retain(|model| model.provider != provider && !model.id.starts_with(&model_prefix));
@@ -2532,6 +2574,7 @@ impl AppState {
     }
 
     pub fn session_persisted(&mut self, session: &SessionRecord) {
+        self.nakode_session_id.clone_from(&session.id);
         self.session_id = Some(session.id.clone());
         self.status_message = format!("Session {} started.", short_id(&session.id));
     }
@@ -2587,6 +2630,7 @@ impl AppState {
         self.pending_handoff = None;
         let old_provider_session = self.provider_session_id.clone();
         self.resuming_session = Some(session.clone());
+        self.nakode_session_id.clone_from(&session.id);
         self.client.session_picker = None;
         self.status_message = format!("Resuming session {}…", short_id(&session.id));
         let mut effects = Vec::new();
@@ -2725,6 +2769,237 @@ impl AppState {
     #[must_use]
     pub fn is_shell_mode(&self) -> bool {
         self.client.editor.text().starts_with('!')
+    }
+
+    /// Submits a complete semantic prompt without consulting any client editor.
+    ///
+    /// # Errors
+    /// Rejects blank prompts, unknown skills, unavailable providers, or a busy
+    /// session. Queueing while busy is an explicit separate command.
+    pub fn submit_prompt(
+        &mut self,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.validate_prompt(&text)?;
+        if !self.connection.is_ready() {
+            return Err(DomainCommandError::Conflict(
+                "the selected provider is not ready".to_owned(),
+            ));
+        }
+        if self.is_busy() {
+            return Err(DomainCommandError::Conflict(
+                "the session is busy; enqueue the prompt instead".to_owned(),
+            ));
+        }
+        let prompt = QueuedPrompt {
+            id: self.next_id("msg"),
+            text,
+            attachments,
+        };
+        Ok(self.begin_prompt(prompt))
+    }
+
+    /// Adds a complete semantic prompt to the server-owned queue.
+    ///
+    /// # Errors
+    /// Rejects blank prompts or unknown skill references.
+    pub fn enqueue_prompt(
+        &mut self,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.validate_prompt(&text)?;
+        if !self.is_busy() {
+            return self.submit_prompt(text, attachments);
+        }
+        let id = self.next_id("msg");
+        self.queue.push_back(QueuedPrompt {
+            id,
+            text,
+            attachments,
+        });
+        self.status_message = format!("Queued message {}.", self.queue.len());
+        Ok(Vec::new())
+    }
+
+    /// Removes one queued prompt by its stable server-owned identity.
+    ///
+    /// # Errors
+    /// Returns not found when the prompt is no longer queued.
+    pub fn remove_queued_prompt(
+        &mut self,
+        prompt_id: &str,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        let position = self
+            .queue
+            .iter()
+            .position(|prompt| prompt.id == prompt_id)
+            .ok_or_else(|| DomainCommandError::NotFound(prompt_id.to_owned()))?;
+        let Some(removed) = self.queue.remove(position) else {
+            return Err(DomainCommandError::NotFound(prompt_id.to_owned()));
+        };
+        self.status_message = format!("Removed queued message {}.", removed.id);
+        Ok(Vec::new())
+    }
+
+    /// Starts a supervised workspace shell command without using a TUI draft.
+    ///
+    /// # Errors
+    /// Rejects an empty command.
+    pub fn run_shell_command(
+        &mut self,
+        command: String,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        if command.trim().is_empty() {
+            return Err(DomainCommandError::Invalid(
+                "shell command cannot be empty".to_owned(),
+            ));
+        }
+        let id = self.next_id("shell");
+        self.transcript.upsert(
+            id.clone(),
+            EntryKind::System,
+            format!("$ {}", command.trim()),
+            "",
+            EntryStatus::Running,
+        );
+        self.status_message = format!("Running {}…", command.trim());
+        Ok(vec![Effect::RunShell { id, command }])
+    }
+
+    /// Steers the active provider turn using complete semantic text.
+    ///
+    /// # Errors
+    /// Rejects invalid text, stale turn IDs, unsupported steering, or another
+    /// steer already awaiting acknowledgement.
+    pub fn steer_turn(
+        &mut self,
+        provider_turn_id: &str,
+        text: &str,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.validate_prompt(text)?;
+        if !self.backend_capabilities.steering.is_supported() {
+            return Err(DomainCommandError::Unsupported(format!(
+                "{} does not support steering",
+                self.backend_name
+            )));
+        }
+        if self.pending_steer.is_some() {
+            return Err(DomainCommandError::Conflict(
+                "a steer request is already pending".to_owned(),
+            ));
+        }
+        let active = self
+            .active_turn
+            .as_ref()
+            .ok_or_else(|| DomainCommandError::NotFound(provider_turn_id.to_owned()))?;
+        if active.id != provider_turn_id {
+            return Err(DomainCommandError::NotFound(provider_turn_id.to_owned()));
+        }
+        if active.cancelling {
+            return Err(DomainCommandError::Conflict(
+                "the active turn is being cancelled".to_owned(),
+            ));
+        }
+        let provider_session_id = self.provider_session_id.clone().ok_or_else(|| {
+            DomainCommandError::Conflict("the active provider session is unavailable".to_owned())
+        })?;
+        let id = self.next_id("steer");
+        self.pending_steer = Some(PendingSteer {
+            id: id.clone(),
+            text: text.to_owned(),
+            turn_id: provider_turn_id.to_owned(),
+            editor_revision: None,
+        });
+        self.set_status("Sending steering guidance…");
+        Ok(vec![Effect::Backend(BackendCommand::SteerTurn {
+            provider_session_id,
+            turn_id: provider_turn_id.to_owned(),
+            client_id: id,
+            prompt: self
+                .skills
+                .render_prompt(text)
+                .unwrap_or_else(|_| text.to_owned()),
+        })])
+    }
+
+    /// Cancels one active provider turn without changing server lifecycle.
+    ///
+    /// # Errors
+    /// Rejects stale IDs, unsupported interruption, or unavailable native state.
+    pub fn cancel_turn(
+        &mut self,
+        provider_turn_id: &str,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        if !self.backend_capabilities.interruption.is_supported() {
+            return Err(DomainCommandError::Unsupported(format!(
+                "{} does not support interruption",
+                self.backend_name
+            )));
+        }
+        let active = self
+            .active_turn
+            .as_mut()
+            .ok_or_else(|| DomainCommandError::NotFound(provider_turn_id.to_owned()))?;
+        if active.id != provider_turn_id {
+            return Err(DomainCommandError::NotFound(provider_turn_id.to_owned()));
+        }
+        if active.cancelling {
+            return Err(DomainCommandError::Conflict(
+                "the turn is already being cancelled".to_owned(),
+            ));
+        }
+        let provider_session_id = self.provider_session_id.clone().ok_or_else(|| {
+            DomainCommandError::Conflict("the active provider session is unavailable".to_owned())
+        })?;
+        active.cancelling = true;
+        self.set_status("Interrupting active turn…");
+        Ok(vec![Effect::Backend(BackendCommand::InterruptTurn {
+            provider_session_id,
+            turn_id: provider_turn_id.to_owned(),
+        })])
+    }
+
+    /// Starts manual context compaction without consulting client presentation.
+    ///
+    /// # Errors
+    /// Rejects unavailable, busy, unsupported, or not-yet-started sessions.
+    pub fn compact_context(&mut self) -> Result<Vec<Effect>, DomainCommandError> {
+        if !self.connection.is_ready() {
+            return Err(DomainCommandError::Conflict(
+                "the selected provider is not ready".to_owned(),
+            ));
+        }
+        if self.is_busy() {
+            return Err(DomainCommandError::Conflict(
+                "the session is busy".to_owned(),
+            ));
+        }
+        if !self.backend_capabilities.context_compaction.is_supported() {
+            return Err(DomainCommandError::Unsupported(format!(
+                "{} does not support context compaction",
+                self.backend_name
+            )));
+        }
+        if self.provider_session_id.is_none() {
+            return Err(DomainCommandError::Conflict(
+                "send a prompt before compacting context".to_owned(),
+            ));
+        }
+        Ok(self.compress_session_context())
+    }
+
+    fn validate_prompt(&self, text: &str) -> Result<(), DomainCommandError> {
+        if text.trim().is_empty() {
+            return Err(DomainCommandError::Invalid(
+                "prompt cannot be empty".to_owned(),
+            ));
+        }
+        self.skills
+            .referenced(text)
+            .map(|_| ())
+            .map_err(|name| DomainCommandError::Invalid(format!("unknown skill /skill:{name}")))
     }
 
     pub fn submit_editor(&mut self) -> Vec<Effect> {
@@ -2912,6 +3187,7 @@ impl AppState {
             return Vec::new();
         }
         let previous = self.provider_session_id.take();
+        self.nakode_session_id = uuid::Uuid::now_v7().to_string();
         self.session_id = None;
         self.session_model_override = false;
         self.session_model_options_override = None;
@@ -2952,6 +3228,74 @@ impl AppState {
                 })]
             })
             .unwrap_or_default()
+    }
+
+    /// Starts a fresh logical Nakode session without any client presentation action.
+    ///
+    /// # Errors
+    /// Rejects the transition while current work is active.
+    pub fn create_logical_session(&mut self) -> Result<Vec<Effect>, DomainCommandError> {
+        if self.is_busy() {
+            return Err(DomainCommandError::Conflict(
+                "cannot create a session while work is active".to_owned(),
+            ));
+        }
+        Ok(self.new_session())
+    }
+
+    /// Cancels one delegated run without affecting other work or server lifecycle.
+    ///
+    /// # Errors
+    /// Returns not found after a run has completed or when the ID is unknown.
+    pub fn cancel_run(&mut self, run_id: &str) -> Result<Vec<Effect>, DomainCommandError> {
+        let is_active = self
+            .subagent_executions
+            .get(run_id)
+            .map(|execution| {
+                matches!(
+                    execution.run.status,
+                    SubagentStatus::Starting | SubagentStatus::Working
+                )
+            })
+            .ok_or_else(|| DomainCommandError::NotFound(run_id.to_owned()))?;
+        if !is_active {
+            return Err(DomainCommandError::Conflict(
+                "the delegated run is no longer active".to_owned(),
+            ));
+        }
+        let Some(mut execution) = self.subagent_executions.remove(run_id) else {
+            return Err(DomainCommandError::NotFound(run_id.to_owned()));
+        };
+        execution.run.status = SubagentStatus::Interrupted;
+        "Interrupted".clone_into(&mut execution.run.latest_activity);
+        if let Some(run) = self.subagents.iter_mut().find(|run| run.id == run_id) {
+            run.clone_from(&execution.run);
+        }
+        self.sync_inline_subagent(&execution.run);
+        if let Some(chat) = self.subagent_chats.get_mut(run_id) {
+            chat.transcript.push(
+                EntryKind::System,
+                "INTERRUPTED",
+                "Interrupted by a client.",
+                EntryStatus::Interrupted,
+            );
+            chat.transcript.finish_running(EntryStatus::Interrupted);
+        }
+        self.status_message = format!("Interrupted delegated run {run_id}.");
+        let mut effects = self
+            .persist_subagent_effect(run_id)
+            .into_iter()
+            .collect::<Vec<_>>();
+        effects.push(Effect::CompleteAgentRequest {
+            request_id: execution.request_id,
+            result: format!(
+                "[Subagent Result] [{}] [{}]\nInterrupted by a client.",
+                execution.run.id, execution.run.agent
+            ),
+            success: false,
+        });
+        effects.push(Effect::StopSubagent(run_id.to_owned()));
+        Ok(effects)
     }
 
     pub fn enqueue_editor(&mut self) -> Vec<Effect> {
@@ -3029,7 +3373,7 @@ impl AppState {
             id: id.clone(),
             text: text.clone(),
             turn_id: turn_id.clone(),
-            editor_revision: self.client.editor.revision(),
+            editor_revision: Some(self.client.editor.revision()),
         });
         self.set_status("Sending steering guidance…");
         vec![Effect::Backend(BackendCommand::SteerTurn {
@@ -3636,12 +3980,121 @@ impl AppState {
         })]
     }
 
+    /// Resolves one server-owned approval or question by stable interaction ID.
+    ///
+    /// # Errors
+    /// Rejects stale IDs, a resolution of the wrong interaction kind, invalid
+    /// question option IDs, or an empty answer.
+    pub fn resolve_interaction(
+        &mut self,
+        interaction_id: &nakode_protocol::InteractionId,
+        resolution: &nakode_protocol::InteractionResolution,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        if let Some(position) = self.approvals.iter().position(|approval| {
+            projection::approval_interaction_id(&self.nakode_session_id, &approval.id)
+                == *interaction_id
+        }) {
+            let decision = match resolution {
+                nakode_protocol::InteractionResolution::ApproveOnce => ApprovalDecision::AcceptOnce,
+                nakode_protocol::InteractionResolution::ApproveForSession => {
+                    ApprovalDecision::AcceptForSession
+                }
+                nakode_protocol::InteractionResolution::Decline => ApprovalDecision::Decline,
+                nakode_protocol::InteractionResolution::Answer { .. } => {
+                    return Err(DomainCommandError::Invalid(
+                        "an approval cannot be answered as a question".to_owned(),
+                    ));
+                }
+            };
+            let Some(approval) = self.approvals.remove(position) else {
+                return Err(DomainCommandError::NotFound(interaction_id.to_string()));
+            };
+            let decision_name = match decision {
+                ApprovalDecision::AcceptOnce => "accepted",
+                ApprovalDecision::AcceptForSession => "accepted for this session",
+                ApprovalDecision::Decline => "declined",
+            };
+            self.transcript.push(
+                EntryKind::System,
+                "APPROVAL",
+                format!("{}: {decision_name}", approval.title),
+                EntryStatus::Complete,
+            );
+            self.status_message = format!("Approval {decision_name}.");
+            return Ok(vec![Effect::Backend(BackendCommand::ResolveApproval {
+                id: approval.id,
+                decision,
+            })]);
+        }
+
+        let Some(position) = self.questions.iter().position(|question| {
+            projection::question_interaction_id(&self.nakode_session_id, &question.request.id)
+                == *interaction_id
+        }) else {
+            return Err(DomainCommandError::NotFound(interaction_id.to_string()));
+        };
+        let nakode_protocol::InteractionResolution::Answer { option_ids } = resolution else {
+            return Err(DomainCommandError::Invalid(
+                "a question must be answered with option IDs".to_owned(),
+            ));
+        };
+        let question = self
+            .questions
+            .get(position)
+            .ok_or_else(|| DomainCommandError::NotFound(interaction_id.to_string()))?;
+        if option_ids.is_empty() {
+            return Err(DomainCommandError::Invalid(
+                "at least one question option is required".to_owned(),
+            ));
+        }
+        if !question.request.multi && option_ids.len() != 1 {
+            return Err(DomainCommandError::Invalid(
+                "this question accepts exactly one option".to_owned(),
+            ));
+        }
+        let mut indexes = option_ids
+            .iter()
+            .map(|option_id| {
+                option_id
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|index| *index < question.request.options.len())
+                    .ok_or_else(|| {
+                        DomainCommandError::Invalid(format!(
+                            "unknown question option {option_id:?}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        indexes.sort_unstable();
+        indexes.dedup();
+        if indexes.len() != option_ids.len() {
+            return Err(DomainCommandError::Invalid(
+                "question option IDs must be unique".to_owned(),
+            ));
+        }
+        let answers = indexes
+            .iter()
+            .map(|index| question.request.options[*index].label.clone())
+            .collect::<Vec<_>>();
+        let Some(question) = self.questions.remove(position) else {
+            return Err(DomainCommandError::NotFound(interaction_id.to_string()));
+        };
+        let answer = serde_json::to_string(&answers).unwrap_or_else(|_| answers.join(", "));
+        self.status_message = format!("Answered: {}", answers.join(", "));
+        Ok(vec![Effect::Backend(BackendCommand::ResolveQuestion {
+            id: question.request.id,
+            answer,
+        })])
+    }
+
     pub fn handle_provider_backend(&mut self, provider: &str, event: BackendEvent) -> Vec<Effect> {
         if let Some(effects) = self.handle_provider_authentication(provider, &event) {
             return effects;
         }
         match &event {
             BackendEvent::Ready(identity) => {
+                self.provider_authentication.remove(provider);
                 let context = self
                     .provider_contexts
                     .entry(provider.to_owned())
@@ -3759,6 +4212,13 @@ impl AppState {
                 user_code,
                 ..
             } => {
+                self.provider_authentication.insert(
+                    provider.to_owned(),
+                    ProviderAuthenticationState::Challenge {
+                        verification_url: verification_url.clone(),
+                        user_code: user_code.clone(),
+                    },
+                );
                 if let Some(picker) = &mut self.client.provider_picker {
                     picker.authentication = Some(ProviderAuthentication::Challenge {
                         verification_url: verification_url.clone(),
@@ -3769,6 +4229,7 @@ impl AppState {
                 Some(Vec::new())
             }
             BackendEvent::AuthenticationCompleted { kind, metadata } => {
+                self.provider_authentication.remove(provider);
                 if let Some(picker) = &mut self.client.provider_picker {
                     picker.authentication = None;
                 }
@@ -3784,6 +4245,7 @@ impl AppState {
                 message,
                 ..
             } => {
+                self.provider_authentication.remove(provider);
                 self.provider_authentication_failed(provider, message);
                 Some(Vec::new())
             }
@@ -4134,6 +4596,7 @@ impl AppState {
         }
         let provider_session_id_for_options = provider_session_id.clone();
         self.provider_session_id = Some(provider_session_id);
+        self.nakode_session_id.clone_from(&session.id);
         self.session_id = Some(session.id.clone());
         self.context_usage = None;
         self.context_compaction = None;
@@ -4324,7 +4787,10 @@ impl AppState {
             self.set_status("A late steer response was ignored; the draft was preserved.");
             return;
         }
-        if self.client.editor.revision() == pending.editor_revision {
+        if pending
+            .editor_revision
+            .is_some_and(|revision| self.client.editor.revision() == revision)
+        {
             self.client.editor.clear();
         }
         self.transcript.push(
@@ -7472,6 +7938,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             status: SubagentStatus::Completed,
             latest_activity: "Completed".to_owned(),
             transcript: vec![TranscriptEntry {
+                id: "assistant-entry-1".to_owned(),
                 key: Some("assistant-1".to_owned()),
                 kind: EntryKind::Assistant,
                 title: "ASSISTANT".to_owned(),

@@ -164,6 +164,28 @@ pub trait SessionRepository: Send + Sync {
         workspace: &str,
         title: &str,
         model: Option<&str>,
+    ) -> Result<SessionRecord, SessionError> {
+        self.create_with_id(
+            &Uuid::now_v7().to_string(),
+            provider,
+            provider_session_id,
+            workspace,
+            title,
+            model,
+        )
+    }
+    /// Creates a logical session using an identity assigned before provider work begins.
+    ///
+    /// # Errors
+    /// Returns an error when the record cannot be persisted.
+    fn create_with_id(
+        &self,
+        id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        workspace: &str,
+        title: &str,
+        model: Option<&str>,
     ) -> Result<SessionRecord, SessionError>;
     /// Marks a session as recently used.
     ///
@@ -398,6 +420,7 @@ impl SqliteSessionRepository {
                parent_session_id TEXT NOT NULL,
                run_id TEXT NOT NULL,
                sequence INTEGER NOT NULL,
+               entry_id TEXT NOT NULL,
                item_key TEXT,
                kind TEXT NOT NULL,
                title TEXT NOT NULL,
@@ -408,6 +431,24 @@ impl SqliteSessionRepository {
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
              );",
         )?;
+        let has_agent_turn_entry_id = {
+            let mut statement = connection.prepare("PRAGMA table_info(agent_turns)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns.iter().any(|column| column == "entry_id")
+        };
+        if !has_agent_turn_entry_id {
+            execute_batch_with_busy_retry(
+                &connection,
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE agent_turns ADD COLUMN entry_id TEXT;
+                 UPDATE agent_turns
+                 SET entry_id = parent_session_id || ':' || run_id || ':' || sequence
+                 WHERE entry_id IS NULL;
+                 COMMIT;",
+            )?;
+        }
         let has_model_specific_options = {
             let mut statement = connection.prepare("PRAGMA table_info(provider_model_options)")?;
             let columns = statement
@@ -625,8 +666,9 @@ impl SessionRepository for SqliteSessionRepository {
         }
     }
 
-    fn create(
+    fn create_with_id(
         &self,
+        id: &str,
         provider: &str,
         provider_session_id: &str,
         workspace: &str,
@@ -634,7 +676,6 @@ impl SessionRepository for SqliteSessionRepository {
         model: Option<&str>,
     ) -> Result<SessionRecord, SessionError> {
         let now = unix_timestamp();
-        let id = Uuid::now_v7().to_string();
         let title = title.lines().next().unwrap_or("New session").trim();
         let title = if title.is_empty() {
             "New session"
@@ -911,8 +952,8 @@ impl SessionRepository for SqliteSessionRepository {
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO agent_turns
-                   (parent_session_id, run_id, sequence, item_key, kind, title, body, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                   (parent_session_id, run_id, sequence, entry_id, item_key, kind, title, body, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for (sequence, entry) in record.transcript.iter().enumerate() {
                 let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
@@ -920,6 +961,7 @@ impl SessionRepository for SqliteSessionRepository {
                     record.parent_session_id,
                     record.id,
                     sequence,
+                    entry.id,
                     entry.key,
                     entry_kind_value(entry.kind),
                     entry.title,
@@ -1156,23 +1198,25 @@ fn load_subagent_transcript(
     run_id: &str,
 ) -> Result<Vec<TranscriptEntry>, SessionError> {
     let mut statement = connection.prepare(
-        "SELECT item_key, kind, title, body, status
+        "SELECT entry_id, item_key, kind, title, body, status
          FROM agent_turns
          WHERE parent_session_id = ?1 AND run_id = ?2
          ORDER BY sequence",
     )?;
     let rows = statement.query_map(params![parent_session_id, run_id], |row| {
         Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, String>(1)?,
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
         ))
     })?;
     rows.map(|row| {
-        let (key, kind, title, body, status) = row?;
+        let (id, key, kind, title, body, status) = row?;
         Ok(TranscriptEntry {
+            id,
             key,
             kind: entry_kind_from_value(&kind)?,
             title,
@@ -1525,6 +1569,7 @@ mod tests {
             latest_activity: "Completed".to_owned(),
             transcript: vec![
                 TranscriptEntry {
+                    id: "entry-1".to_owned(),
                     key: None,
                     kind: EntryKind::User,
                     title: "PARENT".to_owned(),
@@ -1532,6 +1577,7 @@ mod tests {
                     status: EntryStatus::Complete,
                 },
                 TranscriptEntry {
+                    id: "entry-2".to_owned(),
                     key: Some("assistant-1".to_owned()),
                     kind: EntryKind::Assistant,
                     title: "ASSISTANT".to_owned(),

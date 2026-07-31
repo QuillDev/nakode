@@ -1577,6 +1577,9 @@ dependencies = [
  "globset",
  "ignore",
  "image",
+ "nakode-client",
+ "nakode-protocol",
+ "nakode-server",
  "nix 0.30.1",
  "open",
  "portable-pty",
@@ -1598,6 +1601,41 @@ dependencies = [
  "tokio-util",
  "toml",
  "unicode-width",
+ "uuid",
+]
+
+[[package]]
+name = "nakode-client"
+version = "0.3.0"
+dependencies = [
+ "futures-util",
+ "nakode-protocol",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "nakode-protocol"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nakode-server"
+version = "0.3.0"
+dependencies = [
+ "futures-util",
+ "nakode-client",
+ "nakode-protocol",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 

@@ -2206,7 +2206,7 @@ first_message = "Inspect the delegated question."
             data_directory: String::new(),
         });
         state.open_settings();
-        let settings = state.settings.as_mut().expect("settings");
+        let settings = state.client.settings.as_mut().expect("settings");
         settings.view = crate::state::SettingsView::Memory;
         let rendered = super::settings_memory_lines(settings)
             .into_iter()

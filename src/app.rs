@@ -81,17 +81,17 @@ struct BackendRegistry {
     vision_service: Option<crate::vision::SharedVisionService>,
 }
 
-#[derive(Clone, Copy)]
-struct PersistenceServices<'a> {
-    sessions: &'a dyn SessionRepository,
-    credentials: &'a dyn CredentialStore,
+#[derive(Clone)]
+pub(crate) struct PersistenceServices {
+    pub(crate) sessions: Arc<dyn SessionRepository>,
+    pub(crate) credentials: Arc<dyn CredentialStore>,
 }
 
 /// Terminal-independent owner of canonical state and every effect executor.
-struct HeadlessServiceRuntime<'a> {
+struct HeadlessServiceRuntime {
     engine: ServiceEngine,
     backends: BackendRegistry,
-    persistence: PersistenceServices<'a>,
+    persistence: PersistenceServices,
     agent_requests: HashMap<u64, IncomingInvocation>,
     shell_processes: ShellProcesses,
 }
@@ -102,18 +102,18 @@ struct HeadlessServiceRuntime<'a> {
 /// extracted from the engine between calls, and rendering receives a disposable
 /// projection assembled from a fresh server view plus that local presentation.
 /// Checkpoint 7 replaces this adapter with the framed out-of-process transport.
-struct InProcessServiceClient<'a> {
-    runtime: HeadlessServiceRuntime<'a>,
+struct InProcessServiceClient {
+    runtime: HeadlessServiceRuntime,
     presentation: ClientPresentationState,
     subscription: ServiceSubscription,
     observed_revision: u64,
 }
 
-impl<'a> InProcessServiceClient<'a> {
+impl InProcessServiceClient {
     fn new(
         mut engine: ServiceEngine,
         backends: BackendRegistry,
-        persistence: PersistenceServices<'a>,
+        persistence: PersistenceServices,
     ) -> Self {
         let presentation = std::mem::take(&mut engine.state_mut().client);
         let observed_revision = engine.snapshot().revision;
@@ -257,7 +257,7 @@ impl<'a> InProcessServiceClient<'a> {
     }
 }
 
-impl Deref for InProcessServiceClient<'_> {
+impl Deref for InProcessServiceClient {
     type Target = AppState;
 
     fn deref(&self) -> &Self::Target {
@@ -265,7 +265,7 @@ impl Deref for InProcessServiceClient<'_> {
     }
 }
 
-impl DerefMut for InProcessServiceClient<'_> {
+impl DerefMut for InProcessServiceClient {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.runtime.engine.state_mut()
     }
@@ -630,10 +630,11 @@ fn read_shared_config<T: Clone + Default>(shared: &RwLock<T>) -> T {
 pub async fn run(config: Config) -> Result<(), AppError> {
     let nakode_executable = std::env::current_exe().map_err(AppError::CurrentExecutable)?;
     let mut signals = ShutdownSignals::install()?;
-    let sessions = SqliteSessionRepository::open_default()?;
+    let sessions = Arc::new(SqliteSessionRepository::open_default()?);
     let session_database = sessions.database_path().to_path_buf();
-    let credentials = SqliteCredentialStore::open(&session_database)?;
-    let (providers, backends) = start_backends(&config, &sessions, &credentials).await?;
+    let credentials = Arc::new(SqliteCredentialStore::open(&session_database)?);
+    let (providers, backends) =
+        start_backends(&config, sessions.as_ref(), credentials.as_ref()).await?;
     let agents = AgentCatalog::load(&config.agents)?;
     let skills = SkillCatalog::load(&config.workspace)?;
     let prompt_addenda =
@@ -688,8 +689,8 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let mut herdr = crate::herdr::Reporter::from_environment();
 
     let persistence = PersistenceServices {
-        sessions: &sessions,
-        credentials: &credentials,
+        sessions: sessions.clone(),
+        credentials: credentials.clone(),
     };
     let mut host = InProcessServiceClient::new(service, backends, persistence);
     let loop_result = {
@@ -911,7 +912,7 @@ fn quote_command_argument(argument: &Path) -> String {
 
 async fn run_loop(
     terminal: &mut Tui,
-    host: &mut InProcessServiceClient<'_>,
+    host: &mut InProcessServiceClient,
     interactive: &mut InteractiveServices<'_>,
     mut herdr: Option<&mut crate::herdr::Reporter>,
 ) -> io::Result<()> {
@@ -1061,12 +1062,12 @@ async fn apply_effects(
     state: &mut AppState,
     effects: Vec<Effect>,
     backends: &mut BackendRegistry,
-    persistence: &PersistenceServices<'_>,
+    persistence: &PersistenceServices,
     agent_requests: &mut HashMap<u64, IncomingInvocation>,
     shell_processes: &mut ShellProcesses,
 ) -> bool {
-    let sessions = persistence.sessions;
-    let credentials = persistence.credentials;
+    let sessions = persistence.sessions.as_ref();
+    let credentials = persistence.credentials.as_ref();
     let (mut quit, mut pending) = (false, std::collections::VecDeque::from(effects));
     while let Some(effect) = pending.pop_front() {
         match effect {
@@ -1185,7 +1186,14 @@ fn persist_session(
     title: &str,
     model: Option<&str>,
 ) {
-    match sessions.create(provider, provider_session_id, workspace, title, model) {
+    match sessions.create_with_id(
+        &state.nakode_session_id,
+        provider,
+        provider_session_id,
+        workspace,
+        title,
+        model,
+    ) {
         Ok(record) => state.session_persisted(&record),
         Err(error) => state.session_store_failed(error.to_string()),
     }
@@ -1340,7 +1348,7 @@ struct ProviderCredentialInput {
 async fn save_provider_credential_effect(
     state: &mut AppState,
     backends: &mut BackendRegistry,
-    persistence: &PersistenceServices<'_>,
+    persistence: &PersistenceServices,
     pending: &mut std::collections::VecDeque<Effect>,
     credential: (String, String, serde_json::Value),
 ) {
@@ -1353,8 +1361,8 @@ async fn save_provider_credential_effect(
     persist_provider_credential(
         state,
         backends,
-        persistence.sessions,
-        persistence.credentials,
+        persistence.sessions.as_ref(),
+        persistence.credentials.as_ref(),
         pending,
         credential,
     )

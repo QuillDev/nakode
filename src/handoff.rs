@@ -141,6 +141,7 @@ mod tests {
 
     fn entry(kind: EntryKind, body: impl Into<String>) -> TranscriptEntry {
         TranscriptEntry {
+            id: uuid::Uuid::now_v7().to_string(),
             key: None,
             kind,
             title: String::new(),

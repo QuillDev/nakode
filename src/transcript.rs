@@ -39,6 +39,7 @@ pub enum EntryStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptEntry {
+    pub id: String,
     pub key: Option<String>,
     pub kind: EntryKind,
     pub title: String,
@@ -82,6 +83,18 @@ pub struct VisibleTranscript {
     pub first_line: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamState {
+    Idle,
+    Active,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryRetention {
+    Complete,
+    Truncated,
+}
+
 #[derive(Clone, Debug)]
 pub struct Transcript {
     entries: Vec<TranscriptEntry>,
@@ -91,12 +104,13 @@ pub struct Transcript {
     cache_width: usize,
     cache_revision: u64,
     cache: Vec<ProjectedLine>,
-    stream_active: bool,
+    stream_state: StreamState,
     stream_label: String,
     expanded_tools: HashSet<String>,
     images: HashMap<String, Vec<PromptImage>>,
     image_previews_enabled: bool,
     show_all_tools: bool,
+    history_retention: HistoryRetention,
 }
 
 impl Transcript {
@@ -110,18 +124,34 @@ impl Transcript {
             cache_width: 0,
             cache_revision: 0,
             cache: Vec::new(),
-            stream_active: false,
+            stream_state: StreamState::Idle,
             stream_label: "Nakode".to_owned(),
             expanded_tools: HashSet::new(),
             images: HashMap::new(),
             image_previews_enabled: false,
             show_all_tools: false,
+            history_retention: HistoryRetention::Complete,
         }
     }
 
     #[must_use]
     pub fn entries(&self) -> &[TranscriptEntry] {
         &self.entries
+    }
+
+    #[must_use]
+    pub const fn has_earlier_entries(&self) -> bool {
+        matches!(self.history_retention, HistoryRetention::Truncated)
+    }
+
+    #[must_use]
+    pub const fn stream_active(&self) -> bool {
+        matches!(self.stream_state, StreamState::Active)
+    }
+
+    #[must_use]
+    pub fn stream_label(&self) -> &str {
+        &self.stream_label
     }
 
     #[must_use]
@@ -152,13 +182,19 @@ impl Transcript {
         self.expanded_tools.clear();
         self.images.clear();
         self.show_all_tools = false;
-        self.stream_active = false;
+        self.stream_state = StreamState::Idle;
+        self.history_retention = HistoryRetention::Complete;
         self.changed();
     }
 
     pub fn set_stream_active(&mut self, active: bool) {
-        if self.stream_active != active {
-            self.stream_active = active;
+        let state = if active {
+            StreamState::Active
+        } else {
+            StreamState::Idle
+        };
+        if self.stream_state != state {
+            self.stream_state = state;
             self.changed();
         }
     }
@@ -211,6 +247,7 @@ impl Transcript {
         status: EntryStatus,
     ) {
         self.entries.push(TranscriptEntry {
+            id: uuid::Uuid::now_v7().to_string(),
             key: None,
             kind,
             title: title.into(),
@@ -238,6 +275,7 @@ impl Transcript {
         } else {
             let index = self.entries.len();
             self.entries.push(TranscriptEntry {
+                id: uuid::Uuid::now_v7().to_string(),
                 key: Some(key.clone()),
                 kind,
                 title: title.into(),
@@ -264,6 +302,7 @@ impl Transcript {
         } else {
             let index = self.entries.len();
             self.entries.push(TranscriptEntry {
+                id: uuid::Uuid::now_v7().to_string(),
                 key: Some(key.clone()),
                 kind,
                 title: title.into(),
@@ -324,8 +363,8 @@ impl Transcript {
                 changed = true;
             }
         }
-        if changed || self.stream_active {
-            self.stream_active = false;
+        if changed || self.stream_active() {
+            self.stream_state = StreamState::Idle;
             self.changed();
         }
     }
@@ -358,6 +397,7 @@ impl Transcript {
         if self.entries.len() > self.limit {
             let remove_count = self.entries.len() - self.limit;
             self.entries.drain(..remove_count);
+            self.history_retention = HistoryRetention::Truncated;
             self.reindex();
         }
     }
@@ -413,8 +453,8 @@ impl Transcript {
                 continue;
             }
             if is_agent_stream(entry) && !stream_header_shown {
-                let active =
-                    self.stream_active && last_user_index.is_none_or(|last_user| index > last_user);
+                let active = self.stream_active()
+                    && last_user_index.is_none_or(|last_user| index > last_user);
                 project_stream_header(
                     &self.stream_label,
                     active,
@@ -454,7 +494,7 @@ impl Transcript {
         let waiting_after_user = self.entries.last().is_some_and(|entry| {
             entry.kind == EntryKind::User && entry.status == EntryStatus::Complete
         });
-        if !stream_header_shown && (self.stream_active || waiting_after_user) {
+        if !stream_header_shown && (self.stream_active() || waiting_after_user) {
             if projected.last().is_some_and(|line| !line.text.is_empty()) {
                 projected.push(blank_line(
                     self.entries.last().and_then(|entry| entry.key.clone()),
@@ -462,7 +502,7 @@ impl Transcript {
             }
             project_stream_header(
                 &self.stream_label,
-                self.stream_active,
+                self.stream_active(),
                 self.entries.last().and_then(|entry| entry.key.clone()),
                 &mut projected,
             );
