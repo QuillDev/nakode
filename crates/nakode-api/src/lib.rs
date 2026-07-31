@@ -17,7 +17,7 @@ pub const MAX_API_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, process::Command};
+    use std::collections::BTreeSet;
 
     use prost::Message;
     use prost_types::FileDescriptorSet;
@@ -75,32 +75,5 @@ mod tests {
             "GetServerInfo",
         ];
         assert_eq!(methods, required.into_iter().map(str::to_owned).collect());
-    }
-
-    #[test]
-    fn stock_protoc_generates_a_typed_non_rust_model() {
-        let output = tempfile::tempdir().expect("create generation directory");
-        let proto_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../proto");
-        let schema = proto_root.join("nakode/v1/nakode.proto");
-        let status = Command::new(protoc_bin_vendored::protoc_bin_path().expect("vendored protoc"))
-            .arg(format!("--proto_path={}", proto_root.display()))
-            .arg(format!(
-                "--proto_path={}",
-                protoc_bin_vendored::include_path()
-                    .expect("vendored include path")
-                    .display()
-            ))
-            .arg(format!("--python_out={}", output.path().display()))
-            .arg(format!("--pyi_out={}", output.path().display()))
-            .arg(schema)
-            .status()
-            .expect("run Python generator");
-        assert!(status.success(), "Python code generation must succeed");
-
-        let type_stubs = std::fs::read_to_string(output.path().join("nakode/v1/nakode_pb2.pyi"))
-            .expect("read generated Python type stubs");
-        assert!(type_stubs.contains("class SessionState"));
-        assert!(type_stubs.contains("class CreateSessionRequest"));
-        assert!(type_stubs.contains("class WorkspaceSnapshot"));
     }
 }

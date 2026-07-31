@@ -12,10 +12,8 @@ controls or presentation.
 
 - [x] `proto/nakode/v1/nakode.proto` is the sole public API schema.
 - [x] gRPC is the sole frontend transport.
-- [x] Rust, Python, Go, and TypeScript generation is declared in
-      `proto/buf.gen.yaml`.
-- [x] The Python generated-client conformance test calls the native Rust
-      server.
+- [x] Go and TypeScript generation is declared in `proto/buf.gen.yaml`; Rust
+      generation is owned by the `nakode-api` crate.
 - [x] API requests and responses have explicit size limits that preserve the
       20 MiB artifact contract.
 
@@ -41,8 +39,6 @@ controls or presentation.
       resubscription, history paging, body reconstruction, and artifact
       hydration.
 - [x] Startup session selection/open/create policy is an SDK operation.
-- [x] A generated Python package and typed high-level entrypoint demonstrate
-      the same contract from a non-Rust language.
 
 ## TUI boundary
 

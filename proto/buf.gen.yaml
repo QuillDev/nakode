@@ -1,12 +1,6 @@
 version: v2
 clean: true
 plugins:
-  - remote: buf.build/protocolbuffers/python
-    out: gen/python
-  - remote: buf.build/protocolbuffers/pyi
-    out: gen/python
-  - remote: buf.build/grpc/python
-    out: gen/python
   - remote: buf.build/protocolbuffers/go
     out: gen/go
     opt: paths=source_relative

@@ -21,8 +21,8 @@ automation ────┘                              ├─ providers and too
 ## Contract and generation
 
 `proto/nakode/v1/nakode.proto` is the only public contract. It generates
-type-safe service clients and models for Rust, Python, Go, TypeScript, and any
-other language with Protobuf/gRPC support. `proto/buf.gen.yaml` contains the
+type-safe service clients and models for Rust, Go, TypeScript, and any other
+language with Protobuf/gRPC support. `proto/buf.gen.yaml` contains the
 multi-language generation configuration.
 
 Generated RPC clients expose the complete product edge inventory, including:
@@ -34,11 +34,10 @@ Generated RPC clients expose the complete product edge inventory, including:
   agent definitions;
 - delegation, run watches, transcript paging, artifacts, and diagnostics.
 
-The Rust `nakode-sdk` crate and checked-in Python conformance SDK add ergonomic
-methods, stable mutation idempotency keys, safe retry, reconnecting watches,
-paging, body reconstruction, and artifact hydration. Equivalent language
-packages implement the same behavioral SDK profile over generated stubs; they
-do not invent new domain semantics.
+The Rust `nakode-sdk` crate adds ergonomic methods, stable mutation idempotency
+keys, safe retry, reconnecting watches, paging, body reconstruction, and
+artifact hydration. Equivalent language packages implement the same behavioral
+SDK profile over generated stubs; they do not invent new domain semantics.
 
 Generated stubs make every RPC type-safe, but a production frontend should use
 its language's high-level SDK profile. If that package does not exist yet, add

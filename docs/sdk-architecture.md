@@ -3,9 +3,9 @@
 ## Decision
 
 The public frontend boundary is `proto/nakode/v1/nakode.proto`. The native
-Rust server implements that service. Rust, TypeScript, Python, Go, and future
-language clients generate transport types and service stubs from the same
-schema. gRPC is the only public frontend transport.
+Rust server implements that service. Rust, TypeScript, Go, and future language
+clients generate transport types and service stubs from the same schema. gRPC
+is the only public frontend transport.
 
 This contract is the hard product boundary. The native server is the agent
 runtime and state authority; every TUI, desktop, web, mobile, IDE, CLI, or
@@ -54,13 +54,10 @@ authoritative snapshots. A watch yields a complete replacement
 `WorkspaceState`, `SessionState`, or `RunState`; it does not require application
 code to reduce internal server events.
 
-The Rust SDK is the complete production implementation used by the TUI. The
-checked-in Python package is the live non-Rust conformance implementation of
-the shared connection, session-selection, retry, watch, paging, body
-reconstruction, and artifact-hydration profile. Go and TypeScript currently
-generate typed service clients from the same schema; their high-level packages
-must implement this profile before application code, rather than placing that
-behavior in an individual frontend.
+The Rust SDK is the complete production implementation used by the TUI. Go and
+TypeScript currently generate typed service clients from the same schema;
+their high-level packages must implement this profile before application code,
+rather than placing that behavior in an individual frontend.
 
 A frontend owns only input mapping, rendering, focus, drafts not yet submitted,
 selection, scroll position, viewport size, clipboard/device integration, and
