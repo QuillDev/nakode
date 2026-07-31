@@ -1,13 +1,38 @@
 # Nakode
 
-Nakode is a provider-neutral terminal application for working with coding
-agents. It gives you one workspace and one consistent interface while allowing
-each session or delegated task to use the provider and model that fit it best.
+Nakode is a provider-neutral agent server for orchestration, continuity, and
+execution. It owns the workspace runtime and canonical session state while
+replaceable frontends provide the interface. The included TUI is one thin
+client, not the application authority.
 
 Nakode is experimental and under active development.
 
-Developers and coding agents can drive the real TUI reducer and renderer through
+Developers and coding agents can drive the real TUI controls and renderer through
 the deterministic JSON Lines [TUI evaluation harness](docs/tui-evaluation.md).
+Alternative interfaces can use the same native server through the
+[generated API and SDK](docs/frontend-development.md);
+the TUI is one renderer of server-owned semantic state.
+
+## Architecture boundary
+
+The background Nakode service manages every session, turn, queue, provider,
+tool, artifact, setting, and orchestration run. It performs all operations and
+mutations, persists canonical state, and continues active work without an
+attached client.
+
+Every frontend—including the built-in TUI—only:
+
+- obtains authoritative state through the generated SDK;
+- maps user intent to distinct typed SDK methods; and
+- renders that state while retaining only ephemeral presentation concerns such
+  as drafts, focus, selection, scrolling, viewport, and device integration.
+
+Frontends never open Nakode's database, connect directly to providers, execute
+tools, reduce provider events, or decide session and queue policy. This is a
+hard project boundary: a new capability must be implemented in the server,
+exposed through `proto/nakode/v1/nakode.proto`, represented in the SDK, and only
+then rendered by clients. See [Building a Nakode frontend](docs/frontend-development.md)
+and the [SDK architecture](docs/sdk-architecture.md).
 
 ## What does it do?
 

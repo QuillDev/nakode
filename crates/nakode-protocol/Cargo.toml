@@ -3,11 +3,12 @@ name = "nakode-protocol"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Frontend-neutral Nakode client/server protocol"
+description = "Internal provider-neutral Nakode semantic types"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
 [dependencies]
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

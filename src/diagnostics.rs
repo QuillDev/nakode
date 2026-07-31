@@ -5,14 +5,24 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use nakode_protocol::{
+    DiagnosticsDailyUsage, DiagnosticsReport, DiagnosticsSessionUsage, DiagnosticsToolUsage,
+    DiagnosticsUsageTotals, ProviderId, SessionId,
+};
 use rusqlite::Connection;
-use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
+    api_projection,
+    config::Config,
+    native_client,
     runtime::{InferenceKind, RuntimeSession},
-    session::{SessionError, SqliteSessionRepository},
 };
+
+type UsageTotals = DiagnosticsUsageTotals;
+type DailyUsage = DiagnosticsDailyUsage;
+type ToolUsage = DiagnosticsToolUsage;
+type SessionUsage = DiagnosticsSessionUsage;
 
 #[derive(Clone, Debug)]
 pub struct DiagnosticsOptions {
@@ -22,112 +32,14 @@ pub struct DiagnosticsOptions {
     pub json: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct UsageTotals {
-    pub inference_rounds: u64,
-    pub compaction_rounds: u64,
-    pub failed_rounds: u64,
-    pub retry_count: u64,
-    pub estimated_input_tokens: u64,
-    pub reported_input_tokens: u64,
-    pub reported_cached_input_tokens: u64,
-    pub reported_cache_write_tokens: u64,
-    pub reported_output_tokens: u64,
-    pub request_bytes: u64,
-    pub response_bytes: u64,
-    pub inference_duration_ms: u64,
-    pub requested_tool_calls: u64,
-    pub executed_tool_calls: u64,
-    pub failed_tool_calls: u64,
-    pub full_tool_output_bytes: u64,
-    pub model_tool_output_bytes: u64,
-    pub tool_duration_ms: u64,
-}
-
-impl UsageTotals {
-    #[must_use]
-    pub fn reported_uncached_input_tokens(&self) -> u64 {
-        self.reported_input_tokens
-            .saturating_sub(self.reported_cached_input_tokens)
-    }
-
-    #[must_use]
-    pub fn cache_rate_percent(&self) -> Option<f64> {
-        (self.reported_input_tokens > 0).then(|| {
-            u64_to_f64(self.reported_cached_input_tokens) * 100.0
-                / u64_to_f64(self.reported_input_tokens)
-        })
-    }
-
-    fn add(&mut self, other: &Self) {
-        self.inference_rounds += other.inference_rounds;
-        self.compaction_rounds += other.compaction_rounds;
-        self.failed_rounds += other.failed_rounds;
-        self.retry_count += other.retry_count;
-        self.estimated_input_tokens += other.estimated_input_tokens;
-        self.reported_input_tokens += other.reported_input_tokens;
-        self.reported_cached_input_tokens += other.reported_cached_input_tokens;
-        self.reported_cache_write_tokens += other.reported_cache_write_tokens;
-        self.reported_output_tokens += other.reported_output_tokens;
-        self.request_bytes += other.request_bytes;
-        self.response_bytes += other.response_bytes;
-        self.inference_duration_ms += other.inference_duration_ms;
-        self.requested_tool_calls += other.requested_tool_calls;
-        self.executed_tool_calls += other.executed_tool_calls;
-        self.failed_tool_calls += other.failed_tool_calls;
-        self.full_tool_output_bytes += other.full_tool_output_bytes;
-        self.model_tool_output_bytes += other.model_tool_output_bytes;
-        self.tool_duration_ms += other.tool_duration_ms;
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct DailyUsage {
-    pub date_utc: String,
-    pub provider: String,
-    #[serde(flatten)]
-    pub totals: UsageTotals,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ToolUsage {
-    pub provider: String,
-    pub tool: String,
-    pub calls: u64,
-    pub failures: u64,
-    pub full_output_bytes: u64,
-    pub model_output_bytes: u64,
-    pub duration_ms: u64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct SessionUsage {
-    pub session_id: String,
-    pub provider: String,
-    pub model: String,
-    pub latest_activity_ms: u64,
-    #[serde(flatten)]
-    pub totals: UsageTotals,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct DiagnosticsReport {
-    pub generated_at_ms: u64,
-    pub period_days: u16,
-    pub provider_filter: Option<String>,
-    pub sessions_scanned: usize,
-    pub sessions_with_activity: usize,
-    pub totals: UsageTotals,
-    pub daily: Vec<DailyUsage>,
-    pub tools: Vec<ToolUsage>,
-    pub sessions: Vec<SessionUsage>,
-    pub notes: Vec<&'static str>,
-}
-
 #[derive(Debug, Error)]
 pub enum DiagnosticsError {
+    #[error("failed to start the native Nakode client: {0}")]
+    NativeClientStart(String),
     #[error(transparent)]
-    Session(#[from] SessionError),
+    Sdk(#[from] nakode_sdk::SdkError),
+    #[error("Nakode diagnostics protocol error: {0}")]
+    Protocol(String),
     #[error("diagnostics database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("invalid persisted runtime session {session_id}: {source}")]
@@ -139,14 +51,28 @@ pub enum DiagnosticsError {
     Serialize(#[from] serde_json::Error),
 }
 
-/// Builds and renders a privacy-preserving report from persisted runtime telemetry.
-/// Prompt text, reasoning, tool arguments, tool output, and session titles are never emitted.
+/// Queries and renders privacy-preserving runtime telemetry through the native
+/// Nakode server. Prompt text, reasoning, tool arguments, tool output, and
+/// session titles are never emitted.
 ///
 /// # Errors
-/// Returns an error when the session database cannot be opened or contains malformed telemetry.
-pub fn run(options: &DiagnosticsOptions) -> Result<String, DiagnosticsError> {
-    let repository = SqliteSessionRepository::open_default()?;
-    let report = collect(repository.database_path(), options, unix_time_ms())?;
+/// Returns an error when the native server, protocol query, or report
+/// serialization fails.
+pub async fn run(
+    config: &Config,
+    options: &DiagnosticsOptions,
+) -> Result<String, DiagnosticsError> {
+    let client = native_client::connect(config)
+        .await
+        .map_err(|error| DiagnosticsError::NativeClientStart(error.to_string()))?;
+    let report = client
+        .get_diagnostics(nakode_sdk::v1::GetDiagnosticsRequest {
+            days: u32::from(options.days),
+            session_limit: u32::try_from(options.session_limit).unwrap_or(u32::MAX),
+            provider_id: options.provider.clone(),
+        })
+        .await?;
+    let report = api_projection::diagnostics(report);
     if options.json {
         serde_json::to_string_pretty(&report).map_err(Into::into)
     } else {
@@ -154,7 +80,7 @@ pub fn run(options: &DiagnosticsOptions) -> Result<String, DiagnosticsError> {
     }
 }
 
-fn collect(
+pub(crate) fn collect(
     database: &Path,
     options: &DiagnosticsOptions,
     now_ms: u64,
@@ -220,7 +146,7 @@ fn collect(
         .into_iter()
         .map(|((day, provider), totals)| DailyUsage {
             date_utc: format_utc_day(day),
-            provider,
+            provider_id: ProviderId::from(provider),
             totals,
         })
         .collect::<Vec<_>>();
@@ -232,17 +158,17 @@ fn collect(
     Ok(DiagnosticsReport {
         generated_at_ms: now_ms,
         period_days: options.days,
-        provider_filter: options.provider.clone(),
-        sessions_scanned,
-        sessions_with_activity,
+        provider_filter: options.provider.clone().map(ProviderId::from),
+        sessions_scanned: u64::try_from(sessions_scanned).unwrap_or(u64::MAX),
+        sessions_with_activity: u64::try_from(sessions_with_activity).unwrap_or(u64::MAX),
         totals,
         daily: daily_values,
         tools: tool_values,
         sessions,
         notes: vec![
-            "No prompt text, reasoning, tool arguments, tool output, session titles, or credentials are included.",
-            "Reported token and cache fields are provider telemetry; zero means the provider did not report that field.",
-            "Cached tokens may still count toward subscription or provider usage limits even when API pricing discounts them.",
+            "No prompt text, reasoning, tool arguments, tool output, session titles, or credentials are included.".to_owned(),
+            "Reported token and cache fields are provider telemetry; zero means the provider did not report that field.".to_owned(),
+            "Cached tokens may still count toward subscription or provider usage limits even when API pricing discounts them.".to_owned(),
         ],
     })
 }
@@ -283,8 +209,8 @@ fn aggregate_session(
         add_tool_usage(tools, &provider, metric);
     }
     (latest_activity_ms > 0).then_some(SessionUsage {
-        session_id,
-        provider,
+        session_id: SessionId::from(session_id),
+        provider_id: ProviderId::from(provider),
         model: session.model,
         latest_activity_ms,
         totals,
@@ -299,7 +225,7 @@ fn add_tool_usage(
     let tool = tools
         .entry((provider.to_owned(), metric.name.clone()))
         .or_insert_with(|| ToolUsage {
-            provider: provider.to_owned(),
+            provider_id: ProviderId::from(provider),
             tool: metric.name.clone(),
             calls: 0,
             failures: 0,
@@ -367,7 +293,7 @@ fn render_text(report: &DiagnosticsReport) -> String {
             output,
             "{:<10}  {:<16}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}",
             day.date_utc,
-            day.provider,
+            day.provider_id,
             day.totals.inference_rounds,
             compact_number(day.totals.reported_input_tokens),
             compact_number(day.totals.reported_cached_input_tokens),
@@ -385,7 +311,7 @@ fn render_text(report: &DiagnosticsReport) -> String {
         writeln!(
             output,
             "{:<16}  {:<14}  {:>6}  {:>7}  {:>10}  {:>10}  {:>9}",
-            tool.provider,
+            tool.provider_id,
             tool.tool,
             tool.calls,
             tool.failures,
@@ -402,8 +328,8 @@ fn render_text(report: &DiagnosticsReport) -> String {
         writeln!(
             output,
             "{:<12}  {:<16}  {:<20}  {:>6}  {:>10}  {:>10}  {:>10}  {:>6}",
-            short_id(&session.session_id),
-            session.provider,
+            short_id(session.session_id.as_str()),
+            session.provider_id,
             truncate(&session.model, 20),
             session.totals.inference_rounds,
             compact_number(session.totals.reported_input_tokens),
@@ -447,7 +373,7 @@ Runtime: {} inference · {} tools\n",
     .expect("writing to a String cannot fail");
 }
 
-fn unix_time_ms() -> u64 {
+pub(crate) fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -517,12 +443,6 @@ fn format_decimal(value: u64, divisor: u64, precision: u32) -> String {
     let fraction = scaled % scale;
     let width = usize::try_from(precision).expect("format precision fits usize");
     format!("{whole}.{fraction:0width$}")
-}
-
-fn u64_to_f64(value: u64) -> f64 {
-    let high = u32::try_from(value >> 32).expect("upper half fits u32");
-    let low = u32::try_from(value & u64::from(u32::MAX)).expect("lower half fits u32");
-    f64::from(high).mul_add(4_294_967_296.0, f64::from(low))
 }
 
 fn short_id(value: &str) -> &str {

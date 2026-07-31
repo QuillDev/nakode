@@ -1,92 +1,68 @@
-# Thin-client service migration checklist
+# Renderer-only frontend architecture
 
-This checklist tracks the migration required by `AGENTS.md`. A checkpoint is
-complete only when its code, tests, and quality gates pass and the checkpoint is
-committed independently. Transitional compatibility is allowed, but no
-checkpoint may introduce a second long-term source of domain truth.
+This document records the implemented frontend boundary. There is no legacy
+frontend compatibility layer.
 
-## 1. Protocol foundation
+This boundary is permanent: the Nakode service owns all canonical state and
+mutations, and every client is only an SDK consumer and renderer. Future
+features must extend the server, public schema, and SDK before adding frontend
+controls or presentation.
 
-- [x] Declare the server/client ownership model in `AGENTS.md`.
-- [x] Add transport-neutral, versioned client command envelopes.
-- [x] Add request correlation and explicit protocol rejection.
-- [x] Route the existing agent invocation through the protocol envelope.
-- [x] Preserve the legacy workspace-socket fallback during migration.
-- [x] Add protocol unit and control-boundary integration tests.
+## Public contract
 
-## 2. Separate client presentation state from domain state
+- [x] `proto/nakode/v1/nakode.proto` is the sole public API schema.
+- [x] gRPC is the sole frontend transport.
+- [x] Rust, Python, Go, and TypeScript generation is declared in
+      `proto/buf.gen.yaml`.
+- [x] The Python generated-client conformance test calls the native Rust
+      server.
+- [x] API requests and responses have explicit size limits that preserve the
+      20 MiB artifact contract.
 
-- [x] Introduce a TUI-owned presentation state type.
-- [x] Move drafts/editor cursor, focus, scroll, selection, viewport, hit regions,
-      and modal navigation into presentation state.
-- [x] Make rendering consume immutable server view data plus mutable local
-      presentation data.
-- [x] Ensure rendering cannot emit domain effects or mutate canonical state.
-- [x] Update the headless TUI harness to distinguish local presentation actions
-      from service commands.
+## Server ownership
 
-## 3. Headless service engine foundation
+- [x] The native Rust server owns workspace, session, turn, queue,
+      interaction, run, provider, model, settings, artifact, and diagnostic
+      state.
+- [x] Provider execution, tools, persistence, orchestration, permissions,
+      cancellation, and prompt queue-versus-start policy remain behind the
+      semantic server request loop.
+- [x] Mutations carry server-recorded idempotency keys.
+- [x] Watches expose authoritative replacement snapshots; internal reducer
+      events are never public frontend messages.
+- [x] Slow or lagged watch consumers cause a fresh server snapshot rather than
+      blocking execution.
 
-- [x] Introduce a server-owned engine that owns canonical application state.
-- [x] Publish revisioned change notifications from the engine.
-- [x] Ensure the engine can run and be tested without terminal acquisition or a
-      renderer.
-- [x] Retain an in-process transport temporarily for deterministic tests.
+## SDK ownership
 
-## 4. Move execution behind the engine
+- [x] The Rust SDK exposes distinct typed product methods rather than a generic
+      command envelope.
+- [x] It owns mutation keys, safe transient retry, stream reconnection,
+      resubscription, history paging, body reconstruction, and artifact
+      hydration.
+- [x] Startup session selection/open/create policy is an SDK operation.
+- [x] A generated Python package and typed high-level entrypoint demonstrate
+      the same contract from a non-Rust language.
 
-- [x] Move backend registry, provider event reduction, persistence effects,
-      tools, shell supervision, and subagent supervision behind the engine.
-- [x] Define typed service commands for every domain-changing TUI action.
-- [x] Remove direct state mutation from the interactive application loop.
+## TUI boundary
 
-## 5. Snapshots, revisions, and subscriptions
+- [x] The TUI connects only through `nakode-sdk`.
+- [x] Controls emit local presentation actions or calls to distinct SDK edges.
+- [x] The TUI does not import the server's internal command enum, runtime,
+      provider adapters, persistence, tools, or process supervision.
+- [x] State watches replace the render model; the TUI does not reduce domain
+      events.
+- [x] Only drafts, focus, selection, scroll, viewport, clipboard, terminal
+      media, and lifecycle remain local.
+- [x] Headless renderer tests and PTY terminal-lifecycle tests exercise the
+      resulting boundary.
+- [x] A boundary regression test rejects TUI imports of server runtime,
+      persistence, provider, tool, and internal command modules.
 
-- [x] Define semantic client view snapshots independent of Ratatui/Crossterm.
-- [x] Add monotonic service revisions and ordered server events.
-- [x] Add subscribe, unsubscribe, fresh-snapshot, and resume-from-revision
-      operations.
-- [x] Add bounded subscriber queues so slow clients cannot block the engine.
-- [x] Add command idempotency tracking and deterministic conflict responses.
+## Removed architecture
 
-## 6. Thin TUI client
-
-- [x] Separate the terminal-independent runtime owner from the in-process TUI
-      presentation adapter.
-- [ ] Replace direct reducer/backend/persistence calls with a service client.
-- [ ] Render only semantic snapshots/events plus local presentation state.
-- [ ] Translate controls into local presentation actions or typed service
-      commands.
-- [ ] Handle disconnect, reconnect, resubscribe, and snapshot replacement over
-      the real client transport.
-- [x] Keep terminal and image lifecycle entirely in the TUI process.
-
-## 7. Long-running out-of-process server
-
-- [ ] Make the service process own the headless engine and all active work.
-- [ ] Add framed local transport for commands, queries, and subscriptions.
-- [ ] Start or connect to one compatible user-level server safely.
-- [ ] Keep work running with zero connected clients.
-- [ ] Support multiple simultaneous clients and multiple logical sessions.
-- [ ] Make shutdown, upgrade, stale-socket recovery, and crash recovery explicit.
-
-## 8. Direct CLI and automation clients
-
-- [ ] Route agent invocation and other CLI operations directly to the server.
-- [ ] Remove the requirement for a matching live TUI registration.
-- [ ] Expose reusable client connection and subscription APIs.
-- [ ] Verify concurrent TUI and CLI clients observe consistent state.
-
-## 9. Remove transitional ownership and harden the boundary
-
-- [ ] Remove TUI-local provider backends, persistence, tools, shell supervision,
-      subagent execution, and routing sockets.
-- [ ] Remove legacy control routing after its compatibility window.
-- [ ] Ensure protocol modules contain no terminal, renderer, provider-wire,
-      SQLite, or process-management types.
-- [ ] Convert TUI evaluation fixtures to service snapshots/events and test the
-      server independently through its public protocol.
-- [ ] Add end-to-end detach, reconnect, multi-client, slow-client, idempotency,
-      and server-without-client tests.
-- [ ] Update user and developer documentation to describe the server lifecycle
-      and client API.
+- [x] The newline-delimited JSON frontend protocol was deleted.
+- [x] The reducer-based `nakode-client` crate was deleted.
+- [x] The lifecycle-coupled `nakode-native-client` crate was deleted.
+- [x] The second frontend socket, transport replay journal, explicit frontend
+      retry UI, and TUI use of internal server commands were deleted.

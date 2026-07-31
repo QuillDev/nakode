@@ -7,14 +7,21 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use nakode_protocol::{InteractionView, ModelOptions, TodoStatusView};
+
 use crate::{
-    backend::{ApprovalRequest, TodoStatus},
     commands,
     selection::{ScreenPoint, ScreenSnapshot},
-    state::AppState,
     transcript::{
         IMAGE_PREVIEW_MARKER, IMAGE_PREVIEW_ROWS, LineTone, MarkdownModifier, MarkdownSpan,
         MarkdownTone, ProjectedLine, is_tool_toggle_marker,
+    },
+    tui_state::{
+        AgentBrowserStatus, AgentEditor, AgentEditorField, AgentModelOption, AgentPicker,
+        MemoryBackend, ModelPickerStage, ModelSelectionScope, ProviderAuthentication,
+        ProviderPicker, QuestionPrompt, SettingsState, SettingsView, TuiState, WebBackend,
+        connection_label, provider_capability_rows, provider_dashboard_url,
+        terminal_image_mode_label,
     },
 };
 
@@ -66,13 +73,21 @@ struct RenderOutput {
     api_key_input_hit_region: Option<(ScreenPoint, ScreenPoint)>,
 }
 
-pub fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
+pub fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     draw_with_images(frame, state, None);
 }
 
 pub fn draw_with_images(
     frame: &mut Frame<'_>,
-    state: &mut AppState,
+    state: &mut TuiState,
+    image_renderer: Option<&mut TerminalImageRenderer>,
+) {
+    draw_tui_with_images(frame, state, image_renderer);
+}
+
+fn draw_tui_with_images(
+    frame: &mut Frame<'_>,
+    state: &mut TuiState,
     image_renderer: Option<&mut TerminalImageRenderer>,
 ) {
     let mut output = RenderOutput {
@@ -95,7 +110,7 @@ pub fn draw_with_images(
 
 fn draw_immutable(
     frame: &mut Frame<'_>,
-    state: &AppState,
+    state: &TuiState,
     mut image_renderer: Option<&mut TerminalImageRenderer>,
     output: &mut RenderOutput,
 ) {
@@ -206,7 +221,7 @@ fn draw_immutable(
     capture_and_highlight_selection(frame, state, area, selectable_regions, output);
 }
 
-fn provider_picker_popup(area: Rect, state: &AppState) -> Rect {
+fn provider_picker_popup(area: Rect, state: &TuiState) -> Rect {
     if state
         .client
         .provider_picker
@@ -221,7 +236,7 @@ fn provider_picker_popup(area: Rect, state: &AppState) -> Rect {
 
 fn capture_and_highlight_selection(
     frame: &mut Frame<'_>,
-    state: &AppState,
+    state: &TuiState,
     area: Rect,
     selectable_regions: Vec<Rect>,
     output: &mut RenderOutput,
@@ -272,7 +287,7 @@ fn rect_contains(area: Rect, point: ScreenPoint) -> bool {
         && point.row < area.bottom()
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(
         Paragraph::new(Line::default()).style(Style::default().bg(SURFACE)),
         area,
@@ -323,7 +338,7 @@ struct TranscriptHitRegions {
 fn render_transcript(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &AppState,
+    state: &TuiState,
     image_renderer: Option<&mut TerminalImageRenderer>,
     output: &mut RenderOutput,
 ) {
@@ -440,7 +455,7 @@ fn render_transcript_view(
     }
 }
 
-fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let items = state
         .queue
         .iter()
@@ -448,7 +463,7 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .map(|(index, prompt)| {
             let selected = state.client.queue_selection == Some(index);
             let marker = if selected { "›" } else { " " };
-            let summary = prompt.text.lines().next().unwrap_or_default();
+            let summary = prompt.summary.lines().next().unwrap_or_default();
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{marker} {}  ", index + 1),
@@ -467,12 +482,12 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(List::new(items).block(block), area);
 }
 
-fn todo_panel_height(state: &AppState) -> u16 {
+fn todo_panel_height(state: &TuiState) -> u16 {
     let has_in_progress_task = state
         .todo_phases
         .iter()
         .flat_map(|phase| &phase.tasks)
-        .any(|task| task.status == TodoStatus::InProgress);
+        .any(|task| task.status == TodoStatusView::InProgress);
     if !has_in_progress_task {
         return 0;
     }
@@ -487,7 +502,7 @@ fn todo_panel_height(state: &AppState) -> u16 {
         .min(8)
 }
 
-fn render_todos(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_todos(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let total = state
         .todo_phases
         .iter()
@@ -497,7 +512,7 @@ fn render_todos(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .todo_phases
         .iter()
         .flat_map(|phase| &phase.tasks)
-        .filter(|task| task.status == TodoStatus::Completed)
+        .filter(|task| task.status == TodoStatusView::Completed)
         .count();
     let available_lines = usize::from(area.height.saturating_sub(2));
     let mut lines = Vec::with_capacity(available_lines);
@@ -508,10 +523,10 @@ fn render_todos(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         ));
         for task in &phase.tasks {
             let (marker, color) = match task.status {
-                TodoStatus::Pending => ("○", MUTED),
-                TodoStatus::InProgress => ("◉", WARNING),
-                TodoStatus::Completed => ("✓", SUCCESS),
-                TodoStatus::Abandoned => ("−", MUTED),
+                TodoStatusView::Pending => ("○", MUTED),
+                TodoStatusView::InProgress => ("◉", WARNING),
+                TodoStatusView::Completed => ("✓", SUCCESS),
+                TodoStatusView::Abandoned => ("−", MUTED),
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {marker} "), Style::default().fg(color)),
@@ -555,7 +570,7 @@ fn subagent_modal_popup(area: Rect) -> Rect {
 fn render_subagent_modal(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &AppState,
+    state: &TuiState,
     output: &mut RenderOutput,
 ) {
     let Some((agent, objective)) = state.selected_subagent_summary() else {
@@ -586,7 +601,7 @@ fn render_subagent_modal(
     output.tool_toggle_hit_regions = tool_toggles;
 }
 
-fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<Position> {
+fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) -> Option<Position> {
     let composer_label = if state.is_shell_mode() {
         " Shell "
     } else {
@@ -639,7 +654,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Optio
     ))
 }
 
-fn context_usage_label(estimated_tokens: usize, context_window: Option<usize>) -> Option<String> {
+fn context_usage_label(estimated_tokens: u64, context_window: Option<u64>) -> Option<String> {
     match context_window {
         Some(context_window) => Some(format!(
             "CTX ~{} / {} ",
@@ -653,7 +668,7 @@ fn context_usage_label(estimated_tokens: usize, context_window: Option<usize>) -
     }
 }
 
-fn context_usage_color(estimated_tokens: usize, context_window: Option<usize>) -> Color {
+fn context_usage_color(estimated_tokens: u64, context_window: Option<u64>) -> Color {
     let Some(context_window) = context_window.filter(|window| *window > 0) else {
         return MUTED;
     };
@@ -666,8 +681,8 @@ fn context_usage_color(estimated_tokens: usize, context_window: Option<usize>) -
     }
 }
 
-fn compact_token_count(tokens: usize) -> String {
-    fn scaled(tokens: usize, divisor: usize, suffix: char) -> String {
+fn compact_token_count(tokens: u64) -> String {
+    fn scaled(tokens: u64, divisor: u64, suffix: char) -> String {
         let tenths = tokens.saturating_mul(10).saturating_add(divisor / 2) / divisor;
         if tenths.is_multiple_of(10) {
             format!("{}{suffix}", tenths / 10)
@@ -715,7 +730,7 @@ fn styled_composer_line(line: String, first_prompt_line: bool) -> Line<'static> 
     Line::from(spans)
 }
 
-fn render_command_completions(frame: &mut Frame<'_>, composer_area: Rect, state: &AppState) {
+fn render_command_completions(frame: &mut Frame<'_>, composer_area: Rect, state: &TuiState) {
     let completions = state.command_completions();
     if completions.is_empty() || composer_area.width < 4 {
         return;
@@ -752,7 +767,7 @@ fn render_command_completions(frame: &mut Frame<'_>, composer_area: Rect, state:
     frame.render_widget(List::new(items).block(block), popup);
 }
 
-fn render_prompt_metadata(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_prompt_metadata(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if state.status_message.starts_with("Reloaded ") {
         let line = Line::from(vec![
             Span::styled(" ✓ ", Style::default().fg(SUCCESS).bold()),
@@ -833,17 +848,17 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let popup = centered(area, 76, 22);
     frame.render_widget(Clear, popup);
     let settings = state.client.settings.as_ref().expect("settings checked");
     let lines = match settings.view {
-        crate::state::SettingsView::Menu => settings_menu_lines(settings),
-        crate::state::SettingsView::Addons => settings_addon_lines(settings),
-        crate::state::SettingsView::WebBrowsing => settings_web_browsing_lines(settings),
-        crate::state::SettingsView::Vision => settings_vision_lines(settings),
-        crate::state::SettingsView::Memory => settings_memory_lines(settings),
-        crate::state::SettingsView::TerminalImages => settings_terminal_image_lines(settings),
+        SettingsView::Menu => settings_menu_lines(settings),
+        SettingsView::Addons => settings_addon_lines(settings),
+        SettingsView::WebBrowsing => settings_web_browsing_lines(settings),
+        SettingsView::Vision => settings_vision_lines(settings),
+        SettingsView::Memory => settings_memory_lines(settings),
+        SettingsView::TerminalImages => settings_terminal_image_lines(settings),
     };
     frame.render_widget(
         Paragraph::new(lines).block(overlay_block(" Settings ", ACCENT)),
@@ -851,7 +866,7 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
 }
 
-fn settings_menu_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+fn settings_menu_lines(settings: &SettingsState) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Search: ", Style::default().fg(MUTED)),
@@ -903,7 +918,7 @@ fn settings_menu_lines(settings: &crate::state::SettingsState) -> Vec<Line<'stat
     lines
 }
 
-fn settings_addon_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+fn settings_addon_lines(settings: &SettingsState) -> Vec<Line<'static>> {
     let rows = [
         ("Web browsing", settings.web.backend.label().to_owned()),
         (
@@ -917,7 +932,7 @@ fn settings_addon_lines(settings: &crate::state::SettingsState) -> Vec<Line<'sta
         ("Memory", settings.memory.backend.label().to_owned()),
         (
             "Terminal images",
-            settings.terminal_images.label().to_owned(),
+            terminal_image_mode_label(settings.terminal_images).to_owned(),
         ),
     ];
     let mut lines = vec![
@@ -935,7 +950,7 @@ fn settings_addon_lines(settings: &crate::state::SettingsState) -> Vec<Line<'sta
     lines
 }
 
-fn settings_memory_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+fn settings_memory_lines(settings: &SettingsState) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled("Memory", Style::default().fg(TEXT).bold()),
         Line::default(),
@@ -946,7 +961,7 @@ fn settings_memory_lines(settings: &crate::state::SettingsState) -> Vec<Line<'st
         ),
         Line::default(),
     ];
-    if settings.memory.backend == crate::memory::MemoryBackend::Disabled {
+    if settings.memory.backend == MemoryBackend::Disabled {
         lines.push(settings_status_row("Status", "Disabled", MUTED));
     } else {
         lines.push(settings_row(
@@ -1003,11 +1018,15 @@ fn settings_memory_lines(settings: &crate::state::SettingsState) -> Vec<Line<'st
     lines
 }
 
-fn settings_terminal_image_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+fn settings_terminal_image_lines(settings: &SettingsState) -> Vec<Line<'static>> {
     vec![
         Line::styled("Terminal images", Style::default().fg(TEXT).bold()),
         Line::default(),
-        settings_row("Previews", settings.terminal_images.label(), true),
+        settings_row(
+            "Previews",
+            terminal_image_mode_label(settings.terminal_images),
+            true,
+        ),
         Line::default(),
         settings_status_row("Applies", "Next launch", MUTED),
         settings_status_row("Fallback", "Attachment labels", MUTED),
@@ -1019,7 +1038,7 @@ fn settings_terminal_image_lines(settings: &crate::state::SettingsState) -> Vec<
     ]
 }
 
-fn settings_vision_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+fn settings_vision_lines(settings: &SettingsState) -> Vec<Line<'static>> {
     let model = settings.vision.model.as_deref().unwrap_or("Disabled");
     vec![
         Line::styled("Vision", Style::default().fg(TEXT).bold()),
@@ -1047,7 +1066,7 @@ fn settings_vision_lines(settings: &crate::state::SettingsState) -> Vec<Line<'st
     ]
 }
 
-fn settings_web_browsing_lines(settings: &crate::state::SettingsState) -> Vec<Line<'static>> {
+fn settings_web_browsing_lines(settings: &SettingsState) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled("Web browsing", Style::default().fg(TEXT).bold()),
         Line::default(),
@@ -1059,18 +1078,16 @@ fn settings_web_browsing_lines(settings: &crate::state::SettingsState) -> Vec<Li
         Line::default(),
     ];
     match settings.web.backend {
-        crate::web::WebBackend::Disabled => {
+        WebBackend::Disabled => {
             lines.push(settings_status_row("Status", "Disabled", MUTED));
         }
-        crate::web::WebBackend::AgentBrowser => {
+        WebBackend::AgentBrowser => {
             let (status, color) = match &settings.agent_browser_status {
-                crate::state::AgentBrowserStatus::Checking => ("Checking…".to_owned(), MUTED),
-                crate::state::AgentBrowserStatus::Available(version) => {
+                AgentBrowserStatus::Checking => ("Checking…".to_owned(), MUTED),
+                AgentBrowserStatus::Available(version) => {
                     (format!("Available · {version}"), SUCCESS)
                 }
-                crate::state::AgentBrowserStatus::Unavailable => {
-                    ("Not detected".to_owned(), WARNING)
-                }
+                AgentBrowserStatus::Unavailable => ("Not detected".to_owned(), WARNING),
             };
             lines.push(settings_status_row("Status", &status, color));
             lines.push(settings_status_row(
@@ -1079,7 +1096,7 @@ fn settings_web_browsing_lines(settings: &crate::state::SettingsState) -> Vec<Li
                 MUTED,
             ));
         }
-        crate::web::WebBackend::Firecrawl => {
+        WebBackend::Firecrawl => {
             let masked = if settings.web.firecrawl_api_key.is_empty() {
                 "not set".to_owned()
             } else {
@@ -1132,7 +1149,7 @@ fn settings_row(label: &str, value: &str, selected: bool) -> Line<'static> {
 fn render_provider_picker(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &AppState,
+    state: &TuiState,
     output: &mut RenderOutput,
 ) {
     output.oauth_link_hit_region = None;
@@ -1174,7 +1191,7 @@ fn render_provider_picker(
         for (index, provider) in picker.providers.iter().enumerate() {
             let selected = index == picker.selected;
             let marker = if selected { "› " } else { "  " };
-            let state_label = if provider.credential.is_none() {
+            let state_label = if !provider.credential_configured {
                 "setup required"
             } else if provider.enabled {
                 "enabled"
@@ -1202,7 +1219,7 @@ fn render_provider_picker(
                         state_label,
                         Style::default().fg(if provider.enabled {
                             SUCCESS
-                        } else if provider.credential.is_none() {
+                        } else if !provider.credential_configured {
                             WARNING
                         } else {
                             MUTED
@@ -1221,7 +1238,7 @@ fn render_provider_picker(
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let popup = centered(area, 82, 24);
     frame.render_widget(Clear, popup);
     let picker = state.client.agent_picker.as_ref().expect("picker checked");
@@ -1246,7 +1263,7 @@ fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             dropdown,
             " Select Agent Model ",
             "No matching models",
-            crate::state::AgentModelOption::search_text,
+            AgentModelOption::search_text,
             |option, selected| {
                 Line::from(vec![
                     Span::styled(
@@ -1275,7 +1292,7 @@ fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         render_model_options_popup(
             frame,
             centered(area, 72, 18),
-            &crate::backend::ModelOptions {
+            &ModelOptions {
                 reasoning_effort: None,
                 fast_mode,
             },
@@ -1347,7 +1364,7 @@ fn render_searchable_dropdown<T, S, R>(
     ));
 }
 
-fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> {
+fn agent_editor_lines(editor: &AgentEditor) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
             "Tab/↑/↓ field · type or paste · Enter choose model · changes save automatically · Esc back",
@@ -1363,7 +1380,7 @@ fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> 
         editor.model.as_str(),
         editor.fallback_models.as_str(),
     ];
-    for (field, value) in crate::state::AgentEditorField::ALL.into_iter().zip(values) {
+    for (field, value) in AgentEditorField::ALL.into_iter().zip(values) {
         let selected = field == editor.field;
         lines.push(
             Line::from(vec![
@@ -1399,7 +1416,7 @@ fn agent_editor_lines(editor: &crate::state::AgentEditor) -> Vec<Line<'static>> 
     lines
 }
 
-fn agent_list_lines(picker: &crate::state::AgentPicker, has_parent: bool) -> Vec<Line<'static>> {
+fn agent_list_lines(picker: &AgentPicker, has_parent: bool) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
             if has_parent {
@@ -1420,10 +1437,20 @@ fn agent_list_lines(picker: &crate::state::AgentPicker, has_parent: bool) -> Vec
     for (index, agent) in picker.agents.iter().enumerate() {
         let selected = index == picker.selected;
         lines.push(agent_list_row(agent, selected));
-        let models = std::iter::once(agent.model.as_deref().unwrap_or("inherit parent model"))
-            .chain(agent.fallback_models.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" → ");
+        let models = std::iter::once(
+            agent
+                .model_id
+                .as_ref()
+                .map_or("inherit parent model", nakode_protocol::ModelId::as_str),
+        )
+        .chain(
+            agent
+                .fallback_models
+                .iter()
+                .map(nakode_protocol::ModelId::as_str),
+        )
+        .collect::<Vec<_>>()
+        .join(" → ");
         let models = if agent.fast_mode {
             format!("{models}  ⚡ fast")
         } else {
@@ -1437,7 +1464,7 @@ fn agent_list_lines(picker: &crate::state::AgentPicker, has_parent: bool) -> Vec
     lines
 }
 
-fn agent_list_row(agent: &crate::agent::AgentDefinition, selected: bool) -> Line<'static> {
+fn agent_list_row(agent: &nakode_protocol::AgentDefinitionView, selected: bool) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             if selected { "› " } else { "  " },
@@ -1464,8 +1491,8 @@ fn agent_list_row(agent: &crate::agent::AgentDefinition, selected: bool) -> Line
 fn render_provider_details(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &AppState,
-    picker: &crate::state::ProviderPicker,
+    state: &TuiState,
+    picker: &ProviderPicker,
     output: &mut RenderOutput,
 ) {
     let popup = centered(area, 72, 32);
@@ -1479,9 +1506,7 @@ fn render_provider_details(
         "disabled"
     };
     let state_color = if provider.enabled { SUCCESS } else { MUTED };
-    let connection = state
-        .provider_connection(&provider.provider)
-        .map_or("not running", crate::state::ConnectionState::label);
+    let connection = connection_label(&provider.connection);
     let mut lines = vec![
         Line::from(vec![
             Span::styled("State      ", Style::default().fg(MUTED)),
@@ -1493,16 +1518,16 @@ fn render_provider_details(
         ]),
         Line::from(vec![
             Span::styled("Slug       ", Style::default().fg(MUTED)),
-            Span::styled(&provider.provider, Style::default().fg(TEXT)),
+            Span::styled(provider.id.as_str(), Style::default().fg(TEXT)),
         ]),
         Line::from(vec![
             Span::styled("Credential ", Style::default().fg(MUTED)),
             Span::styled(
                 provider
-                    .credential
-                    .as_ref()
-                    .map_or("not configured", |credential| credential.kind.as_str()),
-                Style::default().fg(if provider.credential.is_some() {
+                    .credential_kind
+                    .as_deref()
+                    .unwrap_or("not configured"),
+                Style::default().fg(if provider.credential_configured {
                     SUCCESS
                 } else {
                     WARNING
@@ -1515,16 +1540,12 @@ fn render_provider_details(
     let authentication_url_line = if let Some(authentication) = &picker.authentication {
         let first_line = lines.len();
         append_provider_authentication(&mut lines, authentication);
-        if matches!(
-            authentication,
-            crate::state::ProviderAuthentication::ApiKeyInput { .. }
-        ) {
+        if matches!(authentication, ProviderAuthentication::ApiKeyInput { .. }) {
             api_key_input_line = Some(first_line + 2);
         }
         matches!(
             authentication,
-            crate::state::ProviderAuthentication::Challenge { .. }
-                | crate::state::ProviderAuthentication::ApiKeyInput { .. }
+            ProviderAuthentication::Challenge { .. } | ProviderAuthentication::ApiKeyInput { .. }
         )
         .then_some(first_line + 1)
     } else {
@@ -1532,9 +1553,9 @@ fn render_provider_details(
     };
     if !matches!(
         picker.authentication,
-        Some(crate::state::ProviderAuthentication::ApiKeyInput { .. })
+        Some(ProviderAuthentication::ApiKeyInput { .. })
     ) {
-        append_provider_actions(&mut lines, provider.credential.is_some());
+        append_provider_actions(&mut lines, provider.credential_configured);
     }
     let block = overlay_block(format!(" {} ", provider.display_name), ACCENT);
     frame.render_widget(
@@ -1548,29 +1569,26 @@ fn render_provider_details(
         popup,
         authentication_url_line,
         picker.authentication.as_ref(),
-        crate::backend::api_key_provider_setup(&provider.provider).map(|setup| setup.dashboard_url),
+        provider_dashboard_url(provider),
     );
     register_api_key_input(output, popup, api_key_input_line);
 }
 
 fn append_provider_capabilities(
     lines: &mut Vec<Line<'_>>,
-    state: &AppState,
-    provider: &crate::session::ProviderRecord,
+    _state: &TuiState,
+    provider: &nakode_protocol::ProviderView,
 ) {
-    if provider.credential.is_none() {
+    if !provider.credential_configured {
         return;
     }
-    let Some(capabilities) = state.provider_capabilities(&provider.provider) else {
-        return;
-    };
     lines.push(Line::default());
     lines.push(Line::styled(
         "Capabilities",
         Style::default().fg(ACCENT_BRIGHT).bold(),
     ));
-    for (name, support) in capability_rows(capabilities) {
-        let supported = support.is_supported();
+    for (name, capability) in provider_capability_rows() {
+        let supported = provider.capabilities.supports(capability);
         lines.push(Line::from(vec![
             Span::styled(format!("  {name:<22}"), Style::default().fg(MUTED)),
             Span::styled(
@@ -1621,21 +1639,21 @@ fn register_oauth_link(
     output: &mut RenderOutput,
     popup: Rect,
     line: Option<usize>,
-    authentication: Option<&crate::state::ProviderAuthentication>,
+    authentication: Option<&ProviderAuthentication>,
     api_key_url: Option<&str>,
 ) {
     let Some(line) = line else {
         return;
     };
     let url = match authentication {
-        Some(crate::state::ProviderAuthentication::Challenge {
+        Some(ProviderAuthentication::Challenge {
             verification_url, ..
         }) => verification_url.clone(),
-        Some(crate::state::ProviderAuthentication::ApiKeyInput { .. }) => {
+        Some(ProviderAuthentication::ApiKeyInput { .. }) => {
             let Some(url) = api_key_url else { return };
             url.to_owned()
         }
-        Some(crate::state::ProviderAuthentication::Starting) | None => return,
+        Some(ProviderAuthentication::Starting) | None => return,
     };
     let row = popup
         .y
@@ -1650,15 +1668,15 @@ fn register_oauth_link(
 
 fn append_provider_authentication<'a>(
     lines: &mut Vec<Line<'a>>,
-    authentication: &'a crate::state::ProviderAuthentication,
+    authentication: &'a ProviderAuthentication,
 ) {
     lines.push(Line::default());
     match authentication {
-        crate::state::ProviderAuthentication::Starting => lines.push(Line::styled(
+        ProviderAuthentication::Starting => lines.push(Line::styled(
             "Saving or starting provider authentication…",
             Style::default().fg(WARNING),
         )),
-        crate::state::ProviderAuthentication::ApiKeyInput { value, focused } => {
+        ProviderAuthentication::ApiKeyInput { value, focused } => {
             lines.push(Line::styled(
                 "[o] Get API key ↗",
                 Style::default()
@@ -1687,7 +1705,7 @@ fn append_provider_authentication<'a>(
                 ),
             ]));
         }
-        crate::state::ProviderAuthentication::Challenge {
+        ProviderAuthentication::Challenge {
             verification_url,
             user_code,
         } => {
@@ -1716,25 +1734,7 @@ fn append_provider_authentication<'a>(
     }
 }
 
-fn capability_rows(
-    capabilities: &crate::backend::BackendCapabilities,
-) -> [(&'static str, crate::backend::CapabilitySupport); 11] {
-    [
-        ("Resume", capabilities.resume),
-        ("Steering", capabilities.steering),
-        ("Interruption", capabilities.interruption),
-        ("Model catalog", capabilities.model_catalog),
-        ("Models need session", capabilities.models_require_session),
-        ("Session model config", capabilities.session_model_config),
-        ("Context compression", capabilities.context_compaction),
-        ("Approvals", capabilities.approvals),
-        ("Native tools", capabilities.native_tools),
-        ("MCP", capabilities.mcp),
-        ("Close session", capabilities.close_session),
-    ]
-}
-
-fn render_approval(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalRequest) {
+fn render_approval(frame: &mut Frame<'_>, area: Rect, approval: &InteractionView) {
     let popup = centered(area, 76, 12);
     frame.render_widget(Clear, popup);
     let controls = " y accept once · a accept for session · n decline ";
@@ -1752,27 +1752,27 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalRequest
     );
 }
 
-fn render_question(frame: &mut Frame<'_>, area: Rect, prompt: &crate::state::QuestionPrompt) {
+fn render_question(frame: &mut Frame<'_>, area: Rect, prompt: &QuestionPrompt) {
     let description_count = prompt
-        .request
+        .interaction
         .options
         .iter()
         .filter(|option| option.description.is_some())
         .count();
-    let height = u16::try_from(prompt.request.options.len() + description_count)
+    let height = u16::try_from(prompt.interaction.options.len() + description_count)
         .unwrap_or(8)
         .saturating_add(8)
         .min(20);
     let popup = centered(area, 76, height);
     frame.render_widget(Clear, popup);
     let mut lines = vec![
-        Line::styled(&prompt.request.question, Style::default().fg(TEXT)),
+        Line::styled(&prompt.interaction.detail, Style::default().fg(TEXT)),
         Line::default(),
     ];
-    for (index, option) in prompt.request.options.iter().enumerate() {
+    for (index, option) in prompt.interaction.options.iter().enumerate() {
         let selected = index == prompt.selected;
         let checked = prompt.selections.get(index).copied().unwrap_or(false);
-        let marker = if prompt.request.multi {
+        let marker = if prompt.interaction.multiple {
             if checked {
                 "✓"
             } else if selected {
@@ -1795,7 +1795,7 @@ fn render_question(frame: &mut Frame<'_>, area: Rect, prompt: &crate::state::Que
                 "{marker} {}. {}{}",
                 index + 1,
                 option.label,
-                if prompt.request.recommended == Some(index) {
+                if option.recommended {
                     " (Recommended)"
                 } else {
                     ""
@@ -1812,7 +1812,7 @@ fn render_question(frame: &mut Frame<'_>, area: Rect, prompt: &crate::state::Que
     }
     lines.push(Line::default());
     lines.push(Line::styled(
-        if prompt.request.multi {
+        if prompt.interaction.multiple {
             " ↑/↓ select · Space toggle · Enter confirm "
         } else {
             " ↑/↓ select · Enter choose · 1-8 quick select "
@@ -1821,13 +1821,16 @@ fn render_question(frame: &mut Frame<'_>, area: Rect, prompt: &crate::state::Que
     ));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(overlay_block(format!(" {} ", prompt.request.title), ACCENT))
+            .block(overlay_block(
+                format!(" {} ", prompt.interaction.title),
+                ACCENT,
+            ))
             .wrap(Wrap { trim: false }),
         popup,
     );
 }
 
-fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let popup = centered(area, 78, 18);
     frame.render_widget(Clear, popup);
     let picker = state
@@ -1860,7 +1863,7 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         {
             let selected = index == picker.selected;
             let marker = if selected { "› " } else { "  " };
-            let short_id = session.id.get(..8).unwrap_or(&session.id);
+            let short_id = session.id.as_str().get(..8).unwrap_or(session.id.as_str());
             lines.push(
                 Line::from(vec![
                     Span::styled(
@@ -1878,7 +1881,7 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             }),
                     ),
                     Span::styled(
-                        format!("  {short_id}  {}", relative_time(session.updated_at)),
+                        format!("  {short_id}  {}", relative_time(session.updated_at_ms)),
                         Style::default().fg(MUTED),
                     ),
                 ])
@@ -1899,14 +1902,14 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-fn relative_time(timestamp: i64) -> String {
+fn relative_time(timestamp_ms: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
         .try_into()
         .unwrap_or(i64::MAX);
-    let age = now.saturating_sub(timestamp);
+    let age = now.saturating_sub(timestamp_ms.saturating_div(1_000));
     match age {
         0..=59 => "now".to_owned(),
         60..=3_599 => format!("{}m ago", age / 60),
@@ -1918,7 +1921,7 @@ fn relative_time(timestamp: i64) -> String {
 fn render_model_options_popup(
     frame: &mut Frame<'_>,
     popup: Rect,
-    options: &crate::backend::ModelOptions,
+    options: &ModelOptions,
     option_selected: usize,
     fast_only: bool,
     description: &str,
@@ -1979,11 +1982,11 @@ fn render_model_options_popup(
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let popup = centered(area, 72, 18);
     frame.render_widget(Clear, popup);
     let picker = state.client.model_picker.as_ref().expect("picker checked");
-    if picker.stage == crate::state::ModelPickerStage::Options {
+    if picker.stage == ModelPickerStage::Options {
         render_model_options_popup(
             frame,
             popup,
@@ -1991,12 +1994,8 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             picker.option_selected,
             picker.options_fast_only,
             match (picker.scope, picker.options_fast_only) {
-                (crate::state::ModelSelectionScope::Session, true) => {
-                    "Configure this session's Cursor model"
-                }
-                (crate::state::ModelSelectionScope::Session, false) => {
-                    "Configure this session's OpenAI model"
-                }
+                (ModelSelectionScope::Session, true) => "Configure this session's Cursor model",
+                (ModelSelectionScope::Session, false) => "Configure this session's OpenAI model",
                 (_, true) => "Configure the Cursor model default",
                 (_, false) => "Configure the OpenAI model default",
             },
@@ -2012,10 +2011,9 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     for (index, model) in filtered.iter().enumerate() {
         let selected = index == picker.selected;
         let marker = if selected { "› " } else { "  " };
-        let qualified = model.qualified_id();
-        let display = model.display_name();
+        let display = &model.display_name;
         let fast = state.model_uses_fast_mode(model);
-        let current = if state.selected_model.as_deref() == Some(qualified.as_str()) {
+        let current = if state.selected_model.as_ref() == Some(&model.id) {
             "  current"
         } else if model.is_default {
             "  default"
@@ -2038,7 +2036,10 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             Modifier::empty()
                         }),
                 ),
-                Span::styled(format!("  {}", model.provider), Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("  {}", model.provider_id),
+                    Style::default().fg(MUTED),
+                ),
                 Span::styled(if fast { "  ⚡" } else { "" }, Style::default().fg(ACCENT)),
                 Span::styled(current, Style::default().fg(MUTED)),
             ])
@@ -2066,9 +2067,9 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     ));
 
     let title = match picker.scope {
-        crate::state::ModelSelectionScope::Default => " Default Model ",
-        crate::state::ModelSelectionScope::Session => " Switch Session Model ",
-        crate::state::ModelSelectionScope::Vision => " Vision Model ",
+        ModelSelectionScope::Default => " Default Model ",
+        ModelSelectionScope::Session => " Switch Session Model ",
+        ModelSelectionScope::Vision => " Vision Model ",
     };
     let block = overlay_block(title, ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -2166,48 +2167,195 @@ fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use nakode_protocol::{
+        AgentBrowserView, BootstrapView, ConnectionView, ContextUsageView, MemorySettingsView,
+        ModelConfigurationView, ModelId, ModelOptions, ModelView, ProviderAuthenticationView,
+        ProviderCapabilities, ProviderCapability, ProviderId, ProviderView, RunId, RunStatus,
+        RunView, SessionActivity, SessionId, SessionView, SettingsView as ProtocolSettingsView,
+        TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TranscriptEntryKind,
+        TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, VisionSettingsView,
+        WebSettingsView, WorkspaceId,
+    };
     use ratatui::{Terminal, backend::TestBackend};
 
     use crate::{
-        agent::AgentCatalog,
-        backend::{
-            BackendCapabilities, BackendEvent, BackendIdentity, CODEX_PROVIDER, CURSOR_PROVIDER,
-            CapabilitySupport, DEVIN_PROVIDER, ModelInfo, ModelOptions, TodoItem, TodoPhase,
-            TodoStatus,
-        },
-        session::ProviderRecord,
-        state::{ActiveTurn, AgentRequest, AppState, ContextUsageState, Effect},
         transcript::{
             LineTone, MarkdownModifier, MarkdownSpan, MarkdownStyle, MarkdownTone, ProjectedLine,
         },
+        tui_state::{
+            AgentEditorField, ModelPicker, ModelPickerStage, ModelSelectionScope, SettingsView,
+            TuiState,
+        },
     };
 
-    fn install_test_agent(state: &mut AppState) {
-        let directory = tempfile::tempdir().expect("agent directory");
-        std::fs::write(
-            directory.path().join("explorer.toml"),
-            r#"slug = "explorer"
-description = "Explores code context"
-system_prompt = "Explore carefully."
-first_message = "Inspect the delegated question."
-"#,
-        )
-        .expect("agent fixture");
-        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+    fn bootstrap() -> BootstrapView {
+        BootstrapView {
+            workspace_id: WorkspaceId::from("workspace"),
+            workspace_path: "/tmp/project".to_owned(),
+            providers: Vec::new(),
+            models: Vec::new(),
+            agents: Vec::new(),
+            skills: Vec::new(),
+            settings: ProtocolSettingsView {
+                web: WebSettingsView {
+                    backend: "disabled".to_owned(),
+                    credential_configured: false,
+                    agent_browser: AgentBrowserView::Unavailable,
+                },
+                memory: MemorySettingsView {
+                    backend: "disabled".to_owned(),
+                    executable: String::new(),
+                    global_bank: String::new(),
+                    data_directory: String::new(),
+                    configured: false,
+                    available: false,
+                },
+                vision: VisionSettingsView { model_id: None },
+                terminal_images: TerminalImageModeView::Auto,
+            },
+            sessions: Vec::new(),
+            active_session: Some(session()),
+        }
+    }
+
+    fn session() -> SessionView {
+        SessionView {
+            id: SessionId::from("session"),
+            revision: 1,
+            workspace_id: WorkspaceId::from("workspace"),
+            title: "Session".to_owned(),
+            status_message: String::new(),
+            diagnostic_count: 0,
+            activity: SessionActivity::Idle,
+            selected_provider_id: None,
+            selected_model_id: None,
+            active_agent_session: None,
+            active_turn: None,
+            context_usage: None,
+            transcript: empty_transcript(),
+            recoverable_prompt: None,
+            queue: Vec::new(),
+            interactions: Vec::new(),
+            todos: Vec::new(),
+            runs: Vec::new(),
+            runs_has_earlier: false,
+            notices: Vec::new(),
+        }
+    }
+
+    fn empty_transcript() -> TranscriptPage {
+        TranscriptPage {
+            entries: Vec::new(),
+            has_earlier: false,
+            stream_active: false,
+            stream_label: "Nakode".to_owned(),
+        }
+    }
+
+    fn state() -> TuiState {
+        TuiState::from_bootstrap(&bootstrap(), 2_000)
+    }
+
+    fn model(id: &str, display_name: &str, fast_mode: bool) -> ModelView {
+        let (provider, model_slug) = id.split_once('/').expect("qualified model");
+        ModelView {
+            id: ModelId::from(id),
+            provider_id: ProviderId::from(provider),
+            model_slug: model_slug.to_owned(),
+            display_name: display_name.to_owned(),
+            is_default: true,
+            reasoning_effort: None,
+            fast_mode,
+            configuration: ModelConfigurationView::default(),
+        }
+    }
+
+    fn provider(
+        id: &str,
+        display_name: &str,
+        enabled: bool,
+        credential_configured: bool,
+    ) -> ProviderView {
+        ProviderView {
+            id: ProviderId::from(id),
+            display_name: display_name.to_owned(),
+            enabled,
+            credential_configured,
+            credential_kind: credential_configured.then(|| "test".to_owned()),
+            connection: if enabled {
+                ConnectionView::Ready
+            } else {
+                ConnectionView::Disabled
+            },
+            capabilities: ProviderCapabilities::default(),
+            authentication: None,
+        }
+    }
+
+    fn run(id: &str, objective: &str, status: RunStatus) -> RunView {
+        RunView {
+            id: RunId::from(id),
+            agent_slug: "explorer".to_owned(),
+            provider_id: ProviderId::from("openai-codex"),
+            objective: objective.to_owned(),
+            objective_start_byte: 0,
+            objective_total_bytes: u64::try_from(objective.len()).unwrap_or(u64::MAX),
+            status,
+            latest_activity: String::new(),
+            latest_activity_start_byte: 0,
+            latest_activity_total_bytes: 0,
+            outcome: None,
+            outcome_start_byte: 0,
+            outcome_total_bytes: 0,
+            result: None,
+            result_start_byte: 0,
+            result_total_bytes: 0,
+            transcript: TranscriptPage {
+                entries: vec![TranscriptEntryView {
+                    id: "parent-entry".into(),
+                    kind: TranscriptEntryKind::User,
+                    title: "PARENT".to_owned(),
+                    body: format!("Delegated task\n{objective}"),
+                    body_start_byte: 0,
+                    body_total_bytes: u64::try_from("Delegated task\n".len() + objective.len())
+                        .unwrap_or(u64::MAX),
+                    status: TranscriptEntryStatus::Complete,
+                    artifacts: Vec::new(),
+                }],
+                has_earlier: false,
+                stream_active: matches!(status, RunStatus::Starting | RunStatus::Working),
+                stream_label: "explorer".to_owned(),
+            },
+        }
+    }
+
+    fn state_with_run(objective: &str, status: RunStatus) -> TuiState {
+        let mut view = bootstrap();
+        view.active_session
+            .as_mut()
+            .expect("active session")
+            .runs
+            .push(run("run-1", objective, status));
+        TuiState::from_bootstrap(&view, 2_000)
     }
 
     #[test]
     fn memory_settings_render_provider_status_and_install_guidance() {
-        let mut state = AppState::new("/tmp/project", None, 100);
-        state.install_memory_config(crate::memory::MemoryConfig {
-            backend: crate::memory::MemoryBackend::Mnemosyne,
-            executable: "/missing/mnemosyne".into(),
-            global_bank: "my-global-memory".into(),
+        let mut view = bootstrap();
+        view.settings.memory = MemorySettingsView {
+            backend: "mnemosyne".to_owned(),
+            executable: "/missing/mnemosyne".to_owned(),
+            global_bank: "my-global-memory".to_owned(),
             data_directory: String::new(),
-        });
+            configured: true,
+            available: false,
+        };
+        let mut state = TuiState::from_bootstrap(&view, 100);
         state.open_settings();
         let settings = state.client.settings.as_mut().expect("settings");
-        settings.view = crate::state::SettingsView::Memory;
+        settings.view = SettingsView::Memory;
         let rendered = super::settings_memory_lines(settings)
             .into_iter()
             .flat_map(|line| {
@@ -2230,13 +2378,13 @@ first_message = "Inspect the delegated question."
     fn main_view_renders_into_a_test_backend() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", Some("fixture-model".to_owned()), 100);
-        state.handle_backend(BackendEvent::Ready(BackendIdentity {
-            provider: CODEX_PROVIDER.to_owned(),
-            display_name: "fake-codex".to_owned(),
-            version: None,
-            capabilities: BackendCapabilities::default(),
-        }));
+        let mut view = bootstrap();
+        view.models = vec![model("openai-codex/fixture-model", "Fixture Model", false)];
+        view.active_session
+            .as_mut()
+            .expect("active session")
+            .selected_model_id = Some(ModelId::from("openai-codex/fixture-model"));
+        let mut state = TuiState::from_bootstrap(&view, 100);
 
         terminal
             .draw(|frame| super::draw(frame, &mut state))
@@ -2270,7 +2418,7 @@ first_message = "Inspect the delegated question."
     fn composer_identifies_shell_mode_for_a_leading_bang() {
         let backend = TestBackend::new(80, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
+        let mut state = state();
         state.client.editor.set_text("!printf hello");
 
         terminal
@@ -2292,10 +2440,9 @@ first_message = "Inspect the delegated question."
     fn addons_settings_render_terminal_image_choice() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
+        let mut state = state();
         state.open_settings();
-        state.settings_move(3);
-        assert!(state.select_setting().is_empty());
+        state.client.settings.as_mut().expect("settings").view = SettingsView::Addons;
 
         terminal
             .draw(|frame| super::draw(frame, &mut state))
@@ -2318,8 +2465,8 @@ first_message = "Inspect the delegated question."
     fn successful_reload_replaces_prompt_metadata_with_a_visible_confirmation() {
         let backend = TestBackend::new(80, 1);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        state.configuration_reloaded(3, 2, false);
+        let mut state = state();
+        state.set_status("Reloaded 2 skills and 3 agents.");
 
         terminal
             .draw(|frame| super::render_prompt_metadata(frame, frame.area(), &state))
@@ -2340,12 +2487,8 @@ first_message = "Inspect the delegated question."
     fn composer_title_animates_while_nako_is_processing() {
         let backend = TestBackend::new(40, 5);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        state.active_turn = Some(ActiveTurn {
-            id: "turn-1".to_owned(),
-            model: None,
-            cancelling: false,
-        });
+        let mut state = state();
+        state.activity = SessionActivity::RunningTurn;
 
         terminal
             .draw(|frame| {
@@ -2372,10 +2515,11 @@ first_message = "Inspect the delegated question."
     fn composer_title_shows_estimated_context_usage() {
         let backend = TestBackend::new(50, 5);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        state.context_usage = Some(ContextUsageState {
+        let mut state = state();
+        state.context_usage = Some(ContextUsageView {
             estimated_tokens: 12_345,
             context_window: Some(258_400),
+            compacting: false,
         });
 
         terminal
@@ -2414,7 +2558,7 @@ first_message = "Inspect the delegated question."
     fn header_reports_when_no_model_is_selected() {
         let backend = TestBackend::new(40, 1);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let state = AppState::new("/tmp/project", None, 100);
+        let state = state();
 
         terminal
             .draw(|frame| super::render_header(frame, frame.area(), &state))
@@ -2434,24 +2578,13 @@ first_message = "Inspect the delegated question."
     fn header_normalizes_model_name_and_marks_fast_mode() {
         let backend = TestBackend::new(50, 1);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new(
-            "/tmp/project",
-            Some("openai-codex/gpt-5.6-sol".to_owned()),
-            100,
-        );
-        state.models.push(ModelInfo {
-            provider: CODEX_PROVIDER.to_owned(),
-            id: "gpt-5.6-sol".to_owned(),
-            is_default: true,
-        });
-        state.install_model_options(
-            CODEX_PROVIDER,
-            "gpt-5.6-sol",
-            ModelOptions {
-                reasoning_effort: Some("high".to_owned()),
-                fast_mode: true,
-            },
-        );
+        let mut view = bootstrap();
+        view.models = vec![model("openai-codex/gpt-5.6-sol", "GPT 5.6 Sol", true)];
+        view.active_session
+            .as_mut()
+            .expect("active session")
+            .selected_model_id = Some(ModelId::from("openai-codex/gpt-5.6-sol"));
+        let state = TuiState::from_bootstrap(&view, 100);
 
         terminal
             .draw(|frame| super::render_header(frame, frame.area(), &state))
@@ -2471,12 +2604,12 @@ first_message = "Inspect the delegated question."
     fn switch_options_popup_exposes_cursor_fast_mode_for_this_session() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        state.client.model_picker = Some(crate::state::ModelPicker {
+        let mut state = state();
+        state.client.model_picker = Some(ModelPicker {
             filter: String::new(),
             selected: 0,
-            scope: crate::state::ModelSelectionScope::Session,
-            stage: crate::state::ModelPickerStage::Options,
+            scope: ModelSelectionScope::Session,
+            stage: ModelPickerStage::Options,
             option_selected: 0,
             options: ModelOptions {
                 reasoning_effort: None,
@@ -2555,17 +2688,17 @@ first_message = "Inspect the delegated question."
     fn active_todos_render_as_a_compact_persistent_panel() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        state.todo_phases = vec![TodoPhase {
+        let mut state = state();
+        state.todo_phases = vec![TodoPhaseView {
             name: "Implementation".to_owned(),
             tasks: vec![
-                TodoItem {
+                TodoItemView {
                     content: "Project todo events".to_owned(),
-                    status: TodoStatus::Completed,
+                    status: TodoStatusView::Completed,
                 },
-                TodoItem {
+                TodoItemView {
                     content: "Render the active plan".to_owned(),
-                    status: TodoStatus::InProgress,
+                    status: TodoStatusView::InProgress,
                 },
             ],
         }];
@@ -2591,17 +2724,17 @@ first_message = "Inspect the delegated question."
     fn inactive_todos_do_not_render_as_a_persistent_panel() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        state.todo_phases = vec![TodoPhase {
+        let mut state = state();
+        state.todo_phases = vec![TodoPhaseView {
             name: "Finished work".to_owned(),
             tasks: vec![
-                TodoItem {
+                TodoItemView {
                     content: "Completed task".to_owned(),
-                    status: TodoStatus::Completed,
+                    status: TodoStatusView::Completed,
                 },
-                TodoItem {
+                TodoItemView {
                     content: "Pending task".to_owned(),
-                    status: TodoStatus::Pending,
+                    status: TodoStatusView::Pending,
                 },
             ],
         }];
@@ -2627,13 +2760,10 @@ first_message = "Inspect the delegated question."
     fn subagent_renders_inline_with_pending_status_and_truncated_objective() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        install_test_agent(&mut state);
-        state.invoke_agent(&AgentRequest {
-            id: 1,
-            agent: "explorer".to_owned(),
-            task: "Map the authentication flow and identify every relevant boundary".to_owned(),
-        });
+        let mut state = state_with_run(
+            "Map the authentication flow and identify every relevant boundary",
+            RunStatus::Starting,
+        );
 
         terminal
             .draw(|frame| super::draw(frame, &mut state))
@@ -2656,24 +2786,7 @@ first_message = "Inspect the delegated question."
     fn completed_subagent_remains_available_inline() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        install_test_agent(&mut state);
-        let effects = state.invoke_agent(&AgentRequest {
-            id: 1,
-            agent: "explorer".to_owned(),
-            task: "Inspect persistence boundaries".to_owned(),
-        });
-        let Effect::SpawnSubagent { run_id, .. } = &effects[0] else {
-            panic!("expected subagent launch");
-        };
-        state.handle_subagent_backend(
-            run_id,
-            BackendEvent::TurnCompleted {
-                turn_id: "child-turn".to_owned(),
-                outcome: crate::backend::TurnOutcome::Completed,
-                error: None,
-            },
-        );
+        let mut state = state_with_run("Inspect persistence boundaries", RunStatus::Completed);
 
         terminal
             .draw(|frame| super::draw(frame, &mut state))
@@ -2695,13 +2808,7 @@ first_message = "Inspect the delegated question."
     fn clicking_a_subagent_opens_its_reused_transcript_view() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        install_test_agent(&mut state);
-        state.invoke_agent(&AgentRequest {
-            id: 1,
-            agent: "explorer".to_owned(),
-            task: "Map authentication".to_owned(),
-        });
+        let mut state = state_with_run("Map authentication", RunStatus::Starting);
         terminal
             .draw(|frame| super::draw(frame, &mut state))
             .expect("render inline subagent");
@@ -2743,36 +2850,14 @@ first_message = "Inspect the delegated question."
     fn provider_menu_shows_state_and_live_capability_details() {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        state.handle_backend(BackendEvent::Ready(BackendIdentity {
-            provider: CODEX_PROVIDER.to_owned(),
-            display_name: "Codex".to_owned(),
-            version: None,
-            capabilities: BackendCapabilities {
-                resume: CapabilitySupport::Supported,
-                ..BackendCapabilities::default()
-            },
-        }));
-        state.client.editor.set_text("/providers");
-        let _ = state.submit_editor();
-        state.install_providers(vec![
-            ProviderRecord {
-                provider: CODEX_PROVIDER.to_owned(),
-                display_name: "Codex".to_owned(),
-                enabled: true,
-                credential: Some(crate::credential::CredentialMetadata {
-                    provider: CODEX_PROVIDER.to_owned(),
-                    kind: "chatgpt_device_code".to_owned(),
-                    updated_at: 1,
-                }),
-            },
-            ProviderRecord {
-                provider: DEVIN_PROVIDER.to_owned(),
-                display_name: "Devin".to_owned(),
-                enabled: false,
-                credential: None,
-            },
-        ]);
+        let mut view = bootstrap();
+        let mut codex = provider("openai-codex", "Codex", true, true);
+        codex.capabilities = ProviderCapabilities {
+            supported: BTreeSet::from([ProviderCapability::Resume]),
+        };
+        view.providers = vec![codex, provider("devin-acp", "Devin", false, false)];
+        let mut state = TuiState::from_bootstrap(&view, 100);
+        state.open_provider_picker();
 
         terminal
             .draw(|frame| super::draw(frame, &mut state))
@@ -2808,15 +2893,15 @@ first_message = "Inspect the delegated question."
     fn cursor_api_key_input_is_masked_in_provider_details() {
         let backend = TestBackend::new(100, 34);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        state.client.editor.set_text("/providers");
-        let _ = state.submit_editor();
-        state.install_providers(vec![ProviderRecord {
-            provider: CURSOR_PROVIDER.to_owned(),
-            display_name: "Cursor".to_owned(),
-            enabled: false,
-            credential: None,
-        }]);
+        let mut view = bootstrap();
+        let mut cursor = provider("cursor-acp", "Cursor", false, false);
+        cursor.authentication = Some(ProviderAuthenticationView::ApiKeyRequired {
+            dashboard_url: "https://cursor.example.test/api-keys".to_owned(),
+            credential_kind: "api_key".to_owned(),
+        });
+        view.providers = vec![cursor];
+        let mut state = TuiState::from_bootstrap(&view, 100);
+        state.open_provider_picker();
         state.open_provider_details();
 
         terminal
@@ -2866,26 +2951,16 @@ first_message = "Inspect the delegated question."
     fn provider_authentication_shows_full_url_and_click_target() {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
-        state.client.editor.set_text("/providers");
-        let _ = state.submit_editor();
-        state.install_providers(vec![ProviderRecord {
-            provider: CODEX_PROVIDER.to_owned(),
-            display_name: "Codex".to_owned(),
-            enabled: false,
-            credential: None,
-        }]);
-        state.open_provider_details();
-
-        state
-            .client
-            .provider_picker
-            .as_mut()
-            .expect("provider picker")
-            .authentication = Some(crate::state::ProviderAuthentication::Challenge {
+        let mut view = bootstrap();
+        let mut codex = provider("openai-codex", "Codex", false, false);
+        codex.authentication = Some(ProviderAuthenticationView::Challenge {
             verification_url: "https://app.example.test/auth/cli/continue".to_owned(),
             user_code: String::new(),
         });
+        view.providers = vec![codex];
+        let mut state = TuiState::from_bootstrap(&view, 100);
+        state.open_provider_picker();
+        state.open_provider_details();
         terminal
             .draw(|frame| super::draw(frame, &mut state))
             .expect("render provider authentication");
@@ -2925,7 +3000,7 @@ first_message = "Inspect the delegated question."
     fn help_overlay_lists_core_turn_controls() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
+        let mut state = state();
         state.client.show_help = true;
 
         terminal
@@ -2949,7 +3024,14 @@ first_message = "Inspect the delegated question."
     fn agent_menu_starts_empty_and_shows_all_editable_configuration_fields() {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
+        let mut view = bootstrap();
+        let mut cursor = model("cursor-acp/composer-2.5", "Composer 2.5", false);
+        cursor.configuration.fast_mode_configurable = true;
+        view.models = vec![
+            model("openai-codex/gpt-5.6-sol", "GPT 5.6 Sol", false),
+            cursor,
+        ];
+        let mut state = TuiState::from_bootstrap(&view, 100);
         state.open_agent_picker();
 
         terminal
@@ -2981,25 +3063,13 @@ first_message = "Inspect the delegated question."
         assert!(editor.contains("Enter choose model"));
         assert!(editor.contains("changes save automatically"));
 
-        state.models = vec![
-            crate::backend::ModelInfo {
-                provider: "openai-codex".to_owned(),
-                id: "gpt-5.6-sol".to_owned(),
-                is_default: true,
-            },
-            crate::backend::ModelInfo {
-                provider: crate::backend::CURSOR_PROVIDER.to_owned(),
-                id: "composer-2.5".to_owned(),
-                is_default: true,
-            },
-        ];
         state
             .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
             .expect("agent editor")
-            .field = crate::state::AgentEditorField::Model;
+            .field = AgentEditorField::Model;
         state.open_agent_model_dropdown();
         terminal
             .draw(|frame| super::draw(frame, &mut state))
@@ -3022,8 +3092,15 @@ first_message = "Inspect the delegated question."
         assert_eq!(cursor.y, 7);
         assert_eq!(cursor.x, 25);
 
-        state.agent_editor_insert_str("composer");
-        state.select_agent_model_dropdown();
+        let editor = state
+            .client
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor");
+        editor.model = "cursor-acp/composer-2.5".to_owned();
+        editor.model_dropdown = None;
+        editor.pending_fast_mode = Some(false);
         terminal
             .draw(|frame| super::draw(frame, &mut state))
             .expect("render agent model options");
@@ -3043,7 +3120,7 @@ first_message = "Inspect the delegated question."
     fn slash_input_renders_command_completions() {
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut state = AppState::new("/tmp/project", None, 100);
+        let mut state = state();
         state.client.editor.set_text("/");
 
         terminal

@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use crate::transcript::{EntryKind, TranscriptEntry};
+use crate::domain_transcript::{EntryKind, TranscriptEntry};
 
 const MAX_HANDOFF_CHARACTERS: usize = 48_000;
 
@@ -137,7 +137,7 @@ impl HandoffPackage {
 #[cfg(test)]
 mod tests {
     use super::{HandoffPackage, MAX_HANDOFF_CHARACTERS};
-    use crate::transcript::{EntryKind, EntryStatus, TranscriptEntry};
+    use crate::domain_transcript::{EntryKind, EntryStatus, TranscriptEntry};
 
     fn entry(kind: EntryKind, body: impl Into<String>) -> TranscriptEntry {
         TranscriptEntry {

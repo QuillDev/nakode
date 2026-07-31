@@ -14,9 +14,9 @@ pub use crate::backend::{CODEX_PROVIDER, DEVIN_PROVIDER};
 use crate::{
     backend::{ModelInfo, ModelOptions},
     credential::CredentialMetadata,
+    domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
     memory::{MemoryBackend, MemoryConfig},
-    terminal_image::TerminalImageMode,
-    transcript::{EntryKind, EntryStatus, TranscriptEntry},
+    settings::TerminalImageMode,
     vision::VisionConfig,
     web::{WebBackend, WebConfig},
 };

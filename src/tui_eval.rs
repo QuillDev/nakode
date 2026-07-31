@@ -19,14 +19,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
-    app,
-    backend::{
-        ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
-        BackendIdentity, BackendOperation, CapabilitySupport, DeltaKind, ItemKind, ItemStatus,
-        ModelInfo, NormalizedItem, QuestionOption, QuestionRequest, TodoPhase, TurnOutcome,
-    },
     render,
-    state::{AppState, Effect, SettingsView},
+    tui_input::{self, DeviceIntent},
+    tui_state::{SettingsView, TuiState},
 };
 
 /// Command-line options for the headless TUI evaluator.
@@ -119,41 +114,115 @@ enum ProtocolError {
 
 struct Harness {
     terminal: Terminal<TestBackend>,
-    state: AppState,
-    effects: Vec<Effect>,
+    state: TuiState,
+    view: nakode_protocol::BootstrapView,
+    commands: Vec<crate::api_projection::TuiAction>,
+    command_history: Vec<crate::api_projection::TuiAction>,
+    devices: Vec<Value>,
+    should_quit: bool,
+}
+
+fn initial_bootstrap(
+    workspace: &std::path::Path,
+) -> Result<nakode_protocol::BootstrapView, serde_json::Error> {
+    let workspace_path = workspace.to_string_lossy();
+    serde_json::from_value(json!({
+        "workspace_id": "tui-eval-workspace",
+        "workspace_path": workspace_path,
+        "providers": [],
+        "models": [],
+        "agents": [],
+        "skills": [],
+        "settings": {
+            "web": {
+                "backend": "disabled",
+                "credential_configured": false,
+                "agent_browser": {"state": "unavailable"}
+            },
+            "memory": {
+                "backend": "disabled",
+                "executable": "",
+                "global_bank": "",
+                "data_directory": "",
+                "configured": false,
+                "available": false
+            },
+            "vision": {"model_id": null},
+            "terminal_images": "auto"
+        },
+        "sessions": [{
+            "id": "tui-eval-session",
+            "workspace_id": "tui-eval-workspace",
+            "title": "TUI evaluation",
+            "active_provider_id": null,
+            "active_model_id": null,
+            "updated_at_ms": 0
+        }],
+        "active_session": {
+            "id": "tui-eval-session",
+            "revision": 0,
+            "workspace_id": "tui-eval-workspace",
+            "title": "TUI evaluation",
+            "status_message": "",
+            "diagnostic_count": 0,
+            "activity": "idle",
+            "selected_provider_id": null,
+            "selected_model_id": null,
+            "active_agent_session": null,
+            "active_turn": null,
+            "context_usage": null,
+            "transcript": {
+                "entries": [],
+                "has_earlier": false,
+                "stream_active": false,
+                "stream_label": ""
+            },
+            "queue": [],
+            "interactions": [],
+            "todos": [],
+            "runs": [],
+            "notices": []
+        }
+    }))
 }
 
 impl Harness {
     fn new(options: &Options) -> Result<Self, Box<dyn Error>> {
         let terminal = Terminal::new(TestBackend::new(options.width, options.height))?;
-        let state = AppState::new(options.workspace.to_string_lossy(), None, 2_000);
+        let view = initial_bootstrap(&options.workspace)?;
+        let state = TuiState::from_bootstrap(&view, 2_000);
         Ok(Self {
             terminal,
             state,
-            effects: Vec::new(),
+            view,
+            commands: Vec::new(),
+            command_history: Vec::new(),
+            devices: Vec::new(),
+            should_quit: false,
         })
     }
 
     fn apply(&mut self, action: Action) -> Result<(), String> {
         if !matches!(action, Action::Snapshot { .. } | Action::Assert { .. }) {
-            self.effects.clear();
+            self.commands.clear();
+            self.devices.clear();
         }
         match action {
             Action::Snapshot { .. } | Action::Assert { .. } => {}
             Action::Key { key, modifiers } => {
                 let event = key_event(&key, &modifiers)?;
-                self.effects = app::handle_terminal_event(&mut self.state, Event::Key(event));
+                self.apply_input(Event::Key(event));
             }
             Action::Type { text } => {
                 for character in text.chars() {
-                    self.effects.extend(app::handle_terminal_event(
-                        &mut self.state,
-                        Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-                    ));
+                    self.apply_input(Event::Key(KeyEvent::new(
+                        KeyCode::Char(character),
+                        KeyModifiers::NONE,
+                    )));
                 }
             }
             Action::Paste { text } => {
-                self.effects = app::handle_terminal_event(&mut self.state, Event::Paste(text));
+                self.apply_input(Event::Paste(text));
             }
             Action::Mouse {
                 kind,
@@ -163,15 +232,12 @@ impl Harness {
             } => {
                 let kind = mouse_event_kind(&kind)?;
                 let modifiers = key_modifiers(&modifiers)?;
-                self.effects = app::handle_terminal_event(
-                    &mut self.state,
-                    Event::Mouse(MouseEvent {
-                        kind,
-                        column,
-                        row,
-                        modifiers,
-                    }),
-                );
+                self.apply_input(Event::Mouse(MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers,
+                }));
             }
             Action::Resize { width, height } => {
                 if width < 20 || height < 8 {
@@ -181,17 +247,33 @@ impl Harness {
                 self.terminal
                     .autoresize()
                     .map_err(|error| error.to_string())?;
-                self.effects =
-                    app::handle_terminal_event(&mut self.state, Event::Resize(width, height));
+                self.apply_input(Event::Resize(width, height));
             }
-            Action::Backend { provider, event } => {
-                let provider = provider.unwrap_or_else(|| self.state.backend_provider.clone());
-                self.effects = self
-                    .state
-                    .handle_provider_backend(&provider, event.into_backend(&provider)?);
+            Action::Service { event } => {
+                event.apply_view(&mut self.view, &self.command_history)?;
+                self.state.install_bootstrap(&self.view);
             }
         }
         Ok(())
+    }
+
+    fn apply_input(&mut self, event: Event) {
+        let outcome = tui_input::handle_terminal(&mut self.state, &self.view, event);
+        let commands = outcome
+            .commands
+            .into_iter()
+            .map(|intent| intent.command)
+            .collect::<Vec<_>>();
+        self.command_history.extend(commands.iter().cloned());
+        self.commands.extend(commands);
+        self.devices
+            .extend(outcome.devices.into_iter().map(|intent| match intent {
+                DeviceIntent::OpenUrl(url) => json!({"type": "open_url", "url": url}),
+                DeviceIntent::Copy(text) => {
+                    json!({"type": "copy", "byte_length": text.len()})
+                }
+            }));
+        self.should_quit |= outcome.quit;
     }
 
     fn observe(&mut self, step: usize, action: &'static str, styles: bool) -> Observation {
@@ -199,13 +281,14 @@ impl Harness {
             .draw(|frame| render::draw(frame, &mut self.state))
             .expect("the in-memory terminal should render");
         let screen = Screen::capture(self.terminal.backend(), styles);
-        let effects = self.effects.iter().map(effect_view).collect();
+        let commands = self.commands.iter().map(command_view).collect();
         Observation {
             step,
             action,
             screen,
-            state: StateView::capture(&self.state),
-            effects,
+            state: StateView::capture(&self.state, &self.view, self.should_quit),
+            commands,
+            devices: self.devices.clone(),
         }
     }
 }
@@ -239,8 +322,7 @@ enum Action {
         width: u16,
         height: u16,
     },
-    Backend {
-        provider: Option<String>,
+    Service {
         event: FixtureEvent,
     },
     Assert {
@@ -258,7 +340,7 @@ impl Action {
             Self::Paste { .. } => "paste",
             Self::Mouse { .. } => "mouse",
             Self::Resize { .. } => "resize",
-            Self::Backend { .. } => "backend",
+            Self::Service { .. } => "service",
             Self::Assert { .. } => "assert",
         }
     }
@@ -287,9 +369,9 @@ struct Assertion {
     draft: Option<String>,
     connection: Option<String>,
     #[serde(default)]
-    effects_include: Vec<String>,
+    commands_include: Vec<String>,
     #[serde(default)]
-    effects_exclude: Vec<String>,
+    commands_exclude: Vec<String>,
     cursor_visible: Option<bool>,
     screen_width: Option<u16>,
     screen_height: Option<u16>,
@@ -299,7 +381,29 @@ impl Assertion {
     fn check(&self, observation: &Observation) -> Result<(), String> {
         self.check_screen(&observation.screen)?;
         self.check_state(&observation.state)?;
-        self.check_effects(&observation.effects)
+        self.check_commands(&observation.commands)
+    }
+
+    fn check_commands(&self, commands: &[Value]) -> Result<(), String> {
+        let command_names = commands
+            .iter()
+            .filter_map(|command| command.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        for expected in &self.commands_include {
+            if !command_names.contains(&expected.as_str()) {
+                return Err(format!(
+                    "commands {command_names:?} do not include {expected:?}"
+                ));
+            }
+        }
+        for excluded in &self.commands_exclude {
+            if command_names.contains(&excluded.as_str()) {
+                return Err(format!(
+                    "commands {command_names:?} unexpectedly include {excluded:?}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn check_screen(&self, screen: &Screen) -> Result<(), String> {
@@ -390,28 +494,6 @@ impl Assertion {
         }
         Ok(())
     }
-
-    fn check_effects(&self, effects: &[Value]) -> Result<(), String> {
-        let effect_names = effects
-            .iter()
-            .filter_map(|effect| effect.get("type").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        for expected in &self.effects_include {
-            if !effect_names.contains(&expected.as_str()) {
-                return Err(format!(
-                    "effects {effect_names:?} do not include {expected:?}"
-                ));
-            }
-        }
-        for excluded in &self.effects_exclude {
-            if effect_names.contains(&excluded.as_str()) {
-                return Err(format!(
-                    "effects {effect_names:?} unexpectedly include {excluded:?}"
-                ));
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -420,8 +502,8 @@ enum FixtureEvent {
     Ready {
         #[serde(default = "default_display_name")]
         display_name: String,
-        #[serde(default)]
-        version: Option<String>,
+        #[serde(default, rename = "version")]
+        _version: Option<String>,
         #[serde(default)]
         capabilities: Vec<String>,
     },
@@ -436,7 +518,8 @@ enum FixtureEvent {
         turn_id: String,
     },
     Item {
-        turn_id: String,
+        #[serde(rename = "turn_id")]
+        _turn_id: String,
         id: String,
         kind: String,
         title: String,
@@ -445,17 +528,21 @@ enum FixtureEvent {
         status: String,
     },
     Delta {
-        turn_id: String,
+        #[serde(rename = "turn_id")]
+        _turn_id: String,
         item_id: String,
-        kind: String,
+        #[serde(rename = "kind")]
+        _kind: String,
         delta: String,
     },
     Approval {
         #[serde(default = "default_request_id")]
         id: Value,
         #[serde(default = "default_approval_method")]
-        method: String,
-        kind: String,
+        #[serde(rename = "method")]
+        _method: String,
+        #[serde(rename = "kind")]
+        _kind: String,
         title: String,
         detail: String,
     },
@@ -468,11 +555,15 @@ enum FixtureEvent {
         multi: bool,
         recommended: Option<usize>,
     },
+    InteractionResolved {
+        id: String,
+    },
     Todo {
-        phases: Vec<TodoPhase>,
+        phases: Vec<nakode_protocol::TodoPhaseView>,
     },
     TurnCompleted {
-        turn_id: String,
+        #[serde(rename = "turn_id")]
+        _turn_id: String,
         #[serde(default = "default_turn_outcome")]
         outcome: String,
         error: Option<String>,
@@ -500,6 +591,8 @@ struct FixtureModel {
     id: String,
     #[serde(default)]
     is_default: bool,
+    #[serde(default)]
+    configuration: nakode_protocol::ModelConfigurationView,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -511,6 +604,8 @@ struct FixtureQuestionOption {
 fn default_display_name() -> String {
     "Codex".to_owned()
 }
+
+const FIXTURE_PROVIDER_ID: &str = "fixture-provider";
 
 fn default_item_status() -> String {
     "complete".to_owned()
@@ -533,68 +628,35 @@ const fn default_error_code() -> i64 {
 }
 
 impl FixtureEvent {
-    fn into_backend(self, provider: &str) -> Result<BackendEvent, String> {
-        Ok(match self {
+    fn apply_view(
+        self,
+        view: &mut nakode_protocol::BootstrapView,
+        commands: &[crate::api_projection::TuiAction],
+    ) -> Result<(), String> {
+        match self {
             Self::Ready {
                 display_name,
-                version,
                 capabilities,
-            } => BackendEvent::Ready(BackendIdentity {
-                provider: provider.to_owned(),
-                display_name,
-                version,
-                capabilities: fixture_capabilities(&capabilities)?,
-            }),
-            Self::Models { models } => BackendEvent::Models(
-                models
-                    .into_iter()
-                    .map(|model| ModelInfo {
-                        provider: provider.to_owned(),
-                        id: model.id,
-                        is_default: model.is_default,
-                    })
-                    .collect(),
-            ),
+                ..
+            } => install_ready_view(view, &display_name, &capabilities)?,
+            Self::Models { models } => install_model_views(view, models),
             Self::SessionCreated {
                 provider_session_id,
                 model,
-            } => BackendEvent::SessionCreated {
-                provider_session_id,
-                model,
-            },
-            Self::TurnStarted { turn_id } => BackendEvent::TurnStarted { turn_id },
+            } => install_created_session_view(view, commands, provider_session_id, model)?,
+            Self::TurnStarted { turn_id } => install_started_turn_view(view, turn_id)?,
             Self::Item {
-                turn_id,
                 id,
                 kind,
                 title,
                 body,
                 status,
-            } => fixture_item_event(turn_id, id, &kind, title, body, &status)?,
-            Self::Delta {
-                turn_id,
-                item_id,
-                kind,
-                delta,
-            } => BackendEvent::ItemDelta {
-                turn_id,
-                item_id,
-                kind: fixture_delta_kind(&kind)?,
-                delta,
-            },
+                ..
+            } => install_item_view(view, &id, &kind, title, body, &status)?,
+            Self::Delta { item_id, delta, .. } => install_delta_view(view, &item_id, &delta)?,
             Self::Approval {
-                id,
-                method,
-                kind,
-                title,
-                detail,
-            } => BackendEvent::ApprovalRequested(ApprovalRequest {
-                id,
-                method,
-                kind: fixture_approval_kind(&kind)?,
-                title,
-                detail,
-            }),
+                id, title, detail, ..
+            } => install_approval_view(view, &id, title, detail)?,
             Self::Question {
                 id,
                 title,
@@ -602,177 +664,445 @@ impl FixtureEvent {
                 options,
                 multi,
                 recommended,
-            } => fixture_question_event(id, title, question, options, multi, recommended),
-            Self::Todo { phases } => BackendEvent::TodoUpdated { phases },
-            Self::TurnCompleted {
-                turn_id,
-                outcome,
-                error,
-            } => BackendEvent::TurnCompleted {
-                turn_id,
-                outcome: fixture_turn_outcome(&outcome)?,
-                error,
-            },
+            } => install_question_view(view, id, title, question, options, multi, recommended)?,
+            Self::InteractionResolved { id } => resolve_interaction_view(view, &id)?,
+            Self::Todo { phases } => install_todo_view(view, phases)?,
+            Self::TurnCompleted { outcome, error, .. } => {
+                complete_turn_view(view, &outcome, error)?;
+            }
             Self::ContextUsage {
                 estimated_tokens,
                 context_window,
-            } => BackendEvent::ContextUsageUpdated {
-                estimated_tokens,
-                context_window,
-            },
-            Self::Warning { message } => BackendEvent::Warning(message),
+            } => install_context_usage_view(view, estimated_tokens, context_window)?,
+            Self::Warning { message } => {
+                install_notice(view, nakode_protocol::NoticeLevel::Warning, message)?;
+            }
             Self::RequestFailed {
                 operation,
                 code,
                 message,
-            } => BackendEvent::RequestFailed {
-                operation: fixture_backend_operation(&operation)?,
-                code,
-                message,
-            },
-            Self::Disconnected { reason } => BackendEvent::Disconnected { reason },
-        })
+            } => {
+                install_notice(
+                    view,
+                    nakode_protocol::NoticeLevel::Error,
+                    format!("{operation} failed ({code}): {message}"),
+                )?;
+            }
+            Self::Disconnected { reason } => install_disconnected_view(view, reason),
+        }
+        Ok(())
     }
 }
 
-fn fixture_item_event(
-    turn_id: String,
-    id: String,
-    kind: &str,
-    title: String,
-    body: String,
-    status: &str,
-) -> Result<BackendEvent, String> {
-    let item = NormalizedItem {
-        id,
-        kind: fixture_item_kind(kind)?,
-        title,
-        body,
-        status: fixture_item_status(status)?,
-    };
-    Ok(if status == "running" {
-        BackendEvent::ItemStarted { turn_id, item }
-    } else {
-        BackendEvent::ItemCompleted { turn_id, item }
-    })
+fn active_session_mut(
+    view: &mut nakode_protocol::BootstrapView,
+) -> Result<&mut nakode_protocol::SessionView, String> {
+    view.active_session
+        .as_mut()
+        .ok_or_else(|| "service fixture requires an active session".to_owned())
 }
 
-fn fixture_question_event(
+fn bump_session(session: &mut nakode_protocol::SessionView) {
+    session.revision = session.revision.saturating_add(1);
+}
+
+fn install_delta_view(
+    view: &mut nakode_protocol::BootstrapView,
+    item_id: &str,
+    delta: &str,
+) -> Result<(), String> {
+    let session = active_session_mut(view)?;
+    let item = session
+        .transcript
+        .entries
+        .iter_mut()
+        .find(|item| item.id.as_str() == item_id)
+        .ok_or_else(|| format!("unknown transcript item {item_id:?}"))?;
+    item.body.push_str(delta);
+    bump_session(session);
+    Ok(())
+}
+
+fn install_approval_view(
+    view: &mut nakode_protocol::BootstrapView,
+    id: &Value,
+    title: String,
+    detail: String,
+) -> Result<(), String> {
+    let interaction_id = id
+        .as_str()
+        .ok_or_else(|| "service approval ids must be strings".to_owned())?;
+    let session = active_session_mut(view)?;
+    session.interactions.push(nakode_protocol::InteractionView {
+        id: interaction_id.to_owned().into(),
+        revision: session.revision.saturating_add(1),
+        kind: nakode_protocol::InteractionKind::Approval,
+        status: nakode_protocol::InteractionStatus::Pending,
+        title,
+        detail,
+        options: Vec::new(),
+        multiple: false,
+    });
+    bump_session(session);
+    Ok(())
+}
+
+fn install_question_view(
+    view: &mut nakode_protocol::BootstrapView,
     id: String,
     title: String,
     question: String,
     options: Vec<FixtureQuestionOption>,
     multi: bool,
     recommended: Option<usize>,
-) -> BackendEvent {
-    BackendEvent::QuestionRequested(QuestionRequest {
-        id,
+) -> Result<(), String> {
+    let session = active_session_mut(view)?;
+    session.interactions.push(nakode_protocol::InteractionView {
+        id: id.into(),
+        revision: session.revision.saturating_add(1),
+        kind: nakode_protocol::InteractionKind::Question,
+        status: nakode_protocol::InteractionStatus::Pending,
         title,
-        question,
+        detail: question,
         options: options
             .into_iter()
-            .map(|option| QuestionOption {
+            .enumerate()
+            .map(|(index, option)| nakode_protocol::InteractionOptionView {
+                id: format!("option-{}", index + 1),
                 label: option.label,
                 description: option.description,
+                recommended: recommended == Some(index),
             })
             .collect(),
-        multi,
-        recommended,
-    })
+        multiple: multi,
+    });
+    bump_session(session);
+    Ok(())
 }
 
-fn fixture_capabilities(names: &[String]) -> Result<BackendCapabilities, String> {
-    let mut capabilities = BackendCapabilities::default();
-    for name in names {
-        let value = CapabilitySupport::Supported;
-        match name.as_str() {
-            "resume" => capabilities.resume = value,
-            "steering" => capabilities.steering = value,
-            "interruption" => capabilities.interruption = value,
-            "model_catalog" => capabilities.model_catalog = value,
-            "models_require_session" => capabilities.models_require_session = value,
-            "session_model_config" => capabilities.session_model_config = value,
-            "context_compaction" => capabilities.context_compaction = value,
-            "approvals" => capabilities.approvals = value,
-            "native_tools" => capabilities.native_tools = value,
-            "mcp" => capabilities.mcp = value,
-            "close_session" => capabilities.close_session = value,
-            _ => return Err(format!("unknown capability {name:?}")),
+fn resolve_interaction_view(
+    view: &mut nakode_protocol::BootstrapView,
+    id: &str,
+) -> Result<(), String> {
+    let session = active_session_mut(view)?;
+    let interaction = session
+        .interactions
+        .iter_mut()
+        .find(|interaction| interaction.id.as_str() == id)
+        .ok_or_else(|| format!("unknown interaction {id:?}"))?;
+    interaction.status = nakode_protocol::InteractionStatus::Resolved;
+    interaction.revision = interaction.revision.saturating_add(1);
+    bump_session(session);
+    Ok(())
+}
+
+fn install_todo_view(
+    view: &mut nakode_protocol::BootstrapView,
+    phases: Vec<nakode_protocol::TodoPhaseView>,
+) -> Result<(), String> {
+    let session = active_session_mut(view)?;
+    session.todos = phases;
+    bump_session(session);
+    Ok(())
+}
+
+fn complete_turn_view(
+    view: &mut nakode_protocol::BootstrapView,
+    outcome: &str,
+    error: Option<String>,
+) -> Result<(), String> {
+    let session = active_session_mut(view)?;
+    session.active_turn = None;
+    session.activity = nakode_protocol::SessionActivity::Idle;
+    session.transcript.stream_active = false;
+    session.transcript.stream_label.clear();
+    session.status_message = match outcome {
+        "completed" => "Turn completed.".to_owned(),
+        "interrupted" => "Turn interrupted.".to_owned(),
+        "failed" => error.unwrap_or_else(|| "Turn failed.".to_owned()),
+        _ => return Err(format!("unknown turn outcome {outcome:?}")),
+    };
+    bump_session(session);
+    Ok(())
+}
+
+fn install_context_usage_view(
+    view: &mut nakode_protocol::BootstrapView,
+    estimated_tokens: usize,
+    context_window: Option<usize>,
+) -> Result<(), String> {
+    let session = active_session_mut(view)?;
+    session.context_usage = Some(nakode_protocol::ContextUsageView {
+        estimated_tokens: u64::try_from(estimated_tokens).unwrap_or(u64::MAX),
+        context_window: context_window.map(|window| u64::try_from(window).unwrap_or(u64::MAX)),
+        compacting: false,
+    });
+    bump_session(session);
+    Ok(())
+}
+
+fn install_disconnected_view(view: &mut nakode_protocol::BootstrapView, reason: String) {
+    let provider_id = selected_provider_id(view);
+    if let Some(provider) = view
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == provider_id)
+    {
+        provider.connection = nakode_protocol::ConnectionView::Disconnected { message: reason };
+    }
+    if let Some(session) = &mut view.active_session {
+        if let Some(agent) = &mut session.active_agent_session {
+            agent.connection = nakode_protocol::ConnectionView::Disconnected {
+                message: "provider disconnected".to_owned(),
+            };
         }
-    }
-    Ok(capabilities)
-}
-
-fn fixture_item_kind(value: &str) -> Result<ItemKind, String> {
-    match value {
-        "user" => Ok(ItemKind::User),
-        "assistant" => Ok(ItemKind::Assistant),
-        "reasoning" => Ok(ItemKind::Reasoning),
-        "tool" => Ok(ItemKind::Tool),
-        "diff" => Ok(ItemKind::Diff),
-        "system" => Ok(ItemKind::System),
-        _ => Err(format!("unknown item kind {value:?}")),
+        "Provider disconnected.".clone_into(&mut session.status_message);
+        bump_session(session);
     }
 }
 
-fn fixture_item_status(value: &str) -> Result<ItemStatus, String> {
-    match value {
-        "running" => Ok(ItemStatus::Running),
-        "complete" => Ok(ItemStatus::Complete),
-        "failed" => Ok(ItemStatus::Failed),
-        "declined" => Ok(ItemStatus::Declined),
-        _ => Err(format!("unknown item status {value:?}")),
-    }
+fn selected_provider_id(view: &nakode_protocol::BootstrapView) -> nakode_protocol::ProviderId {
+    view.active_session
+        .as_ref()
+        .and_then(|session| session.selected_provider_id.clone())
+        .or_else(|| view.providers.first().map(|provider| provider.id.clone()))
+        .unwrap_or_else(|| nakode_protocol::ProviderId::from(FIXTURE_PROVIDER_ID.to_owned()))
 }
 
-fn fixture_delta_kind(value: &str) -> Result<DeltaKind, String> {
-    match value {
-        "assistant" => Ok(DeltaKind::Assistant),
-        "plan" => Ok(DeltaKind::Plan),
-        "reasoning" => Ok(DeltaKind::Reasoning),
-        "tool" => Ok(DeltaKind::Tool),
-        _ => value
-            .strip_prefix("reasoning_summary:")
-            .and_then(|index| index.parse::<usize>().ok())
-            .map(|index| DeltaKind::ReasoningSummary { index })
-            .ok_or_else(|| format!("unknown delta kind {value:?}")),
+fn install_ready_view(
+    view: &mut nakode_protocol::BootstrapView,
+    display_name: &str,
+    capability_names: &[String],
+) -> Result<(), String> {
+    let provider_id = nakode_protocol::ProviderId::from(FIXTURE_PROVIDER_ID.to_owned());
+    let capabilities = fixture_protocol_capabilities(capability_names)?;
+    let provider = nakode_protocol::ProviderView {
+        id: provider_id.clone(),
+        display_name: display_name.to_owned(),
+        enabled: true,
+        credential_configured: true,
+        credential_kind: None,
+        connection: nakode_protocol::ConnectionView::Ready,
+        capabilities: capabilities.clone(),
+        authentication: None,
+    };
+    if let Some(existing) = view
+        .providers
+        .iter_mut()
+        .find(|existing| existing.id == provider_id)
+    {
+        *existing = provider;
+    } else {
+        view.providers.push(provider);
     }
+    let session = active_session_mut(view)?;
+    session.selected_provider_id = Some(provider_id.clone());
+    session.active_agent_session = Some(nakode_protocol::AgentSessionView {
+        id: nakode_protocol::AgentSessionId::from("agent-session-1".to_owned()),
+        provider_id,
+        model_id: None,
+        role: "primary".to_owned(),
+        capabilities,
+        connection: nakode_protocol::ConnectionView::Ready,
+    });
+    session.activity = nakode_protocol::SessionActivity::Idle;
+    "Ready.".clone_into(&mut session.status_message);
+    bump_session(session);
+    Ok(())
 }
 
-fn fixture_approval_kind(value: &str) -> Result<ApprovalKind, String> {
-    match value {
-        "command" => Ok(ApprovalKind::Command),
-        "file_change" => Ok(ApprovalKind::FileChange),
-        "other" => Ok(ApprovalKind::Other),
-        _ => Err(format!("unknown approval kind {value:?}")),
+fn fixture_protocol_capabilities(
+    names: &[String],
+) -> Result<nakode_protocol::ProviderCapabilities, String> {
+    let mut supported = std::collections::BTreeSet::new();
+    for name in names {
+        supported.insert(match name.as_str() {
+            "resume" => nakode_protocol::ProviderCapability::Resume,
+            "steering" => nakode_protocol::ProviderCapability::Steering,
+            "interruption" => nakode_protocol::ProviderCapability::Interruption,
+            "model_catalog" => nakode_protocol::ProviderCapability::ModelCatalog,
+            "models_require_session" => nakode_protocol::ProviderCapability::ModelsRequireSession,
+            "session_model_config" => {
+                nakode_protocol::ProviderCapability::SessionModelConfiguration
+            }
+            "context_compaction" => nakode_protocol::ProviderCapability::ContextCompaction,
+            "approvals" => nakode_protocol::ProviderCapability::Approvals,
+            "native_tools" => nakode_protocol::ProviderCapability::NativeTools,
+            "mcp" => nakode_protocol::ProviderCapability::Mcp,
+            "close_session" => nakode_protocol::ProviderCapability::CloseSession,
+            _ => return Err(format!("unknown capability {name:?}")),
+        });
     }
+    Ok(nakode_protocol::ProviderCapabilities { supported })
 }
 
-fn fixture_turn_outcome(value: &str) -> Result<TurnOutcome, String> {
-    match value {
-        "completed" => Ok(TurnOutcome::Completed),
-        "interrupted" => Ok(TurnOutcome::Interrupted),
-        "failed" => Ok(TurnOutcome::Failed),
-        _ => Err(format!("unknown turn outcome {value:?}")),
-    }
+fn install_model_views(view: &mut nakode_protocol::BootstrapView, models: Vec<FixtureModel>) {
+    let provider_id = selected_provider_id(view);
+    view.models = models
+        .into_iter()
+        .map(|model| {
+            let id = if model.id.contains('/') {
+                model.id.clone()
+            } else {
+                format!("{provider_id}/{}", model.id)
+            };
+            nakode_protocol::ModelView {
+                id: nakode_protocol::ModelId::from(id),
+                provider_id: provider_id.clone(),
+                model_slug: model.id,
+                display_name: "Model".to_owned(),
+                is_default: model.is_default,
+                reasoning_effort: None,
+                fast_mode: false,
+                configuration: model.configuration,
+            }
+        })
+        .collect();
 }
 
-fn fixture_backend_operation(value: &str) -> Result<BackendOperation, String> {
-    match value {
-        "initialize" => Ok(BackendOperation::Initialize),
-        "authenticate" => Ok(BackendOperation::Authenticate),
-        "model_list" => Ok(BackendOperation::ModelList),
-        "reload" => Ok(BackendOperation::Reload),
-        "set_session_model" => Ok(BackendOperation::SetSessionModel),
-        "start_session" => Ok(BackendOperation::StartSession),
-        "resume_session" => Ok(BackendOperation::ResumeSession),
-        "unsubscribe_session" => Ok(BackendOperation::UnsubscribeSession),
-        "compact_session" => Ok(BackendOperation::CompactSession),
-        "start_turn" => Ok(BackendOperation::StartTurn),
-        "steer_turn" => Ok(BackendOperation::SteerTurn),
-        "interrupt_turn" => Ok(BackendOperation::InterruptTurn),
-        _ => Err(format!("unknown backend operation {value:?}")),
+fn install_created_session_view(
+    view: &mut nakode_protocol::BootstrapView,
+    commands: &[crate::api_projection::TuiAction],
+    provider_session_id: String,
+    model: String,
+) -> Result<(), String> {
+    let provider_id = selected_provider_id(view);
+    let model_id = nakode_protocol::ModelId::from(if model.contains('/') {
+        model
+    } else {
+        format!("{provider_id}/{model}")
+    });
+    let prompt = commands.iter().rev().find_map(|command| match command {
+        crate::api_projection::TuiAction::SendPrompt { prompt, .. } => Some(prompt.text.clone()),
+        _ => None,
+    });
+    let session = active_session_mut(view)?;
+    session.selected_model_id = Some(model_id.clone());
+    let capabilities = session
+        .active_agent_session
+        .as_ref()
+        .map_or_else(nakode_protocol::ProviderCapabilities::default, |agent| {
+            agent.capabilities.clone()
+        });
+    session.active_agent_session = Some(nakode_protocol::AgentSessionView {
+        id: nakode_protocol::AgentSessionId::from(provider_session_id),
+        provider_id,
+        model_id: Some(model_id),
+        role: "primary".to_owned(),
+        capabilities,
+        connection: nakode_protocol::ConnectionView::Ready,
+    });
+    if let Some(prompt) = prompt {
+        session
+            .transcript
+            .entries
+            .push(nakode_protocol::TranscriptEntryView {
+                id: nakode_protocol::EntryId::from(format!("user-{}", session.revision + 1)),
+                kind: nakode_protocol::TranscriptEntryKind::User,
+                title: "YOU".to_owned(),
+                body_total_bytes: u64::try_from(prompt.len()).unwrap_or(u64::MAX),
+                body_start_byte: 0,
+                body: prompt,
+                status: nakode_protocol::TranscriptEntryStatus::Complete,
+                artifacts: Vec::new(),
+            });
     }
+    session.activity = nakode_protocol::SessionActivity::StartingTurn;
+    "Starting turn…".clone_into(&mut session.status_message);
+    bump_session(session);
+    Ok(())
+}
+
+fn install_started_turn_view(
+    view: &mut nakode_protocol::BootstrapView,
+    turn_id: String,
+) -> Result<(), String> {
+    let provider_id = selected_provider_id(view);
+    let provider_name = view
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .map_or("Provider", |provider| provider.display_name.as_str())
+        .to_owned();
+    let session = active_session_mut(view)?;
+    let agent = session
+        .active_agent_session
+        .as_ref()
+        .ok_or_else(|| "turn_started requires an active agent session".to_owned())?;
+    session.active_turn = Some(nakode_protocol::TurnView {
+        id: nakode_protocol::TurnId::from(turn_id),
+        agent_session_id: agent.id.clone(),
+        model_id: agent.model_id.clone(),
+        status: nakode_protocol::TurnStatus::Running,
+    });
+    session.activity = nakode_protocol::SessionActivity::RunningTurn;
+    session.transcript.stream_active = true;
+    "working".clone_into(&mut session.transcript.stream_label);
+    session.status_message = format!("{provider_name} is working…");
+    bump_session(session);
+    Ok(())
+}
+
+fn install_item_view(
+    view: &mut nakode_protocol::BootstrapView,
+    id: &str,
+    kind: &str,
+    title: String,
+    body: String,
+    status: &str,
+) -> Result<(), String> {
+    let session = active_session_mut(view)?;
+    let entry = nakode_protocol::TranscriptEntryView {
+        id: nakode_protocol::EntryId::from(id.to_owned()),
+        kind: match kind {
+            "user" => nakode_protocol::TranscriptEntryKind::User,
+            "assistant" => nakode_protocol::TranscriptEntryKind::Assistant,
+            "reasoning" => nakode_protocol::TranscriptEntryKind::Reasoning,
+            "tool" => nakode_protocol::TranscriptEntryKind::Tool,
+            "diff" => nakode_protocol::TranscriptEntryKind::Diff,
+            "system" => nakode_protocol::TranscriptEntryKind::System,
+            _ => return Err(format!("unknown item kind {kind:?}")),
+        },
+        title,
+        body_total_bytes: u64::try_from(body.len()).unwrap_or(u64::MAX),
+        body_start_byte: 0,
+        body,
+        status: match status {
+            "running" => nakode_protocol::TranscriptEntryStatus::Running,
+            "complete" => nakode_protocol::TranscriptEntryStatus::Complete,
+            "failed" | "declined" => nakode_protocol::TranscriptEntryStatus::Failed,
+            _ => return Err(format!("unknown item status {status:?}")),
+        },
+        artifacts: Vec::new(),
+    };
+    if let Some(existing) = session
+        .transcript
+        .entries
+        .iter_mut()
+        .find(|entry| entry.id.as_str() == id)
+    {
+        *existing = entry;
+    } else {
+        session.transcript.entries.push(entry);
+    }
+    bump_session(session);
+    Ok(())
+}
+
+fn install_notice(
+    view: &mut nakode_protocol::BootstrapView,
+    level: nakode_protocol::NoticeLevel,
+    message: String,
+) -> Result<(), String> {
+    let session = active_session_mut(view)?;
+    session.notices.push(nakode_protocol::NoticeView {
+        id: format!("notice-{}", session.notices.len() + 1),
+        level,
+        message: message.clone(),
+    });
+    session.status_message = message;
+    bump_session(session);
+    Ok(())
 }
 
 fn key_event(key: &str, modifiers: &[String]) -> Result<KeyEvent, String> {
@@ -850,7 +1180,8 @@ struct Observation {
     action: &'static str,
     screen: Screen,
     state: StateView,
-    effects: Vec<Value>,
+    commands: Vec<Value>,
+    devices: Vec<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -949,18 +1280,36 @@ struct StateView {
     draft: String,
     queue_length: usize,
     transcript: Vec<TranscriptEntryView>,
-    diagnostics: usize,
+    diagnostics: u64,
     should_quit: bool,
 }
 
 impl StateView {
-    fn capture(state: &AppState) -> Self {
+    fn capture(state: &TuiState, view: &nakode_protocol::BootstrapView, should_quit: bool) -> Self {
+        let active_agent = view
+            .active_session
+            .as_ref()
+            .and_then(|session| session.active_agent_session.as_ref());
+        let provider = active_agent
+            .map(|agent| &agent.provider_id)
+            .and_then(|provider_id| {
+                view.providers
+                    .iter()
+                    .find(|provider| &provider.id == provider_id)
+                    .map(|provider| provider.display_name.clone())
+                    .or_else(|| Some(provider_id.to_string()))
+            })
+            .unwrap_or_default();
         Self {
-            connection: state.connection.label().to_owned(),
-            provider: state.backend_provider.clone(),
-            model: state.selected_model.clone(),
-            session_active: state.provider_session_id.is_some(),
-            turn: state.active_turn.as_ref().map(|turn| turn.id.clone()),
+            connection: active_agent
+                .map_or("disabled", |agent| {
+                    crate::tui_state::connection_label(&agent.connection)
+                })
+                .to_owned(),
+            provider,
+            model: state.selected_model.as_ref().map(ToString::to_string),
+            session_active: state.session_id.is_some(),
+            turn: state.active_turn.as_ref().map(|turn| turn.id.to_string()),
             modal: active_modal(state),
             status: state.status_message.clone(),
             draft: state.client.editor.text(),
@@ -980,7 +1329,7 @@ impl StateView {
                 })
                 .collect(),
             diagnostics: state.diagnostic_count,
-            should_quit: state.should_quit,
+            should_quit,
         }
     }
 }
@@ -993,7 +1342,7 @@ struct TranscriptEntryView {
     body: String,
 }
 
-fn active_modal(state: &AppState) -> String {
+fn active_modal(state: &TuiState) -> String {
     if state.questions.front().is_some() {
         "question".to_owned()
     } else if state.approvals.front().is_some() {
@@ -1024,213 +1373,34 @@ fn active_modal(state: &AppState) -> String {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn effect_view(effect: &Effect) -> Value {
-    match effect {
-        Effect::Backend(command) => backend_command_view(command),
-        Effect::RunShell { id, command } => {
-            json!({"type": "run_shell", "id": id, "command": command})
-        }
-        Effect::SpawnSubagent { run_id, provider } => {
-            json!({"type": "spawn_subagent", "run_id": run_id, "provider": provider})
-        }
-        Effect::SubagentBackend { run_id, command } => {
-            let mut value = backend_command_view(command);
-            value["type"] = json!("subagent_backend");
-            value["run_id"] = json!(run_id);
-            value
-        }
-        Effect::StopSubagent(run_id) => json!({"type": "stop_subagent", "run_id": run_id}),
-        Effect::CompleteAgentRequest {
-            request_id,
-            result,
-            success,
-        } => json!({
-            "type": "complete_agent_request",
-            "request_id": request_id,
-            "result": result,
-            "success": success
-        }),
-        Effect::ListSessions => json!({"type": "list_sessions"}),
-        Effect::ListProviders => json!({"type": "list_providers"}),
-        Effect::SetProviderEnabled { provider, enabled } => {
-            json!({"type": "set_provider_enabled", "provider": provider, "enabled": enabled})
-        }
-        Effect::AuthenticateProvider(provider) => {
-            json!({"type": "authenticate_provider", "provider": provider})
-        }
-        Effect::SaveProviderCredential { provider, kind, .. } => {
-            json!({"type": "save_provider_credential", "provider": provider, "kind": kind})
-        }
-        Effect::ClearProviderCredential(provider) => {
-            json!({"type": "clear_provider_credential", "provider": provider})
-        }
-        Effect::OpenUrl(url) => json!({"type": "open_url", "url": url}),
-        Effect::SaveAgent {
-            definition,
-            previous_slug,
-        } => json!({
-            "type": "save_agent",
-            "slug": definition.slug,
-            "previous_slug": previous_slug
-        }),
-        Effect::DeleteAgent(slug) => json!({"type": "delete_agent", "slug": slug}),
-        Effect::ReloadConfiguration => json!({"type": "reload_configuration"}),
-        Effect::ResolveSession(id) => json!({"type": "resolve_session", "id": id}),
-        Effect::PersistSession {
-            provider,
-            provider_session_id,
-            title,
-            model,
-            ..
-        } => json!({
-            "type": "persist_session",
-            "provider": provider,
-            "provider_session_id": provider_session_id,
-            "title": title,
-            "model": model
-        }),
-        Effect::PersistModels { provider, models } => {
-            json!({"type": "persist_models", "provider": provider, "count": models.len()})
-        }
-        Effect::SetDefaultModel { provider, model } => {
-            json!({"type": "set_default_model", "provider": provider, "model": model})
-        }
-        Effect::SaveModelOptions {
-            provider,
-            model,
-            options,
-        } => json!({
-            "type": "save_model_options",
-            "provider": provider,
-            "model": model,
-            "reasoning_effort": options.reasoning_effort,
-            "fast_mode": options.fast_mode
-        }),
-        Effect::PersistSubagent(record) => {
-            json!({"type": "persist_subagent", "id": record.id})
-        }
-        Effect::LoadSubagents(session_id) => {
-            json!({"type": "load_subagents", "session_id": session_id})
-        }
-        Effect::UpdateSessionModel { session_id, model } => {
-            json!({"type": "update_session_model", "session_id": session_id, "model": model})
-        }
-        Effect::TouchSession(session_id) => {
-            json!({"type": "touch_session", "session_id": session_id})
-        }
-        Effect::SaveWebConfig(_) => json!({"type": "save_web_config"}),
-        Effect::SaveMemoryConfig(_) => json!({"type": "save_memory_config"}),
-        Effect::SaveVisionConfig(_) => json!({"type": "save_vision_config"}),
-        Effect::SaveTerminalImageMode(mode) => {
-            json!({
-                "type": "save_terminal_image_mode",
-                "mode": format!("{mode:?}").to_ascii_lowercase()
-            })
-        }
-        Effect::CheckAgentBrowser => json!({"type": "check_agent_browser"}),
-        Effect::Quit => json!({"type": "quit"}),
-    }
+fn command_view(command: &crate::api_projection::TuiAction) -> Value {
+    json!({"type": command_name(command)})
 }
 
-fn backend_command_view(command: &BackendCommand) -> Value {
+const fn command_name(command: &crate::api_projection::TuiAction) -> &'static str {
+    use crate::api_projection::TuiAction;
     match command {
-        BackendCommand::BeginAuthentication => json!({"type": "backend:begin_authentication"}),
-        BackendCommand::StartSession {
-            model,
-            instructions,
-        } => json!({
-            "type": "backend:start_session",
-            "model": model,
-            "has_instructions": instructions.is_some()
-        }),
-        BackendCommand::ResumeSession {
-            provider_session_id,
-        } => json!({
-            "type": "backend:resume_session",
-            "provider_session_id": provider_session_id
-        }),
-        BackendCommand::UnsubscribeSession {
-            provider_session_id,
-        } => json!({
-            "type": "backend:unsubscribe_session",
-            "provider_session_id": provider_session_id
-        }),
-        BackendCommand::StartTurn {
-            provider_session_id,
-            client_id,
-            prompt,
-            attachments,
-            model,
-        } => json!({
-            "type": "backend:start_turn",
-            "provider_session_id": provider_session_id,
-            "client_id": client_id,
-            "prompt": prompt,
-            "attachment_count": attachments.len(),
-            "model": model
-        }),
-        BackendCommand::SteerTurn {
-            provider_session_id,
-            turn_id,
-            prompt,
-            ..
-        } => json!({
-            "type": "backend:steer_turn",
-            "provider_session_id": provider_session_id,
-            "turn_id": turn_id,
-            "prompt": prompt
-        }),
-        BackendCommand::InterruptTurn {
-            provider_session_id,
-            turn_id,
-        } => json!({
-            "type": "backend:interrupt_turn",
-            "provider_session_id": provider_session_id,
-            "turn_id": turn_id
-        }),
-        BackendCommand::CompactSession {
-            provider_session_id,
-            compaction_id,
-        } => json!({
-            "type": "backend:compact_session",
-            "provider_session_id": provider_session_id,
-            "compaction_id": compaction_id
-        }),
-        BackendCommand::SetSessionModel {
-            provider_session_id,
-            model,
-        } => json!({
-            "type": "backend:set_session_model",
-            "provider_session_id": provider_session_id,
-            "model": model
-        }),
-        BackendCommand::SetSessionOptions {
-            provider_session_id,
-            options,
-        } => json!({
-            "type": "backend:set_session_options",
-            "provider_session_id": provider_session_id,
-            "reasoning_effort": options.reasoning_effort,
-            "fast_mode": options.fast_mode
-        }),
-        BackendCommand::Reload {
-            provider_session_id,
-        } => json!({
-            "type": "backend:reload",
-            "provider_session_id": provider_session_id
-        }),
-        BackendCommand::ResolveApproval { id, decision } => json!({
-            "type": "backend:resolve_approval",
-            "id": id,
-            "decision": format!("{decision:?}").to_ascii_lowercase()
-        }),
-        BackendCommand::ResolveQuestion { id, answer } => json!({
-            "type": "backend:resolve_question",
-            "id": id,
-            "answer": answer
-        }),
-        BackendCommand::Shutdown => json!({"type": "backend:shutdown"}),
+        TuiAction::CreateSession { .. } => "create_session",
+        TuiAction::OpenSession { .. } => "open_session",
+        TuiAction::SendPrompt { .. } => "send_prompt",
+        TuiAction::EnqueuePrompt { .. } => "enqueue_prompt",
+        TuiAction::RemoveQueuedPrompt { .. } => "remove_queued_prompt",
+        TuiAction::SteerTurn { .. } => "steer_turn",
+        TuiAction::CancelSessionWork { .. } => "cancel_session_work",
+        TuiAction::CompactContext { .. } => "compact_context",
+        TuiAction::SelectModel { .. } => "select_model",
+        TuiAction::ResolveInteraction { .. } => "resolve_interaction",
+        TuiAction::CancelRun { .. } => "cancel_run",
+        TuiAction::RunShell { .. } => "run_shell",
+        TuiAction::SetProviderEnabled { .. } => "set_provider_enabled",
+        TuiAction::BeginProviderAuthentication { .. } => "begin_provider_authentication",
+        TuiAction::SetProviderCredential { .. } => "set_provider_credential",
+        TuiAction::ClearProviderCredential { .. } => "clear_provider_credential",
+        TuiAction::SaveAgent { .. } => "save_agent",
+        TuiAction::DeleteAgent { .. } => "delete_agent",
+        TuiAction::UpdateSettings { .. } => "update_settings",
+        TuiAction::CheckAgentBrowser { .. } => "check_agent_browser",
+        TuiAction::ReloadWorkspace { .. } => "reload_workspace",
     }
 }
 
@@ -1270,16 +1440,19 @@ mod tests {
     }
 
     #[test]
-    fn backend_fixtures_make_approval_interactions_deterministic() {
+    fn service_fixtures_make_approval_interactions_deterministic() {
         let workspace = tempfile::tempdir().expect("workspace");
         let source = concat!(
-            "{\"action\":\"backend\",\"event\":{\"type\":\"approval\",",
+            "{\"action\":\"service\",\"event\":{\"type\":\"approval\",",
             "\"kind\":\"command\",\"title\":\"Run tests\",\"detail\":\"cargo test\"}}\n",
             "{\"action\":\"assert\",\"modal\":\"approval\",",
             "\"screen_contains\":[\"Run tests\",\"cargo test\"]}\n",
             "{\"action\":\"key\",\"key\":\"y\"}\n",
-            "{\"action\":\"assert\",\"modal\":\"none\",",
-            "\"effects_include\":[\"backend:resolve_approval\"]}\n",
+            "{\"action\":\"assert\",\"modal\":\"approval\",",
+            "\"commands_include\":[\"resolve_interaction\"]}\n",
+            "{\"action\":\"service\",\"event\":{\"type\":\"interaction_resolved\",",
+            "\"id\":\"approval-1\"}}\n",
+            "{\"action\":\"assert\",\"modal\":\"none\"}\n",
         );
         let mut output = Vec::new();
         run_script(
@@ -1288,7 +1461,7 @@ mod tests {
             &options(workspace.path()),
         )
         .expect("scenario");
-        assert_eq!(String::from_utf8(output).expect("JSONL").lines().count(), 4);
+        assert_eq!(String::from_utf8(output).expect("JSONL").lines().count(), 6);
     }
 
     #[test]
@@ -1318,7 +1491,7 @@ mod tests {
         .expect("committed smoke scenario");
         assert_eq!(
             String::from_utf8(output).expect("JSONL").lines().count(),
-            32
+            36
         );
     }
 }

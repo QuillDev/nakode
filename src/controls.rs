@@ -162,7 +162,7 @@ const KEY_CONTROLS: &[KeyControl] = &[
         Control,
         "Active turn",
         "Ctrl+C",
-        "interrupt the turn and subagents; press again to exit"
+        "cancel active work; press again to detach"
     ),
     control!(
         Global,
@@ -171,7 +171,7 @@ const KEY_CONTROLS: &[KeyControl] = &[
         Control,
         "General",
         "Ctrl+D",
-        "exit while idle"
+        "detach; server work continues"
     ),
     control!(
         Global,

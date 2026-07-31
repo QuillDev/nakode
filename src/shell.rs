@@ -1,4 +1,4 @@
-use std::{ffi::OsString, path::PathBuf, process::Stdio, sync::Arc};
+use std::{collections::HashMap, ffi::OsString, path::PathBuf, process::Stdio, sync::Arc};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -35,7 +35,12 @@ pub struct ShellProcesses {
     pub events: mpsc::Receiver<ShellEvent>,
     event_tx: mpsc::Sender<ShellEvent>,
     cancellation: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: HashMap<String, ShellProcess>,
+}
+
+struct ShellProcess {
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
 }
 
 impl ShellProcesses {
@@ -45,26 +50,51 @@ impl ShellProcesses {
             events,
             event_tx,
             cancellation: CancellationToken::new(),
-            tasks: Vec::new(),
+            tasks: HashMap::new(),
         }
     }
 
     pub fn spawn(&mut self, workspace: PathBuf, id: String, command: String) {
         let events = self.event_tx.clone();
         let cancellation = self.cancellation.child_token();
-        self.tasks.push(tokio::spawn(async move {
-            if let Err(message) =
-                run_shell_command(workspace, id.clone(), command, events.clone(), cancellation)
-                    .await
+        let task_id = id.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            if let Err(message) = run_shell_command(
+                workspace,
+                task_id.clone(),
+                command,
+                events.clone(),
+                task_cancellation,
+            )
+            .await
             {
-                let _ = events.send(ShellEvent::Failed { id, message }).await;
+                let _ = events
+                    .send(ShellEvent::Failed {
+                        id: task_id,
+                        message,
+                    })
+                    .await;
             }
-        }));
+        });
+        self.tasks.insert(id, ShellProcess { cancellation, task });
+    }
+
+    pub fn cancel(&self, id: &str) -> bool {
+        self.tasks.get(id).is_some_and(|process| {
+            process.cancellation.cancel();
+            true
+        })
+    }
+
+    pub fn complete(&mut self, id: &str) {
+        self.tasks.remove(id);
     }
 
     pub async fn shutdown(&mut self) {
         self.cancellation.cancel();
-        for mut task in self.tasks.drain(..) {
+        for (_, process) in self.tasks.drain() {
+            let mut task = process.task;
             loop {
                 tokio::select! {
                     _ = &mut task => break,
@@ -248,6 +278,16 @@ mod tests {
         "echo first & echo second 1>&2 & exit /b 7"
     }
 
+    #[cfg(unix)]
+    fn long_running_command() -> &'static str {
+        "sleep 30"
+    }
+
+    #[cfg(windows)]
+    fn long_running_command() -> &'static str {
+        "ping -n 30 127.0.0.1 > nul"
+    }
+
     #[tokio::test]
     async fn shell_process_streams_output_and_reports_exit_status() {
         let workspace = tempdir().expect("workspace");
@@ -277,6 +317,40 @@ mod tests {
                 super::ShellEvent::Failed { message, .. } => panic!("shell failed: {message}"),
             }
         }
+        processes.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn one_supervised_shell_process_can_be_cancelled_by_id() {
+        let workspace = tempdir().expect("workspace");
+        let mut processes = super::ShellProcesses::new();
+        processes.spawn(
+            workspace.path().to_path_buf(),
+            "shell:cancel".to_owned(),
+            long_running_command().to_owned(),
+        );
+
+        assert!(processes.cancel("shell:cancel"));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match processes.events.recv().await.expect("shell event") {
+                    event @ super::ShellEvent::Finished { .. } => break event,
+                    super::ShellEvent::Output { .. } => {}
+                    super::ShellEvent::Failed { message, .. } => panic!("shell failed: {message}"),
+                }
+            }
+        })
+        .await
+        .expect("cancelled shell exits promptly");
+        assert!(matches!(
+            event,
+            super::ShellEvent::Finished {
+                id,
+                interrupted: true,
+                ..
+            } if id == "shell:cancel"
+        ));
+        processes.complete("shell:cancel");
         processes.shutdown().await;
     }
 }
