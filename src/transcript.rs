@@ -5,7 +5,11 @@ use std::{
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::{backend::PromptImage, markdown::render_markdown};
+use crate::{markdown::render_markdown, media::ImageData};
+use nakode_protocol::{
+    ArtifactView, TranscriptEntryKind as ViewEntryKind, TranscriptEntryStatus as ViewEntryStatus,
+    TranscriptPage,
+};
 
 const RECENT_TOOL_CALL_LIMIT: usize = 5;
 pub(crate) const IMAGE_PREVIEW_ROWS: usize = 8;
@@ -39,6 +43,7 @@ pub enum EntryStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptEntry {
+    pub id: String,
     pub key: Option<String>,
     pub kind: EntryKind,
     pub title: String,
@@ -82,7 +87,23 @@ pub struct VisibleTranscript {
     pub first_line: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamState {
+    Idle,
+    Active,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryRetention {
+    Complete,
+    Truncated,
+}
+
+/// Terminal-local projection and render cache for a server transcript view.
+///
+/// This state is disposable and rebuilt from protocol snapshots/events. It is
+/// never a canonical transcript and is not used by the server reducer.
+#[derive(Clone, Debug)]
 pub struct Transcript {
     entries: Vec<TranscriptEntry>,
     item_indices: HashMap<String, usize>,
@@ -91,12 +112,13 @@ pub struct Transcript {
     cache_width: usize,
     cache_revision: u64,
     cache: Vec<ProjectedLine>,
-    stream_active: bool,
+    stream_state: StreamState,
     stream_label: String,
     expanded_tools: HashSet<String>,
-    images: HashMap<String, Vec<PromptImage>>,
+    images: HashMap<String, Vec<ImageData>>,
     image_previews_enabled: bool,
     show_all_tools: bool,
+    history_retention: HistoryRetention,
 }
 
 impl Transcript {
@@ -110,12 +132,13 @@ impl Transcript {
             cache_width: 0,
             cache_revision: 0,
             cache: Vec::new(),
-            stream_active: false,
+            stream_state: StreamState::Idle,
             stream_label: "Nakode".to_owned(),
             expanded_tools: HashSet::new(),
             images: HashMap::new(),
             image_previews_enabled: false,
             show_all_tools: false,
+            history_retention: HistoryRetention::Complete,
         }
     }
 
@@ -125,7 +148,22 @@ impl Transcript {
     }
 
     #[must_use]
-    pub fn image(&self, key: &str, index: usize) -> Option<&PromptImage> {
+    pub const fn has_earlier_entries(&self) -> bool {
+        matches!(self.history_retention, HistoryRetention::Truncated)
+    }
+
+    #[must_use]
+    pub const fn stream_active(&self) -> bool {
+        matches!(self.stream_state, StreamState::Active)
+    }
+
+    #[must_use]
+    pub fn stream_label(&self) -> &str {
+        &self.stream_label
+    }
+
+    #[must_use]
+    pub fn image(&self, key: &str, index: usize) -> Option<&ImageData> {
         self.images.get(key).and_then(|images| images.get(index))
     }
 
@@ -136,14 +174,65 @@ impl Transcript {
         }
     }
 
-    pub fn set_images(&mut self, key: impl Into<String>, images: Vec<PromptImage>) {
+    pub fn set_images(&mut self, key: impl Into<String>, images: Vec<ImageData>) {
+        let multiple = images.len() > 1;
+        self.set_labeled_images(
+            key,
+            images
+                .into_iter()
+                .enumerate()
+                .map(|(index, image)| {
+                    let label = if multiple {
+                        format!("Image {}", index.saturating_add(1))
+                    } else {
+                        "Image".to_owned()
+                    };
+                    (label, image)
+                })
+                .collect(),
+        );
+    }
+
+    pub(crate) fn set_labeled_images(
+        &mut self,
+        key: impl Into<String>,
+        images: Vec<(String, ImageData)>,
+    ) {
         let key = key.into();
         if images.is_empty() {
             self.images.remove(&key);
         } else {
-            self.images.insert(key, images);
+            self.images
+                .insert(key, images.into_iter().map(|(_, image)| image).collect());
         }
         self.changed();
+    }
+
+    pub(crate) fn install_artifacts(
+        &mut self,
+        key: impl Into<String>,
+        artifacts: &[ArtifactView],
+    ) -> bool {
+        let key = key.into();
+        if !self.item_indices.contains_key(&key) {
+            return false;
+        }
+        self.set_labeled_images(
+            key,
+            artifacts
+                .iter()
+                .map(|artifact| {
+                    (
+                        artifact.label.clone(),
+                        ImageData {
+                            mime_type: artifact.media_type.clone(),
+                            data: artifact.data.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+        true
     }
 
     pub fn clear(&mut self) {
@@ -152,13 +241,19 @@ impl Transcript {
         self.expanded_tools.clear();
         self.images.clear();
         self.show_all_tools = false;
-        self.stream_active = false;
+        self.stream_state = StreamState::Idle;
+        self.history_retention = HistoryRetention::Complete;
         self.changed();
     }
 
     pub fn set_stream_active(&mut self, active: bool) {
-        if self.stream_active != active {
-            self.stream_active = active;
+        let state = if active {
+            StreamState::Active
+        } else {
+            StreamState::Idle
+        };
+        if self.stream_state != state {
+            self.stream_state = state;
             self.changed();
         }
     }
@@ -169,6 +264,45 @@ impl Transcript {
             self.stream_label = label;
             self.changed();
         }
+    }
+
+    /// Replaces local transcript content from a server projection while
+    /// retaining terminal-local expansion preferences.
+    pub fn install_projection(&mut self, page: &TranscriptPage) {
+        self.entries = page
+            .entries
+            .iter()
+            .map(|entry| TranscriptEntry {
+                id: entry.id.to_string(),
+                key: Some(entry.id.to_string()),
+                kind: projection_entry_kind(entry.kind),
+                title: entry.title.clone(),
+                body: entry.body.clone(),
+                status: projection_entry_status(entry.status),
+            })
+            .collect();
+        self.item_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id.clone(), index))
+            .collect();
+        self.expanded_tools
+            .retain(|key| self.item_indices.contains_key(key));
+        self.images
+            .retain(|key, _| self.item_indices.contains_key(key));
+        self.stream_state = if page.stream_active {
+            StreamState::Active
+        } else {
+            StreamState::Idle
+        };
+        self.stream_label.clone_from(&page.stream_label);
+        self.history_retention = if page.has_earlier {
+            HistoryRetention::Truncated
+        } else {
+            HistoryRetention::Complete
+        };
+        self.changed();
     }
 
     pub fn toggle_tool_output(&mut self, key: &str) -> Option<bool> {
@@ -211,6 +345,7 @@ impl Transcript {
         status: EntryStatus,
     ) {
         self.entries.push(TranscriptEntry {
+            id: uuid::Uuid::now_v7().to_string(),
             key: None,
             kind,
             title: title.into(),
@@ -238,6 +373,7 @@ impl Transcript {
         } else {
             let index = self.entries.len();
             self.entries.push(TranscriptEntry {
+                id: uuid::Uuid::now_v7().to_string(),
                 key: Some(key.clone()),
                 kind,
                 title: title.into(),
@@ -264,6 +400,7 @@ impl Transcript {
         } else {
             let index = self.entries.len();
             self.entries.push(TranscriptEntry {
+                id: uuid::Uuid::now_v7().to_string(),
                 key: Some(key.clone()),
                 kind,
                 title: title.into(),
@@ -324,8 +461,8 @@ impl Transcript {
                 changed = true;
             }
         }
-        if changed || self.stream_active {
-            self.stream_active = false;
+        if changed || self.stream_active() {
+            self.stream_state = StreamState::Idle;
             self.changed();
         }
     }
@@ -358,6 +495,7 @@ impl Transcript {
         if self.entries.len() > self.limit {
             let remove_count = self.entries.len() - self.limit;
             self.entries.drain(..remove_count);
+            self.history_retention = HistoryRetention::Truncated;
             self.reindex();
         }
     }
@@ -374,6 +512,8 @@ impl Transcript {
                 .get(key)
                 .is_some_and(|index| self.entries[*index].kind == EntryKind::Tool)
         });
+        self.images
+            .retain(|key, _| self.item_indices.contains_key(key));
     }
 
     fn rebuild_cache(&mut self, width: usize) {
@@ -413,8 +553,8 @@ impl Transcript {
                 continue;
             }
             if is_agent_stream(entry) && !stream_header_shown {
-                let active =
-                    self.stream_active && last_user_index.is_none_or(|last_user| index > last_user);
+                let active = self.stream_active()
+                    && last_user_index.is_none_or(|last_user| index > last_user);
                 project_stream_header(
                     &self.stream_label,
                     active,
@@ -454,7 +594,7 @@ impl Transcript {
         let waiting_after_user = self.entries.last().is_some_and(|entry| {
             entry.kind == EntryKind::User && entry.status == EntryStatus::Complete
         });
-        if !stream_header_shown && (self.stream_active || waiting_after_user) {
+        if !stream_header_shown && (self.stream_active() || waiting_after_user) {
             if projected.last().is_some_and(|line| !line.text.is_empty()) {
                 projected.push(blank_line(
                     self.entries.last().and_then(|entry| entry.key.clone()),
@@ -462,7 +602,7 @@ impl Transcript {
             }
             project_stream_header(
                 &self.stream_label,
-                self.stream_active,
+                self.stream_active(),
                 self.entries.last().and_then(|entry| entry.key.clone()),
                 &mut projected,
             );
@@ -483,8 +623,31 @@ impl Transcript {
     }
 }
 
+const fn projection_entry_kind(kind: ViewEntryKind) -> EntryKind {
+    match kind {
+        ViewEntryKind::System => EntryKind::System,
+        ViewEntryKind::User => EntryKind::User,
+        ViewEntryKind::Assistant => EntryKind::Assistant,
+        ViewEntryKind::Steering => EntryKind::Steering,
+        ViewEntryKind::Reasoning => EntryKind::Reasoning,
+        ViewEntryKind::Tool => EntryKind::Tool,
+        ViewEntryKind::Diff => EntryKind::Diff,
+        ViewEntryKind::Warning => EntryKind::Warning,
+        ViewEntryKind::Error => EntryKind::Error,
+    }
+}
+
+const fn projection_entry_status(status: ViewEntryStatus) -> EntryStatus {
+    match status {
+        ViewEntryStatus::Running => EntryStatus::Running,
+        ViewEntryStatus::Complete => EntryStatus::Complete,
+        ViewEntryStatus::Failed => EntryStatus::Failed,
+        ViewEntryStatus::Interrupted => EntryStatus::Interrupted,
+    }
+}
+
 fn project_entry_images(
-    image_state: (bool, &HashMap<String, Vec<PromptImage>>),
+    image_state: (bool, &HashMap<String, Vec<ImageData>>),
     entry: &TranscriptEntry,
     output: &mut Vec<ProjectedLine>,
 ) {
@@ -931,7 +1094,7 @@ mod tests {
         );
         transcript.set_images(
             "user:one",
-            vec![crate::backend::PromptImage {
+            vec![crate::media::ImageData {
                 mime_type: "image/png".to_owned(),
                 data: vec![1, 2, 3],
             }],

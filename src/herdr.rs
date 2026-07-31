@@ -6,7 +6,7 @@ use std::{
 
 use tokio::{process::Command, sync::mpsc, task::JoinHandle};
 
-use crate::state::AppState;
+use crate::tui_state::TuiState;
 
 const REPORT_SOURCE: &str = "nakode:native";
 const AGENT_LABEL: &str = "nakode";
@@ -47,13 +47,13 @@ struct AgentSnapshot {
 }
 
 impl AgentSnapshot {
-    fn from_state(state: &AppState) -> Self {
+    fn from_state(state: &TuiState) -> Self {
         Self {
             status: AgentStatus::from_state(
                 !state.approvals.is_empty() || !state.questions.is_empty(),
                 state.is_busy(),
             ),
-            session_id: state.session_id.clone(),
+            session_id: state.session_id.as_ref().map(ToString::to_string),
         }
     }
 }
@@ -98,7 +98,7 @@ impl Reporter {
         })
     }
 
-    pub(crate) fn sync(&mut self, state: &AppState) {
+    pub(crate) fn sync(&mut self, state: &TuiState) {
         let snapshot = AgentSnapshot::from_state(state);
         if self.last_snapshot.as_ref() == Some(&snapshot) {
             return;

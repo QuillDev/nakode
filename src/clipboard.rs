@@ -8,15 +8,22 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat, common::RustImage};
 use thiserror::Error;
 
-use crate::backend::{PromptAttachment, PromptImage};
+use crate::media::ImageData;
 
 const MAX_SELECTION_BYTES: usize = 1024 * 1024;
 const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ClipboardPayload {
-    Attachments(Vec<PromptAttachment>),
+    Attachments(Vec<ClipboardAttachment>),
     Text(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardAttachment {
+    pub label: String,
+    pub path: Option<PathBuf>,
+    pub image: Option<ImageData>,
 }
 
 #[derive(Debug, Error)]
@@ -58,10 +65,10 @@ pub fn read_desktop() -> Result<ClipboardPayload, ClipboardError> {
             .map_err(|error| ClipboardError::Unavailable(error.to_string()))?;
         let data = png.get_bytes().to_vec();
         check_attachment_size(data.len().try_into().unwrap_or(u64::MAX))?;
-        return Ok(ClipboardPayload::Attachments(vec![PromptAttachment {
+        return Ok(ClipboardPayload::Attachments(vec![ClipboardAttachment {
             label: "Image".to_owned(),
             path: None,
-            image: Some(PromptImage {
+            image: Some(ImageData {
                 mime_type: "image/png".to_owned(),
                 data,
             }),
@@ -76,7 +83,7 @@ pub fn read_desktop() -> Result<ClipboardPayload, ClipboardError> {
 /// Converts a terminal paste to attachments when every pasted token names an
 /// existing file. Terminal emulators use this path for drag and drop.
 #[must_use]
-pub fn attachments_from_terminal_paste(text: &str) -> Option<Vec<PromptAttachment>> {
+pub fn attachments_from_terminal_paste(text: &str) -> Option<Vec<ClipboardAttachment>> {
     let trimmed = text.trim();
     let direct = PathBuf::from(trimmed);
     let paths = if direct.is_file() {
@@ -96,7 +103,7 @@ pub fn attachments_from_terminal_paste(text: &str) -> Option<Vec<PromptAttachmen
 
 fn attachments_from_paths(
     paths: impl IntoIterator<Item = PathBuf>,
-) -> Result<Vec<PromptAttachment>, ClipboardError> {
+) -> Result<Vec<ClipboardAttachment>, ClipboardError> {
     paths
         .into_iter()
         .filter(|path| path.is_file())
@@ -104,11 +111,11 @@ fn attachments_from_paths(
         .collect()
 }
 
-fn attachment_from_path(path: PathBuf) -> Result<PromptAttachment, ClipboardError> {
+fn attachment_from_path(path: PathBuf) -> Result<ClipboardAttachment, ClipboardError> {
     let metadata = fs::metadata(&path)?;
     check_attachment_size(metadata.len())?;
     let image = image_mime(&path).map(|mime_type| {
-        fs::read(&path).map(|data| PromptImage {
+        fs::read(&path).map(|data| ImageData {
             mime_type: mime_type.to_owned(),
             data,
         })
@@ -119,7 +126,7 @@ fn attachment_from_path(path: PathBuf) -> Result<PromptAttachment, ClipboardErro
         .and_then(|name| name.to_str())
         .unwrap_or("File")
         .to_owned();
-    Ok(PromptAttachment {
+    Ok(ClipboardAttachment {
         label,
         path: Some(path),
         image,
@@ -186,7 +193,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        MAX_SELECTION_BYTES, attachments_from_terminal_paste, osc52_sequence, write_osc52,
+        MAX_ATTACHMENT_BYTES, MAX_SELECTION_BYTES, attachments_from_terminal_paste,
+        check_attachment_size, osc52_sequence, write_osc52,
     };
 
     #[test]
@@ -210,6 +218,16 @@ mod tests {
         let oversized = "x".repeat(MAX_SELECTION_BYTES + 1);
 
         assert!(osc52_sequence(&oversized, false).is_err());
+    }
+
+    #[test]
+    fn attachment_limit_matches_the_service_transport_contract() {
+        assert_eq!(
+            MAX_ATTACHMENT_BYTES,
+            u64::try_from(nakode_protocol::MAX_ARTIFACT_BYTES).expect("artifact limit fits u64")
+        );
+        assert!(check_attachment_size(MAX_ATTACHMENT_BYTES).is_ok());
+        assert!(check_attachment_size(MAX_ATTACHMENT_BYTES + 1).is_err());
     }
 
     #[test]

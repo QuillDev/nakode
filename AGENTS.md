@@ -29,6 +29,17 @@ The governing rule is:
 > inference semantics. Optional external harnesses own only the sessions that
 > explicitly select those compatibility adapters.
 
+The frontend boundary is equally strict:
+
+> The Nakode server owns all canonical product state and every operation that
+> can mutate it. A frontend is only a renderer and input adapter over the
+> public SDK. The TUI has no privileged access to application behavior.
+
+This is a hard project boundary. New product capabilities are server
+capabilities first, public API operations second, SDK methods third, and
+frontend rendering last. A feature implemented only inside the TUI is not a
+Nakode feature and must not be merged as one.
+
 ### In-process provider adapters own
 
 - Provider authentication and token refresh
@@ -54,8 +65,8 @@ state.
 - Shared skills and their provider-specific materialization
 - Shared memory, provenance, scopes, confidence, and supersession
 - Provider enablement and user model-default preferences
-- Session discovery, coordination metadata, audit history, controls, and TUI
-  state
+- Session discovery, coordination metadata, audit history, controls, and
+  canonical client-independent application state
 
 The portable runtime exposes clear provider-neutral tools rather than copying
 the private implementation of an existing harness. Provider-hosted tools may be
@@ -67,6 +78,87 @@ External executables may be supported by optional compatibility adapters. Such
 an adapter must declare its executable requirement and degrade independently
 when missing. It must never prevent the application or unrelated providers from
 starting.
+
+## Server and client architecture
+
+Nakode is a client-server application. The long-running Nakode server is the
+single authority for domain state and execution; the TUI is one thin client of
+that server, not the owner of the application. Web, desktop, CLI, IDE, mobile,
+and automation clients must be able to use the same service contract without
+reimplementing orchestration semantics.
+
+The server is the product runtime. Frontends are replaceable projections of
+that runtime. No frontend may gain special capabilities by being written in
+Rust, shipped in the same executable, or maintained in this repository.
+
+The server owns:
+
+- Logical sessions, transcripts, turns, tasks, queues, and artifacts
+- Provider connections, native agent sessions, inference streams, and retries
+- Tool execution, process supervision, agents, subagents, and orchestration
+- Approvals, questions, permission policy, cancellation, and unattended work
+- Configuration, credentials, persistence, audit history, and canonical state
+- Client subscriptions, ordered event publication, and reconnectable snapshots
+
+The server must continue running and supervising active work with zero attached
+clients. Closing, crashing, or replacing a TUI must not cancel work or transfer
+ownership of a session. CLI and automation calls address the server directly;
+they must not be routed through a TUI or require a TUI to be running.
+
+Clients own only presentation and device concerns:
+
+- Input capture and translation into protocol actions
+- Rendering server-provided semantic state
+- Draft text before submission, focus, scroll, selection, viewport dimensions,
+  local navigation, and other per-client ephemeral presentation state
+- Terminal, browser, desktop, or IDE lifecycle integration specific to that
+  client
+
+A client must not open provider connections, execute tools, mutate persistence,
+or maintain an authoritative copy of domain state. It must not infer a domain
+transition from a snapshot, reconcile provider events, choose queue-versus-run
+policy, manage session continuity, or perform an operation because the server
+API lacks an edge. Every operation that changes Nakode state is a typed SDK call
+to the server. Purely presentational interactions such as typing an unsent
+draft, scrolling, selecting text, or resizing remain local and must not create
+server traffic merely to redraw a view.
+
+### Service protocol
+
+The service boundary is the explicit, versioned, language-neutral Protobuf
+contract in `proto/nakode/v1/nakode.proto`, served over gRPC. It has three
+concepts:
+
+1. **Commands** request domain changes and receive accepted or rejected results.
+2. **Queries and snapshots** establish a complete client view at a known
+   revision.
+3. **Watches** publish authoritative replacement snapshots to subscribers.
+
+Protocol messages use stable resource IDs, monotonic revisions, and unique
+idempotency keys for mutating commands. A reconnecting client must be able to
+request a fresh snapshot or continue from a known revision without guessing
+what changed. Slow clients must not block inference, tools, persistence, or
+other subscribers. Protocol evolution must be explicitly versioned, and a
+version mismatch must fail clearly rather than silently misinterpreting state.
+
+Snapshots describe semantic product state, not terminal cells, Ratatui widgets,
+or provider wire events. Clients replace their observed product projection and
+render it locally; they do not replay the server's reducer. gRPC is the sole
+public frontend transport. Additional network or browser transports may be
+added only as adapters over the same Protobuf service and must not introduce a
+second product contract or new domain semantics.
+
+Multiple clients may observe one session concurrently. Mutating commands must
+have deterministic conflict and authorization semantics. Interactive requests
+such as approvals and questions remain server-owned resources with explicit
+resolution status so simultaneous clients cannot resolve them inconsistently.
+
+The public API must expose every capability needed to build a feature-complete
+alternative frontend. SDKs own connection recovery, idempotent mutation retry,
+watch resubscription, paging, hydration, and session open/create selection so
+frontend code only calls distinct product methods and renders their state.
+Generated transport stubs are the base layer; supported language SDKs add this
+shared behavior without inventing client-side domain policy.
 
 ## Session model
 
@@ -273,18 +365,20 @@ The registry owns:
 - Command-completion descriptions and placement rules
 - Primary `Ctrl+?` help grouping, labels, and descriptions
 
-Input handling in `src/app.rs` resolves registered actions and then invokes
-state transitions. Do not add direct `KeyCode` or modifier comparisons for a
-new action in an input handler. Raw text insertion and extraction of dynamic
-data from an already registered pattern, such as a numbered question choice,
-are the narrow exceptions.
+Client input handling resolves registered actions and then either updates
+purely local presentation state or emits a typed service command. It must not
+invoke provider, persistence, tool, or orchestration code directly. Do not add
+direct `KeyCode` or modifier comparisons for a new action in an input handler.
+Raw text insertion and extraction of dynamic data from an already registered
+pattern, such as a numbered question choice, are the narrow exceptions.
 
 When adding or changing a control:
 
 1. Add or reuse a `ControlAction` and register its binding under the narrowest
    valid `ControlContext` in `src/controls.rs`.
-2. Route the resolved action to its behavior in `src/app.rs`; keep business
-   state transitions in `src/state.rs`.
+2. Route the resolved action to either local presentation behavior or a typed
+   service command. Business transitions run in server-owned domain state, not
+   in the client.
 3. Add help metadata for controls users need to discover globally. Contextual
    overlays may compose local hints, but those hints do not define behavior and
    must agree with the registry.
@@ -318,37 +412,52 @@ affordances rather than instructions.
 
 ## Process and UI boundaries
 
-Keep these responsibilities separate:
+The process boundary is an architectural boundary, not merely a module
+organization preference:
+
+- The server process owns the domain reducer, provider-neutral engine, provider
+  adapters, runtime, tools, persistence, credentials, process supervision, and
+  all ongoing work.
+- Client processes own their platform lifecycle, input mapping, ephemeral view
+  state, and rendering.
+- A protocol package owns shared command, query, snapshot, event, error,
+  identity, revision, and capability types. It contains no Ratatui,
+  Crossterm, provider-wire, SQLite, or process-management types.
+- Transport adapters own framing, connection lifecycle, authentication, and
+  subscriptions without acquiring domain authority.
+
+For the terminal client specifically:
 
 - `src/terminal.rs` — terminal acquisition, modes, and restoration
 - `src/render.rs` — Ratatui layout and presentation only
 - `src/controls.rs` — control discovery and input binding metadata
-- `src/app.rs` — event loop, effect execution, and subsystem wiring
-- `src/state.rs` — provider-neutral application transitions
-- `src/backend.rs` — provider-neutral adapter command/event contracts
-- `src/runtime.rs` — portable inference and tool loop
-- `src/tools/` — supervised local tool implementations
-- `src/codex/native.rs`, `src/devin/native.rs`, and `src/kimi/native.rs` — in-process
-  provider wire adapters
-- `src/session.rs` — SQLite metadata persistence
-- `src/pty.rs` and process helpers — child-process supervision and cleanup
+- TUI application code — connection lifecycle, protocol action emission,
+  event/snapshot consumption, and per-client presentation state only
 
-Compatibility clients stay isolated from primary native adapters. Rendering
-must not perform persistence or provider operations. Provider modules must not
-mutate TUI state directly.
+Server-side code owns provider-neutral transitions and effect execution.
+Provider wire adapters normalize events before the engine consumes them.
+Compatibility adapters stay isolated from primary native adapters. Rendering
+must never perform persistence, provider, tool, or orchestration operations,
+and server modules must never depend on TUI state or rendering types.
 
-The application preserves Ratatui/Crossterm terminal ownership, bounded
-channels, normalized event reduction, provider-native authentication,
-queue-versus-steer semantics, SQLite metadata, and terminal and child-process
-cleanup on every exit path.
+Existing `src/app.rs` and `src/state.rs` responsibilities must not be treated as
+authority by filename. `src/app.rs` is client event-loop and effect wiring;
+server/domain modules own canonical transitions. Presentation types may project
+server snapshots but must never become a second domain model. The production
+TUI must use the same public gRPC/SDK path available to an external frontend,
+even when client and server ship in one executable.
+
+Both sides must clean up what they own: clients restore terminal or platform
+state on every exit path, while the server supervises and cleans up child
+processes independently of client connections.
 
 ## Headless TUI evaluation
 
 Use Nakode's deterministic TUI evaluation harness for interaction, rendering,
 and UI smoke tests. It runs fully headlessly: it does not open a window, acquire
 the desktop terminal, start a provider process, touch persistence, or parse ANSI
-output. It drives the real control registry, application event reducer, state,
-and Ratatui renderer through an in-memory terminal.
+output. It drives the real control registry, client input reducer, presentation
+state, and Ratatui renderer through an in-memory terminal.
 
 Run the committed smoke scenario with:
 
@@ -361,10 +470,10 @@ The harness reads JSON Lines actions from `--scenario` or standard input and
 emits one structured JSON observation per action. Use it to:
 
 - send real key, text, paste, mouse, and resize events;
-- inject normalized backend events for sessions, turns, streamed items,
-  approvals, questions, todos, warnings, failures, and disconnects;
-- inspect rendered lines, cursor state, optional style runs, semantic
-  application state, recent transcript entries, and emitted effects;
+- install service-owned snapshot changes for sessions, turns, streamed
+  items, approvals, questions, todos, warnings, failures, and disconnects;
+- inspect rendered lines, cursor state, optional style runs, per-client
+  presentation state, recent view entries, and emitted service commands;
 - assert screen content, modal state, status, draft contents, connection,
   effects, cursor visibility, and terminal dimensions.
 
@@ -374,10 +483,11 @@ visual evaluation. A failed assertion must exit nonzero, identify its scenario
 line, and retain the failed observation for diagnosis.
 
 Keep reusable end-to-end scenarios under `tests/tui_scenarios/` and execute
-them from Rust tests so they cannot silently drift. Extend harness fixtures at
-the normalized backend boundary; provider wire-protocol fixtures remain inside
-their adapter tests. The complete action, fixture, assertion, and observation
-reference lives in `docs/tui-evaluation.md`.
+them from Rust tests so they cannot silently drift. Extend client harness
+fixtures at the service protocol boundary; test the headless server separately
+through commands, snapshots, and event subscriptions. Provider wire-protocol
+fixtures remain inside their adapter tests. The complete action, fixture,
+assertion, and observation reference lives in `docs/tui-evaluation.md`.
 
 The headless harness complements `tests/tui_terminal.rs`. Use the PTY tests only
 for behavior that depends on the actual executable or terminal lifecycle, such

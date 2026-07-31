@@ -1,0 +1,275 @@
+syntax = "proto3";
+
+package nakode.v1;
+
+option go_package = "github.com/QuillDev/nakode/gen/go/nakode/v1;nakodev1";
+
+import "google/protobuf/empty.proto";
+
+// NakodeService is the complete product boundary used by every frontend.
+// Watch methods emit authoritative replacement snapshots, not reducer events.
+service NakodeService {
+  rpc GetWorkspace(GetWorkspaceRequest) returns (WorkspaceSnapshot);
+  rpc WatchWorkspace(WatchWorkspaceRequest) returns (stream WorkspaceSnapshot);
+  rpc ReloadWorkspace(ReloadWorkspaceRequest) returns (MutationResult);
+
+  rpc CreateSession(CreateSessionRequest) returns (MutationResult);
+  rpc OpenSession(OpenSessionRequest) returns (MutationResult);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc GetSession(GetSessionRequest) returns (SessionSnapshot);
+  rpc WatchSession(WatchSessionRequest) returns (stream SessionSnapshot);
+  rpc SendPrompt(SendPromptRequest) returns (MutationResult);
+  rpc EnqueuePrompt(EnqueuePromptRequest) returns (MutationResult);
+  rpc RemoveQueuedPrompt(RemoveQueuedPromptRequest) returns (MutationResult);
+  rpc SteerTurn(SteerTurnRequest) returns (MutationResult);
+  rpc CancelTurn(CancelTurnRequest) returns (MutationResult);
+  rpc CancelSessionWork(CancelSessionWorkRequest) returns (MutationResult);
+  rpc CompactContext(CompactContextRequest) returns (MutationResult);
+  rpc ResolveInteraction(ResolveInteractionRequest) returns (MutationResult);
+  rpc RunShell(RunShellRequest) returns (MutationResult);
+
+  rpc SelectModel(SelectModelRequest) returns (MutationResult);
+  rpc SetProviderEnabled(SetProviderEnabledRequest) returns (MutationResult);
+  rpc BeginProviderAuthentication(BeginProviderAuthenticationRequest) returns (MutationResult);
+  rpc SetProviderCredential(SetProviderCredentialRequest) returns (MutationResult);
+  rpc ClearProviderCredential(ClearProviderCredentialRequest) returns (MutationResult);
+  rpc SaveAgent(SaveAgentRequest) returns (MutationResult);
+  rpc DeleteAgent(DeleteAgentRequest) returns (MutationResult);
+  rpc UpdateSettings(UpdateSettingsRequest) returns (MutationResult);
+  rpc CheckAgentBrowser(CheckAgentBrowserRequest) returns (MutationResult);
+
+  rpc Delegate(DelegateRequest) returns (MutationResult);
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  rpc GetRun(GetRunRequest) returns (RunSnapshot);
+  rpc WatchRun(WatchRunRequest) returns (stream RunSnapshot);
+  rpc CancelRun(CancelRunRequest) returns (MutationResult);
+
+  rpc GetTranscriptPage(GetTranscriptPageRequest) returns (TranscriptPage);
+  rpc GetTranscriptBodyWindow(GetTranscriptBodyWindowRequest) returns (TranscriptBodyWindow);
+  rpc GetRunTextWindow(GetRunTextWindowRequest) returns (RunTextWindow);
+  rpc GetArtifact(GetArtifactRequest) returns (Artifact);
+  rpc GetDiagnostics(GetDiagnosticsRequest) returns (DiagnosticsReport);
+  rpc GetServerInfo(google.protobuf.Empty) returns (ServerInfo);
+}
+
+message MutationOptions {
+  // SDK-generated and stable across a retry of one logical operation.
+  string idempotency_key = 1;
+  optional uint64 expected_revision = 2;
+}
+
+message MutationResult {
+  optional string resource_id = 1;
+  optional uint64 revision = 2;
+}
+
+message Cursor { string server_epoch = 1; uint64 sequence = 2; }
+message ServerInfo { string server_version = 1; string api_version = 2; repeated string capabilities = 3; }
+
+message GetWorkspaceRequest { string workspace = 1; optional string session_id = 2; }
+// `after` is a resume hint. The server may always answer with a newer full
+// replacement snapshot, so clients never need to reduce replay events.
+message WatchWorkspaceRequest { string workspace_id = 1; optional Cursor after = 2; }
+message ReloadWorkspaceRequest { MutationOptions mutation = 1; string workspace_id = 2; string session_id = 3; }
+message WorkspaceSnapshot { Cursor cursor = 1; WorkspaceState state = 2; }
+
+message CreateSessionRequest { MutationOptions mutation = 1; string workspace_id = 2; optional string title = 3; }
+message OpenSessionRequest { MutationOptions mutation = 1; string session_id = 2; }
+message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
+message ListSessionsResponse { repeated SessionSummary sessions = 1; }
+message GetSessionRequest { string session_id = 1; }
+message WatchSessionRequest { string session_id = 1; optional Cursor after = 2; }
+message SessionSnapshot { Cursor cursor = 1; SessionState state = 2; }
+
+message PromptInput { string text = 1; repeated PromptAttachment attachments = 2; }
+message PromptAttachment {
+  string label = 1;
+  oneof source {
+    string artifact_id = 2;
+    string local_file = 3;
+    InlineImage inline_image = 4;
+  }
+}
+message InlineImage { string media_type = 1; bytes data = 2; }
+message SendPromptRequest { MutationOptions mutation = 1; string session_id = 2; PromptInput prompt = 3; }
+message EnqueuePromptRequest { MutationOptions mutation = 1; string session_id = 2; PromptInput prompt = 3; }
+message RemoveQueuedPromptRequest { MutationOptions mutation = 1; string session_id = 2; string prompt_id = 3; }
+message SteerTurnRequest { MutationOptions mutation = 1; string turn_id = 2; string text = 3; }
+message CancelTurnRequest { MutationOptions mutation = 1; string turn_id = 2; }
+message CancelSessionWorkRequest { MutationOptions mutation = 1; string session_id = 2; }
+message CompactContextRequest { MutationOptions mutation = 1; string agent_session_id = 2; }
+message RunShellRequest { MutationOptions mutation = 1; string session_id = 2; string command = 3; }
+
+enum InteractionResolutionKind {
+  INTERACTION_RESOLUTION_KIND_UNSPECIFIED = 0;
+  INTERACTION_RESOLUTION_KIND_APPROVE_ONCE = 1;
+  INTERACTION_RESOLUTION_KIND_APPROVE_FOR_SESSION = 2;
+  INTERACTION_RESOLUTION_KIND_DECLINE = 3;
+  INTERACTION_RESOLUTION_KIND_ANSWER = 4;
+}
+message ResolveInteractionRequest {
+  MutationOptions mutation = 1;
+  string interaction_id = 2;
+  InteractionResolutionKind resolution = 3;
+  repeated string option_ids = 4;
+}
+
+message ModelOptions { optional string reasoning_effort = 1; bool fast_mode = 2; }
+message ModelTarget {
+  oneof target {
+    string provider_default = 1;
+    string session_id = 2;
+    string agent_session_id = 3;
+    bool vision = 4;
+  }
+}
+message SelectModelRequest { MutationOptions mutation = 1; ModelTarget target = 2; string model_id = 3; ModelOptions options = 4; }
+message SetProviderEnabledRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; }
+message BeginProviderAuthenticationRequest { MutationOptions mutation = 1; string provider_id = 2; }
+message SetProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; string kind = 3; string credential = 4; }
+message ClearProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; }
+
+message AgentDefinitionInput {
+  string slug = 1;
+  string description = 2;
+  string system_prompt = 3;
+  string first_message = 4;
+  optional string model_id = 5;
+  repeated string fallback_models = 6;
+  bool fast_mode = 7;
+}
+message SaveAgentRequest { MutationOptions mutation = 1; string workspace_id = 2; AgentDefinitionInput definition = 3; optional string previous_slug = 4; }
+message DeleteAgentRequest { MutationOptions mutation = 1; string workspace_id = 2; string slug = 3; }
+message CheckAgentBrowserRequest { MutationOptions mutation = 1; string workspace_id = 2; }
+
+message WebSettingsPatch { string backend = 1; optional string credential = 2; }
+message MemorySettingsPatch { string backend = 1; optional string executable = 2; optional string global_bank = 3; optional string data_directory = 4; }
+message VisionSettingsPatch { optional string model_id = 1; bool clear_model = 2; }
+message TerminalImagesSettingsPatch { string mode = 1; }
+message SettingsPatch {
+  oneof patch {
+    WebSettingsPatch web = 1;
+    MemorySettingsPatch memory = 2;
+    VisionSettingsPatch vision = 3;
+    TerminalImagesSettingsPatch terminal_images = 4;
+  }
+}
+message UpdateSettingsRequest { MutationOptions mutation = 1; SettingsPatch patch = 2; }
+
+message DelegateRequest { MutationOptions mutation = 1; string session_id = 2; string agent_slug = 3; string task = 4; }
+message ListRunsRequest { string session_id = 1; optional string before_run_id = 2; uint32 limit = 3; }
+message ListRunsResponse { repeated RunState runs = 1; bool has_earlier = 2; }
+message GetRunRequest { string run_id = 1; }
+message WatchRunRequest { string run_id = 1; optional Cursor after = 2; }
+message RunSnapshot { Cursor cursor = 1; RunState state = 2; }
+message CancelRunRequest { MutationOptions mutation = 1; string run_id = 2; }
+
+enum TranscriptOwnerKind { TRANSCRIPT_OWNER_KIND_UNSPECIFIED = 0; TRANSCRIPT_OWNER_KIND_SESSION = 1; TRANSCRIPT_OWNER_KIND_RUN = 2; }
+message GetTranscriptPageRequest { TranscriptOwnerKind owner_kind = 1; string owner_id = 2; optional string before_entry_id = 3; uint32 limit = 4; }
+message GetTranscriptBodyWindowRequest { TranscriptOwnerKind owner_kind = 1; string owner_id = 2; string entry_id = 3; optional uint64 before_byte = 4; uint32 limit_bytes = 5; }
+enum RunTextField { RUN_TEXT_FIELD_UNSPECIFIED = 0; RUN_TEXT_FIELD_OBJECTIVE = 1; RUN_TEXT_FIELD_LATEST_ACTIVITY = 2; RUN_TEXT_FIELD_OUTCOME = 3; RUN_TEXT_FIELD_RESULT = 4; }
+message GetRunTextWindowRequest { string run_id = 1; RunTextField field = 2; optional uint64 before_byte = 3; uint32 limit_bytes = 4; }
+message GetArtifactRequest { string artifact_id = 1; }
+message GetDiagnosticsRequest { uint32 days = 1; uint32 session_limit = 2; optional string provider_id = 3; }
+
+message WorkspaceState {
+  string workspace_id = 1;
+  string workspace_path = 2;
+  repeated Provider providers = 3;
+  repeated Model models = 4;
+  repeated AgentDefinition agents = 5;
+  repeated Skill skills = 6;
+  Settings settings = 7;
+  repeated SessionSummary sessions = 8;
+  optional SessionState active_session = 9;
+}
+
+message ProviderCapabilities { repeated ProviderCapability supported = 1; }
+enum ProviderCapability {
+  PROVIDER_CAPABILITY_UNSPECIFIED = 0;
+  PROVIDER_CAPABILITY_RESUME = 1;
+  PROVIDER_CAPABILITY_STEERING = 2;
+  PROVIDER_CAPABILITY_INTERRUPTION = 3;
+  PROVIDER_CAPABILITY_MODEL_CATALOG = 4;
+  PROVIDER_CAPABILITY_MODELS_REQUIRE_SESSION = 5;
+  PROVIDER_CAPABILITY_SESSION_MODEL_CONFIGURATION = 6;
+  PROVIDER_CAPABILITY_CONTEXT_COMPACTION = 7;
+  PROVIDER_CAPABILITY_APPROVALS = 8;
+  PROVIDER_CAPABILITY_NATIVE_TOOLS = 9;
+  PROVIDER_CAPABILITY_MCP = 10;
+  PROVIDER_CAPABILITY_CLOSE_SESSION = 11;
+}
+enum ConnectionState { CONNECTION_STATE_UNSPECIFIED = 0; CONNECTION_STATE_DISABLED = 1; CONNECTION_STATE_STARTING = 2; CONNECTION_STATE_READY = 3; CONNECTION_STATE_FAILED = 4; CONNECTION_STATE_DISCONNECTED = 5; }
+message Connection { ConnectionState state = 1; optional string message = 2; }
+message ProviderAuthentication { enum Kind { KIND_UNSPECIFIED = 0; KIND_STARTING = 1; KIND_API_KEY_REQUIRED = 2; KIND_CHALLENGE = 3; } Kind kind = 1; optional string dashboard_url = 2; optional string credential_kind = 3; optional string verification_url = 4; optional string user_code = 5; }
+message Provider { string id = 1; string display_name = 2; bool enabled = 3; bool credential_configured = 4; optional string credential_kind = 5; Connection connection = 6; ProviderCapabilities capabilities = 7; optional ProviderAuthentication authentication = 8; }
+message ModelConfiguration { repeated string reasoning_efforts = 1; bool fast_mode_configurable = 2; bool vision_eligible = 3; }
+message Model { string id = 1; string provider_id = 2; string model_slug = 3; string display_name = 4; bool is_default = 5; optional string reasoning_effort = 6; bool fast_mode = 7; ModelConfiguration configuration = 8; }
+message AgentDefinition { string slug = 1; string description = 2; string system_prompt = 3; string first_message = 4; optional string model_id = 5; repeated string fallback_models = 6; bool fast_mode = 7; }
+message Skill { string name = 1; string description = 2; }
+
+message WebSettings { string backend = 1; bool credential_configured = 2; AgentBrowser agent_browser = 3; }
+message AgentBrowser { enum State { STATE_UNSPECIFIED = 0; STATE_CHECKING = 1; STATE_AVAILABLE = 2; STATE_UNAVAILABLE = 3; } State state = 1; optional string version = 2; }
+message MemorySettings { string backend = 1; string executable = 2; string global_bank = 3; string data_directory = 4; bool configured = 5; bool available = 6; }
+message VisionSettings { optional string model_id = 1; }
+enum TerminalImageMode { TERMINAL_IMAGE_MODE_UNSPECIFIED = 0; TERMINAL_IMAGE_MODE_AUTO = 1; TERMINAL_IMAGE_MODE_ON = 2; TERMINAL_IMAGE_MODE_OFF = 3; }
+message Settings { WebSettings web = 1; MemorySettings memory = 2; VisionSettings vision = 3; TerminalImageMode terminal_images = 4; }
+
+message SessionSummary { string id = 1; string workspace_id = 2; string title = 3; optional string active_provider_id = 4; optional string active_model_id = 5; int64 updated_at_ms = 6; }
+enum SessionActivity { SESSION_ACTIVITY_UNSPECIFIED = 0; SESSION_ACTIVITY_IDLE = 1; SESSION_ACTIVITY_CREATING_AGENT_SESSION = 2; SESSION_ACTIVITY_STARTING_TURN = 3; SESSION_ACTIVITY_RUNNING_TURN = 4; SESSION_ACTIVITY_COMPACTING_CONTEXT = 5; SESSION_ACTIVITY_RUNNING_DELEGATES = 6; SESSION_ACTIVITY_RUNNING_SHELL = 7; }
+message AgentSession { string id = 1; string provider_id = 2; optional string model_id = 3; string role = 4; ProviderCapabilities capabilities = 5; Connection connection = 6; }
+enum TurnStatus { TURN_STATUS_UNSPECIFIED = 0; TURN_STATUS_STARTING = 1; TURN_STATUS_RUNNING = 2; TURN_STATUS_CANCELLING = 3; TURN_STATUS_COMPLETED = 4; TURN_STATUS_INTERRUPTED = 5; TURN_STATUS_FAILED = 6; }
+message Turn { string id = 1; string agent_session_id = 2; optional string model_id = 3; TurnStatus status = 4; }
+message ContextUsage { uint64 estimated_tokens = 1; optional uint64 context_window = 2; bool compacting = 3; }
+message SessionState {
+  string id = 1;
+  uint64 revision = 2;
+  string workspace_id = 3;
+  string title = 4;
+  string status_message = 5;
+  uint64 diagnostic_count = 6;
+  SessionActivity activity = 7;
+  optional string selected_provider_id = 8;
+  optional string selected_model_id = 9;
+  optional AgentSession active_agent_session = 10;
+  optional Turn active_turn = 11;
+  optional ContextUsage context_usage = 12;
+  TranscriptPage transcript = 13;
+  optional RecoverablePrompt recoverable_prompt = 14;
+  repeated QueueItem queue = 15;
+  repeated Interaction interactions = 16;
+  repeated TodoPhase todos = 17;
+  repeated RunState runs = 18;
+  bool runs_has_earlier = 19;
+  repeated Notice notices = 20;
+}
+
+enum TranscriptEntryKind { TRANSCRIPT_ENTRY_KIND_UNSPECIFIED = 0; TRANSCRIPT_ENTRY_KIND_SYSTEM = 1; TRANSCRIPT_ENTRY_KIND_USER = 2; TRANSCRIPT_ENTRY_KIND_ASSISTANT = 3; TRANSCRIPT_ENTRY_KIND_STEERING = 4; TRANSCRIPT_ENTRY_KIND_REASONING = 5; TRANSCRIPT_ENTRY_KIND_TOOL = 6; TRANSCRIPT_ENTRY_KIND_DIFF = 7; TRANSCRIPT_ENTRY_KIND_WARNING = 8; TRANSCRIPT_ENTRY_KIND_ERROR = 9; }
+enum TranscriptEntryStatus { TRANSCRIPT_ENTRY_STATUS_UNSPECIFIED = 0; TRANSCRIPT_ENTRY_STATUS_RUNNING = 1; TRANSCRIPT_ENTRY_STATUS_COMPLETE = 2; TRANSCRIPT_ENTRY_STATUS_FAILED = 3; TRANSCRIPT_ENTRY_STATUS_INTERRUPTED = 4; }
+message TranscriptEntry { string id = 1; TranscriptEntryKind kind = 2; string title = 3; string body = 4; uint64 body_start_byte = 5; uint64 body_total_bytes = 6; TranscriptEntryStatus status = 7; repeated string artifact_ids = 8; }
+message TranscriptPage { repeated TranscriptEntry entries = 1; bool has_earlier = 2; bool stream_active = 3; string stream_label = 4; }
+message TranscriptBodyWindow { string entry_id = 1; string body = 2; uint64 start_byte = 3; uint64 total_bytes = 4; bool has_earlier = 5; }
+message QueueItem { string id = 1; string summary = 2; uint32 attachment_count = 3; }
+message RecoverablePrompt { string id = 1; string text = 2; repeated PromptAttachment attachments = 3; }
+
+enum InteractionKind { INTERACTION_KIND_UNSPECIFIED = 0; INTERACTION_KIND_APPROVAL = 1; INTERACTION_KIND_QUESTION = 2; }
+enum InteractionStatus { INTERACTION_STATUS_UNSPECIFIED = 0; INTERACTION_STATUS_PENDING = 1; INTERACTION_STATUS_RESOLVED = 2; INTERACTION_STATUS_DECLINED = 3; INTERACTION_STATUS_CANCELLED = 4; }
+message InteractionOption { string id = 1; string label = 2; optional string description = 3; bool recommended = 4; }
+message Interaction { string id = 1; uint64 revision = 2; InteractionKind kind = 3; InteractionStatus status = 4; string title = 5; string detail = 6; repeated InteractionOption options = 7; bool multiple = 8; }
+enum TodoStatus { TODO_STATUS_UNSPECIFIED = 0; TODO_STATUS_PENDING = 1; TODO_STATUS_IN_PROGRESS = 2; TODO_STATUS_COMPLETED = 3; TODO_STATUS_ABANDONED = 4; }
+message TodoItem { string content = 1; TodoStatus status = 2; }
+message TodoPhase { string name = 1; repeated TodoItem tasks = 2; }
+enum NoticeLevel { NOTICE_LEVEL_UNSPECIFIED = 0; NOTICE_LEVEL_INFO = 1; NOTICE_LEVEL_WARNING = 2; NOTICE_LEVEL_ERROR = 3; }
+message Notice { string id = 1; NoticeLevel level = 2; string message = 3; }
+
+enum RunStatus { RUN_STATUS_UNSPECIFIED = 0; RUN_STATUS_STARTING = 1; RUN_STATUS_WORKING = 2; RUN_STATUS_COMPLETED = 3; RUN_STATUS_INTERRUPTED = 4; RUN_STATUS_FAILED = 5; }
+message RunOutcome { enum Kind { KIND_UNSPECIFIED = 0; KIND_COMPLETED = 1; KIND_FAILED = 2; KIND_INTERRUPTED = 3; } Kind kind = 1; string body = 2; }
+message RunState { string id = 1; string agent_slug = 2; string provider_id = 3; string objective = 4; uint64 objective_start_byte = 5; uint64 objective_total_bytes = 6; RunStatus status = 7; string latest_activity = 8; uint64 latest_activity_start_byte = 9; uint64 latest_activity_total_bytes = 10; optional RunOutcome outcome = 11; uint64 outcome_start_byte = 12; uint64 outcome_total_bytes = 13; optional string result = 14; uint64 result_start_byte = 15; uint64 result_total_bytes = 16; TranscriptPage transcript = 17; }
+message RunTextWindow { string run_id = 1; RunTextField field = 2; string text = 3; uint64 start_byte = 4; uint64 total_bytes = 5; bool has_earlier = 6; }
+message Artifact { string id = 1; string label = 2; string media_type = 3; uint64 byte_length = 4; bytes data = 5; }
+
+message DiagnosticsUsageTotals { uint64 inference_rounds = 1; uint64 compaction_rounds = 2; uint64 failed_rounds = 3; uint64 retry_count = 4; uint64 estimated_input_tokens = 5; uint64 reported_input_tokens = 6; uint64 reported_cached_input_tokens = 7; uint64 reported_cache_write_tokens = 8; uint64 reported_output_tokens = 9; uint64 request_bytes = 10; uint64 response_bytes = 11; uint64 inference_duration_ms = 12; uint64 requested_tool_calls = 13; uint64 executed_tool_calls = 14; uint64 failed_tool_calls = 15; uint64 full_tool_output_bytes = 16; uint64 model_tool_output_bytes = 17; uint64 tool_duration_ms = 18; }
+message DiagnosticsDailyUsage { string date_utc = 1; string provider_id = 2; DiagnosticsUsageTotals totals = 3; }
+message DiagnosticsToolUsage { string provider_id = 1; string tool = 2; uint64 calls = 3; uint64 failures = 4; uint64 full_output_bytes = 5; uint64 model_output_bytes = 6; uint64 duration_ms = 7; }
+message DiagnosticsSessionUsage { string session_id = 1; string provider_id = 2; string model = 3; uint64 latest_activity_ms = 4; DiagnosticsUsageTotals totals = 5; }
+message DiagnosticsReport { uint64 generated_at_ms = 1; uint32 period_days = 2; optional string provider_filter = 3; uint64 sessions_scanned = 4; uint64 sessions_with_activity = 5; DiagnosticsUsageTotals totals = 6; repeated DiagnosticsDailyUsage daily = 7; repeated DiagnosticsToolUsage tools = 8; repeated DiagnosticsSessionUsage sessions = 9; repeated string notes = 10; }

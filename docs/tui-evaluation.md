@@ -1,15 +1,15 @@
 # TUI evaluation harness
 
 `nakode tui-eval` is a deterministic, headless terminal for evaluating the real
-Nakode TUI. It uses the same input reducer, control registry, application state,
-and Ratatui renderer as the interactive application. It does not start provider
+Nakode TUI. It uses the same input reducer, control registry, presentation
+state, and Ratatui renderer as the interactive client. It does not start provider
 processes, touch persistence, acquire the desktop terminal, or parse ANSI
 output.
 
 The harness complements, rather than replaces, `tests/tui_terminal.rs`:
 
-- `tui-eval` covers interaction, rendering, state transitions, provider events,
-  emitted effects, terminal sizes, and visual styles.
+- `tui-eval` covers interaction, rendering, authoritative service projections,
+  emitted SDK intents, terminal sizes, and visual styles.
 - PTY tests cover executable startup, Crossterm modes, control-service
   coordination, and terminal restoration.
 
@@ -50,8 +50,8 @@ All coordinates are zero-based terminal cells.
 | `paste` | `text` | Send a bracketed-paste event. |
 | `mouse` | `kind`, `column`, `row`, `modifiers` | Send left down/drag/up or scroll events. |
 | `resize` | `width`, `height` | Resize the TestBackend and send the matching resize event. |
-| `backend` | `provider`, `event` | Inject a normalized provider event without running a provider. |
-| `assert` | assertion fields | Check the current render, semantic state, and effects from the previous action. |
+| `service` | `event` | Install a fixture representing an authoritative server-side state change. |
+| `assert` | assertion fields | Check the current render, semantic state, and commands from the previous action. |
 
 Supported key names include individual characters, `enter`, `esc`, `tab`,
 `backtab`, `backspace`, `delete`, arrows, `home`, `end`, `page_up`,
@@ -60,17 +60,18 @@ Supported key names include individual characters, `enter`, `esc`, `tab`,
 
 Mouse kinds are `down`, `drag`, `up`, `scroll_up`, and `scroll_down`.
 
-## Provider fixtures
+## Service fixtures
 
-Backend events model the normalized boundary consumed by `AppState`, not any
-provider's wire protocol. Supported fixture event types are:
+Service fixtures update the protocol view consumed by the thin client; they do
+not run a provider, mutate persistence, or execute a command. Supported fixture
+event types are:
 
 - `ready` with a capability list
 - `models`
 - `session_created`
 - `turn_started`
 - `item` and `delta`
-- `approval` and `question`
+- `approval`, `question`, and `interaction_resolved`
 - `todo`
 - `turn_completed`
 - `context_usage`
@@ -80,19 +81,19 @@ provider's wire protocol. Supported fixture event types are:
 
 This is enough to evaluate full composer-to-response flows, streaming, tool and
 diff presentation, queues, approvals, questions, model/session state, errors,
-and disconnect behavior. Extend this normalized fixture enum when a new shared
-TUI state needs evaluation; provider protocol fixtures belong in their adapter
+and disconnect behavior. Extend this semantic fixture enum when a new shared
+TUI view needs evaluation; provider protocol fixtures belong in their adapter
 tests.
 
 Example:
 
 ```json
-{"action":"backend","event":{"type":"ready","display_name":"Codex","capabilities":["resume","steering","interruption","approvals"]}}
+{"action":"service","event":{"type":"ready","display_name":"Codex","capabilities":["resume","steering","interruption","approvals"]}}
 {"action":"type","text":"Run the tests"}
 {"action":"key","key":"enter"}
-{"action":"assert","effects_include":["backend:start_session"],"draft":""}
-{"action":"backend","event":{"type":"session_created","provider_session_id":"provider-session-1","model":"gpt-5"}}
-{"action":"assert","effects_include":["backend:start_turn"],"status":"Starting turn…"}
+{"action":"assert","commands_include":["submit_prompt"],"draft":""}
+{"action":"service","event":{"type":"session_created","provider_session_id":"provider-session-1","model":"gpt-5"}}
+{"action":"assert","status":"Starting turn…"}
 ```
 
 ## Assertions
@@ -102,7 +103,7 @@ Assertions may combine:
 - `screen_contains` and `screen_excludes`
 - exact `status` or `status_contains`
 - exact `modal`, `draft`, or `connection`
-- `effects_include` and `effects_exclude`
+- `commands_include` and `commands_exclude`
 - `cursor_visible`
 - `screen_width` and `screen_height`
 
@@ -110,10 +111,10 @@ Modal names are stable semantic identifiers: `none`, `help`, `approval`,
 `question`, `sessions`, `providers`, `agents`, `models`, `subagent`, `settings`,
 and the `settings:*` subviews.
 
-Effect names identify application boundaries such as `backend:start_session`,
-`backend:start_turn`, `backend:resolve_approval`, `list_providers`,
-`save_agent`, and `quit`. Each observation also includes relevant effect
-arguments.
+Command names are SDK operations such as `submit_prompt`,
+`resolve_interaction`, `select_model`, and `cancel_session_work`. Command
+payloads remain inside the typed harness so credentials or prompt content are
+not copied into observations. Provider effects belong in adapter tests.
 
 ## Observation shape
 
@@ -125,7 +126,8 @@ Each JSON result contains:
 - `state`: connection, provider, model, session/turn activity, active modal,
   status, draft, queue length, recent transcript entries, diagnostics, and quit
   state
-- `effects`: structured side effects emitted by the interaction
+- `commands`: typed server commands emitted by the interaction
+- `devices`: local URL/clipboard intents emitted by the interaction
 
 Prefer semantic assertions for behavior and a few high-value screen assertions
 for affordances. Use styled snapshots for targeted visual evaluation instead of

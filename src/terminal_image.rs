@@ -2,32 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use ratatui::{Frame, layout::Rect};
 use ratatui_image::{Image, Resize, picker::Picker, protocol::Protocol};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::backend::PromptImage;
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalImageMode {
-    #[default]
-    Auto,
-    On,
-    Off,
-}
-
-impl TerminalImageMode {
-    pub const ALL: [Self; 3] = [Self::Auto, Self::On, Self::Off];
-
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Automatic",
-            Self::On => "On",
-            Self::Off => "Off",
-        }
-    }
-}
+use crate::{media::ImageData, settings::TerminalImageMode};
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CacheKey {
     digest: [u8; 32],
@@ -71,7 +48,7 @@ impl TerminalImageRenderer {
         self.terminal_size = Some(terminal_size);
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect, image: &PromptImage) {
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect, image: &ImageData) {
         if area.is_empty() {
             return;
         }
@@ -149,7 +126,7 @@ mod tests {
     use ratatui_image::picker::Picker;
 
     use super::TerminalImageRenderer;
-    use crate::backend::PromptImage;
+    use crate::media::ImageData;
 
     #[test]
     fn valid_image_bytes_are_encoded_once_and_rendered() {
@@ -157,7 +134,7 @@ mod tests {
         DynamicImage::new_rgb8(2, 2)
             .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
             .expect("encode image");
-        let image = PromptImage {
+        let image = ImageData {
             mime_type: "image/png".to_owned(),
             data: bytes,
         };

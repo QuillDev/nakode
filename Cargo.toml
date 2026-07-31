@@ -3,7 +3,16 @@ name = "nakode"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A provider-neutral terminal layer for agent sessions and orchestration"
+description = "A provider-neutral agent server with generated SDKs and thin clients"
+
+[workspace]
+members = [
+  "crates/nakode-protocol",
+  "crates/nakode-sdk",
+  "crates/nakode-server",
+]
+exclude = ["crates/nakode-api"]
+resolver = "3"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -34,6 +43,9 @@ flate2 = "1"
 globset = "0.4"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+nakode-protocol = { path = "crates/nakode-protocol" }
+nakode-server = { path = "crates/nakode-server" }
+nakode-sdk = { path = "crates/nakode-sdk" }
 open = "5"
 portable-pty = "0.9"
 prost = "0.14"
@@ -65,12 +77,14 @@ tokio = { version = "1.52", features = [
   "time",
 ] }
 tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["net"] }
 toml = "0.9"
+tonic = "0.14.6"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v5", "v7"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal"] }
+nix = { version = "0.30", features = ["process", "signal"] }
 
 [dev-dependencies]
 tempfile = "3"

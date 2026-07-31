@@ -1,0 +1,1707 @@
+use std::{collections::BTreeSet, path::Component};
+
+use nakode_protocol::{
+    AgentBrowserView, AgentDefinitionView, AgentSessionId, AgentSessionView, ArtifactId,
+    ArtifactView, BootstrapView, ConnectionView, ContextUsageView, EntryId, InteractionId,
+    InteractionKind, InteractionOptionView, InteractionStatus, InteractionView, MAX_ARTIFACT_BYTES,
+    MAX_RUN_TEXT_BYTES, MAX_SESSION_RUNS, MAX_SESSION_RUNS_BYTES, MAX_TRANSCRIPT_ENTRY_BODY_BYTES,
+    MAX_TRANSCRIPT_PAGE_BODY_BYTES, MAX_TRANSCRIPT_PAGE_ENTRIES, MemorySettingsView,
+    ModelConfigurationView, ModelId, ModelView, NoticeLevel, NoticeView,
+    PromptAttachment as ProtocolPromptAttachment, PromptId, ProviderAuthenticationView,
+    ProviderCapabilities, ProviderCapability, ProviderId, ProviderView, QueueItemView,
+    RecoverablePromptView, RunId, RunOutcome, RunPage, RunStatus, RunTextField, RunTextWindow,
+    RunView, SessionActivity, SessionId, SessionSummary, SessionView, SettingsView, SkillView,
+    TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TranscriptBodyWindow,
+    TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TurnId,
+    TurnStatus, TurnView, VisionSettingsView, WebSettingsView, WorkspaceId,
+};
+
+use super::{
+    AgentBrowserStatus, ConnectionState, DomainState, ProviderAuthenticationState, SubagentRun,
+    SubagentStatus,
+};
+use crate::{
+    backend::{
+        BackendCapabilities, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, ModelInfo,
+        TodoStatus,
+    },
+    domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
+    memory::MemoryBackend,
+    session::{ProviderRecord, SessionRecord},
+    settings::TerminalImageMode,
+    web::WebBackend,
+};
+
+const ID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0xf3dc_a1f0_948e_5fa3_8f0e_5c26_c07c_42be);
+
+#[must_use]
+pub fn workspace_id(workspace: &str) -> WorkspaceId {
+    WorkspaceId::from(scoped_id("workspace", workspace))
+}
+
+#[must_use]
+pub fn bootstrap(
+    state: &DomainState,
+    revision: u64,
+    providers: &[ProviderRecord],
+    sessions: &[SessionRecord],
+) -> BootstrapView {
+    let workspace_id = workspace_id(&state.workspace);
+    let active_session = session_view(state, revision, &workspace_id, sessions);
+    let mut session_summaries = sessions
+        .iter()
+        .map(|session| session_summary(session, &workspace_id))
+        .collect::<Vec<_>>();
+    if !session_summaries
+        .iter()
+        .any(|session| session.id.as_str() == state.nakode_session_id)
+    {
+        session_summaries.insert(
+            0,
+            SessionSummary {
+                id: SessionId::from(state.nakode_session_id.clone()),
+                workspace_id: workspace_id.clone(),
+                title: active_session.title.clone(),
+                active_provider_id: provider_id(&state.backend_provider),
+                active_model_id: state.selected_model.clone().map(ModelId::from),
+                updated_at_ms: 0,
+            },
+        );
+    }
+
+    BootstrapView {
+        workspace_id: workspace_id.clone(),
+        workspace_path: state.workspace.clone(),
+        providers: providers
+            .iter()
+            .map(|provider| provider_view(state, provider))
+            .collect(),
+        models: state
+            .models
+            .iter()
+            .map(|model| {
+                let qualified = model.qualified_id();
+                let options = state.model_options_for_qualified(&qualified);
+                ModelView {
+                    id: ModelId::from(qualified),
+                    provider_id: ProviderId::from(model.provider.clone()),
+                    model_slug: model.id.clone(),
+                    display_name: model.display_name(),
+                    is_default: model.is_default,
+                    reasoning_effort: options.reasoning_effort,
+                    fast_mode: options.fast_mode,
+                    configuration: model_configuration(model),
+                }
+            })
+            .collect(),
+        agents: state
+            .agents
+            .definitions()
+            .iter()
+            .map(|definition| AgentDefinitionView {
+                slug: definition.slug.clone(),
+                description: definition.description.clone(),
+                system_prompt: definition.system_prompt.clone(),
+                first_message: definition.first_message.clone(),
+                model_id: definition.model.clone().map(ModelId::from),
+                fallback_models: definition
+                    .fallback_models
+                    .iter()
+                    .cloned()
+                    .map(ModelId::from)
+                    .collect(),
+                fast_mode: definition.fast_mode,
+            })
+            .collect(),
+        skills: state
+            .skills
+            .definitions()
+            .iter()
+            .map(|skill| SkillView {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+            })
+            .collect(),
+        settings: settings_view(state),
+        sessions: session_summaries,
+        active_session: Some(active_session),
+    }
+}
+
+fn model_configuration(model: &ModelInfo) -> ModelConfigurationView {
+    if model.provider == CODEX_PROVIDER {
+        return ModelConfigurationView {
+            reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            fast_mode_configurable: true,
+            vision_eligible: true,
+        };
+    }
+    let model_id = model.id.to_ascii_lowercase();
+    if model.provider == CURSOR_PROVIDER
+        && (model_id.starts_with("composer-") || model_id.starts_with("grok-4.5"))
+    {
+        return ModelConfigurationView {
+            fast_mode_configurable: true,
+            ..ModelConfigurationView::default()
+        };
+    }
+    ModelConfigurationView::default()
+}
+
+fn session_view(
+    state: &DomainState,
+    revision: u64,
+    workspace_id: &WorkspaceId,
+    sessions: &[SessionRecord],
+) -> SessionView {
+    let session_id = SessionId::from(state.nakode_session_id.clone());
+    let provider = provider_id(&state.backend_provider);
+    let agent_session = agent_session_view(state, &session_id, provider.as_ref());
+    let active_turn = turn_view(state, &session_id, agent_session.as_ref());
+    let (runs, runs_has_earlier) = run_views(state);
+
+    SessionView {
+        id: session_id.clone(),
+        revision,
+        workspace_id: workspace_id.clone(),
+        title: session_title(state, sessions),
+        status_message: state.status_message.clone(),
+        diagnostic_count: u64::try_from(state.diagnostic_count).unwrap_or(u64::MAX),
+        activity: activity(state),
+        selected_provider_id: provider,
+        selected_model_id: state.selected_model.clone().map(ModelId::from),
+        active_agent_session: agent_session,
+        active_turn,
+        context_usage: context_usage_view(state),
+        transcript: transcript_page(&state.transcript),
+        recoverable_prompt: recoverable_prompt_view(state),
+        queue: queue_views(state),
+        interactions: interactions(state, revision),
+        todos: todo_views(state),
+        runs,
+        runs_has_earlier,
+        notices: notice_views(state, revision),
+    }
+}
+
+fn recoverable_prompt_view(state: &DomainState) -> Option<RecoverablePromptView> {
+    let prompt = state.recoverable_prompt()?;
+    let entry_key = format!("user:{}", prompt.id);
+    let entry = state
+        .transcript
+        .entries()
+        .iter()
+        .find(|entry| entry.key.as_deref() == Some(entry_key.as_str()));
+    let mut image_artifacts = entry.into_iter().flat_map(|entry| {
+        state
+            .transcript
+            .image_artifacts(entry)
+            .enumerate()
+            .map(move |(index, _)| transcript_artifact_id(&entry.id, index))
+    });
+    let attachments = prompt
+        .attachments
+        .iter()
+        .map(|attachment| {
+            if attachment.image.is_some() {
+                return image_artifacts.next().map(|artifact_id| {
+                    ProtocolPromptAttachment::Artifact {
+                        artifact_id,
+                        label: attachment.label.clone(),
+                    }
+                });
+            }
+            let path = attachment.path.as_deref().filter(|path| {
+                !path.as_os_str().is_empty()
+                    && !path.is_absolute()
+                    && path.components().all(|component| {
+                        !matches!(
+                            component,
+                            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                        )
+                    })
+            })?;
+            Some(ProtocolPromptAttachment::LocalFile {
+                label: attachment.label.clone(),
+                path: path.to_str()?.to_owned(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if image_artifacts.next().is_some() {
+        return None;
+    }
+    Some(RecoverablePromptView {
+        id: PromptId::from(prompt.id.clone()),
+        text: prompt.text.clone(),
+        attachments,
+    })
+}
+
+fn session_title(state: &DomainState, sessions: &[SessionRecord]) -> String {
+    sessions
+        .iter()
+        .find(|session| session.id == state.nakode_session_id)
+        .map_or_else(
+            || {
+                state
+                    .transcript
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.kind == EntryKind::User)
+                    .map_or_else(|| "New session".to_owned(), |entry| first_line(&entry.body))
+            },
+            |session| session.title.clone(),
+        )
+}
+
+fn agent_session_view(
+    state: &DomainState,
+    session_id: &SessionId,
+    provider_id: Option<&ProviderId>,
+) -> Option<AgentSessionView> {
+    let provider_id = provider_id?;
+    Some(AgentSessionView {
+        id: AgentSessionId::from(scoped_id(
+            "agent-session",
+            &format!("{}:{}:primary", session_id.as_str(), provider_id.as_str()),
+        )),
+        provider_id: provider_id.clone(),
+        model_id: state.selected_model.clone().map(ModelId::from),
+        role: "primary".to_owned(),
+        capabilities: capabilities_view(&state.backend_capabilities),
+        connection: connection_view(&state.connection),
+    })
+}
+
+fn turn_view(
+    state: &DomainState,
+    session_id: &SessionId,
+    agent_session: Option<&AgentSessionView>,
+) -> Option<TurnView> {
+    let turn = state.active_turn.as_ref()?;
+    let agent_session = agent_session?;
+    Some(TurnView {
+        id: TurnId::from(scoped_id(
+            "turn",
+            &format!("{}:{}", session_id.as_str(), turn.id),
+        )),
+        agent_session_id: agent_session.id.clone(),
+        model_id: turn.model.clone().map(|model| qualify_model(state, &model)),
+        status: if turn.cancelling {
+            TurnStatus::Cancelling
+        } else {
+            TurnStatus::Running
+        },
+    })
+}
+
+fn context_usage_view(state: &DomainState) -> Option<ContextUsageView> {
+    state.context_usage.map(|usage| ContextUsageView {
+        estimated_tokens: u64::try_from(usage.estimated_tokens).unwrap_or(u64::MAX),
+        context_window: usage
+            .context_window
+            .map(|window| u64::try_from(window).unwrap_or(u64::MAX)),
+        compacting: state.context_compaction.is_some(),
+    })
+}
+
+fn queue_views(state: &DomainState) -> Vec<QueueItemView> {
+    state
+        .queue
+        .iter()
+        .map(|prompt| QueueItemView {
+            id: PromptId::from(prompt.id.clone()),
+            summary: first_line(&prompt.text),
+            attachment_count: u32::try_from(prompt.attachments.len()).unwrap_or(u32::MAX),
+        })
+        .collect()
+}
+
+fn todo_views(state: &DomainState) -> Vec<TodoPhaseView> {
+    state
+        .todo_phases
+        .iter()
+        .map(|phase| TodoPhaseView {
+            name: phase.name.clone(),
+            tasks: phase
+                .tasks
+                .iter()
+                .map(|task| TodoItemView {
+                    content: task.content.clone(),
+                    status: todo_status(task.status),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn run_views(state: &DomainState) -> (Vec<RunView>, bool) {
+    let page = projected_run_page(state, None, MAX_SESSION_RUNS)
+        .expect("an unbounded recent run page always exists");
+    (page.runs, page.has_earlier)
+}
+
+pub(crate) fn run_page(
+    state: &DomainState,
+    before: Option<&RunId>,
+    limit: usize,
+) -> Option<RunPage> {
+    projected_run_page(state, before, limit.min(MAX_SESSION_RUNS))
+}
+
+pub(crate) fn run_view(state: &DomainState, run_id: &RunId) -> Option<RunView> {
+    let run = state
+        .subagents
+        .iter()
+        .find(|run| run.id == run_id.as_str())?;
+    Some(project_run(state, run, MAX_TRANSCRIPT_PAGE_BODY_BYTES))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunTextWindowError {
+    RunNotFound,
+    FieldUnavailable,
+    LimitOutOfBounds { actual: usize, maximum: usize },
+    CursorOutOfBounds { actual: usize, total: usize },
+    CursorNotUtf8Boundary { actual: usize },
+    LimitTooSmallForCharacter { minimum: usize },
+}
+
+pub(crate) fn run_text_window(
+    state: &DomainState,
+    run_id: &RunId,
+    field: RunTextField,
+    before_byte: Option<u64>,
+    limit_bytes: usize,
+) -> Result<RunTextWindow, RunTextWindowError> {
+    if limit_bytes == 0 || limit_bytes > MAX_RUN_TEXT_BYTES {
+        return Err(RunTextWindowError::LimitOutOfBounds {
+            actual: limit_bytes,
+            maximum: MAX_RUN_TEXT_BYTES,
+        });
+    }
+    let run = state
+        .subagents
+        .iter()
+        .find(|run| run.id == run_id.as_str())
+        .ok_or(RunTextWindowError::RunNotFound)?;
+    let text = run_text(state, run, field).ok_or(RunTextWindowError::FieldUnavailable)?;
+    let end = before_byte.map_or(Ok(text.len()), |before| {
+        usize::try_from(before).map_err(|_| RunTextWindowError::CursorOutOfBounds {
+            actual: usize::MAX,
+            total: text.len(),
+        })
+    })?;
+    if end > text.len() {
+        return Err(RunTextWindowError::CursorOutOfBounds {
+            actual: end,
+            total: text.len(),
+        });
+    }
+    if !text.is_char_boundary(end) {
+        return Err(RunTextWindowError::CursorNotUtf8Boundary { actual: end });
+    }
+    let mut start = end.saturating_sub(limit_bytes);
+    while start < end && !text.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    if start == end && end > 0 {
+        let minimum = text[..end].chars().next_back().map_or(1, char::len_utf8);
+        return Err(RunTextWindowError::LimitTooSmallForCharacter { minimum });
+    }
+    Ok(RunTextWindow {
+        run_id: run_id.clone(),
+        field,
+        text: text[start..end].to_owned(),
+        start_byte: u64::try_from(start).unwrap_or(u64::MAX),
+        total_bytes: u64::try_from(text.len()).unwrap_or(u64::MAX),
+        has_earlier: start > 0,
+    })
+}
+
+fn run_text<'a>(
+    state: &'a DomainState,
+    run: &'a SubagentRun,
+    field: RunTextField,
+) -> Option<&'a str> {
+    match field {
+        RunTextField::Objective => Some(&run.objective),
+        RunTextField::LatestActivity => Some(&run.latest_activity),
+        RunTextField::Outcome => run_outcome_text(state, run),
+        RunTextField::Result if run_status(run.status) == RunStatus::Completed => {
+            latest_run_transcript_body(state, run, |entry| entry.kind == EntryKind::Assistant)
+                .or(Some(&run.latest_activity))
+        }
+        RunTextField::Result => None,
+    }
+}
+
+fn run_outcome_text<'a>(state: &'a DomainState, run: &'a SubagentRun) -> Option<&'a str> {
+    match run_status(run.status) {
+        RunStatus::Starting | RunStatus::Working => None,
+        RunStatus::Completed => {
+            latest_run_transcript_body(state, run, |entry| entry.kind == EntryKind::Assistant)
+                .or(Some(&run.latest_activity))
+        }
+        RunStatus::Failed => {
+            latest_run_transcript_body(state, run, |entry| entry.kind == EntryKind::Error)
+                .or(Some(&run.latest_activity))
+        }
+        RunStatus::Interrupted => latest_run_transcript_body(state, run, |entry| {
+            entry.status == EntryStatus::Interrupted
+                && matches!(
+                    entry.kind,
+                    EntryKind::System | EntryKind::Warning | EntryKind::Error
+                )
+        })
+        .or(Some(&run.latest_activity)),
+    }
+}
+
+fn latest_run_transcript_body<'a>(
+    state: &'a DomainState,
+    run: &SubagentRun,
+    predicate: impl Fn(&TranscriptEntry) -> bool,
+) -> Option<&'a str> {
+    state
+        .subagent_chats
+        .get(&run.id)?
+        .transcript
+        .entries()
+        .iter()
+        .rev()
+        .find(|entry| predicate(entry))
+        .map(|entry| entry.body.as_str())
+}
+
+fn projected_run_page(
+    state: &DomainState,
+    before: Option<&RunId>,
+    limit: usize,
+) -> Option<RunPage> {
+    let end = before.map_or(state.subagents.len(), |before| {
+        state
+            .subagents
+            .iter()
+            .position(|run| run.id == before.as_str())
+            .unwrap_or(usize::MAX)
+    });
+    if end == usize::MAX {
+        return None;
+    }
+
+    let mut runs = Vec::with_capacity(limit.min(end));
+    let mut remaining_bytes = MAX_SESSION_RUNS_BYTES;
+    for run in state.subagents[..end].iter().rev().take(limit) {
+        let projection = project_run(state, run, MAX_TRANSCRIPT_PAGE_BODY_BYTES / 16);
+        let encoded_bytes =
+            serde_json::to_vec(&projection).map_or(remaining_bytes, |value| value.len());
+        if encoded_bytes > remaining_bytes && !runs.is_empty() {
+            break;
+        }
+        remaining_bytes = remaining_bytes.saturating_sub(encoded_bytes);
+        runs.push(projection);
+    }
+    runs.reverse();
+    Some(RunPage {
+        has_earlier: runs.len() < end,
+        runs,
+    })
+}
+
+fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> RunView {
+    let transcript = state
+        .subagent_chats
+        .get(&run.id)
+        .map_or_else(empty_transcript_page, |chat| {
+            projected_transcript_page(
+                &chat.transcript,
+                None,
+                MAX_TRANSCRIPT_PAGE_ENTRIES,
+                body_budget,
+            )
+            .expect("an unbounded recent transcript page always exists")
+        });
+    let status = run_status(run.status);
+    let objective = bounded_text(&run.objective);
+    let latest_activity = bounded_text(&run.latest_activity);
+    let result_entry = transcript
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == TranscriptEntryKind::Assistant);
+    let result = (status == RunStatus::Completed).then(|| {
+        result_entry.map_or_else(
+            || latest_activity.clone(),
+            BoundedText::from_transcript_entry,
+        )
+    });
+    let (outcome, outcome_window) = run_outcome_projection(status, &latest_activity, &transcript);
+    RunView {
+        id: RunId::from(run.id.clone()),
+        agent_slug: run.agent.clone(),
+        provider_id: ProviderId::from(run.provider.clone()),
+        objective: objective.value,
+        objective_start_byte: objective.start_byte,
+        objective_total_bytes: objective.total_bytes,
+        status,
+        latest_activity: latest_activity.value,
+        latest_activity_start_byte: latest_activity.start_byte,
+        latest_activity_total_bytes: latest_activity.total_bytes,
+        outcome,
+        outcome_start_byte: outcome_window.start_byte,
+        outcome_total_bytes: outcome_window.total_bytes,
+        result: result.as_ref().map(|window| window.value.clone()),
+        result_start_byte: result.as_ref().map_or(0, |window| window.start_byte),
+        result_total_bytes: result.as_ref().map_or(0, |window| window.total_bytes),
+        transcript,
+    }
+}
+
+#[cfg(test)]
+fn run_outcome(
+    status: RunStatus,
+    latest_activity: &str,
+    transcript: &TranscriptPage,
+) -> Option<RunOutcome> {
+    run_outcome_projection(status, &bounded_text(latest_activity), transcript).0
+}
+
+fn run_outcome_projection(
+    status: RunStatus,
+    latest_activity: &BoundedText,
+    transcript: &TranscriptPage,
+) -> (Option<RunOutcome>, BoundedText) {
+    match status {
+        RunStatus::Starting | RunStatus::Working => (None, BoundedText::default()),
+        RunStatus::Completed => {
+            let window = latest_run_entry(transcript, |entry| {
+                entry.kind == TranscriptEntryKind::Assistant
+            })
+            .map_or_else(
+                || latest_activity.clone(),
+                BoundedText::from_transcript_entry,
+            );
+            (
+                Some(RunOutcome::Completed {
+                    body: window.value.clone(),
+                }),
+                window,
+            )
+        }
+        RunStatus::Failed => {
+            let window =
+                latest_run_entry(transcript, |entry| entry.kind == TranscriptEntryKind::Error)
+                    .map_or_else(
+                        || latest_activity.clone(),
+                        BoundedText::from_transcript_entry,
+                    );
+            (
+                Some(RunOutcome::Failed {
+                    reason: window.value.clone(),
+                }),
+                window,
+            )
+        }
+        RunStatus::Interrupted => {
+            let window = latest_run_entry(transcript, |entry| {
+                entry.status == TranscriptEntryStatus::Interrupted
+                    && matches!(
+                        entry.kind,
+                        TranscriptEntryKind::System
+                            | TranscriptEntryKind::Warning
+                            | TranscriptEntryKind::Error
+                    )
+            })
+            .map_or_else(
+                || latest_activity.clone(),
+                BoundedText::from_transcript_entry,
+            );
+            (
+                Some(RunOutcome::Interrupted {
+                    reason: window.value.clone(),
+                }),
+                window,
+            )
+        }
+    }
+}
+
+fn latest_run_entry(
+    transcript: &TranscriptPage,
+    predicate: impl Fn(&TranscriptEntryView) -> bool,
+) -> Option<&TranscriptEntryView> {
+    transcript
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| predicate(entry))
+}
+
+#[derive(Clone, Debug, Default)]
+struct BoundedText {
+    value: String,
+    start_byte: u64,
+    total_bytes: u64,
+}
+
+impl BoundedText {
+    fn from_transcript_entry(entry: &TranscriptEntryView) -> Self {
+        Self {
+            value: entry.body.clone(),
+            start_byte: entry.body_start_byte,
+            total_bytes: entry.body_total_bytes,
+        }
+    }
+}
+
+fn bounded_text(value: &str) -> BoundedText {
+    let tail = utf8_tail(value, MAX_RUN_TEXT_BYTES);
+    BoundedText {
+        value: tail.to_owned(),
+        start_byte: u64::try_from(value.len().saturating_sub(tail.len())).unwrap_or(u64::MAX),
+        total_bytes: u64::try_from(value.len()).unwrap_or(u64::MAX),
+    }
+}
+
+fn notice_views(state: &DomainState, revision: u64) -> Vec<NoticeView> {
+    (!state.status_message.is_empty())
+        .then(|| NoticeView {
+            id: format!("status:{revision}"),
+            level: NoticeLevel::Info,
+            message: state.status_message.clone(),
+        })
+        .into_iter()
+        .collect()
+}
+
+fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView {
+    let connection = state.provider_connection(&provider.provider).map_or_else(
+        || {
+            if provider.enabled {
+                ConnectionView::Starting
+            } else {
+                ConnectionView::Disabled
+            }
+        },
+        connection_view,
+    );
+    let authentication = state
+        .provider_authentication
+        .get(&provider.provider)
+        .map(authentication_view)
+        .or_else(|| {
+            (provider.credential.is_none())
+                .then(|| crate::backend::api_key_provider_setup(&provider.provider))
+                .flatten()
+                .map(|setup| ProviderAuthenticationView::ApiKeyRequired {
+                    dashboard_url: setup.dashboard_url.to_owned(),
+                    credential_kind: setup.credential_kind.to_owned(),
+                })
+        });
+    ProviderView {
+        id: ProviderId::from(provider.provider.clone()),
+        display_name: provider.display_name.clone(),
+        enabled: provider.enabled,
+        credential_configured: provider.credential.is_some(),
+        credential_kind: provider
+            .credential
+            .as_ref()
+            .map(|credential| credential.kind.clone()),
+        connection,
+        capabilities: state
+            .provider_capabilities(&provider.provider)
+            .map_or_else(ProviderCapabilities::default, capabilities_view),
+        authentication,
+    }
+}
+
+fn settings_view(state: &DomainState) -> SettingsView {
+    SettingsView {
+        web: WebSettingsView {
+            backend: match state.web_config.backend {
+                WebBackend::Disabled => "disabled",
+                WebBackend::AgentBrowser => "agent-browser",
+                WebBackend::Firecrawl => "firecrawl",
+            }
+            .to_owned(),
+            credential_configured: !state.web_config.firecrawl_api_key.trim().is_empty(),
+            agent_browser: match &state.agent_browser_status {
+                AgentBrowserStatus::Checking => AgentBrowserView::Checking,
+                AgentBrowserStatus::Available(version) => AgentBrowserView::Available {
+                    version: version.clone(),
+                },
+                AgentBrowserStatus::Unavailable => AgentBrowserView::Unavailable,
+            },
+        },
+        memory: MemorySettingsView {
+            backend: match state.memory_config.backend {
+                MemoryBackend::Disabled => "disabled",
+                MemoryBackend::Mnemosyne => "mnemosyne",
+            }
+            .to_owned(),
+            executable: state.memory_config.executable.clone(),
+            global_bank: state.memory_config.global_bank.clone(),
+            data_directory: state.memory_config.data_directory.clone(),
+            configured: state.memory_config.configured(),
+            available: state.memory_config.available(),
+        },
+        vision: VisionSettingsView {
+            model_id: state.vision_config.model.clone().map(ModelId::from),
+        },
+        terminal_images: match state.terminal_image_mode {
+            TerminalImageMode::Auto => TerminalImageModeView::Auto,
+            TerminalImageMode::On => TerminalImageModeView::On,
+            TerminalImageMode::Off => TerminalImageModeView::Off,
+        },
+    }
+}
+
+fn interactions(state: &DomainState, revision: u64) -> Vec<InteractionView> {
+    let approvals = state.approvals.iter().map(|approval| InteractionView {
+        id: approval_interaction_id(&state.nakode_session_id, &approval.id),
+        revision,
+        kind: InteractionKind::Approval,
+        status: InteractionStatus::Pending,
+        title: approval.title.clone(),
+        detail: approval.detail.clone(),
+        options: vec![
+            interaction_option("approve_once", "Approve once"),
+            interaction_option("approve_session", "Approve for session"),
+            interaction_option("decline", "Decline"),
+        ],
+        multiple: false,
+    });
+    let questions = state.questions.iter().map(|question| InteractionView {
+        id: question_interaction_id(&state.nakode_session_id, &question.request.id),
+        revision,
+        kind: InteractionKind::Question,
+        status: InteractionStatus::Pending,
+        title: question.request.title.clone(),
+        detail: question.request.question.clone(),
+        options: question
+            .request
+            .options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| InteractionOptionView {
+                id: index.to_string(),
+                label: option.label.clone(),
+                description: option.description.clone(),
+                recommended: question.request.recommended == Some(index),
+            })
+            .collect(),
+        multiple: question.request.multi,
+    });
+    approvals.chain(questions).collect()
+}
+
+pub(super) fn approval_interaction_id(
+    session_id: &str,
+    provider_id: &serde_json::Value,
+) -> InteractionId {
+    InteractionId::from(scoped_id(
+        "interaction",
+        &format!(
+            "{session_id}:approval:{}",
+            serde_json::to_string(provider_id).unwrap_or_default()
+        ),
+    ))
+}
+
+pub(super) fn question_interaction_id(session_id: &str, provider_id: &str) -> InteractionId {
+    InteractionId::from(scoped_id(
+        "interaction",
+        &format!("{session_id}:question:{provider_id}"),
+    ))
+}
+
+fn interaction_option(id: &str, label: &str) -> InteractionOptionView {
+    InteractionOptionView {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        description: None,
+        recommended: false,
+    }
+}
+
+fn transcript_page(transcript: &DomainTranscript) -> TranscriptPage {
+    projected_transcript_page(
+        transcript,
+        None,
+        MAX_TRANSCRIPT_PAGE_ENTRIES,
+        MAX_TRANSCRIPT_PAGE_BODY_BYTES,
+    )
+    .expect("an unbounded recent transcript page always exists")
+}
+
+pub(crate) fn session_transcript_page(
+    state: &DomainState,
+    before: Option<&EntryId>,
+    limit: usize,
+) -> Option<TranscriptPage> {
+    projected_transcript_page(
+        &state.transcript,
+        before,
+        limit.min(MAX_TRANSCRIPT_PAGE_ENTRIES),
+        MAX_TRANSCRIPT_PAGE_BODY_BYTES,
+    )
+}
+
+pub(crate) fn run_transcript_page(
+    state: &DomainState,
+    run_id: &RunId,
+    before: Option<&EntryId>,
+    limit: usize,
+) -> Option<TranscriptPage> {
+    let transcript = &state.subagent_chats.get(run_id.as_str())?.transcript;
+    projected_transcript_page(
+        transcript,
+        before,
+        limit.min(MAX_TRANSCRIPT_PAGE_ENTRIES),
+        MAX_TRANSCRIPT_PAGE_BODY_BYTES,
+    )
+}
+
+pub(crate) fn transcript_entry_body<'a>(
+    state: &'a DomainState,
+    run_id: Option<&RunId>,
+    entry_id: &EntryId,
+) -> Option<&'a str> {
+    let transcript = match run_id {
+        Some(run_id) => &state.subagent_chats.get(run_id.as_str())?.transcript,
+        None => &state.transcript,
+    };
+    transcript
+        .entries()
+        .iter()
+        .find(|entry| entry.id == entry_id.as_str())
+        .map(|entry| entry.body.as_str())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TranscriptBodyWindowError {
+    EntryNotFound,
+    LimitOutOfBounds { actual: usize, maximum: usize },
+    CursorOutOfBounds { actual: usize, total: usize },
+    CursorNotUtf8Boundary { actual: usize },
+    LimitTooSmallForCharacter { minimum: usize },
+}
+
+pub(crate) fn transcript_body_window(
+    state: &DomainState,
+    run_id: Option<&RunId>,
+    entry_id: &EntryId,
+    before_byte: Option<u64>,
+    limit_bytes: usize,
+) -> Result<TranscriptBodyWindow, TranscriptBodyWindowError> {
+    if limit_bytes == 0 || limit_bytes > MAX_TRANSCRIPT_ENTRY_BODY_BYTES {
+        return Err(TranscriptBodyWindowError::LimitOutOfBounds {
+            actual: limit_bytes,
+            maximum: MAX_TRANSCRIPT_ENTRY_BODY_BYTES,
+        });
+    }
+    let body = transcript_entry_body(state, run_id, entry_id)
+        .ok_or(TranscriptBodyWindowError::EntryNotFound)?;
+    let end = before_byte.map_or(Ok(body.len()), |before| {
+        usize::try_from(before).map_err(|_| TranscriptBodyWindowError::CursorOutOfBounds {
+            actual: usize::MAX,
+            total: body.len(),
+        })
+    })?;
+    if end > body.len() {
+        return Err(TranscriptBodyWindowError::CursorOutOfBounds {
+            actual: end,
+            total: body.len(),
+        });
+    }
+    if !body.is_char_boundary(end) {
+        return Err(TranscriptBodyWindowError::CursorNotUtf8Boundary { actual: end });
+    }
+
+    let mut start = end.saturating_sub(limit_bytes);
+    while start < end && !body.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    if start == end && end > 0 {
+        let minimum = body[..end].chars().next_back().map_or(1, char::len_utf8);
+        return Err(TranscriptBodyWindowError::LimitTooSmallForCharacter { minimum });
+    }
+    Ok(TranscriptBodyWindow {
+        entry_id: entry_id.clone(),
+        body: body[start..end].to_owned(),
+        start_byte: u64::try_from(start).unwrap_or(u64::MAX),
+        total_bytes: u64::try_from(body.len()).unwrap_or(u64::MAX),
+        has_earlier: start > 0,
+    })
+}
+
+fn projected_transcript_page(
+    transcript: &DomainTranscript,
+    before: Option<&EntryId>,
+    limit: usize,
+    body_budget: usize,
+) -> Option<TranscriptPage> {
+    let entries = transcript
+        .entries()
+        .iter()
+        .filter(|entry| {
+            !entry
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("subagent:"))
+        })
+        .collect::<Vec<_>>();
+    let end = before.map_or(entries.len(), |before| {
+        entries
+            .iter()
+            .position(|entry| entry.id == before.as_str())
+            .unwrap_or(usize::MAX)
+    });
+    if end == usize::MAX {
+        return None;
+    }
+
+    let mut remaining_body_bytes = body_budget;
+    let mut projected = Vec::with_capacity(limit.min(entries.len()));
+    let mut truncated_body = false;
+    for entry in entries[..end].iter().rev().take(limit) {
+        let body_limit = remaining_body_bytes.min(MAX_TRANSCRIPT_ENTRY_BODY_BYTES);
+        if body_limit == 0 && !entry.body.is_empty() {
+            break;
+        }
+        let body = utf8_tail(&entry.body, body_limit);
+        truncated_body |= body.len() < entry.body.len();
+        remaining_body_bytes = remaining_body_bytes.saturating_sub(body.len());
+        projected.push(transcript_entry_view(transcript, entry, body));
+    }
+    projected.reverse();
+    let omitted_entries = projected.len() < end;
+    Some(TranscriptPage {
+        entries: projected,
+        has_earlier: transcript.has_earlier_entries() || omitted_entries || truncated_body,
+        stream_active: before.is_none() && transcript.stream_active(),
+        stream_label: transcript.stream_label().to_owned(),
+    })
+}
+
+fn transcript_entry_view(
+    transcript: &DomainTranscript,
+    entry: &TranscriptEntry,
+    body: &str,
+) -> TranscriptEntryView {
+    TranscriptEntryView {
+        id: EntryId::from(entry.id.clone()),
+        kind: entry_kind(entry.kind),
+        title: entry.title.clone(),
+        body: body.to_owned(),
+        body_start_byte: u64::try_from(entry.body.len().saturating_sub(body.len()))
+            .unwrap_or(u64::MAX),
+        body_total_bytes: u64::try_from(entry.body.len()).unwrap_or(u64::MAX),
+        status: entry_status(entry.status),
+        artifacts: transcript
+            .image_artifacts(entry)
+            .enumerate()
+            .map(|(index, _)| transcript_artifact_id(&entry.id, index))
+            .collect(),
+    }
+}
+
+fn utf8_tail(value: &str, maximum_bytes: usize) -> &str {
+    if value.len() <= maximum_bytes {
+        return value;
+    }
+    let mut start = value.len().saturating_sub(maximum_bytes);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    &value[start..]
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactTooLarge {
+    pub(crate) actual: usize,
+    pub(crate) maximum: usize,
+}
+
+pub(crate) fn artifact_view(
+    state: &DomainState,
+    artifact_id: &ArtifactId,
+) -> Result<Option<ArtifactView>, ArtifactTooLarge> {
+    let transcripts = std::iter::once(&state.transcript)
+        .chain(state.subagent_chats.values().map(|chat| &chat.transcript));
+    for transcript in transcripts {
+        if let Some(artifact) = transcript_artifact_view(transcript, artifact_id)? {
+            return Ok(Some(artifact));
+        }
+    }
+    Ok(None)
+}
+
+fn transcript_artifact_view(
+    transcript: &DomainTranscript,
+    artifact_id: &ArtifactId,
+) -> Result<Option<ArtifactView>, ArtifactTooLarge> {
+    for entry in transcript.entries() {
+        for (index, (label, image)) in transcript.image_artifacts(entry).enumerate() {
+            let id = transcript_artifact_id(&entry.id, index);
+            if id != *artifact_id {
+                continue;
+            }
+            if image.data.len() > MAX_ARTIFACT_BYTES {
+                return Err(ArtifactTooLarge {
+                    actual: image.data.len(),
+                    maximum: MAX_ARTIFACT_BYTES,
+                });
+            }
+            return Ok(Some(ArtifactView {
+                id,
+                label: label.to_owned(),
+                media_type: image.mime_type.clone(),
+                byte_length: u64::try_from(image.data.len()).unwrap_or(u64::MAX),
+                data: image.data.clone(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn transcript_artifact_id(entry_id: &str, index: usize) -> ArtifactId {
+    ArtifactId::from(scoped_id("artifact", &format!("{entry_id}:{index}")))
+}
+
+fn empty_transcript_page() -> TranscriptPage {
+    TranscriptPage {
+        entries: Vec::new(),
+        has_earlier: false,
+        stream_active: false,
+        stream_label: String::new(),
+    }
+}
+
+fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> SessionSummary {
+    SessionSummary {
+        id: SessionId::from(session.id.clone()),
+        workspace_id: workspace_id.clone(),
+        title: session.title.clone(),
+        active_provider_id: provider_id(&session.provider),
+        active_model_id: session.model.clone().map(ModelId::from),
+        updated_at_ms: session.updated_at.saturating_mul(1_000),
+    }
+}
+
+fn capabilities_view(capabilities: &BackendCapabilities) -> ProviderCapabilities {
+    let supported = [
+        (ProviderCapability::Resume, capabilities.resume),
+        (ProviderCapability::Steering, capabilities.steering),
+        (ProviderCapability::Interruption, capabilities.interruption),
+        (ProviderCapability::ModelCatalog, capabilities.model_catalog),
+        (
+            ProviderCapability::ModelsRequireSession,
+            capabilities.models_require_session,
+        ),
+        (
+            ProviderCapability::SessionModelConfiguration,
+            capabilities.session_model_config,
+        ),
+        (
+            ProviderCapability::ContextCompaction,
+            capabilities.context_compaction,
+        ),
+        (ProviderCapability::Approvals, capabilities.approvals),
+        (ProviderCapability::NativeTools, capabilities.native_tools),
+        (ProviderCapability::Mcp, capabilities.mcp),
+        (ProviderCapability::CloseSession, capabilities.close_session),
+    ]
+    .into_iter()
+    .filter_map(|(capability, support)| {
+        (support == CapabilitySupport::Supported).then_some(capability)
+    })
+    .collect::<BTreeSet<_>>();
+    ProviderCapabilities { supported }
+}
+
+fn connection_view(connection: &ConnectionState) -> ConnectionView {
+    match connection {
+        ConnectionState::Starting => ConnectionView::Starting,
+        ConnectionState::Ready { .. } => ConnectionView::Ready,
+        ConnectionState::Failed(message) => ConnectionView::Failed {
+            message: message.clone(),
+        },
+        ConnectionState::Disconnected(message) => ConnectionView::Disconnected {
+            message: message.clone(),
+        },
+    }
+}
+
+fn authentication_view(authentication: &ProviderAuthenticationState) -> ProviderAuthenticationView {
+    match authentication {
+        ProviderAuthenticationState::Starting => ProviderAuthenticationView::Starting,
+        #[cfg(test)]
+        ProviderAuthenticationState::ApiKeyRequired {
+            dashboard_url,
+            credential_kind,
+        } => ProviderAuthenticationView::ApiKeyRequired {
+            dashboard_url: dashboard_url.clone(),
+            credential_kind: credential_kind.clone(),
+        },
+        ProviderAuthenticationState::Challenge {
+            verification_url,
+            user_code,
+        } => ProviderAuthenticationView::Challenge {
+            verification_url: verification_url.clone(),
+            user_code: user_code.clone(),
+        },
+    }
+}
+
+fn activity(state: &DomainState) -> SessionActivity {
+    if state.context_compaction.is_some() {
+        SessionActivity::CompactingContext
+    } else if state.active_turn.is_some() {
+        SessionActivity::RunningTurn
+    } else if state.starting_turn.is_some() {
+        SessionActivity::StartingTurn
+    } else if state.creating_session.is_some() {
+        SessionActivity::CreatingAgentSession
+    } else if state.has_running_subagents() {
+        SessionActivity::RunningDelegates
+    } else if !state.active_shell_ids().is_empty() {
+        SessionActivity::RunningShell
+    } else {
+        SessionActivity::Idle
+    }
+}
+
+fn entry_kind(kind: EntryKind) -> TranscriptEntryKind {
+    match kind {
+        EntryKind::System => TranscriptEntryKind::System,
+        EntryKind::User => TranscriptEntryKind::User,
+        EntryKind::Assistant => TranscriptEntryKind::Assistant,
+        EntryKind::Steering => TranscriptEntryKind::Steering,
+        EntryKind::Reasoning => TranscriptEntryKind::Reasoning,
+        EntryKind::Tool => TranscriptEntryKind::Tool,
+        EntryKind::Diff => TranscriptEntryKind::Diff,
+        EntryKind::Warning => TranscriptEntryKind::Warning,
+        EntryKind::Error => TranscriptEntryKind::Error,
+    }
+}
+
+fn entry_status(status: EntryStatus) -> TranscriptEntryStatus {
+    match status {
+        EntryStatus::Running => TranscriptEntryStatus::Running,
+        EntryStatus::Complete => TranscriptEntryStatus::Complete,
+        EntryStatus::Failed => TranscriptEntryStatus::Failed,
+        EntryStatus::Interrupted => TranscriptEntryStatus::Interrupted,
+    }
+}
+
+const fn todo_status(status: TodoStatus) -> TodoStatusView {
+    match status {
+        TodoStatus::Pending => TodoStatusView::Pending,
+        TodoStatus::InProgress => TodoStatusView::InProgress,
+        TodoStatus::Completed => TodoStatusView::Completed,
+        TodoStatus::Abandoned => TodoStatusView::Abandoned,
+    }
+}
+
+const fn run_status(status: SubagentStatus) -> RunStatus {
+    match status {
+        SubagentStatus::Starting => RunStatus::Starting,
+        SubagentStatus::Working => RunStatus::Working,
+        SubagentStatus::Completed => RunStatus::Completed,
+        SubagentStatus::Interrupted => RunStatus::Interrupted,
+        SubagentStatus::Failed => RunStatus::Failed,
+    }
+}
+
+fn qualify_model(state: &DomainState, model: &str) -> ModelId {
+    ModelId::from(if model.contains('/') {
+        model.to_owned()
+    } else {
+        format!("{}/{model}", state.backend_provider)
+    })
+}
+
+fn provider_id(provider: &str) -> Option<ProviderId> {
+    (!provider.is_empty()).then(|| ProviderId::from(provider.to_owned()))
+}
+
+fn first_line(value: &str) -> String {
+    let line = value.lines().next().unwrap_or_default().trim();
+    if line.is_empty() {
+        "New session".to_owned()
+    } else {
+        line.to_owned()
+    }
+}
+
+fn scoped_id(kind: &str, value: &str) -> String {
+    uuid::Uuid::new_v5(&ID_NAMESPACE, format!("{kind}:{value}").as_bytes()).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use nakode_protocol::{
+        EntryId, MAX_API_MESSAGE_BYTES, MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_SESSION_RUNS,
+        MAX_TRANSCRIPT_ENTRY_BODY_BYTES, MAX_TRANSCRIPT_PAGE_BODY_BYTES, RunId, RunOutcome,
+        RunStatus, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
+    };
+
+    use super::{artifact_view, bootstrap, model_configuration, run_outcome};
+    use crate::{
+        backend::{CODEX_PROVIDER, CURSOR_PROVIDER, ModelInfo, PromptImage},
+        domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
+        session::SubagentRecord,
+        state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
+    };
+
+    #[test]
+    fn model_configuration_is_derived_before_reaching_frontends() {
+        let openai = model_configuration(&model(CODEX_PROVIDER, "gpt-5.6"));
+        assert_eq!(
+            openai
+                .reasoning_efforts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(openai.fast_mode_configurable);
+        assert!(openai.vision_eligible);
+
+        let cursor = model_configuration(&model(CURSOR_PROVIDER, "composer-2"));
+        assert!(cursor.reasoning_efforts.is_empty());
+        assert!(cursor.fast_mode_configurable);
+        assert!(!cursor.vision_eligible);
+
+        assert_eq!(
+            model_configuration(&model(CURSOR_PROVIDER, "basic")),
+            nakode_protocol::ModelConfigurationView::default()
+        );
+        assert_eq!(
+            model_configuration(&model("other-provider", "model")),
+            nakode_protocol::ModelConfigurationView::default()
+        );
+    }
+
+    #[test]
+    fn bootstrap_contains_stable_semantic_ids_and_no_secret_settings() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        state.web_config.firecrawl_api_key = "must-not-leak".to_owned();
+        state
+            .transcript
+            .push(EntryKind::User, "YOU", "hello", EntryStatus::Complete);
+
+        let first = bootstrap(&state, 7, &[], &[]);
+        let second = bootstrap(&state, 7, &[], &[]);
+        assert_eq!(first.workspace_id, second.workspace_id);
+        assert_eq!(
+            first.active_session.as_ref().map(|session| &session.id),
+            second.active_session.as_ref().map(|session| &session.id)
+        );
+        assert_eq!(
+            first
+                .active_session
+                .as_ref()
+                .expect("active session")
+                .transcript
+                .entries[0]
+                .id,
+            second
+                .active_session
+                .as_ref()
+                .expect("active session")
+                .transcript
+                .entries[0]
+                .id
+        );
+        let encoded = serde_json::to_string(&first).expect("serialize bootstrap");
+        assert!(!encoded.contains("must-not-leak"));
+    }
+
+    #[test]
+    fn session_transcript_omits_legacy_inline_subagent_rows() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        state.transcript.upsert(
+            "subagent:run-1",
+            EntryKind::Assistant,
+            "reviewer",
+            "legacy duplicate",
+            EntryStatus::Complete,
+        );
+        state.transcript.upsert(
+            "assistant:primary",
+            EntryKind::Assistant,
+            "Nakode",
+            "primary response",
+            EntryStatus::Complete,
+        );
+
+        let view = bootstrap(&state, 1, &[], &[]);
+        let transcript = &view.active_session.expect("active session").transcript;
+        assert_eq!(transcript.entries.len(), 1);
+        assert_eq!(transcript.entries[0].body, "primary response");
+    }
+
+    #[test]
+    fn session_snapshot_and_history_pages_are_explicitly_bounded() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 3_000);
+        for index in 0..2_000 {
+            state.transcript.push(
+                EntryKind::Assistant,
+                "Nakode",
+                format!("entry-{index:04}-{}", "x".repeat(1_024)),
+                EntryStatus::Complete,
+            );
+        }
+        state.transcript.push(
+            EntryKind::Assistant,
+            "Nakode",
+            "z".repeat(MAX_TRANSCRIPT_ENTRY_BODY_BYTES * 2),
+            EntryStatus::Running,
+        );
+
+        let snapshot = bootstrap(&state, 3, &[], &[]);
+        let session = snapshot.active_session.expect("active session");
+        assert!(session.transcript.has_earlier);
+        assert!(session.transcript.entries.len() <= nakode_protocol::MAX_TRANSCRIPT_PAGE_ENTRIES);
+        assert!(
+            session
+                .transcript
+                .entries
+                .iter()
+                .map(|entry| entry.body.len())
+                .sum::<usize>()
+                <= MAX_TRANSCRIPT_PAGE_BODY_BYTES
+        );
+        let last = session.transcript.entries.last().expect("latest entry");
+        assert!(last.body_start_byte > 0);
+        assert_eq!(
+            last.body_total_bytes,
+            u64::try_from(MAX_TRANSCRIPT_ENTRY_BODY_BYTES * 2).expect("body length")
+        );
+        assert!(
+            serde_json::to_vec(&session).expect("encode session").len() < MAX_API_MESSAGE_BYTES
+        );
+
+        let before = session.transcript.entries[0].id.clone();
+        let earlier = super::session_transcript_page(&state, Some(&before), 32)
+            .expect("page from canonical transcript");
+        assert!(!earlier.entries.is_empty());
+        assert!(earlier.entries.iter().all(|entry| {
+            !session
+                .transcript
+                .entries
+                .iter()
+                .any(|visible| visible.id == entry.id)
+        }));
+    }
+
+    #[test]
+    fn omitted_runs_are_discoverable_through_complete_cursor_pagination() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        let parent_session_id = state.nakode_session_id.clone();
+        state.install_subagents(
+            (0..150)
+                .map(|index| SubagentRecord {
+                    parent_session_id: parent_session_id.clone(),
+                    id: format!("run-{index:03}"),
+                    agent: "reviewer".to_owned(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                    provider_session_id: None,
+                    objective: format!("Review {index}"),
+                    status: SubagentStatus::Completed,
+                    latest_activity: "Completed".to_owned(),
+                    transcript: Vec::new(),
+                })
+                .collect(),
+        );
+
+        let session = bootstrap(&state, 2, &[], &[])
+            .active_session
+            .expect("active session");
+        assert_eq!(session.runs.len(), MAX_SESSION_RUNS);
+        assert!(session.runs_has_earlier);
+
+        let mut before = None;
+        let mut run_ids = Vec::new();
+        loop {
+            let page = super::run_page(&state, before.as_ref(), 37).expect("run page");
+            assert!(page.runs.len() <= 37);
+            if page.runs.is_empty() {
+                break;
+            }
+            before = page.runs.first().map(|run| run.id.clone());
+            run_ids.extend(page.runs.iter().map(|run| run.id.clone()));
+            if !page.has_earlier {
+                break;
+            }
+        }
+        run_ids.sort();
+        run_ids.dedup();
+        assert_eq!(run_ids.len(), 150);
+        assert_eq!(run_ids.first(), Some(&RunId::from("run-000")));
+        assert_eq!(run_ids.last(), Some(&RunId::from("run-149")));
+    }
+
+    #[test]
+    fn run_metadata_and_outcomes_expose_their_bounded_text_windows() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        let body = "r".repeat(MAX_TRANSCRIPT_ENTRY_BODY_BYTES * 2);
+        state.install_subagents(vec![SubagentRecord {
+            parent_session_id: state.nakode_session_id.clone(),
+            id: "run-large".to_owned(),
+            agent: "reviewer".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: None,
+            objective: "o".repeat(MAX_RUN_TEXT_BYTES * 2),
+            status: SubagentStatus::Completed,
+            latest_activity: "a".repeat(MAX_RUN_TEXT_BYTES * 2),
+            transcript: vec![TranscriptEntry {
+                id: "run-entry".to_owned(),
+                key: Some("assistant".to_owned()),
+                kind: EntryKind::Assistant,
+                title: "reviewer".to_owned(),
+                body,
+                status: EntryStatus::Complete,
+            }],
+        }]);
+
+        let run = super::run_view(&state, &RunId::from("run-large")).expect("run projection");
+        assert!(run.objective_start_byte > 0);
+        assert_eq!(run.objective.len(), MAX_RUN_TEXT_BYTES);
+        assert!(run.latest_activity_start_byte > 0);
+        assert!(run.outcome_start_byte > 0);
+        assert!(run.result_start_byte > 0);
+        assert!(serde_json::to_vec(&run).expect("encode run").len() < MAX_API_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn transcript_images_project_stable_reconnectable_artifacts() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        state.transcript.set_labeled_images(
+            "user:image",
+            vec![(
+                "clipboard.png".to_owned(),
+                PromptImage {
+                    mime_type: "image/png".to_owned(),
+                    data: vec![0, 1, 2, 255],
+                },
+            )],
+        );
+        state.transcript.upsert(
+            "user:image",
+            EntryKind::User,
+            "YOU",
+            "[clipboard.png]",
+            EntryStatus::Complete,
+        );
+
+        let first = bootstrap(&state, 7, &[], &[]);
+        let second = bootstrap(&state, 8, &[], &[]);
+        let first_id = first
+            .active_session
+            .as_ref()
+            .expect("active session")
+            .transcript
+            .entries[0]
+            .artifacts[0]
+            .clone();
+        let second_id = second
+            .active_session
+            .as_ref()
+            .expect("active session")
+            .transcript
+            .entries[0]
+            .artifacts[0]
+            .clone();
+        assert_eq!(first_id, second_id);
+
+        let artifact = artifact_view(&state, &first_id)
+            .expect("artifact is within the protocol limit")
+            .expect("artifact exists");
+        assert_eq!(artifact.label, "clipboard.png");
+        assert_eq!(artifact.media_type, "image/png");
+        assert_eq!(artifact.byte_length, 4);
+        assert_eq!(artifact.data, [0, 1, 2, 255]);
+    }
+
+    #[test]
+    fn run_images_are_queryable_and_oversized_artifacts_fail_explicitly() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        let mut transcript = DomainTranscript::new(100);
+        transcript.set_labeled_images(
+            "run:image",
+            vec![(
+                "review.png".to_owned(),
+                PromptImage {
+                    mime_type: "image/png".to_owned(),
+                    data: vec![9, 8, 7],
+                },
+            )],
+        );
+        transcript.upsert(
+            "run:image",
+            EntryKind::User,
+            "TASK",
+            "[review.png]",
+            EntryStatus::Complete,
+        );
+        state.subagents.push(SubagentRun {
+            id: "run-1".to_owned(),
+            agent: "reviewer".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: None,
+            objective: "Review".to_owned(),
+            status: SubagentStatus::Working,
+            latest_activity: "Working".to_owned(),
+        });
+        state.subagent_chats.insert(
+            "run-1".to_owned(),
+            SubagentChat {
+                transcript,
+                reasoning_summaries: ReasoningSummaryTracker::default(),
+            },
+        );
+
+        let view = bootstrap(&state, 3, &[], &[]);
+        let artifact_id = view.active_session.as_ref().expect("active session").runs[0]
+            .transcript
+            .entries[0]
+            .artifacts[0]
+            .clone();
+        assert_eq!(
+            artifact_view(&state, &artifact_id)
+                .expect("bounded artifact")
+                .expect("run artifact")
+                .data,
+            [9, 8, 7]
+        );
+
+        let chat = state
+            .subagent_chats
+            .get_mut("run-1")
+            .expect("run transcript");
+        chat.transcript.set_labeled_images(
+            "run:image",
+            vec![(
+                "review.png".to_owned(),
+                PromptImage {
+                    mime_type: "image/png".to_owned(),
+                    data: vec![0; MAX_ARTIFACT_BYTES.saturating_add(1)],
+                },
+            )],
+        );
+        let error = artifact_view(&state, &artifact_id).expect_err("artifact exceeds limit");
+        assert_eq!(error.actual, MAX_ARTIFACT_BYTES.saturating_add(1));
+        assert_eq!(error.maximum, MAX_ARTIFACT_BYTES);
+    }
+
+    #[test]
+    fn completed_run_outcome_uses_the_final_assistant_body() {
+        let transcript = transcript([
+            entry(
+                TranscriptEntryKind::Assistant,
+                "Earlier response",
+                TranscriptEntryStatus::Complete,
+            ),
+            entry(
+                TranscriptEntryKind::Assistant,
+                "Final response",
+                TranscriptEntryStatus::Complete,
+            ),
+        ]);
+
+        assert_eq!(
+            run_outcome(RunStatus::Completed, "Completed", &transcript),
+            Some(RunOutcome::Completed {
+                body: "Final response".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn failed_run_outcome_uses_the_exact_error_reason() {
+        let transcript = transcript([
+            entry(
+                TranscriptEntryKind::Assistant,
+                "Partial response",
+                TranscriptEntryStatus::Complete,
+            ),
+            entry(
+                TranscriptEntryKind::Error,
+                "Provider authentication expired.",
+                TranscriptEntryStatus::Failed,
+            ),
+        ]);
+
+        assert_eq!(
+            run_outcome(RunStatus::Failed, "Failed", &transcript),
+            Some(RunOutcome::Failed {
+                reason: "Provider authentication expired.".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn interrupted_run_outcome_uses_the_exact_interruption_reason() {
+        let transcript = transcript([entry(
+            TranscriptEntryKind::System,
+            "Interrupted by a client.",
+            TranscriptEntryStatus::Interrupted,
+        )]);
+
+        assert_eq!(
+            run_outcome(RunStatus::Interrupted, "Interrupted", &transcript),
+            Some(RunOutcome::Interrupted {
+                reason: "Interrupted by a client.".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn active_run_has_no_terminal_outcome() {
+        assert_eq!(
+            run_outcome(RunStatus::Working, "Working", &transcript([])),
+            None
+        );
+    }
+
+    fn transcript<const N: usize>(entries: [TranscriptEntryView; N]) -> TranscriptPage {
+        TranscriptPage {
+            entries: entries.into(),
+            has_earlier: false,
+            stream_active: false,
+            stream_label: "reviewer".to_owned(),
+        }
+    }
+
+    fn entry(
+        kind: TranscriptEntryKind,
+        body: &str,
+        status: TranscriptEntryStatus,
+    ) -> TranscriptEntryView {
+        TranscriptEntryView {
+            id: EntryId::from(format!("entry-{body}")),
+            kind,
+            title: String::new(),
+            body: body.to_owned(),
+            body_start_byte: 0,
+            body_total_bytes: u64::try_from(body.len()).unwrap_or(u64::MAX),
+            status,
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn model(provider: &str, id: &str) -> ModelInfo {
+        ModelInfo {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            is_default: false,
+        }
+    }
+}

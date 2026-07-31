@@ -6,21 +6,36 @@ use std::{
     io::{self, Read},
     path::Path,
     process::Command,
+    sync::{Arc, LazyLock, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use nakode::pty::PtySession;
 use portable_pty::PtySize;
 
+static TUI_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 #[test]
 fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
+    let _guard = TUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempfile::tempdir()?;
     let control_directory = temp.path().join("control");
     let mut session = spawn_tui(temp.path(), &control_directory)?;
-    let reader_thread = drain_output(&mut session)?;
-
-    thread::sleep(Duration::from_millis(1_500));
+    let output_drain = drain_output(&mut session)?;
+    if !output_drain.wait_for(b"\x1b[?1049h", Duration::from_secs(10)) {
+        let _ = session.kill();
+        let _ = session.wait();
+        let output = output_drain.finish()?;
+        shutdown_service(temp.path(), &control_directory)?;
+        return Err(io::Error::other(format!(
+            "TUI did not acquire the alternate screen before input:\n{}",
+            String::from_utf8_lossy(&output)
+        ))
+        .into());
+    }
     session.writer().write_all(b"NAKODE")?;
     session.writer().flush()?;
     thread::sleep(Duration::from_millis(150));
@@ -45,16 +60,14 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
         let _ = session.kill();
         let _ = session.wait();
     }
-    let output = reader_thread
-        .join()
-        .map_err(|_| io::Error::other("PTY reader thread panicked"))??;
+    let output = output_drain.finish()?;
     shutdown_service(temp.path(), &control_directory)?;
     assert!(exited, "Nakode did not exit after Ctrl+D");
 
     let output = String::from_utf8_lossy(&output);
     assert!(
         output.contains("\u{1b}[?1049h"),
-        "alternate screen was not entered"
+        "alternate screen was not entered; output:\n{output}"
     );
     assert!(
         output.contains("\u{1b}[?1049l"),
@@ -66,14 +79,15 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
     );
     assert!(
         output.contains("\u{1b}]52;c;TkFLT0RF\u{7}"),
-        "mouse selection was not copied with OSC 52; emitted sequences: {:?}",
+        "mouse selection was not copied with OSC 52; emitted sequences: {:?}; output:\n{}",
         output
             .match_indices("\u{1b}]52;")
             .map(|(index, _)| &output[index
                 ..output[index..]
                     .find('\u{7}')
                     .map_or(output.len(), |end| index + end + 1)])
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>(),
+        output,
     );
     assert!(output.contains("\u{1b}[?25h"), "cursor was not restored");
     assert!(
@@ -84,7 +98,10 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn multiple_tuis_share_one_control_service() -> Result<(), Box<dyn Error>> {
+fn multiple_tuis_share_one_server_without_owning_its_lifecycle() -> Result<(), Box<dyn Error>> {
+    let _guard = TUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempfile::tempdir()?;
     let control_directory = temp.path().join("control");
     let mut first = spawn_tui(temp.path(), &control_directory)?;
@@ -99,12 +116,8 @@ fn multiple_tuis_share_one_control_service() -> Result<(), Box<dyn Error>> {
     if let Some(status) = first.try_wait()? {
         let _ = second.kill();
         let _ = second.wait();
-        let first_output = first_reader
-            .join()
-            .map_err(|_| io::Error::other("first PTY reader thread panicked"))??;
-        let second_output = second_reader
-            .join()
-            .map_err(|_| io::Error::other("second PTY reader thread panicked"))??;
+        let first_output = first_reader.finish()?;
+        let second_output = second_reader.finish()?;
         return Err(io::Error::other(format!(
             "first TUI exited unexpectedly ({status:?}):\nfirst:\n{}\nsecond:\n{}",
             String::from_utf8_lossy(&first_output),
@@ -115,12 +128,8 @@ fn multiple_tuis_share_one_control_service() -> Result<(), Box<dyn Error>> {
     if let Some(status) = second.try_wait()? {
         let _ = first.kill();
         let _ = first.wait();
-        let first_output = first_reader
-            .join()
-            .map_err(|_| io::Error::other("first PTY reader thread panicked"))??;
-        let second_output = second_reader
-            .join()
-            .map_err(|_| io::Error::other("second PTY reader thread panicked"))??;
+        let first_output = first_reader.finish()?;
+        let second_output = second_reader.finish()?;
         return Err(io::Error::other(format!(
             "second TUI exited unexpectedly ({status:?}):\nfirst:\n{}\nsecond:\n{}",
             String::from_utf8_lossy(&first_output),
@@ -130,14 +139,10 @@ fn multiple_tuis_share_one_control_service() -> Result<(), Box<dyn Error>> {
     }
 
     shutdown_service(temp.path(), &control_directory)?;
-    thread::sleep(Duration::from_millis(1_500));
-    assert!(
-        control_directory.join("control.sock").exists(),
-        "attached TUIs did not restart the shared service"
-    );
+    thread::sleep(Duration::from_millis(500));
     assert!(
         first.try_wait()?.is_none() && second.try_wait()?.is_none(),
-        "a TUI exited while the shared service restarted"
+        "a renderer exited merely because the independently owned server stopped"
     );
 
     first.writer().write_all(&[0x04])?;
@@ -146,12 +151,8 @@ fn multiple_tuis_share_one_control_service() -> Result<(), Box<dyn Error>> {
     second.writer().flush()?;
     assert!(wait_for_exit(&mut first)?, "first TUI did not exit");
     assert!(wait_for_exit(&mut second)?, "second TUI did not exit");
-    first_reader
-        .join()
-        .map_err(|_| io::Error::other("first PTY reader thread panicked"))??;
-    second_reader
-        .join()
-        .map_err(|_| io::Error::other("second PTY reader thread panicked"))??;
+    first_reader.finish()?;
+    second_reader.finish()?;
     shutdown_service(temp.path(), &control_directory)?;
     Ok(())
 }
@@ -186,25 +187,65 @@ fn spawn_tui(workspace: &Path, control_directory: &Path) -> Result<PtySession, B
     .map_err(Into::into)
 }
 
-fn drain_output(
-    session: &mut PtySession,
-) -> Result<thread::JoinHandle<io::Result<Vec<u8>>>, Box<dyn Error>> {
+fn drain_output(session: &mut PtySession) -> Result<PtyOutputDrain, Box<dyn Error>> {
     let mut reader = session
         .take_reader()
         .ok_or_else(|| io::Error::other("PTY output reader was already taken"))?;
-    Ok(thread::spawn(move || {
-        let mut output = Vec::new();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let thread_output = Arc::clone(&output);
+    let worker = thread::spawn(move || {
         let mut buffer = [0_u8; 4096];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Ok(read) => thread_output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&buffer[..read]),
                 Err(error) if error.raw_os_error() == Some(5) => break,
                 Err(error) => return Err(error),
             }
         }
-        Ok(output)
-    }))
+        Ok(())
+    });
+    Ok(PtyOutputDrain { output, worker })
+}
+
+struct PtyOutputDrain {
+    output: Arc<Mutex<Vec<u8>>>,
+    worker: thread::JoinHandle<io::Result<()>>,
+}
+
+impl PtyOutputDrain {
+    fn wait_for(&self, needle: &[u8], timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .windows(needle.len())
+                .any(|window| window == needle)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn finish(self) -> io::Result<Vec<u8>> {
+        self.worker
+            .join()
+            .map_err(|_| io::Error::other("PTY reader thread panicked"))??;
+        Ok(self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone())
+    }
 }
 
 fn wait_for_exit(session: &mut PtySession) -> io::Result<bool> {

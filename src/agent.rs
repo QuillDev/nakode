@@ -98,6 +98,12 @@ pub struct AgentCatalog {
 }
 
 impl AgentCatalog {
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn from_definitions(definitions: Vec<AgentDefinition>) -> Self {
+        Self { definitions }
+    }
+
     /// Validates an agent definition before it is persisted.
     ///
     /// # Errors

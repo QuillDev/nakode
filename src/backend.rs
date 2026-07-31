@@ -5,6 +5,8 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 
+pub use crate::media::ImageData as PromptImage;
+
 pub const CODEX_PROVIDER: &str = "openai-codex";
 pub const DEVIN_PROVIDER: &str = "devin-acp";
 pub const CURSOR_PROVIDER: &str = "cursor-sdk";
@@ -470,12 +472,6 @@ pub struct PromptAttachment {
     pub label: String,
     pub path: Option<PathBuf>,
     pub image: Option<PromptImage>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PromptImage {
-    pub mime_type: String,
-    pub data: Vec<u8>,
 }
 
 /// Provider-neutral commands understood by an agent backend adapter.

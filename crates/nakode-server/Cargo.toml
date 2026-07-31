@@ -1,0 +1,19 @@
+[package]
+name = "nakode-server"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Authoritative request broker and gRPC transport for Nakode"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+futures-util = "0.3"
+nakode-api = { path = "../nakode-api" }
+nakode-protocol = { path = "../nakode-protocol" }
+thiserror = "2"
+tokio = { version = "1.52", features = ["sync"] }
+tokio-stream = "0.1"
+tonic = "0.14.6"
+uuid = { version = "1", features = ["v7"] }

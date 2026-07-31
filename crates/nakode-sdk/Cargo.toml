@@ -1,0 +1,20 @@
+[package]
+name = "nakode-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "High-level renderer-facing Nakode SDK"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+futures-util = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+nakode-api = { path = "../nakode-api" }
+thiserror = "2"
+tokio = { version = "1.52", features = ["net", "rt", "sync", "time"] }
+tokio-stream = "0.1"
+tonic = "0.14.6"
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1", features = ["v7"] }

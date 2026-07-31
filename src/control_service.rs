@@ -1,268 +1,266 @@
 use std::{
-    collections::HashMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
     time::Duration,
 };
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::Mutex,
 };
+
+use crate::config::Config;
 
 const SERVICE_START_ATTEMPTS: usize = 40;
 const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
-const REGISTRATION_INTERVAL: Duration = Duration::from_secs(1);
-const REGISTRATION_TTL: Duration = Duration::from_secs(4);
-
-#[derive(Clone, Debug)]
-struct RegisteredTui {
-    socket_path: PathBuf,
-    refreshed_at: tokio::time::Instant,
-}
+const RESUME_ENVIRONMENT_KEYS: [&str; 2] = ["NAKODE_RESUME", "NAKO_AGENT_RESUME"];
 
 #[derive(Debug, Error)]
 pub enum ControlError {
-    #[error("Nakode control socket error at {path}: {source}")]
+    #[error("Nakode server socket error at {path}: {source}")]
     Io {
         path: String,
         source: std::io::Error,
     },
-    #[error("invalid Nakode control message: {0}")]
+    #[error("invalid Nakode lifecycle message: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("Nakode control service closed without a result")]
+    #[error("Nakode server closed without a lifecycle response")]
     MissingResponse,
-    #[error("a Nakode control service is already running at {0}")]
+    #[error("a Nakode server is already running at {0}")]
     AlreadyRunning(String),
     #[error("this platform does not expose an application data directory")]
     MissingDataDirectory,
-    #[error("could not start the Nakode control service: {0}")]
+    #[error("could not start the Nakode server: {0}")]
     SpawnService(#[source] std::io::Error),
-    #[error("Nakode control service did not become ready at {0}")]
+    #[error("Nakode server did not become ready at {0}")]
     ServiceStartup(String),
-    #[error("Nakode control service rejected the request: {0}")]
+    #[error("Nakode server rejected the lifecycle request: {0}")]
     ServiceRejected(String),
-    #[error("unexpected response from the Nakode control service")]
-    UnexpectedServiceResponse,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct AgentInvocation {
-    pub agent: String,
-    pub session_id: String,
-    pub task: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct AgentResponse {
-    pub success: bool,
-    pub result: String,
-}
-
-pub struct IncomingInvocation {
-    pub id: u64,
-    pub invocation: AgentInvocation,
-    response: tokio::sync::oneshot::Sender<AgentResponse>,
-}
-
-pub struct ControlServer {
-    pub requests: tokio::sync::mpsc::Receiver<IncomingInvocation>,
-    socket_path: PathBuf,
-    task: tokio::task::JoinHandle<()>,
-}
-
-/// Keeps one TUI registered with the user-level control service.
-pub struct ControlRegistration {
-    session_id: String,
-    socket_path: PathBuf,
-    task: tokio::task::JoinHandle<()>,
+    #[error(
+        "the running Nakode server uses different server configuration; stop it before changing server-owned options"
+    )]
+    ConfigurationMismatch,
+    #[error(transparent)]
+    NativeRuntime(#[from] crate::server::runtime::NativeRuntimeError),
+    #[error("Nakode gRPC service failed: {0}")]
+    Grpc(#[from] tonic::transport::Error),
+    #[error("Nakode server component stopped unexpectedly: {0}")]
+    ComponentStopped(&'static str),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ServiceRequest {
+enum LifecycleRequest {
     Ping,
-    Register {
-        session_id: String,
-        socket_path: PathBuf,
-    },
-    Unregister {
-        session_id: String,
-        socket_path: PathBuf,
-    },
-    Invoke {
-        invocation: AgentInvocation,
-    },
     Shutdown,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ServiceResponse {
+enum LifecycleResponse {
     Ok,
-    Agent { response: AgentResponse },
+    Ready { configuration: String },
     Error { message: String },
 }
 
-impl ControlServer {
-    /// Binds a TUI-local control socket.
-    ///
-    /// # Errors
-    /// Returns an error when the socket cannot be prepared or bound.
-    pub async fn bind(path: &Path) -> Result<Self, ControlError> {
-        if path.exists() {
-            if UnixStream::connect(path).await.is_ok() {
-                return Err(ControlError::AlreadyRunning(path.display().to_string()));
-            }
-            std::fs::remove_file(path).map_err(|source| socket_error(path, source))?;
-        }
-        let listener = UnixListener::bind(path).map_err(|source| socket_error(path, source))?;
-        let (tx, requests) = tokio::sync::mpsc::channel(32);
-        let task = tokio::spawn(async move {
-            let mut next_id = 1_u64;
-            while let Ok((stream, _)) = listener.accept().await {
-                let tx = tx.clone();
-                let id = next_id;
-                next_id = next_id.wrapping_add(1);
-                tokio::spawn(async move {
-                    handle_tui_connection(stream, id, tx).await;
+/// Runs the native workspace server until it receives a lifecycle shutdown
+/// request or one of its required components stops.
+///
+/// # Errors
+/// Returns when socket acquisition, runtime preparation, or a server component
+/// fails.
+pub async fn run_service(config: Config) -> Result<(), ControlError> {
+    let mut lease = WorkspaceServerLease::acquire(&config.workspace).await?;
+    let configuration = service_configuration_fingerprint(&config);
+    let prepared = crate::server::runtime::prepare_runtime(&config).await?;
+    let (runtime, handle) = prepared.into_actor();
+    let lifecycle_path = lease.lifecycle_path.clone();
+    let grpc_path = lease.grpc_path.clone();
+    let lifecycle_listener = lease
+        .lifecycle
+        .take()
+        .ok_or(ControlError::ComponentStopped(
+            "workspace lifecycle listener lease",
+        ))?;
+    let grpc_listener = lease.grpc.take().ok_or(ControlError::ComponentStopped(
+        "workspace gRPC listener lease",
+    ))?;
+    let endpoint = handle.endpoint().clone();
+    let mut lifecycle = tokio::spawn(run_lifecycle_listener(
+        lifecycle_listener,
+        lifecycle_path,
+        configuration,
+    ));
+    let mut grpc = tokio::spawn(run_grpc_listener(grpc_listener, grpc_path, endpoint));
+    let mut actor = tokio::spawn(runtime.run());
+
+    let result = tokio::select! {
+        result = &mut lifecycle => flatten_component(result, "lifecycle listener"),
+        result = &mut grpc => flatten_component(result, "gRPC listener"),
+        result = &mut actor => match result {
+            Ok(()) => Err(ControlError::ComponentStopped("native runtime")),
+            Err(_) => Err(ControlError::ComponentStopped("native runtime task")),
+        },
+    };
+    handle.shutdown().await;
+    lifecycle.abort();
+    grpc.abort();
+    if !actor.is_finished() {
+        let _ = actor.await;
+    }
+    result
+}
+
+async fn run_lifecycle_listener(
+    listener: UnixListener,
+    path: PathBuf,
+    configuration: String,
+) -> Result<(), ControlError> {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.map_err(|source| socket_error(&path, source))?;
+                let shutdown_tx = shutdown_tx.clone();
+                let configuration = configuration.clone();
+                connections.spawn(async move {
+                    handle_lifecycle_connection(stream, shutdown_tx, &configuration).await;
                 });
             }
-        });
-        Ok(Self {
-            requests,
-            socket_path: path.to_path_buf(),
-            task,
-        })
-    }
-
-    pub fn shutdown(self) {
-        self.task.abort();
-        let _ = std::fs::remove_file(self.socket_path);
-    }
-}
-
-impl IncomingInvocation {
-    pub fn respond(self, response: AgentResponse) {
-        let _ = self.response.send(response);
-    }
-}
-
-impl ControlRegistration {
-    /// Registers a TUI with the shared control service and keeps the registration alive.
-    ///
-    /// # Errors
-    /// Returns an error when the service cannot be started or the initial registration fails.
-    pub async fn start(
-        executable: &Path,
-        session_id: &str,
-        socket_path: &Path,
-    ) -> Result<Self, ControlError> {
-        ensure_service(executable).await?;
-        let service_path = service_socket_path()?;
-        register_at(&service_path, session_id, socket_path).await?;
-
-        let executable = executable.to_path_buf();
-        let session_id = session_id.to_owned();
-        let socket_path = socket_path.to_path_buf();
-        let task_session_id = session_id.clone();
-        let task_socket_path = socket_path.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(REGISTRATION_INTERVAL).await;
-                if ensure_service(&executable).await.is_ok()
-                    && let Ok(service_path) = service_socket_path()
-                {
-                    let _ = register_at(&service_path, &task_session_id, &task_socket_path).await;
+            shutdown = shutdown_rx.recv() => {
+                if shutdown.is_some() {
+                    break;
                 }
             }
-        });
-
-        Ok(Self {
-            session_id,
-            socket_path,
-            task,
-        })
-    }
-
-    pub async fn shutdown(self) {
-        self.task.abort();
-        if let Ok(service_path) = service_socket_path() {
-            let _ = unregister_at(&service_path, &self.session_id, &self.socket_path).await;
+            completed = connections.join_next(), if !connections.is_empty() => {
+                let _ = completed;
+            }
         }
     }
+    connections.abort_all();
+    drop(listener);
+    Ok(())
 }
 
-async fn handle_tui_connection(
+async fn handle_lifecycle_connection(
     stream: UnixStream,
-    id: u64,
-    tx: tokio::sync::mpsc::Sender<IncomingInvocation>,
+    shutdown_tx: tokio::sync::mpsc::Sender<()>,
+    configuration: &str,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut line = String::new();
     if BufReader::new(reader).read_line(&mut line).await.is_err() {
         return;
     }
-    let Ok(invocation) = serde_json::from_str(&line) else {
-        return;
+    let request = match serde_json::from_str(&line) {
+        Ok(request) => request,
+        Err(error) => {
+            write_lifecycle_response(
+                &mut writer,
+                &LifecycleResponse::Error {
+                    message: error.to_string(),
+                },
+            )
+            .await;
+            return;
+        }
     };
-    let (response, receive) = tokio::sync::oneshot::channel();
-    if tx
-        .send(IncomingInvocation {
-            id,
-            invocation,
-            response,
-        })
-        .await
-        .is_err()
-    {
-        return;
+    let should_shutdown = matches!(request, LifecycleRequest::Shutdown);
+    let response = match request {
+        LifecycleRequest::Ping => LifecycleResponse::Ready {
+            configuration: configuration.to_owned(),
+        },
+        LifecycleRequest::Shutdown => LifecycleResponse::Ok,
+    };
+    write_lifecycle_response(&mut writer, &response).await;
+    if should_shutdown {
+        let _ = shutdown_tx.send(()).await;
     }
-    if let Ok(response) = receive.await
-        && let Ok(encoded) = serde_json::to_string(&response)
-    {
+}
+
+async fn write_lifecycle_response(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &LifecycleResponse,
+) {
+    if let Ok(encoded) = serde_json::to_string(response) {
         let _ = writer.write_all(encoded.as_bytes()).await;
         let _ = writer.write_all(b"\n").await;
     }
 }
 
-/// Sends an invocation directly to one TUI and waits for its result.
-///
-/// # Errors
-/// Returns an error when the TUI cannot be reached or exchanges an invalid response.
-pub async fn invoke(
-    path: &Path,
-    invocation: &AgentInvocation,
-) -> Result<AgentResponse, ControlError> {
-    exchange(path, invocation).await
+async fn run_grpc_listener(
+    listener: UnixListener,
+    _path: PathBuf,
+    endpoint: nakode_server::ServerEndpoint,
+) -> Result<(), ControlError> {
+    let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+    tonic::transport::Server::builder()
+        .add_service(nakode_server::grpc::GrpcService::new(endpoint).into_server())
+        .serve_with_incoming(incoming)
+        .await?;
+    Ok(())
 }
 
-/// Routes an invocation through the shared service, with compatibility fallback
-/// to a control socket owned by an older TUI.
-///
-/// # Errors
-/// Returns an error when no compatible control service can be reached.
-pub async fn invoke_via_service(
-    workspace: &Path,
-    invocation: &AgentInvocation,
-) -> Result<AgentResponse, ControlError> {
-    let service_path = service_socket_path()?;
-    match invoke_at(&service_path, invocation).await {
-        Ok(response) => Ok(response),
-        Err(service_error) => {
-            let compatibility_path = client_socket_path(workspace);
-            if compatibility_path.exists() {
-                invoke(&compatibility_path, invocation).await
-            } else {
-                Err(service_error)
-            }
-        }
+fn flatten_component(
+    result: Result<Result<(), ControlError>, tokio::task::JoinError>,
+    name: &'static str,
+) -> Result<(), ControlError> {
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(ControlError::ComponentStopped(name)),
     }
+}
+
+struct WorkspaceServerLease {
+    lifecycle_path: PathBuf,
+    grpc_path: PathBuf,
+    lifecycle: Option<UnixListener>,
+    grpc: Option<UnixListener>,
+}
+
+impl WorkspaceServerLease {
+    async fn acquire(workspace: &Path) -> Result<Self, ControlError> {
+        let lifecycle_path = service_socket_path(workspace)?;
+        let grpc_path = grpc_service_socket_path(workspace)?;
+        let lifecycle = bind_service_listener(&lifecycle_path).await?;
+        let grpc = match bind_service_listener(&grpc_path).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                drop(lifecycle);
+                let _ = std::fs::remove_file(&lifecycle_path);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            lifecycle_path,
+            grpc_path,
+            lifecycle: Some(lifecycle),
+            grpc: Some(grpc),
+        })
+    }
+}
+
+impl Drop for WorkspaceServerLease {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lifecycle_path);
+        let _ = std::fs::remove_file(&self.grpc_path);
+    }
+}
+
+async fn bind_service_listener(path: &Path) -> Result<UnixListener, ControlError> {
+    if path.exists() {
+        if UnixStream::connect(path).await.is_ok() {
+            return Err(ControlError::AlreadyRunning(path.display().to_string()));
+        }
+        std::fs::remove_file(path).map_err(|source| socket_error(path, source))?;
+    }
+    UnixListener::bind(path).map_err(|source| socket_error(path, source))
 }
 
 async fn exchange<Request, Response>(
@@ -310,242 +308,54 @@ where
     Ok(serde_json::from_str(&line)?)
 }
 
-/// Runs the user-level control service until it receives a shutdown request.
-///
-/// # Errors
-/// Returns an error when its socket cannot be created or served.
-pub async fn run_service() -> Result<(), ControlError> {
-    let path = service_socket_path()?;
-    run_service_at(&path).await
-}
-
-async fn run_service_at(path: &Path) -> Result<(), ControlError> {
-    if path.exists() {
-        if ping_at(path).await.is_ok() {
-            return Err(ControlError::AlreadyRunning(path.display().to_string()));
-        }
-        std::fs::remove_file(path).map_err(|source| socket_error(path, source))?;
-    }
-    let listener = UnixListener::bind(path).map_err(|source| socket_error(path, source))?;
-    let routes = Arc::new(Mutex::new(HashMap::<String, RegisteredTui>::new()));
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
-    let mut stale_route_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + REGISTRATION_TTL,
-        REGISTRATION_TTL,
-    );
-
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|source| socket_error(path, source))?;
-                let routes = Arc::clone(&routes);
-                let shutdown_tx = shutdown_tx.clone();
-                tokio::spawn(async move {
-                    handle_service_connection(stream, routes, shutdown_tx).await;
-                });
-            }
-            _ = shutdown_rx.recv() => break,
-            _ = stale_route_tick.tick() => {
-                let cutoff = tokio::time::Instant::now() - REGISTRATION_TTL;
-                let mut routes = routes.lock().await;
-                routes.retain(|_, route| route.refreshed_at >= cutoff);
-                if routes.is_empty() {
-                    break;
-                }
-            }
-        }
-    }
-
-    drop(listener);
-    let _ = std::fs::remove_file(path);
-    Ok(())
-}
-
-async fn handle_service_connection(
-    stream: UnixStream,
-    routes: Arc<Mutex<HashMap<String, RegisteredTui>>>,
-    shutdown_tx: tokio::sync::mpsc::Sender<()>,
-) {
-    let (reader, mut writer) = stream.into_split();
-    let mut line = String::new();
-    if BufReader::new(reader).read_line(&mut line).await.is_err() {
-        return;
-    }
-    let request = match serde_json::from_str(&line) {
-        Ok(request) => request,
-        Err(error) => {
-            write_service_response(
-                &mut writer,
-                &ServiceResponse::Error {
-                    message: error.to_string(),
-                },
-            )
-            .await;
-            return;
-        }
-    };
-
-    let mut should_shutdown = false;
-    let response = match request {
-        ServiceRequest::Ping => ServiceResponse::Ok,
-        ServiceRequest::Register {
-            session_id,
-            socket_path,
-        } => {
-            routes.lock().await.insert(
-                session_id,
-                RegisteredTui {
-                    socket_path,
-                    refreshed_at: tokio::time::Instant::now(),
-                },
-            );
-            ServiceResponse::Ok
-        }
-        ServiceRequest::Unregister {
-            session_id,
-            socket_path,
-        } => {
-            let mut routes = routes.lock().await;
-            if routes
-                .get(&session_id)
-                .is_some_and(|route| route.socket_path == socket_path)
-            {
-                routes.remove(&session_id);
-            }
-            ServiceResponse::Ok
-        }
-        ServiceRequest::Invoke { invocation } => route_invocation(&routes, &invocation).await,
-        ServiceRequest::Shutdown => {
-            should_shutdown = true;
-            ServiceResponse::Ok
-        }
-    };
-
-    write_service_response(&mut writer, &response).await;
-    if should_shutdown {
-        let _ = shutdown_tx.send(()).await;
-    }
-}
-
-async fn route_invocation(
-    routes: &Mutex<HashMap<String, RegisteredTui>>,
-    invocation: &AgentInvocation,
-) -> ServiceResponse {
-    let socket_path = routes
-        .lock()
-        .await
-        .get(&invocation.session_id)
-        .map(|route| route.socket_path.clone());
-    let Some(socket_path) = socket_path else {
-        return ServiceResponse::Agent {
-            response: AgentResponse {
-                success: false,
-                result: "No running TUI is registered for this Nakode session.".to_owned(),
-            },
-        };
-    };
-
-    match invoke(&socket_path, invocation).await {
-        Ok(response) => ServiceResponse::Agent { response },
-        Err(error) => {
-            let mut routes = routes.lock().await;
-            if routes
-                .get(&invocation.session_id)
-                .is_some_and(|route| route.socket_path == socket_path)
-            {
-                routes.remove(&invocation.session_id);
-            }
-            ServiceResponse::Agent {
-                response: AgentResponse {
-                    success: false,
-                    result: format!("The TUI registered for this session is unavailable: {error}"),
-                },
-            }
-        }
-    }
-}
-
-async fn write_service_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    response: &ServiceResponse,
-) {
-    if let Ok(encoded) = serde_json::to_string(response) {
-        let _ = writer.write_all(encoded.as_bytes()).await;
-        let _ = writer.write_all(b"\n").await;
-    }
-}
-
-async fn invoke_at(
-    service_path: &Path,
-    invocation: &AgentInvocation,
-) -> Result<AgentResponse, ControlError> {
-    match exchange(
-        service_path,
-        &ServiceRequest::Invoke {
-            invocation: invocation.clone(),
-        },
-    )
-    .await?
-    {
-        ServiceResponse::Agent { response } => Ok(response),
-        ServiceResponse::Error { message } => Err(ControlError::ServiceRejected(message)),
-        ServiceResponse::Ok => Err(ControlError::UnexpectedServiceResponse),
-    }
-}
-
-async fn register_at(
-    service_path: &Path,
-    session_id: &str,
-    socket_path: &Path,
-) -> Result<(), ControlError> {
-    expect_ok(
-        service_path,
-        &ServiceRequest::Register {
-            session_id: session_id.to_owned(),
-            socket_path: socket_path.to_path_buf(),
-        },
-    )
-    .await
-}
-
-async fn unregister_at(
-    service_path: &Path,
-    session_id: &str,
-    socket_path: &Path,
-) -> Result<(), ControlError> {
-    expect_ok(
-        service_path,
-        &ServiceRequest::Unregister {
-            session_id: session_id.to_owned(),
-            socket_path: socket_path.to_path_buf(),
-        },
-    )
-    .await
-}
-
-async fn ping_at(service_path: &Path) -> Result<(), ControlError> {
-    expect_ok(service_path, &ServiceRequest::Ping).await
-}
-
-async fn expect_ok(path: &Path, request: &ServiceRequest) -> Result<(), ControlError> {
+async fn expect_ok(path: &Path, request: &LifecycleRequest) -> Result<(), ControlError> {
     match exchange(path, request).await? {
-        ServiceResponse::Ok => Ok(()),
-        ServiceResponse::Error { message } => Err(ControlError::ServiceRejected(message)),
-        ServiceResponse::Agent { .. } => Err(ControlError::UnexpectedServiceResponse),
+        LifecycleResponse::Ok => Ok(()),
+        LifecycleResponse::Ready { .. } => Err(ControlError::ServiceRejected(
+            "unexpected readiness response".to_owned(),
+        )),
+        LifecycleResponse::Error { message } => Err(ControlError::ServiceRejected(message)),
     }
 }
 
-async fn ensure_service(executable: &Path) -> Result<(), ControlError> {
-    let service_path = service_socket_path()?;
-    if ping_at(&service_path).await.is_ok() {
-        return Ok(());
+async fn ping_at(service_path: &Path, config: &Config) -> Result<(), ControlError> {
+    let configuration = running_configuration_at(service_path).await?;
+    if configuration == service_configuration_fingerprint(config) {
+        Ok(())
+    } else {
+        Err(ControlError::ConfigurationMismatch)
+    }
+}
+
+async fn running_configuration_at(service_path: &Path) -> Result<String, ControlError> {
+    match exchange(service_path, &LifecycleRequest::Ping).await? {
+        LifecycleResponse::Ready { configuration } => Ok(configuration),
+        LifecycleResponse::Ok => Err(ControlError::ServiceRejected(
+            "unexpected lifecycle readiness response".to_owned(),
+        )),
+        LifecycleResponse::Error { message } => Err(ControlError::ServiceRejected(message)),
+    }
+}
+
+async fn ensure_service(executable: &Path, config: &Config) -> Result<(), ControlError> {
+    let service_path = service_socket_path(&config.workspace)?;
+    ensure_service_at(&service_path, executable, config).await
+}
+
+async fn ensure_service_at(
+    service_path: &Path,
+    executable: &Path,
+    config: &Config,
+) -> Result<(), ControlError> {
+    match ping_at(service_path, config).await {
+        Ok(()) => return Ok(()),
+        Err(ControlError::ConfigurationMismatch) => {
+            return Err(ControlError::ConfigurationMismatch);
+        }
+        Err(_) => {}
     }
 
-    let mut child = tokio::process::Command::new(executable)
-        .args(["service", "run"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    let mut child = service_command(executable, config)
         .spawn()
         .map_err(ControlError::SpawnService)?;
     tokio::spawn(async move {
@@ -554,7 +364,7 @@ async fn ensure_service(executable: &Path) -> Result<(), ControlError> {
 
     for _ in 0..SERVICE_START_ATTEMPTS {
         tokio::time::sleep(SERVICE_START_RETRY).await;
-        if ping_at(&service_path).await.is_ok() {
+        if ping_at(service_path, config).await.is_ok() {
             return Ok(());
         }
     }
@@ -563,16 +373,217 @@ async fn ensure_service(executable: &Path) -> Result<(), ControlError> {
     ))
 }
 
-/// Stops the user-level service if one is currently running.
+fn service_command(executable: &Path, config: &Config) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .args(service_arguments(config))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    detach_service_process(&mut command);
+    for key in RESUME_ENVIRONMENT_KEYS {
+        command.env_remove(key);
+    }
+    command
+}
+
+#[cfg(unix)]
+fn detach_service_process(command: &mut tokio::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: `setsid` is a single async-signal-safe system call. The closure
+    // neither allocates nor accesses shared process state after `fork`.
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            nix::unistd::setsid()
+                .map(|_| ())
+                .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach_service_process(command: &mut tokio::process::Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    command
+        .as_std_mut()
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn detach_service_process(_command: &mut tokio::process::Command) {}
+
+fn service_arguments(config: &Config) -> Vec<OsString> {
+    let mut arguments = vec![
+        OsString::from("--workspace"),
+        config.workspace.as_os_str().to_owned(),
+        OsString::from("--scrollback"),
+        OsString::from(config.scrollback.to_string()),
+        OsString::from("--compaction-threshold-percent"),
+        OsString::from(config.compaction_threshold_percent.to_string()),
+        OsString::from("--openai-reasoning-effort"),
+        OsString::from(config.openai_reasoning_effort.as_str()),
+        OsString::from("--agents"),
+        config.agents.as_os_str().to_owned(),
+    ];
+    if let Some(personalities) = &config.personalities {
+        arguments.push(OsString::from("--personalities"));
+        arguments.push(personalities.as_os_str().to_owned());
+    }
+    if let Some(soul) = &config.soul {
+        arguments.push(OsString::from("--soul"));
+        arguments.push(soul.as_os_str().to_owned());
+    }
+    arguments.push(OsString::from("service"));
+    arguments.push(OsString::from("run"));
+    arguments
+}
+
+fn service_configuration_fingerprint(config: &Config) -> String {
+    let components = [
+        env!("CARGO_PKG_VERSION").to_owned(),
+        config.scrollback.to_string(),
+        config.compaction_threshold_percent.to_string(),
+        config.openai_reasoning_effort.as_str().to_owned(),
+        config.agents.to_string_lossy().into_owned(),
+        config
+            .personalities
+            .as_ref()
+            .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+        config
+            .soul
+            .as_ref()
+            .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+    ];
+    let mut digest = Sha256::new();
+    for component in components {
+        digest.update(component.len().to_le_bytes());
+        digest.update(component.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+async fn ensure_api_service(executable: &Path, config: &Config) -> Result<PathBuf, ControlError> {
+    let api_path = grpc_service_socket_path(&config.workspace)?;
+    ensure_service(executable, config).await?;
+    for _ in 0..SERVICE_START_ATTEMPTS {
+        if api_ready(&api_path, &config.workspace).await {
+            return Ok(api_path);
+        }
+        tokio::time::sleep(SERVICE_START_RETRY).await;
+    }
+    Err(ControlError::ServiceStartup(api_path.display().to_string()))
+}
+
+/// Returns a compatible live endpoint or starts the workspace server when none
+/// exists.
+///
+/// Discovery deliberately does not compare the live server's startup
+/// configuration with the connector process's defaults. The running server is
+/// authoritative for its own configuration. A missing server is still started
+/// through [`ensure_api_service`], whose fingerprint check prevents racing
+/// or replacing a server started with conflicting options.
 ///
 /// # Errors
-/// Returns an error when a live service rejects or cannot read the request.
-pub async fn shutdown_service() -> Result<(), ControlError> {
-    let service_path = service_socket_path()?;
+/// Returns when a live server does not expose a compatible API endpoint or
+/// when a missing server cannot be started with the supplied configuration.
+pub async fn frontend_api_endpoint(
+    executable: &Path,
+    config: &Config,
+) -> Result<PathBuf, ControlError> {
+    let lifecycle_path = service_socket_path(&config.workspace)?;
+    let api_path = grpc_service_socket_path(&config.workspace)?;
+    frontend_api_endpoint_at(&lifecycle_path, &api_path, &config.workspace, || {
+        ensure_api_service(executable, config)
+    })
+    .await
+}
+
+async fn frontend_api_endpoint_at<Start, StartFuture>(
+    lifecycle_path: &Path,
+    api_path: &Path,
+    workspace: &Path,
+    start_missing: Start,
+) -> Result<PathBuf, ControlError>
+where
+    Start: FnOnce() -> StartFuture,
+    StartFuture: std::future::Future<Output = Result<PathBuf, ControlError>>,
+{
+    if let Some(endpoint) = discover_running_api_at(lifecycle_path, api_path, workspace).await? {
+        return Ok(endpoint);
+    }
+    start_missing().await
+}
+
+async fn discover_running_api_at(
+    lifecycle_path: &Path,
+    api_path: &Path,
+    workspace: &Path,
+) -> Result<Option<PathBuf>, ControlError> {
+    if api_ready(api_path, workspace).await {
+        return Ok(Some(api_path.to_owned()));
+    }
+
+    match running_configuration_at(lifecycle_path).await {
+        Ok(_) => {}
+        Err(ControlError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    }
+
+    // A lifecycle-ready server may still be bringing up its API listener.
+    // Wait for that live server instead of treating connector defaults as
+    // authority and attempting a conflicting start.
+    for _ in 0..SERVICE_START_ATTEMPTS {
+        tokio::time::sleep(SERVICE_START_RETRY).await;
+        if api_ready(api_path, workspace).await {
+            return Ok(Some(api_path.to_owned()));
+        }
+    }
+    Err(ControlError::ServiceStartup(api_path.display().to_string()))
+}
+
+async fn api_ready(path: &Path, workspace: &Path) -> bool {
+    let readiness = async {
+        let client = nakode_sdk::NakodeClient::connect_unix(path.to_owned())
+            .await
+            .map_err(|error| ControlError::ServiceRejected(error.to_string()))?;
+        let state = client
+            .get_workspace(workspace.to_string_lossy(), None)
+            .await
+            .map_err(|error| ControlError::ServiceRejected(error.to_string()))?;
+        if state.workspace_path == workspace.to_string_lossy() {
+            Ok(())
+        } else {
+            Err(ControlError::ServiceRejected(
+                "workspace response did not match the requested workspace".to_owned(),
+            ))
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(1), readiness)
+        .await
+        .is_ok_and(|result| result.is_ok())
+}
+
+/// Stops the workspace server if one is currently running.
+///
+/// # Errors
+/// Returns an error when a live server rejects or cannot read the request.
+pub async fn shutdown_service(workspace: &Path) -> Result<(), ControlError> {
+    let service_path = service_socket_path(workspace)?;
     if !service_path.exists() {
         return Ok(());
     }
-    match expect_ok(&service_path, &ServiceRequest::Shutdown).await {
+    match expect_ok(&service_path, &LifecycleRequest::Shutdown).await {
         Ok(()) => Ok(()),
         Err(ControlError::Io { source, .. })
             if matches!(
@@ -595,30 +606,57 @@ fn control_directory() -> Result<PathBuf, ControlError> {
             .map(|project| project.data_local_dir().to_path_buf())
             .ok_or(ControlError::MissingDataDirectory)?
     };
-    std::fs::create_dir_all(&directory).map_err(|source| socket_error(&directory, source))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .map_err(|source| socket_error(&directory, source))?;
-    }
+    prepare_private_directory(&directory)?;
     Ok(directory)
 }
 
-/// Returns the socket used by the shared user-level control service.
-///
-/// # Errors
-/// Returns an error when the platform data directory cannot be prepared.
-pub fn service_socket_path() -> Result<PathBuf, ControlError> {
-    Ok(control_directory()?.join("control.sock"))
+fn prepare_private_directory(directory: &Path) -> Result<(), ControlError> {
+    std::fs::create_dir_all(directory).map_err(|source| socket_error(directory, source))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|source| socket_error(directory, source))?;
+    }
+    Ok(())
 }
 
-/// Returns the private socket used by the current TUI process.
+/// Returns the private lifecycle socket for one canonical workspace.
 ///
 /// # Errors
 /// Returns an error when the platform data directory cannot be prepared.
-pub fn tui_socket_path() -> Result<PathBuf, ControlError> {
-    Ok(control_directory()?.join(format!("tui-{}.sock", std::process::id())))
+pub fn service_socket_path(workspace: &Path) -> Result<PathBuf, ControlError> {
+    Ok(workspace_control_directory(workspace)?.join("c.sock"))
+}
+
+/// Returns the socket implementing the generated Nakode API.
+///
+/// # Errors
+/// Returns an error when the platform data directory cannot be prepared.
+pub fn grpc_service_socket_path(workspace: &Path) -> Result<PathBuf, ControlError> {
+    Ok(workspace_control_directory(workspace)?.join("api.sock"))
+}
+
+fn workspace_control_directory(workspace: &Path) -> Result<PathBuf, ControlError> {
+    workspace_control_directory_in(&control_directory()?, workspace)
+}
+
+fn workspace_control_directory_in(
+    control_root: &Path,
+    workspace: &Path,
+) -> Result<PathBuf, ControlError> {
+    let canonical =
+        std::fs::canonicalize(workspace).map_err(|source| socket_error(workspace, source))?;
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let mut key = String::with_capacity(16);
+    for byte in &digest[..8] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        key.push(char::from(HEX[usize::from(byte >> 4)]));
+        key.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    let directory = control_root.join("w").join(key);
+    prepare_private_directory(&directory)?;
+    Ok(directory)
 }
 
 fn socket_error(path: &Path, source: std::io::Error) -> ControlError {
@@ -628,210 +666,284 @@ fn socket_error(path: &Path, source: std::io::Error) -> ControlError {
     }
 }
 
-#[must_use]
-pub fn socket_path(workspace: &Path) -> PathBuf {
-    workspace.join(".nakode").join("control.sock")
-}
-
-#[must_use]
-pub fn client_socket_path(workspace: &Path) -> PathBuf {
-    let current = socket_path(workspace);
-    if current.exists() {
-        return current;
-    }
-    let legacy = workspace.join(".nako-agent").join("control.sock");
-    if legacy.exists() { legacy } else { current }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        AgentInvocation, AgentResponse, ControlError, ControlServer, ServiceRequest,
-        client_socket_path, expect_ok, invoke, invoke_at, register_at, run_service_at, socket_path,
+    use std::{
+        ffi::OsStr,
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
+    use super::{
+        ControlError, LifecycleRequest, RESUME_ENVIRONMENT_KEYS, bind_service_listener,
+        detach_service_process, ensure_service_at, expect_ok, frontend_api_endpoint_at, ping_at,
+        run_lifecycle_listener, service_arguments, service_command,
+        service_configuration_fingerprint, workspace_control_directory_in,
+    };
+    use crate::config::{Config, OpenAiReasoningEffort};
+
+    fn config_for(workspace: &Path) -> Config {
+        Config {
+            command: None,
+            update: false,
+            workspace: workspace.to_path_buf(),
+            model: None,
+            resume: None,
+            scrollback: 2_000,
+            compaction_threshold_percent: 85,
+            openai_reasoning_effort: OpenAiReasoningEffort::Medium,
+            personalities: None,
+            soul: None,
+            agents: workspace.join(".nakode/agents"),
+        }
+    }
+
     #[test]
-    fn client_socket_falls_back_to_the_legacy_workspace_path() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let legacy = directory.path().join(".nako-agent/control.sock");
-        std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
-            .expect("legacy control directory");
-        std::fs::write(&legacy, []).expect("legacy socket placeholder");
+    fn server_launch_preserves_configuration_without_resume() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = Config {
+            command: None,
+            update: false,
+            workspace: workspace.path().to_path_buf(),
+            model: Some("openai-codex/gpt-5".to_owned()),
+            resume: Some("session-that-must-not-cross-the-boundary".to_owned()),
+            scrollback: 4_321,
+            compaction_threshold_percent: 73,
+            openai_reasoning_effort: OpenAiReasoningEffort::High,
+            personalities: Some(workspace.path().join("personalities.toml")),
+            soul: Some(workspace.path().join("SOUL.md")),
+            agents: workspace.path().join("agents"),
+        };
 
-        assert_eq!(client_socket_path(directory.path()), legacy);
-        assert_eq!(
-            socket_path(directory.path()),
-            directory.path().join(".nakode/control.sock")
+        let arguments = service_arguments(&config);
+        let rendered = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let expected = vec![
+            "--workspace".to_owned(),
+            workspace.path().to_string_lossy().into_owned(),
+            "--scrollback".to_owned(),
+            "4321".to_owned(),
+            "--compaction-threshold-percent".to_owned(),
+            "73".to_owned(),
+            "--openai-reasoning-effort".to_owned(),
+            "high".to_owned(),
+            "--agents".to_owned(),
+            workspace
+                .path()
+                .join("agents")
+                .to_string_lossy()
+                .into_owned(),
+            "--personalities".to_owned(),
+            workspace
+                .path()
+                .join("personalities.toml")
+                .to_string_lossy()
+                .into_owned(),
+            "--soul".to_owned(),
+            workspace
+                .path()
+                .join("SOUL.md")
+                .to_string_lossy()
+                .into_owned(),
+            "service".to_owned(),
+            "run".to_owned(),
+        ];
+        assert_eq!(rendered, expected);
+        assert!(!rendered.iter().any(|argument| argument == "--resume"));
+        assert!(!rendered.iter().any(|argument| argument == "--model"));
+        assert!(
+            !rendered
+                .iter()
+                .any(|argument| argument == "session-that-must-not-cross-the-boundary")
         );
-    }
+        assert!(
+            !rendered
+                .iter()
+                .any(|argument| argument == "openai-codex/gpt-5")
+        );
 
-    #[tokio::test]
-    async fn invocation_round_trips_through_one_tui() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("control.sock");
-        let mut server = ControlServer::bind(&path).await.expect("control server");
-        let invocation = invocation("session-7", "Review auth");
-        let client_path = path.clone();
-        let client = tokio::spawn(async move { invoke(&client_path, &invocation).await });
-
-        let request = server.requests.recv().await.expect("incoming invocation");
-        assert_eq!(request.invocation.agent, "reviewer");
-        assert_eq!(request.invocation.session_id, "session-7");
-        assert_eq!(request.invocation.task, "Review auth");
-        request.respond(AgentResponse {
-            success: true,
-            result: "No defects".to_owned(),
-        });
-
-        let response = client.await.expect("client task").expect("agent response");
-        assert!(response.success);
-        assert_eq!(response.result, "No defects");
-        server.shutdown();
-    }
-
-    #[tokio::test]
-    async fn concurrent_invocations_keep_independent_response_channels() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("control.sock");
-        let mut server = ControlServer::bind(&path).await.expect("control server");
-        let first_path = path.clone();
-        let first =
-            tokio::spawn(
-                async move { invoke(&first_path, &invocation("session-7", "hardware")).await },
+        let command = service_command(Path::new("nakode"), &config);
+        for key in RESUME_ENVIRONMENT_KEYS {
+            assert!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .any(|(name, value)| name == OsStr::new(key) && value.is_none())
             );
-        let second_path = path.clone();
-        let second = tokio::spawn(async move {
-            invoke(&second_path, &invocation("session-7", "operating system")).await
-        });
-
-        for _ in 0..2 {
-            let request = server.requests.recv().await.expect("concurrent invocation");
-            let result = format!("{} complete", request.invocation.task);
-            request.respond(AgentResponse {
-                success: true,
-                result,
-            });
         }
+    }
 
-        let first = first
-            .await
-            .expect("first client task")
-            .expect("first result");
-        let second = second
-            .await
-            .expect("second client task")
-            .expect("second result");
-        assert_eq!(first.result, "hardware complete");
-        assert_eq!(second.result, "operating system complete");
-        server.shutdown();
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_server_starts_in_an_independent_unix_session() {
+        use nix::unistd::{Pid, getsid};
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_service_process(&mut command);
+        let mut child = command.spawn().expect("spawn detached helper");
+        let child_pid = child.id().expect("detached helper pid");
+        let child_pid = i32::try_from(child_pid).expect("pid fits i32");
+        let child_session = getsid(Some(Pid::from_raw(child_pid))).expect("child session");
+        assert_eq!(
+            child_session.as_raw(),
+            child_pid,
+            "setsid must make the service its own session leader"
+        );
+        child.start_kill().expect("stop detached helper");
+        child.wait().await.expect("reap detached helper");
+    }
+
+    #[test]
+    fn workspace_paths_are_stable_private_and_distinct() {
+        let root = tempfile::tempdir().expect("control root");
+        let first_workspace = tempfile::tempdir().expect("first workspace");
+        let second_workspace = tempfile::tempdir().expect("second workspace");
+
+        let first = workspace_control_directory_in(root.path(), first_workspace.path())
+            .expect("first path");
+        let repeated = workspace_control_directory_in(root.path(), first_workspace.path())
+            .expect("repeated path");
+        let second = workspace_control_directory_in(root.path(), second_workspace.path())
+            .expect("second path");
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, second);
+        assert_eq!(
+            first.parent().and_then(Path::file_name),
+            Some(OsStr::new("w"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(first)
+                    .expect("workspace control directory")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
     }
 
     #[tokio::test]
-    async fn binding_does_not_replace_a_live_tui_socket() {
+    async fn lifecycle_accepts_ping_and_stops_after_shutdown() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("control.sock");
-        let server = ControlServer::bind(&path).await.expect("control server");
-
-        let error = ControlServer::bind(&path)
+        let path = directory.path().join("lifecycle.sock");
+        let listener = bind_service_listener(&path)
             .await
-            .err()
-            .expect("second server must fail");
+            .expect("lifecycle listener");
+        let config = config_for(directory.path());
+        let configuration = service_configuration_fingerprint(&config);
+        let task_path = path.clone();
+        let task = tokio::spawn(async move {
+            run_lifecycle_listener(listener, task_path, configuration).await
+        });
+
+        ping_at(&path, &config).await.expect("ping response");
+        let mut changed_config = config.clone();
+        changed_config.scrollback += 1;
+        assert!(matches!(
+            ping_at(&path, &changed_config).await,
+            Err(ControlError::ConfigurationMismatch)
+        ));
+        expect_ok(&path, &LifecycleRequest::Shutdown)
+            .await
+            .expect("shutdown response");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("lifecycle stops promptly")
+            .expect("lifecycle task")
+            .expect("lifecycle result");
+    }
+
+    #[tokio::test]
+    async fn frontend_discovery_starts_a_missing_server_once() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let lifecycle_path = directory.path().join("missing-lifecycle.sock");
+        let api_path = directory.path().join("missing-api.sock");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let starts_for_request = Arc::clone(&starts);
+        let started_path = api_path.clone();
+
+        let resolved = frontend_api_endpoint_at(
+            &lifecycle_path,
+            &api_path,
+            directory.path(),
+            move || async move {
+                starts_for_request.fetch_add(1, Ordering::SeqCst);
+                Ok(started_path)
+            },
+        )
+        .await
+        .expect("missing server starts");
+
+        assert_eq!(resolved, api_path);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_startup_refuses_a_live_server_with_conflicting_configuration() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let lifecycle_path = directory.path().join("lifecycle.sock");
+        let listener = bind_service_listener(&lifecycle_path)
+            .await
+            .expect("lifecycle listener");
+        let default_config = config_for(directory.path());
+        let mut live_config = default_config.clone();
+        live_config.scrollback += 1;
+        let configuration = service_configuration_fingerprint(&live_config);
+        let task_path = lifecycle_path.clone();
+        let task = tokio::spawn(async move {
+            run_lifecycle_listener(listener, task_path, configuration).await
+        });
+
+        let error = ensure_service_at(
+            &lifecycle_path,
+            Path::new("/missing/nakode"),
+            &default_config,
+        )
+        .await
+        .expect_err("conflicting live service must not be replaced");
+        assert!(matches!(error, ControlError::ConfigurationMismatch));
+
+        expect_ok(&lifecycle_path, &LifecycleRequest::Shutdown)
+            .await
+            .expect("shutdown response");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("lifecycle stops promptly")
+            .expect("lifecycle task")
+            .expect("lifecycle result");
+    }
+
+    #[tokio::test]
+    async fn binding_reclaims_stale_socket_without_replacing_a_live_server() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("lifecycle.sock");
+        let listener = bind_service_listener(&path).await.expect("first listener");
+
+        let error = bind_service_listener(&path)
+            .await
+            .expect_err("live listener must not be replaced");
         assert!(matches!(error, ControlError::AlreadyRunning(_)));
-        server.shutdown();
-    }
 
-    #[tokio::test]
-    async fn shared_service_routes_multiple_tuis_by_session() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let service_path = directory.path().join("service.sock");
-        let first_path = directory.path().join("first.sock");
-        let second_path = directory.path().join("second.sock");
-        let mut first_server = ControlServer::bind(&first_path).await.expect("first TUI");
-        let mut second_server = ControlServer::bind(&second_path).await.expect("second TUI");
-
-        let task_path = service_path.clone();
-        let service_task = tokio::spawn(async move { run_service_at(&task_path).await });
-        wait_for_service(&service_path).await;
-        register_at(&service_path, "first-session", &first_path)
+        drop(listener);
+        let replacement = bind_service_listener(&path)
             .await
-            .expect("register first TUI");
-        register_at(&service_path, "second-session", &second_path)
-            .await
-            .expect("register second TUI");
-
-        let first_service_path = service_path.clone();
-        let first_invocation = tokio::spawn(async move {
-            invoke_at(
-                &first_service_path,
-                &invocation("first-session", "first task"),
-            )
-            .await
-        });
-        let second_service_path = service_path.clone();
-        let second_invocation = tokio::spawn(async move {
-            invoke_at(
-                &second_service_path,
-                &invocation("second-session", "second task"),
-            )
-            .await
-        });
-
-        let first_request = first_server.requests.recv().await.expect("first request");
-        assert_eq!(first_request.invocation.task, "first task");
-        first_request.respond(AgentResponse {
-            success: true,
-            result: "first result".to_owned(),
-        });
-        let second_request = second_server.requests.recv().await.expect("second request");
-        assert_eq!(second_request.invocation.task, "second task");
-        second_request.respond(AgentResponse {
-            success: true,
-            result: "second result".to_owned(),
-        });
-
-        assert_eq!(
-            first_invocation
-                .await
-                .expect("first invocation task")
-                .expect("first invocation")
-                .result,
-            "first result"
-        );
-        assert_eq!(
-            second_invocation
-                .await
-                .expect("second invocation task")
-                .expect("second invocation")
-                .result,
-            "second result"
-        );
-
-        expect_ok(&service_path, &ServiceRequest::Shutdown)
-            .await
-            .expect("shutdown service");
-        service_task
-            .await
-            .expect("service task")
-            .expect("service result");
-        first_server.shutdown();
-        second_server.shutdown();
-    }
-
-    fn invocation(session_id: &str, task: &str) -> AgentInvocation {
-        AgentInvocation {
-            agent: "reviewer".to_owned(),
-            session_id: session_id.to_owned(),
-            task: task.to_owned(),
-        }
-    }
-
-    async fn wait_for_service(path: &std::path::Path) {
-        for _ in 0..20 {
-            if expect_ok(path, &ServiceRequest::Ping).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("service did not start");
+            .expect("stale socket is reclaimed");
+        drop(replacement);
     }
 }

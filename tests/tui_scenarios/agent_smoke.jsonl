@@ -1,29 +1,33 @@
 # Start a provider and verify the baseline frame.
 {"action":"snapshot"}
-{"action":"backend","event":{"type":"ready","display_name":"Codex","capabilities":["resume","steering","interruption","model_catalog","session_model_config","context_compaction","approvals","native_tools"]}}
+{"action":"service","event":{"type":"ready","display_name":"Codex","capabilities":["resume","steering","interruption","model_catalog","session_model_config","context_compaction","approvals","native_tools"]}}
 {"action":"assert","connection":"ready","status":"Ready.","screen_contains":["NAKODE","No model selected"]}
 
-# Exercise the composer, session creation, and turn start effects.
+# Exercise the composer and semantic session/turn projections.
 {"action":"type","text":"Run the focused tests"}
 {"action":"key","key":"enter"}
-{"action":"assert","draft":"","effects_include":["backend:start_session"],"screen_contains":["Run the focused tests"]}
-{"action":"backend","event":{"type":"session_created","provider_session_id":"provider-session-1","model":"gpt-5"}}
-{"action":"assert","status":"Starting turn…","effects_include":["persist_session","backend:start_turn"]}
-{"action":"backend","event":{"type":"turn_started","turn_id":"turn-1"}}
+{"action":"assert","draft":"","commands_include":["send_prompt"]}
+{"action":"service","event":{"type":"session_created","provider_session_id":"provider-session-1","model":"gpt-5"}}
+{"action":"assert","status":"Starting turn…","screen_contains":["Run the focused tests"]}
+{"action":"service","event":{"type":"turn_started","turn_id":"turn-1"}}
 {"action":"assert","status":"Codex is working…"}
 
 # Project normalized output and resolve both interactive modal types.
-{"action":"backend","event":{"type":"item","turn_id":"turn-1","id":"assistant-1","kind":"assistant","title":"NAKODE","body":"The focused tests passed.","status":"complete"}}
+{"action":"service","event":{"type":"item","turn_id":"turn-1","id":"assistant-1","kind":"assistant","title":"NAKODE","body":"The focused tests passed.","status":"complete"}}
 {"action":"assert","screen_contains":["The focused tests passed."]}
-{"action":"backend","event":{"type":"approval","id":"approval-1","kind":"command","title":"Run full suite","detail":"cargo test --all-targets"}}
+{"action":"service","event":{"type":"approval","id":"approval-1","kind":"command","title":"Run full suite","detail":"cargo test --all-targets"}}
 {"action":"assert","modal":"approval","screen_contains":["Run full suite","cargo test --all-targets"],"cursor_visible":false}
 {"action":"key","key":"y"}
-{"action":"assert","modal":"none","effects_include":["backend:resolve_approval"]}
-{"action":"backend","event":{"type":"question","id":"question-1","title":"Scope","question":"Which suite?","options":[{"label":"All targets","description":"Run everything"},{"label":"Library","description":"Run library tests"}],"recommended":0}}
+{"action":"assert","modal":"approval","commands_include":["resolve_interaction"]}
+{"action":"service","event":{"type":"interaction_resolved","id":"approval-1"}}
+{"action":"assert","modal":"none"}
+{"action":"service","event":{"type":"question","id":"question-1","title":"Scope","question":"Which suite?","options":[{"label":"All targets","description":"Run everything"},{"label":"Library","description":"Run library tests"}],"recommended":0}}
 {"action":"assert","modal":"question","screen_contains":["Which suite?","All targets"]}
 {"action":"key","key":"enter"}
-{"action":"assert","modal":"none","effects_include":["backend:resolve_question"]}
-{"action":"backend","event":{"type":"turn_completed","turn_id":"turn-1"}}
+{"action":"assert","modal":"question","commands_include":["resolve_interaction"]}
+{"action":"service","event":{"type":"interaction_resolved","id":"question-1"}}
+{"action":"assert","modal":"none"}
+{"action":"service","event":{"type":"turn_completed","turn_id":"turn-1"}}
 {"action":"assert","status":"Turn completed."}
 
 # Exercise registered slash controls, modal dismissal, resizing, and styles.

@@ -1,4 +1,7 @@
 /target
+/gen
+**/target/
+crates/nakode-api/Cargo.lock
 /.desloppify/
 /.pi-subagents/
 __pycache__/

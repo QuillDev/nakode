@@ -111,7 +111,7 @@ pub enum NakodeCommand {
     },
     /// Update this installation through its package manager.
     Update,
-    /// Invoke a predefined agent through the running Nakode control service.
+    /// Invoke a predefined agent through the native Nakode server.
     Agent {
         agent_slug: String,
         #[arg(long)]
@@ -119,7 +119,7 @@ pub enum NakodeCommand {
         #[arg(long, default_value = "Complete your predefined assignment.")]
         task: String,
     },
-    /// Manage the shared user-level control service.
+    /// Manage the native server for this workspace.
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -141,10 +141,13 @@ pub enum NakodeCommand {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum ServiceAction {
-    /// Run the control service in the foreground.
+    /// Run the workspace server in the foreground.
     Run,
-    /// Stop the running control service. Active TUIs reconnect automatically.
+    /// Stop the workspace server. Connected clients reconnect automatically.
     Shutdown,
+    /// Ensure the workspace server and print its machine-readable endpoint.
+    #[command(hide = true)]
+    Endpoint,
 }
 
 #[derive(Debug, Error)]
@@ -220,12 +223,7 @@ impl Config {
         if self.update && self.command.is_some() {
             return Err(ConfigError::UpdateWithCommand);
         }
-        if self.update
-            || matches!(
-                self.command.as_ref(),
-                Some(NakodeCommand::Update | NakodeCommand::Diagnostics { .. })
-            )
-        {
+        if self.update || matches!(self.command.as_ref(), Some(NakodeCommand::Update)) {
             return Ok(self);
         }
         if !self.workspace.exists() {
@@ -403,6 +401,19 @@ mod tests {
     }
 
     #[test]
+    fn hidden_service_endpoint_action_parses_for_native_connectors() {
+        let config = Config::try_parse_from(["nakode", "service", "endpoint"])
+            .expect("hidden endpoint action");
+
+        assert!(matches!(
+            config.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Endpoint
+            })
+        ));
+    }
+
+    #[test]
     fn diagnostics_command_parses_bounded_privacy_preserving_options() {
         let config = Config::try_parse_from([
             "nakode",
@@ -424,6 +435,25 @@ mod tests {
         ));
         assert!(Config::try_parse_from(["nakode", "diagnostics", "--days=0"]).is_err());
         assert!(Config::try_parse_from(["nakode", "diagnostics", "--sessions=501"]).is_err());
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let noncanonical = workspace.path().join(".");
+        let config = Config::try_parse_from([
+            "nakode",
+            "--workspace",
+            noncanonical.to_str().expect("UTF-8 workspace"),
+            "diagnostics",
+        ])
+        .expect("diagnostics command")
+        .validated()
+        .expect("validated diagnostics");
+        assert_eq!(
+            config.workspace,
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+        );
     }
 
     #[test]
