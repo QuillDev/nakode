@@ -1,7 +1,7 @@
 use nakode::{
     agent_cli, app,
     config::{Config, NakodeCommand, ServiceAction},
-    control_service, diagnostics, tui_eval, update,
+    control_service, diagnostics, discord, tui_eval, update,
 };
 
 #[tokio::main]
@@ -55,6 +55,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(NakodeCommand::Service {
             action: ServiceAction::Shutdown,
         }) => control_service::shutdown_service(&config.workspace).await?,
+        Some(NakodeCommand::Service {
+            action: ServiceAction::Discord { action },
+        }) => discord::run_command(&config, action).await?,
         Some(NakodeCommand::Service {
             action: ServiceAction::Endpoint,
         }) => {

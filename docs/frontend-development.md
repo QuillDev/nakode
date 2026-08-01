@@ -83,6 +83,51 @@ cancel server-owned work; stopping the server is an explicit lifecycle action.
 The TUI uses this exact public SDK path. It is an example frontend, not a
 privileged application runtime.
 
+## Discord frontend
+
+The optional Discord adapter is configured through the service command group:
+
+```text
+nakode service discord setup
+nakode service discord status
+nakode service discord start
+nakode service discord stop
+nakode service discord restart
+nakode service discord enable
+nakode service discord disable
+nakode service discord bind --channel-id <channel> [--guild-id <guild>] [--session-id <session>]
+nakode service discord unbind --channel-id <channel>
+```
+
+`setup` is interactive and reads the bot token without echoing it. The token is
+stored in a private per-workspace file; the TOML configuration stores only the
+enabled flag, authorized Discord user and guild IDs, configured parent-channel
+entry points, and persisted Discord-thread/session mappings. A configured
+parent channel is mention-driven when its optional legacy session ID is empty:
+a real `@nako` mention creates a new Nakode session and a Discord thread, and
+subsequent authorized messages in that thread route to the same session. A
+legacy binding with an explicit session ID continues to accept direct channel
+prompts. An enabled configuration requires an explicit allow-list of users and
+at least one parent-channel binding. The adapter accepts text prompts and
+bounded HTTPS image attachments, sends them through `NakodeClient::send_prompt`,
+and renders bounded `watch_hydrated_session` replacement snapshots. `!nakode`
+commands expose cancellation and text-based interaction resolution for the MVP.
+The bot needs message-content access and permission to send messages and create
+public threads in each configured parent channel.
+
+The native service owns the transport supervisor, but transports have
+independent runtime lifecycles. `start`, `stop`, and `restart` control Discord
+without stopping or restarting the native runtime. `enable` and `disable`
+change automatic startup policy and also apply the corresponding live action
+when the workspace service is already running. `setup` applies its configuration
+immediately; `bind` and `unbind` reload Discord only when it is currently
+running.
+`status` reports both persisted configuration and live runtime state. The
+current endpoint is a private per-workspace Unix socket; this integration is
+therefore a same-host frontend. Remote Discord hosting requires authenticated
+TCP/TLS transport plus server-side authorization and must not be enabled by
+exposing the private socket.
+
 ## Adding a product capability
 
 Implement features in this order:
