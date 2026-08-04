@@ -143,11 +143,79 @@ pub enum NakodeCommand {
 pub enum ServiceAction {
     /// Run the workspace server in the foreground.
     Run,
+    /// Show whether the workspace server is running.
+    Status {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restart the workspace server in the background.
+    Restart,
     /// Stop the workspace server. Connected clients reconnect automatically.
     Shutdown,
-    /// Ensure the workspace server and print its machine-readable endpoint.
+    /// Manage the Discord frontend attached to this workspace.
+    Discord {
+        #[command(subcommand)]
+        action: DiscordAction,
+    },
+    /// Print the private gRPC endpoint used by native frontends.
     #[command(hide = true)]
     Endpoint,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum DiscordAction {
+    /// Interactively configure the Discord bot and its first channel binding.
+    Setup {
+        /// Discord channel snowflake. If omitted, setup prompts for it.
+        #[arg(long)]
+        channel_id: Option<String>,
+        /// Optional Discord guild snowflake for the channel binding.
+        #[arg(long)]
+        guild_id: Option<String>,
+        /// Optional Nakode session id for legacy direct channel routing. Blank makes the channel
+        /// mention-driven, creating a new session and thread for each bot mention.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Comma-separated Discord user snowflakes allowed to use the bot.
+        #[arg(long)]
+        allowed_users: Option<String>,
+    },
+    /// Show Discord configuration without revealing the bot token.
+    Status {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable Discord autostart. If the workspace service is running, also start Discord now.
+    Enable,
+    /// Disable Discord autostart. If the workspace service is running, also stop Discord now.
+    Disable,
+    /// Start Discord in the running workspace service without restarting the native service.
+    Start,
+    /// Stop Discord in the running workspace service without stopping the native service.
+    Stop,
+    /// Restart Discord in the running workspace service.
+    Restart,
+    /// Add or replace a parent-channel binding.
+    Bind {
+        /// Discord channel snowflake.
+        #[arg(long)]
+        channel_id: String,
+        /// Optional Discord guild snowflake.
+        #[arg(long)]
+        guild_id: Option<String>,
+        /// Optional Nakode session id for legacy direct channel routing. Blank makes the channel
+        /// mention-driven, creating a new session and thread for each bot mention.
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Remove a parent-channel binding.
+    Unbind {
+        /// Discord channel snowflake.
+        #[arg(long)]
+        channel_id: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -288,7 +356,7 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ConfigError> {
 mod tests {
     use clap::Parser;
 
-    use super::{Config, NakodeCommand, OpenAiReasoningEffort, ServiceAction};
+    use super::{Config, DiscordAction, NakodeCommand, OpenAiReasoningEffort, ServiceAction};
 
     #[test]
     fn backend_flag_is_not_part_of_the_cli() {
@@ -401,6 +469,77 @@ mod tests {
     }
 
     #[test]
+    fn discord_service_commands_parse_nested_configuration_actions() {
+        let setup = Config::try_parse_from([
+            "nakode",
+            "service",
+            "discord",
+            "setup",
+            "--channel-id",
+            "123",
+            "--guild-id",
+            "456",
+            "--allowed-users",
+            "789,790",
+        ])
+        .expect("Discord setup command");
+        assert!(matches!(
+            setup.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Discord {
+                    action: DiscordAction::Setup {
+                        channel_id: Some(channel_id),
+                        guild_id: Some(guild_id),
+                        allowed_users: Some(allowed_users),
+                        ..
+                    }
+                }
+            }) if channel_id == "123" && guild_id == "456" && allowed_users == "789,790"
+        ));
+
+        let start = Config::try_parse_from(["nakode", "service", "discord", "start"])
+            .expect("Discord start command");
+        assert!(matches!(
+            start.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Discord {
+                    action: DiscordAction::Start
+                }
+            })
+        ));
+        let stop = Config::try_parse_from(["nakode", "service", "discord", "stop"])
+            .expect("Discord stop command");
+        assert!(matches!(
+            stop.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Discord {
+                    action: DiscordAction::Stop
+                }
+            })
+        ));
+        let restart = Config::try_parse_from(["nakode", "service", "discord", "restart"])
+            .expect("Discord restart command");
+        assert!(matches!(
+            restart.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Discord {
+                    action: DiscordAction::Restart
+                }
+            })
+        ));
+
+        let status = Config::try_parse_from(["nakode", "service", "discord", "status", "--json"])
+            .expect("Discord status command");
+        assert!(matches!(
+            status.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Discord {
+                    action: DiscordAction::Status { json: true }
+                }
+            })
+        ));
+    }
+    #[test]
     fn hidden_service_endpoint_action_parses_for_native_connectors() {
         let config = Config::try_parse_from(["nakode", "service", "endpoint"])
             .expect("hidden endpoint action");
@@ -480,6 +619,22 @@ mod tests {
             run.command,
             Some(NakodeCommand::Service {
                 action: ServiceAction::Run
+            })
+        ));
+        let status = Config::try_parse_from(["nakode", "service", "status", "--json"])
+            .expect("service status");
+        assert!(matches!(
+            status.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Status { json: true }
+            })
+        ));
+        let restart =
+            Config::try_parse_from(["nakode", "service", "restart"]).expect("service restart");
+        assert!(matches!(
+            restart.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Restart
             })
         ));
         let shutdown =

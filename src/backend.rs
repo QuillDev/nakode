@@ -10,6 +10,7 @@ pub use crate::media::ImageData as PromptImage;
 pub const CODEX_PROVIDER: &str = "openai-codex";
 pub const DEVIN_PROVIDER: &str = "devin-acp";
 pub const CURSOR_PROVIDER: &str = "cursor-sdk";
+pub const CLAUDE_PROVIDER: &str = "claude-agent";
 pub const KIMI_PROVIDER: &str = "kimi-coding";
 pub const GLM_PROVIDER: &str = "zai-coding";
 

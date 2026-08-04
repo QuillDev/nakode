@@ -1,7 +1,7 @@
 use nakode::{
     agent_cli, app,
     config::{Config, NakodeCommand, ServiceAction},
-    control_service, diagnostics, tui_eval, update,
+    control_service, diagnostics, discord, tui_eval, update,
 };
 
 #[tokio::main]
@@ -53,8 +53,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             action: ServiceAction::Run,
         }) => control_service::run_service(config).await?,
         Some(NakodeCommand::Service {
+            action: ServiceAction::Status { json },
+        }) => {
+            let status = control_service::service_status(&config.workspace).await?;
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else if status.running {
+                println!("Nakode service: running");
+            } else {
+                println!("Nakode service: stopped");
+            }
+        }
+        Some(NakodeCommand::Service {
+            action: ServiceAction::Restart,
+        }) => {
+            let executable = std::env::current_exe()?;
+            control_service::restart_service(&executable, &config).await?;
+            println!("Nakode service: restarted");
+        }
+        Some(NakodeCommand::Service {
             action: ServiceAction::Shutdown,
         }) => control_service::shutdown_service(&config.workspace).await?,
+        Some(NakodeCommand::Service {
+            action: ServiceAction::Discord { action },
+        }) => discord::run_command(&config, action).await?,
         Some(NakodeCommand::Service {
             action: ServiceAction::Endpoint,
         }) => {

@@ -1469,7 +1469,12 @@ mod tests {
         let credentials =
             crate::credential::SqliteCredentialStore::open(&path).expect("credential store");
         let providers = store.list_providers()?;
-        assert_eq!(providers.len(), 5);
+        assert_eq!(providers.len(), 6);
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider.provider == crate::backend::CLAUDE_PROVIDER)
+        );
         assert!(
             providers
                 .iter()

@@ -1,11 +1,14 @@
 use std::{
+    collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
 use directories::ProjectDirs;
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -17,8 +20,92 @@ use tokio::{
 use crate::config::Config;
 
 const SERVICE_START_ATTEMPTS: usize = 40;
+const SERVICE_STOP_ATTEMPTS: usize = 100;
 const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
 const RESUME_ENVIRONMENT_KEYS: [&str; 2] = ["NAKODE_RESUME", "NAKO_AGENT_RESUME"];
+
+/// Workspace service state returned by the lifecycle CLI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ServiceStatus {
+    pub running: bool,
+    pub workspace: PathBuf,
+}
+
+/// Runtime state reported for a frontend transport.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TransportStatus {
+    pub name: String,
+    pub enabled: bool,
+    pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Runtime operation applied to an independent frontend transport.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportAction {
+    Start,
+    Stop,
+    Restart,
+    Status,
+}
+
+pub(crate) trait TransportController: Send + Sync {
+    fn autostart(&self) -> BoxFuture<'_, Result<TransportStatus, String>>;
+    fn start(&self) -> BoxFuture<'_, Result<TransportStatus, String>>;
+    fn stop(&self) -> BoxFuture<'_, Result<TransportStatus, String>>;
+    fn restart(&self) -> BoxFuture<'_, Result<TransportStatus, String>>;
+    fn status(&self) -> BoxFuture<'_, Result<TransportStatus, String>>;
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct TransportSupervisor {
+    transports: Arc<HashMap<String, Arc<dyn TransportController>>>,
+}
+
+impl TransportSupervisor {
+    pub(crate) fn new(
+        transports: impl IntoIterator<Item = (String, Arc<dyn TransportController>)>,
+    ) -> Self {
+        Self {
+            transports: Arc::new(transports.into_iter().collect()),
+        }
+    }
+
+    async fn autostart(&self) {
+        for (name, transport) in self.transports.iter() {
+            if let Err(error) = transport.autostart().await {
+                eprintln!("nakode {name}: could not start transport: {error}");
+            }
+        }
+    }
+
+    async fn control(
+        &self,
+        name: &str,
+        action: TransportAction,
+    ) -> Result<TransportStatus, String> {
+        let transport = self
+            .transports
+            .get(name)
+            .ok_or_else(|| format!("unknown transport {name:?}"))?;
+        match action {
+            TransportAction::Start => transport.start().await,
+            TransportAction::Stop => transport.stop().await,
+            TransportAction::Restart => transport.restart().await,
+            TransportAction::Status => transport.status().await,
+        }
+    }
+
+    async fn stop_all(&self) {
+        for (name, transport) in self.transports.iter() {
+            if let Err(error) = transport.stop().await {
+                eprintln!("nakode {name}: could not stop transport: {error}");
+            }
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ControlError {
@@ -39,6 +126,8 @@ pub enum ControlError {
     SpawnService(#[source] std::io::Error),
     #[error("Nakode server did not become ready at {0}")]
     ServiceStartup(String),
+    #[error("Nakode server did not stop at {0}")]
+    ServiceShutdown(String),
     #[error("Nakode server rejected the lifecycle request: {0}")]
     ServiceRejected(String),
     #[error(
@@ -58,6 +147,10 @@ pub enum ControlError {
 enum LifecycleRequest {
     Ping,
     Shutdown,
+    Transport {
+        name: String,
+        action: TransportAction,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -65,6 +158,7 @@ enum LifecycleRequest {
 enum LifecycleResponse {
     Ok,
     Ready { configuration: String },
+    Transport { status: TransportStatus },
     Error { message: String },
 }
 
@@ -91,13 +185,20 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
         "workspace gRPC listener lease",
     ))?;
     let endpoint = handle.endpoint().clone();
+    let transports = crate::discord::transport_supervisor(&config.workspace, grpc_path.clone());
     let mut lifecycle = tokio::spawn(run_lifecycle_listener(
         lifecycle_listener,
         lifecycle_path,
         configuration,
+        transports.clone(),
     ));
-    let mut grpc = tokio::spawn(run_grpc_listener(grpc_listener, grpc_path, endpoint));
+    let mut grpc = tokio::spawn(run_grpc_listener(
+        grpc_listener,
+        grpc_path.clone(),
+        endpoint,
+    ));
     let mut actor = tokio::spawn(runtime.run());
+    transports.autostart().await;
 
     let result = tokio::select! {
         result = &mut lifecycle => flatten_component(result, "lifecycle listener"),
@@ -110,6 +211,7 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
     handle.shutdown().await;
     lifecycle.abort();
     grpc.abort();
+    transports.stop_all().await;
     if !actor.is_finished() {
         let _ = actor.await;
     }
@@ -120,6 +222,7 @@ async fn run_lifecycle_listener(
     listener: UnixListener,
     path: PathBuf,
     configuration: String,
+    transports: TransportSupervisor,
 ) -> Result<(), ControlError> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
     let mut connections = tokio::task::JoinSet::new();
@@ -129,8 +232,15 @@ async fn run_lifecycle_listener(
                 let (stream, _) = accepted.map_err(|source| socket_error(&path, source))?;
                 let shutdown_tx = shutdown_tx.clone();
                 let configuration = configuration.clone();
+                let transports = transports.clone();
                 connections.spawn(async move {
-                    handle_lifecycle_connection(stream, shutdown_tx, &configuration).await;
+                    handle_lifecycle_connection(
+                        stream,
+                        shutdown_tx,
+                        &configuration,
+                        &transports,
+                    )
+                    .await;
                 });
             }
             shutdown = shutdown_rx.recv() => {
@@ -152,6 +262,7 @@ async fn handle_lifecycle_connection(
     stream: UnixStream,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     configuration: &str,
+    transports: &TransportSupervisor,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut line = String::new();
@@ -177,6 +288,12 @@ async fn handle_lifecycle_connection(
             configuration: configuration.to_owned(),
         },
         LifecycleRequest::Shutdown => LifecycleResponse::Ok,
+        LifecycleRequest::Transport { name, action } => {
+            match transports.control(&name, action).await {
+                Ok(status) => LifecycleResponse::Transport { status },
+                Err(message) => LifecycleResponse::Error { message },
+            }
+        }
     };
     write_lifecycle_response(&mut writer, &response).await;
     if should_shutdown {
@@ -314,6 +431,9 @@ async fn expect_ok(path: &Path, request: &LifecycleRequest) -> Result<(), Contro
         LifecycleResponse::Ready { .. } => Err(ControlError::ServiceRejected(
             "unexpected readiness response".to_owned(),
         )),
+        LifecycleResponse::Transport { .. } => Err(ControlError::ServiceRejected(
+            "unexpected transport response".to_owned(),
+        )),
         LifecycleResponse::Error { message } => Err(ControlError::ServiceRejected(message)),
     }
 }
@@ -332,6 +452,9 @@ async fn running_configuration_at(service_path: &Path) -> Result<String, Control
         LifecycleResponse::Ready { configuration } => Ok(configuration),
         LifecycleResponse::Ok => Err(ControlError::ServiceRejected(
             "unexpected lifecycle readiness response".to_owned(),
+        )),
+        LifecycleResponse::Transport { .. } => Err(ControlError::ServiceRejected(
+            "unexpected transport readiness response".to_owned(),
         )),
         LifecycleResponse::Error { message } => Err(ControlError::ServiceRejected(message)),
     }
@@ -574,6 +697,68 @@ async fn api_ready(path: &Path, workspace: &Path) -> bool {
         .is_ok_and(|result| result.is_ok())
 }
 
+/// Reports whether the workspace server currently responds to lifecycle requests.
+///
+/// A missing or stale lifecycle socket is reported as a stopped service. Other
+/// socket and protocol failures remain errors so an unhealthy service is not
+/// mistaken for one that can be safely replaced.
+///
+/// # Errors
+/// Returns an error when lifecycle state cannot be read reliably.
+pub async fn service_status(workspace: &Path) -> Result<ServiceStatus, ControlError> {
+    let service_path = service_socket_path(workspace)?;
+    let running = service_running_at(&service_path).await?;
+    Ok(ServiceStatus {
+        running,
+        workspace: workspace.to_path_buf(),
+    })
+}
+
+async fn service_running_at(service_path: &Path) -> Result<bool, ControlError> {
+    match running_configuration_at(service_path).await {
+        Ok(_) => Ok(true),
+        Err(ControlError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Restarts the workspace server as a detached background process, or starts it
+/// when it is currently stopped.
+///
+/// # Errors
+/// Returns an error when the current service cannot be stopped or its
+/// replacement cannot be started.
+pub async fn restart_service(executable: &Path, config: &Config) -> Result<(), ControlError> {
+    let status = service_status(&config.workspace).await?;
+    let lifecycle_path = service_socket_path(&config.workspace)?;
+    let api_path = grpc_service_socket_path(&config.workspace)?;
+    shutdown_service(&config.workspace).await?;
+
+    if status.running {
+        for _ in 0..SERVICE_STOP_ATTEMPTS {
+            if !lifecycle_path.exists() && !api_path.exists() {
+                return ensure_service(executable, config).await;
+            }
+            tokio::time::sleep(SERVICE_START_RETRY).await;
+        }
+        return Err(ControlError::ServiceShutdown(
+            lifecycle_path.display().to_string(),
+        ));
+    }
+
+    // A stopped process can leave socket files behind after an unclean exit.
+    let _ = std::fs::remove_file(&lifecycle_path);
+    let _ = std::fs::remove_file(api_path);
+    ensure_service(executable, config).await
+}
+
 /// Stops the workspace server if one is currently running.
 ///
 /// # Errors
@@ -595,6 +780,34 @@ pub async fn shutdown_service(workspace: &Path) -> Result<(), ControlError> {
             Ok(())
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Controls one frontend transport in a running workspace service without
+/// changing the native server lifecycle.
+///
+/// # Errors
+/// Returns an error when the service is not reachable or rejects the request.
+pub async fn transport_action(
+    workspace: &Path,
+    name: &str,
+    action: TransportAction,
+) -> Result<TransportStatus, ControlError> {
+    let service_path = service_socket_path(workspace)?;
+    match exchange(
+        &service_path,
+        &LifecycleRequest::Transport {
+            name: name.to_owned(),
+            action,
+        },
+    )
+    .await?
+    {
+        LifecycleResponse::Transport { status } => Ok(status),
+        LifecycleResponse::Error { message } => Err(ControlError::ServiceRejected(message)),
+        LifecycleResponse::Ok | LifecycleResponse::Ready { .. } => Err(
+            ControlError::ServiceRejected("unexpected lifecycle transport response".to_owned()),
+        ),
     }
 }
 
@@ -673,18 +886,73 @@ mod tests {
         path::Path,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
+    use futures_util::future::BoxFuture;
+
     use super::{
-        ControlError, LifecycleRequest, RESUME_ENVIRONMENT_KEYS, bind_service_listener,
-        detach_service_process, ensure_service_at, expect_ok, frontend_api_endpoint_at, ping_at,
-        run_lifecycle_listener, service_arguments, service_command,
-        service_configuration_fingerprint, workspace_control_directory_in,
+        ControlError, LifecycleRequest, LifecycleResponse, RESUME_ENVIRONMENT_KEYS,
+        TransportAction, TransportController, TransportStatus, TransportSupervisor,
+        bind_service_listener, detach_service_process, ensure_service_at, exchange, expect_ok,
+        frontend_api_endpoint_at, ping_at, run_lifecycle_listener, service_arguments,
+        service_command, service_configuration_fingerprint, service_running_at,
+        workspace_control_directory_in,
     };
     use crate::config::{Config, OpenAiReasoningEffort};
+
+    struct FakeTransport {
+        running: Arc<AtomicBool>,
+    }
+
+    impl FakeTransport {
+        fn status(&self) -> TransportStatus {
+            TransportStatus {
+                name: "fake".to_owned(),
+                enabled: true,
+                running: self.running.load(Ordering::SeqCst),
+                error: None,
+            }
+        }
+
+        fn set_running(&self, running: bool) -> BoxFuture<'_, Result<TransportStatus, String>> {
+            let state = Arc::clone(&self.running);
+            Box::pin(async move {
+                state.store(running, Ordering::SeqCst);
+                Ok(TransportStatus {
+                    name: "fake".to_owned(),
+                    enabled: true,
+                    running,
+                    error: None,
+                })
+            })
+        }
+    }
+
+    impl TransportController for FakeTransport {
+        fn autostart(&self) -> BoxFuture<'_, Result<TransportStatus, String>> {
+            self.set_running(true)
+        }
+
+        fn start(&self) -> BoxFuture<'_, Result<TransportStatus, String>> {
+            self.set_running(true)
+        }
+
+        fn stop(&self) -> BoxFuture<'_, Result<TransportStatus, String>> {
+            self.set_running(false)
+        }
+
+        fn restart(&self) -> BoxFuture<'_, Result<TransportStatus, String>> {
+            self.set_running(true)
+        }
+
+        fn status(&self) -> BoxFuture<'_, Result<TransportStatus, String>> {
+            let status = self.status();
+            Box::pin(async move { Ok(status) })
+        }
+    }
 
     fn config_for(workspace: &Path) -> Config {
         Config {
@@ -849,10 +1117,21 @@ mod tests {
         let configuration = service_configuration_fingerprint(&config);
         let task_path = path.clone();
         let task = tokio::spawn(async move {
-            run_lifecycle_listener(listener, task_path, configuration).await
+            run_lifecycle_listener(
+                listener,
+                task_path,
+                configuration,
+                TransportSupervisor::default(),
+            )
+            .await
         });
 
         ping_at(&path, &config).await.expect("ping response");
+        assert!(
+            service_running_at(&path)
+                .await
+                .expect("running service status")
+        );
         let mut changed_config = config.clone();
         changed_config.scrollback += 1;
         assert!(matches!(
@@ -867,8 +1146,94 @@ mod tests {
             .expect("lifecycle stops promptly")
             .expect("lifecycle task")
             .expect("lifecycle result");
+        std::fs::remove_file(&path).expect("remove stopped lifecycle socket");
+        assert!(
+            !service_running_at(&path)
+                .await
+                .expect("stopped service status")
+        );
     }
 
+    #[tokio::test]
+    async fn lifecycle_controls_a_transport_without_stopping_the_service() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("lifecycle.sock");
+        let listener = bind_service_listener(&path)
+            .await
+            .expect("lifecycle listener");
+        let config = config_for(directory.path());
+        let configuration = service_configuration_fingerprint(&config);
+        let fake = Arc::new(FakeTransport {
+            running: Arc::new(AtomicBool::new(false)),
+        });
+        let supervisor = TransportSupervisor::new([(
+            "fake".to_owned(),
+            Arc::clone(&fake) as Arc<dyn TransportController>,
+        )]);
+        let task_path = path.clone();
+        let task = tokio::spawn(async move {
+            run_lifecycle_listener(listener, task_path, configuration, supervisor).await
+        });
+
+        let start = exchange(
+            &path,
+            &LifecycleRequest::Transport {
+                name: "fake".to_owned(),
+                action: TransportAction::Start,
+            },
+        )
+        .await
+        .expect("transport start response");
+        assert!(matches!(
+            start,
+            LifecycleResponse::Transport { status } if status.running
+        ));
+        assert!(fake.running.load(Ordering::SeqCst));
+
+        let status = exchange(
+            &path,
+            &LifecycleRequest::Transport {
+                name: "fake".to_owned(),
+                action: TransportAction::Status,
+            },
+        )
+        .await
+        .expect("transport status response");
+        assert!(matches!(
+            status,
+            LifecycleResponse::Transport { status } if status.running
+        ));
+        ping_at(&path, &config)
+            .await
+            .expect("native service remains available");
+
+        let stop = exchange(
+            &path,
+            &LifecycleRequest::Transport {
+                name: "fake".to_owned(),
+                action: TransportAction::Stop,
+            },
+        )
+        .await
+        .expect("transport stop response");
+        assert!(matches!(
+            stop,
+            LifecycleResponse::Transport { status } if !status.running
+        ));
+        assert!(!fake.running.load(Ordering::SeqCst));
+        ping_at(&path, &config)
+            .await
+            .expect("native service remains available after transport stop");
+
+        expect_ok(&path, &LifecycleRequest::Shutdown)
+            .await
+            .expect("shutdown response");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("lifecycle stops promptly")
+            .expect("lifecycle task")
+            .expect("lifecycle result");
+    }
     #[tokio::test]
     async fn frontend_discovery_starts_a_missing_server_once() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -907,7 +1272,13 @@ mod tests {
         let configuration = service_configuration_fingerprint(&live_config);
         let task_path = lifecycle_path.clone();
         let task = tokio::spawn(async move {
-            run_lifecycle_listener(listener, task_path, configuration).await
+            run_lifecycle_listener(
+                listener,
+                task_path,
+                configuration,
+                TransportSupervisor::default(),
+            )
+            .await
         });
 
         let error = ensure_service_at(

@@ -23,7 +23,7 @@ use thiserror::Error;
 use crate::{
     agent::{AgentCatalog, AgentCatalogError},
     backend::{BackendCommand, BackendError, BackendEvent, BackendHandle},
-    codex,
+    claude, codex,
     config::Config,
     credential::{
         Credential, CredentialError, CredentialStore, SecretValue, SqliteCredentialStore,
@@ -640,6 +640,14 @@ impl BackendRegistry {
                         .with_session_database(self.session_database.clone())
                         .with_web_config(Arc::clone(&self.web_config))
                         .with_memory(Arc::clone(&self.memory_service))
+                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
+                )
+                .await?
+            }
+            crate::backend::CLAUDE_PROVIDER => {
+                claude::spawn(
+                    claude::BackendConfig::native(self.config.workspace.clone())
+                        .with_credential(credential)
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
