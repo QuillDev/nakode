@@ -143,6 +143,14 @@ pub enum NakodeCommand {
 pub enum ServiceAction {
     /// Run the workspace server in the foreground.
     Run,
+    /// Show whether the workspace server is running.
+    Status {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restart the workspace server in the background.
+    Restart,
     /// Stop the workspace server. Connected clients reconnect automatically.
     Shutdown,
     /// Manage the Discord frontend attached to this workspace.
@@ -611,6 +619,22 @@ mod tests {
             run.command,
             Some(NakodeCommand::Service {
                 action: ServiceAction::Run
+            })
+        ));
+        let status = Config::try_parse_from(["nakode", "service", "status", "--json"])
+            .expect("service status");
+        assert!(matches!(
+            status.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Status { json: true }
+            })
+        ));
+        let restart =
+            Config::try_parse_from(["nakode", "service", "restart"]).expect("service restart");
+        assert!(matches!(
+            restart.command,
+            Some(NakodeCommand::Service {
+                action: ServiceAction::Restart
             })
         ));
         let shutdown =

@@ -20,8 +20,16 @@ use tokio::{
 use crate::config::Config;
 
 const SERVICE_START_ATTEMPTS: usize = 40;
+const SERVICE_STOP_ATTEMPTS: usize = 100;
 const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
 const RESUME_ENVIRONMENT_KEYS: [&str; 2] = ["NAKODE_RESUME", "NAKO_AGENT_RESUME"];
+
+/// Workspace service state returned by the lifecycle CLI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ServiceStatus {
+    pub running: bool,
+    pub workspace: PathBuf,
+}
 
 /// Runtime state reported for a frontend transport.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -118,6 +126,8 @@ pub enum ControlError {
     SpawnService(#[source] std::io::Error),
     #[error("Nakode server did not become ready at {0}")]
     ServiceStartup(String),
+    #[error("Nakode server did not stop at {0}")]
+    ServiceShutdown(String),
     #[error("Nakode server rejected the lifecycle request: {0}")]
     ServiceRejected(String),
     #[error(
@@ -687,6 +697,68 @@ async fn api_ready(path: &Path, workspace: &Path) -> bool {
         .is_ok_and(|result| result.is_ok())
 }
 
+/// Reports whether the workspace server currently responds to lifecycle requests.
+///
+/// A missing or stale lifecycle socket is reported as a stopped service. Other
+/// socket and protocol failures remain errors so an unhealthy service is not
+/// mistaken for one that can be safely replaced.
+///
+/// # Errors
+/// Returns an error when lifecycle state cannot be read reliably.
+pub async fn service_status(workspace: &Path) -> Result<ServiceStatus, ControlError> {
+    let service_path = service_socket_path(workspace)?;
+    let running = service_running_at(&service_path).await?;
+    Ok(ServiceStatus {
+        running,
+        workspace: workspace.to_path_buf(),
+    })
+}
+
+async fn service_running_at(service_path: &Path) -> Result<bool, ControlError> {
+    match running_configuration_at(service_path).await {
+        Ok(_) => Ok(true),
+        Err(ControlError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Restarts the workspace server as a detached background process, or starts it
+/// when it is currently stopped.
+///
+/// # Errors
+/// Returns an error when the current service cannot be stopped or its
+/// replacement cannot be started.
+pub async fn restart_service(executable: &Path, config: &Config) -> Result<(), ControlError> {
+    let status = service_status(&config.workspace).await?;
+    let lifecycle_path = service_socket_path(&config.workspace)?;
+    let api_path = grpc_service_socket_path(&config.workspace)?;
+    shutdown_service(&config.workspace).await?;
+
+    if status.running {
+        for _ in 0..SERVICE_STOP_ATTEMPTS {
+            if !lifecycle_path.exists() && !api_path.exists() {
+                return ensure_service(executable, config).await;
+            }
+            tokio::time::sleep(SERVICE_START_RETRY).await;
+        }
+        return Err(ControlError::ServiceShutdown(
+            lifecycle_path.display().to_string(),
+        ));
+    }
+
+    // A stopped process can leave socket files behind after an unclean exit.
+    let _ = std::fs::remove_file(&lifecycle_path);
+    let _ = std::fs::remove_file(api_path);
+    ensure_service(executable, config).await
+}
+
 /// Stops the workspace server if one is currently running.
 ///
 /// # Errors
@@ -826,7 +898,8 @@ mod tests {
         TransportAction, TransportController, TransportStatus, TransportSupervisor,
         bind_service_listener, detach_service_process, ensure_service_at, exchange, expect_ok,
         frontend_api_endpoint_at, ping_at, run_lifecycle_listener, service_arguments,
-        service_command, service_configuration_fingerprint, workspace_control_directory_in,
+        service_command, service_configuration_fingerprint, service_running_at,
+        workspace_control_directory_in,
     };
     use crate::config::{Config, OpenAiReasoningEffort};
 
@@ -1054,6 +1127,11 @@ mod tests {
         });
 
         ping_at(&path, &config).await.expect("ping response");
+        assert!(
+            service_running_at(&path)
+                .await
+                .expect("running service status")
+        );
         let mut changed_config = config.clone();
         changed_config.scrollback += 1;
         assert!(matches!(
@@ -1068,6 +1146,12 @@ mod tests {
             .expect("lifecycle stops promptly")
             .expect("lifecycle task")
             .expect("lifecycle result");
+        std::fs::remove_file(&path).expect("remove stopped lifecycle socket");
+        assert!(
+            !service_running_at(&path)
+                .await
+                .expect("stopped service status")
+        );
     }
 
     #[tokio::test]

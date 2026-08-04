@@ -3,6 +3,10 @@ slug = "openai-codex"
 display_name = "Codex"
 
 [[providers]]
+slug = "claude-agent"
+display_name = "Claude"
+
+[[providers]]
 slug = "cursor-sdk"
 display_name = "Cursor"
 

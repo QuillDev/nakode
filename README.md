@@ -20,6 +20,19 @@ tool, artifact, setting, and orchestration run. It performs all operations and
 mutations, persists canonical state, and continues active work without an
 attached client.
 
+Manage the service for the selected workspace from the CLI:
+
+```sh
+nakode service status
+nakode service status --json
+nakode service restart
+nakode service shutdown
+```
+
+`restart` starts a stopped service as well as replacing a running one. Use
+`--workspace <path>` before `service` to target a workspace other than the
+current directory.
+
 Every frontend—including the built-in TUI—only:
 
 - obtains authoritative state through the generated SDK;
@@ -58,6 +71,7 @@ are product goals, not all current features.
 Nakode currently supports:
 
 - **OpenAI Codex**
+- **Claude**
 - **Devin**
 - **Cursor**
 - **Kimi For Coding**
@@ -67,10 +81,16 @@ Providers are disabled on a fresh installation. Start Nakode, open
 `/providers`, and sign in to the providers you want to use. Press `F2` to browse
 and select from their available models.
 
-Nakode does not require the separate Codex, Devin, Kimi, or z.ai applications. Cursor uses
-its local TypeScript SDK and requires Node.js 22.13 or newer plus npm. Cursor, Kimi,
-and GLM setup in `/providers` includes an API-key field and a link to the provider's
-API-key dashboard. Kimi requires a [Kimi Coding Plan](https://www.kimi.com/code/)
+Nakode does not require the separate Codex, Devin, Kimi, or z.ai applications. Claude
+uses the official Claude Agent SDK and the login managed by an installed Claude Code
+CLI; install Claude Code and run `claude auth login` before connecting Claude in
+`/providers`. Claude requires Node.js 18 or newer plus npm. Nakode stores only an
+external-login marker, not Claude OAuth credentials; Claude Code continues to own its
+configuration and keychain entries. Agent SDK activity is subject to Anthropic's current
+subscription eligibility, usage limits, and third-party application policies. Cursor uses
+its local TypeScript SDK and requires Node.js 22.13 or newer plus npm. Cursor, Kimi, and GLM
+setup in `/providers` includes an API-key field and a link to the provider's API-key
+dashboard. Kimi requires a [Kimi Coding Plan](https://www.kimi.com/code/)
 API key; Moonshot Platform API keys are a separate product and are not
 interchangeable. GLM requires a [z.ai GLM Coding Plan](https://z.ai/subscribe)
 API key and uses the plan's dedicated Coding API endpoint; Team Plan members must
@@ -107,9 +127,12 @@ cd nakode
 ./install.sh
 ```
 
-This installs `nakode` to `~/.local/bin`. Run `./install.sh --help` for system
-and custom-prefix options. Do not run Nakode or the entire installer through
-`sudo`; provider sign-in uses your normal desktop account.
+This installs `nakode` to `~/.local/bin`. During local development,
+`./install.sh --debug` reuses the development build for much faster iteration,
+at the cost of a larger and less optimized installed executable. Run
+`./install.sh --help` for system and custom-prefix options. Do not run Nakode or
+the entire installer through `sudo`; provider sign-in uses your normal desktop
+account.
 
 ### Start Nakode
 

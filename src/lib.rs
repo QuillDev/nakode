@@ -3,6 +3,7 @@ pub mod agent_cli;
 pub(crate) mod api_projection;
 pub mod app;
 pub mod backend;
+pub mod claude;
 pub mod clipboard;
 pub mod codex;
 pub mod commands;

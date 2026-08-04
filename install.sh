@@ -6,12 +6,14 @@ invocation_directory="$(pwd -P)"
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--system | --prefix PATH]
+Usage: ./install.sh [--debug] [--system | --prefix PATH]
 
 Build and install the Nakode executable. Rerun the same command after updating
 this checkout to replace an existing installation.
 
 Options:
+  --debug        Use the faster development build for local iteration. The
+                 installed executable will be larger and less optimized.
   --system       Install to /usr/local/bin, using sudo only for the copy when
                  the destination is not writable.
   --prefix PATH  Install to PATH/bin without using sudo.
@@ -22,11 +24,15 @@ EOF
 }
 
 system_install=false
+debug_build=false
 prefix="${PREFIX:-${HOME:?HOME must be set}/.local}"
 prefix_was_set=false
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --debug)
+      debug_build=true
+      ;;
     --system)
       if [ "$prefix_was_set" = true ]; then
         printf '%s\n' 'Choose either --system or --prefix, not both.' >&2
@@ -114,12 +120,19 @@ if [ -z "${CARGO_TARGET_DIR:-}" ]; then
   export CARGO_TARGET_DIR
 fi
 
-printf '%s\n' 'Building Nakode in release mode...'
-cargo build --release --locked
+if [ "$debug_build" = true ]; then
+  printf '%s\n' 'Building Nakode in development mode...'
+  cargo build --locked
+  build_directory=debug
+else
+  printf '%s\n' 'Building Nakode in release mode...'
+  cargo build --release --locked
+  build_directory=release
+fi
 
 case "$CARGO_TARGET_DIR" in
-  /*) built_binary="$CARGO_TARGET_DIR/release/nakode" ;;
-  *) built_binary="$script_directory/$CARGO_TARGET_DIR/release/nakode" ;;
+  /*) built_binary="$CARGO_TARGET_DIR/$build_directory/nakode" ;;
+  *) built_binary="$script_directory/$CARGO_TARGET_DIR/$build_directory/nakode" ;;
 esac
 
 if [ ! -x "$built_binary" ]; then
