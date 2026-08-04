@@ -329,6 +329,7 @@ struct CommandContext<'a> {
     session_store: Option<&'a RuntimeSessionStore>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_>) {
     match command {
         BackendCommand::BeginAuthentication => {
@@ -356,7 +357,18 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::StartSession {
             model,
             instructions,
-        } => start_session(model, instructions, context).await,
+            external_tools,
+            replace_builtin_tools,
+        } => {
+            start_session(
+                model,
+                instructions,
+                external_tools,
+                replace_builtin_tools,
+                context,
+            )
+            .await;
+        }
         BackendCommand::ResumeSession {
             provider_session_id,
         } => resume_session(provider_session_id, context).await,
@@ -421,6 +433,13 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::ResolveQuestion { id, answer } => {
             if let Some(runtime) = context.runtime {
                 runtime.resolve_question(&id, answer).await;
+            }
+        }
+        BackendCommand::ResolveExternalTool { id, output, failed } => {
+            if let Some(runtime) = context.runtime {
+                runtime
+                    .resolve_external_tool(&id, crate::tools::ToolResult { output, failed })
+                    .await;
             }
         }
         BackendCommand::ResolveApproval { .. }
@@ -633,6 +652,8 @@ async fn start_turn(
 async fn start_session(
     model: Option<String>,
     instructions: Option<String>,
+    external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
+    replace_builtin_tools: bool,
     context: &mut CommandContext<'_>,
 ) {
     let Some(api_key) = context.api_key else {
@@ -672,6 +693,14 @@ async fn start_session(
     let session = RuntimeSession::new(selected_id.clone(), instructions.unwrap_or_default())
         .with_context_window(selected.context_window);
     let session_id = session.id.clone();
+    if let Some(runtime) = context.runtime
+        && let Err(error) = runtime
+            .configure_external_tools(&session_id, external_tools, replace_builtin_tools)
+            .await
+    {
+        request_failed(context.events, BackendOperation::StartSession, error).await;
+        return;
+    }
     let estimated_tokens = session.estimated_context_tokens();
     let context_window = session.context_window;
     if let Some(store) = context.session_store
@@ -712,6 +741,7 @@ fn native_capabilities() -> BackendCapabilities {
         context_compaction: CapabilitySupport::Supported,
         approvals: CapabilitySupport::Unsupported,
         native_tools: CapabilitySupport::Supported,
+        external_tools: CapabilitySupport::Supported,
         mcp: CapabilitySupport::Unsupported,
         close_session: CapabilitySupport::Supported,
     }
@@ -858,8 +888,8 @@ fn build_chat_request(
         .iter()
         .map(|tool| {
             Ok(protocol::ChatToolDefinition {
-                name: tool.name.to_owned(),
-                description: tool.description.to_owned(),
+                name: tool.name.clone(),
+                description: tool.description.clone(),
                 json_schema_string: serde_json::to_string(&tool.parameters)
                     .map_err(|error| error.to_string())?,
                 strict: false,
@@ -1202,7 +1232,11 @@ mod tests {
     #[test]
     fn connect_frames_are_gzipped_and_length_delimited() {
         let mut inference_request = test_request();
-        inference_request.tools = crate::tools::ToolRegistry::base().definitions();
+        inference_request.tools = crate::tools::ToolRegistry::base()
+            .definitions()
+            .into_iter()
+            .map(Into::into)
+            .collect();
         let request = build_chat_request(&inference_request, "token", "jwt")
             .expect("build Devin chat request");
         let frame = encode_connect_frame(&request).expect("encode Connect frame");

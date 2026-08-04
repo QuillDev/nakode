@@ -2,11 +2,11 @@ use std::{collections::BTreeSet, path::Component};
 
 use nakode_protocol::{
     AgentBrowserView, AgentDefinitionView, AgentSessionId, AgentSessionView, ArtifactId,
-    ArtifactView, BootstrapView, ConnectionView, ContextUsageView, EntryId, InteractionId,
-    InteractionKind, InteractionOptionView, InteractionStatus, InteractionView, MAX_ARTIFACT_BYTES,
-    MAX_RUN_TEXT_BYTES, MAX_SESSION_RUNS, MAX_SESSION_RUNS_BYTES, MAX_TRANSCRIPT_ENTRY_BODY_BYTES,
-    MAX_TRANSCRIPT_PAGE_BODY_BYTES, MAX_TRANSCRIPT_PAGE_ENTRIES, MemorySettingsView,
-    ModelConfigurationView, ModelId, ModelView, NoticeLevel, NoticeView,
+    ArtifactView, BootstrapView, ConnectionView, ContextUsageView, EntryId, ExternalToolCallView,
+    InteractionId, InteractionKind, InteractionOptionView, InteractionStatus, InteractionView,
+    MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_SESSION_RUNS, MAX_SESSION_RUNS_BYTES,
+    MAX_TRANSCRIPT_ENTRY_BODY_BYTES, MAX_TRANSCRIPT_PAGE_BODY_BYTES, MAX_TRANSCRIPT_PAGE_ENTRIES,
+    MemorySettingsView, ModelConfigurationView, ModelId, ModelView, NoticeLevel, NoticeView,
     PromptAttachment as ProtocolPromptAttachment, PromptId, ProviderAuthenticationView,
     ProviderCapabilities, ProviderCapability, ProviderId, ProviderView, QueueItemView,
     RecoverablePromptView, RunId, RunOutcome, RunPage, RunStatus, RunTextField, RunTextWindow,
@@ -184,6 +184,15 @@ fn session_view(
         runs,
         runs_has_earlier,
         notices: notice_views(state, revision),
+        external_tool_calls: state
+            .external_tool_calls
+            .iter()
+            .map(|call| ExternalToolCallView {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments_json: call.arguments_json.clone(),
+            })
+            .collect(),
     }
 }
 

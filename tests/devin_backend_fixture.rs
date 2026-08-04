@@ -280,6 +280,8 @@ async fn cached_model_selection_is_applied_before_first_prompt() -> TestResult {
         .send(BackendCommand::StartSession {
             model: Some("devin-second-model".to_owned()),
             instructions: None,
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
         })
         .await?;
     match next_event(&mut backend).await? {

@@ -404,6 +404,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         BackendCommand::StartSession {
             model,
             instructions,
+            ..
         } => ("create", json!({"model":model,"instructions":instructions})),
         BackendCommand::ResumeSession {
             provider_session_id,
@@ -455,6 +456,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         }
         BackendCommand::ResolveApproval { .. }
         | BackendCommand::ResolveQuestion { .. }
+        | BackendCommand::ResolveExternalTool { .. }
         | BackendCommand::BeginAuthentication
         | BackendCommand::Shutdown => return Ok(None),
     };

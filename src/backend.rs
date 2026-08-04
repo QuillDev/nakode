@@ -82,6 +82,7 @@ pub struct BackendCapabilities {
     pub context_compaction: CapabilitySupport,
     pub approvals: CapabilitySupport,
     pub native_tools: CapabilitySupport,
+    pub external_tools: CapabilitySupport,
     pub mcp: CapabilitySupport,
     pub close_session: CapabilitySupport,
 }
@@ -435,6 +436,7 @@ pub enum BackendEvent {
     },
     ApprovalRequested(ApprovalRequest),
     QuestionRequested(QuestionRequest),
+    ExternalToolRequested(ExternalToolRequest),
     ApprovalResolved {
         request_id: Value,
     },
@@ -474,6 +476,13 @@ pub struct PromptAttachment {
     pub image: Option<PromptImage>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalToolRequest {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+
 /// Provider-neutral commands understood by an agent backend adapter.
 #[derive(Clone, Debug)]
 pub enum BackendCommand {
@@ -481,6 +490,8 @@ pub enum BackendCommand {
     StartSession {
         model: Option<String>,
         instructions: Option<String>,
+        external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
+        replace_builtin_tools: bool,
     },
     ResumeSession {
         provider_session_id: String,
@@ -527,6 +538,11 @@ pub enum BackendCommand {
     ResolveQuestion {
         id: String,
         answer: String,
+    },
+    ResolveExternalTool {
+        id: String,
+        output: String,
+        failed: bool,
     },
     Shutdown,
 }

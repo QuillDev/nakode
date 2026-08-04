@@ -52,6 +52,8 @@ mod tests {
             "CancelSessionWork",
             "CompactContext",
             "ResolveInteraction",
+            "ConfigureSessionTools",
+            "SubmitExternalToolResult",
             "RunShell",
             "SelectModel",
             "SetProviderEnabled",

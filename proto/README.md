@@ -19,3 +19,9 @@ Generated transport stubs are deliberately not the whole SDK. Language SDKs
 must also own connection recovery, idempotency keys, subscription resumption,
 snapshot replacement, paging, and artifact hydration. A frontend owns only
 device-local presentation state and rendering.
+
+External clients can install a session-scoped JSON-schema tool table with
+`ConfigureSessionTools`. Nakode publishes pending calls in `SessionState` and
+keeps the agent turn suspended until `SubmitExternalToolResult` resolves them.
+`replace_builtin_tools` gives a client a strict tool surface without moving
+tool-call ownership or inference state out of the server.
