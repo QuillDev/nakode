@@ -599,6 +599,14 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             provider_id: protocol::ProviderId::from(input.provider_id)
         }
     );
+    command_rpc!(
+        reload_provider,
+        api::ReloadProviderRequest,
+        input,
+        protocol::Command::ReloadProvider {
+            provider_id: protocol::ProviderId::from(input.provider_id)
+        }
+    );
     try_command_rpc!(
         save_agent,
         api::SaveAgentRequest,

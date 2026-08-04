@@ -800,6 +800,7 @@ pub enum Effect {
         metadata: serde_json::Value,
     },
     ClearProviderCredential(String),
+    ReloadProvider(String),
     #[cfg(test)]
     OpenUrl(String),
     SaveAgent {
@@ -2610,14 +2611,7 @@ impl DomainState {
 
     pub fn provider_logged_out(&mut self, provider: &str) {
         let display_name = self.provider_display_name(provider);
-        self.provider_contexts.remove(provider);
-        self.provider_authentication.remove(provider);
-        if provider == self.backend_provider {
-            self.connection = ConnectionState::Disconnected("logged out".to_owned());
-            self.provider_session_id = None;
-            self.session_id = None;
-            self.context_usage = None;
-        }
+        self.provider_disabled(provider);
         self.set_status(&format!("Logged out of {display_name}."));
     }
 
@@ -8637,6 +8631,21 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.provider_disabled(CODEX_PROVIDER);
         assert!(state.backend_provider.is_empty());
         assert!(!state.connection.is_ready());
+    }
+
+    #[test]
+    fn provider_logout_removes_its_models_immediately() {
+        let mut state = ready_state();
+        state.install_models(vec![ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "gpt-test".to_owned(),
+            is_default: true,
+        }]);
+
+        state.provider_logged_out(CODEX_PROVIDER);
+
+        assert!(state.models.is_empty());
+        assert!(state.backend_provider.is_empty());
     }
 
     #[test]

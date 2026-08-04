@@ -35,6 +35,7 @@ service NakodeService {
   rpc BeginProviderAuthentication(BeginProviderAuthenticationRequest) returns (MutationResult);
   rpc SetProviderCredential(SetProviderCredentialRequest) returns (MutationResult);
   rpc ClearProviderCredential(ClearProviderCredentialRequest) returns (MutationResult);
+  rpc ReloadProvider(ReloadProviderRequest) returns (MutationResult);
   rpc SaveAgent(SaveAgentRequest) returns (MutationResult);
   rpc DeleteAgent(DeleteAgentRequest) returns (MutationResult);
   rpc UpdateSettings(UpdateSettingsRequest) returns (MutationResult);
@@ -144,6 +145,7 @@ message SetProviderEnabledRequest { MutationOptions mutation = 1; string provide
 message BeginProviderAuthenticationRequest { MutationOptions mutation = 1; string provider_id = 2; }
 message SetProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; string kind = 3; string credential = 4; }
 message ClearProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; }
+message ReloadProviderRequest { MutationOptions mutation = 1; string provider_id = 2; }
 
 message AgentDefinitionInput {
   string slug = 1;
