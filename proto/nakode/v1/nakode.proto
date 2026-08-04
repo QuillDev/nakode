@@ -26,6 +26,8 @@ service NakodeService {
   rpc CancelSessionWork(CancelSessionWorkRequest) returns (MutationResult);
   rpc CompactContext(CompactContextRequest) returns (MutationResult);
   rpc ResolveInteraction(ResolveInteractionRequest) returns (MutationResult);
+  rpc ConfigureSessionTools(ConfigureSessionToolsRequest) returns (MutationResult);
+  rpc SubmitExternalToolResult(SubmitExternalToolResultRequest) returns (MutationResult);
   rpc RunShell(RunShellRequest) returns (MutationResult);
 
   rpc SelectModel(SelectModelRequest) returns (MutationResult);
@@ -112,6 +114,20 @@ message ResolveInteractionRequest {
   string interaction_id = 2;
   InteractionResolutionKind resolution = 3;
   repeated string option_ids = 4;
+}
+message ExternalToolDefinition { string name = 1; string description = 2; string input_schema_json = 3; }
+message ConfigureSessionToolsRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  repeated ExternalToolDefinition tools = 3;
+  bool replace_builtin_tools = 4;
+}
+message SubmitExternalToolResultRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string call_id = 3;
+  string output = 4;
+  bool failed = 5;
 }
 
 message ModelOptions { optional string reasoning_effort = 1; bool fast_mode = 2; }
@@ -242,7 +258,9 @@ message SessionState {
   repeated RunState runs = 18;
   bool runs_has_earlier = 19;
   repeated Notice notices = 20;
+  repeated ExternalToolCall external_tool_calls = 21;
 }
+message ExternalToolCall { string id = 1; string name = 2; string arguments_json = 3; }
 
 enum TranscriptEntryKind { TRANSCRIPT_ENTRY_KIND_UNSPECIFIED = 0; TRANSCRIPT_ENTRY_KIND_SYSTEM = 1; TRANSCRIPT_ENTRY_KIND_USER = 2; TRANSCRIPT_ENTRY_KIND_ASSISTANT = 3; TRANSCRIPT_ENTRY_KIND_STEERING = 4; TRANSCRIPT_ENTRY_KIND_REASONING = 5; TRANSCRIPT_ENTRY_KIND_TOOL = 6; TRANSCRIPT_ENTRY_KIND_DIFF = 7; TRANSCRIPT_ENTRY_KIND_WARNING = 8; TRANSCRIPT_ENTRY_KIND_ERROR = 9; }
 enum TranscriptEntryStatus { TRANSCRIPT_ENTRY_STATUS_UNSPECIFIED = 0; TRANSCRIPT_ENTRY_STATUS_RUNNING = 1; TRANSCRIPT_ENTRY_STATUS_COMPLETE = 2; TRANSCRIPT_ENTRY_STATUS_FAILED = 3; TRANSCRIPT_ENTRY_STATUS_INTERRUPTED = 4; }

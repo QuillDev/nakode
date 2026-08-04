@@ -501,6 +501,15 @@ pub struct SessionView {
     #[serde(default)]
     pub runs_has_earlier: bool,
     pub notices: Vec<NoticeView>,
+    #[serde(default)]
+    pub external_tool_calls: Vec<ExternalToolCallView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExternalToolCallView {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

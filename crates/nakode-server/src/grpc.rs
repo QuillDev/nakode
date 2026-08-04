@@ -508,6 +508,43 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         .await
     }
 
+    async fn configure_session_tools(
+        &self,
+        request: tonic::Request<api::ConfigureSessionToolsRequest>,
+    ) -> Result<tonic::Response<api::MutationResult>, tonic::Status> {
+        let mut input = request.into_inner();
+        let options = input.mutation.take();
+        self.mutate(
+            options,
+            protocol::Command::ConfigureSessionTools {
+                session_id: protocol::SessionId::from(input.session_id),
+                tools: input
+                    .tools
+                    .into_iter()
+                    .map(|tool| protocol::ExternalToolDefinition {
+                        name: tool.name,
+                        description: tool.description,
+                        input_schema_json: tool.input_schema_json,
+                    })
+                    .collect(),
+                replace_builtin_tools: input.replace_builtin_tools,
+            },
+        )
+        .await
+    }
+
+    command_rpc!(
+        submit_external_tool_result,
+        api::SubmitExternalToolResultRequest,
+        input,
+        protocol::Command::SubmitExternalToolResult {
+            session_id: protocol::SessionId::from(input.session_id),
+            call_id: input.call_id,
+            output: input.output,
+            failed: input.failed
+        }
+    );
+
     command_rpc!(
         run_shell,
         api::RunShellRequest,
@@ -1228,6 +1265,15 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         runs: value.runs.into_iter().map(run).collect(),
         runs_has_earlier: value.runs_has_earlier,
         notices: value.notices.into_iter().map(notice).collect(),
+        external_tool_calls: value
+            .external_tool_calls
+            .into_iter()
+            .map(|call| api::ExternalToolCall {
+                id: call.id,
+                name: call.name,
+                arguments_json: call.arguments_json,
+            })
+            .collect(),
     }
 }
 

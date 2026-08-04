@@ -906,6 +906,9 @@ pub struct DomainState {
     session_model_options_override: Option<(String, ModelOptions)>,
     pub approvals: VecDeque<ApprovalRequest>,
     pub questions: VecDeque<QuestionPrompt>,
+    pub external_tool_calls: Vec<crate::backend::ExternalToolRequest>,
+    external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
+    replace_builtin_tools: bool,
     pub todo_phases: Vec<TodoPhase>,
     pub status_message: String,
     pub diagnostic_count: usize,
@@ -1556,6 +1559,9 @@ impl DomainState {
             session_model_options_override: None,
             approvals: VecDeque::new(),
             questions: VecDeque::new(),
+            external_tool_calls: Vec::new(),
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
             todo_phases: Vec::new(),
             status_message: format!("Connecting to {backend_name}…"),
             diagnostic_count: 0,
@@ -2946,6 +2952,14 @@ impl DomainState {
             return Err(DomainCommandError::Conflict(
                 "the session is busy; enqueue the prompt instead".to_owned(),
             ));
+        }
+        if !self.external_tools.is_empty()
+            && !self.backend_capabilities.external_tools.is_supported()
+        {
+            return Err(DomainCommandError::Invalid(format!(
+                "{} does not support externally executed tools; select a native Nakode provider before sending this prompt",
+                self.backend_name
+            )));
         }
         let prompt = QueuedPrompt {
             id: Self::next_id("msg"),
@@ -4644,6 +4658,74 @@ impl DomainState {
         })])
     }
 
+    /// Configures the externally executed tools exposed to this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the session has started or when the tool definitions are invalid.
+    pub fn configure_external_tools(
+        &mut self,
+        tools: Vec<nakode_protocol::ExternalToolDefinition>,
+        replace_builtin_tools: bool,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        if self.is_busy() || self.provider_session_id.is_some() {
+            return Err(DomainCommandError::Invalid(
+                "session tools must be configured before the first prompt".to_owned(),
+            ));
+        }
+        if tools.is_empty() {
+            return Err(DomainCommandError::Invalid(
+                "at least one external tool is required".to_owned(),
+            ));
+        }
+        let mut names = HashSet::new();
+        for tool in &tools {
+            if tool.name.trim().is_empty() || !names.insert(tool.name.as_str()) {
+                return Err(DomainCommandError::Invalid(
+                    "external tool names must be non-empty and unique".to_owned(),
+                ));
+            }
+            serde_json::from_str::<serde_json::Value>(&tool.input_schema_json).map_err(
+                |error| {
+                    DomainCommandError::Invalid(format!(
+                        "invalid schema for external tool {}: {error}",
+                        tool.name
+                    ))
+                },
+            )?;
+        }
+        self.external_tools = tools;
+        self.replace_builtin_tools = replace_builtin_tools;
+        Ok(Vec::new())
+    }
+
+    /// Resolves a pending external tool request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call is not pending for this session.
+    pub fn submit_external_tool_result(
+        &mut self,
+        call_id: &str,
+        output: String,
+        failed: bool,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        let Some(position) = self
+            .external_tool_calls
+            .iter()
+            .position(|call| call.id == call_id)
+        else {
+            return Err(DomainCommandError::NotFound(call_id.to_owned()));
+        };
+        self.external_tool_calls.remove(position);
+        self.status_message = format!("External tool completed: {call_id}");
+        Ok(vec![Effect::Backend(BackendCommand::ResolveExternalTool {
+            id: call_id.to_owned(),
+            output,
+            failed,
+        })])
+    }
+
     pub fn handle_provider_backend(&mut self, provider: &str, event: BackendEvent) -> Vec<Effect> {
         if let Some(effects) = self.handle_provider_authentication(provider, &event) {
             return effects;
@@ -4840,6 +4922,7 @@ impl DomainState {
         true
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn handle_backend(&mut self, event: BackendEvent) -> Vec<Effect> {
         let event = match self.reduce_context_compaction_event(event) {
             Ok(effects) => return effects,
@@ -4884,7 +4967,10 @@ impl DomainState {
                 turn_id,
                 outcome,
                 error,
-            } => return self.complete_turn(&turn_id, outcome, error),
+            } => {
+                self.external_tool_calls.clear();
+                return self.complete_turn(&turn_id, outcome, error);
+            }
             BackendEvent::ItemStarted { turn_id, item } => {
                 self.observe_item(&turn_id, item, false);
             }
@@ -4908,6 +4994,10 @@ impl DomainState {
                 self.approvals.push_back(approval);
             }
             BackendEvent::QuestionRequested(request) => self.handle_question_request(request),
+            BackendEvent::ExternalToolRequested(request) => {
+                self.status_message = format!("External tool requested: {}", request.name);
+                self.external_tool_calls.push(request);
+            }
             BackendEvent::ApprovalResolved { request_id } => {
                 self.resolve_external_approval(&request_id);
             }
@@ -5512,6 +5602,8 @@ impl DomainState {
             vec![Effect::Backend(BackendCommand::StartSession {
                 model: prompt.model,
                 instructions: Some(self.nakode_system_instructions()),
+                external_tools: self.external_tools.clone(),
+                replace_builtin_tools: self.replace_builtin_tools,
             })]
         }
     }
@@ -6142,6 +6234,7 @@ impl DomainState {
             | BackendEvent::ContextCompactionFailed { .. }
             | BackendEvent::TurnDiff { .. }
             | BackendEvent::TurnPlan { .. }
+            | BackendEvent::ExternalToolRequested(_)
             | BackendEvent::ApprovalResolved { .. }
             | BackendEvent::SteerAccepted { .. }
             | BackendEvent::InterruptAccepted
@@ -6319,6 +6412,8 @@ impl DomainState {
             command: BackendCommand::StartSession {
                 model,
                 instructions,
+                external_tools: Vec::new(),
+                replace_builtin_tools: false,
             },
         }]
     }
@@ -7046,6 +7141,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 context_compaction: CapabilitySupport::Supported,
                 approvals: CapabilitySupport::Supported,
                 native_tools: CapabilitySupport::Supported,
+                external_tools: CapabilitySupport::Supported,
                 mcp: CapabilitySupport::Supported,
                 close_session: CapabilitySupport::Supported,
             },
@@ -7056,6 +7152,28 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             is_default: true,
         }]));
         state
+    }
+
+    #[test]
+    fn external_tools_reject_a_provider_that_cannot_execute_them() {
+        let mut state = ready_state();
+        state
+            .configure_external_tools(
+                vec![nakode_protocol::ExternalToolDefinition {
+                    name: "dashboard_read".to_owned(),
+                    description: "Read dashboard state".to_owned(),
+                    input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                }],
+                true,
+            )
+            .expect("external tools configure before the first prompt");
+        state.backend_capabilities.external_tools = CapabilitySupport::Unsupported;
+
+        let error = state
+            .submit_prompt("inspect the dashboard".to_owned(), Vec::new())
+            .expect_err("unsupported providers must reject external tool sessions");
+
+        assert!(error.to_string().contains("native Nakode provider"));
     }
 
     #[test]

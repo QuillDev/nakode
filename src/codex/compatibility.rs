@@ -417,6 +417,7 @@ async fn handle_command(
         | BackendCommand::SetSessionOptions { .. }
         | BackendCommand::ResolveApproval { .. }
         | BackendCommand::ResolveQuestion { .. }
+        | BackendCommand::ResolveExternalTool { .. }
         | BackendCommand::Shutdown => return Ok(()),
         _ => {}
     }
@@ -438,6 +439,7 @@ fn command_request(
         BackendCommand::StartSession {
             model,
             instructions,
+            ..
         } => (
             BackendOperation::StartSession,
             "thread/start",
@@ -517,6 +519,7 @@ fn command_request(
         | BackendCommand::CompactSession { .. }
         | BackendCommand::ResolveApproval { .. }
         | BackendCommand::ResolveQuestion { .. }
+        | BackendCommand::ResolveExternalTool { .. }
         | BackendCommand::Shutdown => unreachable!(),
     }
 }
@@ -808,6 +811,7 @@ async fn initialize_response(
                 context_compaction: CapabilitySupport::Unsupported,
                 approvals: CapabilitySupport::Supported,
                 native_tools: CapabilitySupport::Supported,
+                external_tools: CapabilitySupport::Unsupported,
                 mcp: CapabilitySupport::Supported,
                 close_session: CapabilitySupport::Supported,
             },

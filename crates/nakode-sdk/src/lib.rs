@@ -375,6 +375,54 @@ impl NakodeClient {
         )
     }
 
+    /// Installs a client-owned tool surface before the session's first prompt.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn configure_session_tools(
+        &self,
+        session_id: impl Into<String>,
+        tools: Vec<api::ExternalToolDefinition>,
+        replace_builtin_tools: bool,
+        expected_revision: Option<u64>,
+    ) -> Result<api::MutationResult, SdkError> {
+        send_mutation!(
+            self,
+            configure_session_tools,
+            api::ConfigureSessionToolsRequest {
+                mutation: Some(mutation(expected_revision)),
+                session_id: session_id.into(),
+                tools,
+                replace_builtin_tools,
+            }
+        )
+    }
+
+    /// Resolves one server-owned external tool request.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn submit_external_tool_result(
+        &self,
+        session_id: impl Into<String>,
+        call_id: impl Into<String>,
+        output: impl Into<String>,
+        failed: bool,
+        expected_revision: Option<u64>,
+    ) -> Result<api::MutationResult, SdkError> {
+        send_mutation!(
+            self,
+            submit_external_tool_result,
+            api::SubmitExternalToolResultRequest {
+                mutation: Some(mutation(expected_revision)),
+                session_id: session_id.into(),
+                call_id: call_id.into(),
+                output: output.into(),
+                failed,
+            }
+        )
+    }
+
     /// Starts a bounded delegated run and returns its identifier.
     ///
     /// # Errors
