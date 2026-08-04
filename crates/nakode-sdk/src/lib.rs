@@ -499,6 +499,7 @@ impl NakodeClient {
         clear_provider_credential,
         api::ClearProviderCredentialRequest
     );
+    typed_mutation!(reload_provider, api::ReloadProviderRequest);
     typed_mutation!(save_agent, api::SaveAgentRequest);
     typed_mutation!(delete_agent, api::DeleteAgentRequest);
     typed_mutation!(update_settings, api::UpdateSettingsRequest);

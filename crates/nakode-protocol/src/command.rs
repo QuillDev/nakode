@@ -212,6 +212,9 @@ pub enum Command {
     ClearProviderCredential {
         provider_id: ProviderId,
     },
+    ReloadProvider {
+        provider_id: ProviderId,
+    },
     SaveAgent {
         workspace_id: WorkspaceId,
         definition: AgentDefinitionInput,

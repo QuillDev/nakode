@@ -1063,6 +1063,9 @@ impl EffectExecutor {
                 self.clear_provider_credential_effect(state, &provider)
                     .await;
             }
+            Effect::ReloadProvider(provider) => {
+                self.reload_provider(state, &provider).await;
+            }
             Effect::SaveAgent {
                 definition,
                 previous_slug,
@@ -1140,6 +1143,25 @@ impl EffectExecutor {
             provider,
         )
         .await;
+    }
+
+    async fn reload_provider(&mut self, state: &mut DomainState, provider: &str) {
+        if let Err(error) = self.backends.start_provider(provider).await {
+            state.provider_authentication_failed(provider, &error.to_string());
+            return;
+        }
+        if !self
+            .backends
+            .send(
+                provider,
+                BackendCommand::Reload {
+                    provider_session_id: None,
+                },
+            )
+            .await
+        {
+            state.provider_authentication_failed(provider, "provider refresh channel closed");
+        }
     }
 
     pub(crate) fn handle_shell_event(state: &mut DomainState, event: ShellEvent) {
@@ -1382,6 +1404,10 @@ async fn clear_provider_credential(
         return;
     }
     if let Err(error) = sessions.set_provider_enabled(provider, false) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    if let Err(error) = sessions.replace_models(provider, &[]) {
         state.session_store_failed(error.to_string());
         return;
     }

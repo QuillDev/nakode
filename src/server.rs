@@ -444,6 +444,7 @@ impl ServerCore {
             Command::ClearProviderCredential { provider_id } => {
                 self.clear_provider_credential_command(&provider_id)
             }
+            Command::ReloadProvider { provider_id } => self.reload_provider_command(&provider_id),
             Command::SaveAgent {
                 workspace_id,
                 definition,
@@ -733,6 +734,24 @@ impl ServerCore {
             Some(provider_id.to_string()),
             vec![Effect::ClearProviderCredential(provider_id.to_string())],
         ))
+    }
+
+    fn reload_provider_command(&self, provider_id: &ProviderId) -> DomainCommandOutcome {
+        self.ensure_provider(provider_id)?;
+        let enabled = self
+            .providers
+            .iter()
+            .find(|provider| provider.provider == provider_id.as_str())
+            .is_some_and(|provider| provider.enabled);
+        let effect = if enabled {
+            Effect::ReloadProvider(provider_id.to_string())
+        } else {
+            Effect::SetProviderEnabled {
+                provider: provider_id.to_string(),
+                enabled: true,
+            }
+        };
+        Ok(Self::accepted(Some(provider_id.to_string()), vec![effect]))
     }
 
     fn save_agent_command(
@@ -1639,6 +1658,7 @@ impl ServerCore {
             | Command::BeginProviderAuthentication { .. }
             | Command::SetProviderCredential { .. }
             | Command::ClearProviderCredential { .. }
+            | Command::ReloadProvider { .. }
             | Command::SaveAgent { .. }
             | Command::DeleteAgent { .. }
             | Command::UpdateSettings { .. }
@@ -2367,6 +2387,49 @@ mod tests {
                 .status_message,
             "Starting Codex authentication…"
         );
+    }
+
+    #[test]
+    fn provider_reload_targets_one_enabled_provider() {
+        let state = AppState::new_unconfigured("/tmp/project", None, 100);
+        let provider = ProviderRecord {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            enabled: true,
+            credential: None,
+        };
+        let core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
+
+        let (_, effects) = core
+            .reload_provider_command(&ProviderId::from(CODEX_PROVIDER))
+            .expect("provider reload");
+
+        assert!(matches!(
+            effects.as_slice(),
+            [crate::state::Effect::ReloadProvider(provider)] if provider == CODEX_PROVIDER
+        ));
+    }
+
+    #[test]
+    fn provider_reload_reconnects_a_disabled_provider() {
+        let state = AppState::new_unconfigured("/tmp/project", None, 100);
+        let provider = ProviderRecord {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            enabled: false,
+            credential: None,
+        };
+        let core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
+
+        let (_, effects) = core
+            .reload_provider_command(&ProviderId::from(CODEX_PROVIDER))
+            .expect("provider reconnect");
+
+        assert!(matches!(
+            effects.as_slice(),
+            [crate::state::Effect::SetProviderEnabled { provider, enabled: true }]
+                if provider == CODEX_PROVIDER
+        ));
     }
 
     #[test]

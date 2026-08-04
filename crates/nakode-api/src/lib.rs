@@ -60,6 +60,7 @@ mod tests {
             "BeginProviderAuthentication",
             "SetProviderCredential",
             "ClearProviderCredential",
+            "ReloadProvider",
             "SaveAgent",
             "DeleteAgent",
             "UpdateSettings",
