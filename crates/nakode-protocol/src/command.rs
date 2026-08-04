@@ -74,6 +74,13 @@ pub struct ModelOptions {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExternalToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema_json: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum ModelTarget {
     ProviderDefault { provider_id: ProviderId },
@@ -166,6 +173,17 @@ pub enum Command {
     ResolveInteraction {
         interaction_id: InteractionId,
         resolution: InteractionResolution,
+    },
+    ConfigureSessionTools {
+        session_id: SessionId,
+        tools: Vec<ExternalToolDefinition>,
+        replace_builtin_tools: bool,
+    },
+    SubmitExternalToolResult {
+        session_id: SessionId,
+        call_id: String,
+        output: String,
+        failed: bool,
     },
     Delegate {
         session_id: SessionId,

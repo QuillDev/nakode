@@ -160,6 +160,10 @@ frontend code only calls distinct product methods and renders their state.
 Generated transport stubs are the base layer; supported language SDKs add this
 shared behavior without inventing client-side domain policy.
 
+Client-owned tools use the session-scoped public external-tool contract. The
+server owns pending calls and turn suspension; clients only execute a call and
+submit its result.
+
 ## Session model
 
 A Nakode session is a logical body of work, not an alias for one provider

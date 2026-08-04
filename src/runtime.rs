@@ -141,7 +141,7 @@ pub struct InferenceRequest {
     pub model: String,
     pub instructions: String,
     pub history: Vec<ConversationItem>,
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Vec<DynamicToolDefinition>,
     pub reasoning_effort: Option<String>,
     pub fast_mode: bool,
 }
@@ -214,6 +214,37 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct DynamicToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl From<ToolDefinition> for DynamicToolDefinition {
+    fn from(value: ToolDefinition) -> Self {
+        Self {
+            name: value.name.to_owned(),
+            description: value.description.to_owned(),
+            parameters: value.parameters,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExternalToolConfiguration {
+    tools: Vec<DynamicToolDefinition>,
+    replace_builtin_tools: bool,
+}
+
+#[derive(Default)]
+struct ExternalToolBroker {
+    sessions: tokio::sync::Mutex<std::collections::HashMap<String, ExternalToolConfiguration>>,
+    pending: tokio::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<crate::tools::ToolResult>>,
+    >,
+}
+
 pub type InferenceFuture<'a> =
     Pin<Box<dyn Future<Output = Result<InferenceOutput, InferenceFailure>> + Send + 'a>>;
 
@@ -236,6 +267,7 @@ pub struct AgentRuntime {
     vision_config: Option<Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
     vision: Option<crate::vision::SharedVisionService>,
     direct_image_input: bool,
+    external_tools: Arc<ExternalToolBroker>,
 }
 
 impl AgentRuntime {
@@ -250,7 +282,88 @@ impl AgentRuntime {
             vision_config: None,
             vision: None,
             direct_image_input: true,
+            external_tools: Arc::new(ExternalToolBroker::default()),
         }
+    }
+
+    /// Configures the externally executed tools available to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a tool name is empty or duplicated, or when a tool schema is not
+    /// valid JSON.
+    pub async fn configure_external_tools(
+        &self,
+        session_id: &str,
+        tools: Vec<nakode_protocol::ExternalToolDefinition>,
+        replace_builtin_tools: bool,
+    ) -> Result<(), String> {
+        let mut definitions = Vec::with_capacity(tools.len());
+        let mut names = std::collections::HashSet::new();
+        for tool in tools {
+            if tool.name.trim().is_empty() || !names.insert(tool.name.clone()) {
+                return Err(format!(
+                    "external tool names must be non-empty and unique: {}",
+                    tool.name
+                ));
+            }
+            let parameters = serde_json::from_str(&tool.input_schema_json).map_err(|error| {
+                format!("invalid schema for external tool {}: {error}", tool.name)
+            })?;
+            definitions.push(DynamicToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                parameters,
+            });
+        }
+        self.external_tools.sessions.lock().await.insert(
+            session_id.to_owned(),
+            ExternalToolConfiguration {
+                tools: definitions,
+                replace_builtin_tools,
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn resolve_external_tool(&self, id: &str, result: crate::tools::ToolResult) -> bool {
+        self.external_tools
+            .pending
+            .lock()
+            .await
+            .remove(id)
+            .is_some_and(|sender| sender.send(result).is_ok())
+    }
+
+    async fn inference_tools(&self, session_id: &str) -> Vec<DynamicToolDefinition> {
+        let external = self
+            .external_tools
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut tools = if external.replace_builtin_tools {
+            Vec::new()
+        } else {
+            self.tools
+                .definitions()
+                .into_iter()
+                .map(DynamicToolDefinition::from)
+                .collect()
+        };
+        tools.extend(external.tools);
+        tools
+    }
+
+    async fn is_external_tool(&self, session_id: &str, name: &str) -> bool {
+        self.external_tools
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|config| config.tools.iter().any(|tool| tool.name == name))
     }
 
     #[must_use]
@@ -465,7 +578,7 @@ impl AgentRuntime {
             model: session.model.clone(),
             instructions: session.instructions.clone(),
             history: session.history.clone(),
-            tools: self.tools.definitions(),
+            tools: self.inference_tools(&session.id).await,
             reasoning_effort: session.reasoning_effort.clone(),
             fast_mode: session.fast_mode,
         };
@@ -789,6 +902,11 @@ impl AgentRuntime {
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: &CancellationToken,
     ) -> Result<ExecutedTool, String> {
+        if self.is_external_tool(&session.id, &tool_call.name).await {
+            return self
+                .execute_external_tool(session, turn_id, tool_call, backend_events, cancellation)
+                .await;
+        }
         let Some(tool) = self
             .tools
             .find(&tool_call.name)
@@ -818,6 +936,52 @@ impl AgentRuntime {
             }
             Err(error) => crate::tools::ToolResult::failure(error),
         };
+        Ok(ExecutedTool::new(
+            tool_call.id,
+            tool_call.name,
+            title,
+            result.output,
+            result.failed,
+            started_at_ms,
+            duration_ms(started.elapsed()),
+        ))
+    }
+
+    async fn execute_external_tool(
+        &self,
+        session: &RuntimeSession,
+        turn_id: &str,
+        tool_call: ToolCall,
+        backend_events: &mpsc::Sender<BackendEvent>,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutedTool, String> {
+        let title = tool_call.name.clone();
+        send_tool_started(turn_id, &tool_call.id, &title, backend_events).await?;
+        let started_at_ms = unix_time_ms();
+        let started = Instant::now();
+        let request_id = Uuid::now_v7().to_string();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.external_tools
+            .pending
+            .lock()
+            .await
+            .insert(request_id.clone(), result_tx);
+        let request = crate::backend::ExternalToolRequest {
+            id: request_id.clone(),
+            name: tool_call.name.clone(),
+            arguments_json: serde_json::to_string(&tool_call.arguments)
+                .map_err(|error| format!("could not encode external tool arguments: {error}"))?,
+        };
+        backend_events
+            .send(BackendEvent::ExternalToolRequested(request))
+            .await
+            .map_err(|_| "backend event receiver closed".to_owned())?;
+        let result = tokio::select! {
+            result = result_rx => result.map_err(|_| "external tool result was dismissed".to_owned())?,
+            () = cancellation.cancelled() => crate::tools::ToolResult::failure("external tool call interrupted"),
+        };
+        self.external_tools.pending.lock().await.remove(&request_id);
+        let _ = session;
         Ok(ExecutedTool::new(
             tool_call.id,
             tool_call.name,
@@ -1696,6 +1860,10 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct ExternalToolProvider {
+        calls: AtomicUsize,
+    }
+
     struct ParallelProbeTool {
         active: AtomicUsize,
         max_active: AtomicUsize,
@@ -1802,6 +1970,39 @@ mod tests {
         }
     }
 
+    impl InferenceProvider for ExternalToolProvider {
+        fn infer(
+            &self,
+            request: InferenceRequest,
+            _events: mpsc::Sender<InferenceEvent>,
+            _cancellation: CancellationToken,
+        ) -> InferenceFuture<'_> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if call == 0 {
+                    assert_eq!(request.tools.len(), 1);
+                    assert_eq!(request.tools[0].name, "DashboardRead");
+                    return Ok(InferenceOutput {
+                        tool_calls: vec![ToolCall {
+                            id: "provider-call".to_owned(),
+                            name: "DashboardRead".to_owned(),
+                            arguments: json!({"ticketId": "ticket-1"}),
+                        }],
+                        ..InferenceOutput::default()
+                    });
+                }
+                assert!(request.history.iter().any(|item| matches!(
+                    item,
+                    ConversationItem::ToolResult { output, failed: false, .. } if output == "dashboard result"
+                )));
+                Ok(InferenceOutput {
+                    text: "done".to_owned(),
+                    ..InferenceOutput::default()
+                })
+            })
+        }
+    }
+
     impl InferenceProvider for FailedCompactionProvider {
         fn infer(
             &self,
@@ -1867,6 +2068,65 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[tokio::test]
+    async fn external_tools_replace_builtins_and_resume_the_agent_loop() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider);
+        let session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        runtime
+            .configure_external_tools(
+                &session.id,
+                vec![nakode_protocol::ExternalToolDefinition {
+                    name: "DashboardRead".to_owned(),
+                    description: "Read the dashboard.".to_owned(),
+                    input_schema_json: json!({"type": "object"}).to_string(),
+                }],
+                true,
+            )
+            .await
+            .expect("tool configuration");
+        let (events, mut receiver) = mpsc::channel(32);
+        let running = runtime.clone();
+        let sent = events.clone();
+        let turn = tokio::spawn(async move {
+            let mut session = session;
+            let result = running
+                .run_turn(
+                    &mut session,
+                    "turn-external",
+                    "Read it.".to_owned(),
+                    Vec::new(),
+                    &sent,
+                    CancellationToken::new(),
+                )
+                .await;
+            (session, result)
+        });
+        let request = loop {
+            if let BackendEvent::ExternalToolRequested(request) =
+                receiver.recv().await.expect("external tool request")
+            {
+                break request;
+            }
+        };
+        assert_eq!(request.name, "DashboardRead");
+        assert_eq!(request.arguments_json, r#"{"ticketId":"ticket-1"}"#);
+        assert!(
+            runtime
+                .resolve_external_tool(&request.id, ToolResult::success("dashboard result"))
+                .await
+        );
+        let (session, result) = turn.await.expect("turn task");
+        result.expect("turn completes");
+        assert!(matches!(
+            session.history.last(),
+            Some(ConversationItem::Assistant { text, .. }) if text == "done"
+        ));
     }
 
     #[tokio::test]

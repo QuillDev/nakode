@@ -215,6 +215,9 @@ impl NativeServerRuntime {
         let mut backend_open = true;
         let mut shell_open = true;
         let mut shutdown_open = true;
+        let mut provider_sync = tokio::time::interval(SHARED_PROVIDER_SYNC_INTERVAL);
+        provider_sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        provider_sync.tick().await;
         loop {
             tokio::select! {
                 request = self.requests.recv() => {
@@ -261,6 +264,7 @@ impl NativeServerRuntime {
                         None => shutdown_open = false,
                     }
                 }
+                _ = provider_sync.tick() => self.synchronize_shared_providers().await,
             }
         }
         self.effects.shutdown().await;
@@ -342,6 +346,36 @@ impl NativeServerRuntime {
                 .commit_and_publish_session(&self.endpoint, &session_id);
         }
         outcome.respond();
+    }
+
+    async fn synchronize_shared_providers(&mut self) {
+        let providers = match self.effects.persistence.sessions.list_providers() {
+            Ok(providers) => providers,
+            Err(error) => {
+                self.core
+                    .engine_mut()
+                    .state_mut()
+                    .session_store_failed(error.to_string());
+                return;
+            }
+        };
+        if providers == self.core.provider_records() {
+            return;
+        }
+
+        let enablement_changes =
+            provider_enablement_changes(self.core.provider_records(), &providers);
+        let session_id = self.core.default_session_id().clone();
+        for (provider, enabled) in enablement_changes {
+            if let Some(engine) = self.core.engine_for_mut(&session_id) {
+                self.effects
+                    .set_provider_enabled(engine.state_mut(), &provider, enabled)
+                    .await;
+            }
+        }
+        self.core.replace_provider_records(providers);
+        self.core
+            .commit_and_publish_session(&self.endpoint, &session_id);
     }
 
     async fn handle_backend_event(&mut self, source: BackendSource, event: BackendEvent) {
@@ -442,12 +476,30 @@ impl NativeServerRuntime {
     }
 }
 
+fn provider_enablement_changes(
+    current: &[ProviderRecord],
+    shared: &[ProviderRecord],
+) -> Vec<(String, bool)> {
+    shared
+        .iter()
+        .filter_map(|provider| {
+            let previous = current
+                .iter()
+                .find(|record| record.provider == provider.provider);
+            previous
+                .is_none_or(|record| record.enabled != provider.enabled)
+                .then(|| (provider.provider.clone(), provider.enabled))
+        })
+        .collect()
+}
+
 fn native_service_capabilities() -> ServiceCapabilities {
     ServiceCapabilities {
         supported: [
             ServiceCapability::Subscriptions,
             ServiceCapability::MultipleClients,
             ServiceCapability::ArtifactTransfer,
+            ServiceCapability::ExternalTools,
         ]
         .into_iter()
         .collect(),
@@ -494,6 +546,7 @@ pub(crate) struct ProviderCooldown {
 }
 
 const PROVIDER_FATAL_ERROR_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+const SHARED_PROVIDER_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 
 impl BackendRegistry {
     pub(crate) fn current_web_config(&self) -> crate::web::WebConfig {
@@ -1797,7 +1850,7 @@ mod tests {
     use super::{
         BackendRegistry, BackendSource, EffectExecutor, EffectOrigin, NativeServerRuntime,
         PersistenceServices, ProviderCredentialInput, native_service_capabilities,
-        save_provider_credential,
+        provider_enablement_changes, save_provider_credential,
     };
     use crate::{
         backend::{BackendCommand, BackendEvent, BackendHandle, BackendIdentity, CODEX_PROVIDER},
@@ -1807,6 +1860,36 @@ mod tests {
         session::SqliteSessionRepository,
         state::{DomainState, Effect},
     };
+
+    fn provider(provider: &str, enabled: bool, credential: bool) -> crate::session::ProviderRecord {
+        crate::session::ProviderRecord {
+            provider: provider.to_owned(),
+            display_name: provider.to_owned(),
+            enabled,
+            credential: credential.then(|| crate::credential::CredentialMetadata {
+                provider: provider.to_owned(),
+                kind: "api-key".to_owned(),
+                updated_at: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn shared_provider_sync_detects_enablement_without_restarting_for_metadata() {
+        let current = vec![
+            provider("openai-codex", true, false),
+            provider("zai-coding", false, false),
+        ];
+        let shared = vec![
+            provider("openai-codex", true, true),
+            provider("zai-coding", true, true),
+        ];
+
+        assert_eq!(
+            provider_enablement_changes(&current, &shared),
+            vec![("zai-coding".to_owned(), true)]
+        );
+    }
 
     fn config_for(workspace: &Path) -> Config {
         Config {
@@ -1853,6 +1936,48 @@ mod tests {
             command_rx,
             event_tx,
         )
+    }
+
+    #[tokio::test]
+    async fn running_workspace_synchronizes_shared_provider_enablement() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        persistence
+            .sessions
+            .set_provider_enabled(CODEX_PROVIDER, true)
+            .expect("enable shared provider");
+        let providers = persistence
+            .sessions
+            .list_providers()
+            .expect("provider records");
+        let shared = Arc::clone(&persistence.sessions);
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            providers,
+            Vec::new(),
+            effects,
+        );
+
+        shared
+            .set_provider_enabled(CODEX_PROVIDER, false)
+            .expect("disable shared provider");
+        runtime.synchronize_shared_providers().await;
+
+        assert!(
+            runtime
+                .core
+                .provider_records()
+                .iter()
+                .any(|provider| provider.provider == CODEX_PROVIDER && !provider.enabled)
+        );
     }
 
     fn test_persistence(workspace: &Path) -> (PersistenceServices, Arc<SqliteCredentialStore>) {
@@ -1940,6 +2065,8 @@ mod tests {
                 BackendCommand::StartSession {
                     model: Some(model.to_owned()),
                     instructions: None,
+                    external_tools: Vec::new(),
+                    replace_builtin_tools: false,
                 },
             )
             .await
@@ -1984,6 +2111,8 @@ mod tests {
                 BackendCommand::StartSession {
                     model: Some("model-first".to_owned()),
                     instructions: None,
+                    external_tools: Vec::new(),
+                    replace_builtin_tools: false,
                 },
             )
             .await
@@ -1995,6 +2124,8 @@ mod tests {
                 BackendCommand::StartSession {
                     model: Some("model-second".to_owned()),
                     instructions: None,
+                    external_tools: Vec::new(),
+                    replace_builtin_tools: false,
                 },
             )
             .await

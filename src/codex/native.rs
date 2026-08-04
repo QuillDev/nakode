@@ -559,7 +559,18 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::StartSession {
             model,
             instructions,
-        } => start_session(model, instructions, context).await,
+            external_tools,
+            replace_builtin_tools,
+        } => {
+            start_session(
+                model,
+                instructions,
+                external_tools,
+                replace_builtin_tools,
+                context,
+            )
+            .await;
+        }
         BackendCommand::ResumeSession {
             provider_session_id,
         } => resume_session(provider_session_id, context).await,
@@ -639,6 +650,13 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::ResolveQuestion { id, answer } => {
             if let Some(runtime) = context.runtime {
                 runtime.resolve_question(&id, answer).await;
+            }
+        }
+        BackendCommand::ResolveExternalTool { id, output, failed } => {
+            if let Some(runtime) = context.runtime {
+                runtime
+                    .resolve_external_tool(&id, crate::tools::ToolResult { output, failed })
+                    .await;
             }
         }
         BackendCommand::ResolveApproval { .. } | BackendCommand::Shutdown => {}
@@ -816,6 +834,8 @@ async fn start_turn(
 async fn start_session(
     model: Option<String>,
     instructions: Option<String>,
+    external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
+    replace_builtin_tools: bool,
     context: &mut CommandContext<'_>,
 ) {
     let Some(credential) = context.credential else {
@@ -856,6 +876,14 @@ async fn start_session(
         .with_context_window(selected.context_window)
         .with_reasoning_effort(context.config.reasoning_effort.clone());
     let session_id = session.id.clone();
+    if let Some(runtime) = context.runtime
+        && let Err(error) = runtime
+            .configure_external_tools(&session_id, external_tools, replace_builtin_tools)
+            .await
+    {
+        request_failed(context.events, BackendOperation::StartSession, error).await;
+        return;
+    }
     let estimated_tokens = session.estimated_context_tokens();
     let context_window = session.context_window;
     if let Some(store) = context.session_store
@@ -954,6 +982,7 @@ fn native_capabilities() -> BackendCapabilities {
         context_compaction: CapabilitySupport::Supported,
         approvals: CapabilitySupport::Unsupported,
         native_tools: CapabilitySupport::Supported,
+        external_tools: CapabilitySupport::Supported,
         mcp: CapabilitySupport::Unsupported,
         close_session: CapabilitySupport::Supported,
     }
@@ -1935,7 +1964,11 @@ mod tests {
     #[test]
     fn codex_request_registers_the_configured_dynamic_tools() {
         let mut request = test_request();
-        request.tools = crate::tools::ToolRegistry::base().definitions();
+        request.tools = crate::tools::ToolRegistry::base()
+            .definitions()
+            .into_iter()
+            .map(Into::into)
+            .collect();
 
         let body = codex_request_body(&request);
         let names = body["tools"]

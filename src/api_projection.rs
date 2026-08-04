@@ -503,6 +503,15 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
             .into_iter()
             .map(notice)
             .collect::<Result<_, _>>()?,
+        external_tool_calls: value
+            .external_tool_calls
+            .into_iter()
+            .map(|call| view::ExternalToolCallView {
+                id: call.id,
+                name: call.name,
+                arguments_json: call.arguments_json,
+            })
+            .collect(),
     })
 }
 

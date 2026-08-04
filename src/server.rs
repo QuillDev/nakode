@@ -252,6 +252,10 @@ impl ServerCore {
         self.providers = providers;
     }
 
+    pub(crate) fn provider_records(&self) -> &[ProviderRecord] {
+        &self.providers
+    }
+
     pub(crate) fn replace_session_records(&mut self, sessions: Vec<SessionRecord>) {
         self.sessions = sessions;
     }
@@ -353,6 +357,7 @@ impl ServerCore {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn try_execute_command(&mut self, command: Command) -> DomainCommandOutcome {
         match command {
             Command::CreateSession { workspace_id, .. } => {
@@ -389,6 +394,31 @@ impl ServerCore {
                 interaction_id,
                 resolution,
             } => self.resolve_interaction_command(&interaction_id, &resolution),
+            Command::ConfigureSessionTools {
+                session_id,
+                tools,
+                replace_builtin_tools,
+            } => {
+                self.ensure_session(&session_id)?;
+                let effects = self
+                    .session_engine_mut(&session_id)?
+                    .state_mut()
+                    .configure_external_tools(tools, replace_builtin_tools)?;
+                Ok(Self::accepted(Some(session_id.to_string()), effects))
+            }
+            Command::SubmitExternalToolResult {
+                session_id,
+                call_id,
+                output,
+                failed,
+            } => {
+                self.ensure_session(&session_id)?;
+                let effects = self
+                    .session_engine_mut(&session_id)?
+                    .state_mut()
+                    .submit_external_tool_result(&call_id, output, failed)?;
+                Ok(Self::accepted(Some(session_id.to_string()), effects))
+            }
             Command::Delegate {
                 session_id,
                 agent_slug,
@@ -1577,6 +1607,8 @@ impl ServerCore {
             | Command::Delegate { session_id, .. }
             | Command::RunShell { session_id, .. }
             | Command::ReloadWorkspace { session_id, .. }
+            | Command::ConfigureSessionTools { session_id, .. }
+            | Command::SubmitExternalToolResult { session_id, .. }
             | Command::SelectModel {
                 target: ModelTarget::Session { session_id },
                 ..
@@ -3718,6 +3750,7 @@ mod tests {
                     ServiceCapability::Subscriptions,
                     ServiceCapability::MultipleClients,
                     ServiceCapability::ArtifactTransfer,
+                    ServiceCapability::ExternalTools,
                 ]),
             },
             16,

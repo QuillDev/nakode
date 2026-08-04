@@ -109,6 +109,7 @@ impl AcpCapabilities {
             context_compaction: CapabilitySupport::Unsupported,
             approvals: CapabilitySupport::Supported,
             native_tools: CapabilitySupport::Supported,
+            external_tools: CapabilitySupport::Unsupported,
             mcp: self.mcp.map_or(CapabilitySupport::Unsupported, |()| {
                 CapabilitySupport::Supported
             }),
@@ -504,10 +505,7 @@ async fn handle_command(
             tokio::spawn(authenticate_devin(oauth.clone(), events.clone()));
             Ok(())
         }
-        BackendCommand::StartSession {
-            model,
-            instructions: _,
-        } => {
+        BackendCommand::StartSession { model, .. } => {
             send_request(
                 stdin,
                 pending,
@@ -587,6 +585,7 @@ async fn handle_command(
         BackendCommand::ResolveApproval { .. }
         | BackendCommand::SetSessionOptions { .. }
         | BackendCommand::ResolveQuestion { .. }
+        | BackendCommand::ResolveExternalTool { .. }
         | BackendCommand::Shutdown => Ok(()),
     }
 }

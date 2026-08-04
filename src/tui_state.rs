@@ -363,6 +363,7 @@ mod tests {
             runs: Vec::new(),
             runs_has_earlier: false,
             notices: Vec::new(),
+            external_tool_calls: Vec::new(),
         }
     }
 

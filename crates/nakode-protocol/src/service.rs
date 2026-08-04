@@ -13,6 +13,7 @@ pub enum ServiceCapability {
     Subscriptions,
     MultipleClients,
     ArtifactTransfer,
+    ExternalTools,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

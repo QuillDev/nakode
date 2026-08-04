@@ -58,6 +58,8 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
         .send(BackendCommand::StartSession {
             model: Some("fixture-model".to_owned()),
             instructions: None,
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
         })
         .await?;
 
@@ -288,6 +290,8 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
         .send(BackendCommand::StartSession {
             model: Some("fixture-model".to_owned()),
             instructions: None,
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
         })
         .await?;
     let mut gate_writer = OpenOptions::new().write(true).open(&gate)?;
