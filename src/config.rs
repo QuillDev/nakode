@@ -14,7 +14,7 @@ pub struct Config {
     #[command(subcommand)]
     pub command: Option<NakodeCommand>,
 
-    /// Update this installation through its package manager.
+    /// Update the managed source checkout and reinstall Nakode.
     #[arg(long)]
     pub update: bool,
 
@@ -109,7 +109,7 @@ pub enum NakodeCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Update this installation through its package manager.
+    /// Update the managed source checkout and reinstall Nakode.
     Update,
     /// Invoke a predefined agent through the native Nakode server.
     Agent {

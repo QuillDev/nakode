@@ -5,107 +5,115 @@ use std::{
 
 use thiserror::Error;
 
-const HOMEBREW_FORMULA: &str = "quilldev/tap/nakode";
+const SOURCE_DIRECTORY: &str = ".nakode/src";
 
 #[derive(Debug, Error)]
 pub enum UpdateError {
-    #[error("failed to locate the running Nakode executable: {0}")]
-    CurrentExecutable(#[source] std::io::Error),
+    #[error("HOME is not set; cannot locate the Nakode source checkout")]
+    MissingHome,
     #[error(
-        "this Nakode installation is not managed by Homebrew ({executable})\n\
-         Update a source installation with `git pull --ff-only` followed by `./install.sh`, \
-         or install the managed release with `brew install {HOMEBREW_FORMULA}`"
+        "the managed Nakode source checkout was not found at {0}\n\
+         Reinstall Nakode with the command in README.md to create it"
     )]
-    UnsupportedInstall { executable: String },
-    #[error("the Homebrew executable was not found at {0}")]
-    MissingHomebrew(String),
-    #[error("failed to start Homebrew: {0}")]
-    StartHomebrew(#[source] std::io::Error),
-    #[error("Homebrew could not update Nakode (exit status {0})")]
-    HomebrewFailed(std::process::ExitStatus),
+    MissingSource(String),
+    #[error("the Nakode installer was not found at {0}")]
+    MissingInstaller(String),
+    #[error("failed to start git: {0}")]
+    StartGit(#[source] std::io::Error),
+    #[error("git could not update the Nakode source checkout (exit status {0})")]
+    GitFailed(std::process::ExitStatus),
+    #[error("failed to start install.sh: {0}")]
+    StartInstaller(#[source] std::io::Error),
+    #[error("install.sh could not install the updated Nakode build (exit status {0})")]
+    InstallerFailed(std::process::ExitStatus),
 }
 
-/// Updates a Homebrew-managed Nakode installation.
+/// Updates the managed source checkout and installs the resulting build.
 ///
 /// # Errors
 ///
-/// Returns an error when the current installation is not managed by Homebrew
-/// or when Homebrew cannot complete the upgrade.
+/// Returns an error when the managed checkout is missing, Git cannot pull the
+/// update, or the installer cannot complete successfully.
 pub fn run() -> Result<(), UpdateError> {
-    let executable = std::env::current_exe().map_err(UpdateError::CurrentExecutable)?;
-    let resolved = executable.canonicalize().unwrap_or(executable);
-    let Some(prefix) = homebrew_prefix(&resolved) else {
-        return Err(UpdateError::UnsupportedInstall {
-            executable: resolved.display().to_string(),
-        });
-    };
-    let brew = prefix.join("bin/brew");
-    if !brew.is_file() {
-        return Err(UpdateError::MissingHomebrew(brew.display().to_string()));
-    }
-
-    println!("Updating Nakode with Homebrew…");
-    let status = Command::new(brew)
-        .args(["upgrade", HOMEBREW_FORMULA])
-        .status()
-        .map_err(UpdateError::StartHomebrew)?;
-    if !status.success() {
-        return Err(UpdateError::HomebrewFailed(status));
-    }
-    println!("Nakode is up to date. Restart open Nakode windows to use the new version.");
-    Ok(())
+    let home = std::env::var_os("HOME").ok_or(UpdateError::MissingHome)?;
+    run_from(&source_directory(&PathBuf::from(home)))
 }
 
-fn homebrew_prefix(executable: &Path) -> Option<PathBuf> {
-    let components = executable.components().collect::<Vec<_>>();
-    let cellar = components
-        .iter()
-        .position(|component| component.as_os_str() == "Cellar")?;
-    if components
-        .get(cellar + 1)
-        .is_none_or(|component| component.as_os_str() != "nakode")
-    {
-        return None;
+fn source_directory(home: &Path) -> PathBuf {
+    home.join(SOURCE_DIRECTORY)
+}
+
+fn run_from(source: &Path) -> Result<(), UpdateError> {
+    if !source.is_dir() {
+        return Err(UpdateError::MissingSource(source.display().to_string()));
     }
 
-    let mut prefix = PathBuf::new();
-    for component in &components[..cellar] {
-        prefix.push(component.as_os_str());
+    let installer = source.join("install.sh");
+    if !installer.is_file() {
+        return Err(UpdateError::MissingInstaller(
+            installer.display().to_string(),
+        ));
     }
-    Some(prefix)
+
+    println!("Updating Nakode source in {}…", source.display());
+    let status = Command::new("git")
+        .args(["pull", "--ff-only"])
+        .current_dir(source)
+        .status()
+        .map_err(UpdateError::StartGit)?;
+    if !status.success() {
+        return Err(UpdateError::GitFailed(status));
+    }
+
+    println!("Installing the updated Nakode build…");
+    let status = Command::new("sh")
+        .arg("./install.sh")
+        .current_dir(source)
+        .status()
+        .map_err(UpdateError::StartInstaller)?;
+    if !status.success() {
+        return Err(UpdateError::InstallerFailed(status));
+    }
+
+    println!("Nakode is up to date.");
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    use super::homebrew_prefix;
+    use tempfile::tempdir;
+
+    use super::{UpdateError, run_from, source_directory};
 
     #[test]
-    fn recognizes_apple_silicon_homebrew_cellar_install() {
-        assert_eq!(
-            homebrew_prefix(Path::new("/opt/homebrew/Cellar/nakode/0.2.0/bin/nakode")),
-            Some(PathBuf::from("/opt/homebrew"))
-        );
+    fn rejects_a_missing_managed_checkout() {
+        let home = tempdir().expect("temporary home");
+        let source = home.path().join(".nakode/src");
+
+        assert!(matches!(
+            run_from(&source),
+            Err(UpdateError::MissingSource(path)) if path == source.display().to_string()
+        ));
     }
 
     #[test]
-    fn recognizes_intel_homebrew_cellar_install() {
-        assert_eq!(
-            homebrew_prefix(Path::new("/usr/local/Cellar/nakode/0.2.0/bin/nakode")),
-            Some(PathBuf::from("/usr/local"))
-        );
+    fn rejects_a_checkout_without_an_installer() {
+        let source = tempdir().expect("temporary checkout");
+        let installer = source.path().join("install.sh");
+
+        assert!(matches!(
+            run_from(source.path()),
+            Err(UpdateError::MissingInstaller(path)) if path == installer.display().to_string()
+        ));
     }
 
     #[test]
-    fn rejects_source_and_other_cellar_installs() {
+    fn managed_checkout_is_under_nakode_in_home() {
         assert_eq!(
-            homebrew_prefix(Path::new("/Users/quill/.local/bin/nakode")),
-            None
-        );
-        assert_eq!(
-            homebrew_prefix(Path::new("/opt/homebrew/Cellar/other/1.0/bin/nakode")),
-            None
+            source_directory(Path::new("/home/example")),
+            Path::new("/home/example/.nakode/src")
         );
     }
 }
