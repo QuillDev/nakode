@@ -99,40 +99,33 @@ model.
 
 ## Installation
 
-### Homebrew on macOS
-
-Install Nakode from the official QuillDev tap:
+Nakode requires Git and Rust 1.88 or newer. Install it with this command:
 
 ```sh
-brew install quilldev/tap/nakode
+mkdir -p "$HOME/.nakode" && \
+  git clone https://github.com/QuillDev/nakode.git "$HOME/.nakode/src" && \
+  "$HOME/.nakode/src/install.sh"
 ```
 
-Update Nakode from the command line:
+This keeps the managed source checkout in `~/.nakode/src` and installs the
+`nakode` executable to `~/.local/bin`. If that directory is not already in your
+`PATH`, the installer prints the line to add to your shell profile. Do not run
+Nakode or the entire installer through `sudo`; provider sign-in uses your normal
+desktop account.
+
+Update the checkout, rebuild Nakode, and replace the installed executable with:
 
 ```sh
 nakode update
 ```
 
-`nakode --update` is supported as a convenience alias. For a Homebrew
-installation, Nakode delegates the upgrade to Homebrew so the package manager
-remains authoritative.
+`nakode update` runs `git pull --ff-only` in `~/.nakode/src` and then runs that
+checkout's `install.sh`. `nakode --update` is supported as a convenience alias.
 
-### Build from source
-
-A source installation requires Rust 1.88 or newer:
-
-```sh
-git clone https://github.com/QuillDev/nakode.git
-cd nakode
-./install.sh
-```
-
-This installs `nakode` to `~/.local/bin`. During local development,
-`./install.sh --debug` reuses the development build for much faster iteration,
-at the cost of a larger and less optimized installed executable. Run
-`./install.sh --help` for system and custom-prefix options. Do not run Nakode or
-the entire installer through `sudo`; provider sign-in uses your normal desktop
-account.
+For local development in another checkout, `./install.sh --debug` reuses the
+development build for much faster iteration, at the cost of a larger and less
+optimized installed executable. Run `./install.sh --help` for system and
+custom-prefix options.
 
 ### Start Nakode
 

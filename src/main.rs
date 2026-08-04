@@ -16,7 +16,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     if config.update || matches!(config.command.as_ref(), Some(NakodeCommand::Update)) {
         update::run()?;
-        control_service::shutdown_service(&config.workspace).await?;
         return Ok(());
     }
     match config.command.clone() {
