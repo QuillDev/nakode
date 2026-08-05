@@ -2,6 +2,8 @@ import {
   query,
   createSdkMcpServer,
   getSessionMessages,
+  filterEscalatingDefaultMode,
+  resolveSettings,
   tool,
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
@@ -253,6 +255,9 @@ async function createSession(command, resumed) {
     model: command.model || "sonnet",
     options: {},
     ownerSessionId: command.ownerSessionId || null,
+    securityValidator: validatorSession(command.instructions || ""),
+    validationEnabled:
+      Boolean(command.ownerSessionId) && !validatorSession(command.instructions || ""),
   });
   let history = [];
   if (resumed) {
@@ -280,9 +285,125 @@ async function createSession(command, resumed) {
   });
 }
 
-function permissionHandler(turnId) {
-  return (toolName, input, options) =>
-    new Promise((resolve) => {
+function validatorSession(instructions) {
+  return instructions.includes("[Nakode Security Validator]");
+}
+
+async function permissionMode(workspace) {
+  const resolved = await resolveSettings({
+    cwd: workspace,
+    settingSources: ["user", "project", "local"],
+  });
+  return (
+    filterEscalatingDefaultMode(resolved).permissions?.defaultMode || "auto"
+  );
+}
+
+function parseValidatorResult(result) {
+  if (result.status !== "completed") {
+    return {
+      verdict: "escalate",
+      rationale: `Configured Sonnet validator unavailable: ${result.error || "delegated run failed"}`,
+      validated: false,
+      ...result,
+    };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(result.result);
+  } catch {
+    return {
+      verdict: "escalate",
+      rationale: "Configured Sonnet validator returned malformed output.",
+      validated: false,
+      ...result,
+    };
+  }
+  if (
+    !["allow", "reject", "escalate"].includes(parsed?.verdict) ||
+    typeof parsed?.rationale !== "string" ||
+    !parsed.rationale.trim()
+  ) {
+    return {
+      verdict: "escalate",
+      rationale: "Configured Sonnet validator omitted a clear verdict or rationale.",
+      validated: false,
+      ...result,
+    };
+  }
+  return { ...result, ...parsed, validated: true };
+}
+
+async function securityValidation(ownerSessionId, toolName, input, options) {
+  const archetype =
+    process.env.NAKODE_SECURITY_VALIDATOR_AGENT || "security-validator";
+  const task = `Return JSON only as {"verdict":"allow|reject|escalate","rationale":"..."}.\nDo not use tools or delegate. Independently validate this security-sensitive proposed Claude Code operation against the owner's repository task. Allow only when intent and bounded impact are clear; reject security-control bypass, credential exposure, exfiltration, and destructive out-of-scope actions; escalate uncertainty.\n\n${JSON.stringify({ tool: toolName, input, reason: options.decisionReason || options.description || "Claude auto mode requested review." })}`;
+  try {
+    return parseValidatorResult(await delegate(ownerSessionId, { archetype, task }));
+  } catch (error) {
+    return {
+      verdict: "escalate",
+      rationale: `Configured Sonnet validator unavailable: ${errorMessage(error)}`,
+      validated: false,
+      runId: null,
+      archetype,
+    };
+  }
+}
+
+function permissionHandler(turnId, session, mode) {
+  return async (toolName, input, options) => {
+    if (
+      toolName !== "AskUserQuestion" &&
+      mode === "auto" &&
+      !options.matchedAskRule &&
+      session.validationEnabled
+    ) {
+      const result = await securityValidation(
+        session.ownerSessionId,
+        toolName,
+        input,
+        options,
+      );
+      write({
+        event: "tool_call",
+        turnId,
+        callId: `security:${options.toolUseID || randomUUID()}`,
+        name: "SecurityValidation",
+        status: result.verdict === "allow" ? "completed" : "error",
+        result: {
+          verdict: result.verdict,
+          rationale: result.rationale,
+          validated: result.validated,
+          validator: result.archetype,
+          runId: result.runId,
+        },
+      });
+      return result.verdict === "allow"
+        ? { behavior: "allow", updatedInput: input }
+        : {
+            behavior: "deny",
+            message:
+              result.verdict === "reject"
+                ? `Independent security validation rejected this operation: ${result.rationale}`
+                : `Security validation requires escalation; the operation was not run: ${result.rationale}`,
+            toolUseID: options.toolUseID,
+          };
+    }
+    if (
+      toolName !== "AskUserQuestion" &&
+      mode === "auto" &&
+      !options.matchedAskRule &&
+      !session.validationEnabled
+    ) {
+      return {
+        behavior: "deny",
+        message:
+          "Recursive security validation was prevented in a delegated validator context.",
+        toolUseID: options.toolUseID,
+      };
+    }
+    return new Promise((resolve) => {
       const approvalId = options.toolUseID || randomUUID();
       let settled = false;
       const finish = (result) => {
@@ -318,6 +439,7 @@ function permissionHandler(turnId) {
         description: options.description || options.decisionReason || "",
       });
     });
+  };
 }
 
 function emitContent(turnId, message) {
@@ -388,6 +510,9 @@ async function sendTurn(command) {
 
   const model = command.model || session.model;
   session.model = model;
+  const mode = session.securityValidator
+    ? "dontAsk"
+    : await permissionMode(command.workspace);
   const options = {
     cwd: command.workspace,
     pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE || "claude",
@@ -398,8 +523,10 @@ async function sendTurn(command) {
     settingSources: ["user", "project", "local"],
     includePartialMessages: true,
     abortController,
-    canUseTool: permissionHandler(command.turnId),
-    ...(session.ownerSessionId
+    permissionMode: mode,
+    ...(session.securityValidator ? { allowedTools: [] } : {}),
+    canUseTool: permissionHandler(command.turnId, session, mode),
+    ...(session.ownerSessionId && session.validationEnabled
       ? { mcpServers: { nakode: nakodeServer(session.ownerSessionId) } }
       : {}),
     ...(session.started

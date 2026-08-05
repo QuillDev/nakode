@@ -6300,9 +6300,25 @@ impl DomainState {
                 "agent invocation requires a non-empty task".to_owned(),
             ));
         }
-        if self.agents.find(agent_slug).is_none() {
+        let Some(definition) = self.agents.find(agent_slug) else {
             return Err(DomainCommandError::NotFound(format!(
                 "predefined agent {agent_slug:?}"
+            )));
+        };
+        let validator_slug = std::env::var("NAKODE_SECURITY_VALIDATOR_AGENT")
+            .unwrap_or_else(|_| "security-validator".to_owned());
+        if agent_slug == validator_slug
+            && (definition
+                .model
+                .as_ref()
+                .is_none_or(|model| !model.to_ascii_lowercase().contains("sonnet"))
+                || definition
+                    .fallback_models
+                    .iter()
+                    .any(|model| !model.to_ascii_lowercase().contains("sonnet")))
+        {
+            return Err(DomainCommandError::Invalid(format!(
+                "security validator {validator_slug:?} must configure only Sonnet-tier models"
             )));
         }
         Ok(())
@@ -6742,10 +6758,17 @@ impl DomainState {
         let qualified_model = model
             .as_ref()
             .map(|model| format!("{}/{model}", target.provider));
-        let instructions = Some(prompt_addenda.apply(
-            execution.definition.instructions(),
-            qualified_model.as_deref(),
-        ));
+        let mut validator_instructions = execution.definition.instructions().to_owned();
+        let validator_slug = std::env::var("NAKODE_SECURITY_VALIDATOR_AGENT")
+            .unwrap_or_else(|_| "security-validator".to_owned());
+        if execution.definition.slug == validator_slug {
+            validator_instructions.insert_str(
+                0,
+                "[Nakode Security Validator]\nDelegation and security re-validation are disabled for this scoped validator run.\n[/Nakode Security Validator]\n\n",
+            );
+        }
+        let instructions =
+            Some(prompt_addenda.apply(&validator_instructions, qualified_model.as_deref()));
         self.sync_subagent(run_id);
         vec![Effect::SubagentBackend {
             run_id: run_id.to_owned(),
@@ -10695,6 +10718,41 @@ reasoning_effort = "unsupported"
             "'/opt/nakode/bin/nakode' agent explorer --session-id={}",
             state.nakode_session_id
         )));
+    }
+
+    #[test]
+    fn security_validator_requires_an_explicit_sonnet_tier() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("security-validator.toml"),
+            r#"
+slug = "security-validator"
+description = "Validate one sensitive operation"
+model = "openai-codex/model-a"
+"#,
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+
+        let error = state
+            .validate_agent_request("security-validator", "Validate Bash")
+            .expect_err("non-Sonnet validator must fail closed");
+        assert!(error.to_string().contains("Sonnet-tier"));
+
+        fs::write(
+            directory.path().join("security-validator.toml"),
+            r#"
+slug = "security-validator"
+description = "Validate one sensitive operation"
+model = "claude-agent/sonnet"
+"#,
+        )
+        .expect("agent definition");
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        state
+            .validate_agent_request("security-validator", "Validate Bash")
+            .expect("Sonnet validator");
     }
 
     #[test]
