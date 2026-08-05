@@ -5,8 +5,12 @@ script_directory="$(CDPATH= cd -P "$(dirname "$0")" && pwd -P)"
 cd "$script_directory"
 
 clean_install=false
-launches_tui=true
-workspace="${NAKODE_WORKSPACE:-${NAKO_AGENT_WORKSPACE:-.}}"
+# Nakode is the service; the interactive client is only launched by --tui, so
+# only that invocation owns and replaces the running development instance.
+launches_tui=false
+# Only for the vestigial legacy-socket check below; the CLI's own default is the
+# home directory.
+workspace="${NAKODE_WORKSPACE:-${HOME:-.}}"
 workspace_argument_follows=false
 remaining_arguments=$#
 while [ "$remaining_arguments" -gt 0 ]; do
@@ -27,8 +31,8 @@ while [ "$remaining_arguments" -gt 0 ]; do
   fi
 
   case "$argument" in
-    -h | --help | -V | --version | agent | help)
-      launches_tui=false
+    --tui)
+      launches_tui=true
       ;;
     --workspace)
       workspace_argument_follows=true

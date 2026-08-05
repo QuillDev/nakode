@@ -22,14 +22,14 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempfile::tempdir()?;
-    let control_directory = temp.path().join("control");
-    let mut session = spawn_tui(temp.path(), &control_directory)?;
+    let home = temp.path().join("nakode-home");
+    let mut session = spawn_tui(temp.path(), &home)?;
     let output_drain = drain_output(&mut session)?;
     if !output_drain.wait_for(b"\x1b[?1049h", Duration::from_secs(10)) {
         let _ = session.kill();
         let _ = session.wait();
         let output = output_drain.finish()?;
-        shutdown_service(temp.path(), &control_directory)?;
+        shutdown_service(temp.path(), &home)?;
         return Err(io::Error::other(format!(
             "TUI did not acquire the alternate screen before input:\n{}",
             String::from_utf8_lossy(&output)
@@ -61,7 +61,7 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
         let _ = session.wait();
     }
     let output = output_drain.finish()?;
-    shutdown_service(temp.path(), &control_directory)?;
+    shutdown_service(temp.path(), &home)?;
     assert!(exited, "Nakode did not exit after Ctrl+D");
 
     let output = String::from_utf8_lossy(&output);
@@ -103,13 +103,13 @@ fn multiple_tuis_share_one_server_without_owning_its_lifecycle() -> Result<(), B
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempfile::tempdir()?;
-    let control_directory = temp.path().join("control");
-    let mut first = spawn_tui(temp.path(), &control_directory)?;
+    let home = temp.path().join("nakode-home");
+    let mut first = spawn_tui(temp.path(), &home)?;
     let first_reader = drain_output(&mut first)?;
     thread::sleep(Duration::from_millis(500));
     assert!(first.try_wait()?.is_none(), "first TUI exited unexpectedly");
 
-    let mut second = spawn_tui(temp.path(), &control_directory)?;
+    let mut second = spawn_tui(temp.path(), &home)?;
     let second_reader = drain_output(&mut second)?;
 
     thread::sleep(Duration::from_secs(1));
@@ -138,7 +138,7 @@ fn multiple_tuis_share_one_server_without_owning_its_lifecycle() -> Result<(), B
         .into());
     }
 
-    shutdown_service(temp.path(), &control_directory)?;
+    shutdown_service(temp.path(), &home)?;
     thread::sleep(Duration::from_millis(500));
     assert!(
         first.try_wait()?.is_none() && second.try_wait()?.is_none(),
@@ -153,26 +153,27 @@ fn multiple_tuis_share_one_server_without_owning_its_lifecycle() -> Result<(), B
     assert!(wait_for_exit(&mut second)?, "second TUI did not exit");
     first_reader.finish()?;
     second_reader.finish()?;
-    shutdown_service(temp.path(), &control_directory)?;
+    shutdown_service(temp.path(), &home)?;
     Ok(())
 }
 
 fn spawn_tui(workspace: &Path, control_directory: &Path) -> Result<PtySession, Box<dyn Error>> {
-    let home = workspace.join("home");
+    let user_home = workspace.join("home");
     let data = workspace.join("data");
-    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&user_home)?;
     std::fs::create_dir_all(&data)?;
     PtySession::spawn(
         "/usr/bin/env",
         [
             OsString::from("NAKODE_TERMINAL_IMAGES=off"),
-            OsString::from(format!("HOME={}", home.display())),
+            OsString::from(format!("HOME={}", user_home.display())),
             OsString::from(format!("XDG_DATA_HOME={}", data.display())),
             OsString::from(format!(
                 "NAKODE_CONTROL_DIR={}",
                 control_directory.display()
             )),
             OsString::from(env!("CARGO_BIN_EXE_nakode")),
+            OsString::from("--tui"),
             OsString::from("--workspace"),
             workspace.as_os_str().to_owned(),
         ],
@@ -260,7 +261,7 @@ fn wait_for_exit(session: &mut PtySession) -> io::Result<bool> {
 
 fn shutdown_service(workspace: &Path, control_directory: &Path) -> io::Result<()> {
     let status = Command::new(env!("CARGO_BIN_EXE_nakode"))
-        .args(["service", "shutdown"])
+        .arg("stop")
         .env("NAKODE_CONTROL_DIR", control_directory)
         .current_dir(workspace)
         .status()?;

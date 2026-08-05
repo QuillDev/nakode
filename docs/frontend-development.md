@@ -120,28 +120,34 @@ queue rows locally.
 
 ## Local endpoint
 
-`nakode service endpoint` ensures the workspace server exists and prints a
+`nakode endpoint` ensures the workspace server exists and prints a
 machine-readable descriptor for its `grpc+unix` endpoint. The endpoint is
 private to the desktop user. Stopping a renderer does not stop the server or
 cancel server-owned work; stopping the server is an explicit lifecycle action.
+
+The earlier `nakode service endpoint` spelling remains supported for installed
+connectors. It prints the same descriptor on standard output and writes only its
+deprecation notice to standard error, so a connector that parses standard output
+is unaffected. `--workspace` continues to select the canonical workspace whose
+service is discovered or started.
 
 The TUI uses this exact public SDK path. It is an example frontend, not a
 privileged application runtime.
 
 ## Discord frontend
 
-The optional Discord adapter is configured through the service command group:
+The optional Discord adapter is configured through the transport command group:
 
 ```text
-nakode service discord setup
-nakode service discord status
-nakode service discord start
-nakode service discord stop
-nakode service discord restart
-nakode service discord enable
-nakode service discord disable
-nakode service discord bind --channel-id <channel> [--guild-id <guild>] [--session-id <session>]
-nakode service discord unbind --channel-id <channel>
+nakode transport discord setup
+nakode transport discord status
+nakode transport discord start
+nakode transport discord stop
+nakode transport discord restart
+nakode transport discord enable
+nakode transport discord disable
+nakode transport discord bind --channel-id <channel> [--guild-id <guild>] [--session-id <session>]
+nakode transport discord unbind --channel-id <channel>
 ```
 
 `setup` is interactive and reads the bot token without echoing it. The token is

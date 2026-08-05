@@ -382,11 +382,11 @@ pub(crate) fn unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn day_number(timestamp_ms: u64) -> i64 {
+pub(crate) fn day_number(timestamp_ms: u64) -> i64 {
     i64::try_from(timestamp_ms / 86_400_000).unwrap_or(i64::MAX)
 }
 
-fn format_utc_day(day: i64) -> String {
+pub(crate) fn format_utc_day(day: i64) -> String {
     let z = day + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let day_of_era = z - era * 146_097;

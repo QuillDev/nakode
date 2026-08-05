@@ -20,18 +20,40 @@ tool, artifact, setting, and orchestration run. It performs all operations and
 mutations, persists canonical state, and continues active work without an
 attached client.
 
-Manage the service for the selected workspace from the CLI:
+`nakode` is that service. Run it directly:
 
 ```sh
-nakode service status
-nakode service status --json
-nakode service restart
-nakode service shutdown
+nakode start            # background, returns once it accepts connections
+nakode run              # foreground until Ctrl-C
+nakode status           # version, process, endpoint, capabilities, log path
+nakode status --json
+nakode logs -f          # tail the captured service log
+nakode restart
+nakode stop
 ```
 
-`restart` starts a stopped service as well as replacing a running one. Use
-`--workspace <path>` before `service` to target a workspace other than the
-current directory.
+`start` and `stop` are safe to repeat: an already-running service reports that
+it is running rather than starting a second one, and stopping a stopped service
+succeeds. `restart` starts a stopped service as well as replacing a running one.
+
+`--workspace <path>` selects the workspace service, defaulting to the current
+directory exactly as before. Each canonical workspace has its own sockets, log,
+and running process; no command reaches a workspace you did not name.
+
+The interactive terminal client is one frontend over that service:
+
+```sh
+nakode --tui
+```
+
+Frontend transports are managed under `transport`:
+
+```sh
+nakode transport discord status
+```
+
+The earlier `nakode service <action>` spellings still work. Each prints a
+deprecation notice on standard error naming its replacement, then does the work.
 
 Every frontend—including the built-in TUI—only:
 

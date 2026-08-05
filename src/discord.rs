@@ -40,7 +40,9 @@ use tokio::task::JoinHandle;
 
 use crate::{
     config::{Config, DiscordAction},
-    control_service::{TransportAction, TransportController, TransportStatus, TransportSupervisor},
+    control_service::{
+        ServicePaths, TransportAction, TransportController, TransportStatus, TransportSupervisor,
+    },
 };
 
 const CONFIG_VERSION: u32 = 1;
@@ -290,7 +292,7 @@ pub enum DiscordError {
     CombinedAttachmentsTooLarge,
     #[error("Discord attachment {name:?} is not a supported HTTPS image")]
     UnsupportedAttachment { name: String },
-    #[error("the workspace service is not running; start `nakode service run` first")]
+    #[error("the workspace service is not running; run `nakode start` first")]
     ServiceNotRunning,
     #[error("Discord transport control failed: {0}")]
     Control(#[from] crate::control_service::ControlError),
@@ -453,6 +455,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), DiscordError> {
 /// Handles a `nakode service discord ...` command.
 pub async fn run_command(config: &Config, action: DiscordAction) -> Result<(), DiscordError> {
     let store = DiscordConfigStore::for_workspace(&config.workspace)?;
+    let paths = crate::control_service::ServicePaths::of(config)?;
     match action {
         DiscordAction::Setup {
             channel_id,
@@ -461,46 +464,28 @@ pub async fn run_command(config: &Config, action: DiscordAction) -> Result<(), D
             allowed_users,
         } => {
             setup(&store, channel_id, guild_id, session_id, allowed_users)?;
-            start_or_reload(&config.workspace, "Discord configuration applied").await?;
+            start_or_reload(&paths, "Discord configuration applied").await?;
         }
-        DiscordAction::Status { json } => status(&store, &config.workspace, json).await?,
+        DiscordAction::Status { json } => status(&store, &paths, json).await?,
         DiscordAction::Enable => {
             set_enabled(&store, true)?;
-            report_live_action(
-                &config.workspace,
-                TransportAction::Start,
-                "Discord frontend started",
-            )
-            .await?;
+            report_live_action(&paths, TransportAction::Start, "Discord frontend started").await?;
         }
         DiscordAction::Disable => {
             set_enabled(&store, false)?;
-            report_live_action(
-                &config.workspace,
-                TransportAction::Stop,
-                "Discord frontend stopped",
-            )
-            .await?;
+            report_live_action(&paths, TransportAction::Stop, "Discord frontend stopped").await?;
         }
         DiscordAction::Start => {
-            report_required_action(
-                &config.workspace,
-                TransportAction::Start,
-                "Discord frontend started",
-            )
-            .await?;
+            report_required_action(&paths, TransportAction::Start, "Discord frontend started")
+                .await?;
         }
         DiscordAction::Stop => {
-            report_required_action(
-                &config.workspace,
-                TransportAction::Stop,
-                "Discord frontend stopped",
-            )
-            .await?;
+            report_required_action(&paths, TransportAction::Stop, "Discord frontend stopped")
+                .await?;
         }
         DiscordAction::Restart => {
             report_required_action(
-                &config.workspace,
+                &paths,
                 TransportAction::Restart,
                 "Discord frontend restarted",
             )
@@ -514,21 +499,17 @@ pub async fn run_command(config: &Config, action: DiscordAction) -> Result<(), D
             bind(&store, channel_id, guild_id, session_id)?;
             let discord_config = store.load()?;
             if discord_config.enabled {
-                reload_if_running(&config.workspace, "Discord configuration reloaded").await?;
+                reload_if_running(&paths, "Discord configuration reloaded").await?;
             }
         }
         DiscordAction::Unbind { channel_id } => {
             unbind(&store, &channel_id)?;
             let discord_config = store.load()?;
             if discord_config.enabled {
-                reload_if_running(&config.workspace, "Discord configuration reloaded").await?;
+                reload_if_running(&paths, "Discord configuration reloaded").await?;
             } else {
-                report_live_action(
-                    &config.workspace,
-                    TransportAction::Stop,
-                    "Discord frontend stopped",
-                )
-                .await?;
+                report_live_action(&paths, TransportAction::Stop, "Discord frontend stopped")
+                    .await?;
             }
         }
     }
@@ -607,12 +588,11 @@ fn setup(
 }
 
 async fn report_required_action(
-    workspace: &Path,
+    paths: &ServicePaths,
     action: TransportAction,
     message: &str,
 ) -> Result<(), DiscordError> {
-    let status = match crate::control_service::transport_action(workspace, "discord", action).await
-    {
+    let status = match crate::control_service::transport_action(paths, "discord", action).await {
         Ok(status) => status,
         Err(error) if service_unavailable(&error) => return Err(DiscordError::ServiceNotRunning),
         Err(error) => return Err(error.into()),
@@ -625,11 +605,11 @@ async fn report_required_action(
 }
 
 async fn report_live_action(
-    workspace: &Path,
+    paths: &ServicePaths,
     action: TransportAction,
     message: &str,
 ) -> Result<(), DiscordError> {
-    match crate::control_service::transport_action(workspace, "discord", action).await {
+    match crate::control_service::transport_action(paths, "discord", action).await {
         Ok(status) => {
             println!("{message} (transport running: {}).", status.running);
             Ok(())
@@ -657,22 +637,19 @@ fn service_unavailable(error: &crate::control_service::ControlError) -> bool {
 
 async fn status(
     store: &DiscordConfigStore,
-    workspace: &Path,
+    paths: &ServicePaths,
     json: bool,
 ) -> Result<(), DiscordError> {
     let config = store.load()?;
     let token_configured = store.token_configured();
-    let runtime = match crate::control_service::transport_action(
-        workspace,
-        "discord",
-        TransportAction::Status,
-    )
-    .await
-    {
-        Ok(status) => Some(status),
-        Err(error) if service_unavailable(&error) => None,
-        Err(error) => return Err(error.into()),
-    };
+    let runtime =
+        match crate::control_service::transport_action(paths, "discord", TransportAction::Status)
+            .await
+        {
+            Ok(status) => Some(status),
+            Err(error) if service_unavailable(&error) => None,
+            Err(error) => return Err(error.into()),
+        };
     if json {
         #[derive(Serialize)]
         struct Status<'a> {
@@ -729,9 +706,8 @@ async fn status(
     Ok(())
 }
 
-async fn start_or_reload(workspace: &Path, message: &str) -> Result<(), DiscordError> {
-    match crate::control_service::transport_action(workspace, "discord", TransportAction::Status)
-        .await
+async fn start_or_reload(paths: &ServicePaths, message: &str) -> Result<(), DiscordError> {
+    match crate::control_service::transport_action(paths, "discord", TransportAction::Status).await
     {
         Ok(status) => {
             let action = if status.running {
@@ -739,8 +715,7 @@ async fn start_or_reload(workspace: &Path, message: &str) -> Result<(), DiscordE
             } else {
                 TransportAction::Start
             };
-            let status =
-                crate::control_service::transport_action(workspace, "discord", action).await?;
+            let status = crate::control_service::transport_action(paths, "discord", action).await?;
             println!("{message} (transport running: {}).", status.running);
             Ok(())
         }
@@ -754,13 +729,12 @@ async fn start_or_reload(workspace: &Path, message: &str) -> Result<(), DiscordE
     }
 }
 
-async fn reload_if_running(workspace: &Path, message: &str) -> Result<(), DiscordError> {
-    match crate::control_service::transport_action(workspace, "discord", TransportAction::Status)
-        .await
+async fn reload_if_running(paths: &ServicePaths, message: &str) -> Result<(), DiscordError> {
+    match crate::control_service::transport_action(paths, "discord", TransportAction::Status).await
     {
         Ok(status) if status.running => {
             let status = crate::control_service::transport_action(
-                workspace,
+                paths,
                 "discord",
                 TransportAction::Restart,
             )

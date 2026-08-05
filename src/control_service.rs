@@ -25,10 +25,131 @@ const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
 const RESUME_ENVIRONMENT_KEYS: [&str; 2] = ["NAKODE_RESUME", "NAKO_AGENT_RESUME"];
 
 /// Workspace service state returned by the lifecycle CLI.
+///
+/// Every field describes the service reached for the named workspace. The
+/// process record and API metadata are read from the private directory and
+/// socket serving that workspace, so a report never covers one the caller did
+/// not name.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ServiceStatus {
     pub running: bool,
     pub workspace: PathBuf,
+    /// Version of the `nakode` executable that produced this report.
+    pub nakode_version: String,
+    /// Process identifier recorded by the running service, when it published one.
+    pub pid: Option<u32>,
+    pub started_at_unix_ms: Option<u64>,
+    pub started_at_utc: Option<String>,
+    pub uptime_seconds: Option<u64>,
+    /// Socket implementing the generated Nakode API for native frontends.
+    pub endpoint: PathBuf,
+    pub lifecycle_socket: PathBuf,
+    pub log: PathBuf,
+    /// API metadata reported by the running service, absent when it is stopped.
+    pub server: Option<ServerReport>,
+}
+
+/// Server and API identity reported by a running service through `GetServerInfo`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ServerReport {
+    pub server_version: String,
+    pub api_version: String,
+    pub capabilities: Vec<String>,
+}
+
+/// Process identity published by a running workspace service.
+///
+/// The file lives beside the workspace's sockets, is written when the service
+/// acquires its lease, and is removed when that lease is released. It is only
+/// trusted while the lifecycle socket answers, so a record left behind by a
+/// killed process is never reported as a live one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ServiceRuntimeRecord {
+    pub pid: u32,
+    pub started_at_unix_ms: u64,
+    pub version: String,
+}
+
+/// Result of starting a workspace service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartOutcome {
+    Started,
+    AlreadyRunning,
+}
+
+/// Result of stopping a workspace service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopOutcome {
+    Stopped,
+    AlreadyStopped,
+}
+
+/// Where one canonical workspace service keeps its runtime state.
+///
+/// Resolving once keeps every operation on a single workspace and avoids
+/// re-deriving the same directory per lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServicePaths {
+    lifecycle: PathBuf,
+    api: PathBuf,
+    log: PathBuf,
+    runtime: PathBuf,
+}
+
+impl ServicePaths {
+    /// Resolves the service runtime for one canonical workspace.
+    ///
+    /// # Errors
+    /// Returns an error when the private runtime directory cannot be prepared.
+    pub fn resolve(workspace: &Path) -> Result<Self, ControlError> {
+        Ok(Self::in_directory(&workspace_runtime_directory_in(
+            &control_directory()?,
+            workspace,
+        )?))
+    }
+
+    /// Names the runtime files a service keeps in one prepared directory.
+    #[must_use]
+    pub fn in_directory(directory: &Path) -> Self {
+        Self {
+            lifecycle: directory.join("c.sock"),
+            api: directory.join("api.sock"),
+            log: directory.join("service.log"),
+            runtime: directory.join("service.json"),
+        }
+    }
+
+    /// Resolves the service addressed by a validated configuration.
+    ///
+    /// # Errors
+    /// Returns an error when the private runtime directory cannot be prepared.
+    pub fn of(config: &Config) -> Result<Self, ControlError> {
+        Self::resolve(&config.workspace)
+    }
+
+    /// Socket carrying lifecycle requests.
+    #[must_use]
+    pub fn lifecycle(&self) -> &Path {
+        &self.lifecycle
+    }
+
+    /// Socket implementing the generated Nakode API.
+    #[must_use]
+    pub fn api(&self) -> &Path {
+        &self.api
+    }
+
+    /// Captured standard output and standard error of a background service.
+    #[must_use]
+    pub fn log(&self) -> &Path {
+        &self.log
+    }
+
+    /// Process record published by the running service.
+    #[must_use]
+    pub fn runtime(&self) -> &Path {
+        &self.runtime
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -173,16 +294,27 @@ enum LifecycleResponse {
 }
 
 /// Runs the native workspace server until it receives a lifecycle shutdown
-/// request or one of its required components stops.
+/// request, its terminal interrupts it, or one of its required components
+/// stops.
 ///
 /// # Errors
 /// Returns when socket acquisition, runtime preparation, or a server component
 /// fails.
 pub async fn run_service(config: Config) -> Result<(), ControlError> {
-    let mut lease = WorkspaceServerLease::acquire(&config.workspace).await?;
+    let paths = ServicePaths::of(&config)?;
+    let mut lease = WorkspaceServerLease::acquire(&paths).await?;
+    // Only a backgrounded service writes into the captured log, and only it may
+    // rotate that file. A foreground run owns a terminal instead.
+    if let Some(log) = std::env::var_os(crate::service_log::LOG_PATH_ENVIRONMENT) {
+        tokio::spawn(crate::service_log::supervise_size(PathBuf::from(log)));
+    }
     let configuration = service_configuration_fingerprint(&config);
     let prepared = crate::server::runtime::prepare_runtime(&config).await?;
     let (runtime, handle) = prepared.into_actor();
+    eprintln!(
+        "nakode service started for workspace {}",
+        config.workspace.display()
+    );
     let lifecycle_path = lease.lifecycle_path.clone();
     let grpc_path = lease.grpc_path.clone();
     let lifecycle_listener = lease
@@ -217,6 +349,13 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
             Ok(()) => Err(ControlError::ComponentStopped("native runtime")),
             Err(_) => Err(ControlError::ComponentStopped("native runtime task")),
         },
+        // A foreground service is stopped from its terminal. Leaving the
+        // interrupt to the default disposition would kill the process before
+        // the lease released its sockets and process record.
+        signal = tokio::signal::ctrl_c() => match signal {
+            Ok(()) => Ok(()),
+            Err(_) => Err(ControlError::ComponentStopped("interrupt handler")),
+        },
     };
     handle.shutdown().await;
     lifecycle.abort();
@@ -225,6 +364,10 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
     if !actor.is_finished() {
         let _ = actor.await;
     }
+    eprintln!(
+        "nakode service stopped for workspace {}",
+        config.workspace.display()
+    );
     result
 }
 
@@ -347,14 +490,16 @@ fn flatten_component(
 struct WorkspaceServerLease {
     lifecycle_path: PathBuf,
     grpc_path: PathBuf,
+    runtime_path: PathBuf,
     lifecycle: Option<UnixListener>,
     grpc: Option<UnixListener>,
 }
 
 impl WorkspaceServerLease {
-    async fn acquire(workspace: &Path) -> Result<Self, ControlError> {
-        let lifecycle_path = service_socket_path(workspace)?;
-        let grpc_path = grpc_service_socket_path(workspace)?;
+    async fn acquire(paths: &ServicePaths) -> Result<Self, ControlError> {
+        let lifecycle_path = paths.lifecycle().to_path_buf();
+        let grpc_path = paths.api().to_path_buf();
+        let runtime_path = paths.runtime().to_path_buf();
         let lifecycle = bind_service_listener(&lifecycle_path).await?;
         let grpc = match bind_service_listener(&grpc_path).await {
             Ok(listener) => listener,
@@ -364,9 +509,11 @@ impl WorkspaceServerLease {
                 return Err(error);
             }
         };
+        publish_runtime_record(&runtime_path);
         Ok(Self {
             lifecycle_path,
             grpc_path,
+            runtime_path,
             lifecycle: Some(lifecycle),
             grpc: Some(grpc),
         })
@@ -377,7 +524,63 @@ impl Drop for WorkspaceServerLease {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.lifecycle_path);
         let _ = std::fs::remove_file(&self.grpc_path);
+        let _ = std::fs::remove_file(&self.runtime_path);
     }
+}
+
+/// Records this process as the owner of the workspace service.
+///
+/// A service that cannot publish its process record still serves clients, so a
+/// write failure only costs `nakode status` its process detail.
+fn publish_runtime_record(runtime_path: &Path) {
+    let record = ServiceRuntimeRecord {
+        pid: std::process::id(),
+        started_at_unix_ms: crate::diagnostics::unix_time_ms(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    match serde_json::to_vec(&record) {
+        Ok(encoded) => {
+            if let Err(error) = write_private_file(runtime_path, &encoded) {
+                eprintln!(
+                    "nakode: could not record the service process at {}: {error}",
+                    runtime_path.display()
+                );
+            }
+        }
+        Err(error) => eprintln!("nakode: could not encode the service process record: {error}"),
+    }
+}
+
+/// Writes a file that only the desktop user can read, matching the sockets and
+/// log it sits beside.
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
+}
+
+fn read_runtime_record(runtime_path: &Path) -> Option<ServiceRuntimeRecord> {
+    let encoded = std::fs::read(runtime_path).ok()?;
+    serde_json::from_slice(&encoded).ok()
+}
+
+/// Returns the process record published by this workspace's service.
+///
+/// An absent or unreadable record is reported as `None`: it only costs the
+/// caller a process detail, never correctness.
+///
+/// # Errors
+/// Returns an error when the platform data directory cannot be prepared.
+#[must_use]
+pub fn service_runtime_record(paths: &ServicePaths) -> Option<ServiceRuntimeRecord> {
+    read_runtime_record(paths.runtime())
 }
 
 /// Reports whether a bound socket path is still served by a live listener.
@@ -485,17 +688,20 @@ async fn running_configuration_at(service_path: &Path) -> Result<String, Control
     }
 }
 
-async fn ensure_service(executable: &Path, config: &Config) -> Result<(), ControlError> {
-    let service_path = service_socket_path(&config.workspace)?;
-    ensure_service_at(&service_path, executable, config).await
-}
-
-async fn ensure_service_at(
-    service_path: &Path,
+async fn ensure_service(
+    paths: &ServicePaths,
     executable: &Path,
     config: &Config,
 ) -> Result<(), ControlError> {
-    match ping_at(service_path, config).await {
+    ensure_service_at(paths, executable, config).await
+}
+
+async fn ensure_service_at(
+    service_path: &ServicePaths,
+    executable: &Path,
+    config: &Config,
+) -> Result<(), ControlError> {
+    match ping_at(service_path.lifecycle(), config).await {
         Ok(()) => return Ok(()),
         Err(ControlError::ConfigurationMismatch) => {
             return Err(ControlError::ConfigurationMismatch);
@@ -503,36 +709,68 @@ async fn ensure_service_at(
         Err(_) => {}
     }
 
-    let mut child = service_command(executable, config)
-        .spawn()
-        .map_err(ControlError::SpawnService)?;
+    let mut command = service_command(executable, config);
+    capture_service_output(&mut command, service_path.log());
+    let mut child = command.spawn().map_err(ControlError::SpawnService)?;
     tokio::spawn(async move {
         let _ = child.wait().await;
     });
 
     for _ in 0..SERVICE_START_ATTEMPTS {
         tokio::time::sleep(SERVICE_START_RETRY).await;
-        if ping_at(service_path, config).await.is_ok() {
+        if ping_at(service_path.lifecycle(), config).await.is_ok() {
             return Ok(());
         }
     }
     Err(ControlError::ServiceStartup(
-        service_path.display().to_string(),
+        service_path.lifecycle().display().to_string(),
     ))
 }
 
 fn service_command(executable: &Path, config: &Config) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(executable);
-    command
-        .args(service_arguments(config))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.args(service_arguments(config)).stdin(Stdio::null());
     detach_service_process(&mut command);
     for key in RESUME_ENVIRONMENT_KEYS {
         command.env_remove(key);
     }
     command
+}
+
+/// Directs a service about to be spawned into this workspace's captured log.
+///
+/// A background service has no terminal, so the log file is the only place its
+/// lifecycle output can go. Standard output and standard error receive
+/// descriptors onto the same appending file description, so the two streams
+/// interleave in write order instead of overwriting each other. A workspace
+/// whose log cannot be opened still gets a service; it only loses `nakode logs`.
+fn capture_service_output(command: &mut tokio::process::Command, log: &Path) {
+    match open_service_log(log) {
+        Ok((log, output, errors)) => {
+            command
+                .stdout(output)
+                .stderr(errors)
+                .env(crate::service_log::LOG_PATH_ENVIRONMENT, log);
+        }
+        Err(error) => {
+            eprintln!("nakode: could not capture service output: {error}");
+            command
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .env_remove(crate::service_log::LOG_PATH_ENVIRONMENT);
+        }
+    }
+}
+
+fn open_service_log(log: &Path) -> Result<(PathBuf, Stdio, Stdio), ControlError> {
+    let log = log.to_path_buf();
+    crate::service_log::rotate_if_oversized(&log).map_err(|source| socket_error(&log, source))?;
+    let file =
+        crate::service_log::open_for_append(&log).map_err(|source| socket_error(&log, source))?;
+    let errors = file
+        .try_clone()
+        .map_err(|source| socket_error(&log, source))?;
+    Ok((log, Stdio::from(file), Stdio::from(errors)))
 }
 
 #[cfg(unix)]
@@ -585,7 +823,6 @@ fn service_arguments(config: &Config) -> Vec<OsString> {
         arguments.push(OsString::from("--soul"));
         arguments.push(soul.as_os_str().to_owned());
     }
-    arguments.push(OsString::from("service"));
     arguments.push(OsString::from("run"));
     arguments
 }
@@ -614,9 +851,13 @@ fn service_configuration_fingerprint(config: &Config) -> String {
     format!("{:x}", digest.finalize())
 }
 
-async fn ensure_api_service(executable: &Path, config: &Config) -> Result<PathBuf, ControlError> {
-    let api_path = grpc_service_socket_path(&config.workspace)?;
-    ensure_service(executable, config).await?;
+async fn ensure_api_service(
+    paths: &ServicePaths,
+    executable: &Path,
+    config: &Config,
+) -> Result<PathBuf, ControlError> {
+    let api_path = paths.api().to_path_buf();
+    ensure_service(paths, executable, config).await?;
     for _ in 0..SERVICE_START_ATTEMPTS {
         if api_ready(&api_path, &config.workspace).await {
             return Ok(api_path);
@@ -642,10 +883,9 @@ pub async fn frontend_api_endpoint(
     executable: &Path,
     config: &Config,
 ) -> Result<PathBuf, ControlError> {
-    let lifecycle_path = service_socket_path(&config.workspace)?;
-    let api_path = grpc_service_socket_path(&config.workspace)?;
-    frontend_api_endpoint_at(&lifecycle_path, &api_path, &config.workspace, || {
-        ensure_api_service(executable, config)
+    let paths = ServicePaths::of(config)?;
+    frontend_api_endpoint_at(paths.lifecycle(), paths.api(), &config.workspace, || {
+        ensure_api_service(&paths, executable, config)
     })
     .await
 }
@@ -730,13 +970,113 @@ async fn api_ready(path: &Path, workspace: &Path) -> bool {
 ///
 /// # Errors
 /// Returns an error when lifecycle state cannot be read reliably.
-pub async fn service_status(workspace: &Path) -> Result<ServiceStatus, ControlError> {
-    let service_path = service_socket_path(workspace)?;
-    let running = service_running_at(&service_path).await?;
+pub async fn service_status(config: &Config) -> Result<ServiceStatus, ControlError> {
+    let paths = ServicePaths::of(config)?;
+    let running = service_running_at(paths.lifecycle()).await?;
+    let record = if running {
+        read_runtime_record(paths.runtime())
+    } else {
+        None
+    };
+    let now = crate::diagnostics::unix_time_ms();
+    let server = if running {
+        server_report(paths.api()).await
+    } else {
+        None
+    };
     Ok(ServiceStatus {
         running,
-        workspace: workspace.to_path_buf(),
+        workspace: config.workspace.clone(),
+        nakode_version: env!("CARGO_PKG_VERSION").to_owned(),
+        pid: record.as_ref().map(|record| record.pid),
+        started_at_unix_ms: record.as_ref().map(|record| record.started_at_unix_ms),
+        started_at_utc: record
+            .as_ref()
+            .map(|record| format_utc_timestamp(record.started_at_unix_ms)),
+        uptime_seconds: record
+            .as_ref()
+            .map(|record| now.saturating_sub(record.started_at_unix_ms) / 1_000),
+        endpoint: paths.api().to_path_buf(),
+        lifecycle_socket: paths.lifecycle().to_path_buf(),
+        log: paths.log().to_path_buf(),
+        server,
     })
+}
+
+/// Reads API identity from a running service without starting one.
+///
+/// Status reporting must never bring a service up, so an unreachable or
+/// still-starting API is reported as absent rather than retried.
+async fn server_report(api_path: &Path) -> Option<ServerReport> {
+    let query = async {
+        let client = nakode_sdk::NakodeClient::connect_unix(api_path.to_owned())
+            .await
+            .ok()?;
+        let info = client.get_server_info().await.ok()?;
+        Some(ServerReport {
+            server_version: info.server_version,
+            api_version: info.api_version,
+            capabilities: info.capabilities,
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), query)
+        .await
+        .ok()
+        .flatten()
+}
+
+fn format_utc_timestamp(unix_ms: u64) -> String {
+    let day = crate::diagnostics::format_utc_day(crate::diagnostics::day_number(unix_ms));
+    let seconds_of_day = (unix_ms / 1_000) % 86_400;
+    format!(
+        "{day}T{:02}:{:02}:{:02}Z",
+        seconds_of_day / 3_600,
+        (seconds_of_day % 3_600) / 60,
+        seconds_of_day % 60
+    )
+}
+
+/// Starts the workspace service in the background when it is not already
+/// running, and waits until it accepts connections.
+///
+/// # Errors
+/// Returns an error when the service cannot be started, or when a service is
+/// already running with conflicting server-owned configuration.
+pub async fn start_service(
+    executable: &Path,
+    config: &Config,
+) -> Result<StartOutcome, ControlError> {
+    let paths = ServicePaths::of(config)?;
+    if ping_at(paths.lifecycle(), config).await.is_ok() {
+        return Ok(StartOutcome::AlreadyRunning);
+    }
+    ensure_api_service(&paths, executable, config).await?;
+    Ok(StartOutcome::Started)
+}
+
+/// Stops the workspace service and waits until it releases its sockets.
+///
+/// # Errors
+/// Returns an error when a live service rejects the request or keeps its
+/// sockets after acknowledging shutdown.
+pub async fn stop_service(paths: &ServicePaths) -> Result<StopOutcome, ControlError> {
+    if !service_running_at(paths.lifecycle()).await? {
+        // An unclean exit can leave socket files behind without a service.
+        let _ = std::fs::remove_file(paths.lifecycle());
+        let _ = std::fs::remove_file(paths.api());
+        let _ = std::fs::remove_file(paths.runtime());
+        return Ok(StopOutcome::AlreadyStopped);
+    }
+    shutdown_service(paths).await?;
+    for _ in 0..SERVICE_STOP_ATTEMPTS {
+        if !paths.lifecycle().exists() && !paths.api().exists() {
+            return Ok(StopOutcome::Stopped);
+        }
+        tokio::time::sleep(SERVICE_START_RETRY).await;
+    }
+    Err(ControlError::ServiceShutdown(
+        paths.lifecycle().display().to_string(),
+    ))
 }
 
 async fn service_running_at(service_path: &Path) -> Result<bool, ControlError> {
@@ -761,39 +1101,37 @@ async fn service_running_at(service_path: &Path) -> Result<bool, ControlError> {
 /// Returns an error when the current service cannot be stopped or its
 /// replacement cannot be started.
 pub async fn restart_service(executable: &Path, config: &Config) -> Result<(), ControlError> {
-    let status = service_status(&config.workspace).await?;
-    let lifecycle_path = service_socket_path(&config.workspace)?;
-    let api_path = grpc_service_socket_path(&config.workspace)?;
-    shutdown_service(&config.workspace).await?;
+    let paths = ServicePaths::of(config)?;
+    let running = service_running_at(paths.lifecycle()).await?;
+    shutdown_service(&paths).await?;
 
-    if status.running {
+    if running {
         for _ in 0..SERVICE_STOP_ATTEMPTS {
-            if !lifecycle_path.exists() && !api_path.exists() {
-                return ensure_service(executable, config).await;
+            if !paths.lifecycle().exists() && !paths.api().exists() {
+                return ensure_service(&paths, executable, config).await;
             }
             tokio::time::sleep(SERVICE_START_RETRY).await;
         }
         return Err(ControlError::ServiceShutdown(
-            lifecycle_path.display().to_string(),
+            paths.lifecycle().display().to_string(),
         ));
     }
 
     // A stopped process can leave socket files behind after an unclean exit.
-    let _ = std::fs::remove_file(&lifecycle_path);
-    let _ = std::fs::remove_file(api_path);
-    ensure_service(executable, config).await
+    let _ = std::fs::remove_file(paths.lifecycle());
+    let _ = std::fs::remove_file(paths.api());
+    ensure_service(&paths, executable, config).await
 }
 
 /// Stops the workspace server if one is currently running.
 ///
 /// # Errors
 /// Returns an error when a live server rejects or cannot read the request.
-pub async fn shutdown_service(workspace: &Path) -> Result<(), ControlError> {
-    let service_path = service_socket_path(workspace)?;
-    if !service_path.exists() {
+pub async fn shutdown_service(paths: &ServicePaths) -> Result<(), ControlError> {
+    if !paths.lifecycle().exists() {
         return Ok(());
     }
-    match expect_ok(&service_path, &LifecycleRequest::Shutdown).await {
+    match expect_ok(paths.lifecycle(), &LifecycleRequest::Shutdown).await {
         Ok(()) => Ok(()),
         Err(ControlError::Io { source, .. })
             if matches!(
@@ -801,7 +1139,7 @@ pub async fn shutdown_service(workspace: &Path) -> Result<(), ControlError> {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            let _ = std::fs::remove_file(service_path);
+            let _ = std::fs::remove_file(paths.lifecycle());
             Ok(())
         }
         Err(error) => Err(error),
@@ -923,13 +1261,12 @@ fn remove_stale_socket(path: &Path) -> std::io::Result<bool> {
 /// # Errors
 /// Returns an error when the service is not reachable or rejects the request.
 pub async fn transport_action(
-    workspace: &Path,
+    paths: &ServicePaths,
     name: &str,
     action: TransportAction,
 ) -> Result<TransportStatus, ControlError> {
-    let service_path = service_socket_path(workspace)?;
     match exchange(
-        &service_path,
+        paths.lifecycle(),
         &LifecycleRequest::Transport {
             name: name.to_owned(),
             action,
@@ -945,6 +1282,7 @@ pub async fn transport_action(
     }
 }
 
+/// Returns the private directory holding all workspace service runtimes.
 fn control_directory() -> Result<PathBuf, ControlError> {
     let directory = if let Some(configured) = std::env::var_os("NAKODE_CONTROL_DIR") {
         PathBuf::from(configured)
@@ -968,27 +1306,7 @@ fn prepare_private_directory(directory: &Path) -> Result<(), ControlError> {
     Ok(())
 }
 
-/// Returns the private lifecycle socket for one canonical workspace.
-///
-/// # Errors
-/// Returns an error when the platform data directory cannot be prepared.
-pub fn service_socket_path(workspace: &Path) -> Result<PathBuf, ControlError> {
-    Ok(workspace_control_directory(workspace)?.join("c.sock"))
-}
-
-/// Returns the socket implementing the generated Nakode API.
-///
-/// # Errors
-/// Returns an error when the platform data directory cannot be prepared.
-pub fn grpc_service_socket_path(workspace: &Path) -> Result<PathBuf, ControlError> {
-    Ok(workspace_control_directory(workspace)?.join("api.sock"))
-}
-
-fn workspace_control_directory(workspace: &Path) -> Result<PathBuf, ControlError> {
-    workspace_control_directory_in(&control_directory()?, workspace)
-}
-
-fn workspace_control_directory_in(
+fn workspace_runtime_directory_in(
     control_root: &Path,
     workspace: &Path,
 ) -> Result<PathBuf, ControlError> {
@@ -1029,12 +1347,12 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::{
-        ControlError, LifecycleRequest, LifecycleResponse, RESUME_ENVIRONMENT_KEYS,
+        ControlError, LifecycleRequest, LifecycleResponse, RESUME_ENVIRONMENT_KEYS, ServicePaths,
         TransportAction, TransportController, TransportStatus, TransportSupervisor, UnixListener,
         bind_service_listener, detach_service_process, ensure_service_at, exchange, expect_ok,
         frontend_api_endpoint_at, ping_at, run_lifecycle_listener, service_arguments,
         service_command, service_configuration_fingerprint, service_running_at,
-        shutdown_all_services_in, workspace_control_directory_in,
+        shutdown_all_services_in, workspace_runtime_directory_in,
     };
     use crate::config::{Config, OpenAiReasoningEffort};
 
@@ -1092,6 +1410,7 @@ mod tests {
     fn config_for(workspace: &Path) -> Config {
         Config {
             command: None,
+            tui: false,
             update: false,
             workspace: workspace.to_path_buf(),
             model: None,
@@ -1110,6 +1429,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let config = Config {
             command: None,
+            tui: false,
             update: false,
             workspace: workspace.path().to_path_buf(),
             model: Some("openai-codex/gpt-5".to_owned()),
@@ -1154,7 +1474,6 @@ mod tests {
                 .join("SOUL.md")
                 .to_string_lossy()
                 .into_owned(),
-            "service".to_owned(),
             "run".to_owned(),
         ];
         assert_eq!(rendered, expected);
@@ -1214,11 +1533,11 @@ mod tests {
         let first_workspace = tempfile::tempdir().expect("first workspace");
         let second_workspace = tempfile::tempdir().expect("second workspace");
 
-        let first = workspace_control_directory_in(root.path(), first_workspace.path())
+        let first = workspace_runtime_directory_in(root.path(), first_workspace.path())
             .expect("first path");
-        let repeated = workspace_control_directory_in(root.path(), first_workspace.path())
+        let repeated = workspace_runtime_directory_in(root.path(), first_workspace.path())
             .expect("repeated path");
-        let second = workspace_control_directory_in(root.path(), second_workspace.path())
+        let second = workspace_runtime_directory_in(root.path(), second_workspace.path())
             .expect("second path");
 
         assert_eq!(first, repeated);
@@ -1397,7 +1716,8 @@ mod tests {
     #[tokio::test]
     async fn strict_startup_refuses_a_live_server_with_conflicting_configuration() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let lifecycle_path = directory.path().join("lifecycle.sock");
+        let paths = ServicePaths::in_directory(directory.path());
+        let lifecycle_path = paths.lifecycle().to_path_buf();
         let listener = bind_service_listener(&lifecycle_path)
             .await
             .expect("lifecycle listener");
@@ -1416,13 +1736,9 @@ mod tests {
             .await
         });
 
-        let error = ensure_service_at(
-            &lifecycle_path,
-            Path::new("/missing/nakode"),
-            &default_config,
-        )
-        .await
-        .expect_err("conflicting live service must not be replaced");
+        let error = ensure_service_at(&paths, Path::new("/missing/nakode"), &default_config)
+            .await
+            .expect_err("conflicting live service must not be replaced");
         assert!(matches!(error, ControlError::ConfigurationMismatch));
 
         expect_ok(&lifecycle_path, &LifecycleRequest::Shutdown)

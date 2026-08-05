@@ -34,6 +34,8 @@ pub mod searchable_dropdown;
 pub mod selection;
 pub mod server;
 pub mod service;
+pub mod service_cli;
+pub mod service_log;
 pub mod session;
 pub mod settings;
 mod shell;
