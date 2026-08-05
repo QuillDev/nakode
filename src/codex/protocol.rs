@@ -288,6 +288,7 @@ pub fn parse_models(result: &Value) -> Vec<ModelInfo> {
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 id,
+                capabilities: super::model_capabilities(),
             })
         })
         .collect()

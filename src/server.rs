@@ -2308,7 +2308,7 @@ mod tests {
         agent::{AgentCatalog, AgentDefinition},
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendIdentity, BackendOperation,
-            CODEX_PROVIDER, CapabilitySupport, ModelInfo, PromptImage,
+            CODEX_PROVIDER, CapabilitySupport, ModelCapabilities, ModelInfo, PromptImage,
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         service::ServiceEngine,
@@ -2417,11 +2417,17 @@ mod tests {
                     provider: CODEX_PROVIDER.to_owned(),
                     id: "model-a".to_owned(),
                     is_default: true,
+                    capabilities: ModelCapabilities {
+                        reasoning_efforts: vec!["high".to_owned()],
+                    },
                 },
                 ModelInfo {
                     provider: CODEX_PROVIDER.to_owned(),
                     id: "model-b".to_owned(),
                     is_default: false,
+                    capabilities: ModelCapabilities {
+                        reasoning_efforts: vec!["high".to_owned()],
+                    },
                 },
             ]),
         );
@@ -3719,11 +3725,13 @@ first_message = "Starting review"
                     provider: CODEX_PROVIDER.to_owned(),
                     id: "model-a".to_owned(),
                     is_default: true,
+                    capabilities: crate::codex::model_capabilities(),
                 },
                 ModelInfo {
                     provider: CODEX_PROVIDER.to_owned(),
                     id: "model-b".to_owned(),
                     is_default: false,
+                    capabilities: crate::codex::model_capabilities(),
                 },
             ]),
         );
@@ -3807,11 +3815,13 @@ first_message = "Starting review"
                     provider: CODEX_PROVIDER.to_owned(),
                     id: "model-a".to_owned(),
                     is_default: true,
+                    capabilities: crate::codex::model_capabilities(),
                 },
                 ModelInfo {
                     provider: CODEX_PROVIDER.to_owned(),
                     id: "model-b".to_owned(),
                     is_default: false,
+                    capabilities: crate::codex::model_capabilities(),
                 },
             ]),
         );

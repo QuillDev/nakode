@@ -102,11 +102,24 @@ pub struct ModelOptions {
     pub fast_mode: bool,
 }
 
+/// Provider-reported capabilities for one concrete model.
+///
+/// These live with the catalogue entry rather than with a provider name so that
+/// consumers can render and validate model options without knowing which
+/// backend supplied them. New capabilities can be added without another
+/// persistence migration because the catalogue stores this object as JSON.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInfo {
     pub provider: String,
     pub id: String,
     pub is_default: bool,
+    pub capabilities: ModelCapabilities,
 }
 
 impl ModelInfo {
