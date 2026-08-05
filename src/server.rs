@@ -664,27 +664,60 @@ impl ServerCore {
 
     /// Removes a logical session and everything persisted beneath it.
     ///
-    /// Unlike every other session command this one does NOT `ensure_session`: the sessions worth
-    /// deleting are the ones nobody has open, and requiring an attached engine would mean loading a
-    /// conversation into memory in order to throw it away.
+    /// Unlike every other session command this one does NOT `ensure_session`: requiring an attached
+    /// engine would mean loading a conversation into memory in order to throw it away.
     ///
-    /// An ATTACHED session is refused instead, and the two reasons are told apart because they need
-    /// different actions from the caller. Work in flight must be cancelled; an idle session that some
-    /// client is projecting must be closed. Deleting either would leave a frontend rendering a session
-    /// whose persistence has gone, and interrupting inference is `CancelSessionWork`'s job, not a
-    /// cleanup command's.
+    /// **Deletion is authoritative, so an attached session is CLOSED here rather than refused.** This
+    /// command used to answer an attached session with "close it before deleting it", which named an
+    /// operation that does not exist: there is no `CloseSession` in the protocol, and nothing else
+    /// evicts an engine. Every session ever created or opened therefore stayed attached for the life
+    /// of the process and became permanently undeletable — the dead sessions that piled up in the
+    /// store. Doing the close internally is what makes the caller's request satisfiable at all.
+    ///
+    /// The one refusal left is a session genuinely still working, which the proto documents and which
+    /// `CancelSessionWork` is the verb for — deleting mid-inference would drop the history a live
+    /// provider child is still writing. That test reads liveness as well as busyness on purpose: a
+    /// backend that died mid-turn can leave `is_busy` true forever (see `provider_is_live`), and the
+    /// old code refused those too, with a cancel that could never land.
     fn delete_session_command(&mut self, session_id: &SessionId) -> DomainCommandOutcome {
-        if let Some(engine) = self.sessions_by_id.get(session_id) {
-            return Err(DomainCommandError::Conflict(if engine.state().is_busy() {
-                format!("session {session_id} has work in flight; cancel it before deleting it")
-            } else {
-                format!("session {session_id} is open; close it before deleting it")
-            }));
+        let working = self.sessions_by_id.get(session_id).map(|engine| {
+            let state = engine.state();
+            state.is_busy() && state.provider_is_live()
+        });
+        let mut effects = Vec::new();
+        if let Some(working) = working {
+            if working {
+                return Err(DomainCommandError::Conflict(format!(
+                    "session {session_id} has work in flight; cancel it before deleting it"
+                )));
+            }
+            // The default session's engine backs three `expect`s and its revision is one clients are
+            // forbidden to see regress, so it is the one engine that may not be evicted. Refused by
+            // name rather than half-deleted, which is what deleting the row under a live engine is.
+            if *session_id == self.default_session {
+                return Err(DomainCommandError::Conflict(format!(
+                    "session {session_id} is this workspace's initial session and cannot be deleted"
+                )));
+            }
+            effects.push(Effect::ReleaseSessionBackends(session_id.to_string()));
+            self.release_session(session_id);
         }
-        Ok(Self::accepted(
-            Some(session_id.to_string()),
-            vec![Effect::DeleteSession(session_id.to_string())],
-        ))
+        effects.push(Effect::DeleteSession(session_id.to_string()));
+        Ok(Self::accepted(Some(session_id.to_string()), effects))
+    }
+
+    /// Drops one session's in-memory engine and the projection kept for its subscribers.
+    ///
+    /// The only eviction path there is. `sessions_by_id` and `published_sessions` were insert-only,
+    /// so both grew with every session for the life of the process, each retaining a whole
+    /// `DomainState` — transcript, entries, subagents and all. Deletion is what frees them.
+    fn release_session(&mut self, session_id: &SessionId) {
+        debug_assert_ne!(
+            session_id, &self.default_session,
+            "the default session runtime always exists"
+        );
+        self.sessions_by_id.remove(session_id);
+        self.published_sessions.remove(session_id);
     }
 
     fn compact_context_command(
@@ -3878,46 +3911,126 @@ first_message = "Starting review"
             && model.is_default));
     }
 
-    /// The three states a delete can be asked for, and the one that is allowed.
+    /// Stages one non-default session and returns its id.
     ///
-    /// An unattached session is the deletable one — and it is the only one a cleanup screen ever lists.
-    /// An attached session is refused twice over, with the reason distinguished, because "cancel the turn"
-    /// and "close the session" are different next actions and one message covering both would tell the
-    /// caller to do the wrong one half the time.
-    #[test]
-    fn deleting_a_session_is_refused_while_it_is_attached() {
-        let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
-        state.handle_provider_backend(
-            CODEX_PROVIDER,
-            BackendEvent::SessionCreated {
-                provider_session_id: "provider-session".to_owned(),
-                model: "model-a".to_owned(),
-            },
-        );
-        let attached = SessionId::from(state.nakode_session_id.clone());
-        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+    /// Non-default deliberately: the default session's engine may not be evicted, so a lifecycle
+    /// assertion made on it would pass for the wrong reason.
+    fn attached_session(core: &mut ServerCore) -> SessionId {
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let accepted = create_default_session(core, &workspace_id).expect("a session is created");
+        SessionId::from(
+            accepted
+                .0
+                .resource_id
+                .expect("a created session names itself"),
+        )
+    }
 
-        // Idle but open: some client is projecting it, so deleting it would pull the session out from
-        // under a rendered view. Closing it is the caller's next move.
+    /// A session whose backend has gone can be deleted, without any close first.
+    ///
+    /// This is the defect: `DeleteSession` used to answer an attached session with "close it before
+    /// deleting it", and there is no `CloseSession` in the protocol to answer that with. Nothing
+    /// evicted an engine either, so a session stayed attached for the life of the process and the
+    /// refusal was permanent. A dead session was therefore undeletable forever.
+    #[test]
+    fn a_dead_session_that_was_never_closed_is_deletable() {
+        let (mut core, _) = ready_codex_server();
+        let dead = attached_session(&mut core);
+        core.engine_for_mut(&dead)
+            .expect("session runtime")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::Disconnected {
+                    reason: "provider exited".to_owned(),
+                },
+            );
+
         let (result, effects, _, _) = core.execute_idempotent(
-            IdempotencyKey::from("delete-open"),
+            IdempotencyKey::from("delete-dead"),
             None,
             false,
             Command::DeleteSession {
-                session_id: attached.clone(),
+                session_id: dead.clone(),
             },
         );
-        let error = result.expect_err("an open session is not deletable");
-        assert!(
-            error.message.contains("is open"),
-            "expected the open-session refusal, got: {}",
-            error.message
-        );
-        assert!(effects.is_empty(), "a refused delete performs no effect");
 
-        // Now mid-turn. Cancelling is a different verb and this command must not become a way to reach it.
-        core.engine_for_mut(&attached)
+        let accepted = result.expect("a dead session is deletable without a close first");
+        assert_eq!(accepted.resource_id.as_deref(), Some(dead.as_str()));
+        // The backend is released BEFORE the history it was writing to is removed.
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    crate::state::Effect::ReleaseSessionBackends(released),
+                    crate::state::Effect::DeleteSession(deleted),
+                ] if released == dead.as_str() && deleted == dead.as_str()
+            ),
+            "expected release-then-delete, got: {effects:?}"
+        );
+        assert!(
+            core.engine_for(&dead).is_none(),
+            "deleting a session must evict its engine"
+        );
+    }
+
+    /// A session stuck busy behind a dead backend is deletable too.
+    ///
+    /// `handle_disconnected` drops the turn but never marks a running subagent stopped, so `is_busy`
+    /// stays true for good. Refusing this one for "work in flight" asked the caller to cancel work
+    /// that nothing was doing, which is the second way a dead session became permanently stuck.
+    #[test]
+    fn a_session_stuck_busy_behind_a_dead_backend_is_deletable() {
+        let (mut core, _) = ready_codex_server();
+        let dead = attached_session(&mut core);
+        {
+            let state = core
+                .engine_for_mut(&dead)
+                .expect("session runtime")
+                .state_mut();
+            state.subagents.push(crate::state::SubagentRun {
+                id: "run-1".to_owned(),
+                agent: "reviewer".to_owned(),
+                provider: CODEX_PROVIDER.to_owned(),
+                provider_session_id: None,
+                objective: "review the diff".to_owned(),
+                status: crate::session::SubagentStatus::Working,
+                latest_activity: String::new(),
+            });
+            state.handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::Disconnected {
+                    reason: "provider exited".to_owned(),
+                },
+            );
+            assert!(
+                state.is_busy(),
+                "the stuck-busy state this test exists for did not reproduce"
+            );
+        }
+
+        let (result, _, _, _) = core.execute_idempotent(
+            IdempotencyKey::from("delete-stuck"),
+            None,
+            false,
+            Command::DeleteSession {
+                session_id: dead.clone(),
+            },
+        );
+
+        result.expect("a session with no backend behind it has no work to cancel");
+        assert!(core.engine_for(&dead).is_none());
+    }
+
+    /// A session actually working is still refused, and cancelling is still its verb.
+    ///
+    /// The proto documents this refusal. Deleting mid-inference would drop the history a live provider
+    /// child is still writing to, so this command must not become a way to reach `CancelSessionWork`.
+    #[test]
+    fn deleting_a_working_session_is_refused() {
+        let (mut core, _) = ready_codex_server();
+        let working = attached_session(&mut core);
+        core.engine_for_mut(&working)
             .expect("session runtime")
             .state_mut()
             .handle_provider_backend(
@@ -3926,20 +4039,127 @@ first_message = "Starting review"
                     turn_id: "provider-turn".to_owned(),
                 },
             );
-        let (result, _, _, _) = core.execute_idempotent(
+
+        let (result, effects, _, _) = core.execute_idempotent(
             IdempotencyKey::from("delete-busy"),
             None,
             false,
             Command::DeleteSession {
-                session_id: attached.clone(),
+                session_id: working.clone(),
             },
         );
+
         let error = result.expect_err("a working session is not deletable");
         assert!(
             error.message.contains("work in flight"),
             "expected the in-flight refusal, got: {}",
             error.message
         );
+        assert!(effects.is_empty(), "a refused delete performs no effect");
+        assert!(
+            core.engine_for(&working).is_some(),
+            "a refused delete must not evict anything"
+        );
+    }
+
+    /// The workspace's initial session is refused by name.
+    ///
+    /// Its engine backs three `expect`s and its revision is one clients may not see regress, so it is
+    /// the one session that cannot be evicted. Saying so beats deleting the row from under a live
+    /// engine, which is what the old "close it first" message amounted to here.
+    #[test]
+    fn deleting_the_initial_session_is_refused_with_its_reason() {
+        let (mut core, default_session) = ready_codex_server();
+
+        let (result, effects, _, _) = core.execute_idempotent(
+            IdempotencyKey::from("delete-default"),
+            None,
+            false,
+            Command::DeleteSession {
+                session_id: default_session.clone(),
+            },
+        );
+
+        let error = result.expect_err("the initial session is not deletable");
+        assert!(
+            error.message.contains("initial session"),
+            "expected the initial-session refusal, got: {}",
+            error.message
+        );
+        assert!(effects.is_empty());
+        assert!(core.engine_for(&default_session).is_some());
+    }
+
+    /// Session lifecycle does not accumulate engines.
+    ///
+    /// `sessions_by_id` and `published_sessions` were insert-only, so every session ever created or
+    /// opened retained a whole `DomainState` for the life of the process. Repeated create/delete now
+    /// returns to its starting size instead of growing once per cycle.
+    #[test]
+    fn repeated_session_lifecycles_do_not_retain_engines() {
+        let (mut core, _) = ready_codex_server();
+        let engines = core.sessions_by_id.len();
+        let published = core.published_sessions.len();
+
+        for cycle in 0..8 {
+            let session_id = attached_session(&mut core);
+            let (result, _, _, _) = core.execute_idempotent(
+                IdempotencyKey::from(format!("cycle-{cycle}")),
+                None,
+                false,
+                Command::DeleteSession {
+                    session_id: session_id.clone(),
+                },
+            );
+            result.expect("each cycle deletes its own session");
+        }
+
+        assert_eq!(
+            core.sessions_by_id.len(),
+            engines,
+            "engines accumulated across create/delete cycles"
+        );
+        assert_eq!(
+            core.published_sessions.len(),
+            published,
+            "session projections accumulated across create/delete cycles"
+        );
+    }
+
+    /// Deleting the same session twice is safe and says the same thing.
+    ///
+    /// The second call finds nothing attached, which is the already-deleted path. It still accepts, so
+    /// a caller retrying after a partial failure — the engine evicted but the row left behind — can
+    /// finish the job rather than being told the session is open.
+    #[test]
+    fn deleting_a_session_twice_is_accepted_both_times() {
+        let (mut core, _) = ready_codex_server();
+        let session_id = attached_session(&mut core);
+
+        for attempt in 0..2 {
+            let (result, effects, _, _) = core.execute_idempotent(
+                IdempotencyKey::from(format!("delete-again-{attempt}")),
+                None,
+                false,
+                Command::DeleteSession {
+                    session_id: session_id.clone(),
+                },
+            );
+            result.expect("a repeated delete is accepted");
+            assert!(
+                effects
+                    .iter()
+                    .any(|effect| matches!(effect, crate::state::Effect::DeleteSession(id) if id == session_id.as_str())),
+                "every attempt must still reach persistence: {effects:?}"
+            );
+        }
+        assert!(core.engine_for(&session_id).is_none());
+    }
+
+    /// An unattached session deletes with the persistence effect alone.
+    #[test]
+    fn deleting_an_unattached_session_reaches_persistence() {
+        let (mut core, _) = ready_codex_server();
 
         // An id nobody has open is the deletable case, and its effect is the persistence one.
         let closed = SessionId::from("019fcf35-780e-7d21-aa88-c10db392bf63".to_owned());
