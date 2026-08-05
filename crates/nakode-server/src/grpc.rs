@@ -342,7 +342,9 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         input,
         protocol::Command::CreateSession {
             workspace_id: protocol::WorkspaceId::from(input.workspace_id),
-            title: input.title
+            title: input.title,
+            model_id: input.model_id.map(protocol::ModelId::from),
+            options: model_options(input.options)
         }
     );
     command_rpc!(
@@ -1277,6 +1279,7 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         activity: session_activity(value.activity),
         selected_provider_id: value.selected_provider_id.map(|id| id.to_string()),
         selected_model_id: value.selected_model_id.map(|id| id.to_string()),
+        selected_model_options: Some(projected_model_options(value.selected_model_options)),
         active_agent_session: value.active_agent_session.map(agent_session),
         active_turn: value.active_turn.map(turn),
         context_usage: value.context_usage.map(context_usage),
@@ -1297,6 +1300,13 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
                 arguments_json: call.arguments_json,
             })
             .collect(),
+    }
+}
+
+fn projected_model_options(value: protocol::ModelOptions) -> api::ModelOptions {
+    api::ModelOptions {
+        reasoning_effort: value.reasoning_effort,
+        fast_mode: value.fast_mode,
     }
 }
 
@@ -1644,5 +1654,21 @@ fn diagnostics_totals(value: &protocol::DiagnosticsUsageTotals) -> api::Diagnost
         full_tool_output_bytes: value.full_tool_output_bytes,
         model_tool_output_bytes: value.model_tool_output_bytes,
         tool_duration_ms: value.tool_duration_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_session_options_are_projected_to_grpc() {
+        let projected = projected_model_options(protocol::ModelOptions {
+            reasoning_effort: Some("high".to_owned()),
+            fast_mode: true,
+        });
+
+        assert_eq!(projected.reasoning_effort.as_deref(), Some("high"));
+        assert!(projected.fast_mode);
     }
 }

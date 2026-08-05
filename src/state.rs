@@ -4131,7 +4131,7 @@ impl DomainState {
         self.model_options_for_qualified(&model.qualified_id())
     }
 
-    fn selected_model_options(&self) -> ModelOptions {
+    pub(crate) fn selected_model_options(&self) -> ModelOptions {
         if let Some(selected) = self.selected_model.as_deref()
             && let Some((override_model, options)) = &self.session_model_options_override
             && override_model == selected
@@ -7150,6 +7150,7 @@ mod tests {
         personality::PromptAddenda,
         session::{SessionRecord, SubagentRecord},
         skill::SkillCatalog,
+        state::projection,
     };
     use tempfile::tempdir;
 
@@ -7714,6 +7715,59 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 && entry.status == EntryStatus::Failed
         }));
         assert!(!state.status_message.contains("ompaction"));
+    }
+
+    #[test]
+    fn fresh_session_effort_reaches_provider_before_the_first_turn() {
+        let mut state = ready_state();
+        let session_id = nakode_protocol::SessionId::from(state.nakode_session_id.clone());
+        state
+            .select_model_intent(
+                &nakode_protocol::ModelTarget::Session { session_id },
+                &nakode_protocol::ModelId::from("openai-codex/model-a"),
+                &nakode_protocol::ModelOptions {
+                    reasoning_effort: Some("high".to_owned()),
+                    fast_mode: false,
+                },
+            )
+            .expect("model selection");
+
+        let projected = projection::bootstrap(&state, 1, &[], &[])
+            .active_session
+            .expect("active session");
+        assert_eq!(
+            projected.selected_model_options.reasoning_effort.as_deref(),
+            Some("high")
+        );
+
+        let effects = state
+            .submit_prompt("first real prompt".to_owned(), Vec::new())
+            .expect("prompt accepted");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(BackendCommand::StartSession {
+                model: Some(model),
+                ..
+            })] if model == "model-a"
+        ));
+
+        let effects = state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "thread-high".to_owned(),
+            model: "model-a".to_owned(),
+        });
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::PersistSession { .. },
+                Effect::Backend(BackendCommand::SetSessionOptions {
+                    provider_session_id,
+                    options,
+                }),
+                Effect::Backend(BackendCommand::StartTurn { .. })
+            ] if provider_session_id == "thread-high"
+                && options.reasoning_effort.as_deref() == Some("high")
+                && !options.fast_mode
+        ));
     }
 
     #[test]

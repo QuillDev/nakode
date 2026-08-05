@@ -184,6 +184,23 @@ impl NakodeClient {
         workspace_id: impl Into<String>,
         title: Option<String>,
     ) -> Result<String, SdkError> {
+        self.create_session_with_model(workspace_id, title, None, None)
+            .await
+    }
+
+    /// Creates a logical session with an optional provider-qualified initial model and its options.
+    /// The selection is validated and committed atomically with creation, before a first prompt can
+    /// run. Omitting it inherits Nakode's configured provider/model defaults.
+    ///
+    /// # Errors
+    /// Returns a transport, server validation, or missing-identifier error.
+    pub async fn create_session_with_model(
+        &self,
+        workspace_id: impl Into<String>,
+        title: Option<String>,
+        model_id: Option<String>,
+        options: Option<api::ModelOptions>,
+    ) -> Result<String, SdkError> {
         let result = send_mutation!(
             self,
             create_session,
@@ -191,6 +208,8 @@ impl NakodeClient {
                 mutation: Some(mutation(None)),
                 workspace_id: workspace_id.into(),
                 title,
+                model_id,
+                options,
             }
         )?;
         result

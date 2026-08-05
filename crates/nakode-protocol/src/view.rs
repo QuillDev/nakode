@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentSessionId, ArtifactId, EntryId, InteractionId, ModelId, PromptId, ProviderId, RunId,
-    SessionId, TurnId, WorkspaceId,
+    AgentSessionId, ArtifactId, EntryId, InteractionId, ModelId, ModelOptions, PromptId,
+    ProviderId, RunId, SessionId, TurnId, WorkspaceId,
 };
 use crate::{PromptAttachment, RunTextField};
 
@@ -494,6 +494,9 @@ pub struct SessionView {
     pub activity: SessionActivity,
     pub selected_provider_id: Option<ProviderId>,
     pub selected_model_id: Option<ModelId>,
+    /** Effective model options for this logical session, including a session-local override. */
+    #[serde(default)]
+    pub selected_model_options: ModelOptions,
     pub active_agent_session: Option<AgentSessionView>,
     pub active_turn: Option<TurnView>,
     pub context_usage: Option<ContextUsageView>,
@@ -527,6 +530,8 @@ pub struct SessionMetadataView {
     pub activity: SessionActivity,
     pub selected_provider_id: Option<ProviderId>,
     pub selected_model_id: Option<ModelId>,
+    #[serde(default)]
+    pub selected_model_options: ModelOptions,
     pub active_agent_session: Option<AgentSessionView>,
     pub active_turn: Option<TurnView>,
     pub context_usage: Option<ContextUsageView>,

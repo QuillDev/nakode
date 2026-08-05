@@ -500,6 +500,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::MultipleClients,
             ServiceCapability::ArtifactTransfer,
             ServiceCapability::ExternalTools,
+            ServiceCapability::InitialSessionModel,
             ServiceCapability::SessionDeletion,
         ]
         .into_iter()
@@ -2391,7 +2392,11 @@ mod tests {
         );
         let (created, _) = runtime
             .core
-            .create_session_command(&workspace_id)
+            .create_session_command(
+                &workspace_id,
+                None,
+                &nakode_protocol::ModelOptions::default(),
+            )
             .expect("second logical session");
         let second_id = SessionId::from(created.resource_id.expect("second logical session id"));
 

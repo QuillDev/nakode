@@ -381,6 +381,7 @@ mod tests {
             activity: SessionActivity::Idle,
             selected_provider_id: None,
             selected_model_id: None,
+            selected_model_options: nakode_protocol::ModelOptions::default(),
             active_agent_session: None,
             active_turn: None,
             context_usage: None,

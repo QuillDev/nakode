@@ -466,6 +466,13 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
         activity: session_activity(value.activity)?,
         selected_provider_id: value.selected_provider_id.map(view::ProviderId::from),
         selected_model_id: value.selected_model_id.map(view::ModelId::from),
+        selected_model_options: value.selected_model_options.map_or_else(
+            view::ModelOptions::default,
+            |options| view::ModelOptions {
+                reasoning_effort: options.reasoning_effort,
+                fast_mode: options.fast_mode,
+            },
+        ),
         active_agent_session: value.active_agent_session.map(agent_session).transpose()?,
         active_turn: value.active_turn.map(turn).transpose()?,
         context_usage: value.context_usage.map(|usage| view::ContextUsageView {
