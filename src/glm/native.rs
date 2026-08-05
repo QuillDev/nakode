@@ -798,6 +798,7 @@ fn discover_models() -> Vec<DiscoveredModel> {
                 provider: GLM_PROVIDER.to_owned(),
                 id: id.to_owned(),
                 is_default: id == "glm-5.2",
+                capabilities: crate::backend::ModelCapabilities::default(),
             },
             context_window: context_window_for_model(id),
         })

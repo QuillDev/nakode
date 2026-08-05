@@ -853,6 +853,7 @@ async fn discover_models(
                     provider: KIMI_PROVIDER.to_owned(),
                     id: id.to_owned(),
                     is_default: id == "k3-256k",
+                    capabilities: crate::backend::ModelCapabilities::default(),
                 },
                 context_window,
             })

@@ -1053,6 +1053,7 @@ async fn discover_models(
                             .get("is_default")
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
+                        capabilities: super::model_capabilities(),
                     },
                     context_window,
                 })
