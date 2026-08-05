@@ -16,6 +16,7 @@ service NakodeService {
   rpc CreateSession(CreateSessionRequest) returns (MutationResult);
   rpc OpenSession(OpenSessionRequest) returns (MutationResult);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc DeleteSession(DeleteSessionRequest) returns (MutationResult);
   rpc GetSession(GetSessionRequest) returns (SessionSnapshot);
   rpc WatchSession(WatchSessionRequest) returns (stream SessionSnapshot);
   rpc SendPrompt(SendPromptRequest) returns (MutationResult);
@@ -79,6 +80,9 @@ message WorkspaceSnapshot { Cursor cursor = 1; WorkspaceState state = 2; }
 message CreateSessionRequest { MutationOptions mutation = 1; string workspace_id = 2; optional string title = 3; }
 message OpenSessionRequest { MutationOptions mutation = 1; string session_id = 2; }
 message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
+// Removes a logical session and its persisted history. Rejected while the session
+// has work in flight; cancel it first. Requires the `SessionDeletion` capability.
+message DeleteSessionRequest { MutationOptions mutation = 1; string session_id = 2; }
 message ListSessionsResponse { repeated SessionSummary sessions = 1; }
 message GetSessionRequest { string session_id = 1; }
 message WatchSessionRequest { string session_id = 1; optional Cursor after = 2; }

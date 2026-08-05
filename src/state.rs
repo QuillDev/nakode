@@ -808,6 +808,8 @@ pub enum Effect {
         previous_slug: Option<String>,
     },
     DeleteAgent(String),
+    /// Removes a logical session and its persisted history. Routed with the persistence effects.
+    DeleteSession(String),
     ReloadConfiguration,
     #[cfg(test)]
     ResolveSession(String),

@@ -224,6 +224,14 @@ pub enum Command {
         workspace_id: WorkspaceId,
         slug: String,
     },
+    /// Removes a logical session and everything persisted under it.
+    ///
+    /// Terminal and not undoable: the transcript, its runs and their turns all go. A session with work
+    /// in flight is rejected rather than interrupted — cancelling is `CancelSessionWork`, and doing
+    /// both under one verb would make a cleanup command able to stop running inference.
+    DeleteSession {
+        session_id: SessionId,
+    },
     UpdateSettings {
         patch: SettingsPatch,
     },

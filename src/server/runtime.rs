@@ -500,6 +500,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::MultipleClients,
             ServiceCapability::ArtifactTransfer,
             ServiceCapability::ExternalTools,
+            ServiceCapability::SessionDeletion,
         ]
         .into_iter()
         .collect(),
@@ -1081,7 +1082,8 @@ impl EffectExecutor {
             | Effect::PersistSubagent(_)
             | Effect::LoadSubagents(_)
             | Effect::UpdateSessionModel { .. }
-            | Effect::TouchSession(_)) => {
+            | Effect::TouchSession(_)
+            | Effect::DeleteSession(_)) => {
                 execute_persistence_effect(state, sessions, persistence_effect);
             }
             Effect::SaveWebConfig(config) => {
@@ -1231,6 +1233,7 @@ fn execute_persistence_effect(
             update_session_model(state, sessions, &session_id, model.as_deref());
         }
         Effect::TouchSession(id) => touch_session(state, sessions, &id),
+        Effect::DeleteSession(id) => delete_session(state, sessions, &id),
         _ => unreachable!("only persistence effects are routed here"),
     }
 }
@@ -1564,6 +1567,12 @@ fn install_changed_agent_catalog(
 
 fn touch_session(state: &mut DomainState, sessions: &dyn SessionRepository, id: &str) {
     if let Err(error) = sessions.touch(id) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
+fn delete_session(state: &mut DomainState, sessions: &dyn SessionRepository, id: &str) {
+    if let Err(error) = sessions.delete(id) {
         state.session_store_failed(error.to_string());
     }
 }
