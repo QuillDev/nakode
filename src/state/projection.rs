@@ -328,6 +328,7 @@ fn queue_views(state: &DomainState) -> Vec<QueueItemView> {
         .map(|prompt| QueueItemView {
             id: PromptId::from(prompt.id.clone()),
             summary: first_line(&prompt.text),
+            text: prompt.text.clone(),
             attachment_count: u32::try_from(prompt.attachments.len()).unwrap_or(u32::MAX),
         })
         .collect()

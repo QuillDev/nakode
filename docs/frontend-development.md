@@ -73,6 +73,46 @@ Watches emit complete replacements. Frontends never receive Nakode's internal
 domain reducer events. The SDK resumes a watch after transport loss and
 re-hydrates bounded history. Mutation retries reuse the same idempotency key.
 
+## Queued prompt controls
+
+`SessionState.queue` is the complete ordered queue projection. Each item carries
+a stable prompt ID, full semantic text, and attachment metadata. Clients must
+preserve that order and identity, including repeated prompts with identical
+text; text is never an identity or deduplication key.
+
+Queue controls cross the public boundary as one mutation, with the current
+expected session revision and an idempotency key:
+
+- `RemoveQueuedPrompt(session_id, prompt_id)` independently cancels one waiting
+  follow-up.
+- `SteerQueuedPrompt(session_id, prompt_id)` atomically converts one waiting
+  follow-up into provider-native steering for the active turn. It is available
+  only when the server advertises `QueuedPromptSteering`; clients also require
+  steering in the active agent session's provider capabilities.
+
+The server validates the prompt identity, active turn, provider capability,
+absence of another pending steer, and the text-only steering boundary before it
+removes anything. Attachment-bearing prompts are rejected unchanged. After
+validation, the server removes exactly that ID and dispatches one
+`BackendCommand::SteerTurn`. Provider acknowledgement records a steering
+transcript item. Provider refusal or a turn-ending race restores the same
+prompt at its prior queue index, after which ordinary follow-up draining still
+applies.
+
+A frontend may optimistically overlay only operation status, keyed by prompt
+ID. Authoritative IDs, text, and order always come from the latest replacement
+snapshot. Pending controls suppress duplicate clicks; rejection may leave a
+retryable error overlay. A snapshot that no longer contains the ID confirms
+success and removes its overlay. This rule prevents loss and duplication across
+reconnects without creating a client-owned queue.
+
+For the FStack desktop client, `electron/nakode-protobuf.ts` decodes this
+projection, `electron/nakode.ts` owns the typed RPC envelope and capability
+check, and `electron/nakode-agent.ts` applies the status-only overlay before
+publishing the normalized agent snapshot. Renderer controls cross IPC with only
+`sessionId` and `promptId`; they never remove, reorder, or synthesize canonical
+queue rows locally.
+
 ## Local endpoint
 
 `nakode service endpoint` ensures the workspace server exists and prints a

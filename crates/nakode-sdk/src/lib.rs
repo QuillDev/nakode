@@ -331,6 +331,27 @@ impl NakodeClient {
         )
     }
 
+    /// Atomically converts one queued prompt into steering guidance for the active turn.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error. A rejected conversion leaves the prompt queued.
+    pub async fn steer_queued_prompt(
+        &self,
+        session_id: impl Into<String>,
+        prompt_id: impl Into<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<api::MutationResult, SdkError> {
+        send_mutation!(
+            self,
+            steer_queued_prompt,
+            api::SteerQueuedPromptRequest {
+                mutation: Some(mutation(expected_revision)),
+                session_id: session_id.into(),
+                prompt_id: prompt_id.into(),
+            }
+        )
+    }
+
     /// Steers the active native turn.
     ///
     /// # Errors

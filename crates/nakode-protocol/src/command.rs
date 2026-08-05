@@ -158,6 +158,11 @@ pub enum Command {
         session_id: SessionId,
         prompt_id: PromptId,
     },
+    /// Atomically removes one queued prompt and submits its text as steering guidance.
+    SteerQueuedPrompt {
+        session_id: SessionId,
+        prompt_id: PromptId,
+    },
     SteerTurn {
         turn_id: TurnId,
         text: String,

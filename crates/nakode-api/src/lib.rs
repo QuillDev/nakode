@@ -48,6 +48,7 @@ mod tests {
             "SendPrompt",
             "EnqueuePrompt",
             "RemoveQueuedPrompt",
+            "SteerQueuedPrompt",
             "SteerTurn",
             "CancelTurn",
             "CancelSessionWork",

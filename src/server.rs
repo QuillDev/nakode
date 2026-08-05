@@ -387,6 +387,10 @@ impl ServerCore {
                 session_id,
                 prompt_id,
             } => self.remove_queued_prompt_command(&session_id, prompt_id.as_str()),
+            Command::SteerQueuedPrompt {
+                session_id,
+                prompt_id,
+            } => self.steer_queued_prompt_command(&session_id, prompt_id.as_str()),
             Command::SteerTurn { turn_id, text } => self.steer_turn_command(&turn_id, &text),
             Command::CancelTurn { turn_id } => self.cancel_turn_command(&turn_id),
             Command::CancelSessionWork { session_id } => {
@@ -611,6 +615,19 @@ impl ServerCore {
             .session_engine_mut(session_id)?
             .state_mut()
             .remove_queued_prompt(prompt_id)?;
+        Ok(Self::accepted(None, effects))
+    }
+
+    fn steer_queued_prompt_command(
+        &mut self,
+        session_id: &SessionId,
+        prompt_id: &str,
+    ) -> DomainCommandOutcome {
+        self.ensure_session(session_id)?;
+        let effects = self
+            .session_engine_mut(session_id)?
+            .state_mut()
+            .steer_queued_prompt(prompt_id)?;
         Ok(Self::accepted(None, effects))
     }
 
@@ -1714,6 +1731,7 @@ impl ServerCore {
             Command::SendPrompt { session_id, .. }
             | Command::EnqueuePrompt { session_id, .. }
             | Command::RemoveQueuedPrompt { session_id, .. }
+            | Command::SteerQueuedPrompt { session_id, .. }
             | Command::CancelSessionWork { session_id }
             | Command::Delegate { session_id, .. }
             | Command::RunShell { session_id, .. }
