@@ -6387,6 +6387,40 @@ impl DomainState {
         effects
     }
 
+    fn answer_subagent_question(run_id: &str, question_id: String) -> Vec<Effect> {
+        vec![Effect::SubagentBackend {
+            run_id: run_id.to_owned(),
+            command: BackendCommand::ResolveQuestion {
+                id: question_id,
+                answer:
+                    "No interactive user is attached to this subagent; continue with best judgment."
+                        .to_owned(),
+            },
+        }]
+    }
+
+    fn apply_subagent_usage(
+        &mut self,
+        run_id: &str,
+        usage: crate::backend::BackendTokenUsage,
+    ) -> Vec<Effect> {
+        if let Some(execution) = self.subagent_executions.get_mut(run_id) {
+            execution.run.usage = usage;
+        }
+        self.sync_subagent(run_id);
+        Vec::new()
+    }
+
+    fn record_subagent_warning(&mut self, run_id: &str, message: &str) -> Vec<Effect> {
+        self.record_subagent_message(run_id, EntryKind::Warning, "WARNING", message);
+        let Some(execution) = self.subagent_executions.get_mut(run_id) else {
+            return Vec::new();
+        };
+        execution.run.latest_activity = summarize_activity(message, "Provider warning");
+        self.sync_subagent(run_id);
+        Vec::new()
+    }
+
     fn reduce_subagent_backend(&mut self, run_id: &str, event: BackendEvent) -> Vec<Effect> {
         let event = match self.reduce_subagent_compaction_event(run_id, event) {
             Ok(effects) => return effects,
@@ -6421,20 +6455,10 @@ impl DomainState {
                     decision: ApprovalDecision::AcceptForSession,
                 },
             }],
-            BackendEvent::QuestionRequested(request) => vec![Effect::SubagentBackend {
-                run_id: run_id.to_owned(),
-                command: BackendCommand::ResolveQuestion {
-                    id: request.id,
-                    answer: "No interactive user is attached to this subagent; continue with best judgment.".to_owned(),
-                },
-            }],
-            BackendEvent::TokenUsageUpdated { usage } => {
-                if let Some(execution) = self.subagent_executions.get_mut(run_id) {
-                    execution.run.usage = usage;
-                }
-                self.sync_subagent(run_id);
-                Vec::new()
+            BackendEvent::QuestionRequested(request) => {
+                Self::answer_subagent_question(run_id, request.id)
             }
+            BackendEvent::TokenUsageUpdated { usage } => self.apply_subagent_usage(run_id, usage),
             BackendEvent::TurnCompleted { outcome, error, .. } => {
                 self.complete_subagent_turn(run_id, outcome, error)
             }
@@ -6461,13 +6485,7 @@ impl DomainState {
                 Vec::new()
             }
             BackendEvent::Warning(message) | BackendEvent::ProtocolDiagnostic(message) => {
-                self.record_subagent_message(run_id, EntryKind::Warning, "WARNING", &message);
-                let Some(execution) = self.subagent_executions.get_mut(run_id) else {
-                    return Vec::new();
-                };
-                execution.run.latest_activity = summarize_activity(&message, "Provider warning");
-                self.sync_subagent(run_id);
-                Vec::new()
+                self.record_subagent_warning(run_id, &message)
             }
             BackendEvent::Models(_)
             | BackendEvent::AuthenticationChallenge { .. }

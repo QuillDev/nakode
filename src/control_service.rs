@@ -31,6 +31,16 @@ pub struct ServiceStatus {
     pub workspace: PathBuf,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BulkServiceShutdownReport {
+    /// Live workspace services that acknowledged shutdown and released their sockets.
+    pub stopped: usize,
+    /// Stale workspace socket sets removed after no service accepted a connection.
+    pub stale: usize,
+    /// Runtime socket sets that could not be stopped or safely classified.
+    pub failures: Vec<String>,
+}
+
 /// Runtime state reported for a frontend transport.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TransportStatus {
@@ -370,9 +380,24 @@ impl Drop for WorkspaceServerLease {
     }
 }
 
+/// Reports whether a bound socket path is still served by a live listener.
+///
+/// A listener whose owner has just released it can keep completing connections for a short window,
+/// so one successful connect does not distinguish a live server from an already-stale socket.
+/// Confirm with a second probe: a live listener stays connectable, while a released one refuses the
+/// retry. Only a failing connect can classify a socket as dead, so this never steals the path from
+/// a busy server.
+async fn socket_is_live(path: &Path) -> bool {
+    if UnixStream::connect(path).await.is_err() {
+        return false;
+    }
+    tokio::time::sleep(SERVICE_START_RETRY).await;
+    UnixStream::connect(path).await.is_ok()
+}
+
 async fn bind_service_listener(path: &Path) -> Result<UnixListener, ControlError> {
     if path.exists() {
-        if UnixStream::connect(path).await.is_ok() {
+        if socket_is_live(path).await {
             return Err(ControlError::AlreadyRunning(path.display().to_string()));
         }
         std::fs::remove_file(path).map_err(|source| socket_error(path, source))?;
@@ -783,6 +808,115 @@ pub async fn shutdown_service(workspace: &Path) -> Result<(), ControlError> {
     }
 }
 
+/// Stops every discoverable workspace service before global session storage is purged.
+///
+/// Service sockets are the authoritative registry for server processes. A live server owns all of
+/// its provider children, shell processes, delegated runs, and frontend transports; its normal
+/// shutdown path terminates and joins those resources before releasing both sockets. Stale socket
+/// files are removed only when no process accepts the lifecycle connection.
+///
+/// # Errors
+/// Returns an error when the private control directory cannot be enumerated.
+pub async fn shutdown_all_services() -> Result<BulkServiceShutdownReport, ControlError> {
+    shutdown_all_services_in(&control_directory()?).await
+}
+
+async fn shutdown_all_services_in(
+    control_root: &Path,
+) -> Result<BulkServiceShutdownReport, ControlError> {
+    let workspace_root = control_root.join("w");
+    let entries = match std::fs::read_dir(&workspace_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BulkServiceShutdownReport::default());
+        }
+        Err(source) => return Err(socket_error(&workspace_root, source)),
+    };
+    let mut directories = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| socket_error(&workspace_root, source))?;
+        let entry_path = entry.path();
+        if entry
+            .file_type()
+            .map_err(|source| socket_error(&entry_path, source))?
+            .is_dir()
+        {
+            directories.push(entry_path);
+        }
+    }
+    directories.sort_unstable();
+
+    let mut report = BulkServiceShutdownReport::default();
+    for directory in directories {
+        let lifecycle_path = directory.join("c.sock");
+        let api_path = directory.join("api.sock");
+        if !lifecycle_path.exists() && !api_path.exists() {
+            continue;
+        }
+        match expect_ok(&lifecycle_path, &LifecycleRequest::Shutdown).await {
+            Ok(()) => {
+                let mut released = false;
+                for _ in 0..SERVICE_STOP_ATTEMPTS {
+                    if !lifecycle_path.exists() && !api_path.exists() {
+                        released = true;
+                        break;
+                    }
+                    tokio::time::sleep(SERVICE_START_RETRY).await;
+                }
+                if released {
+                    report.stopped += 1;
+                } else {
+                    report.failures.push(format!(
+                        "service at {} acknowledged shutdown but retained runtime sockets",
+                        directory.display()
+                    ));
+                }
+            }
+            Err(ControlError::Io { source, .. })
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                if api_path.exists() && socket_is_live(&api_path).await {
+                    report.failures.push(format!(
+                        "runtime API at {} is still active without a lifecycle service",
+                        directory.display()
+                    ));
+                    continue;
+                }
+                let lifecycle_removed = remove_stale_socket(&lifecycle_path);
+                let api_removed = remove_stale_socket(&api_path);
+                match (lifecycle_removed, api_removed) {
+                    (Ok(_), Ok(_)) => report.stale += 1,
+                    (lifecycle, api) => report.failures.push(format!(
+                        "could not clear stale runtime sockets at {}: {}{}",
+                        directory.display(),
+                        lifecycle
+                            .err()
+                            .map_or_else(String::new, |error| error.to_string()),
+                        api.err()
+                            .map_or_else(String::new, |error| format!("; {error}"))
+                    )),
+                }
+            }
+            Err(error) => report.failures.push(format!(
+                "could not stop service at {}: {error}",
+                directory.display()
+            )),
+        }
+    }
+    Ok(report)
+}
+
+fn remove_stale_socket(path: &Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Controls one frontend transport in a running workspace service without
 /// changing the native server lifecycle.
 ///
@@ -892,14 +1026,15 @@ mod tests {
     };
 
     use futures_util::future::BoxFuture;
+    use tokio::io::AsyncWriteExt;
 
     use super::{
         ControlError, LifecycleRequest, LifecycleResponse, RESUME_ENVIRONMENT_KEYS,
-        TransportAction, TransportController, TransportStatus, TransportSupervisor,
+        TransportAction, TransportController, TransportStatus, TransportSupervisor, UnixListener,
         bind_service_listener, detach_service_process, ensure_service_at, exchange, expect_ok,
         frontend_api_endpoint_at, ping_at, run_lifecycle_listener, service_arguments,
         service_command, service_configuration_fingerprint, service_running_at,
-        workspace_control_directory_in,
+        shutdown_all_services_in, workspace_control_directory_in,
     };
     use crate::config::{Config, OpenAiReasoningEffort};
 
@@ -1298,6 +1433,68 @@ mod tests {
             .expect("lifecycle stops promptly")
             .expect("lifecycle task")
             .expect("lifecycle result");
+    }
+
+    #[tokio::test]
+    async fn bulk_shutdown_handles_live_stale_and_failed_runtime_sets_deterministically() {
+        let root = tempfile::tempdir().expect("control root");
+        let workspace_root = root.path().join("w");
+        let live = workspace_root.join("a-live");
+        let stale = workspace_root.join("b-stale");
+        let failed = workspace_root.join("c-failed");
+        for directory in [&live, &stale, &failed] {
+            std::fs::create_dir_all(directory).expect("workspace control directory");
+        }
+
+        let live_lifecycle_path = live.join("c.sock");
+        let live_api_path = live.join("api.sock");
+        let live_lifecycle = UnixListener::bind(&live_lifecycle_path).expect("live lifecycle");
+        let live_api = UnixListener::bind(&live_api_path).expect("live API");
+        let live_task = tokio::spawn(async move {
+            let (stream, _) = live_lifecycle.accept().await.expect("shutdown connection");
+            let (_, mut writer) = stream.into_split();
+            writer
+                .write_all(b"{\"type\":\"ok\"}\n")
+                .await
+                .expect("shutdown response");
+            drop(writer);
+            drop(live_api);
+            std::fs::remove_file(&live_lifecycle_path).expect("remove lifecycle socket");
+            std::fs::remove_file(&live_api_path).expect("remove API socket");
+        });
+
+        let stale_lifecycle_path = stale.join("c.sock");
+        let stale_api_path = stale.join("api.sock");
+        drop(
+            std::os::unix::net::UnixListener::bind(&stale_lifecycle_path).expect("stale lifecycle"),
+        );
+        drop(std::os::unix::net::UnixListener::bind(&stale_api_path).expect("stale API"));
+        std::thread::sleep(Duration::from_millis(10));
+
+        let failed_lifecycle_path = failed.join("c.sock");
+        let failed_api_path = failed.join("api.sock");
+        let failed_lifecycle =
+            UnixListener::bind(&failed_lifecycle_path).expect("failed lifecycle");
+        let failed_api = UnixListener::bind(&failed_api_path).expect("failed API");
+        let failed_task = tokio::spawn(async move {
+            let (stream, _) = failed_lifecycle.accept().await.expect("failed connection");
+            let (_, mut writer) = stream.into_split();
+            writer.write_all(b"not-json\n").await.expect("bad response");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(failed_api);
+        });
+
+        let report = shutdown_all_services_in(root.path())
+            .await
+            .expect("enumerate runtime sets");
+        assert_eq!(report.stopped, 1);
+        assert_eq!(report.stale, 1);
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0].contains("c-failed"));
+        assert!(!stale_lifecycle_path.exists());
+        assert!(!stale_api_path.exists());
+        live_task.await.expect("live task");
+        failed_task.await.expect("failed task");
     }
 
     #[tokio::test]
