@@ -276,7 +276,9 @@ async fn codex_client_resumes_history_and_unsubscribes() -> TestResult {
 async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixture = manifest.join("tests/fixtures/fake_codex.py");
-    let gate_dir = tempfile::tempdir()?;
+    // The compatibility adapter sanitizes TMPDIR before spawning the fixture. Use the child-visible
+    // Unix temporary root so its FIFO confinement check agrees with the parent on macOS too.
+    let gate_dir = tempfile::tempdir_in("/tmp")?;
     let gate = gate_dir.path().join("initialize.fifo");
     let status = Command::new("mkfifo").arg(&gate).status()?;
     assert!(status.success());

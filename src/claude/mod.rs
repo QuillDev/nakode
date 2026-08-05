@@ -551,6 +551,7 @@ async fn augment_image_attachments(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEvent>) {
     let event_name = message
         .get("event")

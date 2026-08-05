@@ -85,19 +85,24 @@ expected session revision and an idempotency key:
 
 - `RemoveQueuedPrompt(session_id, prompt_id)` independently cancels one waiting
   follow-up.
-- `SteerQueuedPrompt(session_id, prompt_id)` atomically converts one waiting
-  follow-up into provider-native steering for the active turn. It is available
-  only when the server advertises `QueuedPromptSteering`; clients also require
-  steering in the active agent session's provider capabilities.
+- `SteerQueuedPrompt(session_id, prompt_id)` atomically redirects active work to
+  one waiting follow-up. It is available only when the server advertises
+  `QueuedPromptSteering`; clients also require either steering or interruption
+  in the active agent session's provider capabilities.
 
 The server validates the prompt identity, active turn, provider capability,
-absence of another pending steer, and the text-only steering boundary before it
-removes anything. Attachment-bearing prompts are rejected unchanged. After
-validation, the server removes exactly that ID and dispatches one
-`BackendCommand::SteerTurn`. Provider acknowledgement records a steering
-transcript item. Provider refusal or a turn-ending race restores the same
-prompt at its prior queue index, after which ordinary follow-up draining still
-applies.
+absence of another pending redirect, and the text-only boundary before it
+removes anything. Attachment-bearing prompts are rejected unchanged. A
+steering-capable provider receives one `BackendCommand::SteerTurn`; provider
+acknowledgement records a steering transcript item, while refusal or a
+turn-ending race restores the same prompt at its prior queue index.
+
+For an interruption-only provider, the server removes the selected prompt from
+the ordinary queue, interrupts the active turn, and holds that prompt as the
+next continuation. Completion of the old turn starts it before every sibling,
+including when completion wins the interrupt race. Interrupt failure restores
+it at its original queue position. Ordinary Stop keeps queue order and starts the
+first follow-up after the interrupted turn.
 
 A frontend may optimistically overlay only operation status, keyed by prompt
 ID. Authoritative IDs, text, and order always come from the latest replacement

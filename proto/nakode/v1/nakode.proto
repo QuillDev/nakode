@@ -22,8 +22,9 @@ service NakodeService {
   rpc SendPrompt(SendPromptRequest) returns (MutationResult);
   rpc EnqueuePrompt(EnqueuePromptRequest) returns (MutationResult);
   rpc RemoveQueuedPrompt(RemoveQueuedPromptRequest) returns (MutationResult);
-  // Atomically removes one queued prompt and submits its text to the active turn as steering.
-  // Requires the `QueuedPromptSteering` service capability and provider steering support.
+  // Atomically redirects active work to one queued prompt. Providers steer the current turn when
+  // supported; interruption-only providers stop it and start the selected prompt next.
+  // Requires the `QueuedPromptSteering` service capability and provider steering or interruption.
   rpc SteerQueuedPrompt(SteerQueuedPromptRequest) returns (MutationResult);
   rpc SteerTurn(SteerTurnRequest) returns (MutationResult);
   rpc CancelTurn(CancelTurnRequest) returns (MutationResult);

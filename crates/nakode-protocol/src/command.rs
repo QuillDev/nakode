@@ -158,7 +158,10 @@ pub enum Command {
         session_id: SessionId,
         prompt_id: PromptId,
     },
-    /// Atomically removes one queued prompt and submits its text as steering guidance.
+    /// Atomically removes one queued prompt and redirects active work to it.
+    ///
+    /// A steering provider accepts it in the current turn. An interruption-only provider stops the
+    /// current turn and starts this prompt before the remaining queue.
     SteerQueuedPrompt {
         session_id: SessionId,
         prompt_id: PromptId,
