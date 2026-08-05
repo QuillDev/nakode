@@ -139,6 +139,18 @@ Then use `/settings` to manage general preferences, agents, models, providers,
 and optional add-ons. The settings menu is searchable. `/providers`, `/agents`,
 and `/models` remain available as direct shortcuts.
 
+### Global agents
+
+Sub-agent archetypes are global to the user rather than tied to a project workspace. Nakode stores
+them as TOML files under `$NAKODE_HOME/agents`; when `NAKODE_HOME` is unset it defaults to
+`~/.nakode`, so the ordinary catalogue is `~/.nakode/agents`. Every workspace loads the same
+catalogue.
+
+Use `--agents PATH` or `NAKODE_AGENTS=PATH` to override the catalogue. Absolute paths are used as
+written; relative paths resolve under Nakode home, not under the current workspace. Nakode does not
+automatically import existing workspace-local `.nakode/agents` directories; move wanted definitions
+into the global directory or point `--agents` at an absolute compatibility directory.
+
 ## Personalities and Soul
 
 Nakode can append user-specific guidance to every newly created native agent

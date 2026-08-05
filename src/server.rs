@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::AgentDefinition,
+    agent::{AgentCatalog, AgentDefinition},
     backend::PromptAttachment,
     service::ServiceEngine,
     session::{ProviderRecord, SessionRecord},
@@ -183,7 +183,14 @@ impl ServerCore {
             }
             ServerRequest::Query { query, respond, .. } => {
                 let cursor = endpoint.cursor();
-                let result = if matches!(&query, Query::GetArtifact { .. })
+                let refresh = if matches!(&query, Query::Bootstrap { .. }) {
+                    self.reload_global_agent_catalogue()
+                } else {
+                    Ok(())
+                };
+                let result = if let Err(error) = refresh {
+                    Err(error)
+                } else if matches!(&query, Query::GetArtifact { .. })
                     && !endpoint
                         .capabilities()
                         .supports(ServiceCapability::ArtifactTransfer)
@@ -557,6 +564,7 @@ impl ServerCore {
         enqueue: bool,
     ) -> DomainCommandOutcome {
         self.ensure_session(session_id)?;
+        self.reload_agent_catalogue_for_session(session_id)?;
         let (text, attachments) = self.convert_prompt(session_id, prompt)?;
         let effects = if enqueue {
             self.session_engine_mut(session_id)?
@@ -646,6 +654,10 @@ impl ServerCore {
         task: &str,
     ) -> DomainCommandOutcome {
         self.ensure_session(session_id)?;
+        // Agent archetypes are global files shared by independently running workspace services.
+        // Re-read at the invocation boundary so a service that was already running observes edits
+        // made through another workspace without requiring a restart.
+        self.reload_agent_catalogue_for_session(session_id)?;
         let (run_id, effects) = self
             .session_engine_mut(session_id)?
             .state_mut()
@@ -831,6 +843,37 @@ impl ServerCore {
             },
             effects,
         )
+    }
+
+    fn reload_agent_catalogue_for_session(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<(), DomainCommandError> {
+        let directory = self
+            .session_engine_mut(session_id)?
+            .state()
+            .agent_directory()
+            .to_path_buf();
+        let agents = AgentCatalog::load(&directory)
+            .map_err(|error| DomainCommandError::Invalid(error.to_string()))?;
+        self.session_engine_mut(session_id)?
+            .state_mut()
+            .install_agents(agents);
+        Ok(())
+    }
+
+    fn reload_global_agent_catalogue(&mut self) -> Result<(), ServiceError> {
+        let directory = self.engine().state().agent_directory().to_path_buf();
+        let agents = AgentCatalog::load(&directory).map_err(|error| {
+            domain_error(DomainCommandError::Invalid(format!(
+                "could not reload global agent catalogue: {error}"
+            )))
+        })?;
+        self.session_template.install_agents(agents.clone());
+        for engine in self.sessions_by_id.values_mut() {
+            engine.state_mut().install_agents(agents.clone());
+        }
+        Ok(())
     }
 
     fn query(&self, query: Query) -> Result<QueryResult, ServiceError> {
@@ -2454,6 +2497,54 @@ mod tests {
                 .subagents
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn delegation_reloads_the_global_agent_catalogue_at_invocation() {
+        let directory = tempfile::tempdir().expect("global agents");
+        std::fs::write(
+            directory.path().join("reviewer.toml"),
+            r#"slug = "reviewer"
+description = "Review changes"
+system_prompt = "Review carefully"
+first_message = "Starting review"
+model = "openai-codex/gpt-5"
+"#,
+        )
+        .expect("agent definition");
+        let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
+        state.set_agent_directory(directory.path().to_path_buf());
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+
+        let (accepted, effects) = core
+            .delegate_command(&session_id, "reviewer", "Inspect authentication")
+            .expect("fresh global agent is available");
+
+        assert!(accepted.resource_id.is_some());
+        assert!(!effects.is_empty());
+    }
+
+    #[test]
+    fn global_agent_catalogue_reload_updates_workspace_projection() {
+        let directory = tempfile::tempdir().expect("global agents");
+        std::fs::write(
+            directory.path().join("reviewer.toml"),
+            r#"slug = "reviewer"
+description = "Review changes"
+system_prompt = "Review carefully"
+first_message = "Starting review"
+"#,
+        )
+        .expect("agent definition");
+        let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
+        state.set_agent_directory(directory.path().to_path_buf());
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+
+        core.reload_global_agent_catalogue()
+            .expect("global catalogue reload");
+
+        assert_eq!(core.workspace_bootstrap().agents[0].slug, "reviewer");
     }
 
     #[test]
