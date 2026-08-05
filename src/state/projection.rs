@@ -111,6 +111,7 @@ pub fn bootstrap(
                     .map(ModelId::from)
                     .collect(),
                 fast_mode: definition.fast_mode,
+                reasoning_effort: definition.reasoning_effort.clone(),
             })
             .collect(),
         skills: state
@@ -128,7 +129,9 @@ pub fn bootstrap(
     }
 }
 
-fn model_configuration(model: &ModelInfo) -> ModelConfigurationView {
+/// The levels and flags a model takes. The ONE place that rule lives — every frontend, and the
+/// delegated-run path that has to refuse a level a model cannot take, reads this.
+pub(crate) fn model_configuration(model: &ModelInfo) -> ModelConfigurationView {
     if model.provider == CODEX_PROVIDER {
         return ModelConfigurationView {
             reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"]

@@ -18,6 +18,14 @@ pub struct AgentDefinition {
     pub fallback_models: Vec<String>,
     #[serde(default)]
     pub fast_mode: bool,
+    /// How hard this archetype thinks, or `None` for whatever its model does by default.
+    ///
+    /// **A level belongs to the model**, so it is only meaningful beside `model` and is refused
+    /// without one — "default" means the default model at its own default level. `serde(default)`
+    /// is what makes every definition already on disk mean exactly that: no level written, no level
+    /// applied, and the run gets the model's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl AgentDefinition {
@@ -103,6 +111,8 @@ pub enum AgentCatalogError {
     DuplicateSlug { slug: String },
     #[error("agent {slug:?} model must use provider/model form: {model}")]
     InvalidModel { slug: String, model: String },
+    #[error("agent {slug:?} sets reasoning_effort {effort:?} without a model to run it at")]
+    EffortWithoutModel { slug: String, effort: String },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -294,6 +304,16 @@ fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalog
             field: "description",
         });
     }
+    // A level with nothing to apply it to. The provider is asked for the parent session's model in
+    // that case, and a level chosen against a model nobody named is a level for a different model.
+    if let Some(effort) = definition.reasoning_effort.as_deref()
+        && definition.model.is_none()
+    {
+        return Err(AgentCatalogError::EffortWithoutModel {
+            slug: definition.slug.clone(),
+            effort: effort.to_owned(),
+        });
+    }
     for model in definition.model.iter().chain(&definition.fallback_models) {
         if model
             .split_once('/')
@@ -335,6 +355,69 @@ model = "openai-codex/gpt-5"
         let agent = catalog.find("explorer").expect("explorer");
         assert_eq!(agent.provider("devin-acp"), "openai-codex");
         assert!(agent.initial_prompt("Check auth").contains("Check auth"));
+    }
+
+    /// Every definition already on disk was written before `reasoning_effort` existed, and has to go
+    /// on meaning what it meant: run the model at its own default level.
+    #[test]
+    fn a_definition_written_without_an_effort_means_the_models_default() {
+        let directory = tempdir().expect("temp directory");
+        fs::write(
+            directory.path().join("explorer.toml"),
+            r#"
+slug = "explorer"
+description = "Explores patches"
+model = "openai-codex/gpt-5"
+"#,
+        )
+        .expect("agent fixture");
+
+        let catalog = AgentCatalog::load(directory.path()).expect("valid catalog");
+        let agent = catalog.find("explorer").expect("explorer");
+        assert_eq!(agent.reasoning_effort, None);
+    }
+
+    #[test]
+    fn a_definition_reads_back_the_effort_it_was_written_with() {
+        let directory = tempdir().expect("temp directory");
+        fs::write(
+            directory.path().join("explorer.toml"),
+            r#"
+slug = "explorer"
+description = "Explores patches"
+model = "openai-codex/gpt-5"
+reasoning_effort = "high"
+"#,
+        )
+        .expect("agent fixture");
+
+        let catalog = AgentCatalog::load(directory.path()).expect("valid catalog");
+        assert_eq!(
+            catalog.find("explorer").expect("explorer").reasoning_effort,
+            Some("high".to_owned())
+        );
+    }
+
+    /// A level belongs to a model, so one without a model is refused rather than quietly applied to
+    /// whatever the parent session happens to be running.
+    #[test]
+    fn an_effort_without_a_model_is_refused() {
+        let directory = tempdir().expect("temp directory");
+        fs::write(
+            directory.path().join("explorer.toml"),
+            r#"
+slug = "explorer"
+description = "Explores patches"
+reasoning_effort = "high"
+"#,
+        )
+        .expect("agent fixture");
+
+        let error = AgentCatalog::load(directory.path()).expect_err("effort with no model");
+        assert!(
+            error.to_string().contains("without a model"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -446,6 +529,7 @@ description = "Research the requested topic and report concrete findings"
             model: Some("openai-codex/gpt-5".to_owned()),
             fallback_models: vec!["devin-acp/swe-1-7-lightning".to_owned()],
             fast_mode: true,
+            reasoning_effort: Some("high".to_owned()),
         };
 
         catalog

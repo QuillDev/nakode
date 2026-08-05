@@ -15,9 +15,9 @@ use crate::{
     controls::{self, ControlAction, ControlContext},
     selection::ScreenPoint,
     tui_state::{
-        AgentEditor, AgentEditorField, AgentModelOption, ComposerDraft, ModelPickerStage,
-        ModelSelectionScope, ProviderAuthentication, SettingsSection, SettingsView, TuiState,
-        model_supports_fast_mode, model_supports_options,
+        AgentEditor, AgentEditorField, AgentModelOption, AgentPendingOptions, ComposerDraft,
+        ModelPickerStage, ModelSelectionScope, ProviderAuthentication, SettingsSection,
+        SettingsView, TuiState, model_supports_fast_mode, model_supports_options,
     },
 };
 
@@ -156,11 +156,15 @@ fn handle_mouse(state: &mut TuiState, mouse: crossterm::event::MouseEvent) -> In
         controls::MouseAction::PrimaryUp => state.finish_text_selection(point),
         controls::MouseAction::ScrollUp => {
             state.clear_text_selection();
-            state.scroll_active_chat(3);
+            if !scroll_open_overlay(state, -1) {
+                state.scroll_active_chat(3);
+            }
         }
         controls::MouseAction::ScrollDown => {
             state.clear_text_selection();
-            state.scroll_active_chat(-3);
+            if !scroll_open_overlay(state, 1) {
+                state.scroll_active_chat(-3);
+            }
         }
         controls::MouseAction::ClearSelection => state.clear_text_selection(),
     }
@@ -173,6 +177,35 @@ fn handle_mouse(state: &mut TuiState, mouse: crossterm::event::MouseEvent) -> In
         devices,
         ..InputOutcome::default()
     }
+}
+
+/// Move the selection in whichever list overlay is on top, and say whether one took the wheel.
+///
+/// A list longer than its popup scrolls by moving its selection — that index IS the scroll position
+/// (`render::scroll_start`) — so the wheel has to reach the same mover the arrow keys do. Left to fall
+/// through it scrolled the transcript UNDERNEATH an open catalogue instead, which is the one surface the
+/// owner cannot see while choosing a model.
+///
+/// Ordered the way the overlays are drawn, innermost first, so the wheel lands on the list actually on
+/// screen. The agent editor's options popup takes the wheel and does nothing with it, for the same
+/// reason ↑/↓ do nothing there: it has one row, and its choices are ←/→.
+fn scroll_open_overlay(state: &mut TuiState, delta: isize) -> bool {
+    if state.client.model_picker.is_some() {
+        state.picker_move(delta);
+    } else if state.agent_model_options_are_open() {
+        return true;
+    } else if state.agent_model_dropdown_is_open() {
+        state.agent_model_dropdown_move(delta);
+    } else if state.client.agent_picker.is_some() {
+        state.agent_picker_move(delta);
+    } else if state.client.session_picker.is_some() {
+        state.session_picker_move(delta);
+    } else if state.client.provider_picker.is_some() {
+        state.provider_picker_move(delta);
+    } else {
+        return false;
+    }
+    true
 }
 
 fn handle_key(state: &mut TuiState, bootstrap: &BootstrapView, key: KeyEvent) -> InputOutcome {
@@ -1341,15 +1374,18 @@ fn handle_agent_editor_key(
         match controls::resolve(ControlContext::ModelPicker, key) {
             Some(ControlAction::Select) => {
                 if let Some(editor) = agent_editor_mut(state)
-                    && let Some(fast_mode) = editor.pending_fast_mode.take()
+                    && let Some(pending) = editor.pending_options.take()
                 {
-                    editor.fast_mode = fast_mode;
+                    editor.fast_mode = pending.options.fast_mode;
+                    editor.reasoning_effort = pending.options.reasoning_effort;
                 }
                 return save_agent_outcome(state, bootstrap);
             }
             Some(ControlAction::Close) => {
                 state.cancel_agent_edit();
             }
+            Some(ControlAction::Previous) => state.move_agent_model_options(-1),
+            Some(ControlAction::Next) => state.move_agent_model_options(1),
             Some(ControlAction::MoveLeft) => state.adjust_agent_model_options(-1),
             Some(ControlAction::MoveRight) => state.adjust_agent_model_options(1),
             _ => {}
@@ -1406,22 +1442,41 @@ fn handle_agent_model_dropdown_key(
             let Some(selected) = selected else {
                 return InputOutcome::default();
             };
-            let (model_id, supports_fast_mode) = match selected {
-                AgentModelOption::Inherit => (String::new(), false),
-                AgentModelOption::Model(model) => {
-                    let supports = model_supports_fast_mode(&model);
-                    (model.id.to_string(), supports)
-                }
+            // What the chosen model can be given decides the step: its own levels, and fast mode if
+            // it takes one. "Inherit the parent model" names no model, so it can be given neither.
+            let (model_id, efforts, supports_fast_mode) = match selected {
+                AgentModelOption::Inherit => (String::new(), Vec::new(), false),
+                AgentModelOption::Model(model) => (
+                    model.id.to_string(),
+                    model.configuration.reasoning_efforts.clone(),
+                    model_supports_fast_mode(&model),
+                ),
             };
+            let configurable = !efforts.is_empty() || supports_fast_mode;
             if let Some(editor) = agent_editor_mut(state) {
                 editor.model = model_id;
                 editor.model_dropdown = None;
-                editor.pending_fast_mode = supports_fast_mode.then_some(editor.fast_mode);
+                // A level the new model does not offer is dropped rather than carried over: the
+                // level lists differ per model, and a stale one would be refused at run time.
+                let kept = editor
+                    .reasoning_effort
+                    .take()
+                    .filter(|effort| efforts.contains(effort));
                 if !supports_fast_mode {
                     editor.fast_mode = false;
                 }
+                editor.pending_options = configurable.then_some(AgentPendingOptions {
+                    reasoning_efforts: efforts,
+                    fast_mode_configurable: supports_fast_mode,
+                    options: ModelOptions {
+                        reasoning_effort: kept.clone(),
+                        fast_mode: editor.fast_mode,
+                    },
+                    selected: 0,
+                });
+                editor.reasoning_effort = kept;
             }
-            if supports_fast_mode {
+            if configurable {
                 return InputOutcome::default();
             }
             return save_agent_outcome(state, bootstrap);
@@ -1574,7 +1629,7 @@ fn no_modal_is_open(state: &TuiState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
     use nakode_protocol::{
         AgentSessionId, ModelConfigurationView, ModelId, ModelView, ProviderId, SessionActivity,
         TurnId, TurnStatus, TurnView,
@@ -1943,5 +1998,61 @@ mod tests {
         open_model_picker(&mut state, ModelSelectionScope::Vision);
         assert_eq!(state.filtered_models().len(), 1);
         assert_eq!(state.filtered_models()[0].id.as_str(), "custom/capable");
+    }
+
+    /// The wheel moves the open catalogue's selection — which is its scroll position — and only reaches
+    /// the transcript when no list is over it.
+    #[test]
+    fn the_wheel_scrolls_an_open_model_catalogue_and_not_the_transcript_under_it() {
+        let mut view = bootstrap();
+        view.models = (0..12)
+            .map(|index| ModelView {
+                id: ModelId::from(format!("custom/model-{index:02}")),
+                provider_id: ProviderId::from("custom"),
+                model_slug: format!("model-{index:02}"),
+                display_name: format!("Model {index:02}"),
+                is_default: index == 0,
+                reasoning_effort: None,
+                fast_mode: false,
+                configuration: ModelConfigurationView::default(),
+            })
+            .collect();
+        let mut state = state(&view);
+        open_model_picker(&mut state, ModelSelectionScope::Default);
+
+        let wheel = |kind| {
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let _ = handle_terminal(&mut state, &view, wheel(MouseEventKind::ScrollDown));
+        let _ = handle_terminal(&mut state, &view, wheel(MouseEventKind::ScrollDown));
+        assert_eq!(
+            state
+                .client
+                .model_picker
+                .as_ref()
+                .map(|picker| picker.selected),
+            Some(2),
+            "two notches down must walk two rows down the catalogue"
+        );
+
+        let _ = handle_terminal(&mut state, &view, wheel(MouseEventKind::ScrollUp));
+        assert_eq!(
+            state
+                .client
+                .model_picker
+                .as_ref()
+                .map(|picker| picker.selected),
+            Some(1)
+        );
+
+        // With no overlay open the wheel is the transcript's again.
+        state.close_model_picker();
+        let _ = handle_terminal(&mut state, &view, wheel(MouseEventKind::ScrollUp));
+        assert!(state.client.model_picker.is_none());
     }
 }

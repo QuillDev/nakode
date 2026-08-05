@@ -146,6 +146,20 @@ them as TOML files under `$NAKODE_HOME/agents`; when `NAKODE_HOME` is unset it d
 `~/.nakode`, so the ordinary catalogue is `~/.nakode/agents`. Every workspace loads the same
 catalogue.
 
+A definition names the archetype (`slug`, `description`), what it is told (`system_prompt`,
+`first_message`), and how it runs: `model`, `fallback_models`, `fast_mode`, and an optional
+`reasoning_effort`. Effort belongs to the model that runs at it, so `reasoning_effort` is refused
+without a `model` and refused when that model does not offer the level named. Omit it and the
+delegated run uses the model's own default level, which is what every definition written before the
+field means — nothing on disk needs editing.
+
+```toml
+slug = "code-reviewer"
+description = "Reviews changes for correctness"
+model = "openai-codex/gpt-5.6-sol"
+reasoning_effort = "high"   # omit for the model's own default
+```
+
 Use `--agents PATH` or `NAKODE_AGENTS=PATH` to override the catalogue. Absolute paths are used as
 written; relative paths resolve under Nakode home, not under the current workspace. Nakode does not
 automatically import existing workspace-local `.nakode/agents` directories; move wanted definitions

@@ -432,6 +432,7 @@ impl AgentEditor {
                 .map(str::to_owned)
                 .collect(),
             fast_mode: self.fast_mode,
+            reasoning_effort: None,
         }
     }
 }
@@ -4093,6 +4094,24 @@ impl DomainState {
         self.selected_model.is_some() && self.selected_model_options().fast_mode
     }
 
+    /// Whether `model` under `provider` reports `effort` among its own levels.
+    ///
+    /// The vocabulary differs per model and belongs to the provider, so this asks the one place that
+    /// decides it (`projection::model_configuration`) rather than keeping a second list here. A model
+    /// this workspace has never heard of offers nothing, which is the safe answer: the level is
+    /// dropped and the model's own default is used.
+    fn model_offers_reasoning_effort(&self, provider: &str, model: &str, effort: &str) -> bool {
+        self.models
+            .iter()
+            .find(|candidate| candidate.provider == provider && candidate.id == model)
+            .is_some_and(|candidate| {
+                projection::model_configuration(candidate)
+                    .reasoning_efforts
+                    .iter()
+                    .any(|candidate| candidate == effort)
+            })
+    }
+
     fn model_options_for_qualified(&self, qualified: &str) -> ModelOptions {
         self.model_options
             .get(qualified)
@@ -5950,6 +5969,21 @@ impl DomainState {
     ) -> Result<(), DomainCommandError> {
         AgentCatalog::validate_definition(definition)
             .map_err(|error| DomainCommandError::Invalid(error.to_string()))?;
+        // A level is only ever valid FOR a model, so it is checked against the one this definition
+        // names. Refused here rather than at run time: a definition that cannot run as written is
+        // worth failing at the moment it is written, while the level list is on screen.
+        if let Some(effort) = definition.reasoning_effort.as_deref()
+            && let Some(model) = definition.model.as_deref()
+        {
+            let offered = model.split_once('/').is_some_and(|(provider, model)| {
+                self.model_offers_reasoning_effort(provider, model, effort)
+            });
+            if !offered {
+                return Err(DomainCommandError::Invalid(format!(
+                    "model {model} does not offer reasoning effort {effort}"
+                )));
+            }
+        }
         if self.agents.definitions().iter().any(|existing| {
             existing.slug == definition.slug
                 && previous_slug.is_none_or(|previous| previous != existing.slug)
@@ -6437,11 +6471,12 @@ impl DomainState {
         provider_session_id: String,
         reported_model: &str,
     ) -> Vec<Effect> {
-        let Some((target, agent_fast_mode)) =
+        let Some((target, agent_fast_mode, agent_effort)) =
             self.subagent_executions.get(run_id).map(|execution| {
                 (
                     execution.model_targets[execution.model_target_index].clone(),
                     execution.definition.fast_mode,
+                    execution.definition.reasoning_effort.clone(),
                 )
             })
         else {
@@ -6455,6 +6490,39 @@ impl DomainState {
             .map(|model| self.model_options_for_qualified(&format!("{}/{model}", target.provider)))
             .unwrap_or_default();
         options.fast_mode |= agent_fast_mode;
+        // The archetype's own level beats whatever the workspace has saved for this model — that is
+        // what defining one on the definition means. `None` changes nothing, so a definition written
+        // before the field existed runs exactly as it did: at the model's own default.
+        //
+        // It is applied only if the model actually starting takes it. Saving already refuses a level
+        // the definition's OWN model does not offer, so what this catches is a FALLBACK model with a
+        // different vocabulary, which is worth saying out loud rather than sending to be refused.
+        let mut defined_effort_applied = false;
+        let mismatch = if let Some(effort) = agent_effort {
+            let offers = options_model.is_some_and(|model| {
+                self.model_offers_reasoning_effort(&target.provider, model, &effort)
+            });
+            if offers {
+                options.reasoning_effort = Some(effort);
+                defined_effort_applied = true;
+                None
+            } else {
+                Some(effort)
+            }
+        } else {
+            None
+        };
+        if let Some(effort) = mismatch {
+            self.record_subagent_message(
+                run_id,
+                EntryKind::Warning,
+                "MODEL",
+                &format!(
+                    "reasoning effort {effort:?} is not available on {}; running at the model's own default",
+                    options_model.unwrap_or(&target.provider)
+                ),
+            );
+        }
         let Some(execution) = self.subagent_executions.get_mut(run_id) else {
             return Vec::new();
         };
@@ -6465,7 +6533,14 @@ impl DomainState {
         let prompt = execution.definition.initial_prompt(&execution.task);
         self.sync_subagent(run_id);
         let mut effects = Vec::new();
-        if target.provider == CURSOR_PROVIDER {
+        // Cursor as before, plus the one new case: an archetype that DEFINES a level has to have it
+        // delivered, and this command is how a level reaches a session.
+        //
+        // Deliberately not widened past that. Every other provider's delegated runs have never been
+        // sent these options — the workspace's own saved level and fast mode are still computed above
+        // and still dropped for them — and starting to send them is a change to how existing runs
+        // behave, which is not this change's business.
+        if defined_effort_applied || target.provider == CURSOR_PROVIDER {
             effects.push(Effect::SubagentBackend {
                 run_id: run_id.to_owned(),
                 command: BackendCommand::SetSessionOptions {
@@ -9405,6 +9480,113 @@ fast_mode = true
                 && options.fast_mode
                 && model == "composer-2.5"
         ));
+    }
+
+    /// An archetype's own level is what its run starts at — the definition is where "how hard this
+    /// agent thinks" is written, and nothing else in the workspace may override it.
+    #[test]
+    fn a_subagent_runs_at_the_effort_its_definition_defines() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("thinker.toml"),
+            format!(
+                r#"
+slug = "thinker"
+description = "Thinks hard"
+system_prompt = "Think carefully."
+first_message = "Consider the delegated question."
+model = "{CODEX_PROVIDER}/model-a"
+reasoning_effort = "xhigh"
+"#
+            ),
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let run_id = launch_codex_subagent(&mut state, "thinker");
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "codex-child".to_owned(),
+                model: "model-a".to_owned(),
+            },
+        );
+        let options = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SubagentBackend {
+                    command: BackendCommand::SetSessionOptions { options, .. },
+                    ..
+                } => Some(options.clone()),
+                _ => None,
+            })
+            .expect("the run's options");
+        assert_eq!(options.reasoning_effort.as_deref(), Some("xhigh"));
+    }
+
+    /// No level written means the model's own default, which is what every definition that predates
+    /// the field says. Nothing is sent, so nothing is changed.
+    #[test]
+    fn a_subagent_with_no_effort_defined_runs_at_the_models_default() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("plain.toml"),
+            format!(
+                r#"
+slug = "plain"
+description = "Takes what it is given"
+system_prompt = "Work."
+first_message = "Consider the delegated question."
+model = "{CODEX_PROVIDER}/model-a"
+"#
+            ),
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let run_id = launch_codex_subagent(&mut state, "plain");
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "codex-child".to_owned(),
+                model: "model-a".to_owned(),
+            },
+        );
+        for effect in &effects {
+            if let Effect::SubagentBackend {
+                command: BackendCommand::SetSessionOptions { options, .. },
+                ..
+            } = effect
+            {
+                assert_eq!(options.reasoning_effort, None);
+            }
+        }
+    }
+
+    /// Gets a delegated run as far as its provider session, so a test can inspect what the first turn
+    /// is configured with.
+    fn launch_codex_subagent(state: &mut AppState, slug: &str) -> String {
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 7,
+            agent: slug.to_owned(),
+            task: "Map auth".to_owned(),
+        });
+        let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
+            panic!("expected a subagent launch, got {effects:?}");
+        };
+        let run_id = run_id.clone();
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        run_id
     }
 
     #[test]

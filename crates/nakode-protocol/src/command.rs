@@ -65,6 +65,9 @@ pub struct AgentDefinitionInput {
     pub fallback_models: Vec<ModelId>,
     #[serde(default)]
     pub fast_mode: bool,
+    /// The level to run at, or `None` for the model's own default. Refused without `model`.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
