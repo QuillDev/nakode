@@ -21,7 +21,7 @@ pub enum ServiceCapability {
     /// Declared rather than assumed so a client can degrade its own affordance instead of offering a
     /// delete that an older server answers with `Unimplemented`.
     SessionDeletion,
-    /// `SteerQueuedPrompt` atomically converts a server-owned follow-up into steering guidance.
+    /// `SteerQueuedPrompt` atomically redirects active work to a server-owned follow-up.
     QueuedPromptSteering,
 }
 

@@ -182,6 +182,12 @@ struct QueuedSteerOrigin {
     index: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingRedirect {
+    prompt: QueuedPrompt,
+    index: usize,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelPickerStage {
@@ -932,6 +938,8 @@ pub struct DomainState {
     starting_turn: Option<OutgoingPrompt>,
     recoverable_prompt: Option<RecoverablePrompt>,
     pending_steer: Option<PendingSteer>,
+    /// A queued follow-up promoted ahead of ordinary draining after interruption.
+    pending_redirect: Option<PendingRedirect>,
     pending_handoff: Option<HandoffPackage>,
     resuming_session: Option<SessionRecord>,
     item_turns: HashMap<String, String>,
@@ -1586,6 +1594,7 @@ impl DomainState {
             starting_turn: None,
             recoverable_prompt: None,
             pending_steer: None,
+            pending_redirect: None,
             pending_handoff: None,
             resuming_session: None,
             item_turns: HashMap::new(),
@@ -3044,13 +3053,14 @@ impl DomainState {
 
     /// Atomically converts one queued text prompt into guidance for the active turn.
     ///
-    /// The prompt remains queued when validation rejects the conversion. Once delivery starts, its
-    /// original position is retained so an asynchronous provider refusal or a turn-ending race can
-    /// restore normal follow-up behavior without losing or duplicating the prompt.
+    /// Providers with native steering receive the prompt in the current turn. Providers that can
+    /// interrupt but not steer instead stop the current turn and run the selected prompt next. The
+    /// selected prompt is held outside the ordinary queue while interruption settles, so completion
+    /// and cancellation races cannot run a sibling first or submit it twice.
     ///
     /// # Errors
-    /// Returns not found for a stale prompt identity, rejects attachments because provider steering
-    /// accepts text only, and preserves every validation error from [`Self::steer_turn`].
+    /// Returns not found for a stale prompt identity, rejects attachments because steering accepts
+    /// text only, and rejects providers that support neither steering nor interruption.
     pub fn steer_queued_prompt(
         &mut self,
         prompt_id: &str,
@@ -3077,17 +3087,51 @@ impl DomainState {
             .ok_or_else(|| {
                 DomainCommandError::Conflict("there is no active turn to steer".to_owned())
             })?;
-        let effects = self.steer_turn(&turn_id, &prompt.text)?;
-        let removed = self
-            .queue
-            .remove(position)
-            .ok_or_else(|| DomainCommandError::NotFound(prompt_id.to_owned()))?;
-        if let Some(pending) = &mut self.pending_steer {
-            pending.queued_origin = Some(QueuedSteerOrigin {
-                prompt: removed,
-                index: position,
-            });
+
+        if self.backend_capabilities.steering.is_supported() {
+            let effects = self.steer_turn(&turn_id, &prompt.text)?;
+            let removed = self
+                .queue
+                .remove(position)
+                .ok_or_else(|| DomainCommandError::NotFound(prompt_id.to_owned()))?;
+            if let Some(pending) = &mut self.pending_steer {
+                pending.queued_origin = Some(QueuedSteerOrigin {
+                    prompt: removed,
+                    index: position,
+                });
+            }
+            return Ok(effects);
         }
+
+        if !self.backend_capabilities.interruption.is_supported() {
+            return Err(DomainCommandError::Unsupported(format!(
+                "{} supports neither steering nor interruption",
+                self.backend_name
+            )));
+        }
+        if self.pending_redirect.is_some() {
+            return Err(DomainCommandError::Conflict(
+                "a queued redirect is already pending".to_owned(),
+            ));
+        }
+
+        let already_cancelling = self
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.cancelling);
+        let effects = if already_cancelling {
+            Vec::new()
+        } else {
+            self.cancel_turn(&turn_id)?
+        };
+        let Some(prompt) = self.queue.remove(position) else {
+            return Err(DomainCommandError::NotFound(prompt_id.to_owned()));
+        };
+        self.pending_redirect = Some(PendingRedirect {
+            prompt,
+            index: position,
+        });
+        self.set_status("Interrupting active turn; selected follow-up will run next…");
         Ok(effects)
     }
 
@@ -3527,6 +3571,7 @@ impl DomainState {
         self.starting_turn = None;
         self.recoverable_prompt = None;
         self.pending_steer = None;
+        self.pending_redirect = None;
         self.pending_handoff = None;
         self.resuming_session = None;
         self.item_turns.clear();
@@ -5623,6 +5668,19 @@ impl DomainState {
         true
     }
 
+    fn restore_pending_redirect(&mut self, pending: PendingRedirect) -> bool {
+        if self
+            .queue
+            .iter()
+            .any(|prompt| prompt.id == pending.prompt.id)
+        {
+            return false;
+        }
+        let index = pending.index.min(self.queue.len());
+        self.queue.insert(index, pending.prompt);
+        true
+    }
+
     fn handle_model_rerouted(&mut self, turn_id: &str, from: &str, to: &str) {
         let Some(active) = self
             .active_turn
@@ -5682,6 +5740,9 @@ impl DomainState {
         if let Some(pending) = self.pending_steer.take() {
             self.restore_queued_steer(pending);
         }
+        if let Some(pending) = self.pending_redirect.take() {
+            self.restore_pending_redirect(pending);
+        }
         self.approvals.clear();
         self.set_status("The provider session was closed.");
         if let Some(prompt) = pending_prompt {
@@ -5701,6 +5762,9 @@ impl DomainState {
         self.creating_session = None;
         if let Some(pending) = self.pending_steer.take() {
             self.restore_queued_steer(pending);
+        }
+        if let Some(pending) = self.pending_redirect.take() {
+            self.restore_pending_redirect(pending);
         }
         self.transcript.push(
             EntryKind::Error,
@@ -5939,7 +6003,11 @@ impl DomainState {
             .map(Effect::TouchSession)
             .into_iter()
             .collect::<Vec<_>>();
-        effects.extend(self.drain_queue());
+        if let Some(pending) = self.pending_redirect.take() {
+            effects.extend(self.begin_prompt(pending.prompt));
+        } else {
+            effects.extend(self.drain_queue());
+        }
         effects
     }
 
@@ -6131,6 +6199,9 @@ impl DomainState {
             BackendOperation::InterruptTurn => {
                 if let Some(active) = &mut self.active_turn {
                     active.cancelling = false;
+                }
+                if let Some(pending) = self.pending_redirect.take() {
+                    self.restore_pending_redirect(pending);
                 }
             }
         }
@@ -8163,6 +8234,187 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .entries()
                 .iter()
                 .any(|entry| { entry.kind == EntryKind::Steering && entry.body == "repeat me" })
+        );
+    }
+
+    #[test]
+    fn interruption_fallback_promotes_selected_follow_up_without_limbo() {
+        let mut state = ready_state();
+        state.backend_capabilities.steering = CapabilitySupport::Unsupported;
+        state.provider_session_id = Some("thread-1".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        for text in ["first", "redirect me", "third"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let selected_id = state.queue[1].id.clone();
+
+        let effects = state
+            .steer_queued_prompt(&selected_id)
+            .expect("interrupt and promote selected follow-up");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(BackendCommand::InterruptTurn { turn_id, .. })]
+                if turn_id == "turn-1"
+        ));
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "third"]
+        );
+
+        let effects = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Interrupted,
+            error: None,
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, prompt, .. })
+                if client_id == &selected_id && prompt.starts_with("redirect me")
+        )));
+        assert!(state.pending_redirect.is_none());
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "third"]
+        );
+    }
+
+    #[test]
+    fn ordinary_stop_starts_the_first_queued_follow_up_once() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("thread-1".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        for text in ["first next", "second next"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let first_id = state.queue[0].id.clone();
+
+        let effects = state.cancel_turn("turn-1").expect("begin interruption");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(BackendCommand::InterruptTurn { turn_id, .. })]
+                if turn_id == "turn-1"
+        ));
+        assert!(matches!(
+            state.cancel_turn("turn-1"),
+            Err(super::DomainCommandError::Conflict(message))
+                if message == "the turn is already being cancelled"
+        ));
+
+        let effects = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Interrupted,
+            error: None,
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, .. })
+                if client_id == &first_id
+        )));
+        assert_eq!(
+            state.queue.front().map(|prompt| prompt.text.as_str()),
+            Some("second next")
+        );
+    }
+
+    #[test]
+    fn redirect_during_stop_uses_the_selected_message_as_the_continuation() {
+        let mut state = ready_state();
+        state.backend_capabilities.steering = CapabilitySupport::Unsupported;
+        state.provider_session_id = Some("thread-1".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        for text in ["ordinary next", "chosen next"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let chosen_id = state.queue[1].id.clone();
+        state.cancel_session_work().expect("begin stop");
+
+        let effects = state
+            .steer_queued_prompt(&chosen_id)
+            .expect("promote while interruption is already pending");
+        assert!(effects.is_empty());
+
+        let effects = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Completed,
+            error: None,
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, .. })
+                if client_id == &chosen_id
+        )));
+        assert_eq!(
+            state.queue.front().map(|prompt| prompt.text.as_str()),
+            Some("ordinary next")
+        );
+    }
+
+    #[test]
+    fn failed_interrupt_restores_promoted_follow_up_at_its_original_position() {
+        let mut state = ready_state();
+        state.backend_capabilities.steering = CapabilitySupport::Unsupported;
+        state.provider_session_id = Some("thread-1".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        for text in ["first", "redirect me", "third"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let selected_id = state.queue[1].id.clone();
+        state
+            .steer_queued_prompt(&selected_id)
+            .expect("begin redirect");
+
+        state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::InterruptTurn,
+            code: -1,
+            message: "turn already ended".to_owned(),
+        });
+
+        assert!(state.pending_redirect.is_none());
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "redirect me", "third"]
+        );
+        assert!(
+            state
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| !turn.cancelling)
         );
     }
 
