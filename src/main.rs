@@ -1,7 +1,8 @@
+use clap::CommandFactory;
 use nakode::{
     agent_cli, app,
-    config::{Config, NakodeCommand, ServiceAction},
-    control_service, diagnostics, discord, purge, tui_eval, update,
+    config::{Config, NakodeCommand, TransportCommand},
+    diagnostics, discord, purge, service_cli, tui_eval, update,
 };
 
 #[tokio::main]
@@ -18,13 +19,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         update::run()?;
         return Ok(());
     }
-    match config.command.clone() {
-        Some(NakodeCommand::Diagnostics {
+    let Some(command) = config.command.clone() else {
+        if config.tui {
+            return Box::pin(app::run(config)).await.map_err(Into::into);
+        }
+        // Nakode is the service. Without a command it starts nothing and shows
+        // what it can do, including the client behind `--tui`.
+        Config::command().print_long_help()?;
+        println!();
+        return Ok(());
+    };
+
+    // The deprecated `nakode service <action>` spellings stay functional. Each
+    // announces its replacement on standard error and then runs the command it
+    // was replaced by, leaving standard output untouched for connectors.
+    let command = match command {
+        NakodeCommand::Service { action } => {
+            service_cli::report_deprecation(action.deprecated_spelling(), action.replacement());
+            action.into_command()
+        }
+        command => command,
+    };
+
+    match command {
+        NakodeCommand::Run => service_cli::run(config).await?,
+        NakodeCommand::Start => service_cli::start(&config).await?,
+        NakodeCommand::Stop => service_cli::stop(&config).await?,
+        NakodeCommand::Restart => service_cli::restart(&config).await?,
+        NakodeCommand::Status { json } => service_cli::status(&config, json).await?,
+        NakodeCommand::Logs { follow, lines } => service_cli::logs(&config, follow, lines).await?,
+        NakodeCommand::Endpoint => service_cli::endpoint(&config).await?,
+        NakodeCommand::Transport {
+            action: TransportCommand::Discord { action },
+        } => discord::run_command(&config, action).await?,
+        NakodeCommand::Diagnostics {
             days,
             sessions,
             provider,
             json,
-        }) => {
+        } => {
             let output = diagnostics::run(
                 &config,
                 &diagnostics::DiagnosticsOptions {
@@ -37,73 +70,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             println!("{output}");
         }
-        Some(NakodeCommand::Agent {
+        NakodeCommand::Agent {
             agent_slug,
             session_id,
             task,
-        }) => {
+        } => {
             let result = agent_cli::run(&config, agent_slug, session_id, task).await?;
             println!("{}", result.output);
             if !result.success {
                 return Err("agent invocation failed".into());
             }
         }
-        Some(NakodeCommand::Service {
-            action: ServiceAction::Run,
-        }) => control_service::run_service(config).await?,
-        Some(NakodeCommand::Service {
-            action: ServiceAction::Status { json },
-        }) => {
-            let status = control_service::service_status(&config.workspace).await?;
-            if json {
-                println!("{}", serde_json::to_string(&status)?);
-            } else if status.running {
-                println!("Nakode service: running");
-            } else {
-                println!("Nakode service: stopped");
-            }
-        }
-        Some(NakodeCommand::Service {
-            action: ServiceAction::Restart,
-        }) => {
-            let executable = std::env::current_exe()?;
-            control_service::restart_service(&executable, &config).await?;
-            println!("Nakode service: restarted");
-        }
-        Some(NakodeCommand::Service {
-            action: ServiceAction::Shutdown,
-        }) => control_service::shutdown_service(&config.workspace).await?,
-        Some(NakodeCommand::Service {
-            action: ServiceAction::Discord { action },
-        }) => discord::run_command(&config, action).await?,
-        Some(NakodeCommand::Service {
-            action: ServiceAction::Endpoint,
-        }) => {
-            let executable = std::env::current_exe()?;
-            let endpoint = control_service::frontend_api_endpoint(&executable, &config).await?;
-            let descriptor = serde_json::json!({
-                "version": 1,
-                "transport": "grpc+unix",
-                "workspace": config.workspace,
-                "endpoint": endpoint,
-            });
-            println!("{}", serde_json::to_string(&descriptor)?);
-        }
-        Some(NakodeCommand::TuiEval {
+        NakodeCommand::TuiEval {
             scenario,
             width,
             height,
-        }) => tui_eval::run(&tui_eval::Options {
+        } => tui_eval::run(&tui_eval::Options {
             workspace: config.workspace,
             scenario,
             width,
             height,
         })?,
-        Some(NakodeCommand::PurgeUnsafe) => {
+        NakodeCommand::PurgeUnsafe => {
             purge::run().await?;
         }
-        Some(NakodeCommand::Update) => unreachable!("update commands return before dispatch"),
-        None => Box::pin(app::run(config)).await?,
+        NakodeCommand::Service { .. } => {
+            unreachable!("deprecated service actions are rewritten before dispatch")
+        }
+        NakodeCommand::Update => unreachable!("update commands return before dispatch"),
     }
     Ok(())
 }

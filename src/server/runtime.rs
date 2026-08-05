@@ -1976,6 +1976,7 @@ mod tests {
     fn config_for(workspace: &Path) -> Config {
         Config {
             command: None,
+            tui: false,
             update: false,
             workspace: workspace.to_path_buf(),
             model: None,

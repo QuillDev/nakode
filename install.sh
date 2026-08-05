@@ -183,9 +183,11 @@ fi
 
 # A running service keeps executing the inode it started from after an atomic
 # replacement. Stop it only after the new executable is in place; attached TUIs
-# will detect the disconnect and launch this newly installed version.
-printf '%s\n' 'Refreshing the shared Nakode control service...'
-"$destination" service shutdown
+# will detect the disconnect and launch this newly installed version. This stops
+# the service for the default workspace; a service started for another workspace
+# keeps running the executable it launched from until it is stopped itself.
+printf '%s\n' 'Refreshing the Nakode service...'
+"$destination" stop
 
 printf '\nInstalled %s\n' "$destination"
 printf '%s\n' "$built_version"
