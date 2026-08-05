@@ -130,7 +130,7 @@ pub struct OwnedProviderSessionView {
     pub native_session_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TokenUsageView {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -150,6 +150,7 @@ pub struct AgentSessionView {
     pub native_session_id: Option<String>,
     /// The provider worker's normalized transcript, suitable for a read-only child view.
     pub transcript: TranscriptPage,
+    #[serde(default)]
     pub usage: TokenUsageView,
 }
 
@@ -346,6 +347,7 @@ pub struct RunView {
     pub model_id: Option<ModelId>,
     /// Provider-native child resource owned by this run, never independently mutable.
     pub native_session_id: Option<String>,
+    #[serde(default)]
     pub usage: TokenUsageView,
     pub objective: String,
     #[serde(default)]
