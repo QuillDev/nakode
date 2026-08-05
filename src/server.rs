@@ -389,6 +389,7 @@ impl ServerCore {
             Command::CancelSessionWork { session_id } => {
                 self.cancel_session_work_command(&session_id)
             }
+            Command::DeleteSession { session_id } => self.delete_session_command(&session_id),
             Command::CompactContext { agent_session_id } => {
                 self.compact_context_command(&agent_session_id)
             }
@@ -620,6 +621,31 @@ impl ServerCore {
             .state_mut()
             .cancel_session_work()?;
         Ok(Self::accepted(Some(session_id.to_string()), effects))
+    }
+
+    /// Removes a logical session and everything persisted beneath it.
+    ///
+    /// Unlike every other session command this one does NOT `ensure_session`: the sessions worth
+    /// deleting are the ones nobody has open, and requiring an attached engine would mean loading a
+    /// conversation into memory in order to throw it away.
+    ///
+    /// An ATTACHED session is refused instead, and the two reasons are told apart because they need
+    /// different actions from the caller. Work in flight must be cancelled; an idle session that some
+    /// client is projecting must be closed. Deleting either would leave a frontend rendering a session
+    /// whose persistence has gone, and interrupting inference is `CancelSessionWork`'s job, not a
+    /// cleanup command's.
+    fn delete_session_command(&mut self, session_id: &SessionId) -> DomainCommandOutcome {
+        if let Some(engine) = self.sessions_by_id.get(session_id) {
+            return Err(DomainCommandError::Conflict(if engine.state().is_busy() {
+                format!("session {session_id} has work in flight; cancel it before deleting it")
+            } else {
+                format!("session {session_id} is open; close it before deleting it")
+            }));
+        }
+        Ok(Self::accepted(
+            Some(session_id.to_string()),
+            vec![Effect::DeleteSession(session_id.to_string())],
+        ))
     }
 
     fn compact_context_command(
@@ -1705,6 +1731,9 @@ impl ServerCore {
             | Command::ReloadProvider { .. }
             | Command::SaveAgent { .. }
             | Command::DeleteAgent { .. }
+            // Deliberately NOT the session it names: that one is unattached, which is the only state
+            // it is deletable in, so there is no engine of its own to run the effect against.
+            | Command::DeleteSession { .. }
             | Command::UpdateSettings { .. }
             | Command::CheckAgentBrowser { .. } => Some(self.default_session.clone()),
         }
@@ -3646,6 +3675,87 @@ first_message = "Starting review"
         assert!(state.models.iter().any(|model| model.id == "model-b"
             && model.provider == CODEX_PROVIDER
             && model.is_default));
+    }
+
+    /// The three states a delete can be asked for, and the one that is allowed.
+    ///
+    /// An unattached session is the deletable one — and it is the only one a cleanup screen ever lists.
+    /// An attached session is refused twice over, with the reason distinguished, because "cancel the turn"
+    /// and "close the session" are different next actions and one message covering both would tell the
+    /// caller to do the wrong one half the time.
+    #[test]
+    fn deleting_a_session_is_refused_while_it_is_attached() {
+        let mut state =
+            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::SessionCreated {
+                provider_session_id: "provider-session".to_owned(),
+                model: "model-a".to_owned(),
+            },
+        );
+        let attached = SessionId::from(state.nakode_session_id.clone());
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+
+        // Idle but open: some client is projecting it, so deleting it would pull the session out from
+        // under a rendered view. Closing it is the caller's next move.
+        let (result, effects, _, _) = core.execute_idempotent(
+            IdempotencyKey::from("delete-open"),
+            None,
+            false,
+            Command::DeleteSession {
+                session_id: attached.clone(),
+            },
+        );
+        let error = result.expect_err("an open session is not deletable");
+        assert!(
+            error.message.contains("is open"),
+            "expected the open-session refusal, got: {}",
+            error.message
+        );
+        assert!(effects.is_empty(), "a refused delete performs no effect");
+
+        // Now mid-turn. Cancelling is a different verb and this command must not become a way to reach it.
+        core.engine_for_mut(&attached)
+            .expect("session runtime")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnStarted {
+                    turn_id: "provider-turn".to_owned(),
+                },
+            );
+        let (result, _, _, _) = core.execute_idempotent(
+            IdempotencyKey::from("delete-busy"),
+            None,
+            false,
+            Command::DeleteSession {
+                session_id: attached.clone(),
+            },
+        );
+        let error = result.expect_err("a working session is not deletable");
+        assert!(
+            error.message.contains("work in flight"),
+            "expected the in-flight refusal, got: {}",
+            error.message
+        );
+
+        // An id nobody has open is the deletable case, and its effect is the persistence one.
+        let closed = SessionId::from("019fcf35-780e-7d21-aa88-c10db392bf63".to_owned());
+        let (result, effects, _, _) = core.execute_idempotent(
+            IdempotencyKey::from("delete-closed"),
+            None,
+            false,
+            Command::DeleteSession {
+                session_id: closed.clone(),
+            },
+        );
+        let accepted = result.expect("an unattached session is deletable");
+        assert_eq!(accepted.resource_id.as_deref(), Some(closed.as_str()));
+        assert!(matches!(
+            effects.as_slice(),
+            [crate::state::Effect::DeleteSession(id)] if id == closed.as_str()
+        ));
     }
 
     #[test]

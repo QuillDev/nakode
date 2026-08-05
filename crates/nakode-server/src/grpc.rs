@@ -632,6 +632,14 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             slug: input.slug
         }
     );
+    command_rpc!(
+        delete_session,
+        api::DeleteSessionRequest,
+        input,
+        protocol::Command::DeleteSession {
+            session_id: protocol::SessionId::from(input.session_id)
+        }
+    );
     try_command_rpc!(
         update_settings,
         api::UpdateSettingsRequest,

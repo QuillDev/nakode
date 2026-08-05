@@ -42,6 +42,7 @@ mod tests {
             "CreateSession",
             "OpenSession",
             "ListSessions",
+            "DeleteSession",
             "GetSession",
             "WatchSession",
             "SendPrompt",

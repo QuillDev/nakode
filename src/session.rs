@@ -192,6 +192,16 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when persistence cannot be updated.
     fn touch(&self, id: &str) -> Result<(), SessionError>;
+    /// Deletes a logical session and every record persisted beneath it.
+    ///
+    /// Takes the session row, its runs and their turns (by cascade), and the native runtime history
+    /// keyed by the provider session it resolves to. That last table carries no foreign key back to
+    /// `sessions`, so it is deleted explicitly — a cascade cannot reach it, and it is where the bulk of
+    /// a session's bytes actually live.
+    ///
+    /// # Errors
+    /// Returns an error when the session is unknown or the transaction cannot be committed.
+    fn delete(&self, id: &str) -> Result<(), SessionError>;
     /// Updates the model associated with a session.
     ///
     /// # Errors
@@ -710,6 +720,35 @@ impl SessionRepository for SqliteSessionRepository {
             params![unix_timestamp(), id],
         )?;
         if updated == 0 {
+            return Err(SessionError::SessionNotFound(id.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn delete(&self, id: &str) -> Result<(), SessionError> {
+        // Resolved through `find` so deletion accepts exactly the ids every other call does, prefixes
+        // included, and so an ambiguous prefix is refused here rather than deleting an arbitrary match.
+        let record = self
+            .find(id)?
+            .ok_or_else(|| SessionError::SessionNotFound(id.to_owned()))?;
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        // The transcript first. It is keyed by the PROVIDER session id and has no foreign key to
+        // `sessions`, so nothing removes it on our behalf; dropping the parent row first would leave it
+        // unreachable and permanent — which is the orphan this table already accumulates.
+        transaction.execute(
+            "DELETE FROM native_runtime_sessions WHERE provider = ?1 AND session_id = ?2",
+            params![record.provider, record.provider_session_id],
+        )?;
+        // Then the session itself. `orchestration_runs` and `agent_turns` go with it by cascade, which
+        // the connection's `PRAGMA foreign_keys = ON` is what makes true.
+        let removed =
+            transaction.execute("DELETE FROM sessions WHERE id = ?1", params![record.id])?;
+        transaction.commit()?;
+        if removed == 0 {
             return Err(SessionError::SessionNotFound(id.to_owned()));
         }
         Ok(())
@@ -1548,6 +1587,94 @@ mod tests {
         assert!(matches!(
             store.set_provider_enabled("missing-provider", true),
             Err(SessionError::ProviderNotFound(provider)) if provider == "missing-provider"
+        ));
+        Ok(())
+    }
+
+    /// Deleting a session must take everything under it, including the one table no cascade reaches.
+    ///
+    /// `native_runtime_sessions` holds the transcripts and has no foreign key to `sessions`, so it is
+    /// the table a naive `DELETE FROM sessions` leaves behind — permanently, since nothing else keys off
+    /// it. That orphan is the whole reason this test writes a row into it by hand.
+    #[test]
+    fn deletes_a_session_with_its_runs_and_native_history() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let doomed = store.create(
+            CODEX_PROVIDER,
+            "doomed-provider-session",
+            "/tmp/project",
+            "Finished work",
+            Some("model-a"),
+        )?;
+        let kept = store.create(
+            CODEX_PROVIDER,
+            "kept-provider-session",
+            "/tmp/project",
+            "Live work",
+            Some("model-a"),
+        )?;
+        store.save_subagent(&SubagentRecord {
+            parent_session_id: doomed.id.clone(),
+            id: "agent-1".to_owned(),
+            agent: "explorer".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: Some("child-provider-session".to_owned()),
+            objective: "Map persistence".to_owned(),
+            status: SubagentStatus::Completed,
+            latest_activity: "Completed".to_owned(),
+            transcript: vec![TranscriptEntry {
+                id: "entry-1".to_owned(),
+                key: None,
+                kind: EntryKind::User,
+                title: "PARENT".to_owned(),
+                body: "Delegated task".to_owned(),
+                status: EntryStatus::Complete,
+            }],
+        })?;
+        let native_rows = |provider_session_id: &str| -> Result<i64, SessionError> {
+            let connection = store
+                .connection
+                .lock()
+                .expect("session database mutex poisoned");
+            Ok(connection.query_row(
+                "SELECT COUNT(*) FROM native_runtime_sessions WHERE provider = ?1 AND session_id = ?2",
+                params![CODEX_PROVIDER, provider_session_id],
+                |row| row.get::<_, i64>(0),
+            )?)
+        };
+        {
+            let connection = store
+                .connection
+                .lock()
+                .expect("session database mutex poisoned");
+            for provider_session_id in ["doomed-provider-session", "kept-provider-session"] {
+                connection.execute(
+                    "INSERT INTO native_runtime_sessions (provider, session_id, session_json, updated_at)
+                     VALUES (?1, ?2, ?3, unixepoch())",
+                    params![CODEX_PROVIDER, provider_session_id, "{}"],
+                )?;
+            }
+        }
+        assert_eq!(native_rows("doomed-provider-session")?, 1);
+        assert_eq!(store.list_subagents(&doomed.id)?.len(), 1);
+
+        store.delete(&doomed.id)?;
+
+        assert_eq!(store.find(&doomed.id)?, None);
+        // The cascade, which only fires because the connection sets `PRAGMA foreign_keys = ON`.
+        assert!(store.list_subagents(&doomed.id)?.is_empty());
+        // The table no cascade reaches.
+        assert_eq!(native_rows("doomed-provider-session")?, 0);
+        // And nothing belonging to the session beside it moved.
+        assert_eq!(store.find(&kept.id)?, Some(kept));
+        assert_eq!(native_rows("kept-provider-session")?, 1);
+
+        // Deleting what is already gone is an error, not a silent success: a caller retrying a failed
+        // cleanup should be told the id means nothing rather than believing it removed something.
+        assert!(matches!(
+            store.delete(&doomed.id),
+            Err(SessionError::SessionNotFound(id)) if id == doomed.id
         ));
         Ok(())
     }
