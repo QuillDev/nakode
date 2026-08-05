@@ -619,7 +619,9 @@ pub struct SubagentRun {
     pub id: String,
     pub agent: String,
     pub provider: String,
+    pub model: Option<String>,
     pub provider_session_id: Option<String>,
+    pub usage: crate::backend::BackendTokenUsage,
     pub objective: String,
     pub status: SubagentStatus,
     pub latest_activity: String,
@@ -901,6 +903,7 @@ pub struct DomainState {
     pub session_id: Option<String>,
     pub active_turn: Option<ActiveTurn>,
     pub context_usage: Option<ContextUsageState>,
+    pub provider_usage: crate::backend::BackendTokenUsage,
     pub context_compaction: Option<ContextCompactionState>,
     pub transcript: DomainTranscript,
     active_shells: HashSet<String>,
@@ -1551,6 +1554,7 @@ impl DomainState {
             session_id: None,
             active_turn: None,
             context_usage: None,
+            provider_usage: crate::backend::BackendTokenUsage::default(),
             context_compaction: None,
             transcript,
             active_shells: HashSet::new(),
@@ -2313,7 +2317,14 @@ impl DomainState {
                 id: record.id.clone(),
                 agent: record.agent,
                 provider: record.provider,
+                model: record.model,
                 provider_session_id: record.provider_session_id,
+                usage: crate::backend::BackendTokenUsage {
+                    input_tokens: record.input_tokens,
+                    output_tokens: record.output_tokens,
+                    cached_input_tokens: record.cached_input_tokens,
+                    cache_write_tokens: record.cache_write_tokens,
+                },
                 objective: record.objective,
                 status,
                 latest_activity,
@@ -2784,6 +2795,7 @@ impl DomainState {
         }
         effects.push(Effect::Backend(BackendCommand::ResumeSession {
             provider_session_id: session.provider_session_id,
+            owner_session_id: Some(self.nakode_session_id.clone()),
         }));
         effects
     }
@@ -5076,6 +5088,24 @@ impl DomainState {
                 return self.handle_session_resumed(provider_session_id, &model, history);
             }
             BackendEvent::TodoUpdated { phases } => self.todo_phases = phases,
+            BackendEvent::TokenUsageUpdated { usage } => {
+                self.provider_usage.input_tokens = self
+                    .provider_usage
+                    .input_tokens
+                    .saturating_add(usage.input_tokens);
+                self.provider_usage.output_tokens = self
+                    .provider_usage
+                    .output_tokens
+                    .saturating_add(usage.output_tokens);
+                self.provider_usage.cached_input_tokens = self
+                    .provider_usage
+                    .cached_input_tokens
+                    .saturating_add(usage.cached_input_tokens);
+                self.provider_usage.cache_write_tokens = self
+                    .provider_usage
+                    .cache_write_tokens
+                    .saturating_add(usage.cache_write_tokens);
+            }
             BackendEvent::AuthenticationChallenge { .. }
             | BackendEvent::AuthenticationCompleted { .. }
             | BackendEvent::ContextUsageUpdated { .. }
@@ -5305,6 +5335,7 @@ impl DomainState {
         }
         self.provider_session_id = Some(provider_session_id.clone());
         self.context_usage = None;
+        self.provider_usage = crate::backend::BackendTokenUsage::default();
         self.context_compaction = None;
         self.creating_session = None;
         if !model.is_empty() {
@@ -5364,6 +5395,7 @@ impl DomainState {
         self.nakode_session_id.clone_from(&session.id);
         self.session_id = Some(session.id.clone());
         self.context_usage = None;
+        self.provider_usage = crate::backend::BackendTokenUsage::default();
         self.context_compaction = None;
         self.session_model_options_override = None;
         if !model.is_empty() {
@@ -5780,6 +5812,7 @@ impl DomainState {
             vec![Effect::Backend(BackendCommand::StartSession {
                 model: prompt.model,
                 instructions: Some(self.nakode_system_instructions()),
+                owner_session_id: Some(self.nakode_session_id.clone()),
                 external_tools: self.external_tools.clone(),
                 replace_builtin_tools: self.replace_builtin_tools,
             })]
@@ -6228,7 +6261,9 @@ impl DomainState {
             id: run_id.clone(),
             agent: definition.slug.clone(),
             provider: provider.clone(),
+            model: model_targets[0].model.clone(),
             provider_session_id: None,
+            usage: crate::backend::BackendTokenUsage::default(),
             objective: task.to_owned(),
             status: SubagentStatus::Starting,
             latest_activity: "Starting provider…".to_owned(),
@@ -6325,7 +6360,7 @@ impl DomainState {
             Clone::clone,
         );
         let base = format!(
-            "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode invocation is available through the native shell. It is a Nakode control-plane command, not a provider tool.\nInitial available agents:\n{}\nThis catalogue can change during a session; a later [Nakode Current Agent Catalogue] block supersedes this initial list.\nTo delegate a concrete bounded task, execute the matching absolute-path command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed in the current catalogue. Use only these Nakode commands for delegation; do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one command per task concurrently using the provider's native shell facilities. Keep each objective distinct and bounded. Each command returns its own agent result on stdout when that child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
+            "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode delegation may be exposed through a session-bound MCP tool and through the native shell. Both are Nakode control-plane paths, not provider-native collaboration.\nInitial available agents:\n{}\nThis catalogue can change during a session; a later [Nakode Current Agent Catalogue] block supersedes this initial list.\nTo delegate a concrete bounded task, prefer the Nakode MCP delegation tool when it is available; its parent session is already bound and must not be supplied by you. Otherwise execute the matching absolute-path Nakode command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed in the current catalogue. Do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one Nakode delegation per task concurrently. Keep each objective distinct and bounded. Each delegation returns its result when the child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
             self.nakode_session_id, model, self.backend_provider, agents,
         );
         self.prompt_addenda
@@ -6393,6 +6428,13 @@ impl DomainState {
                     answer: "No interactive user is attached to this subagent; continue with best judgment.".to_owned(),
                 },
             }],
+            BackendEvent::TokenUsageUpdated { usage } => {
+                if let Some(execution) = self.subagent_executions.get_mut(run_id) {
+                    execution.run.usage = usage;
+                }
+                self.sync_subagent(run_id);
+                Vec::new()
+            }
             BackendEvent::TurnCompleted { outcome, error, .. } => {
                 self.complete_subagent_turn(run_id, outcome, error)
             }
@@ -6562,6 +6604,7 @@ impl DomainState {
             };
             execution.model_target_index = next_index;
             target.provider.clone_into(&mut execution.run.provider);
+            execution.run.model.clone_from(&target.model);
             execution.run.provider_session_id = None;
             execution.run.status = SubagentStatus::Starting;
             execution.run.latest_activity = format!(
@@ -6620,6 +6663,7 @@ impl DomainState {
             command: BackendCommand::StartSession {
                 model,
                 instructions,
+                owner_session_id: Some(self.nakode_session_id.clone()),
                 external_tools: Vec::new(),
                 replace_builtin_tools: false,
             },
@@ -6689,6 +6733,7 @@ impl DomainState {
         };
         execution.session_id = Some(provider_session_id.clone());
         execution.run.provider_session_id = Some(provider_session_id.clone());
+        execution.run.model = options_model.map(str::to_owned);
         execution.run.status = SubagentStatus::Working;
         "Working…".clone_into(&mut execution.run.latest_activity);
         let prompt = execution.definition.initial_prompt(&execution.task);
@@ -6975,7 +7020,12 @@ impl DomainState {
             id: run.id.clone(),
             agent: run.agent.clone(),
             provider: run.provider.clone(),
+            model: run.model.clone(),
             provider_session_id: run.provider_session_id.clone(),
+            input_tokens: run.usage.input_tokens,
+            output_tokens: run.usage.output_tokens,
+            cached_input_tokens: run.usage.cached_input_tokens,
+            cache_write_tokens: run.usage.cache_write_tokens,
             objective: run.objective.clone(),
             status: run.status,
             latest_activity: run.latest_activity.clone(),
@@ -7279,6 +7329,7 @@ fn is_subagent_persistence_boundary(event: &BackendEvent) -> bool {
     matches!(
         event,
         BackendEvent::SessionCreated { .. }
+            | BackendEvent::TokenUsageUpdated { .. }
             | BackendEvent::ContextCompactionStarted { .. }
             | BackendEvent::ContextCompactionCompleted { .. }
             | BackendEvent::ContextCompactionFailed { .. }
@@ -9374,6 +9425,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             model: Some("model-a".to_owned()),
             created_at: 1,
             updated_at: 2,
+            owned_provider_sessions: Vec::new(),
         };
         assert!(matches!(
             state.begin_resume(session.clone()).as_slice(),
@@ -9443,7 +9495,12 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             id: "agent-1".to_owned(),
             agent: "explorer".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
+            model: None,
             provider_session_id: Some("child-session".to_owned()),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
             objective: "Map persistence".to_owned(),
             status: SubagentStatus::Completed,
             latest_activity: "Completed".to_owned(),

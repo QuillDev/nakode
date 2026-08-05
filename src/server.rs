@@ -1581,6 +1581,27 @@ impl ServerCore {
                 .iter()
                 .position(|summary| summary.id == session.id);
             let updated_at_ms = position.map_or(0, |index| bootstrap.sessions[index].updated_at_ms);
+            let mut owned_provider_sessions = session
+                .active_agent_session
+                .as_ref()
+                .and_then(|agent| {
+                    agent.native_session_id.as_ref().map(|native_session_id| {
+                        nakode_protocol::OwnedProviderSessionView {
+                            provider_id: agent.provider_id.clone(),
+                            native_session_id: native_session_id.clone(),
+                        }
+                    })
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            owned_provider_sessions.extend(session.runs.iter().filter_map(|run| {
+                run.native_session_id.as_ref().map(|native_session_id| {
+                    nakode_protocol::OwnedProviderSessionView {
+                        provider_id: run.provider_id.clone(),
+                        native_session_id: native_session_id.clone(),
+                    }
+                })
+            }));
             let summary = nakode_protocol::SessionSummary {
                 id: session.id,
                 workspace_id: session.workspace_id,
@@ -1588,6 +1609,7 @@ impl ServerCore {
                 active_provider_id: session.selected_provider_id,
                 active_model_id: session.selected_model_id,
                 updated_at_ms,
+                owned_provider_sessions,
             };
             if let Some(position) = position {
                 bootstrap.sessions[position] = summary;
@@ -3383,7 +3405,12 @@ first_message = "Starting review"
                     id: format!("run-{index:03}"),
                     agent: "reviewer".to_owned(),
                     provider: CODEX_PROVIDER.to_owned(),
+                    model: None,
                     provider_session_id: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 0,
                     objective: format!("Review {index}"),
                     status: crate::state::SubagentStatus::Completed,
                     latest_activity: "Completed".to_owned(),
@@ -3434,7 +3461,12 @@ first_message = "Starting review"
             id: "run-long-text".to_owned(),
             agent: "reviewer".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
+            model: None,
             provider_session_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
             objective: objective.clone(),
             status: crate::state::SubagentStatus::Completed,
             latest_activity: latest_activity.clone(),
@@ -3477,7 +3509,12 @@ first_message = "Starting review"
             id: "run-history".to_owned(),
             agent: "reviewer".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
+            model: None,
             provider_session_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
             objective: "Review history".to_owned(),
             status: crate::state::SubagentStatus::Completed,
             latest_activity: "Completed".to_owned(),
@@ -3697,7 +3734,12 @@ first_message = "Starting review"
             id: "run-stream".to_owned(),
             agent: "reviewer".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
+            model: None,
             provider_session_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
             objective: "Review".to_owned(),
             status: crate::state::SubagentStatus::Completed,
             latest_activity: "Working".to_owned(),

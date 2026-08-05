@@ -769,6 +769,14 @@ fn session_summary(value: api::SessionSummary) -> view::SessionSummary {
         active_provider_id: value.active_provider_id.map(view::ProviderId::from),
         active_model_id: value.active_model_id.map(view::ModelId::from),
         updated_at_ms: value.updated_at_ms,
+        owned_provider_sessions: value
+            .owned_provider_sessions
+            .into_iter()
+            .map(|resource| view::OwnedProviderSessionView {
+                provider_id: view::ProviderId::from(resource.provider_id),
+                native_session_id: resource.native_session_id,
+            })
+            .collect(),
     }
 }
 
@@ -795,7 +803,19 @@ fn agent_session(value: api::AgentSession) -> Result<view::AgentSessionView, Str
         role: value.role,
         capabilities: capabilities(value.capabilities.unwrap_or_default())?,
         connection: connection(required(value.connection, "agent session connection")?)?,
+        native_session_id: value.native_session_id,
+        transcript: transcript(value.transcript.unwrap_or_default())?,
+        usage: token_usage(value.usage.unwrap_or_default()),
     })
+}
+
+fn token_usage(value: api::TokenUsage) -> view::TokenUsageView {
+    view::TokenUsageView {
+        input_tokens: value.input_tokens,
+        output_tokens: value.output_tokens,
+        cached_input_tokens: value.cached_input_tokens,
+        cache_write_tokens: value.cache_write_tokens,
+    }
 }
 
 fn turn(value: api::Turn) -> Result<view::TurnView, String> {
@@ -962,6 +982,9 @@ pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
         id: view::RunId::from(value.id),
         agent_slug: value.agent_slug,
         provider_id: view::ProviderId::from(value.provider_id),
+        model_id: value.model_id.map(view::ModelId::from),
+        native_session_id: value.native_session_id,
+        usage: token_usage(value.usage.unwrap_or_default()),
         objective: value.objective,
         objective_start_byte: value.objective_start_byte,
         objective_total_bytes: value.objective_total_bytes,

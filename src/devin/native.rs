@@ -359,6 +359,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             instructions,
             external_tools,
             replace_builtin_tools,
+            owner_session_id: _,
         } => {
             start_session(
                 model,
@@ -371,6 +372,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         }
         BackendCommand::ResumeSession {
             provider_session_id,
+            ..
         } => resume_session(provider_session_id, context).await,
         BackendCommand::UnsubscribeSession {
             provider_session_id,

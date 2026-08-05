@@ -1274,6 +1274,14 @@ pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSu
         active_provider_id: value.active_provider_id.map(|id| id.to_string()),
         active_model_id: value.active_model_id.map(|id| id.to_string()),
         updated_at_ms: value.updated_at_ms,
+        owned_provider_sessions: value
+            .owned_provider_sessions
+            .into_iter()
+            .map(|resource| api::OwnedProviderSession {
+                provider_id: resource.provider_id.to_string(),
+                native_session_id: resource.native_session_id,
+            })
+            .collect(),
     }
 }
 
@@ -1341,6 +1349,18 @@ fn agent_session(value: protocol::AgentSessionView) -> api::AgentSession {
         role: value.role,
         capabilities: Some(capabilities(value.capabilities)),
         connection: Some(connection(value.connection)),
+        native_session_id: value.native_session_id,
+        transcript: Some(transcript(value.transcript)),
+        usage: Some(token_usage(value.usage)),
+    }
+}
+
+fn token_usage(value: protocol::TokenUsageView) -> api::TokenUsage {
+    api::TokenUsage {
+        input_tokens: value.input_tokens,
+        output_tokens: value.output_tokens,
+        cached_input_tokens: value.cached_input_tokens,
+        cache_write_tokens: value.cache_write_tokens,
     }
 }
 
@@ -1522,6 +1542,9 @@ pub(crate) fn run(value: protocol::RunView) -> api::RunState {
         id: value.id.to_string(),
         agent_slug: value.agent_slug,
         provider_id: value.provider_id.to_string(),
+        model_id: value.model_id.map(|id| id.to_string()),
+        native_session_id: value.native_session_id,
+        usage: Some(token_usage(value.usage)),
         objective: value.objective,
         objective_start_byte: value.objective_start_byte,
         objective_total_bytes: value.objective_total_bytes,

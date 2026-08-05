@@ -115,6 +115,27 @@ pub struct SessionSummary {
     pub active_provider_id: Option<ProviderId>,
     pub active_model_id: Option<ModelId>,
     pub updated_at_ms: i64,
+    /// Provider-native resources whose lifecycle belongs to this logical session.
+    #[serde(default)]
+    pub owned_provider_sessions: Vec<OwnedProviderSessionView>,
+}
+
+/// An opaque provider resource claimed by one Nakode logical session.
+///
+/// Clients use this identity only to reconcile provider-native discovery. Mutations continue to
+/// address the owning Nakode session or agent session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OwnedProviderSessionView {
+    pub provider_id: ProviderId,
+    pub native_session_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TokenUsageView {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -125,6 +146,11 @@ pub struct AgentSessionView {
     pub role: String,
     pub capabilities: ProviderCapabilities,
     pub connection: ConnectionView,
+    /// Opaque provider resume identity. Nakode is its lifecycle owner.
+    pub native_session_id: Option<String>,
+    /// The provider worker's normalized transcript, suitable for a read-only child view.
+    pub transcript: TranscriptPage,
+    pub usage: TokenUsageView,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -317,6 +343,10 @@ pub struct RunView {
     pub id: RunId,
     pub agent_slug: String,
     pub provider_id: ProviderId,
+    pub model_id: Option<ModelId>,
+    /// Provider-native child resource owned by this run, never independently mutable.
+    pub native_session_id: Option<String>,
+    pub usage: TokenUsageView,
     pub objective: String,
     #[serde(default)]
     pub objective_start_byte: u64,

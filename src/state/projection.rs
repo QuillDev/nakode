@@ -65,6 +65,7 @@ pub fn bootstrap(
                 active_provider_id: provider_id(&state.backend_provider),
                 active_model_id: state.selected_model.clone().map(ModelId::from),
                 updated_at_ms: 0,
+                owned_provider_sessions: owned_provider_sessions(state),
             },
         );
     }
@@ -286,6 +287,9 @@ fn agent_session_view(
         role: "primary".to_owned(),
         capabilities: capabilities_view(&state.backend_capabilities),
         connection: connection_view(&state.connection),
+        native_session_id: state.provider_session_id.clone(),
+        transcript: transcript_page(&state.transcript),
+        usage: token_usage_view(state.provider_usage),
     })
 }
 
@@ -558,6 +562,9 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
         id: RunId::from(run.id.clone()),
         agent_slug: run.agent.clone(),
         provider_id: ProviderId::from(run.provider.clone()),
+        model_id: run.model.clone().map(ModelId::from),
+        native_session_id: run.provider_session_id.clone(),
+        usage: token_usage_view(run.usage),
         objective: objective.value,
         objective_start_byte: objective.start_byte,
         objective_total_bytes: objective.total_bytes,
@@ -1104,6 +1111,53 @@ fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> Sessi
         active_provider_id: provider_id(&session.provider),
         active_model_id: session.model.clone().map(ModelId::from),
         updated_at_ms: session.updated_at.saturating_mul(1_000),
+        owned_provider_sessions: owned_provider_session(
+            &session.provider,
+            Some(&session.provider_session_id),
+        )
+        .into_iter()
+        .chain(session.owned_provider_sessions.iter().filter_map(
+            |(provider, native_session_id)| {
+                owned_provider_session(provider, Some(native_session_id))
+            },
+        ))
+        .collect(),
+    }
+}
+
+fn owned_provider_sessions(state: &DomainState) -> Vec<nakode_protocol::OwnedProviderSessionView> {
+    owned_provider_session(
+        &state.backend_provider,
+        state.provider_session_id.as_deref(),
+    )
+    .into_iter()
+    .chain(state.subagents.iter().filter_map(|run| {
+        owned_provider_session(&run.provider, run.provider_session_id.as_deref())
+    }))
+    .collect()
+}
+
+fn owned_provider_session(
+    provider: &str,
+    native_session_id: Option<&str>,
+) -> Option<nakode_protocol::OwnedProviderSessionView> {
+    let provider_id = provider_id(provider)?;
+    let native_session_id = native_session_id?.trim();
+    if native_session_id.is_empty() {
+        return None;
+    }
+    Some(nakode_protocol::OwnedProviderSessionView {
+        provider_id,
+        native_session_id: native_session_id.to_owned(),
+    })
+}
+
+fn token_usage_view(usage: crate::backend::BackendTokenUsage) -> nakode_protocol::TokenUsageView {
+    nakode_protocol::TokenUsageView {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
     }
 }
 
@@ -1436,7 +1490,12 @@ mod tests {
                     id: format!("run-{index:03}"),
                     agent: "reviewer".to_owned(),
                     provider: CODEX_PROVIDER.to_owned(),
+                    model: None,
                     provider_session_id: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 0,
                     objective: format!("Review {index}"),
                     status: SubagentStatus::Completed,
                     latest_activity: "Completed".to_owned(),
@@ -1481,7 +1540,12 @@ mod tests {
             id: "run-large".to_owned(),
             agent: "reviewer".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
+            model: None,
             provider_session_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
             objective: "o".repeat(MAX_RUN_TEXT_BYTES * 2),
             status: SubagentStatus::Completed,
             latest_activity: "a".repeat(MAX_RUN_TEXT_BYTES * 2),

@@ -260,9 +260,33 @@ message VisionSettings { optional string model_id = 1; }
 enum TerminalImageMode { TERMINAL_IMAGE_MODE_UNSPECIFIED = 0; TERMINAL_IMAGE_MODE_AUTO = 1; TERMINAL_IMAGE_MODE_ON = 2; TERMINAL_IMAGE_MODE_OFF = 3; }
 message Settings { WebSettings web = 1; MemorySettings memory = 2; VisionSettings vision = 3; TerminalImageMode terminal_images = 4; }
 
-message SessionSummary { string id = 1; string workspace_id = 2; string title = 3; optional string active_provider_id = 4; optional string active_model_id = 5; int64 updated_at_ms = 6; }
+message OwnedProviderSession { string provider_id = 1; string native_session_id = 2; }
+message SessionSummary {
+  string id = 1;
+  string workspace_id = 2;
+  string title = 3;
+  optional string active_provider_id = 4;
+  optional string active_model_id = 5;
+  int64 updated_at_ms = 6;
+  // Opaque provider resources claimed by this logical session. Clients use these only to suppress
+  // duplicate native discovery; lifecycle mutations continue to address Nakode.
+  repeated OwnedProviderSession owned_provider_sessions = 7;
+}
 enum SessionActivity { SESSION_ACTIVITY_UNSPECIFIED = 0; SESSION_ACTIVITY_IDLE = 1; SESSION_ACTIVITY_CREATING_AGENT_SESSION = 2; SESSION_ACTIVITY_STARTING_TURN = 3; SESSION_ACTIVITY_RUNNING_TURN = 4; SESSION_ACTIVITY_COMPACTING_CONTEXT = 5; SESSION_ACTIVITY_RUNNING_DELEGATES = 6; SESSION_ACTIVITY_RUNNING_SHELL = 7; }
-message AgentSession { string id = 1; string provider_id = 2; optional string model_id = 3; string role = 4; ProviderCapabilities capabilities = 5; Connection connection = 6; }
+message TokenUsage { uint64 input_tokens = 1; uint64 output_tokens = 2; uint64 cached_input_tokens = 3; uint64 cache_write_tokens = 4; }
+message AgentSession {
+  string id = 1;
+  string provider_id = 2;
+  optional string model_id = 3;
+  string role = 4;
+  ProviderCapabilities capabilities = 5;
+  Connection connection = 6;
+  // Opaque provider resume identity. Nakode remains the lifecycle owner.
+  optional string native_session_id = 7;
+  // Normalized provider-worker transcript for read-only child inspection.
+  TranscriptPage transcript = 8;
+  TokenUsage usage = 9;
+}
 enum TurnStatus { TURN_STATUS_UNSPECIFIED = 0; TURN_STATUS_STARTING = 1; TURN_STATUS_RUNNING = 2; TURN_STATUS_CANCELLING = 3; TURN_STATUS_COMPLETED = 4; TURN_STATUS_INTERRUPTED = 5; TURN_STATUS_FAILED = 6; }
 message Turn { string id = 1; string agent_session_id = 2; optional string model_id = 3; TurnStatus status = 4; }
 message ContextUsage { uint64 estimated_tokens = 1; optional uint64 context_window = 2; bool compacting = 3; }
@@ -313,7 +337,7 @@ message Notice { string id = 1; NoticeLevel level = 2; string message = 3; }
 
 enum RunStatus { RUN_STATUS_UNSPECIFIED = 0; RUN_STATUS_STARTING = 1; RUN_STATUS_WORKING = 2; RUN_STATUS_COMPLETED = 3; RUN_STATUS_INTERRUPTED = 4; RUN_STATUS_FAILED = 5; }
 message RunOutcome { enum Kind { KIND_UNSPECIFIED = 0; KIND_COMPLETED = 1; KIND_FAILED = 2; KIND_INTERRUPTED = 3; } Kind kind = 1; string body = 2; }
-message RunState { string id = 1; string agent_slug = 2; string provider_id = 3; string objective = 4; uint64 objective_start_byte = 5; uint64 objective_total_bytes = 6; RunStatus status = 7; string latest_activity = 8; uint64 latest_activity_start_byte = 9; uint64 latest_activity_total_bytes = 10; optional RunOutcome outcome = 11; uint64 outcome_start_byte = 12; uint64 outcome_total_bytes = 13; optional string result = 14; uint64 result_start_byte = 15; uint64 result_total_bytes = 16; TranscriptPage transcript = 17; }
+message RunState { string id = 1; string agent_slug = 2; string provider_id = 3; string objective = 4; uint64 objective_start_byte = 5; uint64 objective_total_bytes = 6; RunStatus status = 7; string latest_activity = 8; uint64 latest_activity_start_byte = 9; uint64 latest_activity_total_bytes = 10; optional RunOutcome outcome = 11; uint64 outcome_start_byte = 12; uint64 outcome_total_bytes = 13; optional string result = 14; uint64 result_start_byte = 15; uint64 result_total_bytes = 16; TranscriptPage transcript = 17; optional string model_id = 18; optional string native_session_id = 19; TokenUsage usage = 20; }
 message RunTextWindow { string run_id = 1; RunTextField field = 2; string text = 3; uint64 start_byte = 4; uint64 total_bytes = 5; bool has_earlier = 6; }
 message Artifact { string id = 1; string label = 2; string media_type = 3; uint64 byte_length = 4; bytes data = 5; }
 

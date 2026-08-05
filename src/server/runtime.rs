@@ -2149,6 +2149,7 @@ mod tests {
                     instructions: None,
                     external_tools: Vec::new(),
                     replace_builtin_tools: false,
+                    owner_session_id: None,
                 },
             )
             .await
@@ -2195,6 +2196,7 @@ mod tests {
                     instructions: None,
                     external_tools: Vec::new(),
                     replace_builtin_tools: false,
+                    owner_session_id: None,
                 },
             )
             .await
@@ -2208,6 +2210,7 @@ mod tests {
                     instructions: None,
                     external_tools: Vec::new(),
                     replace_builtin_tools: false,
+                    owner_session_id: None,
                 },
             )
             .await

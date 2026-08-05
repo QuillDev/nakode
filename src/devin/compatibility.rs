@@ -528,6 +528,7 @@ async fn handle_command(
         } => set_session_model(provider_session_id, model, stdin, events, runtime).await,
         BackendCommand::ResumeSession {
             provider_session_id,
+            ..
         } => resume_session(provider_session_id, stdin, events, workspace, runtime).await,
         BackendCommand::UnsubscribeSession {
             provider_session_id,

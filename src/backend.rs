@@ -364,6 +364,14 @@ impl BackendOperation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BackendTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum BackendEvent {
     Ready(BackendIdentity),
@@ -402,6 +410,10 @@ pub enum BackendEvent {
     ContextUsageUpdated {
         estimated_tokens: usize,
         context_window: Option<usize>,
+    },
+    /// Token usage reported for one completed provider turn.
+    TokenUsageUpdated {
+        usage: BackendTokenUsage,
     },
     ContextCompactionStarted {
         compaction_id: String,
@@ -504,11 +516,15 @@ pub enum BackendCommand {
     StartSession {
         model: Option<String>,
         instructions: Option<String>,
+        /// Logical Nakode owner bound by the control plane, never provider/model input.
+        owner_session_id: Option<String>,
         external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
     },
     ResumeSession {
         provider_session_id: String,
+        /// Logical Nakode owner bound by the control plane, never provider/model input.
+        owner_session_id: Option<String>,
     },
     UnsubscribeSession {
         provider_session_id: String,
