@@ -1351,11 +1351,11 @@ fn agent_session(value: protocol::AgentSessionView) -> api::AgentSession {
         connection: Some(connection(value.connection)),
         native_session_id: value.native_session_id,
         transcript: Some(transcript(value.transcript)),
-        usage: Some(token_usage(value.usage)),
+        usage: Some(token_usage(&value.usage)),
     }
 }
 
-fn token_usage(value: protocol::TokenUsageView) -> api::TokenUsage {
+fn token_usage(value: &protocol::TokenUsageView) -> api::TokenUsage {
     api::TokenUsage {
         input_tokens: value.input_tokens,
         output_tokens: value.output_tokens,
@@ -1544,7 +1544,7 @@ pub(crate) fn run(value: protocol::RunView) -> api::RunState {
         provider_id: value.provider_id.to_string(),
         model_id: value.model_id.map(|id| id.to_string()),
         native_session_id: value.native_session_id,
-        usage: Some(token_usage(value.usage)),
+        usage: Some(token_usage(&value.usage)),
         objective: value.objective,
         objective_start_byte: value.objective_start_byte,
         objective_total_bytes: value.objective_total_bytes,

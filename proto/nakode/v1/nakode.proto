@@ -99,8 +99,10 @@ message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // Removes a logical session and its persisted history. Deletion is AUTHORITATIVE: a
 // session still attached is closed and released by the service, because there is no
 // close RPC for a caller to issue first and a dead session could never complete one.
-// Rejected only while work is genuinely in flight behind a live provider; cancel it
-// first. Requires the `SessionDeletion` capability.
+// Rejected while work is genuinely in flight behind a live provider, or while the
+// current initial-session role still owns a live native provider resource. Closed
+// former initial sessions are rotated to a fresh control-plane successor and deleted.
+// Requires the `SessionDeletion` capability.
 message DeleteSessionRequest { MutationOptions mutation = 1; string session_id = 2; }
 message ListSessionsResponse { repeated SessionSummary sessions = 1; }
 message GetSessionRequest { string session_id = 1; }

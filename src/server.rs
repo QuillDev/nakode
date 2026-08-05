@@ -674,36 +674,58 @@ impl ServerCore {
     /// of the process and became permanently undeletable — the dead sessions that piled up in the
     /// store. Doing the close internally is what makes the caller's request satisfiable at all.
     ///
-    /// The one refusal left is a session genuinely still working, which the proto documents and which
+    /// A session with live work is refused, which the proto documents and which
     /// `CancelSessionWork` is the verb for — deleting mid-inference would drop the history a live
     /// provider child is still writing. That test reads liveness as well as busyness on purpose: a
     /// backend that died mid-turn can leave `is_busy` true forever (see `provider_is_live`), and the
     /// old code refused those too, with a cancel that could never land.
+    ///
+    /// The initial-session identity is a LIVE control-plane role, not a historical property. While its
+    /// native provider session is live it remains protected. Once that resource is gone, deletion first
+    /// installs a fresh, unpersisted control-plane engine as the default and only then releases the old
+    /// engine. Every default-engine lookup therefore has a valid successor, while the former initial
+    /// session becomes ordinary persisted history.
     fn delete_session_command(&mut self, session_id: &SessionId) -> DomainCommandOutcome {
-        let working = self.sessions_by_id.get(session_id).map(|engine| {
+        let lifecycle = self.sessions_by_id.get(session_id).map(|engine| {
             let state = engine.state();
-            state.is_busy() && state.provider_is_live()
+            (
+                state.is_busy() && state.provider_is_live(),
+                state.provider_is_live() && state.provider_session_id.is_some(),
+            )
         });
         let mut effects = Vec::new();
-        if let Some(working) = working {
+        if let Some((working, owns_live_provider_session)) = lifecycle {
             if working {
                 return Err(DomainCommandError::Conflict(format!(
                     "session {session_id} has work in flight; cancel it before deleting it"
                 )));
             }
-            // The default session's engine backs three `expect`s and its revision is one clients are
-            // forbidden to see regress, so it is the one engine that may not be evicted. Refused by
-            // name rather than half-deleted, which is what deleting the row under a live engine is.
-            if *session_id == self.default_session {
+            if *session_id == self.default_session && owns_live_provider_session {
                 return Err(DomainCommandError::Conflict(format!(
-                    "session {session_id} is this workspace's initial session and cannot be deleted"
+                    "session {session_id} is this workspace's active initial session and cannot be deleted"
                 )));
             }
             effects.push(Effect::ReleaseSessionBackends(session_id.to_string()));
+            if *session_id == self.default_session {
+                self.replace_default_session()?;
+            }
             self.release_session(session_id);
         }
         effects.push(Effect::DeleteSession(session_id.to_string()));
         Ok(Self::accepted(Some(session_id.to_string()), effects))
+    }
+
+    /// Installs the successor for a closed initial session before its engine is removed.
+    fn replace_default_session(&mut self) -> Result<(), DomainCommandError> {
+        let mut successor = ServiceEngine::new(self.session_template.clone());
+        // `new` clones workspace configuration only in production, but tests and legacy callers may
+        // provide a template carrying an old native id. `create_logical_session` clears it; any
+        // unsubscribe effect belongs to that template snapshot, not to the fresh successor.
+        let _discarded_template_effects = successor.state_mut().create_logical_session()?;
+        let successor_id = SessionId::from(successor.state().nakode_session_id.clone());
+        self.sessions_by_id.insert(successor_id.clone(), successor);
+        self.default_session = successor_id;
+        Ok(())
     }
 
     /// Drops one session's in-memory engine and the projection kept for its subscribers.
@@ -1569,7 +1591,22 @@ impl ServerCore {
         let mut bootstrap = self
             .engine()
             .bootstrap_view(&self.providers, &self.sessions);
-        for engine in self.sessions_by_id.values() {
+        let default_is_persisted = self
+            .sessions
+            .iter()
+            .any(|record| record.id == self.default_session.as_str());
+        if !default_is_persisted {
+            bootstrap
+                .sessions
+                .retain(|summary| summary.id != self.default_session);
+        }
+        for (session_id, engine) in &self.sessions_by_id {
+            // A fresh default is the workspace control-plane host, not a logical conversation. It only
+            // becomes discoverable if provider work persists it. This also keeps successor engines from
+            // recreating the old epoch-dated `New session` duplicate after an initial-session delete.
+            if *session_id == self.default_session && !default_is_persisted {
+                continue;
+            }
             let Some(session) = engine
                 .bootstrap_view(&self.providers, &self.sessions)
                 .active_session
@@ -1826,11 +1863,11 @@ impl ServerCore {
             | Command::ReloadProvider { .. }
             | Command::SaveAgent { .. }
             | Command::DeleteAgent { .. }
-            // Deliberately NOT the session it names: that one is unattached, which is the only state
-            // it is deletable in, so there is no engine of its own to run the effect against.
-            | Command::DeleteSession { .. }
             | Command::UpdateSettings { .. }
             | Command::CheckAgentBrowser { .. } => Some(self.default_session.clone()),
+            // Run deletion effects through whichever control-plane engine is default AFTER command
+            // acceptance. This matters when deleting a closed initial session rotates that role.
+            Command::DeleteSession { .. } => None,
         }
     }
 
@@ -2385,7 +2422,7 @@ mod tests {
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         service::ServiceEngine,
-        session::{ProviderRecord, SubagentRecord},
+        session::{ProviderRecord, SessionRecord, SubagentRecord},
         state::AppState,
     };
 
@@ -4034,7 +4071,9 @@ first_message = "Starting review"
                 id: "run-1".to_owned(),
                 agent: "reviewer".to_owned(),
                 provider: CODEX_PROVIDER.to_owned(),
+                model: None,
                 provider_session_id: None,
+                usage: crate::backend::BackendTokenUsage::default(),
                 objective: "review the diff".to_owned(),
                 status: crate::session::SubagentStatus::Working,
                 latest_activity: String::new(),
@@ -4104,13 +4143,9 @@ first_message = "Starting review"
         );
     }
 
-    /// The workspace's initial session is refused by name.
-    ///
-    /// Its engine backs three `expect`s and its revision is one clients may not see regress, so it is
-    /// the one session that cannot be evicted. Saying so beats deleting the row from under a live
-    /// engine, which is what the old "close it first" message amounted to here.
+    /// The workspace's initial role remains protected while it owns a live native session.
     #[test]
-    fn deleting_the_initial_session_is_refused_with_its_reason() {
+    fn deleting_an_active_initial_session_is_refused_with_its_reason() {
         let (mut core, default_session) = ready_codex_server();
 
         let (result, effects, _, _) = core.execute_idempotent(
@@ -4122,14 +4157,125 @@ first_message = "Starting review"
             },
         );
 
-        let error = result.expect_err("the initial session is not deletable");
+        let error = result.expect_err("the active initial session is not deletable");
         assert!(
-            error.message.contains("initial session"),
+            error.message.contains("active initial session"),
             "expected the initial-session refusal, got: {}",
             error.message
         );
         assert!(effects.is_empty());
+        assert_eq!(core.default_session_id(), &default_session);
         assert!(core.engine_for(&default_session).is_some());
+    }
+
+    /// Once its provider resource is closed, an initial session is ordinary persisted history.
+    #[test]
+    fn deleting_a_closed_initial_session_installs_an_empty_successor() {
+        let (mut core, initial_session) = ready_codex_server();
+        core.engine_for_mut(&initial_session)
+            .expect("initial runtime")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::Disconnected {
+                    reason: "workspace session closed".to_owned(),
+                },
+            );
+
+        let (result, effects, effect_session, _) = core.execute_idempotent(
+            IdempotencyKey::from("delete-closed-initial"),
+            None,
+            false,
+            Command::DeleteSession {
+                session_id: initial_session.clone(),
+            },
+        );
+
+        result.expect("a closed initial session is deletable");
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                crate::state::Effect::ReleaseSessionBackends(released),
+                crate::state::Effect::DeleteSession(deleted),
+            ] if released == initial_session.as_str() && deleted == initial_session.as_str()
+        ));
+        assert_eq!(
+            effect_session, None,
+            "effects must run on the post-command default"
+        );
+        let successor = core.default_session_id().clone();
+        assert_ne!(successor, initial_session);
+        assert!(core.engine_for(&initial_session).is_none());
+        assert!(core.engine_for(&successor).is_some());
+        assert!(
+            core.workspace_bootstrap().sessions.is_empty(),
+            "the unpersisted successor is control-plane state, not an epoch-dated conversation"
+        );
+    }
+
+    /// A stale persisted row for the former initial id cannot restore its live-role protection.
+    #[test]
+    fn stale_initial_records_and_repeated_deletion_are_deterministic() {
+        let (mut core, former_initial) = ready_codex_server();
+        core.engine_for_mut(&former_initial)
+            .expect("initial runtime")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::Disconnected {
+                    reason: "closed".to_owned(),
+                },
+            );
+        core.delete_session_command(&former_initial)
+            .expect("first delete rotates the role");
+        let successor = core.default_session_id().clone();
+        core.replace_session_records(vec![SessionRecord {
+            id: former_initial.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "stale-thread".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            title: "New session".to_owned(),
+            model: None,
+            created_at: 0,
+            updated_at: 0,
+            owned_provider_sessions: Vec::new(),
+        }]);
+
+        for attempt in 0..2 {
+            let (_, effects) = core
+                .delete_session_command(&former_initial)
+                .unwrap_or_else(|error| panic!("repeat {attempt} was refused: {error}"));
+            assert!(matches!(
+                effects.as_slice(),
+                [crate::state::Effect::DeleteSession(id)] if id == former_initial.as_str()
+            ));
+            assert_eq!(core.default_session_id(), &successor);
+        }
+    }
+
+    /// Session creation continues through the successor after the old initial session is gone.
+    #[test]
+    fn a_session_can_be_created_after_the_closed_initial_session_is_deleted() {
+        let (mut core, initial) = ready_codex_server();
+        core.engine_for_mut(&initial)
+            .expect("initial runtime")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::Disconnected {
+                    reason: "closed".to_owned(),
+                },
+            );
+        core.delete_session_command(&initial)
+            .expect("closed initial deletion");
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+
+        let (accepted, _) = create_default_session(&mut core, &workspace_id)
+            .expect("session creation recovers through the successor");
+        let created = SessionId::from(accepted.resource_id.expect("created id"));
+        assert_ne!(created, initial);
+        assert_ne!(&created, core.default_session_id());
+        assert!(core.engine_for(&created).is_some());
     }
 
     /// Session lifecycle does not accumulate engines.
