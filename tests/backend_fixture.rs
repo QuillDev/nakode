@@ -60,6 +60,7 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
             instructions: None,
             external_tools: Vec::new(),
             replace_builtin_tools: false,
+            owner_session_id: None,
         })
         .await?;
 
@@ -231,6 +232,7 @@ async fn codex_client_resumes_history_and_unsubscribes() -> TestResult {
         .commands
         .send(BackendCommand::ResumeSession {
             provider_session_id: "thread-fixture".to_owned(),
+            owner_session_id: None,
         })
         .await?;
     match next_event(&mut backend).await? {
@@ -252,6 +254,7 @@ async fn codex_client_resumes_history_and_unsubscribes() -> TestResult {
         .commands
         .send(BackendCommand::UnsubscribeSession {
             provider_session_id: "thread-fixture".to_owned(),
+            owner_session_id: None,
         })
         .await?;
     assert!(matches!(
@@ -292,6 +295,7 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
             instructions: None,
             external_tools: Vec::new(),
             replace_builtin_tools: false,
+            owner_session_id: None,
         })
         .await?;
     let mut gate_writer = OpenOptions::new().write(true).open(&gate)?;

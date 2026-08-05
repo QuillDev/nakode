@@ -47,6 +47,8 @@ pub struct SessionRecord {
     pub model: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Additional provider-native resources owned by delegated runs beneath this session.
+    pub owned_provider_sessions: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,7 +100,12 @@ pub struct SubagentRecord {
     pub id: String,
     pub agent: String,
     pub provider: String,
+    pub model: Option<String>,
     pub provider_session_id: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_tokens: u64,
     pub objective: String,
     pub status: SubagentStatus,
     pub latest_activity: String,
@@ -417,7 +424,12 @@ impl SqliteSessionRepository {
                id TEXT NOT NULL,
                agent_slug TEXT NOT NULL,
                provider TEXT NOT NULL,
+               model TEXT,
                provider_session_id TEXT,
+               input_tokens INTEGER NOT NULL DEFAULT 0,
+               output_tokens INTEGER NOT NULL DEFAULT 0,
+               cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+               cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                objective TEXT NOT NULL,
                status TEXT NOT NULL,
                latest_activity TEXT NOT NULL,
@@ -442,6 +454,34 @@ impl SqliteSessionRepository {
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
              );",
         )?;
+        let orchestration_columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(orchestration_runs)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut orchestration_migration = String::from("BEGIN IMMEDIATE;\n");
+        if !orchestration_columns.iter().any(|column| column == "model") {
+            orchestration_migration
+                .push_str("ALTER TABLE orchestration_runs ADD COLUMN model TEXT;\n");
+        }
+        for (column, definition) in [
+            ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("cached_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("cache_write_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !orchestration_columns
+                .iter()
+                .any(|existing| existing == column)
+            {
+                orchestration_migration.push_str(&format!(
+                    "ALTER TABLE orchestration_runs ADD COLUMN {column} {definition};\n"
+                ));
+            }
+        }
+        orchestration_migration.push_str("COMMIT;");
+        execute_batch_with_busy_retry(&connection, &orchestration_migration)?;
         let has_agent_turn_entry_id = {
             let mut statement = connection.prepare("PRAGMA table_info(agent_turns)")?;
             let columns = statement
@@ -541,8 +581,26 @@ impl SqliteSessionRepository {
             model: row.get(5)?,
             created_at: row.get(6)?,
             updated_at: row.get(7)?,
+            owned_provider_sessions: Vec::new(),
         })
     }
+}
+
+fn load_owned_provider_sessions(
+    connection: &Connection,
+    parent_session_id: &str,
+) -> Result<Vec<(String, String)>, SessionError> {
+    let mut statement = connection.prepare(
+        "SELECT provider, provider_session_id
+         FROM orchestration_runs
+         WHERE parent_session_id = ?1 AND provider_session_id IS NOT NULL
+         GROUP BY provider, provider_session_id
+         ORDER BY MIN(created_at), MIN(id)",
+    )?;
+    statement
+        .query_map([parent_session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
@@ -659,7 +717,12 @@ impl SessionRepository for SqliteSessionRepository {
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
         let rows = statement.query_map(params![workspace, bounded_limit], Self::row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut records = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for record in &mut records {
+            record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
+        }
+        Ok(records)
     }
 
     fn find(&self, id: &str) -> Result<Option<SessionRecord>, SessionError> {
@@ -675,8 +738,9 @@ impl SessionRepository for SqliteSessionRepository {
                 Self::row,
             )
             .optional()?;
-        if exact.is_some() {
-            return Ok(exact);
+        if let Some(mut exact) = exact {
+            exact.owned_provider_sessions = load_owned_provider_sessions(&connection, &exact.id)?;
+            return Ok(Some(exact));
         }
         let pattern = format!("{id}%");
         let mut statement = connection.prepare(
@@ -688,7 +752,12 @@ impl SessionRepository for SqliteSessionRepository {
             .collect::<Result<Vec<_>, _>>()?;
         match matches.as_slice() {
             [] => Ok(None),
-            [record] => Ok(Some(record.clone())),
+            [record] => {
+                let mut record = record.clone();
+                record.owned_provider_sessions =
+                    load_owned_provider_sessions(&connection, &record.id)?;
+                Ok(Some(record))
+            }
             _ => Err(SessionError::Ambiguous(id.to_owned())),
         }
     }
@@ -985,13 +1054,19 @@ impl SessionRepository for SqliteSessionRepository {
         let now = unix_timestamp();
         transaction.execute(
             "INSERT INTO orchestration_runs
-               (parent_session_id, id, agent_slug, provider, provider_session_id, objective,
+               (parent_session_id, id, agent_slug, provider, model, provider_session_id,
+                input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, objective,
                 status, latest_activity, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
              ON CONFLICT(parent_session_id, id) DO UPDATE SET
                agent_slug = excluded.agent_slug,
                provider = excluded.provider,
+               model = excluded.model,
                provider_session_id = excluded.provider_session_id,
+               input_tokens = excluded.input_tokens,
+               output_tokens = excluded.output_tokens,
+               cached_input_tokens = excluded.cached_input_tokens,
+               cache_write_tokens = excluded.cache_write_tokens,
                objective = excluded.objective,
                status = excluded.status,
                latest_activity = excluded.latest_activity,
@@ -1001,7 +1076,12 @@ impl SessionRepository for SqliteSessionRepository {
                 record.id,
                 record.agent,
                 record.provider,
+                record.model,
                 record.provider_session_id,
+                i64::try_from(record.input_tokens).unwrap_or(i64::MAX),
+                i64::try_from(record.output_tokens).unwrap_or(i64::MAX),
+                i64::try_from(record.cached_input_tokens).unwrap_or(i64::MAX),
+                i64::try_from(record.cache_write_tokens).unwrap_or(i64::MAX),
                 record.objective,
                 record.status.database_value(),
                 record.latest_activity,
@@ -1043,8 +1123,9 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, agent_slug, provider, provider_session_id, objective, status,
-                    latest_activity
+            "SELECT id, agent_slug, provider, model, provider_session_id,
+                    input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+                    objective, status, latest_activity
              FROM orchestration_runs
              WHERE parent_session_id = ?1
              ORDER BY created_at, id",
@@ -1055,15 +1136,32 @@ impl SessionRepository for SqliteSessionRepository {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(4)?,
+                u64::try_from(row.get::<_, i64>(5)?).unwrap_or_default(),
+                u64::try_from(row.get::<_, i64>(6)?).unwrap_or_default(),
+                u64::try_from(row.get::<_, i64>(7)?).unwrap_or_default(),
+                u64::try_from(row.get::<_, i64>(8)?).unwrap_or_default(),
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
             ))
         })?;
         let stored_runs = rows.collect::<Result<Vec<_>, _>>()?;
         let mut records = Vec::with_capacity(stored_runs.len());
-        for (id, agent, provider, provider_session_id, objective, status, latest_activity) in
-            stored_runs
+        for (
+            id,
+            agent,
+            provider,
+            model,
+            provider_session_id,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_write_tokens,
+            objective,
+            status,
+            latest_activity,
+        ) in stored_runs
         {
             let transcript = load_subagent_transcript(&connection, parent_session_id, &id)?;
             records.push(SubagentRecord {
@@ -1071,7 +1169,12 @@ impl SessionRepository for SqliteSessionRepository {
                 id,
                 agent,
                 provider,
+                model,
                 provider_session_id,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                cache_write_tokens,
                 objective,
                 status: SubagentStatus::from_database(&status)?,
                 latest_activity,
@@ -1647,7 +1750,12 @@ mod tests {
             id: "agent-1".to_owned(),
             agent: "explorer".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
+            model: None,
             provider_session_id: Some("child-provider-session".to_owned()),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
             objective: "Map persistence".to_owned(),
             status: SubagentStatus::Completed,
             latest_activity: "Completed".to_owned(),
@@ -1723,7 +1831,12 @@ mod tests {
             id: "agent-1".to_owned(),
             agent: "explorer".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
+            model: None,
             provider_session_id: Some("child-provider-session".to_owned()),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
             objective: "Map persistence".to_owned(),
             status: SubagentStatus::Completed,
             latest_activity: "Completed".to_owned(),

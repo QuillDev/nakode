@@ -447,6 +447,7 @@ fn command_request(
         ),
         BackendCommand::ResumeSession {
             provider_session_id,
+            ..
         } => (
             BackendOperation::ResumeSession,
             "thread/resume",

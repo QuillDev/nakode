@@ -904,6 +904,14 @@ fn install_ready_view(
         role: "primary".to_owned(),
         capabilities,
         connection: nakode_protocol::ConnectionView::Ready,
+        native_session_id: None,
+        transcript: session.transcript.clone(),
+        usage: nakode_protocol::TokenUsageView {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+        },
     });
     session.activity = nakode_protocol::SessionActivity::Idle;
     "Ready.".clone_into(&mut session.status_message);
@@ -985,12 +993,20 @@ fn install_created_session_view(
             agent.capabilities.clone()
         });
     session.active_agent_session = Some(nakode_protocol::AgentSessionView {
-        id: nakode_protocol::AgentSessionId::from(provider_session_id),
+        id: nakode_protocol::AgentSessionId::from(provider_session_id.clone()),
         provider_id,
         model_id: Some(model_id),
         role: "primary".to_owned(),
         capabilities,
         connection: nakode_protocol::ConnectionView::Ready,
+        native_session_id: Some(provider_session_id.to_owned()),
+        transcript: session.transcript.clone(),
+        usage: nakode_protocol::TokenUsageView {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+        },
     });
     if let Some(prompt) = prompt {
         session

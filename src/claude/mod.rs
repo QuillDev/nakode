@@ -11,9 +11,9 @@ use uuid::Uuid;
 
 use crate::backend::{
     ApprovalDecision, ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand,
-    BackendError, BackendEvent, BackendHandle, BackendIdentity, BackendOperation, CLAUDE_PROVIDER,
-    CapabilitySupport, DeltaKind, ItemKind, ItemStatus, ModelInfo, NormalizedItem, TurnOutcome,
-    request_failed,
+    BackendError, BackendEvent, BackendHandle, BackendIdentity, BackendOperation,
+    BackendTokenUsage, CLAUDE_PROVIDER, CapabilitySupport, DeltaKind, ItemKind, ItemStatus,
+    ModelInfo, NormalizedItem, TurnOutcome, request_failed,
 };
 
 const COMMAND_CAPACITY: usize = 128;
@@ -407,12 +407,20 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         BackendCommand::StartSession {
             model,
             instructions,
+            owner_session_id,
             external_tools: _,
             replace_builtin_tools: _,
-        } => ("create", json!({"model":model,"instructions":instructions})),
+        } => (
+            "create",
+            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id}),
+        ),
         BackendCommand::ResumeSession {
             provider_session_id,
-        } => ("resume", json!({"sessionId":provider_session_id})),
+            owner_session_id,
+        } => (
+            "resume",
+            json!({"sessionId":provider_session_id,"ownerSessionId":owner_session_id}),
+        ),
         BackendCommand::UnsubscribeSession {
             provider_session_id,
         } => ("close", json!({"sessionId":provider_session_id})),
@@ -557,7 +565,7 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
         "session_resumed" => BackendEvent::SessionResumed {
             provider_session_id: string(message, "sessionId"),
             model: string(message, "model"),
-            history: Vec::new(),
+            history: session_history(message),
         },
         "session_closed" => BackendEvent::SessionClosed {
             provider_session_id: string(message, "sessionId"),
@@ -605,6 +613,21 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
             request_id: message.get("approvalId").cloned().unwrap_or(Value::Null),
         },
         "interrupt_accepted" => BackendEvent::InterruptAccepted,
+        "usage" => {
+            let usage = &message["usage"];
+            BackendEvent::TokenUsageUpdated {
+                usage: BackendTokenUsage {
+                    input_tokens: usage["input_tokens"].as_u64().unwrap_or_default(),
+                    output_tokens: usage["output_tokens"].as_u64().unwrap_or_default(),
+                    cached_input_tokens: usage["cache_read_input_tokens"]
+                        .as_u64()
+                        .unwrap_or_default(),
+                    cache_write_tokens: usage["cache_creation_input_tokens"]
+                        .as_u64()
+                        .unwrap_or_default(),
+                },
+            }
+        }
         "turn_completed" => {
             let outcome = match message["status"].as_str() {
                 Some("finished") => TurnOutcome::Completed,
@@ -664,6 +687,35 @@ fn models_event(message: &Value) -> BackendEvent {
         })
         .collect();
     BackendEvent::Models(models)
+}
+
+fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
+    message["history"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|value| {
+            let kind = match value["kind"].as_str() {
+                Some("user") => ItemKind::User,
+                Some("assistant") => ItemKind::Assistant,
+                _ => ItemKind::Tool,
+            };
+            let status = match value["status"].as_str() {
+                Some("failed") => ItemStatus::Failed,
+                _ => ItemStatus::Complete,
+            };
+            crate::backend::SessionHistoryItem {
+                turn_id: string(value, "turnId"),
+                item: NormalizedItem {
+                    id: string(value, "id"),
+                    kind,
+                    title: string(value, "title"),
+                    body: string(value, "body"),
+                    status,
+                },
+            }
+        })
+        .collect()
 }
 
 fn tool_call_event(message: &Value) -> BackendEvent {
