@@ -501,6 +501,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::ArtifactTransfer,
             ServiceCapability::ExternalTools,
             ServiceCapability::SessionDeletion,
+            ServiceCapability::QueuedPromptSteering,
         ]
         .into_iter()
         .collect(),

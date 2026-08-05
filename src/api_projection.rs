@@ -484,6 +484,7 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
             .map(|item| view::QueueItemView {
                 id: view::PromptId::from(item.id),
                 summary: item.summary,
+                text: item.text,
                 attachment_count: item.attachment_count,
             })
             .collect(),

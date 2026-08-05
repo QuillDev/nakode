@@ -446,6 +446,15 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
     command_rpc!(
+        steer_queued_prompt,
+        api::SteerQueuedPromptRequest,
+        input,
+        protocol::Command::SteerQueuedPrompt {
+            session_id: protocol::SessionId::from(input.session_id),
+            prompt_id: protocol::PromptId::from(input.prompt_id)
+        }
+    );
+    command_rpc!(
         steer_turn,
         api::SteerTurnRequest,
         input,
@@ -1398,6 +1407,7 @@ fn queue_item(value: protocol::QueueItemView) -> api::QueueItem {
         id: value.id.to_string(),
         summary: value.summary,
         attachment_count: value.attachment_count,
+        text: value.text,
     }
 }
 fn recoverable_prompt(value: protocol::RecoverablePromptView) -> api::RecoverablePrompt {

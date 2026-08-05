@@ -181,8 +181,15 @@ struct PendingSteer {
     id: String,
     text: String,
     turn_id: String,
+    queued_origin: Option<QueuedSteerOrigin>,
     #[cfg(test)]
     editor_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QueuedSteerOrigin {
+    prompt: QueuedPrompt,
+    index: usize,
 }
 
 #[cfg(test)]
@@ -3011,6 +3018,55 @@ impl DomainState {
         Ok(Vec::new())
     }
 
+    /// Atomically converts one queued text prompt into guidance for the active turn.
+    ///
+    /// The prompt remains queued when validation rejects the conversion. Once delivery starts, its
+    /// original position is retained so an asynchronous provider refusal or a turn-ending race can
+    /// restore normal follow-up behavior without losing or duplicating the prompt.
+    ///
+    /// # Errors
+    /// Returns not found for a stale prompt identity, rejects attachments because provider steering
+    /// accepts text only, and preserves every validation error from [`Self::steer_turn`].
+    pub fn steer_queued_prompt(
+        &mut self,
+        prompt_id: &str,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        let position = self
+            .queue
+            .iter()
+            .position(|prompt| prompt.id == prompt_id)
+            .ok_or_else(|| DomainCommandError::NotFound(prompt_id.to_owned()))?;
+        let prompt = self
+            .queue
+            .get(position)
+            .cloned()
+            .ok_or_else(|| DomainCommandError::NotFound(prompt_id.to_owned()))?;
+        if !prompt.attachments.is_empty() {
+            return Err(DomainCommandError::Invalid(
+                "queued prompts with attachments cannot be used for steering".to_owned(),
+            ));
+        }
+        let turn_id = self
+            .active_turn
+            .as_ref()
+            .map(|active| active.id.clone())
+            .ok_or_else(|| {
+                DomainCommandError::Conflict("there is no active turn to steer".to_owned())
+            })?;
+        let effects = self.steer_turn(&turn_id, &prompt.text)?;
+        let removed = self
+            .queue
+            .remove(position)
+            .ok_or_else(|| DomainCommandError::NotFound(prompt_id.to_owned()))?;
+        if let Some(pending) = &mut self.pending_steer {
+            pending.queued_origin = Some(QueuedSteerOrigin {
+                prompt: removed,
+                index: position,
+            });
+        }
+        Ok(effects)
+    }
+
     #[must_use]
     pub(crate) const fn recoverable_prompt(&self) -> Option<&RecoverablePrompt> {
         self.recoverable_prompt.as_ref()
@@ -3084,6 +3140,7 @@ impl DomainState {
             id: id.clone(),
             text: text.to_owned(),
             turn_id: provider_turn_id.to_owned(),
+            queued_origin: None,
             #[cfg(test)]
             editor_revision: None,
         });
@@ -3914,6 +3971,7 @@ impl DomainState {
             id: id.clone(),
             text: text.clone(),
             turn_id: turn_id.clone(),
+            queued_origin: None,
             editor_revision: Some(self.client.editor.revision()),
         });
         self.set_status("Sending steering guidance…");
@@ -5426,7 +5484,12 @@ impl DomainState {
             return;
         };
         if pending.turn_id != turn_id || !self.turn_is_current(turn_id) {
-            self.set_status("A late steer response was ignored.");
+            let restored = self.restore_queued_steer(pending);
+            self.set_status(if restored {
+                "A late steer response was ignored; the queued message remains a follow-up."
+            } else {
+                "A late steer response was ignored."
+            });
             return;
         }
         self.transcript.push(
@@ -5436,6 +5499,22 @@ impl DomainState {
             EntryStatus::Complete,
         );
         self.set_status("Steering guidance accepted.");
+    }
+
+    fn restore_queued_steer(&mut self, pending: PendingSteer) -> bool {
+        let Some(origin) = pending.queued_origin else {
+            return false;
+        };
+        if self
+            .queue
+            .iter()
+            .any(|prompt| prompt.id == origin.prompt.id)
+        {
+            return false;
+        }
+        let index = origin.index.min(self.queue.len());
+        self.queue.insert(index, origin.prompt);
+        true
     }
 
     fn handle_model_rerouted(&mut self, turn_id: &str, from: &str, to: &str) {
@@ -5494,7 +5573,9 @@ impl DomainState {
         self.context_usage = None;
         self.context_compaction = None;
         self.creating_session = None;
-        self.pending_steer = None;
+        if let Some(pending) = self.pending_steer.take() {
+            self.restore_queued_steer(pending);
+        }
         self.approvals.clear();
         self.set_status("The provider session was closed.");
         if let Some(prompt) = pending_prompt {
@@ -5512,7 +5593,9 @@ impl DomainState {
         self.active_turn = None;
         self.context_compaction = None;
         self.creating_session = None;
-        self.pending_steer = None;
+        if let Some(pending) = self.pending_steer.take() {
+            self.restore_queued_steer(pending);
+        }
         self.transcript.push(
             EntryKind::Error,
             "BACKEND DISCONNECTED",
@@ -5713,9 +5796,9 @@ impl DomainState {
             .pending_steer
             .as_ref()
             .is_some_and(|pending| pending.turn_id == turn_id)
+            && let Some(pending) = self.pending_steer.take()
         {
-            self.pending_steer = None;
-            self.set_status("Steer was too late; the draft was preserved.");
+            self.restore_queued_steer(pending);
         }
 
         match outcome {
@@ -5934,7 +6017,9 @@ impl DomainState {
                 }
             }
             BackendOperation::SteerTurn => {
-                self.pending_steer = None;
+                if let Some(pending) = self.pending_steer.take() {
+                    self.restore_queued_steer(pending);
+                }
             }
             BackendOperation::InterruptTurn => {
                 if let Some(active) = &mut self.active_turn {
@@ -7827,6 +7912,146 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             effects.as_slice(),
             [Effect::TouchSession(id), Effect::Backend(_)] if id == "nakode-session-1"
         ));
+    }
+
+    #[test]
+    fn queued_prompt_conversion_is_atomic_ordered_and_dispatched_once() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("thread-1".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        for text in ["first follow-up", "repeat me", "repeat me"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let middle_id = state.queue.get(1).expect("middle queue item").id.clone();
+
+        let effects = state
+            .steer_queued_prompt(&middle_id)
+            .expect("convert queued prompt");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(BackendCommand::SteerTurn { prompt, .. })] if prompt == "repeat me"
+        ));
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first follow-up", "repeat me"]
+        );
+
+        let duplicate = state
+            .steer_queued_prompt(&middle_id)
+            .expect_err("the same queue identity cannot dispatch twice");
+        assert!(duplicate.to_string().contains(&middle_id));
+
+        state.handle_backend(BackendEvent::SteerAccepted {
+            turn_id: "turn-1".to_owned(),
+        });
+        assert_eq!(state.queue.len(), 2);
+        assert!(
+            state
+                .transcript
+                .entries()
+                .iter()
+                .any(|entry| { entry.kind == EntryKind::Steering && entry.body == "repeat me" })
+        );
+    }
+
+    #[test]
+    fn failed_queued_steer_restores_the_exact_follow_up_position() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("thread-1".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        for text in ["first", "second", "third"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let second_id = state.queue.get(1).expect("second queue item").id.clone();
+        state
+            .steer_queued_prompt(&second_id)
+            .expect("begin queued steer");
+
+        state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::SteerTurn,
+            code: -32603,
+            message: "provider refused steering".to_owned(),
+        });
+
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| (prompt.id.as_str(), prompt.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (state.queue[0].id.as_str(), "first"),
+                (second_id.as_str(), "second"),
+                (state.queue[2].id.as_str(), "third"),
+            ]
+        );
+        assert!(state.status_message.contains("provider refused steering"));
+    }
+
+    #[test]
+    fn queued_prompt_controls_preserve_siblings_and_reject_steering_attachments() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("thread-1".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        state
+            .enqueue_prompt("keep".to_owned(), Vec::new())
+            .expect("queue first");
+        state
+            .enqueue_prompt(
+                "image follow-up".to_owned(),
+                vec![PromptAttachment {
+                    label: "context.png".to_owned(),
+                    path: None,
+                    image: Some(PromptImage {
+                        mime_type: "image/png".to_owned(),
+                        data: vec![1, 2, 3],
+                    }),
+                }],
+            )
+            .expect("queue image");
+        state
+            .enqueue_prompt("keep too".to_owned(), Vec::new())
+            .expect("queue third");
+        let first_id = state.queue[0].id.clone();
+        let image_id = state.queue[1].id.clone();
+
+        state
+            .remove_queued_prompt(&first_id)
+            .expect("dequeue independently");
+        let error = state
+            .steer_queued_prompt(&image_id)
+            .expect_err("attachments are not silently discarded for steering");
+
+        assert!(error.to_string().contains("attachments"));
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            ["image follow-up", "keep too"]
+        );
+        assert!(state.pending_steer.is_none());
     }
 
     #[test]

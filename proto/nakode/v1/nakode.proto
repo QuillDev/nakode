@@ -22,6 +22,9 @@ service NakodeService {
   rpc SendPrompt(SendPromptRequest) returns (MutationResult);
   rpc EnqueuePrompt(EnqueuePromptRequest) returns (MutationResult);
   rpc RemoveQueuedPrompt(RemoveQueuedPromptRequest) returns (MutationResult);
+  // Atomically removes one queued prompt and submits its text to the active turn as steering.
+  // Requires the `QueuedPromptSteering` service capability and provider steering support.
+  rpc SteerQueuedPrompt(SteerQueuedPromptRequest) returns (MutationResult);
   rpc SteerTurn(SteerTurnRequest) returns (MutationResult);
   rpc CancelTurn(CancelTurnRequest) returns (MutationResult);
   rpc CancelSessionWork(CancelSessionWorkRequest) returns (MutationResult);
@@ -101,6 +104,7 @@ message InlineImage { string media_type = 1; bytes data = 2; }
 message SendPromptRequest { MutationOptions mutation = 1; string session_id = 2; PromptInput prompt = 3; }
 message EnqueuePromptRequest { MutationOptions mutation = 1; string session_id = 2; PromptInput prompt = 3; }
 message RemoveQueuedPromptRequest { MutationOptions mutation = 1; string session_id = 2; string prompt_id = 3; }
+message SteerQueuedPromptRequest { MutationOptions mutation = 1; string session_id = 2; string prompt_id = 3; }
 message SteerTurnRequest { MutationOptions mutation = 1; string turn_id = 2; string text = 3; }
 message CancelTurnRequest { MutationOptions mutation = 1; string turn_id = 2; }
 message CancelSessionWorkRequest { MutationOptions mutation = 1; string session_id = 2; }
@@ -276,7 +280,7 @@ enum TranscriptEntryStatus { TRANSCRIPT_ENTRY_STATUS_UNSPECIFIED = 0; TRANSCRIPT
 message TranscriptEntry { string id = 1; TranscriptEntryKind kind = 2; string title = 3; string body = 4; uint64 body_start_byte = 5; uint64 body_total_bytes = 6; TranscriptEntryStatus status = 7; repeated string artifact_ids = 8; }
 message TranscriptPage { repeated TranscriptEntry entries = 1; bool has_earlier = 2; bool stream_active = 3; string stream_label = 4; }
 message TranscriptBodyWindow { string entry_id = 1; string body = 2; uint64 start_byte = 3; uint64 total_bytes = 4; bool has_earlier = 5; }
-message QueueItem { string id = 1; string summary = 2; uint32 attachment_count = 3; }
+message QueueItem { string id = 1; string summary = 2; uint32 attachment_count = 3; string text = 4; }
 message RecoverablePrompt { string id = 1; string text = 2; repeated PromptAttachment attachments = 3; }
 
 enum InteractionKind { INTERACTION_KIND_UNSPECIFIED = 0; INTERACTION_KIND_APPROVAL = 1; INTERACTION_KIND_QUESTION = 2; }

@@ -220,6 +220,8 @@ pub struct TranscriptWindowView {
 pub struct QueueItemView {
     pub id: PromptId,
     pub summary: String,
+    /// Complete semantic text, so a client can distinguish and control queued work without caching drafts.
+    pub text: String,
     pub attachment_count: u32,
 }
 

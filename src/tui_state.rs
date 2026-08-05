@@ -254,6 +254,7 @@ mod tests {
         session.queue.push(QueueItemView {
             id: "prompt-2".into(),
             summary: "second".to_owned(),
+            text: "second".to_owned(),
             attachment_count: 0,
         });
         state.install_bootstrap(&second);
@@ -394,6 +395,7 @@ mod tests {
             queue: vec![QueueItemView {
                 id: "prompt-1".into(),
                 summary: "first".to_owned(),
+                text: "first".to_owned(),
                 attachment_count: 0,
             }],
             interactions: vec![question()],
