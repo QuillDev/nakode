@@ -1284,21 +1284,19 @@ fn render_agent_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 ])
             },
         );
-    } else if let Some(fast_mode) = picker
+    } else if let Some(pending) = picker
         .editor
         .as_ref()
-        .and_then(|editor| editor.pending_fast_mode)
+        .and_then(|editor| editor.pending_options.as_ref())
     {
         render_model_options_popup(
             frame,
             centered(area, 72, 18),
-            &ModelOptions {
-                reasoning_effort: None,
-                fast_mode,
-            },
-            0,
-            true,
-            "Configure this agent's Cursor model",
+            &pending.options,
+            pending.selected,
+            !pending.reasoning_efforts.is_empty(),
+            pending.fast_mode_configurable,
+            "Configure how this agent runs its model",
         );
     }
 }
@@ -1318,10 +1316,7 @@ fn render_searchable_dropdown<T, S, R>(
     frame.render_widget(Clear, popup);
     let filtered = dropdown.filtered_items(search_text);
     let visible_rows = usize::from(popup.height.saturating_sub(6)).max(1);
-    let start = dropdown
-        .selected
-        .saturating_sub(visible_rows.saturating_sub(1))
-        .min(filtered.len().saturating_sub(visible_rows));
+    let start = scroll_start(dropdown.selected, filtered.len(), visible_rows);
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Search: ", Style::default().fg(ACCENT_BRIGHT).bold()),
@@ -1367,7 +1362,7 @@ fn render_searchable_dropdown<T, S, R>(
 fn agent_editor_lines(editor: &AgentEditor) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
-            "Tab/↑/↓ field · type or paste · Enter choose model · changes save automatically · Esc back",
+            "Tab/↑/↓ field · type/paste · Enter choose model + options · autosaves · Esc back",
             Style::default().fg(MUTED),
         ),
         Line::default(),
@@ -1406,13 +1401,25 @@ fn agent_editor_lines(editor: &AgentEditor) -> Vec<Line<'static>> {
         lines.push(Line::default());
     }
     lines.push(Line::styled(
-        if editor.fast_mode {
-            "Models use provider/model; fallbacks use commas · ⚡ Fast mode enabled"
-        } else {
-            "Models use provider/model; separate fallbacks with commas."
-        },
-        Style::default().fg(if editor.fast_mode { ACCENT } else { MUTED }),
+        "Models use provider/model; separate fallbacks with commas.",
+        Style::default().fg(MUTED),
     ));
+    // What the chosen model was actually given. Both facts are set in the options step behind the
+    // Model field, so this is the one line they can be read back from; nothing is said when there is
+    // nothing to say, which is also what an archetype with no model of its own has.
+    let mut carried = Vec::new();
+    if let Some(effort) = editor.reasoning_effort.as_deref() {
+        carried.push(format!("effort {effort}"));
+    }
+    if editor.fast_mode {
+        carried.push("⚡ fast mode".to_owned());
+    }
+    if !carried.is_empty() {
+        lines.push(Line::styled(
+            format!("Runs at {}", carried.join(" · ")),
+            Style::default().fg(ACCENT),
+        ));
+    }
     lines
 }
 
@@ -1918,16 +1925,23 @@ fn relative_time(timestamp_ms: i64) -> String {
     }
 }
 
+/// The options step: a row per thing the model takes, and nothing for what it does not.
+///
+/// `effort_row` and `fast_row` are what the CHOSEN model reports, so the same popup draws the
+/// session's two rows, a Cursor model's fast-mode-only row, and an agent archetype's own pair. The
+/// rows are indexed in the order they are pushed, which is what `option_selected` counts.
 fn render_model_options_popup(
     frame: &mut Frame<'_>,
     popup: Rect,
     options: &ModelOptions,
     option_selected: usize,
-    fast_only: bool,
+    effort_row: bool,
+    fast_row: bool,
     description: &str,
 ) {
     frame.render_widget(Clear, popup);
-    let effort = options.reasoning_effort.as_deref().unwrap_or("medium");
+    // No level set means the model's own default — say that, rather than naming a level nobody chose.
+    let effort = options.reasoning_effort.as_deref().unwrap_or("default");
     let fast = if options.fast_mode { "⚡ on" } else { "off" };
     let option_line = |index: usize, label: &str, value: &str| {
         let selected = option_selected == index;
@@ -1956,11 +1970,13 @@ fn render_model_options_popup(
         Line::styled(description.to_owned(), Style::default().fg(MUTED)),
         Line::default(),
     ];
-    if fast_only {
-        lines.push(option_line(0, "Fast mode", fast));
-    } else {
-        lines.push(option_line(0, "Reasoning effort", effort));
-        lines.push(option_line(1, "Fast mode", fast));
+    let mut row = 0;
+    if effort_row {
+        lines.push(option_line(row, "Reasoning effort", effort));
+        row = row.saturating_add(1);
+    }
+    if fast_row {
+        lines.push(option_line(row, "Fast mode", fast));
     }
     lines.extend([
         Line::default(),
@@ -1992,7 +2008,8 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             popup,
             &picker.options,
             picker.option_selected,
-            picker.options_fast_only,
+            !picker.options_fast_only,
+            true,
             match (picker.scope, picker.options_fast_only) {
                 (ModelSelectionScope::Session, true) => "Configure this session's Cursor model",
                 (ModelSelectionScope::Session, false) => "Configure this session's OpenAI model",
@@ -2003,12 +2020,31 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     }
     let filtered = state.filtered_models();
+    // The popup's own height, less the two border rows, the filter line and the blank under it, and the
+    // blank and footer beneath the list. What is left is the list's window.
+    let visible_rows = usize::from(popup.height.saturating_sub(6)).max(1);
+    let start = scroll_start(picker.selected, filtered.len(), visible_rows);
     let mut lines = vec![Line::from(vec![
         Span::styled("Filter: ", Style::default().fg(MUTED)),
         Span::styled(&picker.filter, Style::default().fg(TEXT)),
+        // Where the window sits in the catalogue, on the line that is already there. A terminal list has
+        // no scrollbar to show that it moved, and the filter narrows what is being counted, so the pair
+        // is the only thing that says both "there is more" and "your search cut it down".
+        Span::styled(
+            if filtered.len() > visible_rows {
+                format!(
+                    "   {} of {}",
+                    picker.selected.saturating_add(1),
+                    filtered.len()
+                )
+            } else {
+                String::new()
+            },
+            Style::default().fg(MUTED),
+        ),
     ])];
     lines.push(Line::default());
-    for (index, model) in filtered.iter().enumerate() {
+    for (index, model) in filtered.iter().enumerate().skip(start).take(visible_rows) {
         let selected = index == picker.selected;
         let marker = if selected { "› " } else { "  " };
         let display = &model.display_name;
@@ -2147,6 +2183,23 @@ fn spinner_frame() -> &'static str {
         .map_or(0, |duration| duration.as_millis() / 100);
     let frame = usize::try_from(tick % SPINNER_FRAMES.len() as u128).unwrap_or(0);
     SPINNER_FRAMES[frame]
+}
+
+/// First row of the window a list of `length` rows shows inside `visible_rows`, given the selection.
+///
+/// A `Paragraph` draws the lines it is handed and silently loses the rest to the bottom of its block,
+/// so a list longer than its popup is not scrolled — it is CUT, taking every row past the first
+/// screenful and the footer under them with it. Every overlay that draws a selectable list therefore
+/// has to window the list itself, and this is the one place that decides how.
+///
+/// The window is a pure function of the selection because that is all these overlays keep: the
+/// selected index is the scroll position, so nothing can drift out of step with what is drawn. It
+/// stays put until the selection would leave the bottom of it, which is what makes holding ↓ walk the
+/// list a row at a time instead of paging it, and it is clamped so the last screenful is a full one.
+fn scroll_start(selected: usize, length: usize, visible_rows: usize) -> usize {
+    selected
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(length.saturating_sub(visible_rows))
 }
 
 fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
@@ -3062,7 +3115,7 @@ mod tests {
         assert!(editor.contains("First message"));
         assert!(editor.contains("Fallbacks"));
         assert!(editor.contains("Enter choose model"));
-        assert!(editor.contains("changes save automatically"));
+        assert!(editor.contains("autosaves"));
 
         state
             .client
@@ -3101,7 +3154,15 @@ mod tests {
             .expect("agent editor");
         editor.model = "cursor-acp/composer-2.5".to_owned();
         editor.model_dropdown = None;
-        editor.pending_fast_mode = Some(false);
+        editor.pending_options = Some(crate::tui_state::AgentPendingOptions {
+            reasoning_efforts: Vec::new(),
+            fast_mode_configurable: true,
+            options: ModelOptions {
+                reasoning_effort: None,
+                fast_mode: false,
+            },
+            selected: 0,
+        });
         terminal
             .draw(|frame| super::draw(frame, &mut state))
             .expect("render agent model options");
@@ -3113,8 +3174,162 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(options.contains("Model Options"));
-        assert!(options.contains("Configure this agent's Cursor model"));
+        assert!(options.contains("Configure how this agent runs its model"));
         assert!(options.contains("Fast mode"));
+        // A fast-mode-only model draws NO effort row: the levels on offer are the model's own, and
+        // this one reports none.
+        assert!(!options.contains("Reasoning effort"));
+    }
+
+    /// An archetype's level is offered beside its model, from that model's own list, and an archetype
+    /// with none set reads as "default" rather than as a level nobody chose — which is what every
+    /// definition written before the field existed means.
+    #[test]
+    fn an_agent_model_that_takes_levels_offers_them_beside_fast_mode() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut view = bootstrap();
+        let mut codex = model("openai-codex/gpt-5.6-sol", "GPT 5.6 Sol", false);
+        codex.configuration.reasoning_efforts = vec!["low".to_owned(), "high".to_owned()];
+        codex.configuration.fast_mode_configurable = true;
+        view.models = vec![codex];
+        let mut state = TuiState::from_bootstrap(&view, 100);
+        state.open_agent_picker();
+        state.create_agent();
+        let editor = state
+            .client
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .expect("agent editor");
+        editor.model = "openai-codex/gpt-5.6-sol".to_owned();
+        editor.pending_options = Some(crate::tui_state::AgentPendingOptions {
+            reasoning_efforts: vec!["low".to_owned(), "high".to_owned()],
+            fast_mode_configurable: true,
+            options: ModelOptions {
+                reasoning_effort: None,
+                fast_mode: false,
+            },
+            selected: 0,
+        });
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render agent effort options");
+        let levels = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(levels.contains("Reasoning effort: default"));
+        assert!(levels.contains("Fast mode"));
+
+        // Set, it names itself — and the level list is the model's own, never a table of ours.
+        state.adjust_agent_model_options(1);
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render chosen agent effort");
+        let chosen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(chosen.contains("Reasoning effort: low"));
+    }
+
+    /// A catalogue longer than the popup must scroll to whatever is selected rather than drawing
+    /// only its first screenful: every row past the visible window is otherwise unreachable, and the
+    /// footer that says how to reach it is pushed off the popup too.
+    #[test]
+    fn model_picker_scrolls_a_catalogue_taller_than_its_popup() {
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut view = bootstrap();
+        view.models = (0..40)
+            .map(|index| {
+                let mut entry = model(
+                    &format!("openai-codex/model-{index:02}"),
+                    &format!("Catalogue Model {index:02}"),
+                    false,
+                );
+                entry.is_default = index == 0;
+                entry
+            })
+            .collect();
+        let mut state = TuiState::from_bootstrap(&view, 100);
+        state.open_model_picker(ModelSelectionScope::Default);
+        for _ in 0..37 {
+            state.picker_move(1);
+        }
+
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render model picker");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("Catalogue Model 37"),
+            "the selected row must be inside the drawn window"
+        );
+        assert!(
+            !rendered.contains("Catalogue Model 00"),
+            "the window must have scrolled away from the top of the catalogue"
+        );
+        assert!(
+            rendered.contains("Enter apply"),
+            "the footer must survive a catalogue longer than the popup"
+        );
+        assert!(
+            rendered.contains("38 of 40"),
+            "the filter line must say where in the catalogue the window sits"
+        );
+
+        // Searching narrows the list to something that fits, and the window must go back to its top
+        // rather than staying scrolled past the one remaining match.
+        state.picker_insert('3');
+        state.picker_insert('7');
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .expect("render filtered model picker");
+        let filtered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(filtered.contains("Catalogue Model 37"));
+        assert!(
+            !filtered.contains("of 40"),
+            "a list that fits needs no position counter"
+        );
+    }
+
+    /// The window is what the popup can draw, and the selection is the only thing that moves it — so
+    /// every screenful must be reachable and the last one must be full rather than a part-empty tail.
+    #[test]
+    fn scroll_start_keeps_the_selection_inside_a_full_window() {
+        // Short lists never scroll, however the selection moves inside them.
+        assert_eq!(super::scroll_start(0, 3, 10), 0);
+        assert_eq!(super::scroll_start(2, 3, 10), 0);
+        // It holds still until the selection would leave the bottom of the window.
+        assert_eq!(super::scroll_start(9, 40, 10), 0);
+        assert_eq!(super::scroll_start(10, 40, 10), 1);
+        // And stops with a full window rather than scrolling past the end of the list.
+        assert_eq!(super::scroll_start(39, 40, 10), 30);
+        // An empty list has nowhere to start, and a popup with no room for a row must not panic.
+        assert_eq!(super::scroll_start(0, 0, 10), 0);
+        assert_eq!(super::scroll_start(5, 40, 0), 5);
     }
 
     #[test]

@@ -199,7 +199,45 @@ mod tests {
         TranscriptPage, VisionSettingsView, WebSettingsView, WorkspaceId,
     };
 
-    use super::{ModelSelectionScope, TuiState};
+    use super::{AgentPendingOptions, ModelSelectionScope, TuiState};
+
+    /// The step cycles the CHOSEN model's own levels, with the model's default as a real position:
+    /// an archetype has to be able to go back to "whatever the model does", because that is what
+    /// every definition written before the field existed says.
+    #[test]
+    fn an_agent_effort_cycles_the_models_levels_and_its_default() {
+        let mut pending = AgentPendingOptions {
+            reasoning_efforts: vec!["low".to_owned(), "high".to_owned()],
+            fast_mode_configurable: false,
+            options: nakode_protocol::ModelOptions::default(),
+            selected: 0,
+        };
+        assert_eq!(pending.options.reasoning_effort, None);
+        pending.step_effort(1);
+        assert_eq!(pending.options.reasoning_effort.as_deref(), Some("low"));
+        pending.step_effort(1);
+        assert_eq!(pending.options.reasoning_effort.as_deref(), Some("high"));
+        // Round the end, back to the default it started on.
+        pending.step_effort(1);
+        assert_eq!(pending.options.reasoning_effort, None);
+        pending.step_effort(-1);
+        assert_eq!(pending.options.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// A model that reports no levels has nothing to cycle, and its row is not drawn either.
+    #[test]
+    fn a_model_with_no_levels_has_no_effort_to_step() {
+        let mut pending = AgentPendingOptions {
+            reasoning_efforts: Vec::new(),
+            fast_mode_configurable: true,
+            options: nakode_protocol::ModelOptions::default(),
+            selected: 0,
+        };
+        assert_eq!(pending.row_count(), 1);
+        assert!(pending.on_fast_mode_row());
+        pending.step_effort(1);
+        assert_eq!(pending.options.reasoning_effort, None);
+    }
 
     #[test]
     fn snapshots_replace_semantic_state_without_replacing_local_presentation() {
@@ -543,6 +581,63 @@ impl AgentEditorField {
     }
 }
 
+/// The options step of the agent editor: what the model just chosen can be given, and what it is.
+///
+/// It exists only between choosing a model and applying it, and that is what ties a level to a
+/// model: the levels on offer are the chosen model's own (`ModelConfigurationView`), and there is no
+/// other way in. A model that takes neither a level nor fast mode produces no step at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentPendingOptions {
+    /// The chosen model's own levels, in its own order. Empty for a model that takes none.
+    pub reasoning_efforts: Vec<String>,
+    pub fast_mode_configurable: bool,
+    pub options: ModelOptions,
+    pub selected: usize,
+}
+
+impl AgentPendingOptions {
+    /// How many rows the step draws — the effort row is shown first, when there is one.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        usize::from(!self.reasoning_efforts.is_empty()) + usize::from(self.fast_mode_configurable)
+    }
+
+    #[must_use]
+    pub fn on_fast_mode_row(&self) -> bool {
+        self.fast_mode_configurable && (self.reasoning_efforts.is_empty() || self.selected == 1)
+    }
+
+    /// Steps the level, with the model's DEFAULT as the first position rather than a level.
+    ///
+    /// Default has to be reachable: a definition with no level means the model's own, which is what
+    /// every definition written before this field existed means, and the editor cannot be a one-way
+    /// door out of it.
+    fn step_effort(&mut self, delta: isize) {
+        if self.reasoning_efforts.is_empty() {
+            return;
+        }
+        let current = self
+            .options
+            .reasoning_effort
+            .as_deref()
+            .map_or(0, |effort| {
+                self.reasoning_efforts
+                    .iter()
+                    .position(|candidate| candidate == effort)
+                    .map_or(0, |index| index.saturating_add(1))
+            });
+        let next = offset_index(
+            current,
+            self.reasoning_efforts.len().saturating_add(1),
+            delta,
+        );
+        self.options.reasoning_effort = match next.checked_sub(1) {
+            None => None,
+            Some(index) => self.reasoning_efforts.get(index).cloned(),
+        };
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentModelOption {
     Inherit,
@@ -583,7 +678,9 @@ pub struct AgentEditor {
     pub model: String,
     pub fallback_models: String,
     pub fast_mode: bool,
-    pub pending_fast_mode: Option<bool>,
+    /// The level this archetype runs at, or `None` for the chosen model's own default.
+    pub reasoning_effort: Option<String>,
+    pub pending_options: Option<AgentPendingOptions>,
     pub model_dropdown: Option<SearchableDropdown<AgentModelOption>>,
 }
 
@@ -599,7 +696,8 @@ impl AgentEditor {
             model: String::new(),
             fallback_models: String::new(),
             fast_mode: false,
-            pending_fast_mode: None,
+            reasoning_effort: None,
+            pending_options: None,
             model_dropdown: None,
         }
     }
@@ -623,7 +721,8 @@ impl AgentEditor {
                 .collect::<Vec<_>>()
                 .join(", "),
             fast_mode: definition.fast_mode,
-            pending_fast_mode: None,
+            reasoning_effort: definition.reasoning_effort.clone(),
+            pending_options: None,
             model_dropdown: None,
         }
     }
@@ -660,6 +759,9 @@ impl AgentEditor {
             description: description.to_owned(),
             system_prompt: system_prompt.to_owned(),
             first_message: first_message.to_owned(),
+            // A level travels with a model and never without one, so an editor left on "inherit the
+            // parent model" sends none — the run gets the parent's model at its own default level.
+            reasoning_effort: model.as_ref().and(self.reasoning_effort.clone()),
             model,
             fallback_models,
             fast_mode: self.fast_mode,
@@ -1628,7 +1730,7 @@ impl TuiState {
         let Some(editor) = &mut picker.editor else {
             return false;
         };
-        if editor.model_dropdown.take().is_some() || editor.pending_fast_mode.take().is_some() {
+        if editor.model_dropdown.take().is_some() || editor.pending_options.take().is_some() {
             return true;
         }
         picker.editor = None;
@@ -1641,7 +1743,34 @@ impl TuiState {
             .agent_picker
             .as_ref()
             .and_then(|picker| picker.editor.as_ref())
-            .is_some_and(|editor| editor.pending_fast_mode.is_some())
+            .is_some_and(|editor| editor.pending_options.is_some())
+    }
+
+    /// The rows of the options step, when one is open — the effort row first, fast mode after it.
+    #[must_use]
+    pub fn agent_pending_options(&self) -> Option<&AgentPendingOptions> {
+        self.client
+            .agent_picker
+            .as_ref()
+            .and_then(|picker| picker.editor.as_ref())
+            .and_then(|editor| editor.pending_options.as_ref())
+    }
+
+    /// Moves between the step's rows. A step with one row has nothing to move to.
+    pub fn move_agent_model_options(&mut self, delta: isize) {
+        let Some(pending) = self
+            .client
+            .agent_picker
+            .as_mut()
+            .and_then(|picker| picker.editor.as_mut())
+            .and_then(|editor| editor.pending_options.as_mut())
+        else {
+            return;
+        };
+        let rows = pending.row_count();
+        if rows > 1 {
+            pending.selected = offset_index(pending.selected, rows, delta);
+        }
     }
 
     #[must_use]
@@ -1695,19 +1824,22 @@ impl TuiState {
     }
 
     pub fn adjust_agent_model_options(&mut self, delta: isize) {
-        let Some(editor) = self
+        let Some(pending) = self
             .client
             .agent_picker
             .as_mut()
             .and_then(|picker| picker.editor.as_mut())
+            .and_then(|editor| editor.pending_options.as_mut())
         else {
             return;
         };
-        let Some(fast_mode) = &mut editor.pending_fast_mode else {
+        if delta == 0 {
             return;
-        };
-        if delta != 0 {
-            *fast_mode = !*fast_mode;
+        }
+        if pending.on_fast_mode_row() {
+            pending.options.fast_mode = !pending.options.fast_mode;
+        } else {
+            pending.step_effort(delta);
         }
     }
 

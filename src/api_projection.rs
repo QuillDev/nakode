@@ -281,6 +281,7 @@ async fn execute_catalog_command(
                             .map(|id| id.to_string())
                             .collect(),
                         fast_mode: definition.fast_mode,
+                        reasoning_effort: definition.reasoning_effort,
                     }),
                     previous_slug,
                 })
@@ -702,6 +703,7 @@ fn agent(value: api::AgentDefinition) -> view::AgentDefinitionView {
             .map(view::ModelId::from)
             .collect(),
         fast_mode: value.fast_mode,
+        reasoning_effort: value.reasoning_effort,
     }
 }
 

@@ -786,6 +786,7 @@ impl ServerCore {
                 .map(|model| model.to_string())
                 .collect(),
             fast_mode: definition.fast_mode,
+            reasoning_effort: definition.reasoning_effort,
         };
         self.engine()
             .state()
@@ -2558,6 +2559,7 @@ first_message = "Starting review"
             model: None,
             fallback_models: Vec::new(),
             fast_mode: false,
+            reasoning_effort: None,
         }]));
         let workspace_id = crate::state::projection::workspace_id(&state.workspace);
         let core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
@@ -2573,6 +2575,7 @@ first_message = "Starting review"
                     model: None,
                     fallback_models: Vec::new(),
                     fast_mode: false,
+                    reasoning_effort: None,
                 },
                 None,
             )
@@ -2593,6 +2596,7 @@ first_message = "Starting review"
                     model: None,
                     fallback_models: Vec::new(),
                     fast_mode: false,
+                    reasoning_effort: None,
                 },
                 None,
             )

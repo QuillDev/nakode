@@ -411,6 +411,12 @@ pub struct AgentDefinitionView {
     pub model_id: Option<ModelId>,
     pub fallback_models: Vec<ModelId>,
     pub fast_mode: bool,
+    /// The level this archetype runs at, or `None` for the model's own default.
+    ///
+    /// A level is a property OF a model, so this is only ever set alongside `model_id`, and a
+    /// definition written before the field existed reads back as `None` — the default.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

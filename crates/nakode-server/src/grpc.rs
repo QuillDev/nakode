@@ -185,6 +185,12 @@ fn agent_input(
             .map(protocol::ModelId::from)
             .collect(),
         fast_mode: value.fast_mode,
+        // Trimmed to `None`: an empty string is a client that sent the field without a level in it,
+        // which means the model's default, not a level named "".
+        reasoning_effort: value
+            .reasoning_effort
+            .map(|effort| effort.trim().to_owned())
+            .filter(|effort| !effort.is_empty()),
     })
 }
 
@@ -1193,6 +1199,7 @@ fn agent(value: protocol::AgentDefinitionView) -> api::AgentDefinition {
             .map(|id| id.to_string())
             .collect(),
         fast_mode: value.fast_mode,
+        reasoning_effort: value.reasoning_effort,
     }
 }
 
