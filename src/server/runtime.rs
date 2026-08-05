@@ -734,6 +734,35 @@ impl BackendRegistry {
         }
     }
 
+    /// Shuts down every provider backend supervising one logical session.
+    ///
+    /// Keyed on the session alone, across providers: a session may have been served by more than one
+    /// adapter over its life, and a delete that left either behind would leave a provider child
+    /// writing to history that has gone. Idempotent — a session with no backend attached is the
+    /// normal case for a dead one, and finding nothing to stop is a success.
+    pub(crate) async fn stop_session(&mut self, session_id: &nakode_protocol::SessionId) {
+        let keys = self
+            .session_commands
+            .keys()
+            .filter(|(id, _)| id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(commands) = self.session_commands.remove(&key) {
+                let _ = commands.send(BackendCommand::Shutdown).await;
+            }
+        }
+    }
+
+    /// Drops the join handles of supervisors that have already exited.
+    ///
+    /// `tasks` is only ever pushed to and is awaited once, in `shutdown`. Every session and every
+    /// subagent adds two handles, so without this the vector grows with churn for the life of the
+    /// process and keeps a `JoinHandle` per session that has long since ended.
+    fn reap_finished_tasks(&mut self) {
+        self.tasks.retain(|task| !task.is_finished());
+    }
+
     pub(crate) fn set_provider_credential(&mut self, provider: &str, metadata: serde_json::Value) {
         self.provider_credentials
             .insert(provider.to_owned(), metadata.clone());
@@ -747,6 +776,7 @@ impl BackendRegistry {
 
     fn insert_provider_control(&mut self, provider: String, handle: BackendHandle) {
         let (commands, mut events, task) = handle.into_parts();
+        self.reap_finished_tasks();
         self.commands.insert(provider.clone(), commands);
         self.tasks.push(task);
         let event_tx = self.event_tx.clone();
@@ -770,6 +800,7 @@ impl BackendRegistry {
         handle: BackendHandle,
     ) {
         let (commands, mut events, task) = handle.into_parts();
+        self.reap_finished_tasks();
         self.session_commands
             .insert((session_id.clone(), provider.clone()), commands);
         self.tasks.push(task);
@@ -812,6 +843,7 @@ impl BackendRegistry {
         }
         let handle = self.spawn_provider_handle(provider).await?;
         let (commands, mut events, task) = handle.into_parts();
+        self.reap_finished_tasks();
         self.subagent_commands.insert(run_id.clone(), commands);
         self.subagent_providers
             .insert(run_id.clone(), provider.to_owned());
@@ -1033,6 +1065,11 @@ impl EffectExecutor {
                 send_subagent_command(state, &self.backends, pending, &run_id, command).await;
             }
             Effect::StopSubagent(run_id) => self.backends.stop_subagent(&run_id).await,
+            Effect::ReleaseSessionBackends(id) => {
+                self.backends
+                    .stop_session(&nakode_protocol::SessionId::from(id))
+                    .await;
+            }
             Effect::CompleteAgentRequest { .. } => {
                 // Run completion is projected through RunView.
             }
@@ -2256,6 +2293,105 @@ mod tests {
         ));
         assert!(registry.session_commands.is_empty());
         assert!(!registry.commands.contains_key(CODEX_PROVIDER));
+    }
+
+    /// Releasing one session stops its provider children and leaves every other session alone.
+    ///
+    /// What `Effect::ReleaseSessionBackends` runs on a delete. Keyed on the session across providers, so
+    /// a session served by two adapters leaves neither behind — an orphaned child would go on writing to
+    /// history that the same delete is removing.
+    #[tokio::test]
+    async fn releasing_one_session_stops_only_its_own_backends() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let doomed = SessionId::from("session-doomed");
+        let survivor = SessionId::from("session-survivor");
+        let (codex, mut codex_commands, _codex_events) = fake_backend();
+        let (claude, mut claude_commands, _claude_events) = fake_backend();
+        let (kept, mut kept_commands, _kept_events) = fake_backend();
+        registry.insert_session(doomed.clone(), CODEX_PROVIDER.to_owned(), codex);
+        registry.insert_session(
+            doomed.clone(),
+            crate::backend::CLAUDE_PROVIDER.to_owned(),
+            claude,
+        );
+        registry.insert_session(survivor.clone(), CODEX_PROVIDER.to_owned(), kept);
+
+        registry.stop_session(&doomed).await;
+
+        assert!(matches!(
+            codex_commands.recv().await,
+            Some(BackendCommand::Shutdown)
+        ));
+        assert!(matches!(
+            claude_commands.recv().await,
+            Some(BackendCommand::Shutdown)
+        ));
+        assert!(
+            !registry
+                .session_commands
+                .keys()
+                .any(|(id, _)| id == &doomed),
+            "the released session must keep no handle"
+        );
+        assert!(
+            registry
+                .session_commands
+                .contains_key(&(survivor, CODEX_PROVIDER.to_owned())),
+            "releasing one session must not touch another"
+        );
+        assert!(
+            kept_commands.try_recv().is_err(),
+            "the surviving session must not be told to shut down"
+        );
+    }
+
+    /// Releasing a session with nothing attached is a success, which is the dead-session case.
+    #[tokio::test]
+    async fn releasing_a_session_with_no_backend_is_idempotent() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let absent = SessionId::from("session-absent");
+
+        registry.stop_session(&absent).await;
+        registry.stop_session(&absent).await;
+
+        assert!(registry.session_commands.is_empty());
+    }
+
+    /// Supervisor handles do not pile up across session churn.
+    ///
+    /// `tasks` is awaited once, in `shutdown`, and every session and subagent adds two handles to it. It
+    /// was only ever pushed to, so a long-lived server kept one per session that had already ended.
+    #[tokio::test]
+    async fn finished_supervisor_handles_do_not_accumulate() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let baseline = registry.tasks.len();
+
+        for cycle in 0..12 {
+            let session_id = SessionId::from(format!("session-{cycle}"));
+            let (handle, commands, events) = fake_backend();
+            registry.insert_session(session_id.clone(), CODEX_PROVIDER.to_owned(), handle);
+            registry.stop_session(&session_id).await;
+            // Dropping both ends is what ends the forwarder and the supervisor this test is counting.
+            drop(commands);
+            drop(events);
+            tokio::task::yield_now().await;
+        }
+        // One more insert to run the reaper over everything the cycles left finished.
+        let (handle, _commands, _events) = fake_backend();
+        registry.insert_session(
+            SessionId::from("session-last"),
+            CODEX_PROVIDER.to_owned(),
+            handle,
+        );
+
+        assert!(
+            registry.tasks.len() < baseline + 12,
+            "supervisor handles accumulated across session churn: {} handles",
+            registry.tasks.len()
+        );
     }
 
     #[tokio::test]

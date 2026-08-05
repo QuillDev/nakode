@@ -799,6 +799,12 @@ pub enum Effect {
         previous_slug: Option<String>,
     },
     DeleteAgent(String),
+    /// Shuts down every provider backend supervising one logical session.
+    ///
+    /// Emitted by `DeleteSession` for a session that was still attached, because the protocol has
+    /// no close command for a caller to issue first. Ordered BEFORE `DeleteSession` so the provider
+    /// child is gone before the history it was writing to is.
+    ReleaseSessionBackends(String),
     /// Removes a logical session and its persisted history. Routed with the persistence effects.
     DeleteSession(String),
     ReloadConfiguration,
@@ -2836,6 +2842,21 @@ impl DomainState {
             || self.active_turn.is_some()
             || self.context_compaction.is_some()
             || self.has_running_subagents()
+    }
+
+    /// Whether a provider backend is still behind this session.
+    ///
+    /// `is_busy` says what the session was DOING; this says whether anything is left to do it, and
+    /// the two must be read together before refusing an operation for work in flight. A backend that
+    /// dies mid-turn leaves state behind that nothing ever clears: `handle_disconnected` drops the
+    /// turn but never marks a running subagent stopped, so `is_busy` can stay true forever. Asking
+    /// such a session to cancel its work first is asking it to do something it cannot.
+    #[must_use]
+    pub fn provider_is_live(&self) -> bool {
+        matches!(
+            self.connection,
+            ConnectionState::Starting | ConnectionState::Ready { .. }
+        )
     }
 
     #[must_use]
