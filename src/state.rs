@@ -5538,10 +5538,16 @@ impl DomainState {
     }
 
     fn begin_prompt(&mut self, prompt: QueuedPrompt) -> Vec<Effect> {
-        let wire_text = self
+        let mut wire_text = self
             .skills
             .render_prompt(&prompt.text)
             .unwrap_or_else(|_| prompt.text.clone());
+        // Provider sessions retain their original system instructions. Repeat the live catalogue on
+        // later turns so agents added or removed after session creation are represented accurately.
+        if self.provider_session_id.is_some() {
+            wire_text.push_str("\n\n");
+            wire_text.push_str(&self.nakode_current_agent_catalogue());
+        }
         let prompt = OutgoingPrompt {
             id: prompt.id,
             text: prompt.text,
@@ -6085,7 +6091,7 @@ impl DomainState {
         }
     }
 
-    fn nakode_system_instructions(&self) -> String {
+    fn rendered_agent_catalogue(&self) -> String {
         let executable = shell_quote(&self.nakode_executable);
         let agents = self
             .agents
@@ -6103,16 +6109,29 @@ impl DomainState {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        if agents.is_empty() {
+            "- none".to_owned()
+        } else {
+            agents
+        }
+    }
+
+    fn nakode_current_agent_catalogue(&self) -> String {
+        format!(
+            "[Nakode Current Agent Catalogue]\nThis authoritative list supersedes the initial Available agents list for this turn.\nAvailable agents:\n{}\n[/Nakode Current Agent Catalogue]",
+            self.rendered_agent_catalogue()
+        )
+    }
+
+    fn nakode_system_instructions(&self) -> String {
+        let agents = self.rendered_agent_catalogue();
         let model = self.selected_model.as_ref().map_or_else(
             || format!("{}/provider-default", self.backend_provider),
             Clone::clone,
         );
         let base = format!(
-            "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode invocation is available through the native shell. It is a Nakode control-plane command, not a provider tool.\nAvailable agents:\n{}\nTo delegate a concrete bounded task, execute the matching absolute-path command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed above. Use only these Nakode commands for delegation; do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one command per task concurrently using the provider's native shell facilities. Keep each objective distinct and bounded. Each command returns its own agent result on stdout when that child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
-            self.nakode_session_id,
-            model,
-            self.backend_provider,
-            if agents.is_empty() { "- none" } else { &agents },
+            "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode invocation is available through the native shell. It is a Nakode control-plane command, not a provider tool.\nInitial available agents:\n{}\nThis catalogue can change during a session; a later [Nakode Current Agent Catalogue] block supersedes this initial list.\nTo delegate a concrete bounded task, execute the matching absolute-path command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed in the current catalogue. Use only these Nakode commands for delegation; do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one command per task concurrently using the provider's native shell facilities. Keep each objective distinct and bounded. Each command returns its own agent result on stdout when that child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
+            self.nakode_session_id, model, self.backend_provider, agents,
         );
         self.prompt_addenda
             .apply(&base, self.selected_model.as_deref())
@@ -6397,7 +6416,7 @@ impl DomainState {
             .as_ref()
             .map(|model| format!("{}/{model}", target.provider));
         let instructions = Some(prompt_addenda.apply(
-            &execution.definition.system_prompt,
+            execution.definition.instructions(),
             qualified_model.as_deref(),
         ));
         self.sync_subagent(run_id);
@@ -9520,6 +9539,35 @@ fast_mode = true
         assert!(instructions.contains("launch one command per task concurrently"));
         assert!(instructions.contains("do not use provider-native subagent"));
         assert!(instructions.ends_with("[/Nakode System Instructions]"));
+    }
+
+    #[test]
+    fn existing_session_turn_receives_the_current_agent_catalogue() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("existing-provider-session".to_owned());
+        state.install_agents(explorer_catalog());
+        state.set_nakode_executable(Path::new("/opt/nakode/bin/nakode"));
+        state
+            .client
+            .editor
+            .set_text("Use a sub-agent to inspect auth");
+
+        let effects = state.submit_editor();
+        let prompt = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Backend(BackendCommand::StartTurn { prompt, .. }) => Some(prompt),
+                _ => None,
+            })
+            .expect("expected a turn on the existing provider session");
+
+        assert!(prompt.contains("[Nakode Current Agent Catalogue]"));
+        assert!(prompt.contains("supersedes the initial Available agents list"));
+        assert!(prompt.contains("- explorer: Explores code context"));
+        assert!(prompt.contains(&format!(
+            "'/opt/nakode/bin/nakode' agent explorer --session-id={}",
+            state.nakode_session_id
+        )));
     }
 
     #[test]

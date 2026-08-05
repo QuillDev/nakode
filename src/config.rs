@@ -62,8 +62,9 @@ pub struct Config {
     #[arg(long, env = "NAKODE_SOUL")]
     pub soul: Option<PathBuf>,
 
-    /// Directory containing predefined TOML agent definitions.
-    #[arg(long, env = "NAKODE_AGENTS", default_value = ".nakode/agents")]
+    /// Directory containing global predefined TOML agent definitions. Relative paths resolve under
+    /// `NAKODE_HOME` (default: `~/.nakode`), never under the workspace.
+    #[arg(long, env = "NAKODE_AGENTS", default_value = "agents")]
     pub agents: PathBuf,
 }
 
@@ -232,6 +233,8 @@ pub enum ConfigError {
     },
     #[error("model must use the provider/model form: {0}")]
     InvalidModel(String),
+    #[error("neither NAKODE_HOME nor HOME is set; cannot locate Nakode's global agent directory")]
+    MissingNakodeHome,
     #[error("--update cannot be combined with another command")]
     UpdateWithCommand,
 }
@@ -275,7 +278,7 @@ impl Config {
             self.scrollback = scrollback;
         }
         if std::env::var_os("NAKODE_AGENTS").is_none()
-            && self.agents == Path::new(".nakode/agents")
+            && self.agents == Path::new("agents")
             && let Some(agents) = std::env::var_os("NAKO_AGENT_AGENTS")
         {
             self.agents = agents.into();
@@ -303,14 +306,7 @@ impl Config {
 
         self.workspace = canonicalize(&self.workspace)?;
         if self.agents.is_relative() {
-            let uses_default = self.agents == Path::new(".nakode/agents");
-            let configured = self.workspace.join(&self.agents);
-            let legacy = self.workspace.join(".nako-agent/agents");
-            self.agents = if uses_default && !configured.exists() && legacy.exists() {
-                legacy
-            } else {
-                configured
-            };
+            self.agents = nakode_home()?.join(&self.agents);
         }
         if let Some(path) = &self.personalities
             && path.is_relative()
@@ -342,6 +338,16 @@ impl Config {
             .filter(|session| !session.is_empty());
         Ok(self)
     }
+}
+
+fn nakode_home() -> Result<PathBuf, ConfigError> {
+    if let Some(home) = std::env::var_os("NAKODE_HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".nakode"))
+        .ok_or(ConfigError::MissingNakodeHome)
 }
 
 fn canonicalize(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -429,10 +435,8 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_directory_falls_back_to_the_legacy_location() {
+    fn default_agent_directory_is_global_to_nakode_home() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let legacy = workspace.path().join(".nako-agent/agents");
-        std::fs::create_dir_all(&legacy).expect("legacy agent directory");
         let config = Config::try_parse_from([
             "nakode",
             "--workspace",
@@ -441,9 +445,75 @@ mod tests {
         .expect("CLI parse")
         .validated()
         .expect("validated config");
-        let legacy = legacy.canonicalize().expect("canonical legacy directory");
+        let home = std::env::var_os("NAKODE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".nakode"))
+            })
+            .expect("test environment has a home directory");
 
-        assert_eq!(config.agents, legacy);
+        assert_eq!(config.agents, home.join("agents"));
+        assert!(!config.agents.starts_with(workspace.path()));
+    }
+
+    #[test]
+    fn relative_agent_override_resolves_under_nakode_home() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = Config::try_parse_from([
+            "nakode",
+            "--workspace",
+            workspace.path().to_str().expect("UTF-8 workspace"),
+            "--agents",
+            "shared-agents",
+        ])
+        .expect("CLI parse")
+        .validated()
+        .expect("validated config");
+        let home = std::env::var_os("NAKODE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".nakode"))
+            })
+            .expect("test environment has a home directory");
+
+        assert_eq!(config.agents, home.join("shared-agents"));
+    }
+
+    #[test]
+    fn different_workspaces_resolve_to_the_same_global_agent_directory() {
+        let first = tempfile::tempdir().expect("first workspace");
+        let second = tempfile::tempdir().expect("second workspace");
+        let resolve = |workspace: &std::path::Path| {
+            Config::try_parse_from([
+                "nakode",
+                "--workspace",
+                workspace.to_str().expect("UTF-8 workspace"),
+            ])
+            .expect("CLI parse")
+            .validated()
+            .expect("validated config")
+            .agents
+        };
+
+        assert_eq!(resolve(first.path()), resolve(second.path()));
+    }
+
+    #[test]
+    fn absolute_agent_override_is_used_unchanged() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let agents = tempfile::tempdir().expect("agents");
+        let config = Config::try_parse_from([
+            "nakode",
+            "--workspace",
+            workspace.path().to_str().expect("UTF-8 workspace"),
+            "--agents",
+            agents.path().to_str().expect("UTF-8 agents"),
+        ])
+        .expect("CLI parse")
+        .validated()
+        .expect("validated config");
+
+        assert_eq!(config.agents, agents.path());
     }
 
     #[test]

@@ -535,8 +535,8 @@ impl AgentEditorField {
         match self {
             Self::Slug => "Slug",
             Self::Description => "Description",
-            Self::SystemPrompt => "System prompt",
-            Self::FirstMessage => "First message",
+            Self::SystemPrompt => "System prompt (optional)",
+            Self::FirstMessage => "First message (optional)",
             Self::Model => "Model",
             Self::FallbackModels => "Fallbacks",
         }
@@ -638,9 +638,7 @@ impl AgentEditor {
             || !slug.chars().all(|character| {
                 character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
             })
-            || [description, system_prompt, first_message]
-                .into_iter()
-                .any(str::is_empty)
+            || description.is_empty()
         {
             return None;
         }

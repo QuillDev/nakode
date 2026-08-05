@@ -8,7 +8,9 @@ use thiserror::Error;
 pub struct AgentDefinition {
     pub slug: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub system_prompt: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub first_message: String,
     #[serde(default)]
     pub model: Option<String>,
@@ -36,12 +38,23 @@ impl AgentDefinition {
     }
 
     #[must_use]
+    pub fn instructions(&self) -> &str {
+        let system_prompt = self.system_prompt.trim();
+        if system_prompt.is_empty() {
+            self.description.trim()
+        } else {
+            system_prompt
+        }
+    }
+
+    #[must_use]
     pub fn initial_prompt(&self, task: &str) -> String {
-        format!(
-            "{}\n\n# Delegated task\n\n{}",
-            self.first_message.trim(),
-            task.trim()
-        )
+        let first_message = self.first_message.trim();
+        if first_message.is_empty() {
+            format!("# Delegated task\n\n{}", task.trim())
+        } else {
+            format!("{first_message}\n\n# Delegated task\n\n{}", task.trim())
+        }
     }
 }
 
@@ -275,17 +288,11 @@ fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalog
             slug: definition.slug.clone(),
         });
     }
-    for (field, value) in [
-        ("description", definition.description.as_str()),
-        ("system_prompt", definition.system_prompt.as_str()),
-        ("first_message", definition.first_message.as_str()),
-    ] {
-        if value.trim().is_empty() {
-            return Err(AgentCatalogError::EmptyField {
-                path: path.to_owned(),
-                field,
-            });
-        }
+    if definition.description.trim().is_empty() {
+        return Err(AgentCatalogError::EmptyField {
+            path: path.to_owned(),
+            field: "description",
+        });
     }
     for model in definition.model.iter().chain(&definition.fallback_models) {
         if model
@@ -396,6 +403,33 @@ first_message = "Explore the migration."
                 .expect("configured catalog")
                 .definitions()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn description_only_agent_uses_simple_delegation_defaults() {
+        let directory = tempdir().expect("temp directory");
+        fs::write(
+            directory.path().join("researcher.toml"),
+            r#"
+slug = "researcher"
+description = "Research the requested topic and report concrete findings"
+"#,
+        )
+        .expect("agent fixture");
+
+        let catalog = AgentCatalog::load(directory.path()).expect("description-only catalog");
+        let agent = catalog.find("researcher").expect("researcher");
+
+        assert!(agent.system_prompt.is_empty());
+        assert!(agent.first_message.is_empty());
+        assert_eq!(
+            agent.instructions(),
+            "Research the requested topic and report concrete findings"
+        );
+        assert_eq!(
+            agent.initial_prompt("Inspect authentication"),
+            "# Delegated task\n\nInspect authentication"
         );
     }
 
