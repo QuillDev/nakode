@@ -127,6 +127,34 @@ development build for much faster iteration, at the cost of a larger and less
 optimized installed executable. Run `./install.sh --help` for system and
 custom-prefix options.
 
+### Reset every session
+
+To return Nakode to a clean, first-run session state:
+
+```sh
+nakode purge-unsafe
+```
+
+The command prints a warning and then asks for confirmation with a
+default-negative `[N/y]` prompt. Only an explicit `y` or `Y` proceeds; an empty
+line, `n`, end-of-input, and any unrecognized answer abort without changing
+anything. This is deliberately interactive and has no force or bypass flag, so
+it cannot be scripted by accident.
+
+On confirmation it first stops every discoverable workspace service through its
+lifecycle socket, so each server terminates its own provider children, shell
+processes, delegated runs, and frontend transports before persistence is
+touched. Stale socket sets left by a dead server are removed. It then deletes
+every logical session, delegated orchestration run, agent turn, and native
+runtime history — including orphaned histories from dead or partially
+initialized sessions that ordinary close-first deletion cannot clear.
+
+Provider credentials, provider enablement, default-model preferences, global
+add-on configuration such as web and memory settings, installed providers, and
+repository contents are outside the purge boundary and survive it. The command
+reports what it removed and reports failures instead of claiming success, and
+running it again on an already-clean install is a no-op.
+
 ### Start Nakode
 
 Open a project workspace:

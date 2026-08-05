@@ -643,7 +643,7 @@ impl FixtureEvent {
             Self::SessionCreated {
                 provider_session_id,
                 model,
-            } => install_created_session_view(view, commands, provider_session_id, model)?,
+            } => install_created_session_view(view, commands, &provider_session_id, model)?,
             Self::TurnStarted { turn_id } => install_started_turn_view(view, turn_id)?,
             Self::Item {
                 id,
@@ -971,7 +971,7 @@ fn install_model_views(view: &mut nakode_protocol::BootstrapView, models: Vec<Fi
 fn install_created_session_view(
     view: &mut nakode_protocol::BootstrapView,
     commands: &[crate::api_projection::TuiAction],
-    provider_session_id: String,
+    provider_session_id: &str,
     model: String,
 ) -> Result<(), String> {
     let provider_id = selected_provider_id(view);
@@ -993,7 +993,7 @@ fn install_created_session_view(
             agent.capabilities.clone()
         });
     session.active_agent_session = Some(nakode_protocol::AgentSessionView {
-        id: nakode_protocol::AgentSessionId::from(provider_session_id.clone()),
+        id: nakode_protocol::AgentSessionId::from(provider_session_id.to_owned()),
         provider_id,
         model_id: Some(model_id),
         role: "primary".to_owned(),

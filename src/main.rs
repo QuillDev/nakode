@@ -1,7 +1,7 @@
 use nakode::{
     agent_cli, app,
     config::{Config, NakodeCommand, ServiceAction},
-    control_service, diagnostics, discord, tui_eval, update,
+    control_service, diagnostics, discord, purge, tui_eval, update,
 };
 
 #[tokio::main]
@@ -99,6 +99,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             width,
             height,
         })?,
+        Some(NakodeCommand::PurgeUnsafe) => {
+            purge::run().await?;
+        }
         Some(NakodeCommand::Update) => unreachable!("update commands return before dispatch"),
         None => Box::pin(app::run(config)).await?,
     }

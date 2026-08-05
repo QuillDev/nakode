@@ -516,6 +516,14 @@ impl ServerCore {
             .collect::<Vec<_>>();
         match loaded.as_slice() {
             [loaded] => {
+                if *loaded == self.default_session
+                    && !self
+                        .sessions
+                        .iter()
+                        .any(|record| record.id == loaded.as_str())
+                {
+                    return Err(DomainCommandError::NotFound(session_id.to_string()));
+                }
                 return Ok(Self::accepted(Some(loaded.to_string()), Vec::new()));
             }
             [_, ..] => {
@@ -1591,20 +1599,20 @@ impl ServerCore {
         let mut bootstrap = self
             .engine()
             .bootstrap_view(&self.providers, &self.sessions);
-        let default_is_persisted = self
+        let initial_session_is_persisted = self
             .sessions
             .iter()
             .any(|record| record.id == self.default_session.as_str());
-        if !default_is_persisted {
+        if !initial_session_is_persisted {
             bootstrap
                 .sessions
                 .retain(|summary| summary.id != self.default_session);
         }
         for (session_id, engine) in &self.sessions_by_id {
-            // A fresh default is the workspace control-plane host, not a logical conversation. It only
-            // becomes discoverable if provider work persists it. This also keeps successor engines from
-            // recreating the old epoch-dated `New session` duplicate after an initial-session delete.
-            if *session_id == self.default_session && !default_is_persisted {
+            // A fresh initial engine is the workspace control-plane host, not a logical conversation.
+            // It only becomes discoverable if provider work persists it. This also keeps successor
+            // engines from recreating an epoch-dated `New session` duplicate after deletion.
+            if *session_id == self.default_session && !initial_session_is_persisted {
                 continue;
             }
             let Some(session) = engine
@@ -2423,7 +2431,7 @@ mod tests {
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         service::ServiceEngine,
         session::{ProviderRecord, SessionRecord, SubagentRecord},
-        state::AppState,
+        state::{AppState, DomainCommandError},
     };
 
     fn drain_publications(
@@ -2501,6 +2509,56 @@ mod tests {
         }
         chunks.reverse();
         chunks.concat()
+    }
+
+    #[test]
+    fn workspace_discovery_excludes_the_uncreated_initial_engine() {
+        let (mut core, initial_id) = ready_codex_server();
+        let workspace = core.workspace_bootstrap();
+
+        assert!(
+            workspace
+                .sessions
+                .iter()
+                .all(|session| session.id != initial_id)
+        );
+        assert!(matches!(
+            core.open_session_command(&initial_id),
+            Err(DomainCommandError::NotFound(_))
+        ));
+
+        let (created, _) = core
+            .create_session_command(&workspace.workspace_id, None, &ModelOptions::default())
+            .expect("explicit logical session");
+        let created_id = SessionId::from(created.resource_id.expect("created session id"));
+        let discovered = core.workspace_bootstrap();
+        assert_eq!(discovered.sessions.len(), 1);
+        assert_eq!(discovered.sessions[0].id, created_id);
+        assert_eq!(discovered.sessions[0].updated_at_ms, 0);
+    }
+
+    #[test]
+    fn persisted_initial_engine_is_discoverable_after_restart_reconciliation() {
+        let (mut core, initial_id) = ready_codex_server();
+        core.replace_session_records(vec![SessionRecord {
+            id: initial_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-1".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            title: "Direct terminal session".to_owned(),
+            model: None,
+            created_at: 10,
+            updated_at: 12,
+            owned_provider_sessions: Vec::new(),
+        }]);
+
+        let discovered = core.workspace_bootstrap();
+        assert_eq!(discovered.sessions.len(), 1);
+        assert_eq!(discovered.sessions[0].id, initial_id);
+        assert_eq!(discovered.sessions[0].title, "Direct terminal session");
+        assert_eq!(discovered.sessions[0].updated_at_ms, 12_000);
+        core.open_session_command(&initial_id)
+            .expect("persisted initial session remains resumable");
     }
 
     #[test]

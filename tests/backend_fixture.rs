@@ -13,6 +13,11 @@ use tokio::time::timeout;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+#[cfg(unix)]
+const GATE_OPEN_ATTEMPTS: usize = 500;
+#[cfg(unix)]
+const GATE_OPEN_RETRY: Duration = Duration::from_millis(10);
+
 #[tokio::test]
 async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResult {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -254,7 +259,6 @@ async fn codex_client_resumes_history_and_unsubscribes() -> TestResult {
         .commands
         .send(BackendCommand::UnsubscribeSession {
             provider_session_id: "thread-fixture".to_owned(),
-            owner_session_id: None,
         })
         .await?;
     assert!(matches!(
@@ -272,7 +276,9 @@ async fn codex_client_resumes_history_and_unsubscribes() -> TestResult {
 async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixture = manifest.join("tests/fixtures/fake_codex.py");
-    let gate_dir = tempfile::tempdir()?;
+    // The compatibility adapter sanitizes TMPDIR before spawning the fixture. Use the child-visible
+    // Unix temporary root so its FIFO confinement check agrees with the parent on macOS too.
+    let gate_dir = tempfile::tempdir_in("/tmp")?;
     let gate = gate_dir.path().join("initialize.fifo");
     let status = Command::new("mkfifo").arg(&gate).status()?;
     assert!(status.success());
@@ -298,7 +304,7 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
             owner_session_id: None,
         })
         .await?;
-    let mut gate_writer = OpenOptions::new().write(true).open(&gate)?;
+    let mut gate_writer = open_gate_writer(&gate).await?;
     gate_writer.write_all(b"1")?;
     drop(gate_writer);
 
@@ -321,6 +327,64 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
 
     backend.commands.send(BackendCommand::Shutdown).await?;
     timeout(Duration::from_secs(5), backend.join()).await??;
+    Ok(())
+}
+
+/// Opens the initialization gate for writing without blocking the test forever.
+///
+/// A write-only FIFO open blocks until a reader appears, and the fixture only opens the gate while
+/// it handles `initialize`. A fixture that exits before that point would otherwise block this test
+/// in `open` with no timeout, leaving an orphaned process that holds the harness output pipe open.
+/// Poll a non-blocking open instead so a dead fixture fails within a bounded window, and await
+/// between attempts so the runtime can still flush the pending `initialize` request.
+#[cfg(unix)]
+async fn open_gate_writer(gate: &std::path::Path) -> TestResult<std::fs::File> {
+    open_gate_writer_within(gate, GATE_OPEN_ATTEMPTS).await
+}
+
+#[cfg(unix)]
+async fn open_gate_writer_within(
+    gate: &std::path::Path,
+    attempts: usize,
+) -> TestResult<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    for _ in 0..attempts {
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(gate)
+        {
+            Ok(writer) => return Ok(writer),
+            // ENXIO reports a FIFO that no reader has opened yet.
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                tokio::time::sleep(GATE_OPEN_RETRY).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the Codex fixture never opened the initialization gate for reading",
+    )
+    .into())
+}
+
+/// A fixture that never reads the gate must fail the test rather than block it forever.
+#[cfg(unix)]
+#[tokio::test]
+async fn initialization_gate_open_times_out_instead_of_blocking_forever() -> TestResult {
+    let gate_dir = tempfile::tempdir()?;
+    let gate = gate_dir.path().join("initialize.fifo");
+    assert!(Command::new("mkfifo").arg(&gate).status()?.success());
+
+    let error = open_gate_writer_within(&gate, 2)
+        .await
+        .expect_err("an unread FIFO must not block");
+    assert_eq!(
+        error.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(io::ErrorKind::TimedOut)
+    );
     Ok(())
 }
 

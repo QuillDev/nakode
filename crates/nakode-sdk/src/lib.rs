@@ -331,7 +331,10 @@ impl NakodeClient {
         )
     }
 
-    /// Atomically converts one queued prompt into steering guidance for the active turn.
+    /// Atomically redirects active work to one queued prompt.
+    ///
+    /// Steering-capable providers accept it in the current turn. Interruption-only providers stop
+    /// that turn and start the selected prompt next.
     ///
     /// # Errors
     /// Returns a transport or server status error. A rejected conversion leaves the prompt queued.
