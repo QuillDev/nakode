@@ -579,71 +579,19 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
                 .await;
             BackendEvent::TurnStarted { turn_id }
         }
-        "delta" => {
-            let kind = if message["kind"] == "reasoning" {
-                DeltaKind::Reasoning
-            } else {
-                DeltaKind::Assistant
-            };
-            let turn_id = string(message, "turnId");
-            BackendEvent::ItemDelta {
-                item_id: format!("{turn_id}:claude"),
-                turn_id,
-                kind,
-                delta: string(message, "text"),
-            }
-        }
+        "delta" => delta_event(message),
         "tool_call" => tool_call_event(message),
         "plan" => BackendEvent::TurnPlan {
             turn_id: string(message, "turnId"),
             plan: string(message, "text"),
         },
-        "approval_request" => BackendEvent::ApprovalRequested(ApprovalRequest {
-            id: message.get("approvalId").cloned().unwrap_or(Value::Null),
-            method: string(message, "toolName"),
-            kind: match string(message, "toolName").as_str() {
-                "Bash" => ApprovalKind::Command,
-                "Edit" | "Write" | "NotebookEdit" => ApprovalKind::FileChange,
-                _ => ApprovalKind::Other,
-            },
-            title: string(message, "title"),
-            detail: message.get("input").map_or_else(String::new, display_value),
-        }),
+        "approval_request" => approval_request_event(message),
         "approval_resolved" => BackendEvent::ApprovalResolved {
             request_id: message.get("approvalId").cloned().unwrap_or(Value::Null),
         },
         "interrupt_accepted" => BackendEvent::InterruptAccepted,
-        "usage" => {
-            let usage = &message["usage"];
-            BackendEvent::TokenUsageUpdated {
-                usage: BackendTokenUsage {
-                    input_tokens: usage["input_tokens"].as_u64().unwrap_or_default(),
-                    output_tokens: usage["output_tokens"].as_u64().unwrap_or_default(),
-                    cached_input_tokens: usage["cache_read_input_tokens"]
-                        .as_u64()
-                        .unwrap_or_default(),
-                    cache_write_tokens: usage["cache_creation_input_tokens"]
-                        .as_u64()
-                        .unwrap_or_default(),
-                },
-            }
-        }
-        "turn_completed" => {
-            let outcome = match message["status"].as_str() {
-                Some("finished") => TurnOutcome::Completed,
-                Some("cancelled") => TurnOutcome::Interrupted,
-                _ => TurnOutcome::Failed,
-            };
-            let error = message
-                .get("error")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            BackendEvent::TurnCompleted {
-                turn_id: string(message, "turnId"),
-                outcome,
-                error,
-            }
-        }
+        "usage" => usage_event(message),
+        "turn_completed" => turn_completed_event(message),
         "error" => {
             request_failed(
                 events,
@@ -656,6 +604,68 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
         _ => BackendEvent::ProtocolDiagnostic(string(message, "message")),
     };
     let _ = events.send(event).await;
+}
+
+fn delta_event(message: &Value) -> BackendEvent {
+    let kind = if message["kind"] == "reasoning" {
+        DeltaKind::Reasoning
+    } else {
+        DeltaKind::Assistant
+    };
+    let turn_id = string(message, "turnId");
+    BackendEvent::ItemDelta {
+        item_id: format!("{turn_id}:claude"),
+        turn_id,
+        kind,
+        delta: string(message, "text"),
+    }
+}
+
+fn approval_request_event(message: &Value) -> BackendEvent {
+    BackendEvent::ApprovalRequested(ApprovalRequest {
+        id: message.get("approvalId").cloned().unwrap_or(Value::Null),
+        method: string(message, "toolName"),
+        kind: match string(message, "toolName").as_str() {
+            "Bash" => ApprovalKind::Command,
+            "Edit" | "Write" | "NotebookEdit" => ApprovalKind::FileChange,
+            _ => ApprovalKind::Other,
+        },
+        title: string(message, "title"),
+        detail: message.get("input").map_or_else(String::new, display_value),
+    })
+}
+
+fn usage_event(message: &Value) -> BackendEvent {
+    let usage = &message["usage"];
+    BackendEvent::TokenUsageUpdated {
+        usage: BackendTokenUsage {
+            input_tokens: usage["input_tokens"].as_u64().unwrap_or_default(),
+            output_tokens: usage["output_tokens"].as_u64().unwrap_or_default(),
+            cached_input_tokens: usage["cache_read_input_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+            cache_write_tokens: usage["cache_creation_input_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+        },
+    }
+}
+
+fn turn_completed_event(message: &Value) -> BackendEvent {
+    let outcome = match message["status"].as_str() {
+        Some("finished") => TurnOutcome::Completed,
+        Some("cancelled") => TurnOutcome::Interrupted,
+        _ => TurnOutcome::Failed,
+    };
+    let error = message
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    BackendEvent::TurnCompleted {
+        turn_id: string(message, "turnId"),
+        outcome,
+        error,
+    }
 }
 
 fn models_event(message: &Value) -> BackendEvent {

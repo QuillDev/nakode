@@ -110,6 +110,8 @@ pub enum NakodeCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Remove every Nakode session and its persisted session state after confirmation.
+    PurgeUnsafe,
     /// Update the managed source checkout and reinstall Nakode.
     Update,
     /// Invoke a predefined agent through the native Nakode server.
@@ -294,7 +296,12 @@ impl Config {
         if self.update && self.command.is_some() {
             return Err(ConfigError::UpdateWithCommand);
         }
-        if self.update || matches!(self.command.as_ref(), Some(NakodeCommand::Update)) {
+        if self.update
+            || matches!(
+                self.command.as_ref(),
+                Some(NakodeCommand::Update | NakodeCommand::PurgeUnsafe)
+            )
+        {
             return Ok(self);
         }
         if !self.workspace.exists() {
@@ -663,6 +670,20 @@ mod tests {
                 .canonicalize()
                 .expect("canonical workspace")
         );
+    }
+
+    #[test]
+    fn purge_unsafe_is_visible_in_help_and_accepts_no_bypass_flags() {
+        use clap::CommandFactory;
+
+        let config =
+            Config::try_parse_from(["nakode", "purge-unsafe"]).expect("purge command parses");
+        assert!(matches!(config.command, Some(NakodeCommand::PurgeUnsafe)));
+        assert!(Config::try_parse_from(["nakode", "purge-unsafe", "--force"]).is_err());
+
+        let help = Config::command().render_long_help().to_string();
+        assert!(help.contains("purge-unsafe"));
+        assert!(help.contains("Remove every Nakode session"));
     }
 
     #[test]

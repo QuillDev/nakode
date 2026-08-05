@@ -89,4 +89,5 @@ uuid = { version = "1", features = ["v5", "v7"] }
 nix = { version = "0.30", features = ["process", "signal"] }
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = "3"

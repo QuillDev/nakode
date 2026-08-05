@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -49,6 +50,14 @@ pub struct SessionRecord {
     pub updated_at: i64,
     /// Additional provider-native resources owned by delegated runs beneath this session.
     pub owned_provider_sessions: Vec<(String, String)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionPurgeReport {
+    pub sessions: usize,
+    pub orchestration_runs: usize,
+    pub agent_turns: usize,
+    pub native_runtime_sessions: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,6 +218,15 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when the session is unknown or the transaction cannot be committed.
     fn delete(&self, id: &str) -> Result<(), SessionError>;
+    /// Deletes every logical session and every session-scoped persistence row.
+    ///
+    /// Unlike repeated single-session deletion, this also removes orphaned native runtime histories
+    /// left by dead or partially initialized sessions. Provider credentials, provider/model
+    /// preferences, and global add-on configuration are outside this boundary and remain untouched.
+    ///
+    /// # Errors
+    /// Returns an error when the atomic purge transaction cannot be committed.
+    fn purge_all(&self) -> Result<SessionPurgeReport, SessionError>;
     /// Updates the model associated with a session.
     ///
     /// # Errors
@@ -475,9 +493,11 @@ impl SqliteSessionRepository {
                 .iter()
                 .any(|existing| existing == column)
             {
-                orchestration_migration.push_str(&format!(
-                    "ALTER TABLE orchestration_runs ADD COLUMN {column} {definition};\n"
-                ));
+                writeln!(
+                    orchestration_migration,
+                    "ALTER TABLE orchestration_runs ADD COLUMN {column} {definition};"
+                )
+                .expect("writing to a String cannot fail");
             }
         }
         orchestration_migration.push_str("COMMIT;");
@@ -625,6 +645,20 @@ fn execute_batch_with_busy_retry(
         }
     }
     unreachable!("the final database initialization attempt always returns")
+}
+
+fn table_row_count(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+) -> Result<usize, SessionError> {
+    debug_assert!(matches!(
+        table,
+        "sessions" | "orchestration_runs" | "agent_turns" | "native_runtime_sessions"
+    ));
+    let count = transaction.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }
 
 fn is_database_busy(error: &rusqlite::Error) -> bool {
@@ -838,6 +872,27 @@ impl SessionRepository for SqliteSessionRepository {
             return Err(SessionError::SessionNotFound(id.to_owned()));
         }
         Ok(())
+    }
+
+    fn purge_all(&self) -> Result<SessionPurgeReport, SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let report = SessionPurgeReport {
+            sessions: table_row_count(&transaction, "sessions")?,
+            orchestration_runs: table_row_count(&transaction, "orchestration_runs")?,
+            agent_turns: table_row_count(&transaction, "agent_turns")?,
+            native_runtime_sessions: table_row_count(&transaction, "native_runtime_sessions")?,
+        };
+        // Runtime histories intentionally have no parent foreign key and may exist without a complete
+        // logical session. Clear the authoritative session-runtime table directly before cascading the
+        // logical session hierarchy.
+        transaction.execute("DELETE FROM native_runtime_sessions", [])?;
+        transaction.execute("DELETE FROM sessions", [])?;
+        transaction.commit()?;
+        Ok(report)
     }
 
     fn update_model(&self, id: &str, model: Option<&str>) -> Result<(), SessionError> {
@@ -1459,6 +1514,7 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential::{Credential, CredentialStore, SecretValue};
 
     #[test]
     fn terminal_image_mode_defaults_to_auto_and_persists() -> Result<(), SessionError> {
@@ -1911,6 +1967,159 @@ mod tests {
             .optional()?
             .is_some();
         assert!(!legacy_exists);
+        Ok(())
+    }
+
+    /// Seeds two logical sessions, a delegated run with one transcript turn, and two native runtime
+    /// histories: one owned by a live session and one orphaned by a partially initialized session.
+    fn seed_mixed_session_state(store: &SqliteSessionRepository) -> Result<(), SessionError> {
+        let first = store.create(
+            CODEX_PROVIDER,
+            "provider-first",
+            "/tmp/first",
+            "First",
+            None,
+        )?;
+        store.create(
+            DEVIN_PROVIDER,
+            "provider-second",
+            "/tmp/second",
+            "Second",
+            None,
+        )?;
+        store.save_subagent(&SubagentRecord {
+            parent_session_id: first.id,
+            id: "run-1".to_owned(),
+            agent: "explorer".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            model: None,
+            provider_session_id: Some("provider-child".to_owned()),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            objective: "Inspect".to_owned(),
+            status: SubagentStatus::Interrupted,
+            latest_activity: "stale".to_owned(),
+            transcript: vec![TranscriptEntry {
+                id: "turn-1".to_owned(),
+                key: None,
+                kind: EntryKind::Assistant,
+                title: "ASSISTANT".to_owned(),
+                body: "partial".to_owned(),
+                status: EntryStatus::Running,
+            }],
+        })?;
+        let connection = store.connection.lock().expect("database mutex");
+        for (provider, session_id) in [
+            (CODEX_PROVIDER, "provider-first"),
+            (DEVIN_PROVIDER, "orphaned-partial-session"),
+        ] {
+            connection.execute(
+                "INSERT INTO native_runtime_sessions
+                 (provider, session_id, session_json, updated_at)
+                 VALUES (?1, ?2, '{}', unixepoch())",
+                params![provider, session_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_purge_removes_all_session_state_and_preserves_global_configuration()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("purge.db");
+        let store = SqliteSessionRepository::open(&path)?;
+        let credentials =
+            crate::credential::SqliteCredentialStore::open(&path).expect("credential store");
+        credentials
+            .put(
+                CODEX_PROVIDER,
+                &Credential {
+                    kind: "oauth".to_owned(),
+                    secret: SecretValue::new(serde_json::json!({"access_token": "keep-me"})),
+                },
+            )
+            .expect("save credential");
+        store.set_provider_enabled(CODEX_PROVIDER, true)?;
+        store.set_default_model(CODEX_PROVIDER, "model-default")?;
+        store.save_web_config(&WebConfig {
+            backend: WebBackend::Firecrawl,
+            firecrawl_api_key: "keep-web-key".to_owned(),
+        })?;
+
+        seed_mixed_session_state(&store)?;
+
+        assert_eq!(
+            store.purge_all()?,
+            SessionPurgeReport {
+                sessions: 2,
+                orchestration_runs: 1,
+                agent_turns: 1,
+                native_runtime_sessions: 2,
+            }
+        );
+        assert!(store.list_recent("/tmp/first", 500)?.is_empty());
+        assert!(store.list_recent("/tmp/second", 500)?.is_empty());
+        assert_eq!(store.purge_all()?, SessionPurgeReport::default());
+
+        let kept_credential = credentials
+            .get(CODEX_PROVIDER)
+            .expect("load credential")
+            .expect("credential survives");
+        assert_eq!(kept_credential.secret.expose()["access_token"], "keep-me");
+        assert!(
+            store
+                .list_providers()?
+                .into_iter()
+                .find(|provider| provider.provider == CODEX_PROVIDER)
+                .expect("provider")
+                .enabled
+        );
+        assert_eq!(
+            store.load_web_config()?,
+            WebConfig {
+                backend: WebBackend::Firecrawl,
+                firecrawl_api_key: "keep-web-key".to_owned(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_bulk_purge_rolls_back_every_session_table() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("purge-failure.db"))?;
+        let session = store.create(
+            CODEX_PROVIDER,
+            "provider-session",
+            "/tmp/project",
+            "Keep on failure",
+            None,
+        )?;
+        {
+            let connection = store.connection.lock().expect("database mutex");
+            connection.execute_batch(
+                "INSERT INTO native_runtime_sessions
+                   (provider, session_id, session_json, updated_at)
+                 VALUES ('openai-codex', 'provider-session', '{}', unixepoch());
+                 CREATE TRIGGER refuse_session_purge BEFORE DELETE ON sessions
+                 BEGIN SELECT RAISE(FAIL, 'injected purge failure'); END;",
+            )?;
+        }
+
+        assert!(store.purge_all().is_err());
+        assert!(store.find(&session.id)?.is_some());
+        let connection = store.connection.lock().expect("database mutex");
+        let histories =
+            connection.query_row("SELECT COUNT(*) FROM native_runtime_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        assert_eq!(
+            histories, 1,
+            "the failed transaction restores runtime history"
+        );
         Ok(())
     }
 
