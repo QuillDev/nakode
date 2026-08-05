@@ -367,9 +367,12 @@ impl ServerCore {
     #[allow(clippy::too_many_lines)]
     fn try_execute_command(&mut self, command: Command) -> DomainCommandOutcome {
         match command {
-            Command::CreateSession { workspace_id, .. } => {
-                self.create_session_command(&workspace_id)
-            }
+            Command::CreateSession {
+                workspace_id,
+                model_id,
+                options,
+                ..
+            } => self.create_session_command(&workspace_id, model_id.as_ref(), &options),
             Command::OpenSession { session_id } => self.open_session_command(&session_id),
             Command::SendPrompt { session_id, prompt } => {
                 let enqueue = self
@@ -472,11 +475,30 @@ impl ServerCore {
         }
     }
 
-    fn create_session_command(&mut self, workspace_id: &WorkspaceId) -> DomainCommandOutcome {
+    fn create_session_command(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        model_id: Option<&nakode_protocol::ModelId>,
+        options: &nakode_protocol::ModelOptions,
+    ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
+        if model_id.is_none() && (options.reasoning_effort.is_some() || options.fast_mode) {
+            return Err(DomainCommandError::Invalid(
+                "initial model options require model_id".to_owned(),
+            ));
+        }
         let mut engine = ServiceEngine::new(self.session_template.clone());
-        let effects = engine.state_mut().create_logical_session()?;
+        let mut effects = engine.state_mut().create_logical_session()?;
         let session_id = SessionId::from(engine.state().nakode_session_id.clone());
+        if let Some(model_id) = model_id {
+            effects.extend(engine.state_mut().select_model_intent(
+                &ModelTarget::Session {
+                    session_id: session_id.clone(),
+                },
+                model_id,
+                options,
+            )?);
+        }
         self.sessions_by_id.insert(session_id.clone(), engine);
         Ok(Self::accepted(Some(session_id.to_string()), effects))
     }
@@ -1947,6 +1969,7 @@ fn session_metadata(view: &SessionView) -> SessionMetadataView {
         activity: view.activity,
         selected_provider_id: view.selected_provider_id.clone(),
         selected_model_id: view.selected_model_id.clone(),
+        selected_model_options: view.selected_model_options.clone(),
         active_agent_session: view.active_agent_session.clone(),
         active_turn: view.active_turn.clone(),
         context_usage: view.context_usage,
@@ -2275,7 +2298,7 @@ mod tests {
         ModelTarget, PromptAttachment as ProtocolPromptAttachment, PromptInput,
         ProviderAuthenticationView, ProviderId, Query, QueryResult, RunId, RunTextField,
         ServiceCapabilities, ServiceCapability, SessionId, SubscriptionScope, SubscriptionView,
-        TranscriptOwner, ViewEvent,
+        TranscriptOwner, ViewEvent, WorkspaceId,
     };
     use nakode_server::{PublishedEvent, ServerEndpoint, ServerRequest};
     use tokio::sync::broadcast;
@@ -2285,7 +2308,7 @@ mod tests {
         agent::{AgentCatalog, AgentDefinition},
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendIdentity, BackendOperation,
-            CODEX_PROVIDER, CapabilitySupport, ModelInfo, PromptImage,
+            CODEX_PROVIDER, CapabilitySupport, ModelCapabilities, ModelInfo, PromptImage,
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         service::ServiceEngine,
@@ -2331,6 +2354,13 @@ mod tests {
         )
     }
 
+    fn create_default_session(
+        core: &mut ServerCore,
+        workspace_id: &WorkspaceId,
+    ) -> super::DomainCommandOutcome {
+        core.create_session_command(workspace_id, None, &ModelOptions::default())
+    }
+
     fn shell_command(session_id: &SessionId, command: &str) -> Command {
         Command::RunShell {
             session_id: session_id.clone(),
@@ -2361,6 +2391,161 @@ mod tests {
         }
         chunks.reverse();
         chunks.concat()
+    }
+
+    #[test]
+    fn creating_a_session_applies_the_requested_model_atomically() {
+        let mut state =
+            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities {
+                    model_catalog: CapabilitySupport::Supported,
+                    session_model_config: CapabilitySupport::Supported,
+                    ..BackendCapabilities::default()
+                },
+            }),
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Models(vec![
+                ModelInfo {
+                    provider: CODEX_PROVIDER.to_owned(),
+                    id: "model-a".to_owned(),
+                    is_default: true,
+                    capabilities: ModelCapabilities {
+                        reasoning_efforts: vec!["high".to_owned()],
+                    },
+                },
+                ModelInfo {
+                    provider: CODEX_PROVIDER.to_owned(),
+                    id: "model-b".to_owned(),
+                    is_default: false,
+                    capabilities: ModelCapabilities {
+                        reasoning_efforts: vec!["high".to_owned()],
+                    },
+                },
+            ]),
+        );
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+
+        let (accepted, effects) = core
+            .create_session_command(
+                &workspace_id,
+                Some(&ModelId::from("openai-codex/model-b")),
+                &ModelOptions {
+                    reasoning_effort: Some("high".to_owned()),
+                    fast_mode: false,
+                },
+            )
+            .expect("configured logical session");
+        let session_id = SessionId::from(accepted.resource_id.expect("created session id"));
+        let created_state = core
+            .engine_for(&session_id)
+            .expect("created session runtime")
+            .state();
+        assert_eq!(
+            created_state.selected_model.as_deref(),
+            Some("openai-codex/model-b")
+        );
+        assert_eq!(
+            created_state
+                .selected_model_options()
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+        assert!(
+            effects.is_empty(),
+            "creation must not start a transient provider session"
+        );
+
+        core.session_template.selected_model = Some("openai-codex/model-a".to_owned());
+        core.open_session_command(&session_id)
+            .expect("existing logical session resumes");
+        let resumed_state = core
+            .engine_for(&session_id)
+            .expect("resumed session runtime")
+            .state();
+        assert_eq!(
+            resumed_state.selected_model.as_deref(),
+            Some("openai-codex/model-b"),
+            "current defaults must not replace persisted session configuration on resume"
+        );
+        assert_eq!(
+            resumed_state
+                .selected_model_options()
+                .reasoning_effort
+                .as_deref(),
+            Some("high"),
+            "resume must preserve the persisted effort"
+        );
+    }
+
+    #[test]
+    fn invalid_initial_model_options_do_not_publish_a_session() {
+        let (mut core, _) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let session_count = core.sessions_by_id.len();
+
+        let error = core
+            .create_session_command(
+                &workspace_id,
+                Some(&ModelId::from("openai-codex/removed-model")),
+                &ModelOptions {
+                    reasoning_effort: Some("impossible".to_owned()),
+                    fast_mode: false,
+                },
+            )
+            .expect_err("stale initial model must be rejected");
+
+        let message = error.to_string();
+        assert!(message.contains("removed-model"), "{message}");
+        assert_eq!(core.sessions_by_id.len(), session_count);
+    }
+
+    #[test]
+    fn initial_options_without_a_model_are_rejected_without_publishing_a_session() {
+        let (mut core, _) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let session_count = core.sessions_by_id.len();
+
+        let error = core
+            .create_session_command(
+                &workspace_id,
+                None,
+                &ModelOptions {
+                    reasoning_effort: Some("high".to_owned()),
+                    fast_mode: false,
+                },
+            )
+            .expect_err("orphan initial options must be rejected");
+
+        assert!(error.to_string().contains("require model_id"));
+        assert_eq!(core.sessions_by_id.len(), session_count);
+    }
+
+    #[test]
+    fn creating_a_session_without_a_selection_keeps_the_server_default() {
+        let (mut core, _) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+
+        let (accepted, _) = core
+            .create_session_command(&workspace_id, None, &ModelOptions::default())
+            .expect("default logical session");
+        let session_id = SessionId::from(accepted.resource_id.expect("created session id"));
+        assert_eq!(
+            core.engine_for(&session_id)
+                .expect("created session runtime")
+                .state()
+                .selected_model,
+            None
+        );
     }
 
     #[test]
@@ -2643,9 +2828,8 @@ first_message = "Starting review"
         let workspace_id = crate::state::projection::workspace_id(&state.workspace);
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
 
-        let (accepted, _) = core
-            .create_session_command(&workspace_id)
-            .expect("create second session");
+        let (accepted, _) =
+            create_default_session(&mut core, &workspace_id).expect("create second session");
         let second_id = SessionId::from(
             accepted
                 .resource_id
@@ -2702,9 +2886,8 @@ first_message = "Starting review"
         let first_id = SessionId::from(state.nakode_session_id.clone());
         let workspace_id = crate::state::projection::workspace_id(&state.workspace);
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
-        let (created, _) = core
-            .create_session_command(&workspace_id)
-            .expect("create second session");
+        let (created, _) =
+            create_default_session(&mut core, &workspace_id).expect("create second session");
         let second_id = SessionId::from(created.resource_id.expect("created session has an id"));
         let (endpoint, _requests) =
             ServerEndpoint::channel("test", ServiceCapabilities::default(), 16);
@@ -2743,9 +2926,8 @@ first_message = "Starting review"
         let first_id = SessionId::from(state.nakode_session_id.clone());
         let workspace_id = crate::state::projection::workspace_id(&state.workspace);
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
-        let (created, _) = core
-            .create_session_command(&workspace_id)
-            .expect("create second session");
+        let (created, _) =
+            create_default_session(&mut core, &workspace_id).expect("create second session");
         let second_id = SessionId::from(created.resource_id.expect("created session has an id"));
         let (endpoint, _requests) =
             ServerEndpoint::channel("test", ServiceCapabilities::default(), 16);
@@ -2785,9 +2967,8 @@ first_message = "Starting review"
         let state = AppState::new_unconfigured("/tmp/project", None, 100);
         let workspace_id = crate::state::projection::workspace_id(&state.workspace);
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
-        let (created, _) = core
-            .create_session_command(&workspace_id)
-            .expect("create second session");
+        let (created, _) =
+            create_default_session(&mut core, &workspace_id).expect("create second session");
         let second_id = SessionId::from(
             created
                 .resource_id
@@ -3017,9 +3198,8 @@ first_message = "Starting review"
         let first_id = SessionId::from(state.nakode_session_id.clone());
         let workspace_id = crate::state::projection::workspace_id(&state.workspace);
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
-        let (created, _) = core
-            .create_session_command(&workspace_id)
-            .expect("create second session");
+        let (created, _) =
+            create_default_session(&mut core, &workspace_id).expect("create second session");
         let second_id = SessionId::from(created.resource_id.expect("second session id"));
         let state = core
             .engine_for_mut(&second_id)
@@ -3110,9 +3290,8 @@ first_message = "Starting review"
         let first_id = SessionId::from(state.nakode_session_id.clone());
         let workspace_id = crate::state::projection::workspace_id(&state.workspace);
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
-        let (created, _) = core
-            .create_session_command(&workspace_id)
-            .expect("create second session");
+        let (created, _) =
+            create_default_session(&mut core, &workspace_id).expect("create second session");
         let second_id = SessionId::from(
             created
                 .resource_id
@@ -3906,9 +4085,8 @@ first_message = "Starting review"
     fn workspace_reload_effect_targets_the_selected_session() {
         let (mut core, default_session_id) = ready_codex_server();
         let workspace_id = crate::state::projection::workspace_id(&core.engine().state().workspace);
-        let (created, _) = core
-            .create_session_command(&workspace_id)
-            .expect("create selected session");
+        let (created, _) =
+            create_default_session(&mut core, &workspace_id).expect("create selected session");
         let selected_session_id = SessionId::from(created.resource_id.expect("created session id"));
         assert_ne!(selected_session_id, default_session_id);
         core.engine_for_mut(&selected_session_id)
@@ -3951,9 +4129,8 @@ first_message = "Starting review"
         let first_id = SessionId::from(state.nakode_session_id.clone());
         let workspace_id = crate::state::projection::workspace_id(&state.workspace);
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
-        let (created, _) = core
-            .create_session_command(&workspace_id)
-            .expect("create second session");
+        let (created, _) =
+            create_default_session(&mut core, &workspace_id).expect("create second session");
         let second_id = SessionId::from(
             created
                 .resource_id

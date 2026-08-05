@@ -160,6 +160,13 @@ frontend code only calls distinct product methods and renders their state.
 Generated transport stubs are the base layer; supported language SDKs add this
 shared behavior without inventing client-side domain policy.
 
+`CreateSession` applies an optional initial model and its options atomically
+before the logical session is published. An omitted model keeps the server's
+workspace/provider default, options without a model are invalid, and clients
+must not emulate initial selection with create-then-select. The effective
+session-scoped options are projected on `SessionView`/`SessionState`; clients
+must not reconstruct them from a catalogue model's workspace defaults.
+
 Client-owned tools use the session-scoped public external-tool contract. The
 server owns pending calls and turn suspension; clients only execute a call and
 submit its result.

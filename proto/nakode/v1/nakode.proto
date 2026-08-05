@@ -77,7 +77,20 @@ message WatchWorkspaceRequest { string workspace_id = 1; optional Cursor after =
 message ReloadWorkspaceRequest { MutationOptions mutation = 1; string workspace_id = 2; string session_id = 3; }
 message WorkspaceSnapshot { Cursor cursor = 1; WorkspaceState state = 2; }
 
-message CreateSessionRequest { MutationOptions mutation = 1; string workspace_id = 2; optional string title = 3; }
+// A fresh session may carry its provider-qualified model and options in the creation mutation. This
+// prevents clients from exposing or sending a first turn through a transient server default. Omitted
+// selection means the workspace/provider default. OpenSession never takes these fields: resume keeps
+// the persisted session configuration.
+message CreateSessionRequest {
+  MutationOptions mutation = 1;
+  string workspace_id = 2;
+  optional string title = 3;
+  // Atomically validated and applied before the logical session is published.
+  // Requires the `InitialSessionModel` service capability when set.
+  optional string model_id = 4;
+  // Invalid without model_id; omission uses that model's own default options.
+  ModelOptions options = 5;
+}
 message OpenSessionRequest { MutationOptions mutation = 1; string session_id = 2; }
 message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // Removes a logical session and its persisted history. Rejected while the session
@@ -268,6 +281,8 @@ message SessionState {
   bool runs_has_earlier = 19;
   repeated Notice notices = 20;
   repeated ExternalToolCall external_tool_calls = 21;
+  // Effective model options for this logical session, including a session-local override.
+  ModelOptions selected_model_options = 22;
 }
 message ExternalToolCall { string id = 1; string name = 2; string arguments_json = 3; }
 

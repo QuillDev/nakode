@@ -138,6 +138,9 @@ pub enum Command {
     CreateSession {
         workspace_id: WorkspaceId,
         title: Option<String>,
+        /// A provider-qualified initial selection. `None` inherits the workspace/provider default.
+        model_id: Option<ModelId>,
+        options: ModelOptions,
     },
     OpenSession {
         session_id: SessionId,
@@ -322,11 +325,33 @@ mod tests {
     use super::{
         Command, ModelOptions, ModelTarget, PromptAttachment, Query, RunTextField, TranscriptOwner,
     };
-    use crate::{ArtifactId, EntryId, ModelId, RunId, SessionId};
+    use crate::{ArtifactId, EntryId, ModelId, RunId, SessionId, WorkspaceId};
 
     #[test]
     fn logical_session_policy_commands_have_stable_wire_shapes() {
         let session_id = SessionId::from("session-1");
+        let creation = Command::CreateSession {
+            workspace_id: WorkspaceId::from("workspace-1"),
+            title: Some("Dashboard assistant".to_owned()),
+            model_id: Some(ModelId::from("anthropic/claude-opus-5")),
+            options: ModelOptions {
+                reasoning_effort: Some("high".to_owned()),
+                fast_mode: false,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(creation).expect("serialize configured session creation"),
+            json!({
+                "type": "create_session",
+                "workspace_id": "workspace-1",
+                "title": "Dashboard assistant",
+                "model_id": "anthropic/claude-opus-5",
+                "options": {
+                    "reasoning_effort": "high",
+                    "fast_mode": false
+                }
+            }),
+        );
         let selection = Command::SelectModel {
             target: ModelTarget::Session {
                 session_id: session_id.clone(),

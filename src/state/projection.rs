@@ -6,14 +6,14 @@ use nakode_protocol::{
     InteractionId, InteractionKind, InteractionOptionView, InteractionStatus, InteractionView,
     MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_SESSION_RUNS, MAX_SESSION_RUNS_BYTES,
     MAX_TRANSCRIPT_ENTRY_BODY_BYTES, MAX_TRANSCRIPT_PAGE_BODY_BYTES, MAX_TRANSCRIPT_PAGE_ENTRIES,
-    MemorySettingsView, ModelConfigurationView, ModelId, ModelView, NoticeLevel, NoticeView,
-    PromptAttachment as ProtocolPromptAttachment, PromptId, ProviderAuthenticationView,
-    ProviderCapabilities, ProviderCapability, ProviderId, ProviderView, QueueItemView,
-    RecoverablePromptView, RunId, RunOutcome, RunPage, RunStatus, RunTextField, RunTextWindow,
-    RunView, SessionActivity, SessionId, SessionSummary, SessionView, SettingsView, SkillView,
-    TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TranscriptBodyWindow,
-    TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TurnId,
-    TurnStatus, TurnView, VisionSettingsView, WebSettingsView, WorkspaceId,
+    MemorySettingsView, ModelConfigurationView, ModelId, ModelOptions as ProtocolModelOptions,
+    ModelView, NoticeLevel, NoticeView, PromptAttachment as ProtocolPromptAttachment, PromptId,
+    ProviderAuthenticationView, ProviderCapabilities, ProviderCapability, ProviderId, ProviderView,
+    QueueItemView, RecoverablePromptView, RunId, RunOutcome, RunPage, RunStatus, RunTextField,
+    RunTextWindow, RunView, SessionActivity, SessionId, SessionSummary, SessionView, SettingsView,
+    SkillView, TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView,
+    TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView,
+    TranscriptPage, TurnId, TurnStatus, TurnView, VisionSettingsView, WebSettingsView, WorkspaceId,
 };
 
 use super::{
@@ -162,6 +162,7 @@ fn session_view(
     let active_turn = turn_view(state, &session_id, agent_session.as_ref());
     let (runs, runs_has_earlier) = run_views(state);
 
+    let selected_options = state.selected_model_options();
     SessionView {
         id: session_id.clone(),
         revision,
@@ -172,6 +173,10 @@ fn session_view(
         activity: activity(state),
         selected_provider_id: provider,
         selected_model_id: state.selected_model.clone().map(ModelId::from),
+        selected_model_options: ProtocolModelOptions {
+            reasoning_effort: selected_options.reasoning_effort,
+            fast_mode: selected_options.fast_mode,
+        },
         active_agent_session: agent_session,
         active_turn,
         context_usage: context_usage_view(state),

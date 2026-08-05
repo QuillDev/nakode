@@ -14,6 +14,8 @@ pub enum ServiceCapability {
     MultipleClients,
     ArtifactTransfer,
     ExternalTools,
+    /// `CreateSession` can validate and apply an initial model/options before publication.
+    InitialSessionModel,
     /// `DeleteSession` is served: a logical session and its persisted history can be removed.
     ///
     /// Declared rather than assumed so a client can degrade its own affordance instead of offering a
