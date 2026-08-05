@@ -254,7 +254,6 @@ async fn codex_client_resumes_history_and_unsubscribes() -> TestResult {
         .commands
         .send(BackendCommand::UnsubscribeSession {
             provider_session_id: "thread-fixture".to_owned(),
-            owner_session_id: None,
         })
         .await?;
     assert!(matches!(

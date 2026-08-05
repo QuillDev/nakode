@@ -10391,10 +10391,10 @@ reasoning_effort = "unsupported"
             "'/opt/nakode/bin/nakode' agent explorer --session-id={}",
             state.nakode_session_id
         )));
-        assert!(instructions.contains("execute the matching absolute-path command exactly"));
+        assert!(instructions.contains("execute the matching absolute-path Nakode command exactly"));
         assert!(instructions.contains("Up to 4 subagents may run concurrently"));
-        assert!(instructions.contains("launch one command per task concurrently"));
-        assert!(instructions.contains("do not use provider-native subagent"));
+        assert!(instructions.contains("launch one Nakode delegation per task concurrently"));
+        assert!(instructions.contains("Do not use provider-native subagent"));
         assert!(instructions.ends_with("[/Nakode System Instructions]"));
     }
 
