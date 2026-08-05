@@ -827,6 +827,16 @@ mod tests {
     }
 
     #[test]
+    fn claude_uses_auto_as_the_filtered_default_and_an_attributed_validator() {
+        assert!(BRIDGE_SOURCE.contains("filterEscalatingDefaultMode"));
+        assert!(BRIDGE_SOURCE.contains("defaultMode || \"auto\""));
+        assert!(BRIDGE_SOURCE.contains("NAKODE_SECURITY_VALIDATOR_AGENT"));
+        assert!(BRIDGE_SOURCE.contains("SecurityValidation"));
+        assert!(BRIDGE_SOURCE.contains("validated: false"));
+        assert!(BRIDGE_SOURCE.contains("Recursive security validation was prevented"));
+    }
+
+    #[test]
     fn claude_session_options_are_forwarded_to_the_bridge() {
         let request = bridge_request(BackendCommand::SetSessionOptions {
             provider_session_id: "claude-session".to_owned(),
