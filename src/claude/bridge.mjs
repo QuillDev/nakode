@@ -7,12 +7,6 @@ const runs = new Map();
 const approvals = new Map();
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
-const MODELS = [
-  { id: "sonnet", isDefault: true },
-  { id: "opus", isDefault: false },
-  { id: "haiku", isDefault: false },
-];
-
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -177,11 +171,57 @@ async function sendTurn(command) {
   }
 }
 
+async function modelCatalogue(command) {
+  let releasePrompt;
+  const waiting = new Promise((resolve) => {
+    releasePrompt = resolve;
+  });
+  const prompt = (async function* idlePrompt() {
+    await waiting;
+  })();
+  const stream = query({
+    prompt,
+    options: {
+      cwd: command.workspace,
+      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE || "claude",
+      persistSession: false,
+      systemPrompt: "Report the installed model catalogue.",
+      allowedTools: [],
+      settingSources: ["user", "project", "local"],
+    },
+  });
+  const drained = (async () => {
+    try {
+      for await (const _ of stream) {
+        // The control channel carries the catalogue. Conversation output is discarded.
+      }
+    } catch {
+      // The intentional interrupt below closes this disposable query.
+    }
+  })();
+  try {
+    const models = await stream.supportedModels();
+    write({
+      event: "models",
+      requestId: command.requestId,
+      models: models.map((model, index) => ({
+        id: model.value,
+        isDefault: index === 0,
+        supportedEffortLevels: model.supportedEffortLevels || [],
+      })),
+    });
+  } finally {
+    releasePrompt();
+    await stream.interrupt().catch(() => undefined);
+    await drained;
+  }
+}
+
 async function handle(command) {
   switch (command.method) {
     case "models":
     case "reload":
-      write({ event: "models", requestId: command.requestId, models: MODELS });
+      await modelCatalogue(command);
       break;
     case "create":
       createSession(command, false);

@@ -235,6 +235,10 @@ approvals, structured output, and subagents.
 - Treat `/models` as a durable provider-default selection and `/switch` as a
   current-session override. Session-only choices must reset to the persisted
   default when a new session begins.
+- A session model or effort change made while provider work is in flight applies
+  to the next turn. Persist the logical override immediately, but do not address
+  native session state that an active turn or compaction has temporarily taken
+  out of its adapter's idle-session map.
 
 Nakode-launched sessions run unattended by default. In-process sessions use
 the shared runtime's explicit permission and cancellation policy. Optional

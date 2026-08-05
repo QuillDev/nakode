@@ -777,6 +777,7 @@ async fn discover_models(
                 provider: DEVIN_PROVIDER.to_owned(),
                 is_default: default_id == Some(config.model_uid.as_str()),
                 id: config.model_uid,
+                capabilities: crate::backend::ModelCapabilities::default(),
             },
         })
         .collect())

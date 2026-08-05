@@ -3546,11 +3546,13 @@ first_message = "Starting review"
                     provider: CODEX_PROVIDER.to_owned(),
                     id: "model-a".to_owned(),
                     is_default: true,
+                    capabilities: crate::codex::model_capabilities(),
                 },
                 ModelInfo {
                     provider: CODEX_PROVIDER.to_owned(),
                     id: "model-b".to_owned(),
                     is_default: false,
+                    capabilities: crate::codex::model_capabilities(),
                 },
             ]),
         );
@@ -3634,11 +3636,13 @@ first_message = "Starting review"
                     provider: CODEX_PROVIDER.to_owned(),
                     id: "model-a".to_owned(),
                     is_default: true,
+                    capabilities: crate::codex::model_capabilities(),
                 },
                 ModelInfo {
                     provider: CODEX_PROVIDER.to_owned(),
                     id: "model-b".to_owned(),
                     is_default: false,
+                    capabilities: crate::codex::model_capabilities(),
                 },
             ]),
         );

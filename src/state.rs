@@ -37,19 +37,9 @@ use crate::{
 
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 
-fn supports_model_options(provider: &str) -> bool {
-    matches!(provider, CODEX_PROVIDER | CURSOR_PROVIDER)
-}
-
 fn model_supports_options(model: &ModelInfo) -> bool {
-    if model.provider == CODEX_PROVIDER {
-        return true;
-    }
-    if model.provider != CURSOR_PROVIDER {
-        return false;
-    }
-    let id = model.id.to_ascii_lowercase();
-    id.starts_with("composer-") || id.starts_with("grok-4.5")
+    let configuration = projection::model_configuration(model);
+    configuration.fast_mode_configurable || !configuration.reasoning_efforts.is_empty()
 }
 
 #[cfg(test)]
@@ -1816,6 +1806,7 @@ impl DomainState {
                 provider: provider.to_owned(),
                 id: id.to_owned(),
                 is_default: false,
+                capabilities: crate::backend::ModelCapabilities::default(),
             }));
         }
         let selected = items
@@ -3668,6 +3659,7 @@ impl DomainState {
             .backend_capabilities
             .session_model_config
             .is_supported()
+            && self.native_session_accepts_model_mutation()
             && let Some(provider_session_id) = self.provider_session_id.clone()
         {
             effects.push(Effect::Backend(BackendCommand::SetSessionModel {
@@ -3675,6 +3667,10 @@ impl DomainState {
                 model: selected.id.clone(),
             }));
         } else if let Some(session_id) = self.session_id.clone() {
+            // Native adapters temporarily move a session out of their idle-session map while a turn
+            // or compaction owns it. The selected model is already attached to every future
+            // StartTurn, so persist the logical override now instead of addressing a native session
+            // that cannot accept an out-of-band model mutation until its work completes.
             effects.push(Effect::UpdateSessionModel {
                 session_id,
                 model: Some(qualified),
@@ -3689,6 +3685,14 @@ impl DomainState {
             }));
         }
         Ok(effects)
+    }
+
+    /// A native session is temporarily owned by its turn/compaction task while work is in flight.
+    /// Adapters cannot address it through their idle-session map until that task returns it.
+    fn native_session_accepts_model_mutation(&self) -> bool {
+        self.starting_turn.is_none()
+            && self.active_turn.is_none()
+            && self.context_compaction.is_none()
     }
 
     fn apply_vision_model_selection(&mut self, selected: &ModelInfo) -> Vec<Effect> {
@@ -4126,22 +4130,52 @@ impl DomainState {
             .unwrap_or_else(|| self.default_model_options.clone())
     }
 
-    #[cfg(test)]
     fn model_options_for(&self, model: &ModelInfo) -> ModelOptions {
-        self.model_options_for_qualified(&model.qualified_id())
+        let mut options = self.model_options_for_qualified(&model.qualified_id());
+        let configuration = projection::model_configuration(model);
+        if options.reasoning_effort.as_ref().is_some_and(|effort| {
+            !configuration
+                .reasoning_efforts
+                .iter()
+                .any(|candidate| candidate == effort)
+        }) {
+            options.reasoning_effort = None;
+        }
+        if !configuration.fast_mode_configurable {
+            options.fast_mode = false;
+        }
+        options
     }
 
     fn selected_model_options(&self) -> ModelOptions {
-        if let Some(selected) = self.selected_model.as_deref()
+        let selected = self.selected_model.as_deref();
+        let model = selected.and_then(|selected| {
+            self.models
+                .iter()
+                .find(|model| model.qualified_id() == selected)
+        });
+        if let Some(selected) = selected
             && let Some((override_model, options)) = &self.session_model_options_override
             && override_model == selected
         {
-            return options.clone();
+            let mut options = options.clone();
+            if let Some(model) = model {
+                let configuration = projection::model_configuration(model);
+                if options.reasoning_effort.as_ref().is_some_and(|effort| {
+                    !configuration
+                        .reasoning_efforts
+                        .iter()
+                        .any(|candidate| candidate == effort)
+                }) {
+                    options.reasoning_effort = None;
+                }
+                if !configuration.fast_mode_configurable {
+                    options.fast_mode = false;
+                }
+            }
+            return options;
         }
-        self.selected_model.as_ref().map_or_else(
-            || self.default_model_options.clone(),
-            |selected| self.model_options_for_qualified(selected),
-        )
+        model.map_or_else(ModelOptions::default, |model| self.model_options_for(model))
     }
 
     #[cfg(test)]
@@ -4385,6 +4419,7 @@ impl DomainState {
                 .backend_capabilities
                 .session_model_config
                 .is_supported()
+                && self.native_session_accepts_model_mutation()
                 && let Some(session_id) = self.provider_session_id.clone()
             {
                 effects.push(Effect::Backend(BackendCommand::SetSessionModel {
@@ -5214,7 +5249,16 @@ impl DomainState {
             title: prompt.text.clone(),
             model: self.selected_model.clone(),
         }];
-        if supports_model_options(&self.backend_provider) {
+        if self
+            .selected_model
+            .as_deref()
+            .and_then(|selected| {
+                self.models
+                    .iter()
+                    .find(|model| model.qualified_id() == selected)
+            })
+            .is_some_and(model_supports_options)
+        {
             effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
                 provider_session_id: provider_session_id.clone(),
                 options: self.selected_model_options(),
@@ -5254,7 +5298,16 @@ impl DomainState {
             Effect::TouchSession(session.id.clone()),
             Effect::LoadSubagents(session.id),
         ];
-        if self.backend_provider == CURSOR_PROVIDER {
+        if self
+            .selected_model
+            .as_deref()
+            .and_then(|selected| {
+                self.models
+                    .iter()
+                    .find(|model| model.qualified_id() == selected)
+            })
+            .is_some_and(model_supports_options)
+        {
             effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
                 provider_session_id: provider_session_id_for_options,
                 options: self.selected_model_options(),
@@ -7141,10 +7194,11 @@ mod tests {
         agent::AgentCatalog,
         backend::{
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
-            BackendIdentity, BackendOperation, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport,
-            CompactionReason, DEVIN_PROVIDER, DeltaKind, ItemKind, ItemStatus, ModelInfo,
-            ModelOptions, NormalizedItem, PromptAttachment, PromptImage, QuestionOption,
-            QuestionRequest, SessionHistoryItem, TodoItem, TodoPhase, TodoStatus, TurnOutcome,
+            BackendIdentity, BackendOperation, CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER,
+            CapabilitySupport, CompactionReason, DEVIN_PROVIDER, DeltaKind, ItemKind, ItemStatus,
+            ModelCapabilities, ModelInfo, ModelOptions, NormalizedItem, PromptAttachment,
+            PromptImage, QuestionOption, QuestionRequest, SessionHistoryItem, TodoItem, TodoPhase,
+            TodoStatus, TurnOutcome,
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         personality::PromptAddenda,
@@ -7240,6 +7294,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-a".to_owned(),
             is_default: true,
+            capabilities: crate::codex::model_capabilities(),
         }]));
         state
     }
@@ -7355,6 +7410,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CURSOR_PROVIDER.to_owned(),
             id: "composer-2.5".to_owned(),
             is_default: true,
+            capabilities: crate::backend::ModelCapabilities::default(),
         });
         state.open_agent_picker();
         state.edit_selected_agent();
@@ -7744,11 +7800,13 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 provider: DEVIN_PROVIDER.to_owned(),
                 id: "model-a".to_owned(),
                 is_default: true,
+                capabilities: crate::backend::ModelCapabilities::default(),
             },
             ModelInfo {
                 provider: DEVIN_PROVIDER.to_owned(),
                 id: "model-b".to_owned(),
                 is_default: false,
+                capabilities: crate::backend::ModelCapabilities::default(),
             },
         ]));
         let session_id = nakode_protocol::SessionId::from(state.nakode_session_id.clone());
@@ -7911,6 +7969,123 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             [
                 Effect::PersistSession { .. },
                 Effect::Backend(BackendCommand::SetSessionOptions { .. }),
+                Effect::Backend(BackendCommand::StartTurn { .. })
+            ]
+        ));
+    }
+
+    #[test]
+    fn claude_session_creation_applies_supported_catalogue_effort() {
+        let mut state = ready_state();
+        state.backend_provider = CLAUDE_PROVIDER.to_owned();
+        state.models = vec![ModelInfo {
+            provider: CLAUDE_PROVIDER.to_owned(),
+            id: "opus".to_owned(),
+            is_default: true,
+            capabilities: ModelCapabilities {
+                reasoning_efforts: ["low", "medium", "high"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
+        }];
+        state.selected_model = Some(format!("{CLAUDE_PROVIDER}/opus"));
+        state.install_model_options(
+            CLAUDE_PROVIDER,
+            "opus",
+            ModelOptions {
+                reasoning_effort: Some("high".to_owned()),
+                fast_mode: false,
+            },
+        );
+        state.client.editor.set_text("first");
+        state.submit_editor();
+
+        let effects = state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "claude-session".to_owned(),
+            model: "opus".to_owned(),
+        });
+
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::PersistSession { .. },
+                Effect::Backend(BackendCommand::SetSessionOptions { options, .. }),
+                Effect::Backend(BackendCommand::StartTurn { .. })
+            ] if options.reasoning_effort.as_deref() == Some("high") && !options.fast_mode
+        ));
+    }
+
+    #[test]
+    fn stale_claude_effort_is_cleared_before_session_creation() {
+        let mut state = ready_state();
+        state.backend_provider = CLAUDE_PROVIDER.to_owned();
+        state.models = vec![ModelInfo {
+            provider: CLAUDE_PROVIDER.to_owned(),
+            id: "haiku".to_owned(),
+            is_default: true,
+            capabilities: ModelCapabilities {
+                reasoning_efforts: vec!["low".to_owned()],
+            },
+        }];
+        state.selected_model = Some(format!("{CLAUDE_PROVIDER}/haiku"));
+        state.install_model_options(
+            CLAUDE_PROVIDER,
+            "haiku",
+            ModelOptions {
+                reasoning_effort: Some("high".to_owned()),
+                fast_mode: true,
+            },
+        );
+        state.client.editor.set_text("first");
+        state.submit_editor();
+
+        let effects = state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "claude-session".to_owned(),
+            model: "haiku".to_owned(),
+        });
+
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::PersistSession { .. },
+                Effect::Backend(BackendCommand::SetSessionOptions { options, .. }),
+                Effect::Backend(BackendCommand::StartTurn { .. })
+            ] if options.reasoning_effort.is_none() && !options.fast_mode
+        ));
+    }
+
+    #[test]
+    fn a_model_without_configurable_options_omits_session_options() {
+        let mut state = ready_state();
+        state.backend_provider = CLAUDE_PROVIDER.to_owned();
+        state.models = vec![ModelInfo {
+            provider: CLAUDE_PROVIDER.to_owned(),
+            id: "haiku".to_owned(),
+            is_default: true,
+            capabilities: ModelCapabilities::default(),
+        }];
+        state.selected_model = Some(format!("{CLAUDE_PROVIDER}/haiku"));
+        state.install_model_options(
+            CLAUDE_PROVIDER,
+            "haiku",
+            ModelOptions {
+                reasoning_effort: Some("high".to_owned()),
+                fast_mode: true,
+            },
+        );
+        state.client.editor.set_text("first");
+        state.submit_editor();
+
+        let effects = state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "claude-session".to_owned(),
+            model: "haiku".to_owned(),
+        });
+
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::PersistSession { .. },
                 Effect::Backend(BackendCommand::StartTurn { .. })
             ]
         ));
@@ -8736,6 +8911,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "gpt-test".to_owned(),
             is_default: true,
+            capabilities: crate::codex::model_capabilities(),
         }]);
 
         state.provider_logged_out(CODEX_PROVIDER);
@@ -8881,6 +9057,14 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     #[test]
     fn resumed_session_rebuilds_transcript_and_touches_metadata() {
         let mut state = ready_state();
+        state.install_model_options(
+            CODEX_PROVIDER,
+            "model-a",
+            ModelOptions {
+                reasoning_effort: Some("unsupported".to_owned()),
+                fast_mode: true,
+            },
+        );
         let session = SessionRecord {
             id: "01950000-0000-7000-8000-000000000000".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -8913,8 +9097,14 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
 
         assert!(matches!(
             effects.as_slice(),
-            [Effect::TouchSession(touched), Effect::LoadSubagents(loaded)]
-                if touched == &session.id && loaded == &session.id
+            [
+                Effect::TouchSession(touched),
+                Effect::LoadSubagents(loaded),
+                Effect::Backend(BackendCommand::SetSessionOptions { options, .. })
+            ] if touched == &session.id
+                && loaded == &session.id
+                && options.reasoning_effort.is_none()
+                && options.fast_mode
         ));
         assert_eq!(state.session_id.as_deref(), Some(session.id.as_str()));
         assert_eq!(state.provider_session_id.as_deref(), Some("thread-resumed"));
@@ -8987,6 +9177,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "vision-model".to_owned(),
             is_default: false,
+            capabilities: crate::codex::model_capabilities(),
         });
         let session_model = state.selected_model.clone();
 
@@ -9007,6 +9198,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-b".to_owned(),
             is_default: false,
+            capabilities: crate::codex::model_capabilities(),
         });
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
@@ -9038,6 +9230,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-b".to_owned(),
             is_default: false,
+            capabilities: crate::codex::model_capabilities(),
         });
         state.client.editor.set_text("/models");
 
@@ -9092,6 +9285,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CURSOR_PROVIDER.to_owned(),
             id: id.to_owned(),
             is_default: false,
+            capabilities: crate::backend::ModelCapabilities::default(),
         };
 
         assert!(model_supports_options(&cursor_model("composer-2.5")));
@@ -9108,6 +9302,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CURSOR_PROVIDER.to_owned(),
             id: "composer-2.5".to_owned(),
             is_default: true,
+            capabilities: crate::backend::ModelCapabilities::default(),
         }];
         state.selected_model = Some("cursor-sdk/composer-2.5".to_owned());
         state.client.editor.set_text("/models");
@@ -9148,6 +9343,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CURSOR_PROVIDER.to_owned(),
             id: "composer-2.5".to_owned(),
             is_default: true,
+            capabilities: crate::backend::ModelCapabilities::default(),
         }];
         state.selected_model = Some("cursor-sdk/composer-2.5".to_owned());
         state.provider_session_id = Some("cursor-session-1".to_owned());
@@ -9187,6 +9383,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-b".to_owned(),
             is_default: false,
+            capabilities: crate::codex::model_capabilities(),
         });
         state.install_model_options(
             CODEX_PROVIDER,
@@ -9215,12 +9412,82 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    fn model_changes_during_native_work_are_persisted_for_the_next_turn() {
+        for report_turn_started in [false, true] {
+            let mut state = ready_state();
+            state.models.push(ModelInfo {
+                provider: CODEX_PROVIDER.to_owned(),
+                id: "model-b".to_owned(),
+                is_default: false,
+                capabilities: crate::codex::model_capabilities(),
+            });
+            state.backend_capabilities.session_model_config = CapabilitySupport::Supported;
+            state.handle_backend(BackendEvent::SessionCreated {
+                provider_session_id: "thread-1".to_owned(),
+                model: "model-a".to_owned(),
+            });
+            let logical_session_id = state.nakode_session_id.clone();
+            state.session_id = Some(logical_session_id.clone());
+
+            let turn_effects = state
+                .submit_prompt("work".to_owned(), Vec::new())
+                .expect("turn accepted");
+            let client_id = turn_effects
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::Backend(BackendCommand::StartTurn { client_id, .. }) => {
+                        Some(client_id.clone())
+                    }
+                    _ => None,
+                })
+                .expect("native turn starts");
+            if report_turn_started {
+                state.handle_backend(BackendEvent::TurnStarted { turn_id: client_id });
+            }
+
+            let effects = state
+                .select_model_intent(
+                    &nakode_protocol::ModelTarget::Session {
+                        session_id: logical_session_id.into(),
+                    },
+                    &nakode_protocol::ModelId::from("openai-codex/model-b"),
+                    &nakode_protocol::ModelOptions {
+                        reasoning_effort: Some("high".to_owned()),
+                        fast_mode: false,
+                    },
+                )
+                .expect("next-turn model selection");
+
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                Effect::UpdateSessionModel { session_id, model }
+                    if session_id == &state.nakode_session_id
+                        && model.as_deref() == Some("openai-codex/model-b")
+            )));
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Backend(BackendCommand::SetSessionOptions { options, .. })
+                    if options.reasoning_effort.as_deref() == Some("high")
+            )));
+            assert!(!effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Backend(BackendCommand::SetSessionModel { .. })
+            )));
+            assert_eq!(
+                state.selected_model.as_deref(),
+                Some("openai-codex/model-b")
+            );
+        }
+    }
+
+    #[test]
     fn switch_command_applies_only_to_the_current_session() {
         let mut state = ready_state();
         state.models.push(ModelInfo {
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-b".to_owned(),
             is_default: false,
+            capabilities: crate::codex::model_capabilities(),
         });
         state.backend_capabilities.session_model_config = CapabilitySupport::Supported;
         state.handle_backend(BackendEvent::SessionCreated {
@@ -9302,6 +9569,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 provider: CODEX_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
+                capabilities: crate::codex::model_capabilities(),
             }]),
         );
         state.handle_provider_backend(
@@ -9310,6 +9578,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 provider: DEVIN_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
+                capabilities: crate::backend::ModelCapabilities::default(),
             }]),
         );
 
@@ -9350,6 +9619,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                     provider: provider.to_owned(),
                     id: "shared".to_owned(),
                     is_default: true,
+                    capabilities: crate::backend::ModelCapabilities::default(),
                 }]),
             );
         }
@@ -9528,7 +9798,7 @@ reasoning_effort = "xhigh"
     }
 
     /// No level written means the model's own default, which is what every definition that predates
-    /// the field says. Nothing is sent, so nothing is changed.
+    /// the field says. No effort option is sent, so the provider keeps its model default.
     #[test]
     fn a_subagent_with_no_effort_defined_runs_at_the_models_default() {
         let directory = tempdir().expect("agent directory");
@@ -9556,15 +9826,61 @@ model = "{CODEX_PROVIDER}/model-a"
                 model: "model-a".to_owned(),
             },
         );
-        for effect in &effects {
-            if let Effect::SubagentBackend {
-                command: BackendCommand::SetSessionOptions { options, .. },
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SubagentBackend {
+                command: BackendCommand::SetSessionOptions { .. },
                 ..
-            } = effect
-            {
-                assert_eq!(options.reasoning_effort, None);
             }
-        }
+        )));
+    }
+
+    #[test]
+    fn a_stale_subagent_effort_falls_back_to_the_models_default() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("stale.toml"),
+            format!(
+                r#"
+slug = "stale"
+description = "Has an outdated effort"
+system_prompt = "Work."
+model = "{CODEX_PROVIDER}/model-a"
+reasoning_effort = "unsupported"
+"#
+            ),
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let run_id = launch_codex_subagent(&mut state, "stale");
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "codex-child".to_owned(),
+                model: "model-a".to_owned(),
+            },
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SubagentBackend {
+                command: BackendCommand::SetSessionOptions { .. },
+                ..
+            }
+        )));
+        state.client.subagent_modal = Some(run_id.clone());
+        assert!(
+            state
+                .selected_subagent_transcript()
+                .expect("the stale-effort warning transcript")
+                .entries()
+                .iter()
+                .any(|entry| {
+                    entry.kind == EntryKind::Warning
+                        && entry.body.contains("running at the model's own default")
+                })
+        );
     }
 
     /// Gets a delegated run as far as its provider session, so a test can inspect what the first turn

@@ -132,26 +132,22 @@ pub fn bootstrap(
 /// The levels and flags a model takes. The ONE place that rule lives — every frontend, and the
 /// delegated-run path that has to refuse a level a model cannot take, reads this.
 pub(crate) fn model_configuration(model: &ModelInfo) -> ModelConfigurationView {
+    let mut configuration = ModelConfigurationView {
+        reasoning_efforts: model.capabilities.reasoning_efforts.clone(),
+        ..ModelConfigurationView::default()
+    };
     if model.provider == CODEX_PROVIDER {
-        return ModelConfigurationView {
-            reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            fast_mode_configurable: true,
-            vision_eligible: true,
-        };
+        configuration.fast_mode_configurable = true;
+        configuration.vision_eligible = true;
+        return configuration;
     }
     let model_id = model.id.to_ascii_lowercase();
     if model.provider == CURSOR_PROVIDER
         && (model_id.starts_with("composer-") || model_id.starts_with("grok-4.5"))
     {
-        return ModelConfigurationView {
-            fast_mode_configurable: true,
-            ..ModelConfigurationView::default()
-        };
+        configuration.fast_mode_configurable = true;
     }
-    ModelConfigurationView::default()
+    configuration
 }
 
 fn session_view(
@@ -1285,6 +1281,16 @@ mod tests {
         assert!(openai.fast_mode_configurable);
         assert!(openai.vision_eligible);
 
+        let mut claude = model("anthropic-claude", "opus");
+        claude.capabilities.reasoning_efforts = ["low", "medium", "high"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            model_configuration(&claude).reasoning_efforts,
+            ["low", "medium", "high"]
+        );
+
         let cursor = model_configuration(&model(CURSOR_PROVIDER, "composer-2"));
         assert!(cursor.reasoning_efforts.is_empty());
         assert!(cursor.fast_mode_configurable);
@@ -1714,6 +1720,16 @@ mod tests {
             provider: provider.to_owned(),
             id: id.to_owned(),
             is_default: false,
+            capabilities: crate::backend::ModelCapabilities {
+                reasoning_efforts: if provider == CODEX_PROVIDER {
+                    ["none", "low", "medium", "high", "xhigh", "max"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            },
         }
     }
 }

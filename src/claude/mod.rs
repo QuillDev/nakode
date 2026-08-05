@@ -648,6 +648,18 @@ fn models_event(message: &Value) -> BackendEvent {
                     .get("isDefault")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                capabilities: crate::backend::ModelCapabilities {
+                    reasoning_efforts: model
+                        .get("supportedEffortLevels")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|effort| !effort.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                },
             })
         })
         .collect();
@@ -766,6 +778,26 @@ mod tests {
         assert_eq!(request.method, "set_options");
         assert_eq!(request.payload["sessionId"], "claude-session");
         assert_eq!(request.payload["fastMode"], true);
+    }
+
+    #[test]
+    fn claude_models_keep_sdk_reasoning_effort_capabilities() {
+        let event = models_event(&json!({
+            "models": [{
+                "id": "opus",
+                "isDefault": true,
+                "supportedEffortLevels": ["low", "medium", "high"]
+            }]
+        }));
+        let BackendEvent::Models(models) = event else {
+            panic!("expected models event");
+        };
+
+        assert_eq!(models[0].id, "opus");
+        assert_eq!(
+            models[0].capabilities.reasoning_efforts,
+            ["low", "medium", "high"]
+        );
     }
 
     #[test]

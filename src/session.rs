@@ -379,6 +379,7 @@ impl SqliteSessionRepository {
                model_id TEXT NOT NULL,
                is_default INTEGER NOT NULL,
                cached_at INTEGER NOT NULL,
+               capabilities TEXT NOT NULL DEFAULT '{}',
                PRIMARY KEY(provider, model_id)
              );
              CREATE TABLE IF NOT EXISTS provider_model_preferences (
@@ -483,6 +484,22 @@ impl SqliteSessionRepository {
                  SELECT provider, '*', reasoning_effort, fast_mode
                  FROM provider_model_options_legacy;
                  DROP TABLE provider_model_options_legacy;
+                 COMMIT;",
+            )?;
+        }
+        let has_model_capabilities = {
+            let mut statement = connection.prepare("PRAGMA table_info(provider_models)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns.iter().any(|column| column == "capabilities")
+        };
+        if !has_model_capabilities {
+            execute_batch_with_busy_retry(
+                &connection,
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE provider_models
+                   ADD COLUMN capabilities TEXT NOT NULL DEFAULT '{}';
                  COMMIT;",
             )?;
         }
@@ -775,7 +792,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT model_id, is_default
+            "SELECT model_id, is_default, capabilities
              FROM provider_models WHERE provider = ?1
              ORDER BY is_default DESC, model_id COLLATE NOCASE",
         )?;
@@ -785,6 +802,11 @@ impl SessionRepository for SqliteSessionRepository {
                 provider: model_provider.clone(),
                 id: row.get(0)?,
                 is_default: row.get::<_, i64>(1)? != 0,
+                capabilities: row
+                    .get::<_, String>(2)
+                    .ok()
+                    .and_then(|encoded| serde_json::from_str(&encoded).ok())
+                    .unwrap_or_default(),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -812,8 +834,8 @@ impl SessionRepository for SqliteSessionRepository {
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO provider_models
-                 (provider, model_id, is_default, cached_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                 (provider, model_id, is_default, cached_at, capabilities)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for model in models {
                 statement.execute(params![
@@ -825,6 +847,8 @@ impl SessionRepository for SqliteSessionRepository {
                             .map_or(model.is_default, |preferred| preferred == &model.id)
                     ),
                     now,
+                    serde_json::to_string(&model.capabilities)
+                        .expect("model capabilities serialize"),
                 ])?;
             }
         }
@@ -1473,11 +1497,15 @@ mod tests {
                 provider: CODEX_PROVIDER.to_owned(),
                 id: "model-a".to_owned(),
                 is_default: true,
+                capabilities: crate::backend::ModelCapabilities {
+                    reasoning_efforts: vec!["low".to_owned(), "high".to_owned()],
+                },
             },
             ModelInfo {
                 provider: CODEX_PROVIDER.to_owned(),
                 id: "model-b".to_owned(),
                 is_default: false,
+                capabilities: crate::codex::model_capabilities(),
             },
         ];
         store.update_model(&second.id, Some("model-a"))?;
@@ -1757,6 +1785,7 @@ mod tests {
                 provider: CODEX_PROVIDER.to_owned(),
                 id: "legacy-model".to_owned(),
                 is_default: true,
+                capabilities: crate::backend::ModelCapabilities::default(),
             }]
         );
         let connection = store.connection.lock().expect("database mutex");
