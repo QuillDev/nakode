@@ -469,6 +469,7 @@ impl SqliteSessionRepository {
                status TEXT NOT NULL,
                provider_id TEXT,
                model_id TEXT,
+               tool_audit_json TEXT,
                PRIMARY KEY(parent_session_id, run_id, sequence),
                FOREIGN KEY(parent_session_id, run_id)
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
@@ -521,7 +522,7 @@ impl SqliteSessionRepository {
                  COMMIT;",
             )?;
         }
-        for column in ["provider_id", "model_id"] {
+        for column in ["provider_id", "model_id", "tool_audit_json"] {
             if !agent_turn_columns.iter().any(|existing| existing == column) {
                 execute_batch_with_busy_retry(
                     &connection,
@@ -1160,8 +1161,8 @@ impl SessionRepository for SqliteSessionRepository {
             let mut statement = transaction.prepare(
                 "INSERT INTO agent_turns
                    (parent_session_id, run_id, sequence, entry_id, item_key, kind, title, body, status,
-                    provider_id, model_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    provider_id, model_id, tool_audit_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
             for (sequence, entry) in record.transcript.iter().enumerate() {
                 let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
@@ -1177,6 +1178,7 @@ impl SessionRepository for SqliteSessionRepository {
                     entry_status_value(entry.status),
                     entry.provider_id,
                     entry.model_id,
+                    entry.tool_audit_json,
                 ])?;
             }
         }
@@ -1431,7 +1433,8 @@ fn load_subagent_transcript(
     run_id: &str,
 ) -> Result<Vec<TranscriptEntry>, SessionError> {
     let mut statement = connection.prepare(
-        "SELECT entry_id, item_key, kind, title, body, status, provider_id, model_id
+        "SELECT entry_id, item_key, kind, title, body, status, provider_id, model_id,
+                tool_audit_json
          FROM agent_turns
          WHERE parent_session_id = ?1 AND run_id = ?2
          ORDER BY sequence",
@@ -1446,10 +1449,11 @@ fn load_subagent_transcript(
             row.get::<_, String>(5)?,
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, key, kind, title, body, status, provider_id, model_id) = row?;
+        let (id, key, kind, title, body, status, provider_id, model_id, tool_audit_json) = row?;
         Ok(TranscriptEntry {
             id,
             key,
@@ -1459,6 +1463,7 @@ fn load_subagent_transcript(
             status: entry_status_from_value(&status)?,
             provider_id,
             model_id,
+            tool_audit_json,
         })
     })
     .collect()
@@ -1840,6 +1845,7 @@ mod tests {
                 status: EntryStatus::Complete,
                 provider_id: None,
                 model_id: None,
+                tool_audit_json: None,
             }],
         })?;
         let native_rows = |provider_session_id: &str| -> Result<i64, SessionError> {
@@ -1924,6 +1930,7 @@ mod tests {
                     status: EntryStatus::Complete,
                     provider_id: None,
                     model_id: None,
+                    tool_audit_json: None,
                 },
                 TranscriptEntry {
                     id: "entry-2".to_owned(),
@@ -1934,6 +1941,9 @@ mod tests {
                     status: EntryStatus::Complete,
                     provider_id: Some(CODEX_PROVIDER.to_owned()),
                     model_id: Some("openai-codex/gpt-5.4".to_owned()),
+                    tool_audit_json: Some(
+                        r#"{"version":1,"callId":"call-1","kind":"native"}"#.to_owned(),
+                    ),
                 },
             ],
         };
@@ -2032,6 +2042,7 @@ mod tests {
                 status: EntryStatus::Running,
                 provider_id: None,
                 model_id: None,
+                tool_audit_json: None,
             }],
         })?;
         let connection = store.connection.lock().expect("database mutex");

@@ -38,6 +38,8 @@ pub struct TranscriptEntry {
     pub provider_id: Option<String>,
     /// The canonical provider-qualified model used by that turn.
     pub model_id: Option<String>,
+    /// Versioned, bounded provider-neutral tool audit JSON. Never interpreted as markup.
+    pub tool_audit_json: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +206,7 @@ impl DomainTranscript {
             status,
             provider_id: None,
             model_id: None,
+            tool_audit_json: None,
         });
         self.enforce_limit();
     }
@@ -234,6 +237,7 @@ impl DomainTranscript {
                 status,
                 provider_id: None,
                 model_id: None,
+                tool_audit_json: None,
             });
             self.item_indices.insert(key, index);
         }
@@ -263,6 +267,7 @@ impl DomainTranscript {
                 status: EntryStatus::Running,
                 provider_id: None,
                 model_id: None,
+                tool_audit_json: None,
             });
             self.item_indices.insert(key, index);
         }
@@ -278,6 +283,16 @@ impl DomainTranscript {
             if entry.model_id.is_none() {
                 entry.model_id = model_id.map(str::to_owned);
             }
+        }
+    }
+
+    pub fn set_tool_audit(&mut self, key: &str, audit_json: Option<String>) {
+        if let Some(index) = self.item_indices.get(key).copied()
+            && audit_json.is_some()
+        {
+            // A provider update without audit data must not erase the payload already correlated by
+            // this stable item key. Completed updates replace starts because they carry `Some` too.
+            self.entries[index].tool_audit_json = audit_json;
         }
     }
 

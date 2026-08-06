@@ -53,12 +53,20 @@ pub enum ConversationItem {
     },
     ToolResult {
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audit_kind: Option<String>,
         #[serde(default)]
         title: Option<String>,
         output: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_output: Option<String>,
         failed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     Compaction {
         summary: String,
@@ -992,10 +1000,20 @@ impl AgentRuntime {
             return Ok(ExecutedTool::unavailable(turn_id, &tool_call));
         };
         let title = tool_title(&tool_call, tool.as_ref());
-        send_tool_started(turn_id, &tool_call.id, &title, backend_events).await?;
+        send_tool_started(
+            turn_id,
+            &tool_call.id,
+            &tool_call.name,
+            &title,
+            &tool_call.arguments,
+            false,
+            backend_events,
+        )
+        .await?;
+        let arguments = tool_call.arguments.clone();
         let started_at_ms = unix_time_ms();
         let started = Instant::now();
-        let result = match prepare_and_validate(tool.as_ref(), tool_call.arguments) {
+        let result = match prepare_and_validate(tool.as_ref(), arguments.clone()) {
             Ok(arguments) => {
                 tool.execute(
                     crate::tools::ToolContext {
@@ -1013,11 +1031,10 @@ impl AgentRuntime {
             Err(error) => crate::tools::ToolResult::failure(error),
         };
         Ok(ExecutedTool::new(
-            tool_call.id,
-            tool_call.name,
+            runtime_tool_kind(&tool_call.name, false),
+            tool_call,
             title,
-            result.output,
-            result.failed,
+            result,
             started_at_ms,
             duration_ms(started.elapsed()),
         ))
@@ -1032,7 +1049,16 @@ impl AgentRuntime {
         cancellation: &CancellationToken,
     ) -> Result<ExecutedTool, String> {
         let title = tool_call.name.clone();
-        send_tool_started(turn_id, &tool_call.id, &title, backend_events).await?;
+        send_tool_started(
+            turn_id,
+            &tool_call.id,
+            &tool_call.name,
+            &title,
+            &tool_call.arguments,
+            true,
+            backend_events,
+        )
+        .await?;
         let started_at_ms = unix_time_ms();
         let started = Instant::now();
         let request_id = Uuid::now_v7().to_string();
@@ -1059,11 +1085,10 @@ impl AgentRuntime {
         self.external_tools.pending.lock().await.remove(&request_id);
         let _ = session;
         Ok(ExecutedTool::new(
-            tool_call.id,
-            tool_call.name,
+            runtime_tool_kind(&tool_call.name, true),
+            tool_call,
             title,
-            result.output,
-            result.failed,
+            result,
             started_at_ms,
             duration_ms(started.elapsed()),
         ))
@@ -1085,11 +1110,21 @@ impl AgentRuntime {
             return Ok(ExecutedTool::unavailable(turn_id, &tool_call));
         };
         let title = tool_title(&tool_call, tool.as_ref());
-        send_tool_started(turn_id, &tool_call.id, &title, backend_events).await?;
+        send_tool_started(
+            turn_id,
+            &tool_call.id,
+            &tool_call.name,
+            &title,
+            &tool_call.arguments,
+            false,
+            backend_events,
+        )
+        .await?;
+        let arguments = tool_call.arguments.clone();
         let started_at_ms = unix_time_ms();
         let started = Instant::now();
         let mut isolated_session = RuntimeSession::new(String::new(), String::new());
-        let result = match prepare_and_validate(tool.as_ref(), tool_call.arguments) {
+        let result = match prepare_and_validate(tool.as_ref(), arguments.clone()) {
             Ok(arguments) => {
                 tool.execute(
                     crate::tools::ToolContext {
@@ -1107,11 +1142,10 @@ impl AgentRuntime {
             Err(error) => crate::tools::ToolResult::failure(error),
         };
         Ok(ExecutedTool::new(
-            tool_call.id,
-            tool_call.name,
+            runtime_tool_kind(&tool_call.name, false),
+            tool_call,
             title,
-            result.output,
-            result.failed,
+            result,
             started_at_ms,
             duration_ms(started.elapsed()),
         ))
@@ -1121,6 +1155,8 @@ impl AgentRuntime {
 struct ExecutedTool {
     call_id: String,
     name: String,
+    arguments: Value,
+    audit_kind: &'static str,
     item_id: String,
     title: String,
     output: String,
@@ -1132,23 +1168,24 @@ struct ExecutedTool {
 
 impl ExecutedTool {
     fn new(
-        call_id: String,
-        name: String,
+        audit_kind: &'static str,
+        tool_call: ToolCall,
         title: String,
-        output: String,
-        failed: bool,
+        result: crate::tools::ToolResult,
         started_at_ms: u64,
         duration_ms: u64,
     ) -> Self {
-        let model_output = model_facing_output(&output);
+        let model_output = model_facing_output(&result.output);
         Self {
             item_id: String::new(),
-            call_id,
-            name,
+            call_id: tool_call.id,
+            name: tool_call.name,
+            arguments: tool_call.arguments,
+            audit_kind,
             title,
-            output,
+            output: result.output,
             model_output,
-            failed,
+            failed: result.failed,
             started_at_ms,
             duration_ms,
         }
@@ -1157,11 +1194,10 @@ impl ExecutedTool {
     fn unavailable(turn_id: &str, tool_call: &ToolCall) -> Self {
         let output = format!("unknown tool {}", tool_call.name);
         let mut executed = Self::new(
-            tool_call.id.clone(),
-            tool_call.name.clone(),
+            runtime_tool_kind(&tool_call.name, false),
+            tool_call.clone(),
             format!("{} · unavailable", tool_call.name),
-            output,
-            true,
+            crate::tools::ToolResult::failure(output),
             unix_time_ms(),
             0,
         );
@@ -1178,12 +1214,122 @@ fn tool_title(tool_call: &ToolCall, tool: &dyn crate::tools::Tool) -> String {
     )
 }
 
+fn runtime_tool_kind(name: &str, external: bool) -> &'static str {
+    if external {
+        "custom"
+    } else if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "bash" | "shell" | "exec" | "command"
+    ) {
+        "shell"
+    } else {
+        "native"
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeToolAudit<'a> {
+    call_id: &'a str,
+    name: &'a str,
+    arguments: &'a Value,
+    kind: &'a str,
+    output: Option<&'a str>,
+    failed: bool,
+    duration_ms: Option<u64>,
+    status: &'a str,
+}
+
+fn runtime_tool_audit(details: RuntimeToolAudit<'_>) -> String {
+    const MAX_FIELD_BYTES: usize = 64 * 1024;
+    let RuntimeToolAudit {
+        call_id,
+        name,
+        arguments,
+        kind,
+        output,
+        failed,
+        duration_ms,
+        status,
+    } = details;
+    let bounded = |format: &str, value: String| {
+        let bytes = value.len();
+        let mut end = value.len().min(MAX_FIELD_BYTES);
+        while !value.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        serde_json::json!({
+            "format": format,
+            "value": &value[..end],
+            "bytes": bytes,
+            "truncated": end < bytes,
+            "redacted": value.to_ascii_lowercase().contains("[redacted]")
+                || value.to_ascii_lowercase().contains("<redacted>"),
+        })
+    };
+    let structured_output = |value: &str| {
+        serde_json::from_str::<Value>(value).map_or_else(
+            |_| bounded("text", value.to_owned()),
+            |json| {
+                bounded(
+                    "json",
+                    serde_json::to_string_pretty(&json).unwrap_or_else(|_| value.to_owned()),
+                )
+            },
+        )
+    };
+    let is_shell = kind == "shell";
+    let mut audit = serde_json::json!({
+        "version": 1,
+        "callId": call_id,
+        "kind": kind,
+        "name": name,
+        "providerType": "nakodeRuntimeTool",
+        "status": status,
+        "authoritative": "Nakode native runtime session history",
+        "input": bounded("json", serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string())),
+        "durationMs": duration_ms,
+    });
+    if is_shell {
+        if let Some(command) = arguments.get("command") {
+            let rendered = command
+                .as_str()
+                .map_or_else(|| command.to_string(), str::to_owned);
+            audit["shell"] = serde_json::json!({
+                "command": bounded("text", rendered),
+                "cwd": arguments.get("cwd").map_or(Value::Null, |value| bounded("text", value.as_str().map_or_else(|| value.to_string(), str::to_owned))),
+                "output": output.map_or(Value::Null, |value| bounded("text", value.to_owned())),
+                "stdout": Value::Null,
+                "stderr": Value::Null,
+                "exitCode": Value::Null,
+                "durationMs": duration_ms,
+            });
+        }
+    } else if let Some(output) = output {
+        audit[if failed { "error" } else { "output" }] = structured_output(output);
+    }
+    serde_json::to_string(&audit)
+        .unwrap_or_else(|_| "{\"version\":1,\"kind\":\"unknown\",\"status\":\"failed\"}".to_owned())
+}
+
 async fn send_tool_started(
     turn_id: &str,
     call_id: &str,
+    name: &str,
     title: &str,
+    arguments: &Value,
+    external: bool,
     events: &mpsc::Sender<BackendEvent>,
 ) -> Result<(), String> {
+    let audit = runtime_tool_audit(RuntimeToolAudit {
+        call_id,
+        name,
+        arguments,
+        kind: runtime_tool_kind(name, external),
+        output: None,
+        failed: false,
+        duration_ms: None,
+        status: "running",
+    });
     events
         .send(BackendEvent::ItemStarted {
             turn_id: turn_id.to_owned(),
@@ -1193,6 +1339,7 @@ async fn send_tool_started(
                 title: title.to_owned(),
                 body: String::new(),
                 status: ItemStatus::Running,
+                tool_audit_json: Some(audit.into_boxed_str()),
             },
         })
         .await
@@ -1212,7 +1359,7 @@ async fn record_tool_result(
         .send(BackendEvent::ItemCompleted {
             turn_id: turn_id.to_owned(),
             item: NormalizedItem {
-                id: executed.item_id,
+                id: executed.item_id.clone(),
                 kind: ItemKind::Tool,
                 title: executed.title.clone(),
                 body: executed.output.clone(),
@@ -1221,6 +1368,23 @@ async fn record_tool_result(
                 } else {
                     ItemStatus::Complete
                 },
+                tool_audit_json: Some(
+                    runtime_tool_audit(RuntimeToolAudit {
+                        call_id: &executed.call_id,
+                        name: &executed.name,
+                        arguments: &executed.arguments,
+                        kind: executed.audit_kind,
+                        output: Some(&executed.output),
+                        failed: executed.failed,
+                        duration_ms: Some(executed.duration_ms),
+                        status: if executed.failed {
+                            "failed"
+                        } else {
+                            "succeeded"
+                        },
+                    })
+                    .into_boxed_str(),
+                ),
             },
         })
         .await
@@ -1228,7 +1392,7 @@ async fn record_tool_result(
     session.telemetry.tools.push(ToolMetric {
         turn_id: turn_id.to_owned(),
         call_id: executed.call_id.clone(),
-        name: executed.name,
+        name: executed.name.clone(),
         started_at_ms: executed.started_at_ms,
         duration_ms: executed.duration_ms,
         output_bytes: executed.output.len(),
@@ -1237,10 +1401,14 @@ async fn record_tool_result(
     });
     session.history.push(ConversationItem::ToolResult {
         call_id: executed.call_id,
+        name: Some(executed.name),
+        arguments: Some(executed.arguments),
+        audit_kind: Some(executed.audit_kind.to_owned()),
         title: Some(executed.title),
         output: executed.output,
         model_output: Some(executed.model_output),
         failed: executed.failed,
+        duration_ms: Some(executed.duration_ms),
     });
     Ok(())
 }
@@ -1412,6 +1580,7 @@ fn normalize_history_item(
             title: title.to_owned(),
             body,
             status: ItemStatus::Complete,
+            tool_audit_json: None,
         },
     };
     match item {
@@ -1448,22 +1617,8 @@ fn normalize_history_item(
             }
             items
         }
-        ConversationItem::ToolResult {
-            title,
-            output,
-            failed,
-            ..
-        } => {
-            let mut item = normalized(
-                ItemKind::Tool,
-                title.as_deref().unwrap_or("Tool result"),
-                output.clone(),
-                "tool",
-            );
-            if *failed {
-                item.item.status = ItemStatus::Failed;
-            }
-            vec![item]
+        ConversationItem::ToolResult { .. } => {
+            vec![normalize_tool_history_item(&turn_id, item_id("tool"), item)]
         }
         ConversationItem::Compaction { summary } => vec![normalized(
             ItemKind::System,
@@ -1495,9 +1650,62 @@ fn normalize_history_item(
                     title: title.to_owned(),
                     body,
                     status,
+                    tool_audit_json: None,
                 },
             }]
         }
+    }
+}
+
+fn normalize_tool_history_item(
+    turn_id: &str,
+    item_id: String,
+    item: &ConversationItem,
+) -> SessionHistoryItem {
+    let ConversationItem::ToolResult {
+        call_id,
+        name,
+        arguments,
+        audit_kind,
+        title,
+        output,
+        failed,
+        duration_ms,
+        ..
+    } = item
+    else {
+        unreachable!("tool history normalization requires a tool result");
+    };
+    SessionHistoryItem {
+        turn_id: turn_id.to_owned(),
+        provider_id: None,
+        model_id: None,
+        item: NormalizedItem {
+            id: item_id,
+            kind: ItemKind::Tool,
+            title: title.clone().unwrap_or_else(|| "Tool result".to_owned()),
+            body: output.clone(),
+            status: if *failed {
+                ItemStatus::Failed
+            } else {
+                ItemStatus::Complete
+            },
+            tool_audit_json: name.as_ref().map(|name| {
+                runtime_tool_audit(RuntimeToolAudit {
+                    call_id,
+                    name,
+                    arguments: arguments.as_ref().unwrap_or(&Value::Null),
+                    kind: audit_kind
+                        .as_deref()
+                        .unwrap_or_else(|| runtime_tool_kind(name, false)),
+                    output: Some(output),
+                    failed: *failed,
+                    duration_ms: *duration_ms,
+                    status: if *failed { "failed" } else { "succeeded" },
+                })
+                .into_boxed_str()
+            }),
+        },
     }
 }
 
@@ -1927,7 +2135,7 @@ mod tests {
     use super::{
         AgentRuntime, ConversationItem, InferenceEvent, InferenceFuture, InferenceOutput,
         InferenceProvider, InferenceRequest, QuestionBroker, RuntimeSession, RuntimeSessionStore,
-        ToolCall,
+        RuntimeToolAudit, ToolCall, normalize_history_item, runtime_tool_audit,
     };
     use crate::backend::{
         BackendEvent, CompactionReason, ItemKind, QuestionOption, QuestionRequest,
@@ -1939,6 +2147,72 @@ mod tests {
     };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn native_runtime_tool_audit_survives_history_hydration() {
+        let arguments = json!({"path": "src/runtime.rs", "offset": 20});
+        let audit: serde_json::Value =
+            serde_json::from_str(&runtime_tool_audit(RuntimeToolAudit {
+                call_id: "read-7",
+                name: "read",
+                arguments: &arguments,
+                kind: "native",
+                output: Some("line one\nline two"),
+                failed: false,
+                duration_ms: Some(8),
+                status: "succeeded",
+            }))
+            .expect("audit json");
+        assert_eq!(audit["callId"], "read-7");
+        assert_eq!(audit["kind"], "native");
+        assert!(audit["input"]["value"].as_str().unwrap().contains("offset"));
+
+        let history = normalize_history_item(
+            "session-1",
+            2,
+            &ConversationItem::ToolResult {
+                call_id: "read-7".to_owned(),
+                name: Some("read".to_owned()),
+                arguments: Some(arguments),
+                audit_kind: Some("native".to_owned()),
+                title: Some("read · src/runtime.rs".to_owned()),
+                output: "line one\nline two".to_owned(),
+                model_output: None,
+                failed: false,
+                duration_ms: Some(8),
+            },
+        );
+        let restored: serde_json::Value = serde_json::from_str(
+            history[0]
+                .item
+                .tool_audit_json
+                .as_deref()
+                .expect("restored audit"),
+        )
+        .expect("restored audit json");
+        assert_eq!(restored["callId"], "read-7");
+        assert_eq!(restored["output"]["value"], "line one\nline two");
+    }
+
+    #[test]
+    fn native_shell_audit_keeps_multiline_heredoc_inert() {
+        let command = "cat <<'EOF'\n<script>alert(1)</script>\nEOF";
+        let audit: serde_json::Value =
+            serde_json::from_str(&runtime_tool_audit(RuntimeToolAudit {
+                call_id: "shell-1",
+                name: "bash",
+                arguments: &json!({"command": command, "cwd": "/workspace"}),
+                kind: "shell",
+                output: Some("ok"),
+                failed: false,
+                duration_ms: Some(12),
+                status: "succeeded",
+            }))
+            .expect("shell audit json");
+        assert_eq!(audit["shell"]["command"]["value"], command);
+        assert_eq!(audit["shell"]["cwd"]["value"], "/workspace");
+        assert_eq!(audit["shell"]["durationMs"], 12);
+    }
 
     struct RepeatingToolProvider {
         calls: AtomicUsize,
@@ -2254,6 +2528,36 @@ mod tests {
         );
         let (session, result) = turn.await.expect("turn task");
         result.expect("turn completes");
+        let tool_result = session
+            .history
+            .iter()
+            .find(|item| matches!(item, ConversationItem::ToolResult { .. }))
+            .expect("external tool history");
+        assert!(matches!(
+            tool_result,
+            ConversationItem::ToolResult {
+                call_id,
+                audit_kind: Some(kind),
+                arguments: Some(arguments),
+                output,
+                ..
+            } if call_id == "provider-call"
+                && kind == "custom"
+                && arguments["ticketId"] == "ticket-1"
+                && output == "dashboard result"
+        ));
+        let restored = normalize_history_item("session-external", 1, tool_result);
+        let audit: serde_json::Value = serde_json::from_str(
+            restored[0]
+                .item
+                .tool_audit_json
+                .as_deref()
+                .expect("external tool audit"),
+        )
+        .expect("external tool audit json");
+        assert_eq!(audit["callId"], "provider-call");
+        assert_eq!(audit["kind"], "custom");
+        assert_eq!(audit["output"]["value"], "dashboard result");
         assert!(matches!(
             session.history.last(),
             Some(ConversationItem::Assistant { text, .. }) if text == "done"
@@ -2663,6 +2967,10 @@ mod tests {
                 output: "x".repeat(128 * 1024),
                 model_output: Some("x".repeat(32 * 1024)),
                 failed: false,
+                name: None,
+                arguments: None,
+                audit_kind: None,
+                duration_ms: None,
             },
         ];
 
@@ -2855,6 +3163,10 @@ mod tests {
             output: "full".repeat(30_000),
             model_output: Some("bounded".repeat(1_000)),
             failed: false,
+            name: None,
+            arguments: None,
+            audit_kind: None,
+            duration_ms: None,
         });
 
         let history = session.normalized_history();

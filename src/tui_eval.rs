@@ -1025,6 +1025,7 @@ fn install_created_session_view(
                 artifacts: Vec::new(),
                 provider_id: None,
                 model_id: None,
+                tool_audit_json: None,
             });
     }
     session.activity = nakode_protocol::SessionActivity::StartingTurn;
@@ -1096,6 +1097,7 @@ fn install_item_view(
         artifacts: Vec::new(),
         provider_id: None,
         model_id: None,
+        tool_audit_json: None,
     };
     if let Some(existing) = session
         .transcript

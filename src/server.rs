@@ -3637,6 +3637,7 @@ first_message = "Starting review"
                 status: EntryStatus::Complete,
                 provider_id: None,
                 model_id: None,
+                tool_audit_json: None,
             }],
         }]);
         let core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
@@ -3688,6 +3689,7 @@ first_message = "Starting review"
                     status: EntryStatus::Complete,
                     provider_id: None,
                     model_id: None,
+                    tool_audit_json: None,
                 })
                 .collect(),
         }]);
@@ -3914,6 +3916,7 @@ first_message = "Starting review"
                 status: EntryStatus::Running,
                 provider_id: None,
                 model_id: None,
+                tool_audit_json: None,
             }],
         }]);
         state.client.subagent_modal = Some("run-stream".to_owned());

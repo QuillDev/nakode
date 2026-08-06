@@ -307,6 +307,7 @@ pub fn normalize_item(item: &Value) -> NormalizedItem {
             title: "YOU".to_owned(),
             body: user_message_body(item),
             status: ItemStatus::Complete,
+            tool_audit_json: None,
         },
         "agentMessage" => NormalizedItem {
             id,
@@ -314,6 +315,7 @@ pub fn normalize_item(item: &Value) -> NormalizedItem {
             title: "ASSISTANT".to_owned(),
             body: string(item, "text"),
             status: ItemStatus::Complete,
+            tool_audit_json: None,
         },
         "reasoning" => NormalizedItem {
             id,
@@ -321,6 +323,7 @@ pub fn normalize_item(item: &Value) -> NormalizedItem {
             title: "REASONING".to_owned(),
             body: string_array(item, "summary").join("\n"),
             status: ItemStatus::Complete,
+            tool_audit_json: None,
         },
         "plan" => NormalizedItem {
             id,
@@ -328,26 +331,23 @@ pub fn normalize_item(item: &Value) -> NormalizedItem {
             title: "PLAN".to_owned(),
             body: string(item, "text"),
             status: ItemStatus::Complete,
+            tool_audit_json: None,
         },
         "commandExecution"
         | "fileChange"
         | "mcpToolCall"
         | "dynamicToolCall"
-        | "collabAgentToolCall" => normalize_tool_item(&item_type, id, item),
-        "webSearch" => NormalizedItem {
-            id,
-            kind: ItemKind::Tool,
-            title: "WEB SEARCH".to_owned(),
-            body: pretty(item),
-            status: ItemStatus::Complete,
-        },
+        | "collabAgentToolCall"
+        | "webSearch" => normalize_tool_item(&item_type, id, item),
         "contextCompaction" => NormalizedItem {
             id,
             kind: ItemKind::System,
             title: "CONTEXT COMPACTED".to_owned(),
             body: String::new(),
             status: ItemStatus::Complete,
+            tool_audit_json: None,
         },
+        _ if looks_like_tool(item) => normalize_tool_item(&item_type, id, item),
         _ => NormalizedItem {
             id,
             kind: ItemKind::System,
@@ -358,11 +358,14 @@ pub fn normalize_item(item: &Value) -> NormalizedItem {
             },
             body: pretty(item),
             status: item_status(item),
+            tool_audit_json: None,
         },
     }
 }
 
 fn normalize_tool_item(item_type: &str, id: String, item: &Value) -> NormalizedItem {
+    let status = item_status(item);
+    let audit = tool_audit(item_type, &id, item, status);
     match item_type {
         "commandExecution" => {
             let output = item
@@ -374,7 +377,8 @@ fn normalize_tool_item(item_type: &str, id: String, item: &Value) -> NormalizedI
                 kind: ItemKind::Tool,
                 title: format!("$ {}", string(item, "command")),
                 body: output.to_owned(),
-                status: item_status(item),
+                status,
+                tool_audit_json: Some(audit.into_boxed_str()),
             }
         }
         "fileChange" => NormalizedItem {
@@ -382,7 +386,8 @@ fn normalize_tool_item(item_type: &str, id: String, item: &Value) -> NormalizedI
             kind: ItemKind::Diff,
             title: "FILE CHANGES".to_owned(),
             body: format_changes(item.get("changes")),
-            status: item_status(item),
+            status,
+            tool_audit_json: Some(audit.into_boxed_str()),
         },
         "mcpToolCall" => {
             let server = string(item, "server");
@@ -392,7 +397,8 @@ fn normalize_tool_item(item_type: &str, id: String, item: &Value) -> NormalizedI
                 kind: ItemKind::Tool,
                 title: format!("MCP {server}/{tool}"),
                 body: pretty_first(item, &["result", "error", "arguments"]),
-                status: item_status(item),
+                status,
+                tool_audit_json: Some(audit.into_boxed_str()),
             }
         }
         "dynamicToolCall" => {
@@ -408,7 +414,8 @@ fn normalize_tool_item(item_type: &str, id: String, item: &Value) -> NormalizedI
                     _ => format!("TOOL {tool}"),
                 },
                 body: dynamic_tool_body(item),
-                status: item_status(item),
+                status,
+                tool_audit_json: Some(audit.into_boxed_str()),
             }
         }
         "collabAgentToolCall" => NormalizedItem {
@@ -416,9 +423,193 @@ fn normalize_tool_item(item_type: &str, id: String, item: &Value) -> NormalizedI
             kind: ItemKind::Tool,
             title: format!("AGENT {}", value_label(item.get("tool"))),
             body: pretty(item),
-            status: item_status(item),
+            status,
+            tool_audit_json: Some(audit.into_boxed_str()),
         },
-        _ => unreachable!("caller filters tool item types"),
+        "webSearch" => NormalizedItem {
+            id,
+            kind: ItemKind::Tool,
+            title: "WEB SEARCH".to_owned(),
+            body: pretty(item),
+            status,
+            tool_audit_json: Some(audit.into_boxed_str()),
+        },
+        _ => NormalizedItem {
+            id,
+            kind: ItemKind::Tool,
+            title: generic_tool_name(item_type, item),
+            body: pretty_first(item, &["result", "error", "output"]),
+            status,
+            tool_audit_json: Some(audit.into_boxed_str()),
+        },
+    }
+}
+
+/// Each field is bounded independently and says when bytes were omitted. The provider's own session
+/// history remains authoritative for data past these IPC-safe windows.
+const MAX_AUDIT_FIELD_BYTES: usize = 64 * 1024;
+
+fn tool_audit(item_type: &str, id: &str, item: &Value, status: ItemStatus) -> String {
+    let kind = match item_type {
+        "commandExecution" => "shell",
+        "mcpToolCall" => "custom",
+        "dynamicToolCall" if item.get("namespace").is_some_and(|value| !value.is_null()) => {
+            "custom"
+        }
+        "fileChange" | "webSearch" | "dynamicToolCall" | "collabAgentToolCall" => "native",
+        _ => "unknown",
+    };
+    let name = match item_type {
+        "commandExecution" => "Shell".to_owned(),
+        "fileChange" => "Edit".to_owned(),
+        "webSearch" => "Search".to_owned(),
+        _ => generic_tool_name(item_type, item),
+    };
+    let status = match status {
+        ItemStatus::Running => "running",
+        ItemStatus::Complete => "succeeded",
+        ItemStatus::Failed => "failed",
+        ItemStatus::Declined => "cancelled",
+    };
+
+    let mut audit = json!({
+        "version": 1,
+        "callId": id,
+        "kind": kind,
+        "name": name,
+        "providerType": item_type,
+        "status": status,
+        "authoritative": "Nakode provider session history",
+    });
+    if item_type == "commandExecution" {
+        let command = item.get("command").cloned().unwrap_or(Value::Null);
+        audit["shell"] = json!({
+            "command": bounded_payload(&command),
+            "cwd": optional_payload(item.get("cwd")),
+            "stdout": optional_payload(item.get("stdout")),
+            "stderr": optional_payload(item.get("stderr")),
+            "output": optional_payload(item.get("aggregatedOutput")),
+            "exitCode": first_value(item, &["exitCode", "exit_code"]),
+            "durationMs": first_value(item, &["durationMs", "duration_ms"]),
+        });
+    } else {
+        let input = item
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| generic_input(item));
+        audit["input"] = bounded_payload(&input);
+        if let Some(output) = first_present(item, &["result", "error", "output", "contentItems"]) {
+            audit["output"] = bounded_payload(output);
+        }
+    }
+    if item.get("error").is_some_and(|value| !value.is_null()) {
+        audit["error"] = bounded_payload(&item["error"]);
+    }
+    serde_json::to_string(&audit).unwrap_or_else(|_| {
+        r#"{"version":1,"kind":"unknown","status":"failed","error":{"format":"text","value":"Nakode could not encode this tool audit.","bytes":41,"truncated":false,"redacted":false}}"#.to_owned()
+    })
+}
+
+fn looks_like_tool(item: &Value) -> bool {
+    let item_type = string(item, "type").to_ascii_lowercase();
+    item_type.contains("tool")
+        || item_type.contains("call")
+        || item.get("arguments").is_some()
+        || (item.get("tool").is_some() && item.get("status").is_some())
+}
+
+fn generic_tool_name(item_type: &str, item: &Value) -> String {
+    let name = ["tool", "name"]
+        .into_iter()
+        .find_map(|field| item.get(field).and_then(Value::as_str))
+        .unwrap_or(item_type);
+    if name.is_empty() {
+        "Unknown tool".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+fn generic_input(item: &Value) -> Value {
+    let mut input = item.as_object().cloned().unwrap_or_default();
+    for field in [
+        "id",
+        "type",
+        "status",
+        "result",
+        "error",
+        "output",
+        "contentItems",
+        "aggregatedOutput",
+        "stdout",
+        "stderr",
+        "exitCode",
+        "durationMs",
+    ] {
+        input.remove(field);
+    }
+    Value::Object(input)
+}
+
+fn first_present<'a>(item: &'a Value, fields: &[&str]) -> Option<&'a Value> {
+    fields
+        .iter()
+        .find_map(|field| item.get(field).filter(|value| !value.is_null()))
+}
+
+fn first_value(item: &Value, fields: &[&str]) -> Value {
+    first_present(item, fields).cloned().unwrap_or(Value::Null)
+}
+
+fn optional_payload(value: Option<&Value>) -> Value {
+    value
+        .filter(|value| !value.is_null())
+        .map_or(Value::Null, bounded_payload)
+}
+
+fn bounded_payload(value: &Value) -> Value {
+    let (format, rendered) = match value {
+        Value::String(value) => ("text", value.clone()),
+        value => ("json", pretty(value)),
+    };
+    let bytes = rendered.len();
+    let (rendered, truncated) = bounded_utf8(rendered, MAX_AUDIT_FIELD_BYTES);
+    json!({
+        "format": format,
+        "value": rendered,
+        "bytes": bytes,
+        "truncated": truncated,
+        "redacted": contains_redaction(value),
+    })
+}
+
+fn bounded_utf8(mut value: String, maximum: usize) -> (String, bool) {
+    if value.len() <= maximum {
+        return (value, false);
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value.truncate(end);
+    (value, true)
+}
+
+fn contains_redaction(value: &Value) -> bool {
+    match value {
+        Value::String(value) => {
+            let lower = value.to_ascii_lowercase();
+            lower.contains("[redacted]") || lower.contains("<redacted>")
+        }
+        Value::Array(values) => values.iter().any(contains_redaction),
+        Value::Object(values) => {
+            values
+                .get("redacted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || values.values().any(contains_redaction)
+        }
+        _ => false,
     }
 }
 
@@ -663,6 +854,12 @@ mod tests {
         assert_eq!(item.kind, ItemKind::Tool);
         assert_eq!(item.status, ItemStatus::Complete);
         assert_eq!(item.body, "ok");
+        let audit: serde_json::Value =
+            serde_json::from_str(item.tool_audit_json.as_deref().expect("shell audit"))
+                .expect("valid audit json");
+        assert_eq!(audit["callId"], "item-2");
+        assert_eq!(audit["kind"], "shell");
+        assert_eq!(audit["shell"]["command"]["value"], "cargo test");
     }
 
     #[test]
@@ -680,6 +877,41 @@ mod tests {
         assert_eq!(item.title, "TOOL bash");
         assert_eq!(item.body, "ok");
         assert_eq!(item.status, ItemStatus::Complete);
+        let audit: serde_json::Value =
+            serde_json::from_str(item.tool_audit_json.as_deref().expect("tool audit"))
+                .expect("valid audit json");
+        assert_eq!(audit["input"]["format"], "json");
+        assert!(
+            audit["input"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("command")
+        );
+    }
+
+    #[test]
+    fn unknown_future_tool_uses_generic_audit_with_explicit_limits() {
+        let item = normalize_item(&json!({
+            "type": "futureWidgetToolCall",
+            "id": "future-1",
+            "name": "InspectFuture",
+            "arguments": {
+                "hostile": "<script>never execute</script>",
+                "secret": "[REDACTED]",
+                "large": "x".repeat(70_000)
+            },
+            "status": "failed",
+            "error": {"message": "nope"}
+        }));
+        assert_eq!(item.kind, ItemKind::Tool);
+        let audit: serde_json::Value =
+            serde_json::from_str(item.tool_audit_json.as_deref().expect("generic audit"))
+                .expect("valid audit json");
+        assert_eq!(audit["kind"], "unknown");
+        assert_eq!(audit["name"], "InspectFuture");
+        assert_eq!(audit["input"]["truncated"], true);
+        assert_eq!(audit["input"]["redacted"], true);
+        assert_eq!(audit["error"]["format"], "json");
     }
 
     #[test]

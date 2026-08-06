@@ -1487,6 +1487,7 @@ fn transcript_entry(value: protocol::TranscriptEntryView) -> api::TranscriptEntr
             .collect(),
         provider_id: value.provider_id,
         model_id: value.model_id.map(|id| id.to_string()),
+        tool_audit_json: value.tool_audit_json,
     }
 }
 

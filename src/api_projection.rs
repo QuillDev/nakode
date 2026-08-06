@@ -923,6 +923,7 @@ fn transcript_entry(value: api::TranscriptEntry) -> Result<view::TranscriptEntry
             .collect(),
         provider_id: value.provider_id,
         model_id: value.model_id.map(view::ModelId::from),
+        tool_audit_json: value.tool_audit_json,
     })
 }
 

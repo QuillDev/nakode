@@ -813,6 +813,7 @@ async fn initialize_response(
                 approvals: CapabilitySupport::Supported,
                 native_tools: CapabilitySupport::Supported,
                 external_tools: CapabilitySupport::Unsupported,
+                scoped_runtime_policy: CapabilitySupport::Unsupported,
                 mcp: CapabilitySupport::Supported,
                 close_session: CapabilitySupport::Supported,
             },

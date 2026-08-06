@@ -1312,6 +1312,10 @@ mod tests {
                 output: "full transcript output".to_owned(),
                 model_output: Some("bounded model output".to_owned()),
                 failed: false,
+                name: None,
+                arguments: None,
+                audit_kind: None,
+                duration_ms: None,
             },
         );
 

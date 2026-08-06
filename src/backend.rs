@@ -226,6 +226,11 @@ pub struct NormalizedItem {
     pub title: String,
     pub body: String,
     pub status: ItemStatus,
+    /// Versioned, bounded JSON describing the exact tool invocation and result.
+    ///
+    /// Kept opaque at the provider boundary so new tool variants remain inspectable without
+    /// teaching every transport layer their shape. `None` for non-tool transcript items.
+    pub tool_audit_json: Option<Box<str>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

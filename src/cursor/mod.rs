@@ -644,6 +644,7 @@ fn tool_call_event(message: &Value) -> BackendEvent {
         title: string(message, "name"),
         body,
         status,
+        tool_audit_json: None,
     };
     if status == ItemStatus::Running {
         BackendEvent::ItemStarted {

@@ -749,6 +749,7 @@ fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
                     title: string(value, "title"),
                     body: string(value, "body"),
                     status,
+                    tool_audit_json: None,
                 },
             }
         })
@@ -771,6 +772,7 @@ fn tool_call_event(message: &Value) -> BackendEvent {
         title: string(message, "name"),
         body,
         status,
+        tool_audit_json: None,
     };
     if status == ItemStatus::Running {
         BackendEvent::ItemStarted {

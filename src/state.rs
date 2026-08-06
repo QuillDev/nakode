@@ -6216,6 +6216,7 @@ impl DomainState {
             }
             self.item_turns.insert(item.id.clone(), turn_id);
             let item_id = item.id.clone();
+            let tool_audit_json = item.tool_audit_json;
             self.transcript.upsert(
                 item.id,
                 entry_kind(item.kind),
@@ -6223,6 +6224,8 @@ impl DomainState {
                 item.body,
                 entry_status(item.status),
             );
+            self.transcript
+                .set_tool_audit(&item_id, tool_audit_json.map(Into::into));
             self.transcript
                 .set_origin(&item_id, provider_id.as_deref(), model_id.as_deref());
         }
@@ -6270,8 +6273,11 @@ impl DomainState {
             item.body
         };
         let item_id = item.id.clone();
+        let tool_audit_json = item.tool_audit_json;
         self.transcript
             .upsert(item.id, entry_kind(item.kind), item.title, body, status);
+        self.transcript
+            .set_tool_audit(&item_id, tool_audit_json.map(Into::into));
         self.set_entry_turn_origin(&item_id, turn_id);
     }
 
@@ -9855,6 +9861,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 body: "Implementing transcript changes\nRunning focused tests\nVerifying results"
                     .to_owned(),
                 status: ItemStatus::Complete,
+                tool_audit_json: None,
             },
         });
         assert!(state.transcript.entries().iter().any(|entry| {
@@ -9869,6 +9876,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 title: "REASONING".to_owned(),
                 body: "Planning transcript changes".to_owned(),
                 status: ItemStatus::Complete,
+                tool_audit_json: None,
             },
         });
         assert!(
@@ -9898,6 +9906,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 title: title.to_owned(),
                 body: String::new(),
                 status: ItemStatus::Running,
+                tool_audit_json: None,
             },
         };
         let delta = |id: &str, kind: DeltaKind, text: &str| BackendEvent::ItemDelta {
@@ -9914,6 +9923,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 title: name.to_owned(),
                 body: body.to_owned(),
                 status: ItemStatus::Complete,
+                tool_audit_json: None,
             },
         };
 
@@ -9969,6 +9979,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                     title: id.clone(),
                     body: body.clone(),
                     status: ItemStatus::Complete,
+                    tool_audit_json: None,
                 },
             })
             .collect::<Vec<_>>();
@@ -10003,6 +10014,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 title: "TOOL".to_owned(),
                 body: "running".to_owned(),
                 status: ItemStatus::Running,
+                tool_audit_json: None,
             },
         });
         state.handle_backend(BackendEvent::TurnCompleted {
@@ -10037,6 +10049,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 title: "bash".to_owned(),
                 body: "'/opt/nakode' agent explorer --session-id=session-1".to_owned(),
                 status: ItemStatus::Running,
+                tool_audit_json: None,
             },
         });
         state.handle_backend(BackendEvent::ItemDelta {
@@ -10562,6 +10575,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                     title: "YOU".to_owned(),
                     body: "hello".to_owned(),
                     status: ItemStatus::Complete,
+                    tool_audit_json: None,
                 },
             }],
         });
@@ -10632,6 +10646,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 status: EntryStatus::Complete,
                 provider_id: None,
                 model_id: None,
+                tool_audit_json: None,
             }],
         }]);
 
@@ -11905,6 +11920,7 @@ model = "claude-agent/sonnet"
                     title: "cargo test".to_owned(),
                     body: "tests passed".to_owned(),
                     status: ItemStatus::Complete,
+                    tool_audit_json: None,
                 },
             },
         );
