@@ -210,7 +210,7 @@ function savedHistory(messages, sessionId) {
         : savedContent;
     if (!Array.isArray(content)) continue;
     const role = message.message.role || message.type;
-    for (const block of content) {
+    for (const [blockIndex, block] of content.entries()) {
       let kind;
       let title;
       let body;
@@ -218,6 +218,10 @@ function savedHistory(messages, sessionId) {
         kind = role === "user" ? "user" : "assistant";
         title = role === "user" ? "YOU" : "CLAUDE";
         body = block.text || "";
+      } else if (block.type === "thinking" && block.thinking) {
+        kind = "reasoning";
+        title = "THINKING";
+        body = block.thinking || "";
       } else if (block.type === "tool_use") {
         kind = "tool";
         title = block.name || "Tool";
@@ -231,9 +235,17 @@ function savedHistory(messages, sessionId) {
       } else {
         continue;
       }
+      // Text and thinking blocks have no provider block id. Claude's SDK message UUID plus the
+      // content-array index is the durable counterpart of stream_event.index, so resume hydration
+      // patches the same logical blocks in the same order as the live stream. Tool results retain
+      // their tool-use id because they are status/body updates to the call, not new timeline rows.
+      const messageId = message.uuid || `${sessionId}:message:${ordinal}`;
       history.push({
-        turnId: message.uuid || `${sessionId}:turn:${ordinal}`,
-        id: block.id || block.tool_use_id || `${sessionId}:item:${ordinal}`,
+        turnId: messageId,
+        id:
+          block.id ||
+          block.tool_use_id ||
+          `claude:${messageId}:${blockIndex}`,
         kind,
         title,
         body,
@@ -479,13 +491,33 @@ function emitUserToolResults(turnId, message) {
   }
 }
 
-function emitStreamDelta(turnId, message) {
+function emitStreamEvent(turnId, message) {
+  // A Claude "turn" contains several assistant messages around tool results. `uuid` scopes the raw
+  // content-block index to one of those messages; using the turn alone would append the final answer
+  // into the first text/thinking row and leave that row above every intervening tool call.
   const event = message.event;
+  if (event?.type === "content_block_start") {
+    const block = event.content_block;
+    if (block?.type === "tool_use") {
+      providerToolCalls.set(block.id, { name: block.name, input: block.input });
+      write({
+        event: "tool_call",
+        turnId,
+        callId: block.id,
+        name: block.name,
+        status: "running",
+        args: block.input,
+      });
+    }
+    return;
+  }
   if (event?.type !== "content_block_delta") return;
   if (event.delta?.type === "text_delta" && event.delta.text) {
     write({
       event: "delta",
       turnId,
+      messageId: message.uuid,
+      blockIndex: event.index,
       kind: "assistant",
       text: event.delta.text,
     });
@@ -493,6 +525,8 @@ function emitStreamDelta(turnId, message) {
     write({
       event: "delta",
       turnId,
+      messageId: message.uuid,
+      blockIndex: event.index,
       kind: "reasoning",
       text: event.delta.thinking,
     });
@@ -543,7 +577,7 @@ async function sendTurn(command) {
     const stream = query({ prompt: command.prompt, options });
     for await (const message of stream) {
       if (message.type === "stream_event")
-        emitStreamDelta(command.turnId, message);
+        emitStreamEvent(command.turnId, message);
       else if (message.type === "assistant")
         emitContent(command.turnId, message);
       else if (message.type === "user")
