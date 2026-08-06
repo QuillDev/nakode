@@ -14,8 +14,8 @@ mod view;
 
 pub use command::{
     AgentDefinitionInput, Command, CredentialInput, ExternalToolDefinition, InteractionResolution,
-    ModelOptions, ModelTarget, PromptAttachment, PromptInput, Query, RunTextField, SettingsPatch,
-    TranscriptOwner,
+    ModelOptions, ModelTarget, PromptAttachment, PromptInput, Query, QuestionResponse,
+    RunTextField, SettingsPatch, TranscriptOwner,
 };
 pub use diagnostics::{
     DiagnosticsDailyUsage, DiagnosticsReport, DiagnosticsSessionUsage, DiagnosticsToolUsage,
@@ -34,15 +34,15 @@ pub use service::{
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,
     ConnectionView, ContextUsageView, ExternalToolCallView, InteractionKind, InteractionOptionView,
-    InteractionStatus, InteractionView, MemorySettingsView, ModelConfigurationView, ModelView,
-    NoticeLevel, NoticeView, OwnedProviderSessionView, ProviderAuthenticationView,
-    ProviderCapabilities, ProviderCapability, ProviderView, QueueItemView, RecoverablePromptView,
-    RunMetadataView, RunOutcome, RunPage, RunStatus, RunTextWindow, RunView, SessionActivity,
-    SessionMetadataView, SessionSummary, SessionView, SettingsView, SkillView,
-    TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TokenUsageView,
-    TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView,
-    TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionSettingsView,
-    WebSettingsView,
+    InteractionQuestionView, InteractionStatus, InteractionView, MemorySettingsView,
+    ModelConfigurationView, ModelView, NoticeLevel, NoticeView, OwnedProviderSessionView,
+    ProviderAuthenticationView, ProviderCapabilities, ProviderCapability, ProviderView,
+    QueueItemView, RecoverablePromptView, RunMetadataView, RunOutcome, RunPage, RunStatus,
+    RunTextWindow, RunView, SessionActivity, SessionMetadataView, SessionSummary, SessionView,
+    SettingsView, SkillView, TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView,
+    TokenUsageView, TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus,
+    TranscriptEntryView, TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent,
+    VisionSettingsView, WebSettingsView,
 };
 
 /// Maximum encoded Protobuf request or response accepted by Nakode's API.

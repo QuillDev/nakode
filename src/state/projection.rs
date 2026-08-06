@@ -17,8 +17,8 @@ use nakode_protocol::{
 };
 
 use super::{
-    AgentBrowserStatus, ConnectionState, DomainState, ProviderAuthenticationState, SubagentRun,
-    SubagentStatus,
+    AgentBrowserStatus, ConnectionState, DomainState, ProviderAuthenticationState, QuestionPrompt,
+    SubagentRun, SubagentStatus,
 };
 use crate::{
     backend::{
@@ -795,29 +795,61 @@ fn interactions(state: &DomainState, revision: u64) -> Vec<InteractionView> {
             interaction_option("decline", "Decline"),
         ],
         multiple: false,
+        questions: Vec::new(),
     });
-    let questions = state.questions.iter().map(|question| InteractionView {
-        id: question_interaction_id(&state.nakode_session_id, &question.request.id),
-        revision,
-        kind: InteractionKind::Question,
-        status: InteractionStatus::Pending,
-        title: question.request.title.clone(),
-        detail: question.request.question.clone(),
-        options: question
-            .request
-            .options
+    let mut groups: Vec<(&str, Vec<&QuestionPrompt>)> = Vec::new();
+    for question in &state.questions {
+        if let Some((_, questions)) = groups
+            .iter_mut()
+            .find(|(group_id, _)| *group_id == question.request.group_id)
+        {
+            questions.push(question);
+        } else {
+            groups.push((&question.request.group_id, vec![question]));
+        }
+    }
+    let questions = groups.into_iter().map(|(group_id, mut prompts)| {
+        prompts.sort_by_key(|prompt| prompt.request.order);
+        let items = prompts
             .iter()
-            .enumerate()
-            .map(|(index, option)| InteractionOptionView {
-                id: index.to_string(),
-                label: option.label.clone(),
-                description: option.description.clone(),
-                recommended: question.request.recommended == Some(index),
+            .map(|question| nakode_protocol::InteractionQuestionView {
+                id: question.request.logical_id.clone(),
+                title: question.request.title.clone(),
+                detail: question.request.question.clone(),
+                options: question_options(question),
+                multiple: question.request.multi,
             })
-            .collect(),
-        multiple: question.request.multi,
+            .collect::<Vec<_>>();
+        let first = prompts[0];
+        InteractionView {
+            id: question_interaction_id(&state.nakode_session_id, group_id),
+            revision,
+            kind: InteractionKind::Question,
+            status: InteractionStatus::Pending,
+            // Preserve the old scalar shape so old clients can still answer a one-item ask losslessly.
+            title: first.request.title.clone(),
+            detail: first.request.question.clone(),
+            options: question_options(first),
+            multiple: first.request.multi,
+            questions: items,
+        }
     });
     approvals.chain(questions).collect()
+}
+
+fn question_options(question: &QuestionPrompt) -> Vec<InteractionOptionView> {
+    question
+        .request
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| InteractionOptionView {
+            id: index.to_string(),
+            label: option.label.clone(),
+            description: option.description.clone(),
+            recommended: question.request.recommended == Some(index),
+        })
+        .collect()
 }
 
 pub(super) fn approval_interaction_id(

@@ -506,9 +506,30 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 protocol::InteractionResolution::ApproveForSession
             }
             api::InteractionResolutionKind::Decline => protocol::InteractionResolution::Decline,
-            api::InteractionResolutionKind::Answer => protocol::InteractionResolution::Answer {
-                option_ids: input.option_ids,
-            },
+            api::InteractionResolutionKind::Answer => {
+                if input.answers.is_empty() {
+                    protocol::InteractionResolution::Answer {
+                        option_ids: input.option_ids,
+                    }
+                } else {
+                    if !input.option_ids.is_empty() {
+                        return Err(tonic::Status::invalid_argument(
+                            "use either legacy option_ids or structured answers, not both",
+                        ));
+                    }
+                    protocol::InteractionResolution::AnswerQuestions {
+                        answers: input
+                            .answers
+                            .into_iter()
+                            .map(|answer| protocol::QuestionResponse {
+                                question_id: answer.question_id,
+                                option_ids: answer.option_ids,
+                                text: answer.text,
+                            })
+                            .collect(),
+                    }
+                }
+            }
             api::InteractionResolutionKind::Unspecified => {
                 return Err(tonic::Status::invalid_argument(
                     "interaction resolution is required",
@@ -1503,6 +1524,26 @@ fn interaction(value: protocol::InteractionView) -> api::Interaction {
             })
             .collect(),
         multiple: value.multiple,
+        questions: value
+            .questions
+            .into_iter()
+            .map(|question| api::InteractionQuestion {
+                id: question.id,
+                title: question.title,
+                detail: question.detail,
+                options: question
+                    .options
+                    .into_iter()
+                    .map(|option| api::InteractionOption {
+                        id: option.id,
+                        label: option.label,
+                        description: option.description,
+                        recommended: option.recommended,
+                    })
+                    .collect(),
+                multiple: question.multiple,
+            })
+            .collect(),
     }
 }
 

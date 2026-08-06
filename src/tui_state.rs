@@ -431,6 +431,7 @@ mod tests {
                 },
             ],
             multiple: false,
+            questions: Vec::new(),
         }
     }
 
