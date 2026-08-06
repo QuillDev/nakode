@@ -4783,6 +4783,14 @@ impl DomainState {
             })]);
         }
 
+        self.resolve_question_interaction(interaction_id, resolution)
+    }
+
+    fn resolve_question_interaction(
+        &mut self,
+        interaction_id: &nakode_protocol::InteractionId,
+        resolution: &nakode_protocol::InteractionResolution,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
         let Some(group_id) = self
             .questions
             .iter()
@@ -4850,8 +4858,40 @@ impl DomainState {
             }
         }
 
+        let resolved = Self::build_question_resolutions(&group, &responses)?;
+        // Validation above is side-effect free. Only after every item succeeds do we remove the
+        // parked questions and dispatch all provider waiters.
+        let mut positions = resolved
+            .iter()
+            .map(|(position, ..)| *position)
+            .collect::<Vec<_>>();
+        positions.sort_unstable_by(|left, right| right.cmp(left));
+        for position in positions {
+            self.questions.remove(position);
+        }
+        self.status_message = format!(
+            "Answered: {}",
+            resolved
+                .iter()
+                .map(|(_, _, _, shown)| shown.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        Ok(resolved
+            .into_iter()
+            .map(|(_, id, answer, _)| {
+                Effect::Backend(BackendCommand::ResolveQuestion { id, answer })
+            })
+            .collect())
+    }
+
+    fn build_question_resolutions(
+        group: &[(usize, &QuestionPrompt)],
+        responses: &[nakode_protocol::QuestionResponse],
+    ) -> Result<Vec<(usize, String, crate::backend::QuestionAnswer, String)>, DomainCommandError>
+    {
         let mut resolved = Vec::with_capacity(group.len());
-        for (position, question) in &group {
+        for (position, question) in group {
             let id = &question.request.logical_id;
             let response = responses
                 .iter()
@@ -4918,30 +4958,7 @@ impl DomainState {
             resolved.push((*position, question.request.id.clone(), answer, shown));
         }
 
-        // Validation above is side-effect free. Only after every item succeeds do we remove the
-        // parked questions and dispatch all provider waiters.
-        let mut positions = resolved
-            .iter()
-            .map(|(position, ..)| *position)
-            .collect::<Vec<_>>();
-        positions.sort_unstable_by(|left, right| right.cmp(left));
-        for position in positions {
-            self.questions.remove(position);
-        }
-        self.status_message = format!(
-            "Answered: {}",
-            resolved
-                .iter()
-                .map(|(_, _, _, shown)| shown.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
-        Ok(resolved
-            .into_iter()
-            .map(|(_, id, answer, _)| {
-                Effect::Backend(BackendCommand::ResolveQuestion { id, answer })
-            })
-            .collect())
+        Ok(resolved)
     }
 
     /// Configures the externally executed tools exposed to this session.
@@ -5297,7 +5314,7 @@ impl DomainState {
                 self.status_message = format!("Approval required: {}", approval.title);
                 self.approvals.push_back(approval);
             }
-            BackendEvent::QuestionRequested(request) => self.handle_question_request(request),
+            BackendEvent::QuestionRequested(request) => self.handle_question_request(*request),
             BackendEvent::ExternalToolRequested(request) => {
                 self.status_message = format!("External tool requested: {}", request.name);
                 self.external_tool_calls.push(request);
@@ -9086,7 +9103,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     #[test]
     fn tool_questions_are_queued_and_resolved_through_backend_commands() {
         let mut state = ready_state();
-        state.handle_backend(BackendEvent::QuestionRequested(QuestionRequest {
+        state.handle_backend(BackendEvent::QuestionRequested(Box::new(QuestionRequest {
             id: "question-1".to_owned(),
             logical_id: "question-1".to_owned(),
             group_id: "question-1".to_owned(),
@@ -9105,7 +9122,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             ],
             multi: false,
             recommended: None,
-        }));
+        })));
 
         state.move_question_selection(1);
         assert!(matches!(
@@ -9121,7 +9138,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     #[test]
     fn multi_select_tool_questions_preserve_recommendations_and_descriptions() {
         let mut state = ready_state();
-        state.handle_backend(BackendEvent::QuestionRequested(QuestionRequest {
+        state.handle_backend(BackendEvent::QuestionRequested(Box::new(QuestionRequest {
             id: "question-2".to_owned(),
             logical_id: "question-2".to_owned(),
             group_id: "question-2".to_owned(),
@@ -9140,7 +9157,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             ],
             multi: true,
             recommended: Some(1),
-        }));
+        })));
 
         assert_eq!(state.questions.front().expect("question").selected, 1);
         state.toggle_question_selection();
@@ -9161,7 +9178,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn grouped_questions_accept_mixed_text_and_labels_atomically() {
         let mut state = ready_state();
         for (id, order, label) in [("format", 0, "JSON"), ("note", 1, "Brief")] {
-            state.handle_backend(BackendEvent::QuestionRequested(QuestionRequest {
+            state.handle_backend(BackendEvent::QuestionRequested(Box::new(QuestionRequest {
                 id: format!("runtime-{id}"),
                 logical_id: id.to_owned(),
                 group_id: "ask-group".to_owned(),
@@ -9180,7 +9197,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 ],
                 multi: false,
                 recommended: None,
-            }));
+            })));
         }
         let interaction =
             projection::question_interaction_id(&state.nakode_session_id, "ask-group");
@@ -9223,7 +9240,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn rejected_partial_grouped_answer_preserves_every_pending_question_for_retry() {
         let mut state = ready_state();
         for (id, order) in [("first", 0), ("second", 1)] {
-            state.handle_backend(BackendEvent::QuestionRequested(QuestionRequest {
+            state.handle_backend(BackendEvent::QuestionRequested(Box::new(QuestionRequest {
                 id: format!("runtime-{id}"),
                 logical_id: id.to_owned(),
                 group_id: "retry-group".to_owned(),
@@ -9242,7 +9259,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 ],
                 multi: false,
                 recommended: None,
-            }));
+            })));
         }
         let interaction =
             projection::question_interaction_id(&state.nakode_session_id, "retry-group");
