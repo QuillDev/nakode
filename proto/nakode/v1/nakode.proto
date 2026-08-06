@@ -331,7 +331,7 @@ message ExternalToolCall { string id = 1; string name = 2; string arguments_json
 
 enum TranscriptEntryKind { TRANSCRIPT_ENTRY_KIND_UNSPECIFIED = 0; TRANSCRIPT_ENTRY_KIND_SYSTEM = 1; TRANSCRIPT_ENTRY_KIND_USER = 2; TRANSCRIPT_ENTRY_KIND_ASSISTANT = 3; TRANSCRIPT_ENTRY_KIND_STEERING = 4; TRANSCRIPT_ENTRY_KIND_REASONING = 5; TRANSCRIPT_ENTRY_KIND_TOOL = 6; TRANSCRIPT_ENTRY_KIND_DIFF = 7; TRANSCRIPT_ENTRY_KIND_WARNING = 8; TRANSCRIPT_ENTRY_KIND_ERROR = 9; }
 enum TranscriptEntryStatus { TRANSCRIPT_ENTRY_STATUS_UNSPECIFIED = 0; TRANSCRIPT_ENTRY_STATUS_RUNNING = 1; TRANSCRIPT_ENTRY_STATUS_COMPLETE = 2; TRANSCRIPT_ENTRY_STATUS_FAILED = 3; TRANSCRIPT_ENTRY_STATUS_INTERRUPTED = 4; }
-message TranscriptEntry { string id = 1; TranscriptEntryKind kind = 2; string title = 3; string body = 4; uint64 body_start_byte = 5; uint64 body_total_bytes = 6; TranscriptEntryStatus status = 7; repeated string artifact_ids = 8; }
+message TranscriptEntry { string id = 1; TranscriptEntryKind kind = 2; string title = 3; string body = 4; uint64 body_start_byte = 5; uint64 body_total_bytes = 6; TranscriptEntryStatus status = 7; repeated string artifact_ids = 8; optional string provider_id = 9; optional string model_id = 10; }
 message TranscriptPage { repeated TranscriptEntry entries = 1; bool has_earlier = 2; bool stream_active = 3; string stream_label = 4; }
 message TranscriptBodyWindow { string entry_id = 1; string body = 2; uint64 start_byte = 3; uint64 total_bytes = 4; bool has_earlier = 5; }
 message QueueItem { string id = 1; string summary = 2; uint32 attachment_count = 3; string text = 4; }

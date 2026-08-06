@@ -467,6 +467,8 @@ impl SqliteSessionRepository {
                title TEXT NOT NULL,
                body TEXT NOT NULL,
                status TEXT NOT NULL,
+               provider_id TEXT,
+               model_id TEXT,
                PRIMARY KEY(parent_session_id, run_id, sequence),
                FOREIGN KEY(parent_session_id, run_id)
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
@@ -502,14 +504,13 @@ impl SqliteSessionRepository {
         }
         orchestration_migration.push_str("COMMIT;");
         execute_batch_with_busy_retry(&connection, &orchestration_migration)?;
-        let has_agent_turn_entry_id = {
+        let agent_turn_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(agent_turns)")?;
-            let columns = statement
+            statement
                 .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?;
-            columns.iter().any(|column| column == "entry_id")
+                .collect::<Result<Vec<_>, _>>()?
         };
-        if !has_agent_turn_entry_id {
+        if !agent_turn_columns.iter().any(|column| column == "entry_id") {
             execute_batch_with_busy_retry(
                 &connection,
                 "BEGIN IMMEDIATE;
@@ -519,6 +520,14 @@ impl SqliteSessionRepository {
                  WHERE entry_id IS NULL;
                  COMMIT;",
             )?;
+        }
+        for column in ["provider_id", "model_id"] {
+            if !agent_turn_columns.iter().any(|existing| existing == column) {
+                execute_batch_with_busy_retry(
+                    &connection,
+                    &format!("ALTER TABLE agent_turns ADD COLUMN {column} TEXT;"),
+                )?;
+            }
         }
         let has_model_specific_options = {
             let mut statement = connection.prepare("PRAGMA table_info(provider_model_options)")?;
@@ -1150,8 +1159,9 @@ impl SessionRepository for SqliteSessionRepository {
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO agent_turns
-                   (parent_session_id, run_id, sequence, entry_id, item_key, kind, title, body, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                   (parent_session_id, run_id, sequence, entry_id, item_key, kind, title, body, status,
+                    provider_id, model_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for (sequence, entry) in record.transcript.iter().enumerate() {
                 let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
@@ -1165,6 +1175,8 @@ impl SessionRepository for SqliteSessionRepository {
                     entry.title,
                     entry.body,
                     entry_status_value(entry.status),
+                    entry.provider_id,
+                    entry.model_id,
                 ])?;
             }
         }
@@ -1419,7 +1431,7 @@ fn load_subagent_transcript(
     run_id: &str,
 ) -> Result<Vec<TranscriptEntry>, SessionError> {
     let mut statement = connection.prepare(
-        "SELECT entry_id, item_key, kind, title, body, status
+        "SELECT entry_id, item_key, kind, title, body, status, provider_id, model_id
          FROM agent_turns
          WHERE parent_session_id = ?1 AND run_id = ?2
          ORDER BY sequence",
@@ -1432,10 +1444,12 @@ fn load_subagent_transcript(
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, key, kind, title, body, status) = row?;
+        let (id, key, kind, title, body, status, provider_id, model_id) = row?;
         Ok(TranscriptEntry {
             id,
             key,
@@ -1443,6 +1457,8 @@ fn load_subagent_transcript(
             title,
             body,
             status: entry_status_from_value(&status)?,
+            provider_id,
+            model_id,
         })
     })
     .collect()
@@ -1822,6 +1838,8 @@ mod tests {
                 title: "PARENT".to_owned(),
                 body: "Delegated task".to_owned(),
                 status: EntryStatus::Complete,
+                provider_id: None,
+                model_id: None,
             }],
         })?;
         let native_rows = |provider_session_id: &str| -> Result<i64, SessionError> {
@@ -1904,6 +1922,8 @@ mod tests {
                     title: "PARENT".to_owned(),
                     body: "Delegated task: Map persistence".to_owned(),
                     status: EntryStatus::Complete,
+                    provider_id: None,
+                    model_id: None,
                 },
                 TranscriptEntry {
                     id: "entry-2".to_owned(),
@@ -1912,6 +1932,8 @@ mod tests {
                     title: "ASSISTANT".to_owned(),
                     body: "Persistence report".to_owned(),
                     status: EntryStatus::Complete,
+                    provider_id: Some(CODEX_PROVIDER.to_owned()),
+                    model_id: Some("openai-codex/gpt-5.4".to_owned()),
                 },
             ],
         };
@@ -2008,6 +2030,8 @@ mod tests {
                 title: "ASSISTANT".to_owned(),
                 body: "partial".to_owned(),
                 status: EntryStatus::Running,
+                provider_id: None,
+                model_id: None,
             }],
         })?;
         let connection = store.connection.lock().expect("database mutex");

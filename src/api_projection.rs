@@ -886,6 +886,8 @@ fn transcript_entry(value: api::TranscriptEntry) -> Result<view::TranscriptEntry
             .into_iter()
             .map(view::ArtifactId::from)
             .collect(),
+        provider_id: value.provider_id,
+        model_id: value.model_id.map(view::ModelId::from),
     })
 }
 

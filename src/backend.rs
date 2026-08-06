@@ -338,6 +338,10 @@ impl TodoStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionHistoryItem {
     pub turn_id: String,
+    /// Provider identity captured for the turn, absent when an older backend transcript cannot say.
+    pub provider_id: Option<String>,
+    /// Canonical provider-qualified model captured for the turn.
+    pub model_id: Option<String>,
     pub item: NormalizedItem,
 }
 

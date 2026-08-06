@@ -753,6 +753,7 @@ async fn start_session(
     };
     let selected_id = selected.info.id.clone();
     let session = RuntimeSession::new(selected_id.clone(), instructions.unwrap_or_default())
+        .with_provider(KIMI_PROVIDER)
         .with_context_window(selected.context_window);
     let session_id = session.id.clone();
     if let Some(runtime) = context.runtime
@@ -1187,6 +1188,8 @@ mod tests {
                         name: "read".to_owned(),
                         arguments: json!({"path":"README.md"}),
                     }],
+                    provider_id: None,
+                    model_id: None,
                     signature: None,
                     provider_state: Vec::new(),
                 },

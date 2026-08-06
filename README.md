@@ -290,6 +290,12 @@ Long-running turns remain unrestricted. Nakode emits non-blocking transcript war
 when the same tool fails three times and then at each additional five-failure milestone in one
 turn. These warnings are informational and never interrupt the agent.
 
+Canonical transcript entries optionally retain the stable provider ID and qualified model ID active
+when their turn began. Native runtime history and delegated-run SQLite persistence restore that immutable
+origin, and `TranscriptEntryView` plus protobuf fields 9 (`provider_id`) and 10 (`model_id`) expose it to
+SDK clients. Legacy and provider compatibility history without trustworthy origin leaves both fields
+absent; consumers must not infer them from a current selection or display/model-name parsing.
+
 ## Optional web browsing
 
 Nakode's portable runtime can expose a `browser` tool when a browser add-on is

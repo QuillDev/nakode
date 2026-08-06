@@ -34,6 +34,10 @@ pub struct TranscriptEntry {
     pub title: String,
     pub body: String,
     pub status: EntryStatus,
+    /// The provider that produced this entry, when it belongs to an inference turn.
+    pub provider_id: Option<String>,
+    /// The canonical provider-qualified model used by that turn.
+    pub model_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +202,8 @@ impl DomainTranscript {
             title: title.into(),
             body: body.into(),
             status,
+            provider_id: None,
+            model_id: None,
         });
         self.enforce_limit();
     }
@@ -226,6 +232,8 @@ impl DomainTranscript {
                 title: title.into(),
                 body: body.into(),
                 status,
+                provider_id: None,
+                model_id: None,
             });
             self.item_indices.insert(key, index);
         }
@@ -253,10 +261,24 @@ impl DomainTranscript {
                 title: title.into(),
                 body: delta.to_owned(),
                 status: EntryStatus::Running,
+                provider_id: None,
+                model_id: None,
             });
             self.item_indices.insert(key, index);
         }
         self.enforce_limit();
+    }
+
+    pub fn set_origin(&mut self, key: &str, provider_id: Option<&str>, model_id: Option<&str>) {
+        if let Some(index) = self.item_indices.get(key).copied() {
+            let entry = &mut self.entries[index];
+            if entry.provider_id.is_none() {
+                entry.provider_id = provider_id.map(str::to_owned);
+            }
+            if entry.model_id.is_none() {
+                entry.model_id = model_id.map(str::to_owned);
+            }
+        }
     }
 
     pub fn set_status(&mut self, key: &str, status: EntryStatus) {

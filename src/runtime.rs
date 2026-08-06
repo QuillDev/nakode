@@ -42,6 +42,10 @@ pub enum ConversationItem {
         text: String,
         reasoning: String,
         tool_calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_id: Option<String>,
         #[serde(default)]
         signature: Option<String>,
         #[serde(default)]
@@ -539,6 +543,9 @@ impl AgentRuntime {
                 text: output.text,
                 reasoning: output.reasoning,
                 tool_calls: output.tool_calls.clone(),
+                provider_id: (!session.provider_id.is_empty()).then(|| session.provider_id.clone()),
+                model_id: (!session.provider_id.is_empty() && !session.model.is_empty())
+                    .then(|| format!("{}/{}", session.provider_id, session.model)),
                 signature: output.signature,
                 provider_state: output.provider_state,
             });
@@ -1172,6 +1179,8 @@ async fn record_tool_result(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeSession {
     pub id: String,
+    #[serde(default)]
+    pub provider_id: String,
     pub model: String,
     pub instructions: String,
     pub history: Vec<ConversationItem>,
@@ -1194,6 +1203,7 @@ impl RuntimeSession {
     pub fn new(model: String, instructions: String) -> Self {
         Self {
             id: Uuid::now_v7().to_string(),
+            provider_id: String::new(),
             model,
             instructions,
             history: Vec::new(),
@@ -1204,6 +1214,12 @@ impl RuntimeSession {
             reasoning_effort: None,
             fast_mode: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_provider(mut self, provider_id: impl Into<String>) -> Self {
+        self.provider_id = provider_id.into();
+        self
     }
 
     #[must_use]
@@ -1319,6 +1335,8 @@ fn normalize_history_item(
     let item_id = |suffix: &str| format!("{turn_id}:{suffix}");
     let normalized = |kind, title: &str, body: String, suffix: &str| SessionHistoryItem {
         turn_id: turn_id.clone(),
+        provider_id: None,
+        model_id: None,
         item: NormalizedItem {
             id: item_id(suffix),
             kind,
@@ -1332,7 +1350,11 @@ fn normalize_history_item(
             vec![normalized(ItemKind::User, "You", text.clone(), "user")]
         }
         ConversationItem::Assistant {
-            text, reasoning, ..
+            text,
+            reasoning,
+            provider_id,
+            model_id,
+            ..
         } => {
             let mut items = Vec::new();
             if !reasoning.is_empty() {
@@ -1351,6 +1373,10 @@ fn normalize_history_item(
                     "assistant",
                 ));
             }
+            for item in &mut items {
+                item.provider_id.clone_from(provider_id);
+                item.model_id.clone_from(model_id);
+            }
             items
         }
         ConversationItem::ToolResult {
@@ -1360,6 +1386,8 @@ fn normalize_history_item(
             ..
         } => vec![SessionHistoryItem {
             turn_id: turn_id.clone(),
+            provider_id: None,
+            model_id: None,
             item: NormalizedItem {
                 id: item_id("tool"),
                 kind: ItemKind::Tool,
@@ -1394,6 +1422,8 @@ fn normalize_history_item(
             );
             vec![SessionHistoryItem {
                 turn_id: turn_id.clone(),
+                provider_id: None,
+                model_id: None,
                 item: NormalizedItem {
                     id: id.clone(),
                     kind: ItemKind::System,
@@ -2290,6 +2320,8 @@ mod tests {
                 text: "completed work ".repeat(3_000),
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
+                provider_id: None,
+                model_id: None,
                 signature: None,
                 provider_state: Vec::new(),
             },
@@ -2493,6 +2525,8 @@ mod tests {
                     name: "read".to_owned(),
                     arguments: json!({"path": "large.txt"}),
                 }],
+                provider_id: None,
+                model_id: None,
                 signature: None,
                 provider_state: Vec::new(),
             },
@@ -2526,6 +2560,8 @@ mod tests {
                 text: "old answer ".repeat(3_500),
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
+                provider_id: None,
+                model_id: None,
                 signature: None,
                 provider_state: Vec::new(),
             },
@@ -2725,6 +2761,15 @@ mod tests {
             estimated_tokens_after: Some(24_000),
             error: None,
         });
+        session.history.push(ConversationItem::Assistant {
+            text: "Finished".to_owned(),
+            reasoning: "Checked the persisted trace".to_owned(),
+            tool_calls: Vec::new(),
+            provider_id: Some("openai-codex".to_owned()),
+            model_id: Some("openai-codex/gpt-5.4".to_owned()),
+            signature: None,
+            provider_state: Vec::new(),
+        });
 
         store.save(&session).expect("save native session");
         let restored = store
@@ -2738,10 +2783,14 @@ mod tests {
         assert_eq!(restored.telemetry.tools.len(), 1);
         assert_eq!(restored.telemetry.tools[0].output_bytes, 40_000);
         let history = restored.normalized_history();
-        assert_eq!(history.len(), 1);
+        assert_eq!(history.len(), 3);
         assert_eq!(history[0].item.id, "compaction-1");
         assert_eq!(history[0].item.title, "Context compacted");
         assert!(history[0].item.body.contains("220000 to 24000"));
+        assert_eq!(history[1].item.kind, ItemKind::Reasoning);
+        assert_eq!(history[1].provider_id.as_deref(), Some("openai-codex"));
+        assert_eq!(history[1].model_id.as_deref(), Some("openai-codex/gpt-5.4"));
+        assert_eq!(history[2].item.kind, ItemKind::Assistant);
     }
 
     #[tokio::test]

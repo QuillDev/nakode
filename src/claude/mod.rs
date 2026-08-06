@@ -717,6 +717,8 @@ fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
             };
             crate::backend::SessionHistoryItem {
                 turn_id: string(value, "turnId"),
+                provider_id: None,
+                model_id: None,
                 item: NormalizedItem {
                     id: string(value, "id"),
                     kind,

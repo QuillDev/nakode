@@ -147,6 +147,8 @@ mod tests {
             title: String::new(),
             body: body.into(),
             status: EntryStatus::Complete,
+            provider_id: None,
+            model_id: None,
         }
     }
 

@@ -1023,6 +1023,8 @@ fn install_created_session_view(
                 body: prompt,
                 status: nakode_protocol::TranscriptEntryStatus::Complete,
                 artifacts: Vec::new(),
+                provider_id: None,
+                model_id: None,
             });
     }
     session.activity = nakode_protocol::SessionActivity::StartingTurn;
@@ -1092,6 +1094,8 @@ fn install_item_view(
             _ => return Err(format!("unknown item status {status:?}")),
         },
         artifacts: Vec::new(),
+        provider_id: None,
+        model_id: None,
     };
     if let Some(existing) = session
         .transcript

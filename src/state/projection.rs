@@ -1060,6 +1060,8 @@ fn transcript_entry_view(
             .enumerate()
             .map(|(index, _)| transcript_artifact_id(&entry.id, index))
             .collect(),
+        provider_id: entry.provider_id.clone(),
+        model_id: entry.model_id.clone().map(ModelId::from),
     }
 }
 
@@ -1588,6 +1590,8 @@ mod tests {
                 title: "reviewer".to_owned(),
                 body,
                 status: EntryStatus::Complete,
+                provider_id: None,
+                model_id: None,
             }],
         }]);
 
@@ -1816,6 +1820,8 @@ mod tests {
             body_total_bytes: u64::try_from(body.len()).unwrap_or(u64::MAX),
             status,
             artifacts: Vec::new(),
+            provider_id: None,
+            model_id: None,
         }
     }
 
