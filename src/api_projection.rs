@@ -394,6 +394,9 @@ fn api_resolution(
         view::InteractionResolution::Answer { option_ids } => {
             (api::InteractionResolutionKind::Answer, option_ids)
         }
+        view::InteractionResolution::AnswerQuestions { .. } => {
+            unreachable!("the native TUI does not construct structured question answers")
+        }
     }
 }
 
@@ -950,6 +953,26 @@ fn interaction(value: api::Interaction) -> Result<view::InteractionView, String>
             })
             .collect(),
         multiple: value.multiple,
+        questions: value
+            .questions
+            .into_iter()
+            .map(|question| view::InteractionQuestionView {
+                id: question.id,
+                title: question.title,
+                detail: question.detail,
+                options: question
+                    .options
+                    .into_iter()
+                    .map(|option| view::InteractionOptionView {
+                        id: option.id,
+                        label: option.label,
+                        description: option.description,
+                        recommended: option.recommended,
+                    })
+                    .collect(),
+                multiple: question.multiple,
+            })
+            .collect(),
     })
 }
 

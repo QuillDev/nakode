@@ -78,27 +78,35 @@ impl Tool for AskTool {
                 Ok(questions) => questions,
                 Err(error) => return ToolResult::failure(error),
             };
-            let mut results = Vec::new();
-            for question in questions {
-                let logical_id = question.logical_id.clone();
+            // Publish every item before waiting. A multi-question ask is one parked interaction and
+            // must be answered atomically rather than exposing a succession of unrelated dialogs.
+            let results = futures_util::future::join_all(questions.into_iter().map(|question| {
+                let logical_id = question.logical_id;
                 let question_text = question.request.question.clone();
-                match context
-                    .questions
-                    .ask(question.request, context.backend_events, cancellation)
-                    .await
-                {
-                    Ok(answer) => {
-                        let selected_options = serde_json::from_str::<Vec<String>>(&answer)
-                            .unwrap_or_else(|_| vec![answer]);
-                        results.push(json!({
-                            "id": logical_id,
-                            "question": question_text,
-                            "selectedOptions": selected_options
-                        }));
-                    }
-                    Err(error) => return ToolResult::failure(error),
+                async move {
+                    context
+                        .questions
+                        .ask(question.request, context.backend_events, cancellation)
+                        .await
+                        .map(|answer| match answer {
+                            crate::backend::QuestionAnswer::Options(selected_options) => json!({
+                                "id": logical_id,
+                                "question": question_text,
+                                "selectedOptions": selected_options
+                            }),
+                            crate::backend::QuestionAnswer::Text(text) => json!({
+                                "id": logical_id,
+                                "question": question_text,
+                                "text": text
+                            }),
+                        })
                 }
-            }
+            }))
+            .await;
+            let results = match results.into_iter().collect::<Result<Vec<_>, _>>() {
+                Ok(results) => results,
+                Err(error) => return ToolResult::failure(error),
+            };
             ToolResult::success(
                 serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_owned()),
             )
@@ -112,17 +120,29 @@ struct ParsedQuestion {
 }
 
 fn parse_questions(arguments: &Value) -> Result<Vec<ParsedQuestion>, String> {
-    arguments
+    let group_id = Uuid::now_v7().to_string();
+    let questions = arguments
         .get("questions")
         .and_then(Value::as_array)
         .filter(|questions| !questions.is_empty())
         .ok_or_else(|| "ask requires a non-empty questions array".to_owned())?
         .iter()
-        .map(parse_question)
-        .collect()
+        .enumerate()
+        .map(|(order, value)| parse_question(value, &group_id, order))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut ids = std::collections::HashSet::new();
+    for question in &questions {
+        if !ids.insert(question.logical_id.as_str()) {
+            return Err(format!(
+                "duplicate ask question id {:?}",
+                question.logical_id
+            ));
+        }
+    }
+    Ok(questions)
 }
 
-fn parse_question(value: &Value) -> Result<ParsedQuestion, String> {
+fn parse_question(value: &Value, group_id: &str, order: usize) -> Result<ParsedQuestion, String> {
     let logical_id = non_empty_string(value, "id")?.to_owned();
     let question = non_empty_string(value, "question")?.to_owned();
     let title = value
@@ -160,9 +180,12 @@ fn parse_question(value: &Value) -> Result<ParsedQuestion, String> {
         ));
     }
     Ok(ParsedQuestion {
-        logical_id,
+        logical_id: logical_id.clone(),
         request: QuestionRequest {
             id: Uuid::now_v7().to_string(),
+            logical_id: logical_id.clone(),
+            group_id: group_id.to_owned(),
+            order,
             title,
             question,
             options,

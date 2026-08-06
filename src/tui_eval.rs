@@ -742,6 +742,7 @@ fn install_approval_view(
         detail,
         options: Vec::new(),
         multiple: false,
+        questions: Vec::new(),
     });
     bump_session(session);
     Ok(())
@@ -775,6 +776,7 @@ fn install_question_view(
             })
             .collect(),
         multiple: multi,
+        questions: Vec::new(),
     });
     bump_session(session);
     Ok(())

@@ -289,6 +289,15 @@ pub struct InteractionOptionView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InteractionQuestionView {
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+    pub options: Vec<InteractionOptionView>,
+    pub multiple: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InteractionView {
     pub id: InteractionId,
     pub revision: u64,
@@ -298,6 +307,9 @@ pub struct InteractionView {
     pub detail: String,
     pub options: Vec<InteractionOptionView>,
     pub multiple: bool,
+    /// Present for grouped question interactions. Legacy scalar fields above mirror the first item.
+    #[serde(default)]
+    pub questions: Vec<InteractionQuestionView>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
