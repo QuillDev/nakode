@@ -9674,6 +9674,112 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    fn interleaved_content_blocks_converge_across_live_updates_and_history() {
+        let mut state = ready_state();
+        state.backend_provider = crate::backend::CLAUDE_PROVIDER.to_owned();
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("claude-agent/opus".to_owned()),
+            cancelling: false,
+        });
+
+        let started = |id: &str, kind: ItemKind, title: &str| BackendEvent::ItemStarted {
+            turn_id: "turn-1".to_owned(),
+            item: NormalizedItem {
+                id: id.to_owned(),
+                kind,
+                title: title.to_owned(),
+                body: String::new(),
+                status: ItemStatus::Running,
+            },
+        };
+        let delta = |id: &str, kind: DeltaKind, text: &str| BackendEvent::ItemDelta {
+            turn_id: "turn-1".to_owned(),
+            item_id: id.to_owned(),
+            kind,
+            delta: text.to_owned(),
+        };
+        let completed = |id: &str, name: &str, body: &str| BackendEvent::ItemCompleted {
+            turn_id: "turn-1".to_owned(),
+            item: NormalizedItem {
+                id: id.to_owned(),
+                kind: ItemKind::Tool,
+                title: name.to_owned(),
+                body: body.to_owned(),
+                status: ItemStatus::Complete,
+            },
+        };
+
+        for event in [
+            delta("think", DeltaKind::Reasoning, "Inspecting"),
+            delta("intro", DeltaKind::Assistant, "Before tools."),
+            started("tool-a", ItemKind::Tool, "Read"),
+            started("tool-b", ItemKind::Tool, "Grep"),
+            completed("tool-b", "Grep", "second result"),
+            completed("tool-a", "Read", "first result"),
+            delta("final", DeltaKind::Assistant, "After tools."),
+            // A duplicate delayed status patch updates in place rather than jumping to the tail.
+            completed("tool-a", "Read", "first result"),
+        ] {
+            state.handle_backend(event);
+        }
+
+        let live = state
+            .transcript
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key.as_deref().unwrap_or_default().to_owned(),
+                    entry.kind,
+                    entry.body.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            live.iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<Vec<_>>(),
+            ["think", "intro", "tool-a", "tool-b", "final"]
+        );
+        assert_eq!(live[0].1, EntryKind::Reasoning);
+        assert_eq!(live[4].2, "After tools.");
+
+        let history = live
+            .iter()
+            .map(|(id, kind, body)| SessionHistoryItem {
+                turn_id: "turn-1".to_owned(),
+                provider_id: Some(crate::backend::CLAUDE_PROVIDER.to_owned()),
+                model_id: Some("claude-agent/opus".to_owned()),
+                item: NormalizedItem {
+                    id: id.clone(),
+                    kind: match kind {
+                        EntryKind::Reasoning => ItemKind::Reasoning,
+                        EntryKind::Assistant => ItemKind::Assistant,
+                        EntryKind::Tool => ItemKind::Tool,
+                        _ => ItemKind::System,
+                    },
+                    title: id.clone(),
+                    body: body.clone(),
+                    status: ItemStatus::Complete,
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut resumed = ready_state();
+        resumed.install_history(history.clone());
+        resumed.install_history(history);
+        assert_eq!(
+            resumed
+                .transcript
+                .entries()
+                .iter()
+                .map(|entry| entry.key.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ["think", "intro", "tool-a", "tool-b", "final"]
+        );
+    }
+
+    #[test]
     fn turn_completion_finalizes_running_item_entries() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());

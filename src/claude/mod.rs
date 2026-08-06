@@ -613,16 +613,24 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
     let _ = events.send(event).await;
 }
 
+fn claude_content_block_id(message: &Value) -> String {
+    let message_id = string(message, "messageId");
+    let block_index = message["blockIndex"].as_u64();
+    if message_id.is_empty() || block_index.is_none() {
+        return format!("{}:claude", string(message, "turnId"));
+    }
+    format!("claude:{message_id}:{}", block_index.unwrap_or_default())
+}
+
 fn delta_event(message: &Value) -> BackendEvent {
     let kind = if message["kind"] == "reasoning" {
         DeltaKind::Reasoning
     } else {
         DeltaKind::Assistant
     };
-    let turn_id = string(message, "turnId");
     BackendEvent::ItemDelta {
-        item_id: format!("{turn_id}:claude"),
-        turn_id,
+        item_id: claude_content_block_id(message),
+        turn_id: string(message, "turnId"),
         kind,
         delta: string(message, "text"),
     }
@@ -721,6 +729,7 @@ fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
             let kind = match value["kind"].as_str() {
                 Some("user") => ItemKind::User,
                 Some("assistant") => ItemKind::Assistant,
+                Some("reasoning") => ItemKind::Reasoning,
                 _ => ItemKind::Tool,
             };
             let status = match value["status"].as_str() {
@@ -838,6 +847,9 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("@anthropic-ai/claude-agent-sdk"));
         assert!(BRIDGE_SOURCE.contains("pathToClaudeCodeExecutable"));
         assert!(BRIDGE_SOURCE.contains("canUseTool"));
+        assert!(BRIDGE_SOURCE.contains("messageId: message.uuid"));
+        assert!(BRIDGE_SOURCE.contains("blockIndex: event.index"));
+        assert!(BRIDGE_SOURCE.contains("`claude:${messageId}:${blockIndex}`"));
     }
 
     #[test]
@@ -993,6 +1005,89 @@ await eval(`(async () => {
             models[0].capabilities.reasoning_efforts,
             ["low", "medium", "high"]
         );
+    }
+
+    #[test]
+    fn claude_content_blocks_keep_stable_message_and_block_identity() {
+        let first = delta_event(&json!({
+            "turnId": "turn-1",
+            "messageId": "message-a",
+            "blockIndex": 0,
+            "kind": "reasoning",
+            "text": "Inspecting"
+        }));
+        let BackendEvent::ItemDelta { item_id, kind, .. } = first else {
+            panic!("expected item delta");
+        };
+        assert_eq!(item_id, "claude:message-a:0");
+        assert_eq!(kind, DeltaKind::Reasoning);
+
+        let intro = delta_event(&json!({
+            "turnId": "turn-1",
+            "messageId": "message-a",
+            "blockIndex": 1,
+            "kind": "assistant",
+            "text": "Before the tool."
+        }));
+        let final_text = delta_event(&json!({
+            "turnId": "turn-1",
+            "messageId": "message-b",
+            "blockIndex": 0,
+            "kind": "assistant",
+            "text": "After the tool."
+        }));
+        let (
+            BackendEvent::ItemDelta {
+                item_id: intro_id, ..
+            },
+            BackendEvent::ItemDelta {
+                item_id: final_id, ..
+            },
+        ) = (intro, final_text)
+        else {
+            panic!("expected item deltas");
+        };
+        assert_eq!(intro_id, "claude:message-a:1");
+        assert_eq!(final_id, "claude:message-b:0");
+        assert_ne!(intro_id, final_id);
+    }
+
+    #[test]
+    fn resumed_claude_history_preserves_reasoning_and_provider_order() {
+        let history = session_history(&json!({
+            "history": [
+                {"turnId":"turn-1","id":"think","kind":"reasoning","title":"THINKING","body":"Inspect","status":"complete"},
+                {"turnId":"turn-1","id":"intro","kind":"assistant","title":"CLAUDE","body":"Before","status":"complete"},
+                {"turnId":"turn-1","id":"tool-a","kind":"tool","title":"Read","body":"result","status":"complete"},
+                {"turnId":"turn-1","id":"final","kind":"assistant","title":"CLAUDE","body":"After","status":"complete"}
+            ]
+        }));
+
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| (entry.item.id.as_str(), entry.item.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("think", ItemKind::Reasoning),
+                ("intro", ItemKind::Assistant),
+                ("tool-a", ItemKind::Tool),
+                ("final", ItemKind::Assistant),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_claude_delta_without_block_metadata_keeps_compatible_identity() {
+        let event = delta_event(&json!({
+            "turnId": "turn-1",
+            "kind": "assistant",
+            "text": "legacy"
+        }));
+        let BackendEvent::ItemDelta { item_id, .. } = event else {
+            panic!("expected item delta");
+        };
+        assert_eq!(item_id, "turn-1:claude");
     }
 
     #[test]
