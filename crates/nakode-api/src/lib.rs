@@ -25,6 +25,24 @@ mod tests {
     use super::v1::FILE_DESCRIPTOR_SET;
 
     #[test]
+    fn queue_redirect_reservation_round_trips_on_field_five() {
+        let item = super::v1::QueueItem {
+            id: "prompt-1".to_owned(),
+            summary: "reserved follow-up".to_owned(),
+            attachment_count: 1,
+            text: "run next".to_owned(),
+            redirecting: true,
+        };
+        let encoded = item.encode_to_vec();
+        let decoded = super::v1::QueueItem::decode(encoded.as_slice())
+            .expect("generated queue item must decode");
+
+        assert_eq!(decoded, item);
+        assert!(decoded.redirecting);
+        assert!(encoded.windows(2).any(|field| field == [0x28, 0x01]));
+    }
+
+    #[test]
     fn public_descriptor_exposes_the_complete_frontend_edge_inventory() {
         let descriptor = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
             .expect("generated descriptor must decode");

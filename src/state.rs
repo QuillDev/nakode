@@ -178,12 +178,16 @@ struct PendingSteer {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QueuedSteerOrigin {
-    prompt: QueuedPrompt,
-    index: usize,
+    prompt_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingRedirect {
+    prompt_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RedirectStart {
     prompt: QueuedPrompt,
     index: usize,
 }
@@ -938,8 +942,10 @@ pub struct DomainState {
     starting_turn: Option<OutgoingPrompt>,
     recoverable_prompt: Option<RecoverablePrompt>,
     pending_steer: Option<PendingSteer>,
-    /// A queued follow-up promoted ahead of ordinary draining after interruption.
+    /// A queued follow-up reserved in place and promoted after interruption.
     pending_redirect: Option<PendingRedirect>,
+    /// A promoted follow-up removed from the queue only while its replacement turn is starting.
+    redirect_start: Option<RedirectStart>,
     pending_handoff: Option<HandoffPackage>,
     resuming_session: Option<SessionRecord>,
     item_turns: HashMap<String, String>,
@@ -1595,6 +1601,7 @@ impl DomainState {
             recoverable_prompt: None,
             pending_steer: None,
             pending_redirect: None,
+            redirect_start: None,
             pending_handoff: None,
             resuming_session: None,
             item_turns: HashMap::new(),
@@ -3044,6 +3051,21 @@ impl DomainState {
             .iter()
             .position(|prompt| prompt.id == prompt_id)
             .ok_or_else(|| DomainCommandError::NotFound(prompt_id.to_owned()))?;
+        let reserved = self
+            .pending_redirect
+            .as_ref()
+            .is_some_and(|pending| pending.prompt_id == prompt_id)
+            || self.pending_steer.as_ref().is_some_and(|pending| {
+                pending
+                    .queued_origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.prompt_id == prompt_id)
+            });
+        if reserved {
+            return Err(DomainCommandError::Conflict(
+                "the queued message is already being redirected".to_owned(),
+            ));
+        }
         let Some(removed) = self.queue.remove(position) else {
             return Err(DomainCommandError::NotFound(prompt_id.to_owned()));
         };
@@ -3055,12 +3077,13 @@ impl DomainState {
     ///
     /// Providers with native steering receive the prompt in the current turn. Providers that can
     /// interrupt but not steer instead stop the current turn and run the selected prompt next. The
-    /// selected prompt is held outside the ordinary queue while interruption settles, so completion
-    /// and cancellation races cannot run a sibling first or submit it twice.
+    /// selected prompt remains reserved in the ordinary queue while interruption settles, so
+    /// completion and cancellation races cannot run a sibling first or submit it twice.
     ///
     /// # Errors
-    /// Returns not found for a stale prompt identity, rejects attachments because steering accepts
-    /// text only, and rejects providers that support neither steering nor interruption.
+    /// Returns not found for a stale prompt identity and rejects providers that support neither
+    /// native steering nor ordered interruption. Queued attachments use stop-and-send because native
+    /// steering accepts text only.
     pub fn steer_queued_prompt(
         &mut self,
         prompt_id: &str,
@@ -3075,11 +3098,6 @@ impl DomainState {
             .get(position)
             .cloned()
             .ok_or_else(|| DomainCommandError::NotFound(prompt_id.to_owned()))?;
-        if !prompt.attachments.is_empty() {
-            return Err(DomainCommandError::Invalid(
-                "queued prompts with attachments cannot be used for steering".to_owned(),
-            ));
-        }
         let turn_id = self
             .active_turn
             .as_ref()
@@ -3088,16 +3106,17 @@ impl DomainState {
                 DomainCommandError::Conflict("there is no active turn to steer".to_owned())
             })?;
 
-        if self.backend_capabilities.steering.is_supported() {
+        if self.pending_redirect.is_some() {
+            return Err(DomainCommandError::Conflict(
+                "a queued redirect is already pending".to_owned(),
+            ));
+        }
+
+        if self.backend_capabilities.steering.is_supported() && prompt.attachments.is_empty() {
             let effects = self.steer_turn(&turn_id, &prompt.text)?;
-            let removed = self
-                .queue
-                .remove(position)
-                .ok_or_else(|| DomainCommandError::NotFound(prompt_id.to_owned()))?;
             if let Some(pending) = &mut self.pending_steer {
                 pending.queued_origin = Some(QueuedSteerOrigin {
-                    prompt: removed,
-                    index: position,
+                    prompt_id: prompt.id,
                 });
             }
             return Ok(effects);
@@ -3105,16 +3124,10 @@ impl DomainState {
 
         if !self.backend_capabilities.interruption.is_supported() {
             return Err(DomainCommandError::Unsupported(format!(
-                "{} supports neither steering nor interruption",
+                "{} cannot redirect this queued message: native steering accepts text only and interruption is unavailable",
                 self.backend_name
             )));
         }
-        if self.pending_redirect.is_some() {
-            return Err(DomainCommandError::Conflict(
-                "a queued redirect is already pending".to_owned(),
-            ));
-        }
-
         let already_cancelling = self
             .active_turn
             .as_ref()
@@ -3124,14 +3137,10 @@ impl DomainState {
         } else {
             self.cancel_turn(&turn_id)?
         };
-        let Some(prompt) = self.queue.remove(position) else {
-            return Err(DomainCommandError::NotFound(prompt_id.to_owned()));
-        };
         self.pending_redirect = Some(PendingRedirect {
-            prompt,
-            index: position,
+            prompt_id: prompt.id,
         });
-        self.set_status("Interrupting active turn; selected follow-up will run next…");
+        self.set_status("Interrupting active turn; selected follow-up is reserved to run next…");
         Ok(effects)
     }
 
@@ -3572,6 +3581,7 @@ impl DomainState {
         self.recoverable_prompt = None;
         self.pending_steer = None;
         self.pending_redirect = None;
+        self.redirect_start = None;
         self.pending_handoff = None;
         self.resuming_session = None;
         self.item_turns.clear();
@@ -5752,13 +5762,26 @@ impl DomainState {
             return;
         };
         if pending.turn_id != turn_id || !self.turn_is_current(turn_id) {
-            let restored = self.restore_queued_steer(pending);
-            self.set_status(if restored {
+            let queued = pending.queued_origin.is_some();
+            self.set_status(if queued {
                 "A late steer response was ignored; the queued message remains a follow-up."
             } else {
                 "A late steer response was ignored."
             });
             return;
+        }
+        if let Some(origin) = &pending.queued_origin {
+            let Some(position) = self
+                .queue
+                .iter()
+                .position(|prompt| prompt.id == origin.prompt_id)
+            else {
+                self.set_status(
+                    "Steering was accepted, but its reserved queued message was unavailable.",
+                );
+                return;
+            };
+            self.queue.remove(position);
         }
         self.transcript.push(
             EntryKind::Steering,
@@ -5769,23 +5792,7 @@ impl DomainState {
         self.set_status("Steering guidance accepted.");
     }
 
-    fn restore_queued_steer(&mut self, pending: PendingSteer) -> bool {
-        let Some(origin) = pending.queued_origin else {
-            return false;
-        };
-        if self
-            .queue
-            .iter()
-            .any(|prompt| prompt.id == origin.prompt.id)
-        {
-            return false;
-        }
-        let index = origin.index.min(self.queue.len());
-        self.queue.insert(index, origin.prompt);
-        true
-    }
-
-    fn restore_pending_redirect(&mut self, pending: PendingRedirect) -> bool {
+    fn restore_redirect_start(&mut self, pending: RedirectStart) -> bool {
         if self
             .queue
             .iter()
@@ -5796,6 +5803,30 @@ impl DomainState {
         let index = pending.index.min(self.queue.len());
         self.queue.insert(index, pending.prompt);
         true
+    }
+
+    fn begin_pending_redirect(&mut self, pending: &PendingRedirect) -> Vec<Effect> {
+        let Some(position) = self
+            .queue
+            .iter()
+            .position(|prompt| prompt.id == pending.prompt_id)
+        else {
+            self.status_message.push_str(
+                " The selected follow-up could not be found, so no replacement turn was started.",
+            );
+            return Vec::new();
+        };
+        let Some(prompt) = self.queue.remove(position) else {
+            self.status_message.push_str(
+                " The selected follow-up could not be reserved, so no replacement turn was started.",
+            );
+            return Vec::new();
+        };
+        self.redirect_start = Some(RedirectStart {
+            prompt: prompt.clone(),
+            index: position,
+        });
+        self.begin_prompt(prompt)
     }
 
     fn handle_model_rerouted(&mut self, turn_id: &str, from: &str, to: &str) {
@@ -5854,15 +5885,20 @@ impl DomainState {
         self.context_usage = None;
         self.context_compaction = None;
         self.creating_session = None;
-        if let Some(pending) = self.pending_steer.take() {
-            self.restore_queued_steer(pending);
-        }
-        if let Some(pending) = self.pending_redirect.take() {
-            self.restore_pending_redirect(pending);
+        self.pending_steer = None;
+        self.pending_redirect = None;
+        let redirected_prompt = self.redirect_start.take();
+        let redirected_id = redirected_prompt
+            .as_ref()
+            .map(|pending| pending.prompt.id.clone());
+        if let Some(pending) = redirected_prompt {
+            self.restore_redirect_start(pending);
         }
         self.approvals.clear();
         self.set_status("The provider session was closed.");
-        if let Some(prompt) = pending_prompt {
+        if let Some(prompt) = pending_prompt
+            && redirected_id.as_deref() != Some(prompt.id.as_str())
+        {
             self.restore_failed_prompt(&prompt);
         }
     }
@@ -5877,11 +5913,14 @@ impl DomainState {
         self.active_turn = None;
         self.context_compaction = None;
         self.creating_session = None;
-        if let Some(pending) = self.pending_steer.take() {
-            self.restore_queued_steer(pending);
-        }
-        if let Some(pending) = self.pending_redirect.take() {
-            self.restore_pending_redirect(pending);
+        self.pending_steer = None;
+        self.pending_redirect = None;
+        let redirected_prompt = self.redirect_start.take();
+        let redirected_id = redirected_prompt
+            .as_ref()
+            .map(|pending| pending.prompt.id.clone());
+        if let Some(pending) = redirected_prompt {
+            self.restore_redirect_start(pending);
         }
         self.transcript.push(
             EntryKind::Error,
@@ -5890,7 +5929,9 @@ impl DomainState {
             EntryStatus::Failed,
         );
         self.status_message = reason;
-        if let Some(prompt) = pending_prompt {
+        if let Some(prompt) = pending_prompt
+            && redirected_id.as_deref() != Some(prompt.id.as_str())
+        {
             self.restore_failed_prompt(&prompt);
         }
     }
@@ -6025,11 +6066,19 @@ impl DomainState {
             self.diagnostic_count += 1;
             return;
         }
-        let model = self
-            .starting_turn
-            .take()
-            .and_then(|prompt| prompt.model)
+        let starting = self.starting_turn.take();
+        let model = starting
+            .as_ref()
+            .and_then(|prompt| prompt.model.clone())
             .or_else(|| self.selected_model.clone());
+        if let Some(started) = &starting
+            && self
+                .redirect_start
+                .as_ref()
+                .is_some_and(|pending| pending.prompt.id == started.id)
+        {
+            self.redirect_start = None;
+        }
         self.active_turn = Some(ActiveTurn {
             id: turn_id,
             model,
@@ -6084,9 +6133,9 @@ impl DomainState {
             .pending_steer
             .as_ref()
             .is_some_and(|pending| pending.turn_id == turn_id)
-            && let Some(pending) = self.pending_steer.take()
         {
-            self.restore_queued_steer(pending);
+            // A queued native steer was never accepted, so its message remains queued in place.
+            self.pending_steer = None;
         }
 
         match outcome {
@@ -6120,8 +6169,13 @@ impl DomainState {
             .map(Effect::TouchSession)
             .into_iter()
             .collect::<Vec<_>>();
+        if outcome == TurnOutcome::Failed && self.pending_redirect.is_some() {
+            self.pending_redirect = None;
+            self.status_message.push_str(" The selected follow-up remains queued; retry Steer now after the provider recovers.");
+            return effects;
+        }
         if let Some(pending) = self.pending_redirect.take() {
-            effects.extend(self.begin_prompt(pending.prompt));
+            effects.extend(self.begin_pending_redirect(&pending));
         } else {
             effects.extend(self.drain_queue());
         }
@@ -6323,25 +6377,34 @@ impl DomainState {
                     self.set_status(
                         "Turn start timed out; waiting for a definitive backend event.",
                     );
-                } else {
-                    if let Some(prompt) = self.starting_turn.take() {
-                        self.restore_failed_prompt(&prompt);
+                } else if let Some(prompt) = self.starting_turn.take() {
+                    let redirected = self
+                        .redirect_start
+                        .as_ref()
+                        .is_some_and(|pending| pending.prompt.id == prompt.id);
+                    if redirected {
+                        if let Some(pending) = self.redirect_start.take() {
+                            self.restore_redirect_start(pending);
+                        }
+                        self.status_message.push_str(
+                            " The selected follow-up remains queued; retry Steer now after fixing the provider error.",
+                        );
+                        return Vec::new();
                     }
+                    self.restore_failed_prompt(&prompt);
+                    return self.drain_queue();
+                } else {
                     return self.drain_queue();
                 }
             }
             BackendOperation::SteerTurn => {
-                if let Some(pending) = self.pending_steer.take() {
-                    self.restore_queued_steer(pending);
-                }
+                self.pending_steer = None;
             }
             BackendOperation::InterruptTurn => {
                 if let Some(active) = &mut self.active_turn {
                     active.cancelling = false;
                 }
-                if let Some(pending) = self.pending_redirect.take() {
-                    self.restore_pending_redirect(pending);
-                }
+                self.pending_redirect = None;
             }
         }
         Vec::new()
@@ -8379,13 +8442,19 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .iter()
                 .map(|prompt| prompt.text.as_str())
                 .collect::<Vec<_>>(),
-            ["first follow-up", "repeat me"]
+            ["first follow-up", "repeat me", "repeat me"]
+        );
+        assert!(
+            super::projection::queue_views(&state)
+                .iter()
+                .find(|item| item.id.as_str() == middle_id)
+                .is_some_and(|item| item.redirecting)
         );
 
         let duplicate = state
             .steer_queued_prompt(&middle_id)
             .expect_err("the same queue identity cannot dispatch twice");
-        assert!(duplicate.to_string().contains(&middle_id));
+        assert!(duplicate.to_string().contains("already pending"));
 
         state.handle_backend(BackendEvent::SteerAccepted {
             turn_id: "turn-1".to_owned(),
@@ -8431,8 +8500,27 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .iter()
                 .map(|prompt| prompt.text.as_str())
                 .collect::<Vec<_>>(),
-            ["first", "third"]
+            ["first", "redirect me", "third"]
         );
+        assert_eq!(
+            state
+                .pending_redirect
+                .as_ref()
+                .map(|pending| pending.prompt_id.as_str()),
+            Some(selected_id.as_str())
+        );
+        assert!(
+            super::projection::queue_views(&state)
+                .iter()
+                .find(|item| item.id.as_str() == selected_id)
+                .is_some_and(|item| item.redirecting)
+        );
+        assert!(
+            state
+                .handle_backend(BackendEvent::InterruptAccepted)
+                .is_empty()
+        );
+        assert!(state.redirect_start.is_none());
 
         let effects = state.handle_backend(BackendEvent::TurnCompleted {
             turn_id: "turn-1".to_owned(),
@@ -8582,6 +8670,157 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    fn fallback_reservation_rejects_repeated_redirect_and_selected_removal_but_allows_siblings() {
+        let mut state = ready_state();
+        state.backend_capabilities.steering = CapabilitySupport::Unsupported;
+        state.provider_session_id = Some("thread-1".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        for text in ["first", "selected", "third"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let first_id = state.queue[0].id.clone();
+        let selected_id = state.queue[1].id.clone();
+        state
+            .steer_queued_prompt(&selected_id)
+            .expect("reserve selected follow-up");
+
+        assert!(matches!(
+            state.steer_queued_prompt(&selected_id),
+            Err(super::DomainCommandError::Conflict(message))
+                if message == "a queued redirect is already pending"
+        ));
+        assert!(matches!(
+            state.remove_queued_prompt(&selected_id),
+            Err(super::DomainCommandError::Conflict(message))
+                if message == "the queued message is already being redirected"
+        ));
+        state
+            .remove_queued_prompt(&first_id)
+            .expect("an unrelated queue item remains independently removable");
+        state
+            .enqueue_prompt("new sibling".to_owned(), Vec::new())
+            .expect("concurrent queue append");
+
+        let effects = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Interrupted,
+            error: None,
+        });
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    Effect::Backend(BackendCommand::StartTurn { .. })
+                ))
+                .count(),
+            1
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, .. })
+                if client_id == &selected_id
+        )));
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            ["third", "new sibling"]
+        );
+    }
+
+    #[test]
+    fn provider_exit_failure_retains_reserved_follow_up_without_starting_a_replacement() {
+        let mut state = ready_state();
+        state.backend_capabilities.steering = CapabilitySupport::Unsupported;
+        state.provider_session_id = Some("claude-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        state
+            .enqueue_prompt("safe next turn".to_owned(), Vec::new())
+            .expect("queue follow-up");
+        let selected_id = state.queue[0].id.clone();
+        state
+            .steer_queued_prompt(&selected_id)
+            .expect("begin fallback");
+
+        let effects = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Failed,
+            error: Some("Claude Code process exited with code 1".to_owned()),
+        });
+
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. })))
+        );
+        assert_eq!(state.queue[0].id, selected_id);
+        assert!(state.status_message.contains("remains queued"));
+        assert!(state.pending_redirect.is_none());
+    }
+
+    #[test]
+    fn replacement_start_failure_restores_the_reserved_follow_up_without_retrying_it() {
+        let mut state = ready_state();
+        state.backend_capabilities.steering = CapabilitySupport::Unsupported;
+        state.provider_session_id = Some("claude-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+        for text in ["first", "selected", "third"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let selected_id = state.queue[1].id.clone();
+        state
+            .steer_queued_prompt(&selected_id)
+            .expect("begin fallback");
+        let start = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Interrupted,
+            error: None,
+        });
+        assert!(start.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, .. })
+                if client_id == &selected_id
+        )));
+
+        let retry = state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::StartTurn,
+            code: -1,
+            message: "provider process failed before the turn started".to_owned(),
+        });
+
+        assert!(retry.is_empty(), "a failed replacement must not auto-retry");
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "selected", "third"]
+        );
+        assert!(state.status_message.contains("remains queued"));
+        assert!(state.recoverable_prompt().is_none());
+    }
+
+    #[test]
     fn failed_queued_steer_restores_the_exact_follow_up_position() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
@@ -8622,7 +8861,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
-    fn queued_prompt_controls_preserve_siblings_and_reject_steering_attachments() {
+    fn queued_prompt_controls_preserve_siblings_and_fallback_keeps_attachments() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
         state.active_turn = Some(super::ActiveTurn {
@@ -8655,11 +8894,15 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state
             .remove_queued_prompt(&first_id)
             .expect("dequeue independently");
-        let error = state
+        let effects = state
             .steer_queued_prompt(&image_id)
-            .expect_err("attachments are not silently discarded for steering");
+            .expect("an image follow-up uses ordered stop-and-send");
 
-        assert!(error.to_string().contains("attachments"));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(BackendCommand::InterruptTurn { turn_id, .. })]
+                if turn_id == "turn-1"
+        ));
         assert_eq!(
             state
                 .queue
@@ -8667,6 +8910,13 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .map(|prompt| prompt.text.as_str())
                 .collect::<Vec<_>>(),
             ["image follow-up", "keep too"]
+        );
+        assert_eq!(
+            state
+                .pending_redirect
+                .as_ref()
+                .map(|pending| pending.prompt_id.as_str()),
+            Some(image_id.as_str())
         );
         assert!(state.pending_steer.is_none());
     }

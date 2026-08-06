@@ -7,7 +7,7 @@ import {
   tool,
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
-import { spawn } from "node:child_process";
+import { spawn as spawnChild } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -32,7 +32,7 @@ async function delegate(ownerSessionId, task) {
       );
       return;
     }
-    const child = spawn(
+    const child = spawnChild(
       executable,
       [
         "agent",
@@ -112,6 +112,95 @@ function nakodeServer(ownerSessionId) {
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+const FORCE_RELEASE_AFTER_MS = 2_000;
+const RELEASE_FAILURE_AFTER_MS = 7_000;
+
+/**
+ * Own one Claude Code subprocess and expose its close event as the session-release barrier.
+ * The SDK's iterator may settle as soon as cancellation is observed; only this child close proves
+ * that another process may safely resume the same provider session.
+ */
+function providerProcessLifecycle() {
+  let child = null;
+  let release = Promise.resolve();
+  let started = false;
+  let resolveStarted;
+  let rejectStarted;
+  const processStarted = new Promise((resolve, reject) => {
+    resolveStarted = resolve;
+    rejectStarted = reject;
+  });
+
+  return {
+    spawn(options) {
+      if (child !== null)
+        throw new Error("a Claude Code process is already attached to this turn");
+
+      child = spawnChild(options.command, options.args, {
+        cwd: options.cwd,
+        env: options.env,
+        signal: options.signal,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      release = new Promise((resolve, reject) => {
+        let forceTimer = null;
+        let failureTimer = null;
+        let settled = false;
+        const finish = (result, error) => {
+          if (settled) return;
+          settled = true;
+          if (forceTimer !== null) clearTimeout(forceTimer);
+          if (failureTimer !== null) clearTimeout(failureTimer);
+          options.signal.removeEventListener("abort", forceRelease);
+          if (error) reject(error);
+          else resolve(result);
+        };
+        const forceRelease = () => {
+          forceTimer = setTimeout(() => {
+            if (child !== null && child.exitCode === null)
+              child.kill("SIGKILL");
+          }, FORCE_RELEASE_AFTER_MS);
+          failureTimer = setTimeout(
+            () =>
+              finish(
+                null,
+                new Error(
+                  "Claude Code did not exit after cancellation; the provider session may still be in use",
+                ),
+              ),
+            RELEASE_FAILURE_AFTER_MS,
+          );
+        };
+        child.once("spawn", () => {
+          started = true;
+          resolveStarted();
+        });
+        child.once("close", (code, signal) => finish({ code, signal }, null));
+        child.once("error", (error) => {
+          if (child?.pid === undefined) {
+            rejectStarted(error);
+            finish(null, error);
+          }
+        });
+        if (options.signal.aborted) forceRelease();
+        else options.signal.addEventListener("abort", forceRelease, {
+          once: true,
+        });
+      });
+      return child;
+    },
+    async started() {
+      await processStarted;
+    },
+    didStart() {
+      return started;
+    },
+    async released() {
+      await release;
+    },
+  };
 }
 
 async function nativeAgentHistory(workspace, sessionId) {
@@ -506,13 +595,13 @@ async function sendTurn(command) {
 
   const abortController = new AbortController();
   runs.set(command.turnId, abortController);
-  write({ event: "turn_started", turnId: command.turnId });
 
   const model = command.model || session.model;
   session.model = model;
   const mode = session.securityValidator
     ? "dontAsk"
     : await permissionMode(command.workspace);
+  const processLifecycle = providerProcessLifecycle();
   const options = {
     cwd: command.workspace,
     pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE || "claude",
@@ -526,6 +615,7 @@ async function sendTurn(command) {
     permissionMode: mode,
     ...(session.securityValidator ? { allowedTools: [] } : {}),
     canUseTool: permissionHandler(command.turnId, session, mode),
+    spawnClaudeCodeProcess: processLifecycle.spawn,
     ...(session.ownerSessionId && session.validationEnabled
       ? { mcpServers: { nakode: nakodeServer(session.ownerSessionId) } }
       : {}),
@@ -538,9 +628,11 @@ async function sendTurn(command) {
     ...(session.options.fastMode ? { settings: { fastMode: true } } : {}),
   };
 
-  let resultSeen = false;
+  let completion = null;
   try {
     const stream = query({ prompt: command.prompt, options });
+    await processLifecycle.started();
+    write({ event: "turn_started", turnId: command.turnId });
     for await (const message of stream) {
       if (message.type === "stream_event")
         emitStreamDelta(command.turnId, message);
@@ -549,7 +641,6 @@ async function sendTurn(command) {
       else if (message.type === "user")
         emitUserToolResults(command.turnId, message);
       else if (message.type === "result") {
-        resultSeen = true;
         await emitNativeAgentHistory(
           command.workspace,
           session.sessionId,
@@ -562,37 +653,61 @@ async function sendTurn(command) {
             usage: message.usage,
           });
         const success = message.subtype === "success" && !message.is_error;
-        write({
-          event: "turn_completed",
-          turnId: command.turnId,
+        completion = {
           status: success ? "finished" : "failed",
           error: success
             ? undefined
             : (message.errors || [message.result]).filter(Boolean).join("\n"),
           result: message.result,
           usage: message.usage,
-        });
+        };
       }
     }
-    session.started = true;
-    if (!resultSeen) {
-      write({
-        event: "turn_completed",
-        turnId: command.turnId,
-        status: "finished",
-      });
-    }
+    if (completion === null) completion = { status: "finished" };
   } catch (error) {
     const interrupted = abortController.signal.aborted;
-    write({
-      event: "turn_completed",
-      turnId: command.turnId,
+    completion = {
       status: interrupted ? "cancelled" : "failed",
       error: interrupted ? undefined : errorMessage(error),
-    });
+    };
   } finally {
     runs.delete(command.turnId);
   }
+
+  try {
+    await processLifecycle.released();
+  } catch (error) {
+    if (!processLifecycle.didStart()) {
+      write({
+        event: "turn_start_failed",
+        turnId: command.turnId,
+        message: errorMessage(error),
+      });
+      return;
+    }
+    sessions.delete(command.sessionId);
+    write({
+      event: "process_release_failed",
+      turnId: command.turnId,
+      sessionId: command.sessionId,
+      message: `${errorMessage(error)}. The queued follow-up was retained; reconnect only after the Claude Code process has exited.`,
+    });
+    return;
+  }
+  if (!processLifecycle.didStart()) {
+    write({
+      event: "turn_start_failed",
+      turnId: command.turnId,
+      message: completion?.error || "Claude Code process did not start",
+    });
+    return;
+  }
+  session.started = true;
+  write({
+    event: "turn_completed",
+    turnId: command.turnId,
+    ...completion,
+  });
 }
 
 async function modelCatalogue(command) {

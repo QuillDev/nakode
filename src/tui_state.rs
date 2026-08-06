@@ -256,6 +256,7 @@ mod tests {
             summary: "second".to_owned(),
             text: "second".to_owned(),
             attachment_count: 0,
+            redirecting: false,
         });
         state.install_bootstrap(&second);
 
@@ -398,6 +399,7 @@ mod tests {
                 summary: "first".to_owned(),
                 text: "first".to_owned(),
                 attachment_count: 0,
+                redirecting: false,
             }],
             interactions: vec![question()],
             todos: Vec::new(),

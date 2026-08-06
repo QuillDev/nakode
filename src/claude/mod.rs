@@ -593,6 +593,12 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
         "interrupt_accepted" => BackendEvent::InterruptAccepted,
         "usage" => usage_event(message),
         "turn_completed" => turn_completed_event(message),
+        "turn_start_failed" => BackendEvent::RequestFailed {
+            operation: BackendOperation::StartTurn,
+            code: -1,
+            message: string(message, "message"),
+        },
+        "process_release_failed" => process_release_failed_event(message),
         "error" => {
             request_failed(
                 events,
@@ -649,6 +655,12 @@ fn usage_event(message: &Value) -> BackendEvent {
                 .as_u64()
                 .unwrap_or_default(),
         },
+    }
+}
+
+fn process_release_failed_event(message: &Value) -> BackendEvent {
+    BackendEvent::Disconnected {
+        reason: string(message, "message"),
     }
 }
 
@@ -836,6 +848,114 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("SecurityValidation"));
         assert!(BRIDGE_SOURCE.contains("validated: false"));
         assert!(BRIDGE_SOURCE.contains("Recursive security validation was prevented"));
+    }
+
+    #[test]
+    fn claude_bridge_defers_turn_completion_until_the_provider_process_is_released() {
+        let release = BRIDGE_SOURCE
+            .find("await processLifecycle.released()")
+            .expect("provider release barrier");
+        let completion = BRIDGE_SOURCE[release..]
+            .find("event: \"turn_completed\"")
+            .map(|offset| release + offset)
+            .expect("terminal turn event");
+        assert!(completion > release);
+        assert!(
+            BRIDGE_SOURCE
+                .contains("await processLifecycle.started();\n    write({ event: \"turn_started\"")
+        );
+        assert!(BRIDGE_SOURCE.contains("spawnClaudeCodeProcess: processLifecycle.spawn"));
+        assert!(BRIDGE_SOURCE.contains("child.once(\"close\""));
+        assert!(BRIDGE_SOURCE.contains("process_release_failed"));
+    }
+
+    #[test]
+    fn claude_process_close_is_the_replacement_send_barrier() {
+        let directory = tempfile::tempdir().expect("temporary lifecycle test directory");
+        let bridge = directory.path().join("bridge.mjs");
+        let test = directory.path().join("lifecycle-test.mjs");
+        std::fs::write(&bridge, BRIDGE_SOURCE).expect("bridge fixture");
+        std::fs::write(
+            &test,
+            r#"
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
+import { PassThrough } from "node:stream";
+
+const source = readFileSync(process.argv[2], "utf8");
+const start = source.indexOf("const FORCE_RELEASE_AFTER_MS");
+const end = source.indexOf("async function nativeAgentHistory", start);
+assert.notEqual(start, -1);
+assert.notEqual(end, -1);
+const lifecycle = source.slice(start, end);
+
+let child;
+function spawnChild() {
+  child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  child.pid = 42;
+  child.kill = () => true;
+  queueMicrotask(() => child.emit("spawn"));
+  return child;
+}
+
+await eval(`(async () => {
+  ${lifecycle}
+  const controller = new AbortController();
+  const first = providerProcessLifecycle();
+  first.spawn({
+    command: "fake-claude",
+    args: [],
+    cwd: process.cwd(),
+    env: process.env,
+    signal: controller.signal,
+  });
+  await first.started();
+
+  let replacementSent = false;
+  const redirect = (async () => {
+    await first.released();
+    replacementSent = true;
+  })();
+  await new Promise(setImmediate);
+  assert.equal(replacementSent, false, "replacement sent before child close");
+
+  child.exitCode = 0;
+  child.emit("close", 0, null);
+  await redirect;
+  assert.equal(replacementSent, true, "replacement did not send after child close");
+})()`);
+"#,
+        )
+        .expect("lifecycle test script");
+
+        let output = std::process::Command::new("node")
+            .arg(&test)
+            .arg(&bridge)
+            .output()
+            .expect("run lifecycle test with Node");
+        assert!(
+            output.status.success(),
+            "lifecycle test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn process_release_failure_disconnects_without_completing_the_turn() {
+        let event = process_release_failed_event(&json!({
+            "event": "process_release_failed",
+            "message": "Claude Code did not exit; queued follow-up retained"
+        }));
+        assert!(matches!(
+            event,
+            BackendEvent::Disconnected { reason }
+                if reason.contains("queued follow-up retained")
+        ));
     }
 
     #[test]

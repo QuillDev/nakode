@@ -1384,22 +1384,18 @@ fn normalize_history_item(
             output,
             failed,
             ..
-        } => vec![SessionHistoryItem {
-            turn_id: turn_id.clone(),
-            provider_id: None,
-            model_id: None,
-            item: NormalizedItem {
-                id: item_id("tool"),
-                kind: ItemKind::Tool,
-                title: title.clone().unwrap_or_else(|| "Tool result".to_owned()),
-                body: output.clone(),
-                status: if *failed {
-                    ItemStatus::Failed
-                } else {
-                    ItemStatus::Complete
-                },
-            },
-        }],
+        } => {
+            let mut item = normalized(
+                ItemKind::Tool,
+                title.as_deref().unwrap_or("Tool result"),
+                output.clone(),
+                "tool",
+            );
+            if *failed {
+                item.item.status = ItemStatus::Failed;
+            }
+            vec![item]
+        }
         ConversationItem::Compaction { summary } => vec![normalized(
             ItemKind::System,
             "Context checkpoint",

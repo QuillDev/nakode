@@ -325,7 +325,17 @@ fn context_usage_view(state: &DomainState) -> Option<ContextUsageView> {
     })
 }
 
-fn queue_views(state: &DomainState) -> Vec<QueueItemView> {
+pub(super) fn queue_views(state: &DomainState) -> Vec<QueueItemView> {
+    let native_steer = state.pending_steer.as_ref().and_then(|pending| {
+        pending
+            .queued_origin
+            .as_ref()
+            .map(|origin| origin.prompt_id.as_str())
+    });
+    let fallback = state
+        .pending_redirect
+        .as_ref()
+        .map(|pending| pending.prompt_id.as_str());
     state
         .queue
         .iter()
@@ -334,6 +344,8 @@ fn queue_views(state: &DomainState) -> Vec<QueueItemView> {
             summary: first_line(&prompt.text),
             text: prompt.text.clone(),
             attachment_count: u32::try_from(prompt.attachments.len()).unwrap_or(u32::MAX),
+            redirecting: native_steer == Some(prompt.id.as_str())
+                || fallback == Some(prompt.id.as_str()),
         })
         .collect()
 }

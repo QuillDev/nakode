@@ -1227,6 +1227,67 @@ fn capability_supported(value: Option<&Value>) -> bool {
     })
 }
 
+async fn normalize_message_chunk(
+    kind: &str,
+    update: &Value,
+    events: &mpsc::Sender<BackendEvent>,
+    replay: &mut HashMap<String, Vec<SessionHistoryItem>>,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<(), ()> {
+    let text = update
+        .pointer("/content/text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let item_id = update
+        .get("messageId")
+        .and_then(Value::as_str)
+        .map_or_else(|| format!("{kind}:{turn_id}"), str::to_owned);
+    if let Some(history) = replay.get_mut(session_id) {
+        let item_kind = if kind == "user_message_chunk" {
+            ItemKind::User
+        } else {
+            ItemKind::Assistant
+        };
+        if let Some(existing) = history.iter_mut().find(|item| item.item.id == item_id) {
+            existing.item.body.push_str(&text);
+        } else {
+            history.push(SessionHistoryItem {
+                turn_id: turn_id.to_owned(),
+                provider_id: None,
+                model_id: None,
+                item: NormalizedItem {
+                    id: item_id,
+                    kind: item_kind,
+                    title: if item_kind == ItemKind::User {
+                        "YOU"
+                    } else {
+                        "ASSISTANT"
+                    }
+                    .to_owned(),
+                    body: text,
+                    status: ItemStatus::Complete,
+                },
+            });
+        }
+    } else if kind == "agent_message_chunk" {
+        events
+            .send(BackendEvent::ItemDelta {
+                turn_id: turn_id.to_owned(),
+                item_id,
+                kind: DeltaKind::Assistant,
+                delta: text,
+            })
+            .await
+            .map_err(|_| ())?;
+    }
+    Ok(())
+}
+
 async fn normalize_update(
     params: &Value,
     events: &mpsc::Sender<BackendEvent>,
@@ -1242,56 +1303,7 @@ async fn normalize_update(
         .unwrap_or_else(|| format!("history:{session_id}"));
     match kind.as_str() {
         "agent_message_chunk" | "user_message_chunk" => {
-            let text = update
-                .pointer("/content/text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            if text.is_empty() {
-                return Ok(());
-            }
-            let item_id = update
-                .get("messageId")
-                .and_then(Value::as_str)
-                .map_or_else(|| format!("{kind}:{turn_id}"), str::to_owned);
-            if let Some(history) = replay.get_mut(&session_id) {
-                let item_kind = if kind == "user_message_chunk" {
-                    ItemKind::User
-                } else {
-                    ItemKind::Assistant
-                };
-                if let Some(existing) = history.iter_mut().find(|item| item.item.id == item_id) {
-                    existing.item.body.push_str(&text);
-                } else {
-                    history.push(SessionHistoryItem {
-                        turn_id,
-                        provider_id: None,
-                        model_id: None,
-                        item: NormalizedItem {
-                            id: item_id,
-                            kind: item_kind,
-                            title: if item_kind == ItemKind::User {
-                                "YOU"
-                            } else {
-                                "ASSISTANT"
-                            }
-                            .to_owned(),
-                            body: text,
-                            status: ItemStatus::Complete,
-                        },
-                    });
-                }
-            } else if kind == "agent_message_chunk" {
-                events
-                    .send(BackendEvent::ItemDelta {
-                        turn_id,
-                        item_id,
-                        kind: DeltaKind::Assistant,
-                        delta: text,
-                    })
-                    .await
-                    .map_err(|_| ())?;
-            }
+            normalize_message_chunk(&kind, update, events, replay, &session_id, &turn_id).await?;
         }
         "tool_call" => {
             let item = tool_item(update, false);

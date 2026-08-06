@@ -256,6 +256,8 @@ pub struct QueueItemView {
     /// Complete semantic text, so a client can distinguish and control queued work without caching drafts.
     pub text: String,
     pub attachment_count: u32,
+    /// Reserved by an ordered native-steer or stop-and-send operation, but not yet consumed.
+    pub redirecting: bool,
 }
 
 /// A server-owned prompt that definitively failed before inference began.

@@ -1461,6 +1461,7 @@ fn queue_item(value: protocol::QueueItemView) -> api::QueueItem {
         summary: value.summary,
         attachment_count: value.attachment_count,
         text: value.text,
+        redirecting: value.redirecting,
     }
 }
 fn recoverable_prompt(value: protocol::RecoverablePromptView) -> api::RecoverablePrompt {
@@ -1736,6 +1737,21 @@ fn diagnostics_totals(value: &protocol::DiagnosticsUsageTotals) -> api::Diagnost
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_redirect_reservation_projects_to_grpc() {
+        let projected = queue_item(protocol::QueueItemView {
+            id: protocol::PromptId::from("prompt-1"),
+            summary: "reserved follow-up".to_owned(),
+            text: "run next".to_owned(),
+            attachment_count: 1,
+            redirecting: true,
+        });
+        assert_eq!(projected.id, "prompt-1");
+        assert_eq!(projected.text, "run next");
+        assert_eq!(projected.attachment_count, 1);
+        assert!(projected.redirecting);
+    }
 
     #[test]
     fn selected_session_options_are_projected_to_grpc() {
