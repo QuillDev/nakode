@@ -103,12 +103,27 @@ impl fmt::Debug for CredentialInput {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QuestionResponse {
+    pub question_id: String,
+    #[serde(default)]
+    pub option_ids: Vec<String>,
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InteractionResolution {
     ApproveOnce,
     ApproveForSession,
     Decline,
-    Answer { option_ids: Vec<String> },
+    /// Legacy single-question label answer.
+    Answer {
+        option_ids: Vec<String>,
+    },
+    /// Structured, atomic response to every item in a question interaction.
+    AnswerQuestions {
+        answers: Vec<QuestionResponse>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

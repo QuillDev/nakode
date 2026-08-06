@@ -281,12 +281,25 @@ pub struct QuestionOption {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuestionRequest {
+    /// Runtime-unique identity used to resume the provider-side waiter.
     pub id: String,
+    /// Stable identity supplied by the ask tool for this item.
+    pub logical_id: String,
+    /// Shared identity for questions submitted and resolved atomically.
+    pub group_id: String,
+    /// Original item order within the grouped ask.
+    pub order: usize,
     pub title: String,
     pub question: String,
     pub options: Vec<QuestionOption>,
     pub multi: bool,
     pub recommended: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QuestionAnswer {
+    Options(Vec<String>),
+    Text(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -567,7 +580,7 @@ pub enum BackendCommand {
     },
     ResolveQuestion {
         id: String,
-        answer: String,
+        answer: QuestionAnswer,
     },
     ResolveExternalTool {
         id: String,

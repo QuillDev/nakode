@@ -502,6 +502,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::ExternalTools,
             ServiceCapability::InitialSessionModel,
             ServiceCapability::SessionDeletion,
+            ServiceCapability::QuestionTextAnswers,
             ServiceCapability::QueuedPromptSteering,
         ]
         .into_iter()

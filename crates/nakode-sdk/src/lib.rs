@@ -414,6 +414,7 @@ impl NakodeClient {
                 interaction_id: interaction_id.into(),
                 resolution: resolution as i32,
                 option_ids,
+                answers: Vec::new(),
             }
         )
     }

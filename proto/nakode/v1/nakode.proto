@@ -137,11 +137,20 @@ enum InteractionResolutionKind {
   INTERACTION_RESOLUTION_KIND_DECLINE = 3;
   INTERACTION_RESOLUTION_KIND_ANSWER = 4;
 }
+message InteractionAnswer {
+  // Stable item identity from InteractionQuestion.id.
+  string question_id = 1;
+  repeated string option_ids = 2;
+  optional string text = 3;
+}
 message ResolveInteractionRequest {
   MutationOptions mutation = 1;
   string interaction_id = 2;
   InteractionResolutionKind resolution = 3;
+  // Legacy single-question option answer.
   repeated string option_ids = 4;
+  // Structured answers are validated and committed atomically. Requires `QuestionTextAnswers`.
+  repeated InteractionAnswer answers = 5;
 }
 message ExternalToolDefinition { string name = 1; string description = 2; string input_schema_json = 3; }
 message ConfigureSessionToolsRequest {
@@ -331,7 +340,13 @@ message RecoverablePrompt { string id = 1; string text = 2; repeated PromptAttac
 enum InteractionKind { INTERACTION_KIND_UNSPECIFIED = 0; INTERACTION_KIND_APPROVAL = 1; INTERACTION_KIND_QUESTION = 2; }
 enum InteractionStatus { INTERACTION_STATUS_UNSPECIFIED = 0; INTERACTION_STATUS_PENDING = 1; INTERACTION_STATUS_RESOLVED = 2; INTERACTION_STATUS_DECLINED = 3; INTERACTION_STATUS_CANCELLED = 4; }
 message InteractionOption { string id = 1; string label = 2; optional string description = 3; bool recommended = 4; }
-message Interaction { string id = 1; uint64 revision = 2; InteractionKind kind = 3; InteractionStatus status = 4; string title = 5; string detail = 6; repeated InteractionOption options = 7; bool multiple = 8; }
+message InteractionQuestion { string id = 1; string title = 2; string detail = 3; repeated InteractionOption options = 4; bool multiple = 5; }
+message Interaction {
+  string id = 1; uint64 revision = 2; InteractionKind kind = 3; InteractionStatus status = 4;
+  // Legacy scalar shape mirrors the first question for old clients.
+  string title = 5; string detail = 6; repeated InteractionOption options = 7; bool multiple = 8;
+  repeated InteractionQuestion questions = 9;
+}
 enum TodoStatus { TODO_STATUS_UNSPECIFIED = 0; TODO_STATUS_PENDING = 1; TODO_STATUS_IN_PROGRESS = 2; TODO_STATUS_COMPLETED = 3; TODO_STATUS_ABANDONED = 4; }
 message TodoItem { string content = 1; TodoStatus status = 2; }
 message TodoPhase { string name = 1; repeated TodoItem tasks = 2; }

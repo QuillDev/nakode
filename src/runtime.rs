@@ -407,7 +407,7 @@ impl AgentRuntime {
         self
     }
 
-    pub async fn resolve_question(&self, id: &str, answer: String) -> bool {
+    pub async fn resolve_question(&self, id: &str, answer: crate::backend::QuestionAnswer) -> bool {
         self.questions.resolve(id, answer).await
     }
 
@@ -1264,8 +1264,12 @@ impl RuntimeSession {
 
 #[derive(Default)]
 pub struct QuestionBroker {
-    pending:
-        tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    pending: tokio::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            tokio::sync::oneshot::Sender<crate::backend::QuestionAnswer>,
+        >,
+    >,
 }
 
 impl QuestionBroker {
@@ -1279,7 +1283,7 @@ impl QuestionBroker {
         request: crate::backend::QuestionRequest,
         events: &mpsc::Sender<BackendEvent>,
         cancellation: &CancellationToken,
-    ) -> Result<String, String> {
+    ) -> Result<crate::backend::QuestionAnswer, String> {
         let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
         self.pending
             .lock()
@@ -1297,7 +1301,7 @@ impl QuestionBroker {
         answer
     }
 
-    async fn resolve(&self, id: &str, answer: String) -> bool {
+    async fn resolve(&self, id: &str, answer: crate::backend::QuestionAnswer) -> bool {
         self.pending
             .lock()
             .await
@@ -2745,6 +2749,9 @@ mod tests {
         let broker = Arc::new(QuestionBroker::default());
         let request = QuestionRequest {
             id: "question-1".to_owned(),
+            logical_id: "direction".to_owned(),
+            group_id: "ask-1".to_owned(),
+            order: 0,
             title: "Direction".to_owned(),
             question: "Which path?".to_owned(),
             options: vec![
@@ -2772,10 +2779,19 @@ mod tests {
         assert!(
             matches!(receiver.recv().await, Some(BackendEvent::QuestionRequested(event_request)) if event_request == request)
         );
-        assert!(broker.resolve("question-1", "Direct".to_owned()).await);
+        assert!(
+            broker
+                .resolve(
+                    "question-1",
+                    crate::backend::QuestionAnswer::Options(vec!["Direct".to_owned()])
+                )
+                .await
+        );
         assert_eq!(
             answer.await.expect("question task"),
-            Ok("Direct".to_owned())
+            Ok(crate::backend::QuestionAnswer::Options(vec![
+                "Direct".to_owned()
+            ]))
         );
     }
 }

@@ -4728,11 +4728,10 @@ impl DomainState {
         if answers.is_empty() {
             return Vec::new();
         }
-        let answer = serde_json::to_string(&answers).unwrap_or_else(|_| answers.join(", "));
         self.status_message = format!("Answered: {}", answers.join(", "));
         vec![Effect::Backend(BackendCommand::ResolveQuestion {
             id: question.request.id,
-            answer,
+            answer: crate::backend::QuestionAnswer::Options(answers),
         })]
     }
 
@@ -4756,7 +4755,8 @@ impl DomainState {
                     ApprovalDecision::AcceptForSession
                 }
                 nakode_protocol::InteractionResolution::Decline => ApprovalDecision::Decline,
-                nakode_protocol::InteractionResolution::Answer { .. } => {
+                nakode_protocol::InteractionResolution::Answer { .. }
+                | nakode_protocol::InteractionResolution::AnswerQuestions { .. } => {
                     return Err(DomainCommandError::Invalid(
                         "an approval cannot be answered as a question".to_owned(),
                     ));
@@ -4783,65 +4783,165 @@ impl DomainState {
             })]);
         }
 
-        let Some(position) = self.questions.iter().position(|question| {
-            projection::question_interaction_id(&self.nakode_session_id, &question.request.id)
-                == *interaction_id
-        }) else {
-            return Err(DomainCommandError::NotFound(interaction_id.to_string()));
-        };
-        let nakode_protocol::InteractionResolution::Answer { option_ids } = resolution else {
-            return Err(DomainCommandError::Invalid(
-                "a question must be answered with option IDs".to_owned(),
-            ));
-        };
-        let question = self
+        let Some(group_id) = self
             .questions
-            .get(position)
-            .ok_or_else(|| DomainCommandError::NotFound(interaction_id.to_string()))?;
-        if option_ids.is_empty() {
-            return Err(DomainCommandError::Invalid(
-                "at least one question option is required".to_owned(),
-            ));
-        }
-        if !question.request.multi && option_ids.len() != 1 {
-            return Err(DomainCommandError::Invalid(
-                "this question accepts exactly one option".to_owned(),
-            ));
-        }
-        let mut indexes = option_ids
             .iter()
-            .map(|option_id| {
-                option_id
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|index| *index < question.request.options.len())
-                    .ok_or_else(|| {
-                        DomainCommandError::Invalid(format!(
-                            "unknown question option {option_id:?}"
-                        ))
-                    })
+            .map(|question| question.request.group_id.as_str())
+            .find(|group_id| {
+                projection::question_interaction_id(&self.nakode_session_id, group_id)
+                    == *interaction_id
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        indexes.sort_unstable();
-        indexes.dedup();
-        if indexes.len() != option_ids.len() {
-            return Err(DomainCommandError::Invalid(
-                "question option IDs must be unique".to_owned(),
-            ));
-        }
-        let answers = indexes
-            .iter()
-            .map(|index| question.request.options[*index].label.clone())
-            .collect::<Vec<_>>();
-        let Some(question) = self.questions.remove(position) else {
+            .map(str::to_owned)
+        else {
             return Err(DomainCommandError::NotFound(interaction_id.to_string()));
         };
-        let answer = serde_json::to_string(&answers).unwrap_or_else(|_| answers.join(", "));
-        self.status_message = format!("Answered: {}", answers.join(", "));
-        Ok(vec![Effect::Backend(BackendCommand::ResolveQuestion {
-            id: question.request.id,
-            answer,
-        })])
+        let mut group = self
+            .questions
+            .iter()
+            .enumerate()
+            .filter(|(_, question)| question.request.group_id == group_id)
+            .collect::<Vec<_>>();
+        group.sort_by_key(|(_, question)| question.request.order);
+
+        let responses = match resolution {
+            nakode_protocol::InteractionResolution::Answer { option_ids } => {
+                if group.len() != 1 {
+                    return Err(DomainCommandError::Invalid(
+                        "this interaction contains multiple questions; submit one structured answer for each question"
+                            .to_owned(),
+                    ));
+                }
+                vec![nakode_protocol::QuestionResponse {
+                    question_id: group[0].1.request.logical_id.clone(),
+                    option_ids: option_ids.clone(),
+                    text: None,
+                }]
+            }
+            nakode_protocol::InteractionResolution::AnswerQuestions { answers } => answers.clone(),
+            _ => {
+                return Err(DomainCommandError::Invalid(
+                    "a question interaction must be answered".to_owned(),
+                ));
+            }
+        };
+        if responses.len() != group.len() {
+            return Err(DomainCommandError::Invalid(format!(
+                "expected answers for {} questions, received {}; every question must be answered",
+                group.len(),
+                responses.len()
+            )));
+        }
+        let mut response_ids = HashSet::new();
+        for response in &responses {
+            if !response_ids.insert(response.question_id.as_str()) {
+                return Err(DomainCommandError::Invalid(format!(
+                    "duplicate answer for question {:?}",
+                    response.question_id
+                )));
+            }
+            if !group
+                .iter()
+                .any(|(_, question)| question.request.logical_id == response.question_id)
+            {
+                return Err(DomainCommandError::Invalid(format!(
+                    "unknown question {:?}",
+                    response.question_id
+                )));
+            }
+        }
+
+        let mut resolved = Vec::with_capacity(group.len());
+        for (position, question) in &group {
+            let id = &question.request.logical_id;
+            let response = responses
+                .iter()
+                .find(|response| response.question_id == *id)
+                .ok_or_else(|| {
+                    DomainCommandError::Invalid(format!("question {id:?} is unanswered"))
+                })?;
+            let text = response.text.as_deref();
+            if text.is_some_and(|text| text.trim().is_empty()) {
+                return Err(DomainCommandError::Invalid(format!(
+                    "question {id:?} has a blank free-text answer"
+                )));
+            }
+            if text.is_some() && !response.option_ids.is_empty() {
+                return Err(DomainCommandError::Invalid(format!(
+                    "question {id:?} must use option labels or free text, not both"
+                )));
+            }
+            let (answer, shown) = if let Some(text) = text {
+                let text = text.trim().to_owned();
+                (crate::backend::QuestionAnswer::Text(text.clone()), text)
+            } else {
+                if response.option_ids.is_empty() {
+                    return Err(DomainCommandError::Invalid(format!(
+                        "question {id:?} requires an option or free-text answer"
+                    )));
+                }
+                if !question.request.multi && response.option_ids.len() != 1 {
+                    return Err(DomainCommandError::Invalid(format!(
+                        "question {id:?} accepts exactly one option"
+                    )));
+                }
+                let mut indexes = response
+                    .option_ids
+                    .iter()
+                    .map(|option_id| {
+                        option_id
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|index| *index < question.request.options.len())
+                            .ok_or_else(|| {
+                                DomainCommandError::Invalid(format!(
+                                    "question {id:?} has unknown option {option_id:?}"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                indexes.sort_unstable();
+                indexes.dedup();
+                if indexes.len() != response.option_ids.len() {
+                    return Err(DomainCommandError::Invalid(format!(
+                        "question {id:?} option IDs must be unique"
+                    )));
+                }
+                let labels = indexes
+                    .iter()
+                    .map(|index| question.request.options[*index].label.clone())
+                    .collect::<Vec<_>>();
+                (
+                    crate::backend::QuestionAnswer::Options(labels.clone()),
+                    labels.join(", "),
+                )
+            };
+            resolved.push((*position, question.request.id.clone(), answer, shown));
+        }
+
+        // Validation above is side-effect free. Only after every item succeeds do we remove the
+        // parked questions and dispatch all provider waiters.
+        let mut positions = resolved
+            .iter()
+            .map(|(position, ..)| *position)
+            .collect::<Vec<_>>();
+        positions.sort_unstable_by(|left, right| right.cmp(left));
+        for position in positions {
+            self.questions.remove(position);
+        }
+        self.status_message = format!(
+            "Answered: {}",
+            resolved
+                .iter()
+                .map(|(_, _, _, shown)| shown.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        Ok(resolved
+            .into_iter()
+            .map(|(_, id, answer, _)| {
+                Effect::Backend(BackendCommand::ResolveQuestion { id, answer })
+            })
+            .collect())
     }
 
     /// Configures the externally executed tools exposed to this session.
@@ -6479,9 +6579,10 @@ impl DomainState {
             run_id: run_id.to_owned(),
             command: BackendCommand::ResolveQuestion {
                 id: question_id,
-                answer:
+                answer: crate::backend::QuestionAnswer::Text(
                     "No interactive user is attached to this subagent; continue with best judgment."
                         .to_owned(),
+                ),
             },
         }]
     }
@@ -8987,6 +9088,9 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         let mut state = ready_state();
         state.handle_backend(BackendEvent::QuestionRequested(QuestionRequest {
             id: "question-1".to_owned(),
+            logical_id: "question-1".to_owned(),
+            group_id: "question-1".to_owned(),
+            order: 0,
             title: "Direction".to_owned(),
             question: "Which path?".to_owned(),
             options: vec![
@@ -9007,7 +9111,9 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert!(matches!(
             state.resolve_question().as_slice(),
             [Effect::Backend(BackendCommand::ResolveQuestion { id, answer })]
-                if id == "question-1" && answer == "[\"Flexible\"]"
+                if id == "question-1"
+                    && answer
+                        == &crate::backend::QuestionAnswer::Options(vec!["Flexible".to_owned()])
         ));
         assert!(state.questions.is_empty());
     }
@@ -9017,6 +9123,9 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         let mut state = ready_state();
         state.handle_backend(BackendEvent::QuestionRequested(QuestionRequest {
             id: "question-2".to_owned(),
+            logical_id: "question-2".to_owned(),
+            group_id: "question-2".to_owned(),
+            order: 0,
             title: "Targets".to_owned(),
             question: "Which targets?".to_owned(),
             options: vec![
@@ -9040,8 +9149,117 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert!(matches!(
             state.resolve_question().as_slice(),
             [Effect::Backend(BackendCommand::ResolveQuestion { answer, .. })]
-                if answer == "[\"Library\",\"CLI\"]"
+                if answer
+                    == &crate::backend::QuestionAnswer::Options(vec![
+                        "Library".to_owned(),
+                        "CLI".to_owned(),
+                    ])
         ));
+    }
+
+    #[test]
+    fn grouped_questions_accept_mixed_text_and_labels_atomically() {
+        let mut state = ready_state();
+        for (id, order, label) in [("format", 0, "JSON"), ("note", 1, "Brief")] {
+            state.handle_backend(BackendEvent::QuestionRequested(QuestionRequest {
+                id: format!("runtime-{id}"),
+                logical_id: id.to_owned(),
+                group_id: "ask-group".to_owned(),
+                order,
+                title: id.to_owned(),
+                question: format!("Choose {id}"),
+                options: vec![
+                    QuestionOption {
+                        label: label.to_owned(),
+                        description: None,
+                    },
+                    QuestionOption {
+                        label: "Other".to_owned(),
+                        description: None,
+                    },
+                ],
+                multi: false,
+                recommended: None,
+            }));
+        }
+        let interaction =
+            projection::question_interaction_id(&state.nakode_session_id, "ask-group");
+        let effects = state
+            .resolve_interaction(
+                &interaction,
+                &nakode_protocol::InteractionResolution::AnswerQuestions {
+                    answers: vec![
+                        nakode_protocol::QuestionResponse {
+                            question_id: "format".to_owned(),
+                            option_ids: vec!["0".to_owned()],
+                            text: None,
+                        },
+                        nakode_protocol::QuestionResponse {
+                            question_id: "note".to_owned(),
+                            option_ids: Vec::new(),
+                            text: Some("Use the owner wording".to_owned()),
+                        },
+                    ],
+                },
+            )
+            .expect("valid grouped answer");
+        assert_eq!(effects.len(), 2);
+        assert!(matches!(
+            &effects[0],
+            Effect::Backend(BackendCommand::ResolveQuestion {
+                answer: crate::backend::QuestionAnswer::Options(labels), ..
+            }) if labels == &["JSON".to_owned()]
+        ));
+        assert!(matches!(
+            &effects[1],
+            Effect::Backend(BackendCommand::ResolveQuestion {
+                answer: crate::backend::QuestionAnswer::Text(text), ..
+            }) if text == "Use the owner wording"
+        ));
+        assert!(state.questions.is_empty());
+    }
+
+    #[test]
+    fn rejected_partial_grouped_answer_preserves_every_pending_question_for_retry() {
+        let mut state = ready_state();
+        for (id, order) in [("first", 0), ("second", 1)] {
+            state.handle_backend(BackendEvent::QuestionRequested(QuestionRequest {
+                id: format!("runtime-{id}"),
+                logical_id: id.to_owned(),
+                group_id: "retry-group".to_owned(),
+                order,
+                title: id.to_owned(),
+                question: id.to_owned(),
+                options: vec![
+                    QuestionOption {
+                        label: "Yes".to_owned(),
+                        description: None,
+                    },
+                    QuestionOption {
+                        label: "No".to_owned(),
+                        description: None,
+                    },
+                ],
+                multi: false,
+                recommended: None,
+            }));
+        }
+        let interaction =
+            projection::question_interaction_id(&state.nakode_session_id, "retry-group");
+        let error = state
+            .resolve_interaction(
+                &interaction,
+                &nakode_protocol::InteractionResolution::AnswerQuestions {
+                    answers: vec![nakode_protocol::QuestionResponse {
+                        question_id: "first".to_owned(),
+                        option_ids: Vec::new(),
+                        text: Some("   ".to_owned()),
+                    }],
+                },
+            )
+            .expect_err("partial answer must be rejected");
+        assert!(error.to_string().contains("every question"));
+        assert_eq!(state.questions.len(), 2);
     }
 
     #[test]
