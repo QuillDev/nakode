@@ -68,6 +68,76 @@ pub struct AgentDefinitionInput {
     /// The level to run at, or `None` for the model's own default. Refused without `model`.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub ownership: String,
+    #[serde(default = "true_by_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_capabilities: Vec<String>,
+    #[serde(default)]
+    pub denied_capabilities: Vec<String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+    #[serde(default)]
+    pub tool_profile: String,
+    #[serde(default)]
+    pub task_shape: String,
+    #[serde(default)]
+    pub output_contract: String,
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
+    #[serde(default)]
+    pub poll_interval_ms: Option<u32>,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub max_concurrency: u32,
+    #[serde(default)]
+    pub fallback_policy: String,
+    #[serde(default)]
+    pub can_delegate: bool,
+    #[serde(default)]
+    pub max_delegation_depth: u32,
+    #[serde(default = "true_by_default")]
+    pub require_parent_attribution: bool,
+}
+
+fn true_by_default() -> bool {
+    true
+}
+
+impl Default for AgentDefinitionInput {
+    fn default() -> Self {
+        Self {
+            slug: String::new(),
+            description: String::new(),
+            system_prompt: String::new(),
+            first_message: String::new(),
+            model: None,
+            fallback_models: Vec::new(),
+            fast_mode: false,
+            reasoning_effort: None,
+            ownership: "owner_defined".to_owned(),
+            enabled: true,
+            allowed_capabilities: Vec::new(),
+            denied_capabilities: Vec::new(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            tool_profile: "custom".to_owned(),
+            task_shape: String::new(),
+            output_contract: String::new(),
+            timeout_seconds: None,
+            poll_interval_ms: None,
+            max_turns: None,
+            max_concurrency: 4,
+            fallback_policy: "configured_only".to_owned(),
+            can_delegate: false,
+            max_delegation_depth: 0,
+            require_parent_attribution: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -218,6 +288,7 @@ pub enum Command {
         session_id: SessionId,
         agent_slug: String,
         task: String,
+        parent_run_id: Option<RunId>,
     },
     CancelRun {
         run_id: RunId,

@@ -478,6 +478,28 @@ impl NakodeClient {
         task: impl Into<String>,
         expected_revision: Option<u64>,
     ) -> Result<String, SdkError> {
+        self.delegate_attributed(
+            session_id,
+            agent_slug,
+            task,
+            None::<String>,
+            expected_revision,
+        )
+        .await
+    }
+
+    /// Starts a delegated run attributed to another run in the same logical session.
+    ///
+    /// # Errors
+    /// Returns a transport, server status, or missing-identifier error.
+    pub async fn delegate_attributed(
+        &self,
+        session_id: impl Into<String>,
+        agent_slug: impl Into<String>,
+        task: impl Into<String>,
+        parent_run_id: Option<impl Into<String>>,
+        expected_revision: Option<u64>,
+    ) -> Result<String, SdkError> {
         let result = send_mutation!(
             self,
             delegate,
@@ -486,6 +508,7 @@ impl NakodeClient {
                 session_id: session_id.into(),
                 agent_slug: agent_slug.into(),
                 task: task.into(),
+                parent_run_id: parent_run_id.map(Into::into),
             }
         )?;
         result

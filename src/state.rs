@@ -8,7 +8,7 @@ pub(crate) mod projection;
 pub use crate::{backend::ApprovalDecision, session::SubagentStatus};
 
 use crate::{
-    agent::{AgentCatalog, AgentDefinition},
+    agent::{AgentCatalog, AgentDefinition, AgentFallbackPolicy, AgentToolProfile},
     backend::{
         ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent, BackendOperation,
         CODEX_PROVIDER, CURSOR_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus,
@@ -440,6 +440,7 @@ impl AgentEditor {
                 .collect(),
             fast_mode: self.fast_mode,
             reasoning_effort: None,
+            ..AgentDefinition::default()
         }
     }
 }
@@ -742,6 +743,8 @@ struct SubagentExecution {
     definition: AgentDefinition,
     request_id: u64,
     task: String,
+    parent_run_id: Option<String>,
+    remaining_delegation_depth: u32,
     session_id: Option<String>,
     response: String,
     model_targets: Vec<AgentModelTarget>,
@@ -6037,6 +6040,9 @@ impl DomainState {
                 owner_session_id: Some(self.nakode_session_id.clone()),
                 external_tools: self.external_tools.clone(),
                 replace_builtin_tools: self.replace_builtin_tools,
+                allowed_builtin_tools: None,
+                max_turns: None,
+                timeout_seconds: None,
             })]
         }
     }
@@ -6436,6 +6442,39 @@ impl DomainState {
     ) -> Result<(), DomainCommandError> {
         AgentCatalog::validate_definition(definition)
             .map_err(|error| DomainCommandError::Invalid(error.to_string()))?;
+        if let Some(existing_slug) = previous_slug.or(Some(definition.slug.as_str()))
+            && let Some(existing) = self.agents.find(existing_slug)
+        {
+            if existing.ownership == crate::agent::AgentOwnership::BuiltIn {
+                return Err(DomainCommandError::Invalid(format!(
+                    "built-in agent {existing_slug:?} is immutable"
+                )));
+            }
+            if definition.ownership != crate::agent::AgentOwnership::OwnerDefined {
+                return Err(DomainCommandError::Invalid(
+                    "owner-defined archetypes cannot become built-ins".to_owned(),
+                ));
+            }
+        } else if definition.ownership != crate::agent::AgentOwnership::OwnerDefined {
+            return Err(DomainCommandError::Invalid(
+                "new archetypes must be owner-defined".to_owned(),
+            ));
+        }
+        for model in definition
+            .model
+            .iter()
+            .chain(definition.fallback_models.iter())
+        {
+            if !self
+                .models
+                .iter()
+                .any(|candidate| candidate.qualified_id() == *model)
+            {
+                return Err(DomainCommandError::Invalid(format!(
+                    "model {model} is not present in authoritative discovery"
+                )));
+            }
+        }
         // A level is only ever valid FOR a model, so it is checked against the one this definition
         // names. Refused here rather than at run time: a definition that cannot run as written is
         // worth failing at the moment it is written, while the level list is on screen.
@@ -6471,6 +6510,20 @@ impl DomainState {
         Ok(())
     }
 
+    /// Validates deletion while the authoritative catalogue is still in memory.
+    pub fn validate_agent_deletion(&self, slug: &str) -> Result<(), DomainCommandError> {
+        let definition = self
+            .agents
+            .find(slug)
+            .ok_or_else(|| DomainCommandError::NotFound(format!("agent {slug}")))?;
+        if definition.ownership == crate::agent::AgentOwnership::BuiltIn {
+            return Err(DomainCommandError::Invalid(format!(
+                "built-in agent {slug:?} is immutable; disable availability only through shipped policy"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validates a delegated-agent request without mutating session state.
     ///
     /// # Errors
@@ -6480,7 +6533,17 @@ impl DomainState {
         agent_slug: &str,
         task: &str,
     ) -> Result<(), DomainCommandError> {
-        if self
+        let Some(definition) = self.agents.find(agent_slug) else {
+            return Err(DomainCommandError::NotFound(format!(
+                "predefined agent {agent_slug:?}"
+            )));
+        };
+        if !definition.enabled {
+            return Err(DomainCommandError::Invalid(format!(
+                "agent {agent_slug:?} is disabled; enable it before delegation"
+            )));
+        }
+        let running_total = self
             .subagents
             .iter()
             .filter(|run| {
@@ -6489,11 +6552,27 @@ impl DomainState {
                     SubagentStatus::Starting | SubagentStatus::Working
                 )
             })
-            .count()
-            >= MAX_CONCURRENT_SUBAGENTS
-        {
+            .count();
+        if running_total >= MAX_CONCURRENT_SUBAGENTS {
             return Err(DomainCommandError::Conflict(format!(
                 "The concurrent subagent limit ({MAX_CONCURRENT_SUBAGENTS}) is already in use. Wait for a running subagent to finish."
+            )));
+        }
+        let running_for_archetype = self
+            .subagents
+            .iter()
+            .filter(|run| {
+                run.agent == agent_slug
+                    && matches!(
+                        run.status,
+                        SubagentStatus::Starting | SubagentStatus::Working
+                    )
+            })
+            .count();
+        if running_for_archetype >= definition.max_concurrency as usize {
+            return Err(DomainCommandError::Conflict(format!(
+                "agent {agent_slug:?} already has its configured {} concurrent run(s)",
+                definition.max_concurrency
             )));
         }
         let task = task.trim();
@@ -6502,11 +6581,6 @@ impl DomainState {
                 "agent invocation requires a non-empty task".to_owned(),
             ));
         }
-        let Some(definition) = self.agents.find(agent_slug) else {
-            return Err(DomainCommandError::NotFound(format!(
-                "predefined agent {agent_slug:?}"
-            )));
-        };
         let validator_slug = std::env::var("NAKODE_SECURITY_VALIDATOR_AGENT")
             .unwrap_or_else(|_| "security-validator".to_owned());
         if agent_slug == validator_slug
@@ -6535,12 +6609,59 @@ impl DomainState {
         agent_slug: &str,
         task: &str,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
+        self.delegate_agent_attributed(agent_slug, task, None)
+    }
+
+    /// Creates one delegated run linked to its active parent and enforces the parent's recursion
+    /// budget before mutating state.
+    ///
+    /// # Errors
+    /// Rejects missing/inactive parents, disallowed delegation, exhausted depth, and invalid
+    /// archetype requests.
+    pub fn delegate_agent_attributed(
+        &mut self,
+        agent_slug: &str,
+        task: &str,
+        parent_run_id: Option<&str>,
+    ) -> Result<(String, Vec<Effect>), DomainCommandError> {
         self.validate_agent_request(agent_slug, task)?;
         let task = task.trim();
         let Some(definition) = self.agents.find(agent_slug).cloned() else {
             return Err(DomainCommandError::NotFound(format!(
                 "predefined agent {agent_slug:?}"
             )));
+        };
+        let (parent_run_id, remaining_delegation_depth) = if let Some(parent_run_id) = parent_run_id
+        {
+            let parent = self.subagent_executions.get(parent_run_id).ok_or_else(|| {
+                DomainCommandError::NotFound(format!("parent agent run `{parent_run_id}`"))
+            })?;
+            if !matches!(
+                parent.run.status,
+                SubagentStatus::Starting | SubagentStatus::Working
+            ) {
+                return Err(DomainCommandError::Conflict(format!(
+                    "parent agent run `{parent_run_id}` is no longer active"
+                )));
+            }
+            if !parent.definition.can_delegate {
+                return Err(DomainCommandError::Unsupported(format!(
+                    "agent `{}` is not permitted to delegate",
+                    parent.definition.slug
+                )));
+            }
+            let Some(remaining) = parent.remaining_delegation_depth.checked_sub(1) else {
+                return Err(DomainCommandError::Unsupported(format!(
+                    "agent `{}` exhausted its maximum delegation depth",
+                    parent.definition.slug
+                )));
+            };
+            (
+                Some(parent_run_id.to_owned()),
+                remaining.min(definition.max_delegation_depth),
+            )
+        } else {
+            (None, definition.max_delegation_depth)
         };
 
         let run_id = Self::next_id("agent");
@@ -6565,7 +6686,11 @@ impl DomainState {
         transcript.push(
             EntryKind::User,
             "PARENT",
-            definition.initial_prompt(task),
+            format!(
+                "{}\n\n[Nakode Run Attribution]\nRun ID: {run_id}\nParent run: {}\nRemaining delegation depth: {remaining_delegation_depth}\n[/Nakode Run Attribution]",
+                definition.initial_prompt(task),
+                parent_run_id.as_deref().unwrap_or("root"),
+            ),
             EntryStatus::Complete,
         );
         self.subagent_chats.insert(
@@ -6582,6 +6707,8 @@ impl DomainState {
                 definition,
                 request_id: 0,
                 task: task.to_owned(),
+                parent_run_id,
+                remaining_delegation_depth,
                 session_id: None,
                 response: String::new(),
                 model_targets,
@@ -6721,7 +6848,9 @@ impl DomainState {
             Err(event) => event,
         };
         match event {
-            BackendEvent::Ready(_) => self.start_subagent_session(run_id),
+            BackendEvent::Ready(identity) => {
+                self.start_subagent_session(run_id, &identity.capabilities)
+            }
             BackendEvent::SessionCreated {
                 provider_session_id,
                 model,
@@ -6949,7 +7078,24 @@ impl DomainState {
         self.finish_subagent(run_id, Err(message))
     }
 
-    fn start_subagent_session(&mut self, run_id: &str) -> Vec<Effect> {
+    fn start_subagent_session(
+        &mut self,
+        run_id: &str,
+        capabilities: &BackendCapabilities,
+    ) -> Vec<Effect> {
+        let unsupported = self.subagent_executions.get(run_id).and_then(|execution| {
+            (execution.definition.requires_scoped_runtime_policy()
+                && !capabilities.scoped_runtime_policy.is_supported())
+            .then(|| {
+                format!(
+                    "provider {} cannot enforce the scoped tool/turn policy required by archetype {:?}",
+                    execution.run.provider, execution.definition.slug
+                )
+            })
+        });
+        if let Some(message) = unsupported {
+            return self.retry_subagent_or_finish(run_id, message);
+        }
         let prompt_addenda = self.prompt_addenda.clone();
         let Some(execution) = self.subagent_executions.get_mut(run_id) else {
             return Vec::new();
@@ -6962,6 +7108,24 @@ impl DomainState {
             .as_ref()
             .map(|model| format!("{}/{model}", target.provider));
         let mut validator_instructions = execution.definition.instructions().to_owned();
+        let policy = &execution.definition;
+        validator_instructions.push_str(&format!(
+            "\n\n[Nakode Archetype Policy]\nTool profile: {:?}\nAllowed tools: {}\nDenied tools: {}\nNetwork is {}. File writes are {}. Recursive delegation is {} (maximum depth {}). Parent attribution is required.\nExpected task shape: {}\nOutput contract: {}\n[/Nakode Archetype Policy]",
+            policy.tool_profile,
+            if policy.allowed_tools.is_empty() { "none".to_owned() } else { policy.allowed_tools.join(", ") },
+            if policy.denied_tools.is_empty() { "none".to_owned() } else { policy.denied_tools.join(", ") },
+            if policy.allowed_capabilities.iter().any(|name| name == "network") { "allowed" } else { "denied" },
+            if policy.allowed_tools.iter().any(|name| name == "write" || name == "edit" || name == "bash") { "allowed only through listed tools" } else { "denied" },
+            if policy.can_delegate { "allowed" } else { "denied" },
+            policy.max_delegation_depth,
+            policy.task_shape,
+            policy.output_contract,
+        ));
+        validator_instructions.push_str(&format!(
+            "\n\n[Nakode Run Attribution]\nRun ID: {run_id}\nParent run: {}\nRemaining delegation depth: {}\n[/Nakode Run Attribution]",
+            execution.parent_run_id.as_deref().unwrap_or("root"),
+            execution.remaining_delegation_depth,
+        ));
         let validator_slug = std::env::var("NAKODE_SECURITY_VALIDATOR_AGENT")
             .unwrap_or_else(|_| "security-validator".to_owned());
         if execution.definition.slug == validator_slug {
@@ -6970,6 +7134,10 @@ impl DomainState {
                 "[Nakode Security Validator]\nDelegation and security re-validation are disabled for this scoped validator run.\n[/Nakode Security Validator]\n\n",
             );
         }
+        let replace_builtin_tools = execution.definition.tool_profile == AgentToolProfile::None;
+        let allowed_builtin_tools = execution.definition.builtin_tool_allowlist();
+        let max_turns = execution.definition.max_turns;
+        let timeout_seconds = execution.definition.timeout_seconds;
         let instructions =
             Some(prompt_addenda.apply(&validator_instructions, qualified_model.as_deref()));
         self.sync_subagent(run_id);
@@ -6980,7 +7148,10 @@ impl DomainState {
                 instructions,
                 owner_session_id: Some(self.nakode_session_id.clone()),
                 external_tools: Vec::new(),
-                replace_builtin_tools: false,
+                replace_builtin_tools,
+                allowed_builtin_tools,
+                max_turns,
+                timeout_seconds,
             },
         }]
     }
@@ -7603,7 +7774,13 @@ fn agent_model_targets(
             model: None,
         });
     }
-    for model in &definition.fallback_models {
+    let fallback_models: &[String] =
+        if definition.fallback_policy == AgentFallbackPolicy::ConfiguredOnly {
+            &definition.fallback_models
+        } else {
+            &[]
+        };
+    for model in fallback_models {
         push_agent_model_target(&mut targets, model);
     }
     targets
@@ -7725,6 +7902,35 @@ model = "openai-codex/model-a"
         AgentCatalog::load(directory.path()).expect("agent catalog")
     }
 
+    fn recursive_catalog() -> AgentCatalog {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("recursive.toml"),
+            r#"
+slug = "recursive"
+description = "Delegates exactly one level"
+system_prompt = "Perform bounded work."
+first_message = "Complete the delegated question."
+model = "openai-codex/model-a"
+can_delegate = true
+max_delegation_depth = 1
+"#,
+        )
+        .expect("agent definition");
+        fs::write(
+            directory.path().join("leaf.toml"),
+            r#"
+slug = "leaf"
+description = "Does not delegate"
+system_prompt = "Perform bounded work."
+first_message = "Complete the delegated question."
+model = "openai-codex/model-a"
+"#,
+        )
+        .expect("leaf agent definition");
+        AgentCatalog::load(directory.path()).expect("agent catalog")
+    }
+
     fn routed_explorer_catalog() -> AgentCatalog {
         let directory = tempdir().expect("agent directory");
         fs::write(
@@ -7759,6 +7965,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 approvals: CapabilitySupport::Supported,
                 native_tools: CapabilitySupport::Supported,
                 external_tools: CapabilitySupport::Supported,
+                scoped_runtime_policy: CapabilitySupport::Supported,
                 mcp: CapabilitySupport::Supported,
                 close_session: CapabilitySupport::Supported,
             },
@@ -11151,6 +11358,98 @@ reasoning_effort = "unsupported"
                     entry.kind == EntryKind::Warning
                         && entry.body.contains("running at the model's own default")
                 })
+        );
+    }
+
+    #[test]
+    fn attributed_delegation_enforces_parent_permission_and_depth() {
+        let mut state = ready_state();
+        state.install_agents(recursive_catalog());
+
+        let (leaf, _) = state
+            .delegate_agent("leaf", "Leaf task")
+            .expect("leaf delegation");
+        let permission_error = state
+            .delegate_agent_attributed("recursive", "Forbidden child", Some(&leaf))
+            .expect_err("leaf cannot delegate");
+        assert!(
+            permission_error
+                .to_string()
+                .contains("not permitted to delegate")
+        );
+
+        let (root, _) = state
+            .delegate_agent("recursive", "Root task")
+            .expect("root delegation");
+        let (child, _) = state
+            .delegate_agent_attributed("recursive", "Child task", Some(&root))
+            .expect("one attributed child");
+        let error = state
+            .delegate_agent_attributed("recursive", "Grandchild task", Some(&child))
+            .expect_err("depth exhausted");
+
+        assert!(
+            error
+                .to_string()
+                .contains("exhausted its maximum delegation depth")
+        );
+        assert_eq!(state.subagents.len(), 3);
+        assert_eq!(
+            state.subagent_executions[&child].parent_run_id.as_deref(),
+            Some(root.as_str())
+        );
+    }
+
+    #[test]
+    fn restrictive_archetypes_refuse_backends_that_cannot_enforce_runtime_policy() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("restricted.toml"),
+            r#"
+slug = "restricted"
+description = "No tools"
+tool_profile = "none"
+"#,
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 8,
+            agent: "restricted".to_owned(),
+            task: "Inspect nothing".to_owned(),
+        });
+        let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
+            panic!("expected a subagent launch");
+        };
+        let run_id = run_id.clone();
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CURSOR_PROVIDER.to_owned(),
+                display_name: "Unsupported compatibility backend".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+
+        assert!(effects.iter().all(|effect| !matches!(
+            effect,
+            Effect::SubagentBackend {
+                command: BackendCommand::StartSession { .. },
+                ..
+            }
+        )));
+        let run = state
+            .subagents
+            .iter()
+            .find(|run| run.id == run_id)
+            .expect("restricted run");
+        assert_eq!(run.status, SubagentStatus::Failed);
+        assert!(
+            run.latest_activity
+                .contains("cannot enforce the scoped tool/turn policy")
         );
     }
 

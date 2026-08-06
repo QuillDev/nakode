@@ -113,6 +113,38 @@ pub fn bootstrap(
                     .collect(),
                 fast_mode: definition.fast_mode,
                 reasoning_effort: definition.reasoning_effort.clone(),
+                ownership: match definition.ownership {
+                    crate::agent::AgentOwnership::BuiltIn => "built_in",
+                    crate::agent::AgentOwnership::OwnerDefined => "owner_defined",
+                }
+                .to_owned(),
+                enabled: definition.enabled,
+                allowed_capabilities: definition.allowed_capabilities.clone(),
+                denied_capabilities: definition.denied_capabilities.clone(),
+                allowed_tools: definition.allowed_tools.clone(),
+                denied_tools: definition.denied_tools.clone(),
+                tool_profile: match definition.tool_profile {
+                    crate::agent::AgentToolProfile::None => "none",
+                    crate::agent::AgentToolProfile::ReadOnly => "read_only",
+                    crate::agent::AgentToolProfile::CommandRunner => "command_runner",
+                    crate::agent::AgentToolProfile::BoundedWatcher => "bounded_watcher",
+                    crate::agent::AgentToolProfile::Custom => "custom",
+                }
+                .to_owned(),
+                task_shape: definition.task_shape.clone(),
+                output_contract: definition.output_contract.clone(),
+                timeout_seconds: definition.timeout_seconds,
+                poll_interval_ms: definition.poll_interval_ms,
+                max_turns: definition.max_turns,
+                max_concurrency: definition.max_concurrency,
+                fallback_policy: match definition.fallback_policy {
+                    crate::agent::AgentFallbackPolicy::Prohibited => "prohibited",
+                    crate::agent::AgentFallbackPolicy::ConfiguredOnly => "configured_only",
+                }
+                .to_owned(),
+                can_delegate: definition.can_delegate,
+                max_delegation_depth: definition.max_delegation_depth,
+                require_parent_attribution: definition.require_parent_attribution,
             })
             .collect(),
         skills: state

@@ -406,6 +406,9 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             instructions,
             external_tools,
             replace_builtin_tools,
+            allowed_builtin_tools,
+            max_turns,
+            timeout_seconds,
             owner_session_id: _,
         } => {
             start_session(
@@ -413,6 +416,9 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                 instructions,
                 external_tools,
                 replace_builtin_tools,
+                allowed_builtin_tools,
+                max_turns,
+                timeout_seconds,
                 context,
             )
             .await;
@@ -702,6 +708,9 @@ async fn start_session(
     instructions: Option<String>,
     external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
     replace_builtin_tools: bool,
+    allowed_builtin_tools: Option<Vec<String>>,
+    max_turns: Option<u32>,
+    timeout_seconds: Option<u32>,
     context: &mut CommandContext<'_>,
 ) {
     let Some(_api_key) = context.api_key else {
@@ -738,7 +747,14 @@ async fn start_session(
     let session_id = session.id.clone();
     if let Some(runtime) = context.runtime
         && let Err(error) = runtime
-            .configure_external_tools(&session_id, external_tools, replace_builtin_tools)
+            .configure_external_tools(
+                &session_id,
+                external_tools,
+                replace_builtin_tools,
+                allowed_builtin_tools,
+                max_turns,
+                timeout_seconds,
+            )
             .await
     {
         request_failed(context.events, BackendOperation::StartSession, error).await;
@@ -785,6 +801,7 @@ fn native_capabilities() -> BackendCapabilities {
         approvals: CapabilitySupport::Unsupported,
         native_tools: CapabilitySupport::Supported,
         external_tools: CapabilitySupport::Supported,
+        scoped_runtime_policy: CapabilitySupport::Supported,
         mcp: CapabilitySupport::Unsupported,
         close_session: CapabilitySupport::Supported,
     }

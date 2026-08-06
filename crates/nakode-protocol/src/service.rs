@@ -25,6 +25,8 @@ pub enum ServiceCapability {
     QuestionTextAnswers,
     /// `SteerQueuedPrompt` atomically redirects active work to a server-owned follow-up.
     QueuedPromptSteering,
+    /// Owner-facing clients may inspect and atomically mutate the authoritative archetype catalogue.
+    ArchetypeManagement,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

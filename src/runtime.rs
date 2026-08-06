@@ -239,6 +239,9 @@ impl From<ToolDefinition> for DynamicToolDefinition {
 struct ExternalToolConfiguration {
     tools: Vec<DynamicToolDefinition>,
     replace_builtin_tools: bool,
+    allowed_builtin_tools: Option<std::collections::HashSet<String>>,
+    max_turns: Option<u32>,
+    timeout_seconds: Option<u32>,
 }
 
 #[derive(Default)]
@@ -301,6 +304,9 @@ impl AgentRuntime {
         session_id: &str,
         tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
+        allowed_builtin_tools: Option<Vec<String>>,
+        max_turns: Option<u32>,
+        timeout_seconds: Option<u32>,
     ) -> Result<(), String> {
         let mut definitions = Vec::with_capacity(tools.len());
         let mut names = std::collections::HashSet::new();
@@ -325,6 +331,10 @@ impl AgentRuntime {
             ExternalToolConfiguration {
                 tools: definitions,
                 replace_builtin_tools,
+                allowed_builtin_tools: allowed_builtin_tools
+                    .map(|tools| tools.into_iter().collect()),
+                max_turns,
+                timeout_seconds,
             },
         );
         Ok(())
@@ -354,6 +364,12 @@ impl AgentRuntime {
             self.tools
                 .definitions()
                 .into_iter()
+                .filter(|tool| {
+                    external
+                        .allowed_builtin_tools
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.contains(tool.name))
+                })
                 .map(DynamicToolDefinition::from)
                 .collect()
         };
@@ -462,10 +478,56 @@ impl AgentRuntime {
         &self,
         session: &mut RuntimeSession,
         turn_id: &str,
+        prompt: String,
+        attachments: Vec<PromptAttachment>,
+        backend_events: &mpsc::Sender<BackendEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<(), TurnError> {
+        let policy = self
+            .external_tools
+            .sessions
+            .lock()
+            .await
+            .get(&session.id)
+            .cloned()
+            .unwrap_or_default();
+        let timeout = policy
+            .timeout_seconds
+            .map(|seconds| tokio::time::Duration::from_secs(u64::from(seconds)));
+        let on_timeout = cancellation.clone();
+        let turn = self.run_turn_inner(
+            session,
+            turn_id,
+            prompt,
+            attachments,
+            backend_events,
+            cancellation,
+            policy.max_turns,
+        );
+        let Some(timeout) = timeout else {
+            return turn.await;
+        };
+        match tokio::time::timeout(timeout, turn).await {
+            Ok(result) => result,
+            Err(_) => {
+                on_timeout.cancel();
+                Err(TurnError::Failed(format!(
+                    "archetype runtime exceeded its configured {} second timeout",
+                    timeout.as_secs()
+                )))
+            }
+        }
+    }
+
+    async fn run_turn_inner(
+        &self,
+        session: &mut RuntimeSession,
+        turn_id: &str,
         mut prompt: String,
         mut attachments: Vec<PromptAttachment>,
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: CancellationToken,
+        max_turns: Option<u32>,
     ) -> Result<(), TurnError> {
         self.prepare_image_fallback(&mut prompt, &mut attachments, &cancellation)
             .await?;
@@ -485,6 +547,13 @@ impl AgentRuntime {
         let mut inference_round = 0_u64;
         let mut tool_failures = HashMap::<String, usize>::new();
         loop {
+            if let Some(limit) = max_turns
+                && inference_round >= u64::from(limit)
+            {
+                return Err(TurnError::Failed(format!(
+                    "archetype runtime reached its configured maximum of {limit} turn(s)"
+                )));
+            }
             if cancellation.is_cancelled() {
                 return Err(TurnError::Interrupted);
             }
@@ -2101,6 +2170,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builtin_tool_allowlist_is_authoritative_for_native_inference() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider);
+        runtime
+            .configure_external_tools(
+                "restricted-session",
+                Vec::new(),
+                false,
+                Some(vec!["read".to_owned()]),
+                None,
+                None,
+            )
+            .await
+            .expect("restricted tool configuration");
+
+        let tools = runtime.inference_tools("restricted-session").await;
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read"]
+        );
+    }
+
+    #[tokio::test]
     async fn external_tools_replace_builtins_and_resume_the_agent_loop() {
         let directory = tempfile::tempdir().expect("workspace");
         let provider = Arc::new(ExternalToolProvider {
@@ -2117,6 +2215,9 @@ mod tests {
                     input_schema_json: json!({"type": "object"}).to_string(),
                 }],
                 true,
+                None,
+                None,
+                None,
             )
             .await
             .expect("tool configuration");
@@ -2407,6 +2508,36 @@ mod tests {
                 .iter()
                 .all(|history| history.item.title == "todo · view")
         );
+    }
+
+    #[tokio::test]
+    async fn configured_max_turns_stops_native_agentic_rounds() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(RepeatingToolProvider {
+            calls: AtomicUsize::new(0),
+            tool_rounds: 6,
+        });
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider.clone());
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        runtime
+            .configure_external_tools(&session.id, Vec::new(), false, None, Some(2), None)
+            .await
+            .expect("turn policy");
+        let (events, _receiver) = mpsc::channel(128);
+
+        let error = runtime
+            .run_turn(
+                &mut session,
+                "bounded-turn",
+                "Keep working.".to_owned(),
+                Vec::new(),
+                &events,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("configured rounds must stop the loop");
+        assert!(error.to_string().contains("maximum of 2 turn(s)"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

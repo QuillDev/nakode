@@ -28,11 +28,12 @@ pub async fn run(
     agent_slug: String,
     session_id: String,
     task: String,
+    parent_run_id: Option<String>,
 ) -> Result<AgentCommandResult, AgentCliError> {
     let client = native_client::connect(config)
         .await
         .map_err(|error| AgentCliError::NativeClientStart(error.to_string()))?;
-    delegate_and_wait(&client, agent_slug, session_id, task).await
+    delegate_and_wait(&client, agent_slug, session_id, task, parent_run_id).await
 }
 
 async fn delegate_and_wait(
@@ -40,9 +41,12 @@ async fn delegate_and_wait(
     agent_slug: String,
     session_id: String,
     task: String,
+    parent_run_id: Option<String>,
 ) -> Result<AgentCommandResult, AgentCliError> {
     client.get_session(session_id.clone()).await?;
-    let run_id = client.delegate(session_id, agent_slug, task, None).await?;
+    let run_id = client
+        .delegate_attributed(session_id, agent_slug, task, parent_run_id, None)
+        .await?;
     let mut updates = client.watch_run(run_id.clone());
     while let Some(update) = updates.next().await {
         let run = api_projection::run(update?).map_err(AgentCliError::Protocol)?;

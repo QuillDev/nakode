@@ -194,6 +194,23 @@ message AgentDefinitionInput {
   // Absent means the model's own default, which is what every definition written before this field
   // existed says. A level belongs to `model_id`, so it is refused without one.
   optional string reasoning_effort = 8;
+  string ownership = 9;
+  optional bool enabled = 10;
+  repeated string allowed_capabilities = 11;
+  repeated string denied_capabilities = 12;
+  repeated string allowed_tools = 13;
+  repeated string denied_tools = 14;
+  string tool_profile = 15;
+  string task_shape = 16;
+  string output_contract = 17;
+  optional uint32 timeout_seconds = 18;
+  optional uint32 poll_interval_ms = 19;
+  optional uint32 max_turns = 20;
+  uint32 max_concurrency = 21;
+  string fallback_policy = 22;
+  bool can_delegate = 23;
+  uint32 max_delegation_depth = 24;
+  optional bool require_parent_attribution = 25;
 }
 message SaveAgentRequest { MutationOptions mutation = 1; string workspace_id = 2; AgentDefinitionInput definition = 3; optional string previous_slug = 4; }
 message DeleteAgentRequest { MutationOptions mutation = 1; string workspace_id = 2; string slug = 3; }
@@ -213,7 +230,7 @@ message SettingsPatch {
 }
 message UpdateSettingsRequest { MutationOptions mutation = 1; SettingsPatch patch = 2; }
 
-message DelegateRequest { MutationOptions mutation = 1; string session_id = 2; string agent_slug = 3; string task = 4; }
+message DelegateRequest { MutationOptions mutation = 1; string session_id = 2; string agent_slug = 3; string task = 4; optional string parent_run_id = 5; }
 message ListRunsRequest { string session_id = 1; optional string before_run_id = 2; uint32 limit = 3; }
 message ListRunsResponse { repeated RunState runs = 1; bool has_earlier = 2; }
 message GetRunRequest { string run_id = 1; }
@@ -262,7 +279,33 @@ message ProviderAuthentication { enum Kind { KIND_UNSPECIFIED = 0; KIND_STARTING
 message Provider { string id = 1; string display_name = 2; bool enabled = 3; bool credential_configured = 4; optional string credential_kind = 5; Connection connection = 6; ProviderCapabilities capabilities = 7; optional ProviderAuthentication authentication = 8; }
 message ModelConfiguration { repeated string reasoning_efforts = 1; bool fast_mode_configurable = 2; bool vision_eligible = 3; }
 message Model { string id = 1; string provider_id = 2; string model_slug = 3; string display_name = 4; bool is_default = 5; optional string reasoning_effort = 6; bool fast_mode = 7; ModelConfiguration configuration = 8; }
-message AgentDefinition { string slug = 1; string description = 2; string system_prompt = 3; string first_message = 4; optional string model_id = 5; repeated string fallback_models = 6; bool fast_mode = 7; optional string reasoning_effort = 8; }
+message AgentDefinition {
+  string slug = 1;
+  string description = 2;
+  string system_prompt = 3;
+  string first_message = 4;
+  optional string model_id = 5;
+  repeated string fallback_models = 6;
+  bool fast_mode = 7;
+  optional string reasoning_effort = 8;
+  string ownership = 9;
+  optional bool enabled = 10;
+  repeated string allowed_capabilities = 11;
+  repeated string denied_capabilities = 12;
+  repeated string allowed_tools = 13;
+  repeated string denied_tools = 14;
+  string tool_profile = 15;
+  string task_shape = 16;
+  string output_contract = 17;
+  optional uint32 timeout_seconds = 18;
+  optional uint32 poll_interval_ms = 19;
+  optional uint32 max_turns = 20;
+  uint32 max_concurrency = 21;
+  string fallback_policy = 22;
+  bool can_delegate = 23;
+  uint32 max_delegation_depth = 24;
+  optional bool require_parent_attribution = 25;
+}
 message Skill { string name = 1; string description = 2; }
 
 message WebSettings { string backend = 1; bool credential_configured = 2; AgentBrowser agent_browser = 3; }

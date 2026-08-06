@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{AgentCatalog, AgentDefinition},
+    agent::{AgentCatalog, AgentDefinition, AgentFallbackPolicy, AgentOwnership, AgentToolProfile},
     backend::PromptAttachment,
     service::ServiceEngine,
     session::{ProviderRecord, SessionRecord},
@@ -438,7 +438,8 @@ impl ServerCore {
                 session_id,
                 agent_slug,
                 task,
-            } => self.delegate_command(&session_id, &agent_slug, &task),
+                parent_run_id,
+            } => self.delegate_command(&session_id, &agent_slug, &task, parent_run_id.as_ref()),
             Command::CancelRun { run_id } => self.cancel_run_command(&run_id),
             Command::RunShell {
                 session_id,
@@ -780,8 +781,14 @@ impl ServerCore {
         session_id: &SessionId,
         agent_slug: &str,
         task: &str,
+        parent_run_id: Option<&RunId>,
     ) -> DomainCommandOutcome {
         self.ensure_session(session_id)?;
+        if task.trim().is_empty() {
+            return Err(DomainCommandError::Invalid(
+                "agent delegation requires a non-empty task".to_owned(),
+            ));
+        }
         // Agent archetypes are global files shared by independently running workspace services.
         // Re-read at the invocation boundary so a service that was already running observes edits
         // made through another workspace without requiring a restart.
@@ -789,7 +796,11 @@ impl ServerCore {
         let (run_id, effects) = self
             .session_engine_mut(session_id)?
             .state_mut()
-            .delegate_agent(agent_slug, task)?;
+            .delegate_agent_attributed(
+                agent_slug,
+                task,
+                parent_run_id.map(nakode_protocol::RunId::as_str),
+            )?;
         Ok(Self::accepted(Some(run_id), effects))
     }
 
@@ -915,6 +926,54 @@ impl ServerCore {
                 .collect(),
             fast_mode: definition.fast_mode,
             reasoning_effort: definition.reasoning_effort,
+            ownership: match definition.ownership.as_str() {
+                "" | "owner_defined" => AgentOwnership::OwnerDefined,
+                "built_in" => AgentOwnership::BuiltIn,
+                other => {
+                    return Err(DomainCommandError::Invalid(format!(
+                        "unknown agent ownership {other:?}"
+                    )));
+                }
+            },
+            enabled: definition.enabled,
+            allowed_capabilities: definition.allowed_capabilities,
+            denied_capabilities: definition.denied_capabilities,
+            allowed_tools: definition.allowed_tools,
+            denied_tools: definition.denied_tools,
+            tool_profile: match definition.tool_profile.as_str() {
+                "" | "custom" => AgentToolProfile::Custom,
+                "none" => AgentToolProfile::None,
+                "read_only" => AgentToolProfile::ReadOnly,
+                "command_runner" => AgentToolProfile::CommandRunner,
+                "bounded_watcher" => AgentToolProfile::BoundedWatcher,
+                other => {
+                    return Err(DomainCommandError::Invalid(format!(
+                        "unknown agent tool profile {other:?}"
+                    )));
+                }
+            },
+            task_shape: definition.task_shape,
+            output_contract: definition.output_contract,
+            timeout_seconds: definition.timeout_seconds,
+            poll_interval_ms: definition.poll_interval_ms,
+            max_turns: definition.max_turns,
+            max_concurrency: if definition.max_concurrency == 0 {
+                4
+            } else {
+                definition.max_concurrency
+            },
+            fallback_policy: match definition.fallback_policy.as_str() {
+                "" | "configured_only" => AgentFallbackPolicy::ConfiguredOnly,
+                "prohibited" => AgentFallbackPolicy::Prohibited,
+                other => {
+                    return Err(DomainCommandError::Invalid(format!(
+                        "unknown agent fallback policy {other:?}"
+                    )));
+                }
+            },
+            can_delegate: definition.can_delegate,
+            max_delegation_depth: definition.max_delegation_depth,
+            require_parent_attribution: definition.require_parent_attribution,
         };
         self.engine()
             .state()
@@ -934,6 +993,7 @@ impl ServerCore {
         slug: String,
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
+        self.engine().state().validate_agent_deletion(&slug)?;
         Ok(Self::accepted(
             Some(slug.clone()),
             vec![Effect::DeleteAgent(slug)],
@@ -2865,12 +2925,12 @@ mod tests {
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
 
         let empty = core
-            .delegate_command(&session_id, "missing", "   ")
+            .delegate_command(&session_id, "missing", "   ", None)
             .expect_err("blank delegation must be rejected");
         assert!(empty.to_string().contains("non-empty task"));
 
         let unknown = core
-            .delegate_command(&session_id, "missing", "Inspect authentication")
+            .delegate_command(&session_id, "missing", "Inspect authentication", None)
             .expect_err("unknown agent must be rejected");
         assert!(unknown.to_string().contains("predefined agent"));
         assert!(
@@ -2901,7 +2961,7 @@ model = "openai-codex/gpt-5"
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
 
         let (accepted, effects) = core
-            .delegate_command(&session_id, "reviewer", "Inspect authentication")
+            .delegate_command(&session_id, "reviewer", "Inspect authentication", None)
             .expect("fresh global agent is available");
 
         assert!(accepted.resource_id.is_some());
@@ -2942,6 +3002,7 @@ first_message = "Starting review"
             fallback_models: Vec::new(),
             fast_mode: false,
             reasoning_effort: None,
+            ..AgentDefinition::default()
         }]));
         let workspace_id = crate::state::projection::workspace_id(&state.workspace);
         let core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
@@ -2958,6 +3019,7 @@ first_message = "Starting review"
                     fallback_models: Vec::new(),
                     fast_mode: false,
                     reasoning_effort: None,
+                    ..AgentDefinitionInput::default()
                 },
                 None,
             )
@@ -2979,6 +3041,7 @@ first_message = "Starting review"
                     fallback_models: Vec::new(),
                     fast_mode: false,
                     reasoning_effort: None,
+                    ..AgentDefinitionInput::default()
                 },
                 None,
             )

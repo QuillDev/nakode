@@ -166,6 +166,9 @@ pub enum NakodeCommand {
         session_id: String,
         #[arg(long, default_value = "Complete your predefined assignment.")]
         task: String,
+        /// Attributed parent run for policy-bounded recursive delegation.
+        #[arg(long)]
+        parent_run_id: Option<String>,
     },
     /// Deprecated. Manage the native server; use the top-level commands.
     Service {
@@ -854,6 +857,7 @@ mod tests {
                 agent_slug,
                 session_id,
                 task,
+                parent_run_id: None,
             }) if agent_slug == "reviewer" && session_id == "session-7" && task == "Review auth"
         ));
         assert!(Config::try_parse_from(["nakode", "agent", "explorer"]).is_err());

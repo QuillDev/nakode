@@ -110,6 +110,7 @@ impl AcpCapabilities {
             approvals: CapabilitySupport::Supported,
             native_tools: CapabilitySupport::Supported,
             external_tools: CapabilitySupport::Unsupported,
+            scoped_runtime_policy: CapabilitySupport::Unsupported,
             mcp: self.mcp.map_or(CapabilitySupport::Unsupported, |()| {
                 CapabilitySupport::Supported
             }),
