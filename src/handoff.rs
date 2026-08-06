@@ -149,6 +149,7 @@ mod tests {
             status: EntryStatus::Complete,
             provider_id: None,
             model_id: None,
+            tool_audit_json: None,
         }
     }
 

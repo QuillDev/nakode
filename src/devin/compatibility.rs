@@ -1272,6 +1272,7 @@ async fn normalize_message_chunk(
                     .to_owned(),
                     body: text,
                     status: ItemStatus::Complete,
+                    tool_audit_json: None,
                 },
             });
         }
@@ -1387,6 +1388,7 @@ fn tool_item(update: &Value, completed: bool) -> NormalizedItem {
             .to_owned(),
         body: tool_content(update),
         status,
+        tool_audit_json: None,
     }
 }
 

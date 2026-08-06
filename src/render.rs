@@ -2388,6 +2388,7 @@ mod tests {
                     artifacts: Vec::new(),
                     provider_id: None,
                     model_id: None,
+                    tool_audit_json: None,
                 }],
                 has_earlier: false,
                 stream_active: matches!(status, RunStatus::Starting | RunStatus::Working),

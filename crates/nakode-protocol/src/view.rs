@@ -222,6 +222,9 @@ pub struct TranscriptEntryView {
     /// Canonical provider-qualified model captured when this turn began.
     #[serde(default)]
     pub model_id: Option<ModelId>,
+    /// Versioned, bounded tool audit JSON. Clients must render it as inert data.
+    #[serde(default)]
+    pub tool_audit_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -906,6 +909,7 @@ mod tests {
             artifacts: Vec::new(),
             provider_id: Some("openai-codex".to_owned()),
             model_id: Some(ModelId::from("openai-codex/gpt-5.4")),
+            tool_audit_json: None,
         };
         let value = serde_json::to_value(entry).expect("serialize transcript entry");
         assert_eq!(value["body_start_byte"], 96);

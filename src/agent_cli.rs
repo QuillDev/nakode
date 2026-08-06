@@ -237,6 +237,7 @@ mod tests {
             artifacts: Vec::new(),
             provider_id: None,
             model_id: None,
+            tool_audit_json: None,
         }
     }
 }

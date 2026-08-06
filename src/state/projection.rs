@@ -1066,6 +1066,14 @@ fn projected_transcript_page(
     let mut projected = Vec::with_capacity(limit.min(entries.len()));
     let mut truncated_body = false;
     for entry in entries[..end].iter().rev().take(limit) {
+        // Tool audit envelopes share the same IPC/memory budget as transcript bodies. Providers bound
+        // each payload field before it reaches here; the page keeps an envelope whole so a client is
+        // never handed valid-looking partial JSON.
+        let audit_bytes = entry.tool_audit_json.as_ref().map_or(0, String::len);
+        let include_audit = audit_bytes <= remaining_body_bytes;
+        if include_audit {
+            remaining_body_bytes = remaining_body_bytes.saturating_sub(audit_bytes);
+        }
         let body_limit = remaining_body_bytes.min(MAX_TRANSCRIPT_ENTRY_BODY_BYTES);
         if body_limit == 0 && !entry.body.is_empty() {
             break;
@@ -1073,7 +1081,12 @@ fn projected_transcript_page(
         let body = utf8_tail(&entry.body, body_limit);
         truncated_body |= body.len() < entry.body.len();
         remaining_body_bytes = remaining_body_bytes.saturating_sub(body.len());
-        projected.push(transcript_entry_view(transcript, entry, body));
+        projected.push(transcript_entry_view(
+            transcript,
+            entry,
+            body,
+            include_audit,
+        ));
     }
     projected.reverse();
     let omitted_entries = projected.len() < end;
@@ -1089,6 +1102,7 @@ fn transcript_entry_view(
     transcript: &DomainTranscript,
     entry: &TranscriptEntry,
     body: &str,
+    include_audit: bool,
 ) -> TranscriptEntryView {
     TranscriptEntryView {
         id: EntryId::from(entry.id.clone()),
@@ -1106,6 +1120,9 @@ fn transcript_entry_view(
             .collect(),
         provider_id: entry.provider_id.clone(),
         model_id: entry.model_id.clone().map(ModelId::from),
+        tool_audit_json: include_audit
+            .then(|| entry.tool_audit_json.clone())
+            .flatten(),
     }
 }
 
@@ -1558,6 +1575,32 @@ mod tests {
     }
 
     #[test]
+    fn over_budget_tool_audit_is_omitted_without_dropping_its_transcript_row() {
+        let mut transcript = DomainTranscript::new(100);
+        transcript.upsert(
+            "tool-1",
+            EntryKind::Tool,
+            "read · README.md",
+            "",
+            EntryStatus::Complete,
+        );
+        transcript.set_tool_audit("tool-1", Some("x".repeat(64)));
+
+        let page = super::projected_transcript_page(&transcript, None, 10, 16)
+            .expect("bounded transcript page");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].title, "read · README.md");
+        assert_eq!(page.entries[0].tool_audit_json, None);
+
+        let page = super::projected_transcript_page(&transcript, None, 10, 128)
+            .expect("roomy transcript page");
+        assert_eq!(
+            page.entries[0].tool_audit_json.as_deref(),
+            Some("x".repeat(64).as_str())
+        );
+    }
+
+    #[test]
     fn omitted_runs_are_discoverable_through_complete_cursor_pagination() {
         let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
         let parent_session_id = state.nakode_session_id.clone();
@@ -1636,6 +1679,7 @@ mod tests {
                 status: EntryStatus::Complete,
                 provider_id: None,
                 model_id: None,
+                tool_audit_json: None,
             }],
         }]);
 
@@ -1866,6 +1910,7 @@ mod tests {
             artifacts: Vec::new(),
             provider_id: None,
             model_id: None,
+            tool_audit_json: None,
         }
     }
 
