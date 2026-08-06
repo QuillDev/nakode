@@ -98,19 +98,52 @@ unrelated PRs cannot cancel each other. The test and lint jobs have explicit 30
 and 20 minute bounds. Cache hit status and final target size are retained in the
 step summary/logs without flooding normal output.
 
-## Real-run verification procedure
+## Real revised-branch runs
 
-After pushing this branch, inspect the cold run and then push an empty commit or
-a documentation-only commit for the warm run:
+The branch workflow was temporarily enabled for branch pushes to obtain real
+cold and warm evidence, then restored to its final PR/`main` triggers. Both runs
+completed successfully on GitHub-hosted `ubuntu-24.04` x64 runners with no
+retry. Queue delay was 3 seconds in each case.
+
+| Run | Cache | End to end | Test job | Test step | Lint job | Clippy step |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| [31066397258](https://github.com/QuillDev/nakode/actions/runs/31066397258) | cold; both misses | 2m 09s | 2m 05s | 1m 46s | 1m 42s | 1m 26s |
+| [31066519986](https://github.com/QuillDev/nakode/actions/runs/31066519986) | warm; both hits | 1m 14s | 1m 10s | 49s | 45s | 24s |
+
+The warm required-feedback critical path is the test job at 70 seconds. Its
+74-second workflow wall time is 55 seconds (43%) shorter than the cold run and
+46 seconds (38%) shorter than the approximately 120-second measured serial
+local gate, despite the hosted runner having fewer cores. Parallel linting
+keeps the 45-second lint job off the critical path without weakening either
+failure result.
+
+Cold setup was small and deterministic: checkout 0-1 seconds, toolchain install
+1 second, and cache miss lookup 0-2 seconds. Test execution/compilation and
+Clippy were the actual cold critical work, confirming the local root-cause
+ranking. Cold cache saves took 9 seconds (test) and 8 seconds (lint) after the
+checks had already passed; no job depends on the save. The pruned saved caches
+restored on the next run as a 515 MB test cache in 10 seconds and a 348 MB lint
+cache in 8 seconds. The diagnostic step reported `cache-hit: false` on the
+first run and `true` on the second; final target sizes were 2.9 GiB and 798/799
+MiB respectively. This demonstrates correct miss and reuse behavior without
+transferring the full raw target directories.
+
+All 517 tests, all targets/features, formatting, and Clippy with denied warnings
+ran and passed in both hosted runs. There were no artifacts, external downloads
+beyond the Rust/cache actions and Cargo dependencies, retries, hangs, or rate
+limits. Job-level timeouts and per-PR concurrency remain the bounds for genuine
+hangs and superseded work.
+
+For future regression investigations:
 
 ```sh
-gh run list --repo QuillDev/nakode --branch perf/reduce-nakode-ci-times \
-  --workflow Required --limit 5
+gh run list --repo QuillDev/nakode --workflow Required --limit 5
 gh run view <run-id> --repo QuillDev/nakode --json \
   createdAt,startedAt,updatedAt,jobs,url
+gh run view <run-id> --repo QuillDev/nakode --log
 ```
 
-Record queue delay, both job and every step duration, cache-hit output, target
-size, end-to-end wall time, and the final critical path here. Because there was
-no prior CI run, compare cold versus warm revised runs and the measured local
-serial gate; do not label that as a historical hosted before/after result.
+There is deliberately no claimed historical hosted before/after result: the
+repository had no workflow or prior run. The honest comparisons are cold versus
+warm revised CI and revised hosted critical path versus the measured serial
+local quality gate.
