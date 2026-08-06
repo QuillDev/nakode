@@ -1290,7 +1290,7 @@ impl QuestionBroker {
             .await
             .insert(request.id.clone(), answer_tx);
         events
-            .send(BackendEvent::QuestionRequested(request.clone()))
+            .send(BackendEvent::QuestionRequested(Box::new(request.clone())))
             .await
             .map_err(|_| "backend event receiver closed".to_owned())?;
         let answer = tokio::select! {
@@ -2777,7 +2777,7 @@ mod tests {
         });
 
         assert!(
-            matches!(receiver.recv().await, Some(BackendEvent::QuestionRequested(event_request)) if event_request == request)
+            matches!(receiver.recv().await, Some(BackendEvent::QuestionRequested(event_request)) if *event_request == request)
         );
         assert!(
             broker

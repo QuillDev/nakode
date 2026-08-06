@@ -474,7 +474,7 @@ pub enum BackendEvent {
         plan: String,
     },
     ApprovalRequested(ApprovalRequest),
-    QuestionRequested(QuestionRequest),
+    QuestionRequested(Box<QuestionRequest>),
     ExternalToolRequested(ExternalToolRequest),
     ApprovalResolved {
         request_id: Value,
