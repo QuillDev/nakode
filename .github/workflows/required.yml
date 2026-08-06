@@ -2,7 +2,7 @@ name: Required
 
 on:
   push:
-    branches: [main]
+    branches: [main, perf/reduce-nakode-ci-times]
   pull_request:
   workflow_dispatch:
 
