@@ -74,8 +74,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             agent_slug,
             session_id,
             task,
+            parent_run_id,
         } => {
-            let result = agent_cli::run(&config, agent_slug, session_id, task).await?;
+            let result =
+                agent_cli::run(&config, agent_slug, session_id, task, parent_run_id).await?;
             println!("{}", result.output);
             if !result.success {
                 return Err("agent invocation failed".into());

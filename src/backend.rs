@@ -84,6 +84,8 @@ pub struct BackendCapabilities {
     pub approvals: CapabilitySupport,
     pub native_tools: CapabilitySupport,
     pub external_tools: CapabilitySupport,
+    /// Enforces archetype builtin-tool allowlists and delegated turn/time bounds.
+    pub scoped_runtime_policy: CapabilitySupport,
     pub mcp: CapabilitySupport,
     pub close_session: CapabilitySupport,
 }
@@ -537,6 +539,12 @@ pub enum BackendCommand {
         owner_session_id: Option<String>,
         external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
+        /// Canonical Nakode builtin names allowed for this provider session. `None` keeps the
+        /// ordinary full registry; `Some` is authoritative even when empty.
+        allowed_builtin_tools: Option<Vec<String>>,
+        /// Maximum provider/tool inference rounds and wall-clock lifetime for delegated runs.
+        max_turns: Option<u32>,
+        timeout_seconds: Option<u32>,
     },
     ResumeSession {
         provider_session_id: String,

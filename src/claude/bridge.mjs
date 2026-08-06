@@ -20,7 +20,7 @@ const approvals = new Map();
 const providerToolCalls = new Map();
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
-async function delegate(ownerSessionId, task) {
+async function delegate(ownerSessionId, task, parentRunId = null) {
   return new Promise((resolve, reject) => {
     const executable = process.env.NAKODE_EXECUTABLE;
     const workspace = process.env.NAKODE_WORKSPACE;
@@ -39,6 +39,7 @@ async function delegate(ownerSessionId, task) {
         task.archetype,
         `--session-id=${ownerSessionId}`,
         `--task=${task.task}`,
+        ...(parentRunId ? [`--parent-run-id=${parentRunId}`] : []),
       ],
       { cwd: workspace, stdio: ["ignore", "pipe", "pipe"] },
     );
@@ -75,7 +76,7 @@ async function delegate(ownerSessionId, task) {
   });
 }
 
-function nakodeServer(ownerSessionId) {
+function nakodeServer(ownerSessionId, parentRunId) {
   return createSdkMcpServer({
     name: "nakode",
     version: "1.0.0",
@@ -93,7 +94,7 @@ function nakodeServer(ownerSessionId) {
         },
         async (args) => {
           try {
-            const result = await delegate(ownerSessionId, args);
+            const result = await delegate(ownerSessionId, args, parentRunId);
             return {
               isError: result.status !== "completed",
               content: [{ type: "text", text: JSON.stringify(result) }],
@@ -348,6 +349,9 @@ function savedHistory(messages, sessionId) {
 
 async function createSession(command, resumed) {
   const sessionId = command.sessionId || randomUUID();
+  const instructions = command.instructions || "";
+  const policy = archetypePolicy(instructions);
+  const securityValidator = validatorSession(instructions);
   sessions.set(sessionId, {
     sessionId,
     resumed,
@@ -356,9 +360,14 @@ async function createSession(command, resumed) {
     model: command.model || "sonnet",
     options: {},
     ownerSessionId: command.ownerSessionId || null,
-    securityValidator: validatorSession(command.instructions || ""),
-    validationEnabled:
-      Boolean(command.ownerSessionId) && !validatorSession(command.instructions || ""),
+    attributedRunId: policy?.runId ?? null,
+    securityValidator,
+    validationEnabled: Boolean(command.ownerSessionId) && !securityValidator,
+    delegationEnabled: policy?.canDelegate ?? true,
+    allowedTools: securityValidator ? [] : (policy?.allowedTools ?? null),
+    deniedTools: policy?.deniedTools ?? [],
+    maxTurns: command.maxTurns || null,
+    timeoutSeconds: command.timeoutSeconds || null,
   });
   let history = [];
   if (resumed) {
@@ -388,6 +397,50 @@ async function createSession(command, resumed) {
 
 function validatorSession(instructions) {
   return instructions.includes("[Nakode Security Validator]");
+}
+
+const POLICY_TOOL_NAMES = new Map([
+  ["read", "Read"],
+  ["grep", "Grep"],
+  ["find", "Glob"],
+  ["ls", "Glob"],
+  ["bash", "Bash"],
+  ["write", "Write"],
+  ["edit", "Edit"],
+  ["browser", "WebFetch"],
+  ["ask", "AskUserQuestion"],
+]);
+
+function archetypePolicy(instructions) {
+  const start = instructions.lastIndexOf("[Nakode Archetype Policy]");
+  if (start < 0) return null;
+  const policy = instructions.slice(start);
+  const runId = /\[Nakode Run Attribution\]\nRun ID: ([^\n]+)/.exec(policy)?.[1];
+  const profile = /Tool profile: (\w+)/.exec(policy)?.[1];
+  const configured = /Allowed tools: ([^\n]+)/.exec(policy)?.[1] || "none";
+  const denied = /Denied tools: ([^\n]+)/.exec(policy)?.[1] || "none";
+  const names = configured === "none" ? [] : configured.split(",").map((name) => name.trim());
+  const mapped = names.flatMap((name) => {
+    const toolName = POLICY_TOOL_NAMES.get(name);
+    return toolName ? [toolName] : [];
+  });
+  const deniedTools = denied === "none"
+    ? []
+    : denied
+        .split(",")
+        .map((name) => POLICY_TOOL_NAMES.get(name.trim()))
+        .filter((name) => name !== undefined);
+  let allowedTools;
+  if (profile === "none") allowedTools = [];
+  // Empty custom policy preserves legacy definitions; restrictive profiles never do.
+  else if (profile === "custom" && mapped.length === 0) allowedTools = null;
+  else allowedTools = mapped;
+  return {
+    allowedTools,
+    deniedTools,
+    canDelegate: policy.includes("Recursive delegation is allowed"),
+    runId: runId || null,
+  };
 }
 
 async function permissionMode(workspace) {
@@ -454,6 +507,20 @@ async function securityValidation(ownerSessionId, toolName, input, options) {
 
 function permissionHandler(turnId, session, mode) {
   return async (toolName, input, options) => {
+    if (session.deniedTools.includes(toolName)) {
+      return {
+        behavior: "deny",
+        message: `Archetype policy explicitly denies ${toolName}.`,
+        toolUseID: options.toolUseID,
+      };
+    }
+    if (session.allowedTools !== null && !session.allowedTools.includes(toolName)) {
+      return {
+        behavior: "deny",
+        message: `Archetype policy does not allow ${toolName}.`,
+        toolUseID: options.toolUseID,
+      };
+    }
     if (
       toolName !== "AskUserQuestion" &&
       mode === "auto" &&
@@ -647,11 +714,19 @@ async function sendTurn(command) {
     includePartialMessages: true,
     abortController,
     permissionMode: mode,
-    ...(session.securityValidator ? { allowedTools: [] } : {}),
+    ...(session.maxTurns ? { maxTurns: session.maxTurns } : {}),
+    ...(session.allowedTools !== null ? { allowedTools: session.allowedTools } : {}),
     canUseTool: permissionHandler(command.turnId, session, mode),
     spawnClaudeCodeProcess: processLifecycle.spawn,
-    ...(session.ownerSessionId && session.validationEnabled
-      ? { mcpServers: { nakode: nakodeServer(session.ownerSessionId) } }
+    ...(session.ownerSessionId && session.validationEnabled && session.delegationEnabled
+      ? {
+          mcpServers: {
+            nakode: nakodeServer(
+              session.ownerSessionId,
+              session.attributedRunId,
+            ),
+          },
+        }
       : {}),
     ...(session.started
       ? { resume: session.sessionId }
@@ -663,6 +738,13 @@ async function sendTurn(command) {
   };
 
   let completion = null;
+  let timedOut = false;
+  const timeout = session.timeoutSeconds
+    ? setTimeout(() => {
+        timedOut = true;
+        abortController.abort();
+      }, session.timeoutSeconds * 1000)
+    : null;
   try {
     const stream = query({ prompt: command.prompt, options });
     await processLifecycle.started();
@@ -701,10 +783,15 @@ async function sendTurn(command) {
   } catch (error) {
     const interrupted = abortController.signal.aborted;
     completion = {
-      status: interrupted ? "cancelled" : "failed",
-      error: interrupted ? undefined : errorMessage(error),
+      status: timedOut ? "failed" : interrupted ? "cancelled" : "failed",
+      error: timedOut
+        ? `archetype runtime exceeded its configured ${session.timeoutSeconds} second timeout`
+        : interrupted
+          ? undefined
+          : errorMessage(error),
     };
   } finally {
+    if (timeout !== null) clearTimeout(timeout);
     runs.delete(command.turnId);
   }
 

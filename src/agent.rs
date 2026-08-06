@@ -3,8 +3,64 @@ use std::{collections::HashSet, fs, path::Path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+const CANONICAL_AGENT_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "bash",
+    "write",
+    "edit",
+    "eval",
+    "todo",
+    "ask",
+    "memory_search",
+    "memory_store",
+    "vision",
+    "browser",
+];
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOwnership {
+    BuiltIn,
+    #[default]
+    OwnerDefined,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolProfile {
+    None,
+    ReadOnly,
+    CommandRunner,
+    BoundedWatcher,
+    #[default]
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentFallbackPolicy {
+    Prohibited,
+    #[default]
+    ConfiguredOnly,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+fn attributed_by_default() -> bool {
+    true
+}
+
+fn default_concurrency() -> u32 {
+    4
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct AgentDefinition {
     pub slug: String,
     pub description: String,
@@ -26,6 +82,100 @@ pub struct AgentDefinition {
     /// applied, and the run gets the model's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Whether the definition is shipped as immutable policy or belongs to the local owner.
+    #[serde(default, skip_serializing_if = "is_owner_defined")]
+    pub ownership: AgentOwnership,
+    /// Disabled definitions remain inspectable but cannot be delegated.
+    #[serde(default = "enabled_by_default", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
+    /// Provider-neutral capability and tool policy. Names are canonical Nakode runtime names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_tools: Vec<String>,
+    #[serde(default)]
+    pub tool_profile: AgentToolProfile,
+    /// Human-readable task and machine-readable result expectations.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub task_shape: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_contract: String,
+    /// Bounded execution policy. Zero/None means the runtime default where documented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    #[serde(
+        default = "default_concurrency",
+        skip_serializing_if = "is_default_concurrency"
+    )]
+    pub max_concurrency: u32,
+    #[serde(default)]
+    pub fallback_policy: AgentFallbackPolicy,
+    /// Recursive Nakode delegation is denied unless both fields explicitly allow a bounded depth.
+    #[serde(default)]
+    pub can_delegate: bool,
+    #[serde(default)]
+    pub max_delegation_depth: u32,
+    #[serde(
+        default = "attributed_by_default",
+        skip_serializing_if = "is_attributed"
+    )]
+    pub require_parent_attribution: bool,
+}
+
+fn is_owner_defined(value: &AgentOwnership) -> bool {
+    *value == AgentOwnership::OwnerDefined
+}
+
+fn is_enabled(value: &bool) -> bool {
+    *value
+}
+
+fn is_attributed(value: &bool) -> bool {
+    *value
+}
+
+fn is_default_concurrency(value: &u32) -> bool {
+    *value == default_concurrency()
+}
+
+impl Default for AgentDefinition {
+    fn default() -> Self {
+        Self {
+            slug: String::new(),
+            description: String::new(),
+            system_prompt: String::new(),
+            first_message: String::new(),
+            model: None,
+            fallback_models: Vec::new(),
+            fast_mode: false,
+            reasoning_effort: None,
+            ownership: AgentOwnership::OwnerDefined,
+            enabled: true,
+            allowed_capabilities: Vec::new(),
+            denied_capabilities: Vec::new(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            tool_profile: AgentToolProfile::Custom,
+            task_shape: String::new(),
+            output_contract: String::new(),
+            timeout_seconds: None,
+            poll_interval_ms: None,
+            max_turns: None,
+            max_concurrency: default_concurrency(),
+            fallback_policy: AgentFallbackPolicy::ConfiguredOnly,
+            can_delegate: false,
+            max_delegation_depth: 0,
+            require_parent_attribution: true,
+        }
+    }
 }
 
 impl AgentDefinition {
@@ -53,6 +203,31 @@ impl AgentDefinition {
         } else {
             system_prompt
         }
+    }
+
+    #[must_use]
+    pub fn builtin_tool_allowlist(&self) -> Option<Vec<String>> {
+        if self.tool_profile == AgentToolProfile::Custom && self.allowed_tools.is_empty() {
+            if self.denied_tools.is_empty() {
+                return None;
+            }
+            return Some(
+                CANONICAL_AGENT_TOOLS
+                    .iter()
+                    .filter(|tool| !self.denied_tools.iter().any(|denied| denied == *tool))
+                    .map(|tool| (*tool).to_owned())
+                    .collect(),
+            );
+        }
+        Some(self.allowed_tools.clone())
+    }
+
+    /// Whether this definition needs provider-side enforcement beyond ordinary unrestricted turns.
+    #[must_use]
+    pub fn requires_scoped_runtime_policy(&self) -> bool {
+        self.builtin_tool_allowlist().is_some()
+            || self.max_turns.is_some()
+            || self.timeout_seconds.is_some()
     }
 
     #[must_use]
@@ -113,6 +288,12 @@ pub enum AgentCatalogError {
     InvalidModel { slug: String, model: String },
     #[error("agent {slug:?} sets reasoning_effort {effort:?} without a model to run it at")]
     EffortWithoutModel { slug: String, effort: String },
+    #[error("agent {slug:?} has contradictory policy: {detail}")]
+    ContradictoryPolicy { slug: String, detail: String },
+    #[error(
+        "built-in agent {slug:?} is immutable; create an owner-defined archetype with a different slug"
+    )]
+    ImmutableBuiltIn { slug: String },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -217,6 +398,18 @@ impl AgentCatalog {
         previous_slug: Option<&str>,
     ) -> Result<(), AgentCatalogError> {
         validate(definition, &directory.display().to_string())?;
+        if let Some(previous) = previous_slug.and_then(|slug| self.find(slug))
+            && previous.ownership == AgentOwnership::BuiltIn
+        {
+            return Err(AgentCatalogError::ImmutableBuiltIn {
+                slug: previous.slug.clone(),
+            });
+        }
+        if previous_slug.is_none() && definition.ownership == AgentOwnership::BuiltIn {
+            return Err(AgentCatalogError::ImmutableBuiltIn {
+                slug: definition.slug.clone(),
+            });
+        }
         if self.definitions.iter().any(|existing| {
             existing.slug == definition.slug
                 && previous_slug.is_none_or(|previous| previous != existing.slug)
@@ -227,7 +420,27 @@ impl AgentCatalog {
         }
         self.materialize_if_missing(directory)?;
         if let Some(previous_slug) = previous_slug.filter(|slug| *slug != definition.slug) {
-            remove_if_present(&definition_path(directory, previous_slug))?;
+            let previous_path = definition_path(directory, previous_slug);
+            let backup = directory.join(format!(".{previous_slug}.toml.rename-backup"));
+            fs::rename(&previous_path, &backup).map_err(|source| {
+                AgentCatalogError::RemoveDefinition {
+                    path: previous_path.display().to_string(),
+                    source,
+                }
+            })?;
+            if let Err(error) = write_definition(directory, definition) {
+                let _ = fs::rename(&backup, &previous_path);
+                return Err(error);
+            }
+            if let Err(source) = fs::remove_file(&backup) {
+                let _ = fs::remove_file(definition_path(directory, &definition.slug));
+                let _ = fs::rename(&backup, &previous_path);
+                return Err(AgentCatalogError::RemoveDefinition {
+                    path: backup.display().to_string(),
+                    source,
+                });
+            }
+            return Ok(());
         }
         write_definition(directory, definition)
     }
@@ -237,6 +450,13 @@ impl AgentCatalog {
     /// # Errors
     /// Returns an error when the catalog cannot be materialized or the file removed.
     pub fn delete(&self, directory: &Path, slug: &str) -> Result<(), AgentCatalogError> {
+        if let Some(definition) = self.find(slug)
+            && definition.ownership == AgentOwnership::BuiltIn
+        {
+            return Err(AgentCatalogError::ImmutableBuiltIn {
+                slug: slug.to_owned(),
+            });
+        }
         self.materialize_if_missing(directory)?;
         remove_if_present(&definition_path(directory, slug))
     }
@@ -271,7 +491,12 @@ fn write_definition(
         }
     })?;
     let path = definition_path(directory, &definition.slug);
-    fs::write(&path, source).map_err(|source| AgentCatalogError::WriteDefinition {
+    let pending = directory.join(format!(".{}.toml.pending", definition.slug));
+    fs::write(&pending, source).map_err(|source| AgentCatalogError::WriteDefinition {
+        path: pending.display().to_string(),
+        source,
+    })?;
+    fs::rename(&pending, &path).map_err(|source| AgentCatalogError::WriteDefinition {
         path: path.display().to_string(),
         source,
     })
@@ -314,6 +539,244 @@ fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalog
             effort: effort.to_owned(),
         });
     }
+    if definition.max_concurrency == 0 || definition.max_concurrency > 16 {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "max_concurrency must be between 1 and 16".to_owned(),
+        });
+    }
+    if definition
+        .timeout_seconds
+        .is_some_and(|value| value == 0 || value > 86_400)
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "timeout_seconds must be between 1 and 86400".to_owned(),
+        });
+    }
+    if definition
+        .poll_interval_ms
+        .is_some_and(|value| !(100..=3_600_000).contains(&value))
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "poll_interval_ms must be between 100 and 3600000".to_owned(),
+        });
+    }
+    if definition
+        .max_turns
+        .is_some_and(|value| value == 0 || value > 100)
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "max_turns must be between 1 and 100".to_owned(),
+        });
+    }
+    if definition.max_delegation_depth > 4 {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "max_delegation_depth cannot exceed 4".to_owned(),
+        });
+    }
+    if definition.tool_profile == AgentToolProfile::BoundedWatcher
+        && (definition.poll_interval_ms.is_none() || definition.timeout_seconds.is_none())
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "bounded_watcher requires timeout_seconds and poll_interval_ms".to_owned(),
+        });
+    }
+    if definition.can_delegate != (definition.max_delegation_depth > 0) {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail:
+                "can_delegate and max_delegation_depth must enable or disable recursion together"
+                    .to_owned(),
+        });
+    }
+    if !definition.require_parent_attribution {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "parent attribution is required for every supervised archetype".to_owned(),
+        });
+    }
+    if definition.fallback_policy == AgentFallbackPolicy::Prohibited
+        && !definition.fallback_models.is_empty()
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "fallback_models must be empty when fallback_policy is prohibited".to_owned(),
+        });
+    }
+    for name in &definition.allowed_tools {
+        if definition.denied_tools.contains(name) {
+            return Err(AgentCatalogError::ContradictoryPolicy {
+                slug: definition.slug.clone(),
+                detail: format!("tool {name:?} is both allowed and denied"),
+            });
+        }
+    }
+    for name in &definition.allowed_capabilities {
+        if definition.denied_capabilities.contains(name) {
+            return Err(AgentCatalogError::ContradictoryPolicy {
+                slug: definition.slug.clone(),
+                detail: format!("capability {name:?} is both allowed and denied"),
+            });
+        }
+    }
+    let mut all_names = definition
+        .allowed_tools
+        .iter()
+        .chain(&definition.denied_tools)
+        .chain(&definition.allowed_capabilities)
+        .chain(&definition.denied_capabilities);
+    if all_names.any(|name| {
+        name.is_empty()
+            || !name.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || character == '-'
+                    || character == '_'
+            })
+    }) {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail:
+                "capability and tool names use lowercase letters, digits, hyphens or underscores"
+                    .to_owned(),
+        });
+    }
+    const CANONICAL_CAPABILITIES: &[&str] = &[
+        "filesystem_read",
+        "filesystem_write",
+        "command_execution",
+        "network",
+        "memory",
+        "vision",
+        "interaction",
+        "delegation",
+    ];
+    if let Some(name) = definition
+        .allowed_tools
+        .iter()
+        .chain(&definition.denied_tools)
+        .find(|name| !CANONICAL_AGENT_TOOLS.contains(&name.as_str()))
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: format!("unknown canonical tool {name:?}"),
+        });
+    }
+    if let Some(name) = definition
+        .allowed_capabilities
+        .iter()
+        .chain(&definition.denied_capabilities)
+        .find(|name| !CANONICAL_CAPABILITIES.contains(&name.as_str()))
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: format!("unknown canonical capability {name:?}"),
+        });
+    }
+    let profile_tools: &[&str] = match definition.tool_profile {
+        AgentToolProfile::None => &[],
+        AgentToolProfile::ReadOnly => &[
+            "read",
+            "grep",
+            "find",
+            "ls",
+            "todo",
+            "ask",
+            "memory_search",
+            "vision",
+        ],
+        AgentToolProfile::CommandRunner => &["read", "grep", "find", "ls", "bash", "todo", "ask"],
+        AgentToolProfile::BoundedWatcher => &["read", "grep", "find", "ls", "todo", "ask"],
+        AgentToolProfile::Custom => CANONICAL_AGENT_TOOLS,
+    };
+    if let Some(name) = definition
+        .allowed_tools
+        .iter()
+        .find(|name| !profile_tools.contains(&name.as_str()))
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: format!("tool {name:?} is not permitted by the selected tool_profile"),
+        });
+    }
+    if definition.tool_profile == AgentToolProfile::None && !definition.allowed_tools.is_empty() {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "the none tool profile cannot allow tools".to_owned(),
+        });
+    }
+    if definition.tool_profile != AgentToolProfile::Custom
+        && definition
+            .allowed_capabilities
+            .iter()
+            .any(|name| name == "network" || name == "filesystem_write")
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "restrictive tool profiles cannot allow network or filesystem_write".to_owned(),
+        });
+    }
+    for (tool, capability) in [
+        ("read", "filesystem_read"),
+        ("grep", "filesystem_read"),
+        ("find", "filesystem_read"),
+        ("ls", "filesystem_read"),
+        ("browser", "network"),
+        ("write", "filesystem_write"),
+        ("edit", "filesystem_write"),
+        ("bash", "command_execution"),
+        ("memory_store", "memory"),
+        ("memory_search", "memory"),
+        ("vision", "vision"),
+    ] {
+        if definition.allowed_tools.iter().any(|name| name == tool)
+            && !definition
+                .allowed_capabilities
+                .iter()
+                .any(|name| name == capability)
+        {
+            return Err(AgentCatalogError::ContradictoryPolicy {
+                slug: definition.slug.clone(),
+                detail: format!("tool {tool:?} requires capability {capability:?}"),
+            });
+        }
+    }
+    let write_tools = ["write", "edit"];
+    if matches!(
+        definition.tool_profile,
+        AgentToolProfile::ReadOnly | AgentToolProfile::BoundedWatcher
+    ) && definition
+        .allowed_tools
+        .iter()
+        .any(|tool| write_tools.contains(&tool.as_str()) || tool == "bash")
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "read-only and bounded-watcher profiles cannot allow write, edit, or bash"
+                .to_owned(),
+        });
+    }
+    if definition.tool_profile == AgentToolProfile::BoundedWatcher
+        && (definition.poll_interval_ms.is_none() || definition.timeout_seconds.is_none())
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "bounded watchers require poll_interval_ms and timeout_seconds".to_owned(),
+        });
+    }
+    if definition.tool_profile == AgentToolProfile::CommandRunner
+        && !definition.allowed_tools.iter().any(|tool| tool == "bash")
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "command runners must explicitly allow bash".to_owned(),
+        });
+    }
     for model in definition.model.iter().chain(&definition.fallback_models) {
         if model
             .split_once('/')
@@ -334,7 +797,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{AgentCatalog, AgentDefinition};
+    use super::{
+        AgentCatalog, AgentCatalogError, AgentDefinition, AgentOwnership, AgentToolProfile,
+    };
 
     #[test]
     fn loads_and_resolves_agent_definitions() {
@@ -517,6 +982,116 @@ description = "Research the requested topic and report concrete findings"
     }
 
     #[test]
+    fn restrictive_policy_rejects_unknown_or_capabilityless_tools() {
+        let mut definition = AgentDefinition {
+            slug: "reader".to_owned(),
+            description: "Reads bounded files".to_owned(),
+            tool_profile: AgentToolProfile::ReadOnly,
+            allowed_tools: vec!["read".to_owned()],
+            ..AgentDefinition::default()
+        };
+        let missing_capability = AgentCatalog::validate_definition(&definition)
+            .expect_err("read requires filesystem_read");
+        assert!(missing_capability.to_string().contains("filesystem_read"));
+
+        definition.allowed_capabilities = vec!["filesystem_read".to_owned()];
+        AgentCatalog::validate_definition(&definition).expect("read-only policy");
+        assert_eq!(
+            definition.builtin_tool_allowlist(),
+            Some(vec!["read".to_owned()])
+        );
+
+        definition.allowed_tools = vec!["browser".to_owned()];
+        let network = AgentCatalog::validate_definition(&definition)
+            .expect_err("read-only cannot silently gain network");
+        assert!(network.to_string().contains("tool_profile"));
+    }
+
+    #[test]
+    fn custom_legacy_and_deny_only_policies_compute_native_allowlists() {
+        let mut definition = AgentDefinition::default();
+        assert_eq!(definition.builtin_tool_allowlist(), None);
+        definition.denied_tools = vec!["bash".to_owned(), "write".to_owned(), "edit".to_owned()];
+        let allowed = definition
+            .builtin_tool_allowlist()
+            .expect("deny-only custom policy is bounded");
+        assert!(
+            !allowed
+                .iter()
+                .any(|tool| tool == "bash" || tool == "write" || tool == "edit")
+        );
+        assert!(allowed.iter().any(|tool| tool == "read"));
+    }
+
+    #[test]
+    fn built_in_definitions_cannot_be_updated_or_deleted() {
+        let directory = tempdir().expect("agent directory");
+        let built_in = AgentDefinition {
+            slug: "shipped".to_owned(),
+            description: "Shipped policy".to_owned(),
+            ownership: AgentOwnership::BuiltIn,
+            ..AgentDefinition::default()
+        };
+        let catalog = AgentCatalog::from_definitions(vec![built_in.clone()]);
+        let mut replacement = built_in.clone();
+        replacement.description = "Changed".to_owned();
+        assert!(matches!(
+            catalog.save(directory.path(), &replacement, Some("shipped")),
+            Err(AgentCatalogError::ImmutableBuiltIn { .. })
+        ));
+        assert!(matches!(
+            catalog.delete(directory.path(), "shipped"),
+            Err(AgentCatalogError::ImmutableBuiltIn { .. })
+        ));
+    }
+
+    #[test]
+    fn disposable_archetype_smoke_flows_through_authoritative_delete() {
+        let directory = tempdir().expect("disposable agent directory");
+        let empty = AgentCatalog::load(directory.path()).expect("empty catalogue");
+        let mut disposable = AgentDefinition {
+            slug: "dashboard-archetype-smoke".to_owned(),
+            description: "Disposable dashboard verification".to_owned(),
+            system_prompt: "Inspect only.".to_owned(),
+            first_message: "Starting verification.".to_owned(),
+            tool_profile: AgentToolProfile::ReadOnly,
+            allowed_capabilities: vec!["filesystem_read".to_owned()],
+            allowed_tools: vec!["read".to_owned()],
+            timeout_seconds: Some(60),
+            max_turns: Some(2),
+            max_concurrency: 1,
+            ..AgentDefinition::default()
+        };
+        empty
+            .save(directory.path(), &disposable, None)
+            .expect("create disposable");
+
+        let created = AgentCatalog::load(directory.path()).expect("inspect created disposable");
+        assert_eq!(created.find(&disposable.slug), Some(&disposable));
+
+        disposable.description = "Updated disposable dashboard verification".to_owned();
+        disposable.enabled = false;
+        created
+            .save(directory.path(), &disposable, Some(&disposable.slug))
+            .expect("atomic update and disable");
+        let disabled = AgentCatalog::load(directory.path()).expect("inspect disabled disposable");
+        assert_eq!(disabled.find(&disposable.slug), Some(&disposable));
+
+        disabled
+            .delete(directory.path(), &disposable.slug)
+            .expect("confirmed destructive delete path");
+        let deleted = AgentCatalog::load(directory.path()).expect("catalogue after delete");
+        assert!(deleted.find(&disposable.slug).is_none());
+        assert!(
+            fs::read_dir(directory.path())
+                .expect("agent directory")
+                .next()
+                .is_none(),
+            "the disposable definition must leave no file behind"
+        );
+    }
+
+    #[test]
     fn saves_the_first_custom_agent() {
         let parent = tempdir().expect("temp directory");
         let directory = parent.path().join("agents");
@@ -530,6 +1105,7 @@ description = "Research the requested topic and report concrete findings"
             fallback_models: vec!["devin-acp/swe-1-7-lightning".to_owned()],
             fast_mode: true,
             reasoning_effort: Some("high".to_owned()),
+            ..AgentDefinition::default()
         };
 
         catalog

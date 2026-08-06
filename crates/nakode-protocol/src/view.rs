@@ -471,6 +471,44 @@ pub struct AgentDefinitionView {
     /// definition written before the field existed reads back as `None` — the default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub ownership: String,
+    #[serde(default = "true_by_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_capabilities: Vec<String>,
+    #[serde(default)]
+    pub denied_capabilities: Vec<String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+    #[serde(default)]
+    pub tool_profile: String,
+    #[serde(default)]
+    pub task_shape: String,
+    #[serde(default)]
+    pub output_contract: String,
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
+    #[serde(default)]
+    pub poll_interval_ms: Option<u32>,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub max_concurrency: u32,
+    #[serde(default)]
+    pub fallback_policy: String,
+    #[serde(default)]
+    pub can_delegate: bool,
+    #[serde(default)]
+    pub max_delegation_depth: u32,
+    #[serde(default = "true_by_default")]
+    pub require_parent_attribution: bool,
+}
+
+fn true_by_default() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

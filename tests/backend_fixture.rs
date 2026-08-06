@@ -65,6 +65,9 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
             instructions: None,
             external_tools: Vec::new(),
             replace_builtin_tools: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
             owner_session_id: None,
         })
         .await?;
@@ -301,6 +304,9 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
             instructions: None,
             external_tools: Vec::new(),
             replace_builtin_tools: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
             owner_session_id: None,
         })
         .await?;

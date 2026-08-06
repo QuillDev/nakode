@@ -504,6 +504,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::SessionDeletion,
             ServiceCapability::QuestionTextAnswers,
             ServiceCapability::QueuedPromptSteering,
+            ServiceCapability::ArchetypeManagement,
         ]
         .into_iter()
         .collect(),
@@ -2151,6 +2152,9 @@ mod tests {
                     instructions: None,
                     external_tools: Vec::new(),
                     replace_builtin_tools: false,
+                    allowed_builtin_tools: None,
+                    max_turns: None,
+                    timeout_seconds: None,
                     owner_session_id: None,
                 },
             )
@@ -2198,6 +2202,9 @@ mod tests {
                     instructions: None,
                     external_tools: Vec::new(),
                     replace_builtin_tools: false,
+                    allowed_builtin_tools: None,
+                    max_turns: None,
+                    timeout_seconds: None,
                     owner_session_id: None,
                 },
             )
@@ -2212,6 +2219,9 @@ mod tests {
                     instructions: None,
                     external_tools: Vec::new(),
                     replace_builtin_tools: false,
+                    allowed_builtin_tools: None,
+                    max_turns: None,
+                    timeout_seconds: None,
                     owner_session_id: None,
                 },
             )

@@ -410,9 +410,12 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             owner_session_id,
             external_tools: _,
             replace_builtin_tools: _,
+            allowed_builtin_tools: _,
+            max_turns,
+            timeout_seconds,
         } => (
             "create",
-            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id}),
+            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id,"maxTurns":max_turns,"timeoutSeconds":timeout_seconds}),
         ),
         BackendCommand::ResumeSession {
             provider_session_id,
@@ -833,6 +836,7 @@ fn capabilities() -> BackendCapabilities {
         model_catalog: CapabilitySupport::Supported,
         approvals: CapabilitySupport::Supported,
         native_tools: CapabilitySupport::Supported,
+        scoped_runtime_policy: CapabilitySupport::Supported,
         close_session: CapabilitySupport::Supported,
         ..BackendCapabilities::default()
     }
@@ -850,6 +854,10 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("messageId: message.uuid"));
         assert!(BRIDGE_SOURCE.contains("blockIndex: event.index"));
         assert!(BRIDGE_SOURCE.contains("`claude:${messageId}:${blockIndex}`"));
+        assert!(BRIDGE_SOURCE.contains("allowedTools: securityValidator ? []"));
+        assert!(BRIDGE_SOURCE.contains("Archetype policy does not allow"));
+        assert!(BRIDGE_SOURCE.contains("maxTurns: session.maxTurns"));
+        assert!(BRIDGE_SOURCE.contains("session.timeoutSeconds * 1000"));
     }
 
     #[test]

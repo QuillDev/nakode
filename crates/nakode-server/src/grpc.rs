@@ -191,6 +191,23 @@ fn agent_input(
             .reasoning_effort
             .map(|effort| effort.trim().to_owned())
             .filter(|effort| !effort.is_empty()),
+        ownership: value.ownership,
+        enabled: value.enabled.unwrap_or(true),
+        allowed_capabilities: value.allowed_capabilities,
+        denied_capabilities: value.denied_capabilities,
+        allowed_tools: value.allowed_tools,
+        denied_tools: value.denied_tools,
+        tool_profile: value.tool_profile,
+        task_shape: value.task_shape,
+        output_contract: value.output_contract,
+        timeout_seconds: value.timeout_seconds,
+        poll_interval_ms: value.poll_interval_ms,
+        max_turns: value.max_turns,
+        max_concurrency: value.max_concurrency,
+        fallback_policy: value.fallback_policy,
+        can_delegate: value.can_delegate,
+        max_delegation_depth: value.max_delegation_depth,
+        require_parent_attribution: value.require_parent_attribution.unwrap_or(true),
     })
 }
 
@@ -693,7 +710,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         protocol::Command::Delegate {
             session_id: protocol::SessionId::from(input.session_id),
             agent_slug: input.agent_slug,
-            task: input.task
+            task: input.task,
+            parent_run_id: input.parent_run_id.map(protocol::RunId::from)
         }
     );
 
@@ -1240,6 +1258,23 @@ fn agent(value: protocol::AgentDefinitionView) -> api::AgentDefinition {
             .collect(),
         fast_mode: value.fast_mode,
         reasoning_effort: value.reasoning_effort,
+        ownership: value.ownership,
+        enabled: Some(value.enabled),
+        allowed_capabilities: value.allowed_capabilities,
+        denied_capabilities: value.denied_capabilities,
+        allowed_tools: value.allowed_tools,
+        denied_tools: value.denied_tools,
+        tool_profile: value.tool_profile,
+        task_shape: value.task_shape,
+        output_contract: value.output_contract,
+        timeout_seconds: value.timeout_seconds,
+        poll_interval_ms: value.poll_interval_ms,
+        max_turns: value.max_turns,
+        max_concurrency: value.max_concurrency,
+        fallback_policy: value.fallback_policy,
+        can_delegate: value.can_delegate,
+        max_delegation_depth: value.max_delegation_depth,
+        require_parent_attribution: Some(value.require_parent_attribution),
     }
 }
 

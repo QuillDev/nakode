@@ -203,6 +203,21 @@ without a `model` and refused when that model does not offer the level named. Om
 delegated run uses the model's own default level, which is what every definition written before the
 field means — nothing on disk needs editing.
 
+Owner-defined definitions additionally carry ownership and availability, canonical capability/tool
+allow and deny lists, a tool profile (`none`, `read_only`, `command_runner`, `bounded_watcher`, or
+`custom`), task/output contracts, bounded lifecycle values, fallback policy, and delegation/parent
+attribution policy. Shipped built-ins are visible but immutable. Nakode validates these fields against
+its live provider/model catalogue, persists create/update/rename atomically, and remains the sole
+runtime authority; unavailable choices are reported rather than silently replaced. Native Codex,
+Devin, GLM, and Kimi sessions receive an authoritative Nakode builtin-tool allowlist, while Claude
+applies the equivalent SDK allowlist and permission hook. Empty custom policy retains compatibility
+with definitions written before policy fields existed.
+
+Catalogue changes are loaded without restarting the service. After installing a Nakode binary whose
+public protocol changed, restart each workspace service that a frontend uses—for the FStack dashboard,
+`nakode --workspace "$FSTACK_HOME" restart`—and relaunch that frontend so both ends use the same
+protobuf and capability table.
+
 ```toml
 slug = "code-reviewer"
 description = "Reviews changes for correctness"
