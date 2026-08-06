@@ -1265,6 +1265,8 @@ async fn normalize_update(
                 } else {
                     history.push(SessionHistoryItem {
                         turn_id,
+                        provider_id: None,
+                        model_id: None,
                         item: NormalizedItem {
                             id: item_id,
                             kind: item_kind,

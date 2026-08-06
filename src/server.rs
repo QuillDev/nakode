@@ -3572,6 +3572,8 @@ first_message = "Starting review"
                 title: "reviewer".to_owned(),
                 body: result.clone(),
                 status: EntryStatus::Complete,
+                provider_id: None,
+                model_id: None,
             }],
         }]);
         let core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
@@ -3621,6 +3623,8 @@ first_message = "Starting review"
                     title: "reviewer".to_owned(),
                     body: format!("entry body {index:03}"),
                     status: EntryStatus::Complete,
+                    provider_id: None,
+                    model_id: None,
                 })
                 .collect(),
         }]);
@@ -3845,6 +3849,8 @@ first_message = "Starting review"
                 title: "reviewer".to_owned(),
                 body: "seed".to_owned(),
                 status: EntryStatus::Running,
+                provider_id: None,
+                model_id: None,
             }],
         }]);
         state.client.subagent_modal = Some("run-stream".to_owned());

@@ -216,6 +216,12 @@ pub struct TranscriptEntryView {
     pub status: TranscriptEntryStatus,
     #[serde(default)]
     pub artifacts: Vec<ArtifactId>,
+    /// Provider identity captured when this turn began. Absent for legacy or non-inference entries.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// Canonical provider-qualified model captured when this turn began.
+    #[serde(default)]
+    pub model_id: Option<ModelId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -858,9 +864,13 @@ mod tests {
             body_total_bytes: 100,
             status: TranscriptEntryStatus::Running,
             artifacts: Vec::new(),
+            provider_id: Some("openai-codex".to_owned()),
+            model_id: Some(ModelId::from("openai-codex/gpt-5.4")),
         };
         let value = serde_json::to_value(entry).expect("serialize transcript entry");
         assert_eq!(value["body_start_byte"], 96);
         assert_eq!(value["body_total_bytes"], 100);
+        assert_eq!(value["provider_id"], "openai-codex");
+        assert_eq!(value["model_id"], "openai-codex/gpt-5.4");
     }
 }

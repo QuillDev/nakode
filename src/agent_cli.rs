@@ -231,6 +231,8 @@ mod tests {
             body_total_bytes: u64::try_from(body.len()).unwrap_or(u64::MAX),
             status,
             artifacts: Vec::new(),
+            provider_id: None,
+            model_id: None,
         }
     }
 }

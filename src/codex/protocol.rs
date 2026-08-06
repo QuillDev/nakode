@@ -263,6 +263,8 @@ pub fn parse_session_history(result: &Value) -> Vec<SessionHistoryItem> {
                 .filter(|item| !is_internal_provider_item(item))
                 .map(move |item| SessionHistoryItem {
                     turn_id: turn_id.clone(),
+                    provider_id: None,
+                    model_id: None,
                     item: normalize_item(item),
                 })
         })

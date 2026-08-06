@@ -693,6 +693,7 @@ async fn start_session(
     };
     let selected_id = selected.info.id.clone();
     let session = RuntimeSession::new(selected_id.clone(), instructions.unwrap_or_default())
+        .with_provider(DEVIN_PROVIDER)
         .with_context_window(selected.context_window);
     let session_id = session.id.clone();
     if let Some(runtime) = context.runtime

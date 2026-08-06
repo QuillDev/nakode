@@ -2386,6 +2386,8 @@ mod tests {
                         .unwrap_or(u64::MAX),
                     status: TranscriptEntryStatus::Complete,
                     artifacts: Vec::new(),
+                    provider_id: None,
+                    model_id: None,
                 }],
                 has_earlier: false,
                 stream_active: matches!(status, RunStatus::Starting | RunStatus::Working),

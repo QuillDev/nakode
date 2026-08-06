@@ -875,6 +875,7 @@ async fn start_session(
     };
     let selected_id = selected.info.id.clone();
     let session = RuntimeSession::new(selected_id.clone(), instructions.unwrap_or_default())
+        .with_provider(CODEX_PROVIDER)
         .with_context_window(selected.context_window)
         .with_reasoning_effort(context.config.reasoning_effort.clone());
     let session_id = session.id.clone();

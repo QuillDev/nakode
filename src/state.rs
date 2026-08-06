@@ -6145,12 +6145,17 @@ impl DomainState {
         self.reasoning_summaries = ReasoningSummaryTracker::default();
         self.subagent_result_items.clear();
         for history_item in history {
-            let item = history_item.item;
+            let SessionHistoryItem {
+                turn_id,
+                provider_id,
+                model_id,
+                item,
+            } = history_item;
             if hides_subagent_item(&item) {
                 continue;
             }
-            self.item_turns
-                .insert(item.id.clone(), history_item.turn_id);
+            self.item_turns.insert(item.id.clone(), turn_id);
+            let item_id = item.id.clone();
             self.transcript.upsert(
                 item.id,
                 entry_kind(item.kind),
@@ -6158,6 +6163,8 @@ impl DomainState {
                 item.body,
                 entry_status(item.status),
             );
+            self.transcript
+                .set_origin(&item_id, provider_id.as_deref(), model_id.as_deref());
         }
         if self.transcript.entries().is_empty() {
             self.transcript.push(
@@ -6202,8 +6209,10 @@ impl DomainState {
         } else {
             item.body
         };
+        let item_id = item.id.clone();
         self.transcript
             .upsert(item.id, entry_kind(item.kind), item.title, body, status);
+        self.set_entry_turn_origin(&item_id, turn_id);
     }
 
     fn observe_delta(&mut self, turn_id: &str, item_id: &str, kind: DeltaKind, delta: &str) {
@@ -6230,6 +6239,7 @@ impl DomainState {
                     index,
                     delta,
                 );
+                self.set_entry_turn_origin(item_id, turn_id);
                 return;
             }
             DeltaKind::Assistant => (EntryKind::Assistant, "ASSISTANT"),
@@ -6244,9 +6254,21 @@ impl DomainState {
         };
         self.transcript
             .append_delta(item_id, entry_kind, title, delta);
+        self.set_entry_turn_origin(item_id, turn_id);
         if let Some(anchor) = assistant_anchor {
             self.transcript.move_before(item_id, &anchor);
         }
+    }
+
+    fn set_entry_turn_origin(&mut self, item_id: &str, turn_id: &str) {
+        let Some(turn) = self.active_turn.as_ref().filter(|turn| turn.id == turn_id) else {
+            return;
+        };
+        self.transcript.set_origin(
+            item_id,
+            (!self.backend_provider.is_empty()).then_some(self.backend_provider.as_str()),
+            turn.model.as_deref(),
+        );
     }
 
     fn request_failed(
@@ -9303,10 +9325,14 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 kind,
                 delta: delta.to_owned(),
             });
+            // Presentation state may move ahead while late deltas arrive; the active turn origin does not.
+            state.selected_model = Some("openai-codex/model-b".to_owned());
         }
 
         let entries = state.transcript.entries();
         assert_eq!(entries[0].key.as_deref(), Some("turn-1:reasoning:0"));
+        assert_eq!(entries[0].provider_id.as_deref(), Some("openai-codex"));
+        assert_eq!(entries[0].model_id.as_deref(), Some("kimi-coding/k3-256k"));
         assert_eq!(entries[1].key.as_deref(), Some("turn-1:assistant:0"));
     }
 
@@ -9965,6 +9991,8 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             model: "model-a".to_owned(),
             history: vec![SessionHistoryItem {
                 turn_id: "turn-1".to_owned(),
+                provider_id: None,
+                model_id: None,
                 item: NormalizedItem {
                     id: "user-1".to_owned(),
                     kind: ItemKind::User,
@@ -10039,6 +10067,8 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 title: "ASSISTANT".to_owned(),
                 body: "The session store owns orchestration metadata.".to_owned(),
                 status: EntryStatus::Complete,
+                provider_id: None,
+                model_id: None,
             }],
         }]);
 
