@@ -236,6 +236,7 @@ approvals, structured output, and subagents.
 - Preserve useful provider-native inference features instead of forcing a
   lowest common denominator.
 - Record the capability snapshot used by each orchestration run.
+- Queue redirection uses native steering when compatible; otherwise interruption reserves the selected prompt until the stopped provider process has exited and released its session, then starts it exactly once.
 - Treat provider enablement as a persisted registry preference. A disabled
   provider is unavailable for new work; it is not replaced by a `--backend`
   process mode.

@@ -496,6 +496,7 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
                 summary: item.summary,
                 text: item.text,
                 attachment_count: item.attachment_count,
+                redirecting: item.redirecting,
             })
             .collect(),
         interactions: value
