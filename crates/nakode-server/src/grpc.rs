@@ -1259,6 +1259,7 @@ fn model(value: protocol::ModelView) -> api::Model {
             reasoning_efforts: value.configuration.reasoning_efforts,
             fast_mode_configurable: value.configuration.fast_mode_configurable,
             vision_eligible: value.configuration.vision_eligible,
+            accepts_image_input: value.configuration.accepts_image_input,
         }),
     }
 }

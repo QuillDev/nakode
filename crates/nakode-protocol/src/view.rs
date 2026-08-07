@@ -62,6 +62,8 @@ pub struct ModelConfigurationView {
     pub fast_mode_configurable: bool,
     #[serde(default)]
     pub vision_eligible: bool,
+    #[serde(default)]
+    pub accepts_image_input: bool,
 }
 
 impl ModelConfigurationView {
@@ -892,6 +894,7 @@ mod tests {
                 reasoning_efforts: vec!["none".to_owned(), "high".to_owned()],
                 fast_mode_configurable: true,
                 vision_eligible: true,
+                accepts_image_input: true,
             },
         };
 
@@ -909,6 +912,7 @@ mod tests {
                     "reasoning_efforts": ["none", "high"],
                     "fast_mode_configurable": true,
                     "vision_eligible": true,
+                    "accepts_image_input": true,
                 },
             })
         );

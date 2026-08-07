@@ -25,8 +25,8 @@ use super::{
 use crate::{
     agent::{AgentDefinition, AgentToolProfile},
     backend::{
-        BackendCapabilities, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, ModelInfo,
-        TodoStatus,
+        BackendCapabilities, CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport,
+        GLM_PROVIDER, KIMI_PROVIDER, ModelInfo, TodoStatus,
     },
     domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
     memory::MemoryBackend,
@@ -98,7 +98,7 @@ pub fn bootstrap(
                     is_default: model.is_default,
                     reasoning_effort: options.reasoning_effort,
                     fast_mode: options.fast_mode,
-                    configuration: model_configuration(model),
+                    configuration: model_configuration(model, state.vision_config.is_enabled()),
                 }
             })
             .collect(),
@@ -176,9 +176,17 @@ pub fn bootstrap(
 
 /// The levels and flags a model takes. The ONE place that rule lives — every frontend, and the
 /// delegated-run path that has to refuse a level a model cannot take, reads this.
-pub(crate) fn model_configuration(model: &ModelInfo) -> ModelConfigurationView {
+pub(crate) fn model_configuration(
+    model: &ModelInfo,
+    vision_add_on_enabled: bool,
+) -> ModelConfigurationView {
     let mut configuration = ModelConfigurationView {
         reasoning_efforts: model.capabilities.reasoning_efforts.clone(),
+        accepts_image_input: vision_add_on_enabled
+            || matches!(
+                model.provider.as_str(),
+                CODEX_PROVIDER | CLAUDE_PROVIDER | CURSOR_PROVIDER | KIMI_PROVIDER | GLM_PROVIDER
+            ),
         ..ModelConfigurationView::default()
     };
     if model.provider == CODEX_PROVIDER {
@@ -1598,7 +1606,7 @@ mod tests {
 
     use super::{artifact_view, bootstrap, model_configuration, run_outcome};
     use crate::{
-        backend::{CODEX_PROVIDER, CURSOR_PROVIDER, ModelInfo, PromptImage},
+        backend::{CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER, ModelInfo, PromptImage},
         domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
         session::{SubagentObservability, SubagentRecord},
         state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
@@ -1606,7 +1614,7 @@ mod tests {
 
     #[test]
     fn model_configuration_is_derived_before_reaching_frontends() {
-        let openai = model_configuration(&model(CODEX_PROVIDER, "gpt-5.6"));
+        let openai = model_configuration(&model(CODEX_PROVIDER, "gpt-5.6"), false);
         assert_eq!(
             openai
                 .reasoning_efforts
@@ -1617,28 +1625,40 @@ mod tests {
         );
         assert!(openai.fast_mode_configurable);
         assert!(openai.vision_eligible);
+        assert!(openai.accepts_image_input);
 
-        let mut claude = model("anthropic-claude", "opus");
+        let mut claude = model(CLAUDE_PROVIDER, "opus");
         claude.capabilities.reasoning_efforts = ["low", "medium", "high"]
             .into_iter()
             .map(str::to_owned)
             .collect();
         assert_eq!(
-            model_configuration(&claude).reasoning_efforts,
+            model_configuration(&claude, false).reasoning_efforts,
             ["low", "medium", "high"]
         );
+        assert!(model_configuration(&claude, false).accepts_image_input);
 
-        let cursor = model_configuration(&model(CURSOR_PROVIDER, "composer-2"));
+        let cursor = model_configuration(&model(CURSOR_PROVIDER, "composer-2"), false);
         assert!(cursor.reasoning_efforts.is_empty());
         assert!(cursor.fast_mode_configurable);
         assert!(!cursor.vision_eligible);
 
+        let cursor_basic = model_configuration(&model(CURSOR_PROVIDER, "basic"), false);
+        assert!(cursor_basic.accepts_image_input);
+        assert!(!cursor_basic.fast_mode_configurable);
+        assert!(!cursor_basic.vision_eligible);
+
+        let devin_without_add_on = model_configuration(&model("devin-acp", "swe"), false);
+        assert!(!devin_without_add_on.accepts_image_input);
         assert_eq!(
-            model_configuration(&model(CURSOR_PROVIDER, "basic")),
+            devin_without_add_on,
             nakode_protocol::ModelConfigurationView::default()
         );
+        assert!(model_configuration(&model("devin-acp", "swe"), true).accepts_image_input);
+        assert!(!model_configuration(&model("devin-acp", "swe"), true).vision_eligible);
+
         assert_eq!(
-            model_configuration(&model("other-provider", "model")),
+            model_configuration(&model("other-provider", "model"), false),
             nakode_protocol::ModelConfigurationView::default()
         );
     }

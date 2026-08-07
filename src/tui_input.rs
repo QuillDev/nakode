@@ -1949,6 +1949,7 @@ mod tests {
                     reasoning_efforts: vec!["small".to_owned(), "large".to_owned()],
                     fast_mode_configurable: true,
                     vision_eligible: true,
+                    accepts_image_input: true,
                 },
             },
             ModelView {

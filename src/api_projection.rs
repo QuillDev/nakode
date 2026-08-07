@@ -718,6 +718,7 @@ fn model(value: api::Model) -> view::ModelView {
             reasoning_efforts: configuration.reasoning_efforts,
             fast_mode_configurable: configuration.fast_mode_configurable,
             vision_eligible: configuration.vision_eligible,
+            accepts_image_input: configuration.accepts_image_input,
         },
     }
 }
