@@ -286,12 +286,13 @@ enum ProviderCapability {
   PROVIDER_CAPABILITY_NATIVE_TOOLS = 9;
   PROVIDER_CAPABILITY_MCP = 10;
   PROVIDER_CAPABILITY_CLOSE_SESSION = 11;
+  PROVIDER_CAPABILITY_EXTERNAL_TOOLS = 12;
 }
 enum ConnectionState { CONNECTION_STATE_UNSPECIFIED = 0; CONNECTION_STATE_DISABLED = 1; CONNECTION_STATE_STARTING = 2; CONNECTION_STATE_READY = 3; CONNECTION_STATE_FAILED = 4; CONNECTION_STATE_DISCONNECTED = 5; }
 message Connection { ConnectionState state = 1; optional string message = 2; }
 message ProviderAuthentication { enum Kind { KIND_UNSPECIFIED = 0; KIND_STARTING = 1; KIND_API_KEY_REQUIRED = 2; KIND_CHALLENGE = 3; } Kind kind = 1; optional string dashboard_url = 2; optional string credential_kind = 3; optional string verification_url = 4; optional string user_code = 5; }
 message Provider { string id = 1; string display_name = 2; bool enabled = 3; bool credential_configured = 4; optional string credential_kind = 5; Connection connection = 6; ProviderCapabilities capabilities = 7; optional ProviderAuthentication authentication = 8; }
-message ModelConfiguration { repeated string reasoning_efforts = 1; bool fast_mode_configurable = 2; bool vision_eligible = 3; }
+message ModelConfiguration { repeated string reasoning_efforts = 1; bool fast_mode_configurable = 2; bool vision_eligible = 3; bool accepts_image_input = 4; }
 message Model { string id = 1; string provider_id = 2; string model_slug = 3; string display_name = 4; bool is_default = 5; optional string reasoning_effort = 6; bool fast_mode = 7; ModelConfiguration configuration = 8; }
 message AgentDefinition {
   string slug = 1;

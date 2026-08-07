@@ -41,7 +41,7 @@ use crate::{
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 
 fn model_supports_options(model: &ModelInfo) -> bool {
-    let configuration = projection::model_configuration(model);
+    let configuration = projection::model_configuration(model, false);
     configuration.fast_mode_configurable || !configuration.reasoning_efforts.is_empty()
 }
 
@@ -4312,7 +4312,7 @@ impl DomainState {
             .iter()
             .find(|candidate| candidate.provider == provider && candidate.id == model)
             .is_some_and(|candidate| {
-                projection::model_configuration(candidate)
+                projection::model_configuration(candidate, false)
                     .reasoning_efforts
                     .iter()
                     .any(|candidate| candidate == effort)
@@ -4333,7 +4333,7 @@ impl DomainState {
 
     fn model_options_for(&self, model: &ModelInfo) -> ModelOptions {
         let mut options = self.model_options_for_qualified(&model.qualified_id());
-        let configuration = projection::model_configuration(model);
+        let configuration = projection::model_configuration(model, false);
         if options.reasoning_effort.as_ref().is_some_and(|effort| {
             !configuration
                 .reasoning_efforts
@@ -4361,7 +4361,7 @@ impl DomainState {
         {
             let mut options = options.clone();
             if let Some(model) = model {
-                let configuration = projection::model_configuration(model);
+                let configuration = projection::model_configuration(model, false);
                 if options.reasoning_effort.as_ref().is_some_and(|effort| {
                     !configuration
                         .reasoning_efforts

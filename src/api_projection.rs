@@ -662,6 +662,9 @@ fn capabilities(value: api::ProviderCapabilities) -> Result<view::ProviderCapabi
                 api::ProviderCapability::NativeTools => Ok(view::ProviderCapability::NativeTools),
                 api::ProviderCapability::Mcp => Ok(view::ProviderCapability::Mcp),
                 api::ProviderCapability::CloseSession => Ok(view::ProviderCapability::CloseSession),
+                api::ProviderCapability::ExternalTools => {
+                    Ok(view::ProviderCapability::ExternalTools)
+                }
                 api::ProviderCapability::Unspecified => {
                     Err("unspecified provider capability".into())
                 }
@@ -718,6 +721,7 @@ fn model(value: api::Model) -> view::ModelView {
             reasoning_efforts: configuration.reasoning_efforts,
             fast_mode_configurable: configuration.fast_mode_configurable,
             vision_eligible: configuration.vision_eligible,
+            accepts_image_input: configuration.accepts_image_input,
         },
     }
 }

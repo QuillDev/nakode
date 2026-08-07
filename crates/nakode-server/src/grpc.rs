@@ -1195,6 +1195,9 @@ fn capabilities(value: protocol::ProviderCapabilities) -> api::ProviderCapabilit
                 protocol::ProviderCapability::CloseSession => {
                     api::ProviderCapability::CloseSession as i32
                 }
+                protocol::ProviderCapability::ExternalTools => {
+                    api::ProviderCapability::ExternalTools as i32
+                }
             })
             .collect(),
     }
@@ -1259,6 +1262,7 @@ fn model(value: protocol::ModelView) -> api::Model {
             reasoning_efforts: value.configuration.reasoning_efforts,
             fast_mode_configurable: value.configuration.fast_mode_configurable,
             vision_eligible: value.configuration.vision_eligible,
+            accepts_image_input: value.configuration.accepts_image_input,
         }),
     }
 }

@@ -150,7 +150,7 @@ pub const fn model_supports_fast_mode(model: &ModelView) -> bool {
 }
 
 #[must_use]
-pub const fn provider_capability_rows() -> [(&'static str, ProviderCapability); 11] {
+pub const fn provider_capability_rows() -> [(&'static str, ProviderCapability); 12] {
     [
         ("Resume", ProviderCapability::Resume),
         ("Steering", ProviderCapability::Steering),
@@ -169,6 +169,7 @@ pub const fn provider_capability_rows() -> [(&'static str, ProviderCapability); 
         ("Native tools", ProviderCapability::NativeTools),
         ("MCP", ProviderCapability::Mcp),
         ("Close session", ProviderCapability::CloseSession),
+        ("External tools", ProviderCapability::ExternalTools),
     ]
 }
 

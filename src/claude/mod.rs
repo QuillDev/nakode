@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::backend::{
     ApprovalDecision, ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand,
     BackendError, BackendEvent, BackendHandle, BackendIdentity, BackendOperation,
-    BackendTokenUsage, CLAUDE_PROVIDER, CapabilitySupport, DeltaKind, ItemKind, ItemStatus,
-    ModelInfo, NormalizedItem, TurnOutcome, request_failed,
+    BackendTokenUsage, CLAUDE_PROVIDER, CapabilitySupport, DeltaKind, ExternalToolRequest,
+    ItemKind, ItemStatus, ModelInfo, NormalizedItem, TurnOutcome, request_failed,
 };
 
 const COMMAND_CAPACITY: usize = 128;
@@ -409,22 +409,23 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             instructions,
             owner_session_id,
             parent_run_id: _,
-            external_tools: _,
-            replace_builtin_tools: _,
+            external_tools,
+            replace_builtin_tools,
             allowed_builtin_tools: _,
             max_turns,
             timeout_seconds,
         } => (
             "create",
-            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id,"maxTurns":max_turns,"timeoutSeconds":timeout_seconds}),
+            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id,"maxTurns":max_turns,"timeoutSeconds":timeout_seconds,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools}),
         ),
         BackendCommand::ResumeSession {
             provider_session_id,
             owner_session_id,
-            ..
+            external_tools,
+            replace_builtin_tools,
         } => (
             "resume",
-            json!({"sessionId":provider_session_id,"ownerSessionId":owner_session_id}),
+            json!({"sessionId":provider_session_id,"ownerSessionId":owner_session_id,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools}),
         ),
         BackendCommand::UnsubscribeSession {
             provider_session_id,
@@ -482,8 +483,11 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
                 }
             }),
         ),
+        BackendCommand::ResolveExternalTool { id, output, failed } => (
+            "resolve_external_tool",
+            json!({"id":id,"output":output,"failed":failed}),
+        ),
         BackendCommand::ResolveQuestion { .. }
-        | BackendCommand::ResolveExternalTool { .. }
         | BackendCommand::BeginAuthentication
         | BackendCommand::Shutdown => return Ok(None),
     };
@@ -587,6 +591,7 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
         }
         "delta" => delta_event(message),
         "tool_call" => tool_call_event(message),
+        "external_tool_request" => external_tool_request_event(message),
         "plan" => BackendEvent::TurnPlan {
             turn_id: string(message, "turnId"),
             plan: string(message, "text"),
@@ -616,6 +621,14 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
         _ => BackendEvent::ProtocolDiagnostic(string(message, "message")),
     };
     let _ = events.send(event).await;
+}
+
+fn external_tool_request_event(message: &Value) -> BackendEvent {
+    BackendEvent::ExternalToolRequested(ExternalToolRequest {
+        id: string(message, "id"),
+        name: string(message, "name"),
+        arguments_json: string(message, "argumentsJson"),
+    })
 }
 
 fn claude_content_block_id(message: &Value) -> String {
@@ -841,6 +854,7 @@ fn capabilities() -> BackendCapabilities {
         approvals: CapabilitySupport::Supported,
         native_tools: CapabilitySupport::Supported,
         scoped_runtime_policy: CapabilitySupport::Supported,
+        external_tools: CapabilitySupport::Supported,
         close_session: CapabilitySupport::Supported,
         ..BackendCapabilities::default()
     }
@@ -855,13 +869,65 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("@anthropic-ai/claude-agent-sdk"));
         assert!(BRIDGE_SOURCE.contains("pathToClaudeCodeExecutable"));
         assert!(BRIDGE_SOURCE.contains("canUseTool"));
-        assert!(BRIDGE_SOURCE.contains("messageId: message.uuid"));
+        assert!(BRIDGE_SOURCE.contains("event.message?.id || message.uuid"));
+        assert!(BRIDGE_SOURCE.contains("message.message.id || message.uuid"));
         assert!(BRIDGE_SOURCE.contains("blockIndex: event.index"));
         assert!(BRIDGE_SOURCE.contains("`claude:${messageId}:${blockIndex}`"));
         assert!(BRIDGE_SOURCE.contains("allowedTools: securityValidator ? []"));
         assert!(BRIDGE_SOURCE.contains("Archetype policy does not allow"));
         assert!(BRIDGE_SOURCE.contains("maxTurns: session.maxTurns"));
         assert!(BRIDGE_SOURCE.contains("session.timeoutSeconds * 1000"));
+    }
+
+    #[test]
+    fn claude_external_tools_cross_the_mcp_bridge() {
+        let tool = nakode_protocol::ExternalToolDefinition {
+            name: "ReadAssociatedTicket".to_owned(),
+            description: "Read the attached ticket".to_owned(),
+            input_schema_json: r#"{"type":"object","properties":{}}"#.to_owned(),
+        };
+        let create = bridge_request(BackendCommand::StartSession {
+            model: Some("opus".to_owned()),
+            instructions: None,
+            owner_session_id: Some("owner".to_owned()),
+            parent_run_id: None,
+            external_tools: vec![tool],
+            replace_builtin_tools: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
+        })
+        .expect("Claude supports session tools")
+        .expect("bridge request");
+        assert_eq!(
+            create.payload["externalTools"][0]["name"],
+            "ReadAssociatedTicket"
+        );
+        assert_eq!(create.payload["replaceBuiltinTools"], false);
+
+        let resolve = bridge_request(BackendCommand::ResolveExternalTool {
+            id: "external-1".to_owned(),
+            output: "ticket".to_owned(),
+            failed: false,
+        })
+        .expect("Claude supports external tool results")
+        .expect("bridge request");
+        assert_eq!(resolve.method, "resolve_external_tool");
+        assert_eq!(resolve.payload["id"], "external-1");
+        assert!(capabilities().external_tools.is_supported());
+        assert!(BRIDGE_SOURCE.contains("createSdkMcpServer"));
+        assert!(BRIDGE_SOURCE.contains("event: \"external_tool_request\""));
+        assert!(BRIDGE_SOURCE.contains("case \"resolve_external_tool\""));
+        assert!(BRIDGE_SOURCE.contains("mcp__nakode_external__"));
+        assert!(matches!(
+            external_tool_request_event(&json!({
+                "id": "external-1",
+                "name": "ReadAssociatedTicket",
+                "argumentsJson": "{}"
+            })),
+            BackendEvent::ExternalToolRequested(ExternalToolRequest { id, name, arguments_json })
+                if id == "external-1" && name == "ReadAssociatedTicket" && arguments_json == "{}"
+        ));
     }
 
     #[test]
@@ -1062,6 +1128,80 @@ await eval(`(async () => {
         assert_eq!(intro_id, "claude:message-a:1");
         assert_eq!(final_id, "claude:message-b:0");
         assert_ne!(intro_id, final_id);
+    }
+
+    #[test]
+    fn claude_partial_wrapper_uuids_do_not_split_one_content_block() {
+        let directory = tempfile::tempdir().expect("temporary stream identity test directory");
+        let bridge = directory.path().join("bridge.mjs");
+        let test = directory.path().join("stream-identity-test.mjs");
+        std::fs::write(&bridge, BRIDGE_SOURCE).expect("bridge fixture");
+        std::fs::write(
+            &test,
+            r#"
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const source = readFileSync(process.argv[2], "utf8");
+const start = source.indexOf("function emitStreamEvent");
+const end = source.indexOf("async function sendTurn", start);
+assert.notEqual(start, -1);
+assert.notEqual(end, -1);
+const handler = source.slice(start, end);
+const streamMessageIds = new Map();
+const emitted = [];
+const write = (message) => emitted.push(message);
+
+await eval(`(async () => {
+  ${handler}
+  emitStreamEvent("turn-1", {
+    uuid: "wrapper-start",
+    event: { type: "message_start", message: { id: "api-message-1" } },
+  });
+  emitStreamEvent("turn-1", {
+    uuid: "wrapper-delta-a",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "alpha " },
+    },
+  });
+  emitStreamEvent("turn-1", {
+    uuid: "wrapper-delta-b",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "beta" },
+    },
+  });
+  emitStreamEvent("turn-1", {
+    uuid: "wrapper-stop",
+    event: { type: "message_stop" },
+  });
+})()`);
+
+assert.deepEqual(
+  emitted.map(({ messageId, blockIndex, text }) => ({ messageId, blockIndex, text })),
+  [
+    { messageId: "api-message-1", blockIndex: 0, text: "alpha " },
+    { messageId: "api-message-1", blockIndex: 0, text: "beta" },
+  ],
+);
+assert.equal(streamMessageIds.size, 0);
+"#,
+        )
+        .expect("stream identity test script");
+
+        let output = std::process::Command::new("node")
+            .arg(&test)
+            .arg(&bridge)
+            .output()
+            .expect("run stream identity test with Node");
+        assert!(
+            output.status.success(),
+            "stream identity test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

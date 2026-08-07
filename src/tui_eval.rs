@@ -940,6 +940,7 @@ fn fixture_protocol_capabilities(
             "native_tools" => nakode_protocol::ProviderCapability::NativeTools,
             "mcp" => nakode_protocol::ProviderCapability::Mcp,
             "close_session" => nakode_protocol::ProviderCapability::CloseSession,
+            "external_tools" => nakode_protocol::ProviderCapability::ExternalTools,
             _ => return Err(format!("unknown capability {name:?}")),
         });
     }
