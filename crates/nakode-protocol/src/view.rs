@@ -569,6 +569,21 @@ pub struct AgentDefinitionView {
     pub max_delegation_depth: u32,
     #[serde(default = "true_by_default")]
     pub require_parent_attribution: bool,
+    /// Nakode's interpreted runtime boundary. `None` preserves a legacy provider-default tool set.
+    #[serde(default)]
+    pub effective_builtin_tools: Option<Vec<String>>,
+    /// Effective declared capabilities, or `None` when legacy provider defaults are ambiguous.
+    #[serde(default)]
+    pub effective_capabilities: Option<Vec<String>>,
+    /// Authoritative reconciliation and high-impact policy findings.
+    #[serde(default)]
+    pub policy_warnings: Vec<String>,
+    /// Delegated runs intentionally do not receive a frontend's dashboard/control-plane tool table.
+    #[serde(default)]
+    pub dashboard_tools_injected: bool,
+    /// Nonzero when the server projected every interpreted-policy field above.
+    #[serde(default)]
+    pub policy_projection_version: u32,
 }
 
 fn true_by_default() -> bool {

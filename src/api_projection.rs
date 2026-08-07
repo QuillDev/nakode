@@ -750,6 +750,13 @@ fn agent(value: api::AgentDefinition) -> view::AgentDefinitionView {
         can_delegate: value.can_delegate,
         max_delegation_depth: value.max_delegation_depth,
         require_parent_attribution: value.require_parent_attribution.unwrap_or(true),
+        effective_builtin_tools: (!value.effective_builtin_tools_uses_runtime_default)
+            .then_some(value.effective_builtin_tools),
+        effective_capabilities: (!value.effective_capabilities_use_runtime_default)
+            .then_some(value.effective_capabilities),
+        policy_warnings: value.policy_warnings,
+        dashboard_tools_injected: value.dashboard_tools_injected,
+        policy_projection_version: value.policy_projection_version,
     }
 }
 

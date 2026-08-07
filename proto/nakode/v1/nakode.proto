@@ -305,6 +305,15 @@ message AgentDefinition {
   bool can_delegate = 23;
   uint32 max_delegation_depth = 24;
   optional bool require_parent_attribution = 25;
+  // Interpreted by Nakode from the configured policy above. `*_uses_runtime_default` distinguishes
+  // an intentionally ambiguous legacy default from an exact empty boundary.
+  repeated string effective_builtin_tools = 26;
+  bool effective_builtin_tools_uses_runtime_default = 27;
+  repeated string effective_capabilities = 28;
+  bool effective_capabilities_use_runtime_default = 29;
+  repeated string policy_warnings = 30;
+  bool dashboard_tools_injected = 31;
+  uint32 policy_projection_version = 32;
 }
 message Skill { string name = 1; string description = 2; }
 
