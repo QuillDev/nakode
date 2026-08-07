@@ -807,6 +807,26 @@ impl ServerCore {
         Ok(Self::accepted(None, effects))
     }
 
+    pub(crate) fn delegate_agent_attributed(
+        &mut self,
+        session_id: &SessionId,
+        agent_slug: &str,
+        task: &str,
+        parent_run_id: Option<&str>,
+        request_id: u64,
+    ) -> Result<(String, Vec<Effect>), DomainCommandError> {
+        self.ensure_session(session_id)?;
+        if task.trim().is_empty() {
+            return Err(DomainCommandError::Invalid(
+                "agent delegation requires a non-empty task".to_owned(),
+            ));
+        }
+        self.reload_agent_catalogue_for_session(session_id)?;
+        self.session_engine_mut(session_id)?
+            .state_mut()
+            .delegate_agent_attributed_for_request(agent_slug, task, parent_run_id, request_id)
+    }
+
     fn delegate_command(
         &mut self,
         session_id: &SessionId,
@@ -833,6 +853,17 @@ impl ServerCore {
                 parent_run_id.map(nakode_protocol::RunId::as_str),
             )?;
         Ok(Self::accepted(Some(run_id), effects))
+    }
+
+    pub(crate) fn cancel_attributed_run(
+        &mut self,
+        session_id: &SessionId,
+        run_id: &str,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.ensure_session(session_id)?;
+        self.session_engine_mut(session_id)?
+            .state_mut()
+            .cancel_run(run_id)
     }
 
     fn cancel_run_command(&mut self, run_id: &RunId) -> DomainCommandOutcome {

@@ -12,9 +12,10 @@ use crate::{
     agent::{AgentCatalog, AgentDefinition, AgentFallbackPolicy, AgentToolProfile},
     backend::{
         ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent, BackendOperation,
-        CODEX_PROVIDER, CURSOR_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus,
-        ModelInfo, ModelOptions, NormalizedItem, PromptAttachment, QuestionRequest,
-        SessionHistoryItem, TodoPhase, TurnOutcome, display_qualified_model_name,
+        CODEX_PROVIDER, CURSOR_PROVIDER, CompactionReason, DEVIN_PROVIDER, DeltaKind, GLM_PROVIDER,
+        ItemKind, ItemStatus, KIMI_PROVIDER, ModelInfo, ModelOptions, NormalizedItem,
+        PromptAttachment, QuestionRequest, SessionHistoryItem, TodoPhase, TurnOutcome,
+        display_qualified_model_name,
     },
     domain_transcript::{DomainTranscript, EntryKind, EntryStatus},
     handoff::HandoffPackage,
@@ -23,6 +24,7 @@ use crate::{
     session::{SessionRecord, SubagentObservability, SubagentRecord},
     settings::TerminalImageMode,
     skill::SkillCatalog,
+    tools::NAKODE_AGENT_TOOL_NAME,
     web::{WebBackend, WebConfig},
 };
 
@@ -6114,6 +6116,7 @@ impl DomainState {
                 model: prompt.model,
                 instructions: Some(self.nakode_system_instructions()),
                 owner_session_id: Some(self.nakode_session_id.clone()),
+                parent_run_id: None,
                 external_tools: self.external_tools.clone(),
                 replace_builtin_tools: self.replace_builtin_tools,
                 allowed_builtin_tools: None,
@@ -6711,6 +6714,18 @@ impl DomainState {
         task: &str,
         parent_run_id: Option<&str>,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
+        self.delegate_agent_attributed_for_request(agent_slug, task, parent_run_id, 0)
+    }
+
+    /// Creates one delegated run whose terminal effect is correlated to a native runtime waiter.
+    /// Existing UI/CLI delegations use request id zero and keep their historical projection path.
+    pub(crate) fn delegate_agent_attributed_for_request(
+        &mut self,
+        agent_slug: &str,
+        task: &str,
+        parent_run_id: Option<&str>,
+        request_id: u64,
+    ) -> Result<(String, Vec<Effect>), DomainCommandError> {
         self.validate_agent_request(agent_slug, task)?;
         let task = task.trim();
         let Some(definition) = self.agents.find(agent_slug).cloned() else {
@@ -6718,38 +6733,8 @@ impl DomainState {
                 "predefined agent {agent_slug:?}"
             )));
         };
-        let (parent_run_id, remaining_delegation_depth) = if let Some(parent_run_id) = parent_run_id
-        {
-            let parent = self.subagent_executions.get(parent_run_id).ok_or_else(|| {
-                DomainCommandError::NotFound(format!("parent agent run `{parent_run_id}`"))
-            })?;
-            if !matches!(
-                parent.run.status,
-                SubagentStatus::Starting | SubagentStatus::Working
-            ) {
-                return Err(DomainCommandError::Conflict(format!(
-                    "parent agent run `{parent_run_id}` is no longer active"
-                )));
-            }
-            if !parent.definition.can_delegate {
-                return Err(DomainCommandError::Unsupported(format!(
-                    "agent `{}` is not permitted to delegate",
-                    parent.definition.slug
-                )));
-            }
-            let Some(remaining) = parent.remaining_delegation_depth.checked_sub(1) else {
-                return Err(DomainCommandError::Unsupported(format!(
-                    "agent `{}` exhausted its maximum delegation depth",
-                    parent.definition.slug
-                )));
-            };
-            (
-                Some(parent_run_id.to_owned()),
-                remaining.min(definition.max_delegation_depth),
-            )
-        } else {
-            (None, definition.max_delegation_depth)
-        };
+        let (parent_run_id, remaining_delegation_depth) =
+            self.delegation_context(parent_run_id, &definition)?;
 
         let run_id = Self::next_id("agent");
         let model_targets = agent_model_targets(&definition, &self.backend_provider);
@@ -6800,7 +6785,7 @@ impl DomainState {
             SubagentExecution {
                 run,
                 definition,
-                request_id: 0,
+                request_id,
                 task: task.to_owned(),
                 parent_run_id,
                 remaining_delegation_depth,
@@ -6821,8 +6806,53 @@ impl DomainState {
         Ok((run_id, effects))
     }
 
+    fn delegation_context(
+        &self,
+        parent_run_id: Option<&str>,
+        definition: &AgentDefinition,
+    ) -> Result<(Option<String>, u32), DomainCommandError> {
+        let Some(parent_run_id) = parent_run_id else {
+            return Ok((None, definition.max_delegation_depth));
+        };
+        let parent = self.subagent_executions.get(parent_run_id).ok_or_else(|| {
+            DomainCommandError::NotFound(format!("parent agent run `{parent_run_id}`"))
+        })?;
+        if !matches!(
+            parent.run.status,
+            SubagentStatus::Starting | SubagentStatus::Working
+        ) {
+            return Err(DomainCommandError::Conflict(format!(
+                "parent agent run `{parent_run_id}` is no longer active"
+            )));
+        }
+        if !parent.definition.can_delegate {
+            return Err(DomainCommandError::Unsupported(format!(
+                "agent `{}` is not permitted to delegate",
+                parent.definition.slug
+            )));
+        }
+        let remaining = parent
+            .remaining_delegation_depth
+            .checked_sub(1)
+            .ok_or_else(|| {
+                DomainCommandError::Unsupported(format!(
+                    "agent `{}` exhausted its maximum delegation depth",
+                    parent.definition.slug
+                ))
+            })?;
+        Ok((
+            Some(parent_run_id.to_owned()),
+            remaining.min(definition.max_delegation_depth),
+        ))
+    }
+
     pub fn invoke_agent(&mut self, request: &AgentRequest) -> Vec<Effect> {
-        match self.delegate_agent(&request.agent, &request.task) {
+        match self.delegate_agent_attributed_for_request(
+            &request.agent,
+            &request.task,
+            None,
+            request.id,
+        ) {
             Ok((_, effects)) => effects,
             Err(error) => vec![Effect::CompleteAgentRequest {
                 request_id: request.id,
@@ -6832,22 +6862,30 @@ impl DomainState {
         }
     }
 
+    fn native_delegation_callable(&self) -> bool {
+        matches!(
+            self.backend_provider.as_str(),
+            CODEX_PROVIDER | KIMI_PROVIDER | GLM_PROVIDER | DEVIN_PROVIDER
+        ) && self.backend_capabilities.native_tools.is_supported()
+            && !self.replace_builtin_tools
+    }
+
     fn rendered_agent_catalogue(&self) -> String {
-        let executable = shell_quote(&self.nakode_executable);
-        let workspace = shell_quote(&self.workspace);
+        if !self.native_delegation_callable() {
+            return "- none (this provider session has no callable Nakode delegation tool)"
+                .to_owned();
+        }
         let agents = self
             .agents
             .definitions()
             .iter()
             .map(|agent| {
                 format!(
-                    "- {}: {}\n  Command: {} --workspace={} agent {} --session-id={} --task '<bounded task>'",
+                    "- {}: {}\n  Callable: {}({{\"agent\":\"{}\",\"task\":\"<bounded task>\"}})",
                     agent.slug,
                     agent.description.trim(),
-                    executable,
-                    workspace,
+                    NAKODE_AGENT_TOOL_NAME,
                     agent.slug,
-                    self.nakode_session_id,
                 )
             })
             .collect::<Vec<_>>()
@@ -6873,8 +6911,12 @@ impl DomainState {
             Clone::clone,
         );
         let base = format!(
-            "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode delegation may be exposed through a session-bound MCP tool and through the native shell. Both are Nakode control-plane paths, not provider-native collaboration.\nInitial available agents:\n{}\nThis catalogue can change during a session; a later [Nakode Current Agent Catalogue] block supersedes this initial list.\nTo delegate a concrete bounded task, prefer the Nakode MCP delegation tool when it is available; its parent session is already bound and must not be supplied by you. Otherwise execute the matching absolute-path Nakode command exactly with the native shell. Do not merely describe delegation when the user asks you to perform it. Do not claim that an agent is unavailable when it is listed in the current catalogue. Do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one Nakode delegation per task concurrently. Keep each objective distinct and bounded. Each delegation returns its result when the child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
-            self.nakode_session_id, model, self.backend_provider, agents,
+            "[Nakode System Instructions]\nYou are operating inside Nakode.\nSession ID: {}\nModel: {}\nProvider: {}\nNakode delegation is exposed only when the provider's callable schema contains the session-bound `{tool}` tool. It routes through the Nakode control plane, not provider-native collaboration or a shell subprocess.\nInitial available agents:\n{}\nThis catalogue can change during a session; a later [Nakode Current Agent Catalogue] block supersedes this initial list.\nWhen `{tool}` is callable, use it for a concrete bounded delegation request; owner session and parent-run attribution are bound by the server and must not be supplied by you. Do not claim that an agent is available when this catalogue says the callable is absent. Do not use provider-native subagent or collaboration features because Nakode cannot supervise or attribute those children. Up to {MAX_CONCURRENT_SUBAGENTS} subagents may run concurrently. When several independent tasks would benefit from parallel investigation, launch one Nakode delegation per task concurrently. Keep each objective distinct and bounded. Each delegation returns its attributed terminal result when the child finishes; incorporate all relevant results into your response.\n[/Nakode System Instructions]",
+            self.nakode_session_id,
+            model,
+            self.backend_provider,
+            agents,
+            tool = NAKODE_AGENT_TOOL_NAME,
         );
         self.prompt_addenda
             .apply(&base, self.selected_model.as_deref())
@@ -7238,6 +7280,7 @@ impl DomainState {
                 model,
                 instructions,
                 owner_session_id: Some(self.nakode_session_id.clone()),
+                parent_run_id: Some(run_id.to_owned()),
                 external_tools: Vec::new(),
                 replace_builtin_tools,
                 allowed_builtin_tools,
@@ -7898,10 +7941,6 @@ fn summarize_activity(text: &str, fallback: &str) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or(fallback);
     summary.chars().take(120).collect()
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn agent_model_targets(
@@ -11709,6 +11748,25 @@ tool_profile = "none"
         ));
     }
 
+    #[test]
+    fn native_delegation_request_id_survives_to_terminal_effect() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        let (run_id, launch) = state
+            .delegate_agent_attributed_for_request("explorer", "Inspect native routing", None, 77)
+            .expect("native delegation");
+        assert!(matches!(launch.as_slice(), [Effect::SpawnSubagent { .. }]));
+        let effects = state.cancel_run(&run_id).expect("cancel native child");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CompleteAgentRequest {
+                request_id: 77,
+                success: false,
+                ..
+            }
+        )));
+    }
+
     fn begin_mocked_subagent(state: &mut AppState) -> String {
         let effects = state.invoke_agent(&AgentRequest {
             id: 42,
@@ -11784,11 +11842,10 @@ tool_profile = "none"
         assert!(instructions.contains("Model: openai-codex/model-a"));
         assert!(instructions.contains("Provider: openai-codex"));
         assert!(instructions.contains("- explorer: Explores code context"));
-        assert!(instructions.contains(&format!(
-            "'/opt/nakode/bin/nakode' --workspace='/tmp/project' agent explorer --session-id={}",
-            state.nakode_session_id
-        )));
-        assert!(instructions.contains("execute the matching absolute-path Nakode command exactly"));
+        assert!(instructions.contains(
+            "Callable: nakode_agent({\"agent\":\"explorer\",\"task\":\"<bounded task>\"})"
+        ));
+        assert!(instructions.contains("not provider-native collaboration or a shell subprocess"));
         assert!(instructions.contains("Up to 4 subagents may run concurrently"));
         assert!(instructions.contains("launch one Nakode delegation per task concurrently"));
         assert!(instructions.contains("Do not use provider-native subagent"));
@@ -11818,10 +11875,33 @@ tool_profile = "none"
         assert!(prompt.contains("[Nakode Current Agent Catalogue]"));
         assert!(prompt.contains("supersedes the initial Available agents list"));
         assert!(prompt.contains("- explorer: Explores code context"));
-        assert!(prompt.contains(&format!(
-            "'/opt/nakode/bin/nakode' --workspace='/tmp/project' agent explorer --session-id={}",
-            state.nakode_session_id
-        )));
+        assert!(prompt.contains(
+            "Callable: nakode_agent({\"agent\":\"explorer\",\"task\":\"<bounded task>\"})"
+        ));
+    }
+
+    #[test]
+    fn catalogue_never_claims_native_route_for_bridge_only_providers() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        for provider in [CLAUDE_PROVIDER, CURSOR_PROVIDER] {
+            state.backend_provider = provider.to_owned();
+            let catalogue = state.rendered_agent_catalogue();
+            assert!(catalogue.contains("no callable Nakode delegation tool"));
+            assert!(!catalogue.contains("Callable: nakode_agent"));
+        }
+    }
+
+    #[test]
+    fn catalogue_omits_native_route_when_builtins_are_replaced() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        state.replace_builtin_tools = true;
+        assert!(
+            state
+                .rendered_agent_catalogue()
+                .contains("no callable Nakode delegation tool")
+        );
     }
 
     #[test]

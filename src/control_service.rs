@@ -5,6 +5,7 @@ use std::{
     process::Stdio,
     sync::Arc,
     time::Duration,
+    time::SystemTime,
 };
 
 use directories::ProjectDirs;
@@ -21,8 +22,11 @@ use crate::config::Config;
 
 const SERVICE_START_ATTEMPTS: usize = 40;
 const SERVICE_STOP_ATTEMPTS: usize = 100;
+const ACTIVATION_LOCK_ATTEMPTS: usize = 120;
+const ACTIVATION_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
 const RESUME_ENVIRONMENT_KEYS: [&str; 2] = ["NAKODE_RESUME", "NAKO_AGENT_RESUME"];
+const SERVICE_EXECUTABLE_IDENTITY_ENVIRONMENT: &str = "NAKODE_SERVICE_EXECUTABLE_IDENTITY";
 
 /// Workspace service state returned by the lifecycle CLI.
 ///
@@ -36,6 +40,10 @@ pub struct ServiceStatus {
     pub workspace: PathBuf,
     /// Version of the `nakode` executable that produced this report.
     pub nakode_version: String,
+    /// Concrete installed/CLI executable that produced this report.
+    pub nakode_executable: ExecutableIdentity,
+    /// Concrete executable captured by the live service at startup.
+    pub service_executable: Option<ExecutableIdentity>,
     /// Process identifier recorded by the running service, when it published one.
     pub pid: Option<u32>,
     pub started_at_unix_ms: Option<u64>,
@@ -68,6 +76,56 @@ pub struct ServiceRuntimeRecord {
     pub pid: u32,
     pub started_at_unix_ms: u64,
     pub version: String,
+    /// Immutable identity captured from the executable vnode when this process started.
+    ///
+    /// Old runtime records omit this field. That is intentionally distinct from a match: a new
+    /// connector cannot prove an identity for an old process from the path after an in-place update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<ExecutableIdentity>,
+}
+
+/// Content and filesystem identity of one concrete Nakode executable.
+///
+/// SHA-256 is the compatibility identity. The remaining fields make stale-process diagnostics
+/// actionable and prove when a process still maps a replaced vnode at the same display path.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExecutableIdentity {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inode: Option<String>,
+}
+
+impl ExecutableIdentity {
+    #[must_use]
+    fn same_build(&self, other: &Self) -> bool {
+        self.sha256 == other.sha256 && self.size == other.size
+    }
+}
+
+/// How endpoint discovery obtained the verified workspace service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointActivation {
+    Reused,
+    Started,
+    RestartedStaleService,
+}
+
+/// Verified endpoint and identities returned to native frontend connectors.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FrontendEndpoint {
+    pub endpoint: PathBuf,
+    pub lifecycle_socket: PathBuf,
+    pub cli: ExecutableIdentity,
+    pub service: ServiceRuntimeRecord,
+    pub server: Option<ServerReport>,
+    pub activation: EndpointActivation,
 }
 
 /// Result of starting a workspace service.
@@ -94,6 +152,7 @@ pub struct ServicePaths {
     api: PathBuf,
     log: PathBuf,
     runtime: PathBuf,
+    activation: PathBuf,
 }
 
 impl ServicePaths {
@@ -116,6 +175,7 @@ impl ServicePaths {
             api: directory.join("api.sock"),
             log: directory.join("service.log"),
             runtime: directory.join("service.json"),
+            activation: directory.join("activation.lock"),
         }
     }
 
@@ -149,6 +209,12 @@ impl ServicePaths {
     #[must_use]
     pub fn runtime(&self) -> &Path {
         &self.runtime
+    }
+
+    /// Connector lease serializing stale-build activation for this workspace.
+    #[must_use]
+    pub fn activation(&self) -> &Path {
+        &self.activation
     }
 }
 
@@ -271,6 +337,13 @@ pub enum ControlError {
     Grpc(#[from] tonic::transport::Error),
     #[error("Nakode server component stopped unexpectedly: {0}")]
     ComponentStopped(&'static str),
+    #[error("could not identify Nakode executable at {path}: {source}")]
+    ExecutableIdentity {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("cannot activate stale Nakode workspace service: {0}")]
+    StaleServiceActivation(String),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -509,6 +582,8 @@ impl WorkspaceServerLease {
                 return Err(error);
             }
         };
+        // Never leave a prior owner's identity beside newly acquired sockets if publication fails.
+        let _ = std::fs::remove_file(&runtime_path);
         publish_runtime_record(&runtime_path);
         Ok(Self {
             lifecycle_path,
@@ -533,10 +608,27 @@ impl Drop for WorkspaceServerLease {
 /// A service that cannot publish its process record still serves clients, so a
 /// write failure only costs `nakode status` its process detail.
 fn publish_runtime_record(runtime_path: &Path) {
+    let executable = std::env::var(SERVICE_EXECUTABLE_IDENTITY_ENVIRONMENT)
+        .ok()
+        .and_then(|encoded| serde_json::from_str::<ExecutableIdentity>(&encoded).ok())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| match executable_identity(&path) {
+                    Ok(identity) => Some(identity),
+                    Err(error) => {
+                        eprintln!(
+                            "nakode: could not identify the running service executable: {error}"
+                        );
+                        None
+                    }
+                })
+        });
     let record = ServiceRuntimeRecord {
         pid: std::process::id(),
         started_at_unix_ms: crate::diagnostics::unix_time_ms(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        executable,
     };
     match serde_json::to_vec(&record) {
         Ok(encoded) => {
@@ -556,6 +648,7 @@ fn publish_runtime_record(runtime_path: &Path) {
 fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(unix)]
@@ -563,12 +656,88 @@ fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(contents)
+    let mut file = options.open(&temporary)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    match std::fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
 }
 
 fn read_runtime_record(runtime_path: &Path) -> Option<ServiceRuntimeRecord> {
     let encoded = std::fs::read(runtime_path).ok()?;
     serde_json::from_slice(&encoded).ok()
+}
+
+/// Computes the immutable content identity used by endpoint activation.
+///
+/// The service calls this once while acquiring its workspace lease. Connectors compute it for the
+/// executable they are about to spawn. No running process ever re-hashes a path after publication.
+fn executable_identity(path: &Path) -> Result<ExecutableIdentity, ControlError> {
+    use std::io::Read;
+
+    let canonical =
+        std::fs::canonicalize(path).map_err(|source| ControlError::ExecutableIdentity {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let mut file =
+        std::fs::File::open(&canonical).map_err(|source| ControlError::ExecutableIdentity {
+            path: canonical.display().to_string(),
+            source,
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| ControlError::ExecutableIdentity {
+            path: canonical.display().to_string(),
+            source,
+        })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| ControlError::ExecutableIdentity {
+                path: canonical.display().to_string(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let modified_at_unix_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    #[cfg(unix)]
+    let (device, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            Some(metadata.dev().to_string()),
+            Some(metadata.ino().to_string()),
+        )
+    };
+    #[cfg(not(unix))]
+    let (device, inode) = (None, None);
+    Ok(ExecutableIdentity {
+        path: canonical,
+        sha256: format!("{:x}", digest.finalize()),
+        size: metadata.len(),
+        modified_at_unix_ms,
+        device,
+        inode,
+    })
 }
 
 /// Returns the process record published by this workspace's service.
@@ -730,6 +899,11 @@ async fn ensure_service_at(
 fn service_command(executable: &Path, config: &Config) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(executable);
     command.args(service_arguments(config)).stdin(Stdio::null());
+    if let Ok(identity) = executable_identity(executable)
+        && let Ok(encoded) = serde_json::to_string(&identity)
+    {
+        command.env(SERVICE_EXECUTABLE_IDENTITY_ENVIRONMENT, encoded);
+    }
     detach_service_process(&mut command);
     for key in RESUME_ENVIRONMENT_KEYS {
         command.env_remove(key);
@@ -851,6 +1025,103 @@ fn service_configuration_fingerprint(config: &Config) -> String {
     format!("{:x}", digest.finalize())
 }
 
+struct ActivationLease {
+    path: PathBuf,
+    owner: String,
+}
+
+impl ActivationLease {
+    async fn acquire(path: &Path) -> Result<Self, ControlError> {
+        use std::io::Write;
+
+        for _ in 0..ACTIVATION_LOCK_ATTEMPTS {
+            let owner = format!(
+                "{}:{}\n",
+                std::process::id(),
+                crate::diagnostics::unix_time_ms()
+            );
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(path) {
+                Ok(mut file) => {
+                    file.write_all(owner.as_bytes())
+                        .map_err(|source| socket_error(path, source))?;
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                        owner,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if activation_lock_is_abandoned(path) {
+                        let _ = std::fs::remove_file(path);
+                        continue;
+                    }
+                    tokio::time::sleep(SERVICE_START_RETRY).await;
+                }
+                Err(source) => return Err(socket_error(path, source)),
+            }
+        }
+        let timeout_ms = u128::try_from(ACTIVATION_LOCK_ATTEMPTS)
+            .unwrap_or(u128::MAX)
+            .saturating_mul(SERVICE_START_RETRY.as_millis());
+        Err(ControlError::StaleServiceActivation(format!(
+            "another connector kept the workspace activation lease at {} for more than {timeout_ms}ms",
+            path.display(),
+        )))
+    }
+}
+
+impl Drop for ActivationLease {
+    fn drop(&mut self) {
+        if std::fs::read_to_string(&self.path).is_ok_and(|owner| owner == self.owner) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn activation_lock_is_abandoned(path: &Path) -> bool {
+    let stale = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= ACTIVATION_LOCK_STALE_AFTER);
+    if !stale {
+        return false;
+    }
+    let owner = std::fs::read_to_string(path).ok();
+    activation_lock_owner_is_abandoned(owner.as_deref())
+}
+
+fn activation_lock_owner_is_abandoned(owner: Option<&str>) -> bool {
+    let owner_pid = owner
+        .and_then(|owner| owner.split(':').next()?.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0);
+    owner_pid.is_none_or(|pid| !activation_owner_is_alive(pid))
+}
+
+#[cfg(unix)]
+fn activation_owner_is_alive(pid: u32) -> bool {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    match kill(Pid::from_raw(pid), None) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn activation_owner_is_alive(_pid: u32) -> bool {
+    false
+}
+
 async fn ensure_api_service(
     paths: &ServicePaths,
     executable: &Path,
@@ -867,29 +1138,317 @@ async fn ensure_api_service(
     Err(ControlError::ServiceStartup(api_path.display().to_string()))
 }
 
-/// Returns a compatible live endpoint or starts the workspace server when none
-/// exists.
+fn runtime_matches_cli(record: Option<&ServiceRuntimeRecord>, cli: &ExecutableIdentity) -> bool {
+    record
+        .and_then(|record| record.executable.as_ref())
+        .is_some_and(|running| running.same_build(cli))
+}
+
+/// Returns a compatible live endpoint or starts/activates the workspace server.
 ///
-/// Discovery deliberately does not compare the live server's startup
-/// configuration with the connector process's defaults. The running server is
-/// authoritative for its own configuration. A missing server is still started
-/// through [`ensure_api_service`], whose fingerprint check prevents racing
-/// or replacing a server started with conflicting options.
+/// Endpoint discovery is serialized per workspace and compares immutable executable content, not
+/// semver or the mutable path string. A live old service is replaced at most once, and the
+/// replacement is verified before its descriptor is returned.
 ///
 /// # Errors
-/// Returns when a live server does not expose a compatible API endpoint or
-/// when a missing server cannot be started with the supplied configuration.
+/// Returns when identity cannot be established, live work makes replacement unsafe, or a bounded
+/// start/restart cannot produce the invoking executable's identity.
+pub async fn frontend_api_endpoint_report(
+    executable: &Path,
+    config: &Config,
+) -> Result<FrontendEndpoint, ControlError> {
+    let paths = ServicePaths::of(config)?;
+    let cli = executable_identity(executable)?;
+    let _activation_lease = match ActivationLease::acquire(paths.activation()).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            let record = read_runtime_record(paths.runtime());
+            let server = server_report(paths.api()).await;
+            return Err(ControlError::StaleServiceActivation(activation_diagnostic(
+                &paths,
+                &cli,
+                record.as_ref(),
+                server,
+                "activation lease unavailable",
+                &error.to_string(),
+            )));
+        }
+    };
+
+    if discover_running_api_at(paths.lifecycle(), paths.api(), &config.workspace)
+        .await?
+        .is_some()
+    {
+        let old_record = read_runtime_record(paths.runtime());
+        if runtime_matches_cli(old_record.as_ref(), &cli) {
+            return verified_frontend_endpoint(
+                &paths,
+                cli,
+                EndpointActivation::Reused,
+                "reusing current service",
+            )
+            .await;
+        }
+
+        return activate_stale_service(&paths, executable, config, cli, old_record).await;
+    }
+
+    ensure_api_service(&paths, executable, config).await?;
+    verified_frontend_endpoint(
+        &paths,
+        cli,
+        EndpointActivation::Started,
+        "service was started",
+    )
+    .await
+}
+
+async fn activate_stale_service(
+    paths: &ServicePaths,
+    executable: &Path,
+    config: &Config,
+    cli: ExecutableIdentity,
+    old_record: Option<ServiceRuntimeRecord>,
+) -> Result<FrontendEndpoint, ControlError> {
+    let old_server = server_report(paths.api()).await;
+    ensure_stale_service_is_quiescent(paths.api(), &config.workspace)
+        .await
+        .map_err(|reason| {
+            ControlError::StaleServiceActivation(activation_diagnostic(
+                paths,
+                &cli,
+                old_record.as_ref(),
+                old_server.clone(),
+                "restart refused",
+                &reason,
+            ))
+        })?;
+    eprintln!(
+        "nakode: activating updated service for {} (old {}; cli {})",
+        config.workspace.display(),
+        runtime_identity_label(old_record.as_ref()),
+        executable_identity_label(&cli),
+    );
+    if let Err(error) = restart_service(executable, config).await {
+        return Err(stale_replacement_error(
+            paths,
+            &cli,
+            old_record.as_ref(),
+            old_server.clone(),
+            "restart failed",
+            &error,
+        )
+        .await);
+    }
+    if let Err(error) = wait_for_api(paths.api(), &config.workspace).await {
+        return Err(stale_replacement_error(
+            paths,
+            &cli,
+            old_record.as_ref(),
+            old_server,
+            "replacement did not become ready",
+            &error,
+        )
+        .await);
+    }
+    verified_frontend_endpoint(
+        paths,
+        cli,
+        EndpointActivation::RestartedStaleService,
+        "stale service was restarted",
+    )
+    .await
+}
+
+async fn stale_replacement_error(
+    paths: &ServicePaths,
+    cli: &ExecutableIdentity,
+    old_record: Option<&ServiceRuntimeRecord>,
+    old_server: Option<ServerReport>,
+    action: &str,
+    error: &ControlError,
+) -> ControlError {
+    let replacement = read_runtime_record(paths.runtime());
+    let replacement_server = server_report_label(server_report(paths.api()).await);
+    let reason = format!(
+        "{error}; replacement {}; replacement_server {replacement_server}",
+        runtime_identity_label(replacement.as_ref()),
+    );
+    ControlError::StaleServiceActivation(activation_diagnostic(
+        paths, cli, old_record, old_server, action, &reason,
+    ))
+}
+
+fn server_report_label(server: Option<ServerReport>) -> String {
+    server.map_or_else(
+        || "unavailable".to_owned(),
+        |server| {
+            format!(
+                "version={} api={} capabilities=[{}]",
+                server.server_version,
+                server.api_version,
+                server.capabilities.join(",")
+            )
+        },
+    )
+}
+
+/// Returns only the verified socket for in-process clients.
+///
+/// # Errors
+/// Returns when endpoint activation or identity verification fails.
 pub async fn frontend_api_endpoint(
     executable: &Path,
     config: &Config,
 ) -> Result<PathBuf, ControlError> {
-    let paths = ServicePaths::of(config)?;
-    frontend_api_endpoint_at(paths.lifecycle(), paths.api(), &config.workspace, || {
-        ensure_api_service(&paths, executable, config)
-    })
-    .await
+    Ok(frontend_api_endpoint_report(executable, config)
+        .await?
+        .endpoint)
 }
 
+async fn wait_for_api(api_path: &Path, workspace: &Path) -> Result<(), ControlError> {
+    for _ in 0..SERVICE_START_ATTEMPTS {
+        if api_ready(api_path, workspace).await {
+            return Ok(());
+        }
+        tokio::time::sleep(SERVICE_START_RETRY).await;
+    }
+    Err(ControlError::ServiceStartup(api_path.display().to_string()))
+}
+
+async fn verified_frontend_endpoint(
+    paths: &ServicePaths,
+    cli: ExecutableIdentity,
+    activation: EndpointActivation,
+    action: &str,
+) -> Result<FrontendEndpoint, ControlError> {
+    let service = read_runtime_record(paths.runtime()).ok_or_else(|| {
+        ControlError::StaleServiceActivation(activation_diagnostic(
+            paths,
+            &cli,
+            None,
+            None,
+            action,
+            "the ready service did not publish service.json",
+        ))
+    })?;
+    let matches = runtime_matches_cli(Some(&service), &cli);
+    if !matches {
+        return Err(ControlError::StaleServiceActivation(activation_diagnostic(
+            paths,
+            &cli,
+            Some(&service),
+            None,
+            action,
+            "the ready service executable identity does not match the invoking CLI",
+        )));
+    }
+    Ok(FrontendEndpoint {
+        endpoint: paths.api().to_path_buf(),
+        lifecycle_socket: paths.lifecycle().to_path_buf(),
+        cli,
+        service,
+        server: server_report(paths.api()).await,
+        activation,
+    })
+}
+
+async fn ensure_stale_service_is_quiescent(
+    api_path: &Path,
+    workspace: &Path,
+) -> Result<(), String> {
+    let query = async {
+        let client = nakode_sdk::NakodeClient::connect_unix(api_path.to_path_buf())
+            .await
+            .map_err(|error| error.to_string())?;
+        let sessions = client
+            .list_sessions(workspace.to_string_lossy(), u32::MAX)
+            .await
+            .map_err(|error| error.to_string())?;
+        let running = sessions
+            .into_iter()
+            .filter(|session| session.running)
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        if running.is_empty() {
+            Ok(())
+        } else {
+            quiescence_refusal(&running)
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), query)
+        .await
+        .map_err(|_| "timed out while proving that the stale service has no live work".to_owned())?
+}
+
+fn quiescence_refusal(running: &[String]) -> Result<(), String> {
+    if running.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "live work is still owned by session(s) {}; stop or finish that work before activating the updated service",
+            running.join(", ")
+        ))
+    }
+}
+
+fn executable_identity_label(identity: &ExecutableIdentity) -> String {
+    format!(
+        "path={} sha256={} size={} device={} inode={}",
+        identity.path.display(),
+        identity.sha256,
+        identity.size,
+        identity.device.as_deref().unwrap_or("unknown"),
+        identity.inode.as_deref().unwrap_or("unknown"),
+    )
+}
+
+fn runtime_identity_label(record: Option<&ServiceRuntimeRecord>) -> String {
+    record.map_or_else(
+        || "pid=unknown version=unknown executable=unpublished".to_owned(),
+        |record| {
+            format!(
+                "pid={} version={} executable={}",
+                record.pid,
+                record.version,
+                record
+                    .executable
+                    .as_ref()
+                    .map_or_else(|| "unpublished".to_owned(), executable_identity_label)
+            )
+        },
+    )
+}
+
+fn activation_diagnostic(
+    paths: &ServicePaths,
+    cli: &ExecutableIdentity,
+    service: Option<&ServiceRuntimeRecord>,
+    server: Option<ServerReport>,
+    action: &str,
+    reason: &str,
+) -> String {
+    let server = server.map_or_else(
+        || "server=unavailable".to_owned(),
+        |server| {
+            format!(
+                "server_version={} api_version={} capabilities=[{}]",
+                server.server_version,
+                server.api_version,
+                server.capabilities.join(",")
+            )
+        },
+    );
+    format!(
+        "{action}: {reason}; cli={}; service={}; api_endpoint={}; lifecycle_endpoint={}; {server}",
+        executable_identity_label(cli),
+        runtime_identity_label(service),
+        paths.api().display(),
+        paths.lifecycle().display(),
+    )
+}
+
+#[cfg(test)]
 async fn frontend_api_endpoint_at<Start, StartFuture>(
     lifecycle_path: &Path,
     api_path: &Path,
@@ -972,6 +1531,11 @@ async fn api_ready(path: &Path, workspace: &Path) -> bool {
 /// Returns an error when lifecycle state cannot be read reliably.
 pub async fn service_status(config: &Config) -> Result<ServiceStatus, ControlError> {
     let paths = ServicePaths::of(config)?;
+    let current = std::env::current_exe().map_err(|source| ControlError::ExecutableIdentity {
+        path: "current executable".to_owned(),
+        source,
+    })?;
+    let nakode_executable = executable_identity(&current)?;
     let running = service_running_at(paths.lifecycle()).await?;
     let record = if running {
         read_runtime_record(paths.runtime())
@@ -988,6 +1552,8 @@ pub async fn service_status(config: &Config) -> Result<ServiceStatus, ControlErr
         running,
         workspace: config.workspace.clone(),
         nakode_version: env!("CARGO_PKG_VERSION").to_owned(),
+        nakode_executable,
+        service_executable: record.as_ref().and_then(|record| record.executable.clone()),
         pid: record.as_ref().map(|record| record.pid),
         started_at_unix_ms: record.as_ref().map(|record| record.started_at_unix_ms),
         started_at_utc: record
@@ -1335,7 +1901,7 @@ fn socket_error(path: &Path, source: std::io::Error) -> ControlError {
 mod tests {
     use std::{
         ffi::OsStr,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1347,14 +1913,101 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::{
-        ControlError, LifecycleRequest, LifecycleResponse, RESUME_ENVIRONMENT_KEYS, ServicePaths,
-        TransportAction, TransportController, TransportStatus, TransportSupervisor, UnixListener,
-        bind_service_listener, detach_service_process, ensure_service_at, exchange, expect_ok,
-        frontend_api_endpoint_at, ping_at, run_lifecycle_listener, service_arguments,
-        service_command, service_configuration_fingerprint, service_running_at,
+        ControlError, ExecutableIdentity, LifecycleRequest, LifecycleResponse,
+        RESUME_ENVIRONMENT_KEYS, ServicePaths, ServiceRuntimeRecord, TransportAction,
+        TransportController, TransportStatus, TransportSupervisor, UnixListener,
+        activation_lock_owner_is_abandoned, bind_service_listener, detach_service_process,
+        ensure_service_at, exchange, executable_identity, expect_ok, frontend_api_endpoint_at,
+        ping_at, quiescence_refusal, run_lifecycle_listener, runtime_matches_cli,
+        service_arguments, service_command, service_configuration_fingerprint, service_running_at,
         shutdown_all_services_in, workspace_runtime_directory_in,
     };
     use crate::config::{Config, OpenAiReasoningEffort};
+
+    fn identity(path: &str, sha256: &str, size: u64) -> ExecutableIdentity {
+        ExecutableIdentity {
+            path: PathBuf::from(path),
+            sha256: sha256.to_owned(),
+            size,
+            modified_at_unix_ms: Some(123),
+            device: Some("7".to_owned()),
+            inode: Some("11".to_owned()),
+        }
+    }
+
+    #[test]
+    fn runtime_identity_requires_published_matching_content_not_semver() {
+        let cli = identity("/installed/nakode", "new-hash", 200);
+        let matching = ServiceRuntimeRecord {
+            pid: 42,
+            started_at_unix_ms: 10,
+            version: "0.3.0".to_owned(),
+            executable: Some(identity("/same/display/path", "new-hash", 200)),
+        };
+        let same_version_old_build = ServiceRuntimeRecord {
+            executable: Some(identity("/installed/nakode", "old-hash", 190)),
+            ..matching.clone()
+        };
+        let old_record: ServiceRuntimeRecord =
+            serde_json::from_str(r#"{"pid":41,"started_at_unix_ms":9,"version":"0.3.0"}"#)
+                .expect("old records remain readable");
+
+        assert!(runtime_matches_cli(Some(&matching), &cli));
+        assert!(!runtime_matches_cli(Some(&same_version_old_build), &cli));
+        assert!(!runtime_matches_cli(Some(&old_record), &cli));
+        assert!(!runtime_matches_cli(None, &cli));
+    }
+
+    #[test]
+    fn executable_identity_is_content_sensitive_at_equal_size() {
+        let directory = tempfile::tempdir().expect("identity directory");
+        let executable = directory.path().join("nakode");
+        std::fs::write(&executable, b"build-one").expect("first build");
+        let first = executable_identity(&executable).expect("first identity");
+        std::fs::write(&executable, b"build-two").expect("replacement build");
+        let second = executable_identity(&executable).expect("second identity");
+
+        assert_eq!(first.path, second.path);
+        assert_eq!(first.size, second.size);
+        assert_ne!(first.sha256, second.sha256);
+        assert!(!first.same_build(&second));
+    }
+
+    #[test]
+    fn stale_activation_refuses_identity_rich_live_work() {
+        let sessions = vec!["session-a".to_owned(), "session-b".to_owned()];
+        let error = quiescence_refusal(&sessions).expect_err("live work blocks replacement");
+        assert!(error.contains("session-a, session-b"));
+        assert!(error.contains("before activating the updated service"));
+        assert!(quiescence_refusal(&[]).is_ok());
+    }
+
+    #[test]
+    fn activation_lock_never_expires_while_its_owner_is_alive() {
+        let live_owner = format!("{}:1\n", std::process::id());
+        assert!(!activation_lock_owner_is_abandoned(Some(&live_owner)));
+        assert!(activation_lock_owner_is_abandoned(Some(
+            "not-a-valid-owner"
+        )));
+        assert!(activation_lock_owner_is_abandoned(None));
+    }
+
+    #[test]
+    fn activation_lease_drop_cannot_remove_a_replacement_owners_lock() {
+        let directory = tempfile::tempdir().expect("activation directory");
+        let path = directory.path().join("activation.lock");
+        std::fs::write(&path, "first-owner").expect("first owner");
+        let lease = super::ActivationLease {
+            path: path.clone(),
+            owner: "first-owner".to_owned(),
+        };
+        std::fs::write(&path, "replacement-owner").expect("replacement owner");
+        drop(lease);
+        assert_eq!(
+            std::fs::read_to_string(path).expect("replacement lock remains"),
+            "replacement-owner"
+        );
+    }
 
     struct FakeTransport {
         running: Arc<AtomicBool>,

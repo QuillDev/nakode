@@ -50,6 +50,7 @@ pub struct BackendConfig {
     vision_config: Option<Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
     vision_service: Option<crate::vision::SharedVisionService>,
     memory_service: Option<crate::memory::SharedMemoryService>,
+    native_delegation: Option<mpsc::Sender<crate::backend::NativeDelegationRequest>>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +82,7 @@ impl BackendConfig {
             vision_config: None,
             vision_service: None,
             memory_service: None,
+            native_delegation: None,
         }
     }
 
@@ -125,6 +127,15 @@ impl BackendConfig {
     ) -> Self {
         self.vision_config = Some(config);
         self.vision_service = service;
+        self
+    }
+
+    #[must_use]
+    pub fn with_native_delegation(
+        mut self,
+        requests: mpsc::Sender<crate::backend::NativeDelegationRequest>,
+    ) -> Self {
+        self.native_delegation = Some(requests);
         self
     }
 
@@ -419,6 +430,9 @@ async fn run_supervisor(
     let runtime = provider.map(|provider| {
         let mut runtime = AgentRuntime::new(config.workspace.clone(), provider)
             .with_compaction_threshold_percent(config.compaction_threshold_percent);
+        if let Some(requests) = &config.native_delegation {
+            runtime = runtime.with_native_delegation(requests.clone());
+        }
         if let Some(web_config) = &config.web_config {
             runtime = runtime.with_web_config(Arc::clone(web_config));
         }
@@ -465,38 +479,61 @@ async fn run_supervisor(
                 handle_command(command, &mut context).await;
             }
             completed = completed_rx.recv() => {
-                let Some(mut completed) = completed else { break };
-                if let Some(options) = pending_options.remove(&completed.session.id) {
-                    completed.session.reasoning_effort = options.reasoning_effort;
-                    completed.session.fast_mode = options.fast_mode;
-                }
-                if let Some(store) = &session_store
-                    && let Err(error) = store.save(&completed.session)
-                {
-                    let operation = match completed.kind {
-                        CompletedWorkKind::Turn => BackendOperation::StartTurn,
-                        CompletedWorkKind::Compaction => BackendOperation::CompactSession,
-                    };
-                    request_failed(&events, operation, error).await;
-                }
-                sessions.insert(completed.session.id.clone(), completed.session);
-                if active.as_ref().is_some_and(|turn| turn.turn_id == completed.turn_id) {
-                    active = None;
-                }
-                if completed.kind == CompletedWorkKind::Turn {
-                    let (outcome, error) = match completed.result {
-                        Ok(()) => (TurnOutcome::Completed, None),
-                        Err(TurnError::Interrupted) => (TurnOutcome::Interrupted, None),
-                        Err(error) => (TurnOutcome::Failed, Some(error.to_string())),
-                    };
-                    let _ = events.send(BackendEvent::TurnCompleted {
-                        turn_id: completed.turn_id,
-                        outcome,
-                        error,
-                    }).await;
-                }
+                let Some(completed) = completed else { break };
+                handle_completed_turn(
+                    completed,
+                    &mut pending_options,
+                    session_store.as_ref(),
+                    &mut sessions,
+                    &mut active,
+                    &events,
+                ).await;
             }
         }
+    }
+}
+
+async fn handle_completed_turn(
+    mut completed: CompletedTurn,
+    pending_options: &mut HashMap<String, ModelOptions>,
+    session_store: Option<&RuntimeSessionStore>,
+    sessions: &mut HashMap<String, RuntimeSession>,
+    active: &mut Option<ActiveTurn>,
+    events: &mpsc::Sender<BackendEvent>,
+) {
+    if let Some(options) = pending_options.remove(&completed.session.id) {
+        completed.session.reasoning_effort = options.reasoning_effort;
+        completed.session.fast_mode = options.fast_mode;
+    }
+    if let Some(store) = session_store
+        && let Err(error) = store.save(&completed.session)
+    {
+        let operation = match completed.kind {
+            CompletedWorkKind::Turn => BackendOperation::StartTurn,
+            CompletedWorkKind::Compaction => BackendOperation::CompactSession,
+        };
+        request_failed(events, operation, error).await;
+    }
+    sessions.insert(completed.session.id.clone(), completed.session);
+    if active
+        .as_ref()
+        .is_some_and(|turn| turn.turn_id == completed.turn_id)
+    {
+        *active = None;
+    }
+    if completed.kind == CompletedWorkKind::Turn {
+        let (outcome, error) = match completed.result {
+            Ok(()) => (TurnOutcome::Completed, None),
+            Err(TurnError::Interrupted) => (TurnOutcome::Interrupted, None),
+            Err(error) => (TurnOutcome::Failed, Some(error.to_string())),
+        };
+        let _ = events
+            .send(BackendEvent::TurnCompleted {
+                turn_id: completed.turn_id,
+                outcome,
+                error,
+            })
+            .await;
     }
 }
 
@@ -564,11 +601,14 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             allowed_builtin_tools,
             max_turns,
             timeout_seconds,
-            owner_session_id: _,
+            owner_session_id,
+            parent_run_id,
         } => {
             start_session(
                 model,
                 instructions,
+                owner_session_id,
+                parent_run_id,
                 external_tools,
                 replace_builtin_tools,
                 allowed_builtin_tools,
@@ -580,9 +620,9 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         }
         BackendCommand::ResumeSession {
             provider_session_id,
+            owner_session_id,
             external_tools,
             replace_builtin_tools,
-            ..
         } => {
             if let Some(runtime) = context.runtime
                 && let Err(error) = runtime
@@ -599,7 +639,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                 request_failed(context.events, BackendOperation::ResumeSession, error).await;
                 return;
             }
-            resume_session(provider_session_id, context).await;
+            resume_session(provider_session_id, owner_session_id, context).await;
         }
         BackendCommand::UnsubscribeSession {
             provider_session_id,
@@ -864,6 +904,8 @@ async fn start_turn(
 async fn start_session(
     model: Option<String>,
     instructions: Option<String>,
+    owner_session_id: Option<String>,
+    parent_run_id: Option<String>,
     external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
     replace_builtin_tools: bool,
     allowed_builtin_tools: Option<Vec<String>>,
@@ -907,6 +949,7 @@ async fn start_session(
     let selected_id = selected.info.id.clone();
     let session = RuntimeSession::new(selected_id.clone(), instructions.unwrap_or_default())
         .with_provider(CODEX_PROVIDER)
+        .with_owner(owner_session_id, parent_run_id)
         .with_context_window(selected.context_window)
         .with_reasoning_effort(context.config.reasoning_effort.clone());
     let session_id = session.id.clone();
@@ -954,7 +997,11 @@ async fn start_session(
         .await;
 }
 
-async fn resume_session(provider_session_id: String, context: &mut CommandContext<'_>) {
+async fn resume_session(
+    provider_session_id: String,
+    owner_session_id: Option<String>,
+    context: &mut CommandContext<'_>,
+) {
     let persisted = context
         .session_store
         .map(|store| store.load(&provider_session_id))
@@ -972,11 +1019,19 @@ async fn resume_session(provider_session_id: String, context: &mut CommandContex
         .cloned()
         .or(persisted)
     {
+        session.owner_session_id = owner_session_id;
+        session.parent_run_id = None;
         if session.context_window.is_none()
             && let Some(credential) = context.credential
         {
             session.context_window =
                 discover_context_window(context.config, credential, &session.model).await;
+        }
+        if let Some(store) = context.session_store
+            && let Err(error) = store.save(&session)
+        {
+            request_failed(context.events, BackendOperation::ResumeSession, error).await;
+            return;
         }
         context
             .sessions

@@ -283,6 +283,7 @@ pub struct AgentRuntime {
     vision: Option<crate::vision::SharedVisionService>,
     direct_image_input: bool,
     external_tools: Arc<ExternalToolBroker>,
+    native_delegation: Option<mpsc::Sender<crate::backend::NativeDelegationRequest>>,
 }
 
 impl AgentRuntime {
@@ -298,7 +299,19 @@ impl AgentRuntime {
             vision: None,
             direct_image_input: true,
             external_tools: Arc::new(ExternalToolBroker::default()),
+            native_delegation: None,
         }
+    }
+
+    /// Installs the server-owned native delegation route and its matching callable schema.
+    #[must_use]
+    pub fn with_native_delegation(
+        mut self,
+        requests: mpsc::Sender<crate::backend::NativeDelegationRequest>,
+    ) -> Self {
+        self.tools = self.tools.with_native_delegation();
+        self.native_delegation = Some(requests);
+        self
     }
 
     /// Configures the externally executed tools available to a session.
@@ -1025,6 +1038,7 @@ impl AgentRuntime {
                         backend_events,
                         turn_id,
                         questions: &self.questions,
+                        delegation: self.native_delegation.as_ref(),
                     },
                     arguments,
                     cancellation,
@@ -1136,6 +1150,7 @@ impl AgentRuntime {
                         backend_events,
                         turn_id,
                         questions: &self.questions,
+                        delegation: self.native_delegation.as_ref(),
                     },
                     arguments,
                     cancellation,
@@ -1436,6 +1451,12 @@ pub struct RuntimeSession {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub fast_mode: bool,
+    /// Logical control-plane owner; absent only in old persisted provider payloads and isolated tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session_id: Option<String>,
+    /// Active parent run for recursively delegated provider sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
 }
 
 impl RuntimeSession {
@@ -1453,12 +1474,25 @@ impl RuntimeSession {
             telemetry: RuntimeTelemetry::default(),
             reasoning_effort: None,
             fast_mode: false,
+            owner_session_id: None,
+            parent_run_id: None,
         }
     }
 
     #[must_use]
     pub fn with_provider(mut self, provider_id: impl Into<String>) -> Self {
         self.provider_id = provider_id.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_owner(
+        mut self,
+        owner_session_id: Option<String>,
+        parent_run_id: Option<String>,
+    ) -> Self {
+        self.owner_session_id = owner_session_id;
+        self.parent_run_id = parent_run_id;
         self
     }
 
