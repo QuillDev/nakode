@@ -1095,7 +1095,9 @@ impl DomainState {
             .clone_from(&source.default_model_options);
         self.agents.clone_from(&source.agents);
         self.skills.clone_from(&source.skills);
-        self.prompt_addenda.clone_from(&source.prompt_addenda);
+        // Prompt addenda are a logical-session instruction snapshot. Never propagate a
+        // workspace reload into sessions that have already started: later delegated
+        // provider sessions must retain their owner's original instructions too.
         self.agent_directory.clone_from(&source.agent_directory);
         self.nakode_executable.clone_from(&source.nakode_executable);
         self.web_config.clone_from(&source.web_config);
@@ -10658,6 +10660,30 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 context_window: Some(200),
             })
         );
+    }
+
+    #[test]
+    fn workspace_configuration_sync_preserves_prompt_addenda_snapshot() {
+        let directory = tempdir().expect("config directory");
+        let original_soul = directory.path().join("original-soul.md");
+        let changed_soul = directory.path().join("changed-soul.md");
+        fs::write(&original_soul, "Original Soul").expect("original soul");
+        fs::write(&changed_soul, "Changed Soul").expect("changed soul");
+
+        let mut target = ready_state();
+        target.install_prompt_addenda(
+            PromptAddenda::load(None, Some(&original_soul)).expect("original addenda"),
+        );
+        let mut source = ready_state();
+        source.install_prompt_addenda(
+            PromptAddenda::load(None, Some(&changed_soul)).expect("changed addenda"),
+        );
+
+        target.synchronize_workspace_configuration(&source);
+
+        let instructions = target.nakode_system_instructions();
+        assert!(instructions.contains("[Soul]\nOriginal Soul"));
+        assert!(!instructions.contains("Changed Soul"));
     }
 
     #[test]

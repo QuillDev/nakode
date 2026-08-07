@@ -263,15 +263,28 @@ without an entry use `default`. Empty values are ignored. Model keys must use
 the canonical `provider/model` form.
 
 `SOUL.md` describes who the agent is—identity, enduring preferences, and style
-controls. When present, it is always appended independently of the selected
-personality, including for delegated agents. Personality and Soul content is
-materialized when a provider-native session is created. After editing either
-file, use `/reload`; the new content affects newly created sessions rather than
-already-running or resumed sessions.
+controls. Nakode has one configured Soul, not one per model or workspace. When
+present, it is always appended independently of the selected personality,
+including for delegated agents. Owner-facing clients can read and atomically
+save this exact file through `GetSoul` / `SaveSoul`; saves use the last-read
+digest so conflicts remain explicit. The default is the platform Nakode config
+directory's `SOUL.md`; `--soul PATH` / `NAKODE_SOUL` selects the same singleton
+at another path.
+
+Personality and Soul content is snapshotted when a Nakode logical session is
+created, and that snapshot is reused by its primary and delegated provider
+sessions. A successful API save is therefore visible to newly created logical
+sessions across running workspace services; already-running and resumed
+sessions retain the instructions they started with. Personality and Soul are
+followed by a protected runtime boundary, so owner content cannot replace
+security, tool-policy, delegation-limit, objective-mismatch, or run-attribution
+requirements. Direct file edits do not mutate materialized session snapshots;
+`/reload` remains the explicit way to refresh one.
 
 Use `--personalities PATH` / `NAKODE_PERSONALITIES` and `--soul PATH` /
 `NAKODE_SOUL` to select other files. Relative explicit paths are resolved from
-the workspace. Explicit paths must exist; the default files are optional.
+the workspace. Explicit paths must exist at startup; the default files are
+optional, and `SaveSoul` can deliberately create the missing default file.
 
 ## Terminal image previews
 

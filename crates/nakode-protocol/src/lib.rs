@@ -29,7 +29,7 @@ pub use ids::{
 };
 pub use service::{
     CommandAccepted, Cursor, QueryResult, ServiceCapabilities, ServiceCapability, Snapshot,
-    SubscriptionScope, SubscriptionView,
+    SoulDocumentView, SubscriptionScope, SubscriptionView,
 };
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,

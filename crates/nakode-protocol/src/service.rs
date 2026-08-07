@@ -29,6 +29,8 @@ pub enum ServiceCapability {
     QueuedPromptSteering,
     /// Owner-facing clients may inspect and atomically mutate the authoritative archetype catalogue.
     ArchetypeManagement,
+    /// Owner-facing clients may inspect and atomically mutate Nakode's one configured SOUL.md.
+    SoulManagement,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,6 +67,16 @@ pub enum SubscriptionScope {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SoulDocumentView {
+    pub workspace_id: WorkspaceId,
+    pub content: String,
+    pub path: String,
+    pub source: String,
+    pub exists: bool,
+    pub digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CommandAccepted {
     pub resource_id: Option<String>,
     pub revision: Option<u64>,
@@ -74,6 +86,7 @@ pub struct CommandAccepted {
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum QueryResult {
     Bootstrap(Box<BootstrapView>),
+    SoulDocument(SoulDocumentView),
     Sessions(Vec<SessionSummary>),
     Session(Box<SessionView>),
     Transcript(crate::TranscriptPage),

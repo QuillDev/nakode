@@ -40,6 +40,7 @@ pub mod session;
 pub mod settings;
 mod shell;
 pub mod skill;
+pub mod soul;
 pub mod state;
 pub mod terminal;
 pub mod terminal_image;

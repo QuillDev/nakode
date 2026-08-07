@@ -12,6 +12,10 @@ service NakodeService {
   rpc GetWorkspace(GetWorkspaceRequest) returns (WorkspaceSnapshot);
   rpc WatchWorkspace(WatchWorkspaceRequest) returns (stream WorkspaceSnapshot);
   rpc ReloadWorkspace(ReloadWorkspaceRequest) returns (MutationResult);
+  // Reads and atomically persists Nakode's single configured SOUL.md. Existing provider sessions
+  // retain the instructions they started with; fresh sessions observe a successful save.
+  rpc GetSoul(GetSoulRequest) returns (SoulDocument);
+  rpc SaveSoul(SaveSoulRequest) returns (MutationResult);
 
   rpc CreateSession(CreateSessionRequest) returns (MutationResult);
   rpc OpenSession(OpenSessionRequest) returns (MutationResult);
@@ -79,6 +83,28 @@ message GetWorkspaceRequest { string workspace = 1; optional string session_id =
 // replacement snapshot, so clients never need to reduce replay events.
 message WatchWorkspaceRequest { string workspace_id = 1; optional Cursor after = 2; }
 message ReloadWorkspaceRequest { MutationOptions mutation = 1; string workspace_id = 2; string session_id = 3; }
+message GetSoulRequest { string workspace_id = 1; }
+message SaveSoulRequest {
+  MutationOptions mutation = 1;
+  string workspace_id = 2;
+  string content = 3;
+  // Digest returned by GetSoul. Presence is required for replacement; omission is the deliberate
+  // create flow and conflicts if SOUL.md appeared meanwhile.
+  optional string expected_digest = 4;
+}
+message SoulDocument {
+  string workspace_id = 1;
+  string content = 2;
+  string path = 3;
+  enum Source {
+    SOURCE_UNSPECIFIED = 0;
+    SOURCE_FILE = 1;
+    SOURCE_MISSING = 2;
+  }
+  Source source = 4;
+  bool exists = 5;
+  optional string digest = 6;
+}
 message WorkspaceSnapshot { Cursor cursor = 1; WorkspaceState state = 2; }
 
 message SessionToolConfiguration {

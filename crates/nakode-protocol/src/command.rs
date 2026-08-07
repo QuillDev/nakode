@@ -358,6 +358,11 @@ pub enum Command {
         workspace_id: WorkspaceId,
         session_id: SessionId,
     },
+    SaveSoul {
+        workspace_id: WorkspaceId,
+        content: String,
+        expected_digest: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -366,6 +371,9 @@ pub enum Query {
     Bootstrap {
         workspace: String,
         session_id: Option<SessionId>,
+    },
+    GetSoul {
+        workspace_id: WorkspaceId,
     },
     ListSessions {
         workspace_id: WorkspaceId,

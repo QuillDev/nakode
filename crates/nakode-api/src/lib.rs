@@ -57,6 +57,8 @@ mod tests {
             "GetWorkspace",
             "WatchWorkspace",
             "ReloadWorkspace",
+            "GetSoul",
+            "SaveSoul",
             "CreateSession",
             "OpenSession",
             "ListSessions",

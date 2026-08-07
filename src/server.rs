@@ -16,8 +16,9 @@ use nakode_protocol::{
     ErrorCode, IdempotencyKey, MAX_ARTIFACT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES, ModelTarget,
     PromptInput, ProviderId, Query, QueryResult, RunId, RunMetadataView, RunTextField, RunView,
     ServiceCapability, ServiceError, SessionId, SessionMetadataView, SessionView, Snapshot,
-    SubscriptionScope, SubscriptionView, TranscriptEntryStatus, TranscriptEntryView,
-    TranscriptOwner, TranscriptPage, TranscriptWindowView, ViewEvent, WorkspaceId,
+    SoulDocumentView, SubscriptionScope, SubscriptionView, TranscriptEntryStatus,
+    TranscriptEntryView, TranscriptOwner, TranscriptPage, TranscriptWindowView, ViewEvent,
+    WorkspaceId,
 };
 use nakode_server::{ServerEndpoint, ServerRequest};
 use sha2::{Digest, Sha256};
@@ -28,6 +29,7 @@ use crate::{
     backend::PromptAttachment,
     service::ServiceEngine,
     session::{ProviderRecord, SessionRecord},
+    soul::{SoulError, SoulSource, SoulStore},
     state::{DomainCommandError, Effect},
 };
 
@@ -75,6 +77,7 @@ pub struct ServerCore {
     command_order: VecDeque<IdempotencyKey>,
     published_workspace: Option<nakode_protocol::BootstrapView>,
     published_sessions: HashMap<SessionId, PublishedSessionProjection>,
+    soul_store: Option<SoulStore>,
 }
 
 impl ServerCore {
@@ -97,6 +100,7 @@ impl ServerCore {
             command_order: VecDeque::new(),
             published_workspace: None,
             published_sessions: HashMap::new(),
+            soul_store: SoulStore::user_default().ok(),
         };
         core.published_workspace = Some(core.workspace_bootstrap());
         if let Some(projection) = core.published_session(&core.default_session) {
@@ -104,6 +108,10 @@ impl ServerCore {
                 .insert(core.default_session.clone(), projection);
         }
         core
+    }
+
+    pub(crate) fn install_soul_store(&mut self, store: SoulStore) {
+        self.soul_store = Some(store);
     }
 
     #[must_use]
@@ -480,6 +488,11 @@ impl ServerCore {
                 workspace_id,
                 session_id,
             } => self.reload_workspace_command(&workspace_id, &session_id),
+            Command::SaveSoul {
+                workspace_id,
+                content,
+                expected_digest,
+            } => self.save_soul_command(&workspace_id, &content, expected_digest.as_deref()),
         }
     }
 
@@ -496,6 +509,7 @@ impl ServerCore {
                 "initial model options require model_id".to_owned(),
             ));
         }
+        self.refresh_session_template_addenda()?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         let mut effects = engine.state_mut().create_logical_session()?;
         let session_id = SessionId::from(engine.state().nakode_session_id.clone());
@@ -572,6 +586,7 @@ impl ServerCore {
                 )));
             }
         };
+        self.refresh_session_template_addenda()?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         // The workspace template may still carry the bootstrap provider/session identity. Reset that
         // clone before installing client-owned tools; restoration begins only after validation.
@@ -757,6 +772,7 @@ impl ServerCore {
 
     /// Installs the successor for a closed initial session before its engine is removed.
     fn replace_default_session(&mut self) -> Result<(), DomainCommandError> {
+        self.refresh_session_template_addenda()?;
         let mut successor = ServiceEngine::new(self.session_template.clone());
         // `new` clones workspace configuration only in production, but tests and legacy callers may
         // provide a template carrying an old native id. `create_logical_session` clears it; any
@@ -1070,6 +1086,32 @@ impl ServerCore {
         ))
     }
 
+    fn save_soul_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        content: &str,
+        expected_digest: Option<&str>,
+    ) -> DomainCommandOutcome {
+        self.ensure_workspace(workspace_id)?;
+        let store = self.soul_store.as_ref().ok_or_else(|| {
+            DomainCommandError::Invalid("Nakode Soul storage is unavailable".to_owned())
+        })?;
+        store
+            .save(content, expected_digest)
+            .map_err(|error| soul_domain_error(&error))?;
+        Ok(Self::accepted(Some(workspace_id.to_string()), Vec::new()))
+    }
+
+    fn refresh_session_template_addenda(&mut self) -> Result<(), DomainCommandError> {
+        self.session_template
+            .reload_prompt_addenda()
+            .map_err(|error| {
+                DomainCommandError::Invalid(format!(
+                    "could not load prompt addenda for the new session: {error}"
+                ))
+            })
+    }
+
     fn reload_workspace_command(
         &self,
         workspace_id: &WorkspaceId,
@@ -1143,6 +1185,7 @@ impl ServerCore {
                 }
                 Ok(QueryResult::Bootstrap(Box::new(view)))
             }
+            Query::GetSoul { workspace_id } => self.query_soul(workspace_id),
             Query::ListSessions {
                 workspace_id,
                 limit,
@@ -1205,6 +1248,30 @@ impl ServerCore {
                 false,
             )),
         }
+    }
+
+    fn query_soul(&self, workspace_id: WorkspaceId) -> Result<QueryResult, ServiceError> {
+        self.ensure_workspace(&workspace_id).map_err(domain_error)?;
+        let store = self.soul_store.as_ref().ok_or_else(|| {
+            service_error(
+                ErrorCode::Internal,
+                "Nakode Soul storage is unavailable",
+                false,
+            )
+        })?;
+        let soul = store.read().map_err(|error| soul_service_error(&error))?;
+        Ok(QueryResult::SoulDocument(SoulDocumentView {
+            workspace_id,
+            content: soul.content.unwrap_or_default(),
+            path: soul.path.to_string_lossy().into_owned(),
+            source: match soul.source {
+                SoulSource::File => "file",
+                SoulSource::Missing => "missing",
+            }
+            .to_owned(),
+            exists: soul.exists,
+            digest: soul.digest,
+        }))
     }
 
     fn query_session_transcript_page(
@@ -2009,6 +2076,7 @@ impl ServerCore {
             | Command::ClearProviderCredential { .. }
             | Command::ReloadProvider { .. }
             | Command::SaveAgent { .. }
+            | Command::SaveSoul { .. }
             | Command::DeleteAgent { .. }
             | Command::UpdateSettings { .. }
             | Command::CheckAgentBrowser { .. } => Some(self.default_session.clone()),
@@ -2428,6 +2496,27 @@ fn command_digest(command: &Command) -> [u8; 32] {
     Sha256::digest(encoded).into()
 }
 
+fn soul_domain_error(error: &SoulError) -> DomainCommandError {
+    match error {
+        SoulError::Conflict { .. } | SoulError::Appeared => {
+            DomainCommandError::Conflict(error.to_string())
+        }
+        SoulError::MissingDirectory | SoulError::Read { .. } | SoulError::Write { .. } => {
+            DomainCommandError::Invalid(error.to_string())
+        }
+    }
+}
+
+fn soul_service_error(error: &SoulError) -> ServiceError {
+    let code = match error {
+        SoulError::Conflict { .. } | SoulError::Appeared => ErrorCode::Conflict,
+        SoulError::MissingDirectory | SoulError::Read { .. } | SoulError::Write { .. } => {
+            ErrorCode::Internal
+        }
+    };
+    service_error(code, &error.to_string(), false)
+}
+
 fn domain_error(error: DomainCommandError) -> ServiceError {
     let (code, message) = match error {
         DomainCommandError::Invalid(message) => (
@@ -2568,8 +2657,10 @@ mod tests {
             CODEX_PROVIDER, CapabilitySupport, ModelCapabilities, ModelInfo, PromptImage,
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
+        personality::PromptAddenda,
         service::ServiceEngine,
         session::{ProviderRecord, SessionRecord, SubagentObservability, SubagentRecord},
+        soul::{SoulSource, SoulStore},
         state::{AppState, DomainCommandError},
     };
 
@@ -5015,6 +5106,116 @@ first_message = "Starting review"
                 .expect("second runtime")
                 .state()
                 .is_busy()
+        );
+    }
+
+    #[test]
+    fn soul_save_updates_new_logical_sessions_but_preserves_existing_snapshots() {
+        let (mut core, _) = ready_codex_server();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("SOUL.md");
+        std::fs::write(&path, "Original Soul").expect("original soul");
+        core.install_soul_store(SoulStore::new(&path));
+        core.session_template.install_prompt_addenda(
+            PromptAddenda::load(None, Some(&path)).expect("original addenda"),
+        );
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+
+        let (first, _) = create_default_session(&mut core, &workspace_id).expect("first session");
+        let first_id = SessionId::from(first.resource_id.expect("first id"));
+        let initial = core
+            .query(Query::GetSoul {
+                workspace_id: workspace_id.clone(),
+            })
+            .expect("initial soul");
+        let QueryResult::SoulDocument(initial) = initial else {
+            panic!("expected Soul query");
+        };
+        core.save_soul_command(&workspace_id, "Changed Soul", initial.digest.as_deref())
+            .expect("save changed soul");
+        let (second, _) = create_default_session(&mut core, &workspace_id).expect("second session");
+        let second_id = SessionId::from(second.resource_id.expect("second id"));
+
+        let instructions_for = |core: &mut ServerCore, session_id: SessionId, key: &str| {
+            let (result, effects, _, _) = core.execute_idempotent(
+                IdempotencyKey::from(key),
+                None,
+                false,
+                Command::SendPrompt {
+                    session_id,
+                    prompt: PromptInput {
+                        text: "hello".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+            );
+            result.expect("prompt accepted");
+            effects
+                .into_iter()
+                .find_map(|effect| match effect {
+                    crate::state::Effect::Backend(BackendCommand::StartSession {
+                        instructions,
+                        ..
+                    }) => instructions,
+                    _ => None,
+                })
+                .expect("start instructions")
+        };
+
+        let first_instructions = instructions_for(&mut core, first_id, "first-snapshot");
+        let second_instructions = instructions_for(&mut core, second_id, "second-snapshot");
+        assert!(first_instructions.contains("[Soul]\nOriginal Soul"));
+        assert!(!first_instructions.contains("Changed Soul"));
+        assert!(second_instructions.contains("[Soul]\nChanged Soul"));
+        assert!(!second_instructions.contains("Original Soul"));
+    }
+
+    #[test]
+    fn soul_command_round_trips_and_rejects_stale_or_cross_workspace_access() {
+        let (mut core, _) = ready_codex_server();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("SOUL.md");
+        core.install_soul_store(SoulStore::new(&path));
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+
+        let initial = core
+            .query(Query::GetSoul {
+                workspace_id: workspace_id.clone(),
+            })
+            .expect("query missing");
+        let QueryResult::SoulDocument(initial) = initial else {
+            panic!("expected Soul query");
+        };
+        assert_eq!(initial.source, "missing");
+
+        let (_, effects) = core
+            .save_soul_command(&workspace_id, "singleton", None)
+            .expect("create");
+        assert!(effects.is_empty());
+        let saved = core
+            .query(Query::GetSoul {
+                workspace_id: workspace_id.clone(),
+            })
+            .expect("query file");
+        let QueryResult::SoulDocument(saved) = saved else {
+            panic!("expected Soul query");
+        };
+        assert_eq!(saved.source, "file");
+        assert_eq!(saved.content, "singleton");
+        assert_eq!(saved.path, path.to_string_lossy());
+        assert!(
+            core.save_soul_command(&workspace_id, "clobber", None)
+                .is_err()
+        );
+        assert!(
+            core.query(Query::GetSoul {
+                workspace_id: WorkspaceId::from("another-workspace"),
+            })
+            .is_err()
+        );
+        assert_eq!(
+            SoulSource::File,
+            SoulStore::new(path).read().expect("persisted").source
         );
     }
 
