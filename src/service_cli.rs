@@ -61,6 +61,35 @@ pub async fn restart(config: &Config) -> Result<(), ControlError> {
     Ok(())
 }
 
+/// Refreshes every stale workspace service after installation.
+///
+/// # Errors
+///
+/// Returns an error when Nakode cannot locate its executable or inspect the private control
+/// directory.
+pub async fn restart_stale() -> Result<(), ControlError> {
+    let executable = current_executable()?;
+    let report = control_service::restart_stale_services(&executable).await?;
+    println!(
+        "Nakode services: {} current, {} restarted, {} active, {} unknown, {} failed",
+        report.current,
+        report.restarted,
+        report.active.len(),
+        report.unknown.len(),
+        report.failures.len()
+    );
+    for workspace in report.active {
+        eprintln!("nakode: left active stale service running: {workspace}");
+    }
+    for detail in report.unknown {
+        eprintln!("nakode: could not identify stale service workspace: {detail}");
+    }
+    for detail in report.failures {
+        eprintln!("nakode: stale service refresh failed: {detail}");
+    }
+    Ok(())
+}
+
 /// Reports service state as text or JSON.
 ///
 /// # Errors
