@@ -196,6 +196,8 @@ async fn run_loop(context: RunLoopContext<'_>) -> Result<(), AppError> {
     let mut render_tick = tokio::time::interval(Duration::from_millis(33));
     render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut dirty = true;
+    let mut workspace_watch_open = true;
+    let mut session_watch_open = true;
     if let Some(reporter) = &mut herdr {
         reporter.sync(host.projection());
     }
@@ -207,15 +209,23 @@ async fn run_loop(context: RunLoopContext<'_>) -> Result<(), AppError> {
                 Some(Err(error)) => return Err(AppError::Terminal(error)),
                 None => break,
             },
-            update = workspace_updates.next() => match update {
+            update = workspace_updates.next(), if workspace_watch_open => match update {
                 Some(Ok(workspace)) => { if host.install_workspace(workspace).map_err(AppError::Projection)? { crate::terminal::ring_bell(terminal.backend_mut())?; } dirty = true; }
                 Some(Err(error)) => { host.connection_status(error.to_string()); dirty = true; }
-                None => return Err(AppError::Projection("workspace watch closed".into())),
+                None => {
+                    workspace_watch_open = false;
+                    host.connection_status("Workspace service disconnected.".to_owned());
+                    dirty = true;
+                }
             },
-            update = session_updates.next() => match update {
+            update = session_updates.next(), if session_watch_open => match update {
                 Some(Ok(session)) => { if host.install_session(session).map_err(AppError::Projection)? { crate::terminal::ring_bell(terminal.backend_mut())?; } dirty = true; }
                 Some(Err(error)) => { host.connection_status(error.to_string()); dirty = true; }
-                None => return Err(AppError::Projection("session watch closed".into())),
+                None => {
+                    session_watch_open = false;
+                    host.connection_status("Session service disconnected.".to_owned());
+                    dirty = true;
+                }
             },
             () = signals.recv() => break,
             _ = render_tick.tick() => {
@@ -233,6 +243,7 @@ async fn run_loop(context: RunLoopContext<'_>) -> Result<(), AppError> {
             host.install_session(hydrated)
                 .map_err(AppError::Projection)?;
             *session_updates = client.watch_hydrated_session(session_id.to_string(), scrollback);
+            session_watch_open = true;
             dirty = true;
         }
         if let Some(reporter) = &mut herdr {

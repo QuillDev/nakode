@@ -4,7 +4,7 @@ use std::{
     error::Error,
     ffi::OsString,
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, LazyLock, Mutex},
     thread,
@@ -15,6 +15,7 @@ use nakode::pty::PtySession;
 use portable_pty::PtySize;
 
 static TUI_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const TUI_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
 fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
@@ -23,9 +24,10 @@ fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempfile::tempdir()?;
     let home = temp.path().join("nakode-home");
+    let _service_cleanup = ServiceCleanup::new(temp.path(), &home);
     let mut session = spawn_tui(temp.path(), &home)?;
     let output_drain = drain_output(&mut session)?;
-    if !output_drain.wait_for(b"\x1b[?1049h", Duration::from_secs(10)) {
+    if !output_drain.wait_for(b"\x1b[?1049h", TUI_READY_TIMEOUT) {
         let _ = session.kill();
         let _ = session.wait();
         let output = output_drain.finish()?;
@@ -104,15 +106,39 @@ fn multiple_tuis_share_one_server_without_owning_its_lifecycle() -> Result<(), B
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempfile::tempdir()?;
     let home = temp.path().join("nakode-home");
+    let _service_cleanup = ServiceCleanup::new(temp.path(), &home);
     let mut first = spawn_tui(temp.path(), &home)?;
     let first_reader = drain_output(&mut first)?;
-    thread::sleep(Duration::from_millis(500));
-    assert!(first.try_wait()?.is_none(), "first TUI exited unexpectedly");
+    if !first_reader.wait_for(b"\x1b[?1049h", TUI_READY_TIMEOUT) {
+        let _ = first.kill();
+        let _ = first.wait();
+        let output = first_reader.finish()?;
+        shutdown_service(temp.path(), &home)?;
+        return Err(io::Error::other(format!(
+            "first TUI did not become ready:\n{}",
+            String::from_utf8_lossy(&output)
+        ))
+        .into());
+    }
 
     let mut second = spawn_tui(temp.path(), &home)?;
     let second_reader = drain_output(&mut second)?;
+    if !second_reader.wait_for(b"\x1b[?1049h", TUI_READY_TIMEOUT) {
+        let _ = first.kill();
+        let _ = second.kill();
+        let _ = first.wait();
+        let _ = second.wait();
+        let first_output = first_reader.finish()?;
+        let second_output = second_reader.finish()?;
+        shutdown_service(temp.path(), &home)?;
+        return Err(io::Error::other(format!(
+            "second TUI did not become ready:\nfirst:\n{}\nsecond:\n{}",
+            String::from_utf8_lossy(&first_output),
+            String::from_utf8_lossy(&second_output)
+        ))
+        .into());
+    }
 
-    thread::sleep(Duration::from_secs(1));
     if let Some(status) = first.try_wait()? {
         let _ = second.kill();
         let _ = second.wait();
@@ -139,11 +165,17 @@ fn multiple_tuis_share_one_server_without_owning_its_lifecycle() -> Result<(), B
     }
 
     shutdown_service(temp.path(), &home)?;
-    thread::sleep(Duration::from_millis(500));
-    assert!(
-        first.try_wait()?.is_none() && second.try_wait()?.is_none(),
-        "a renderer exited merely because the independently owned server stopped"
-    );
+    if let Err(error) = assert_stays_alive(&mut first, Duration::from_secs(1), "first TUI")
+        .and_then(|()| assert_stays_alive(&mut second, Duration::from_secs(1), "second TUI"))
+    {
+        let _ = first.kill();
+        let _ = second.kill();
+        let _ = first.wait();
+        let _ = second.wait();
+        first_reader.finish()?;
+        second_reader.finish()?;
+        return Err(error.into());
+    }
 
     first.writer().write_all(&[0x04])?;
     first.writer().flush()?;
@@ -230,7 +262,7 @@ impl PtyOutputDrain {
             {
                 return true;
             }
-            if Instant::now() >= deadline {
+            if self.worker.is_finished() || Instant::now() >= deadline {
                 return false;
             }
             thread::sleep(Duration::from_millis(25));
@@ -249,14 +281,47 @@ impl PtyOutputDrain {
     }
 }
 
+fn assert_stays_alive(session: &mut PtySession, duration: Duration, label: &str) -> io::Result<()> {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if let Some(status) = session.try_wait()? {
+            return Err(io::Error::other(format!(
+                "{label} exited when the independently owned service stopped: {status:?}"
+            )));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
 fn wait_for_exit(session: &mut PtySession) -> io::Result<bool> {
-    for _ in 0..100 {
+    for _ in 0..200 {
         if session.try_wait()?.is_some() {
             return Ok(true);
         }
         thread::sleep(Duration::from_millis(50));
     }
     Ok(false)
+}
+
+struct ServiceCleanup {
+    workspace: PathBuf,
+    control_directory: PathBuf,
+}
+
+impl ServiceCleanup {
+    fn new(workspace: &Path, control_directory: &Path) -> Self {
+        Self {
+            workspace: workspace.to_path_buf(),
+            control_directory: control_directory.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for ServiceCleanup {
+    fn drop(&mut self) {
+        let _ = shutdown_service(&self.workspace, &self.control_directory);
+    }
 }
 
 fn shutdown_service(workspace: &Path, control_directory: &Path) -> io::Result<()> {

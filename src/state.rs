@@ -6733,38 +6733,8 @@ impl DomainState {
                 "predefined agent {agent_slug:?}"
             )));
         };
-        let (parent_run_id, remaining_delegation_depth) = if let Some(parent_run_id) = parent_run_id
-        {
-            let parent = self.subagent_executions.get(parent_run_id).ok_or_else(|| {
-                DomainCommandError::NotFound(format!("parent agent run `{parent_run_id}`"))
-            })?;
-            if !matches!(
-                parent.run.status,
-                SubagentStatus::Starting | SubagentStatus::Working
-            ) {
-                return Err(DomainCommandError::Conflict(format!(
-                    "parent agent run `{parent_run_id}` is no longer active"
-                )));
-            }
-            if !parent.definition.can_delegate {
-                return Err(DomainCommandError::Unsupported(format!(
-                    "agent `{}` is not permitted to delegate",
-                    parent.definition.slug
-                )));
-            }
-            let Some(remaining) = parent.remaining_delegation_depth.checked_sub(1) else {
-                return Err(DomainCommandError::Unsupported(format!(
-                    "agent `{}` exhausted its maximum delegation depth",
-                    parent.definition.slug
-                )));
-            };
-            (
-                Some(parent_run_id.to_owned()),
-                remaining.min(definition.max_delegation_depth),
-            )
-        } else {
-            (None, definition.max_delegation_depth)
-        };
+        let (parent_run_id, remaining_delegation_depth) =
+            self.delegation_context(parent_run_id, &definition)?;
 
         let run_id = Self::next_id("agent");
         let model_targets = agent_model_targets(&definition, &self.backend_provider);
@@ -6834,6 +6804,46 @@ impl DomainState {
             effects.push(effect);
         }
         Ok((run_id, effects))
+    }
+
+    fn delegation_context(
+        &self,
+        parent_run_id: Option<&str>,
+        definition: &AgentDefinition,
+    ) -> Result<(Option<String>, u32), DomainCommandError> {
+        let Some(parent_run_id) = parent_run_id else {
+            return Ok((None, definition.max_delegation_depth));
+        };
+        let parent = self.subagent_executions.get(parent_run_id).ok_or_else(|| {
+            DomainCommandError::NotFound(format!("parent agent run `{parent_run_id}`"))
+        })?;
+        if !matches!(
+            parent.run.status,
+            SubagentStatus::Starting | SubagentStatus::Working
+        ) {
+            return Err(DomainCommandError::Conflict(format!(
+                "parent agent run `{parent_run_id}` is no longer active"
+            )));
+        }
+        if !parent.definition.can_delegate {
+            return Err(DomainCommandError::Unsupported(format!(
+                "agent `{}` is not permitted to delegate",
+                parent.definition.slug
+            )));
+        }
+        let remaining = parent
+            .remaining_delegation_depth
+            .checked_sub(1)
+            .ok_or_else(|| {
+                DomainCommandError::Unsupported(format!(
+                    "agent `{}` exhausted its maximum delegation depth",
+                    parent.definition.slug
+                ))
+            })?;
+        Ok((
+            Some(parent_run_id.to_owned()),
+            remaining.min(definition.max_delegation_depth),
+        ))
     }
 
     pub fn invoke_agent(&mut self, request: &AgentRequest) -> Vec<Effect> {

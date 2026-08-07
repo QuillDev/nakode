@@ -702,7 +702,7 @@ fn executable_identity(path: &Path) -> Result<ExecutableIdentity, ControlError> 
             source,
         })?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; 8 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
@@ -1066,10 +1066,12 @@ impl ActivationLease {
                 Err(source) => return Err(socket_error(path, source)),
             }
         }
+        let timeout_ms = u128::try_from(ACTIVATION_LOCK_ATTEMPTS)
+            .unwrap_or(u128::MAX)
+            .saturating_mul(SERVICE_START_RETRY.as_millis());
         Err(ControlError::StaleServiceActivation(format!(
-            "another connector kept the workspace activation lease at {} for more than {}ms",
+            "another connector kept the workspace activation lease at {} for more than {timeout_ms}ms",
             path.display(),
-            ACTIVATION_LOCK_ATTEMPTS as u64 * SERVICE_START_RETRY.as_millis() as u64,
         )))
     }
 }
@@ -1188,84 +1190,7 @@ pub async fn frontend_api_endpoint_report(
             .await;
         }
 
-        let old_server = server_report(paths.api()).await;
-        ensure_stale_service_is_quiescent(paths.api(), &config.workspace)
-            .await
-            .map_err(|reason| {
-                ControlError::StaleServiceActivation(activation_diagnostic(
-                    &paths,
-                    &cli,
-                    old_record.as_ref(),
-                    old_server.clone(),
-                    "restart refused",
-                    &reason,
-                ))
-            })?;
-        eprintln!(
-            "nakode: activating updated service for {} (old {}; cli {})",
-            config.workspace.display(),
-            runtime_identity_label(old_record.as_ref()),
-            executable_identity_label(&cli),
-        );
-        if let Err(error) = restart_service(executable, config).await {
-            let replacement = read_runtime_record(paths.runtime());
-            let replacement_server = server_report(paths.api()).await;
-            let reason = format!(
-                "{}; replacement {}; replacement_server {}",
-                error,
-                runtime_identity_label(replacement.as_ref()),
-                replacement_server.as_ref().map_or_else(
-                    || "unavailable".to_owned(),
-                    |server| format!(
-                        "version={} api={} capabilities=[{}]",
-                        server.server_version,
-                        server.api_version,
-                        server.capabilities.join(",")
-                    )
-                )
-            );
-            return Err(ControlError::StaleServiceActivation(activation_diagnostic(
-                &paths,
-                &cli,
-                old_record.as_ref(),
-                old_server,
-                "restart failed",
-                &reason,
-            )));
-        }
-        if let Err(error) = wait_for_api(paths.api(), &config.workspace).await {
-            let replacement = read_runtime_record(paths.runtime());
-            let replacement_server = server_report(paths.api()).await;
-            let reason = format!(
-                "{}; replacement {}; replacement_server {}",
-                error,
-                runtime_identity_label(replacement.as_ref()),
-                replacement_server.as_ref().map_or_else(
-                    || "unavailable".to_owned(),
-                    |server| format!(
-                        "version={} api={} capabilities=[{}]",
-                        server.server_version,
-                        server.api_version,
-                        server.capabilities.join(",")
-                    )
-                )
-            );
-            return Err(ControlError::StaleServiceActivation(activation_diagnostic(
-                &paths,
-                &cli,
-                old_record.as_ref(),
-                old_server,
-                "replacement did not become ready",
-                &reason,
-            )));
-        }
-        return verified_frontend_endpoint(
-            &paths,
-            cli,
-            EndpointActivation::RestartedStaleService,
-            "stale service was restarted",
-        )
-        .await;
+        return activate_stale_service(&paths, executable, config, cli, old_record).await;
     }
 
     ensure_api_service(&paths, executable, config).await?;
@@ -1278,7 +1203,100 @@ pub async fn frontend_api_endpoint_report(
     .await
 }
 
+async fn activate_stale_service(
+    paths: &ServicePaths,
+    executable: &Path,
+    config: &Config,
+    cli: ExecutableIdentity,
+    old_record: Option<ServiceRuntimeRecord>,
+) -> Result<FrontendEndpoint, ControlError> {
+    let old_server = server_report(paths.api()).await;
+    ensure_stale_service_is_quiescent(paths.api(), &config.workspace)
+        .await
+        .map_err(|reason| {
+            ControlError::StaleServiceActivation(activation_diagnostic(
+                paths,
+                &cli,
+                old_record.as_ref(),
+                old_server.clone(),
+                "restart refused",
+                &reason,
+            ))
+        })?;
+    eprintln!(
+        "nakode: activating updated service for {} (old {}; cli {})",
+        config.workspace.display(),
+        runtime_identity_label(old_record.as_ref()),
+        executable_identity_label(&cli),
+    );
+    if let Err(error) = restart_service(executable, config).await {
+        return Err(stale_replacement_error(
+            paths,
+            &cli,
+            old_record.as_ref(),
+            old_server.clone(),
+            "restart failed",
+            &error,
+        )
+        .await);
+    }
+    if let Err(error) = wait_for_api(paths.api(), &config.workspace).await {
+        return Err(stale_replacement_error(
+            paths,
+            &cli,
+            old_record.as_ref(),
+            old_server,
+            "replacement did not become ready",
+            &error,
+        )
+        .await);
+    }
+    verified_frontend_endpoint(
+        paths,
+        cli,
+        EndpointActivation::RestartedStaleService,
+        "stale service was restarted",
+    )
+    .await
+}
+
+async fn stale_replacement_error(
+    paths: &ServicePaths,
+    cli: &ExecutableIdentity,
+    old_record: Option<&ServiceRuntimeRecord>,
+    old_server: Option<ServerReport>,
+    action: &str,
+    error: &ControlError,
+) -> ControlError {
+    let replacement = read_runtime_record(paths.runtime());
+    let replacement_server = server_report_label(server_report(paths.api()).await);
+    let reason = format!(
+        "{error}; replacement {}; replacement_server {replacement_server}",
+        runtime_identity_label(replacement.as_ref()),
+    );
+    ControlError::StaleServiceActivation(activation_diagnostic(
+        paths, cli, old_record, old_server, action, &reason,
+    ))
+}
+
+fn server_report_label(server: Option<ServerReport>) -> String {
+    server.map_or_else(
+        || "unavailable".to_owned(),
+        |server| {
+            format!(
+                "version={} api={} capabilities=[{}]",
+                server.server_version,
+                server.api_version,
+                server.capabilities.join(",")
+            )
+        },
+    )
+}
+
 /// Returns only the verified socket for in-process clients.
+///
+/// # Errors
+/// Returns when endpoint activation or identity verification fails.
 pub async fn frontend_api_endpoint(
     executable: &Path,
     config: &Config,

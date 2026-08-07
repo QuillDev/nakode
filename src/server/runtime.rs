@@ -169,12 +169,14 @@ pub(crate) async fn prepare_runtime(
     let mut backends = BackendRegistry::spawn(
         config,
         &providers,
-        session_database.clone(),
-        provider_credentials,
-        shared_web_config(session_repository.as_ref())?,
-        shared_memory_config(session_repository.as_ref())?,
-        shared_vision_config(session_repository.as_ref())?,
-        delegation_tx,
+        BackendRegistrySpawn {
+            session_database: session_database.clone(),
+            provider_credentials,
+            web_config: shared_web_config(session_repository.as_ref())?,
+            memory_config: shared_memory_config(session_repository.as_ref())?,
+            vision_config: shared_vision_config(session_repository.as_ref())?,
+            native_delegation: delegation_tx,
+        },
     )
     .await;
     backends.failures.extend(credential_failures);
@@ -690,6 +692,15 @@ impl NativeServerHandle {
     }
 }
 
+pub(crate) struct BackendRegistrySpawn {
+    pub(crate) session_database: PathBuf,
+    pub(crate) provider_credentials: HashMap<String, serde_json::Value>,
+    pub(crate) web_config: Arc<RwLock<crate::web::WebConfig>>,
+    pub(crate) memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
+    pub(crate) vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
+    pub(crate) native_delegation: mpsc::Sender<NativeDelegationRequest>,
+}
+
 pub(crate) struct BackendRegistry {
     /// Provider-scoped handles own authentication, readiness, and model catalogs.
     pub(crate) commands: HashMap<String, mpsc::Sender<BackendCommand>>,
@@ -739,13 +750,16 @@ impl BackendRegistry {
     pub(crate) async fn spawn(
         config: &Config,
         providers: &[ProviderRecord],
-        session_database: PathBuf,
-        provider_credentials: HashMap<String, serde_json::Value>,
-        web_config: Arc<RwLock<crate::web::WebConfig>>,
-        memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
-        vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
-        native_delegation: mpsc::Sender<NativeDelegationRequest>,
+        spawn: BackendRegistrySpawn,
     ) -> Self {
+        let BackendRegistrySpawn {
+            session_database,
+            provider_credentials,
+            web_config,
+            memory_config,
+            vision_config,
+            native_delegation,
+        } = spawn;
         let (event_tx, events) = mpsc::channel(512);
         let mut failures = Vec::new();
         let vision_service = match codex::vision_service(
@@ -2263,12 +2277,14 @@ mod tests {
         BackendRegistry::spawn(
             &config_for(workspace),
             &[],
-            workspace.join("sessions.sqlite3"),
-            HashMap::new(),
-            web_config,
-            memory_config,
-            vision_config,
-            delegation,
+            super::BackendRegistrySpawn {
+                session_database: workspace.join("sessions.sqlite3"),
+                provider_credentials: HashMap::new(),
+                web_config,
+                memory_config,
+                vision_config,
+                native_delegation: delegation,
+            },
         )
         .await
     }

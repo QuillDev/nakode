@@ -1485,6 +1485,7 @@ impl RuntimeSession {
         self
     }
 
+    #[must_use]
     pub fn with_owner(
         mut self,
         owner_session_id: Option<String>,
