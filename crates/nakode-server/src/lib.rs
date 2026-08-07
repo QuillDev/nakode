@@ -27,6 +27,8 @@ pub struct PublishError;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
+// This public broker request envelope intentionally keeps `Command` value-shaped. Boxing only the
+// command arm would push allocation and ownership changes through every transport and server.
 pub enum ServerRequest {
     Command {
         client_id: ClientId,

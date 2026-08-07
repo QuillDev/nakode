@@ -516,19 +516,20 @@ impl AgentRuntime {
         let Some(timeout) = timeout else {
             return turn.await;
         };
-        match tokio::time::timeout(timeout, turn).await {
-            Ok(result) => result,
-            Err(_) => {
-                on_timeout.cancel();
-                Err(TurnError::Failed(format!(
-                    "archetype runtime exceeded its configured {} second timeout",
-                    timeout.as_secs()
-                )))
-            }
+        if let Ok(result) = tokio::time::timeout(timeout, turn).await {
+            result
+        } else {
+            on_timeout.cancel();
+            Err(TurnError::Failed(format!(
+                "archetype runtime exceeded its configured {} second timeout",
+                timeout.as_secs()
+            )))
         }
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    // The inner turn loop receives the owned runtime boundary explicitly; extracting its tightly
+    // ordered inference/tool state machine would weaken the cancellation and history invariants.
     async fn run_turn_inner(
         &self,
         session: &mut RuntimeSession,

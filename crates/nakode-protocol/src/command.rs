@@ -55,6 +55,8 @@ pub enum RunTextField {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// Public command input mirrors independently meaningful protobuf fields; collapsing these booleans
+// into one state enum would change the stable wire contract.
 #[allow(clippy::struct_excessive_bools)]
 pub struct AgentDefinitionInput {
     pub slug: String,
@@ -219,8 +221,10 @@ pub enum SettingsPatch {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Keep commands as value-shaped protocol messages. Boxing only this variant would alter the public
+// Rust command API to optimize an infrequent control-plane enum.
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     CreateSession {
         workspace_id: WorkspaceId,
