@@ -1041,9 +1041,51 @@ fn todo_phase(value: api::TodoPhase) -> Result<view::TodoPhaseView, String> {
 pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
     Ok(view::RunView {
         id: view::RunId::from(value.id),
+        parent_run_id: value.parent_run_id.map(view::RunId::from),
         agent_slug: value.agent_slug,
+        archetype_purpose: value.archetype_purpose,
         provider_id: view::ProviderId::from(value.provider_id),
         model_id: value.model_id.map(view::ModelId::from),
+        reasoning_effort: value.reasoning_effort,
+        fast_mode: value.fast_mode,
+        started_at_ms: value.started_at_ms,
+        ended_at_ms: value.ended_at_ms,
+        duration_ms: value.duration_ms,
+        termination_kind: value.termination_kind,
+        termination_detail: value.termination_detail,
+        objective_mismatch_handoff: value.objective_mismatch_handoff,
+        policy: value
+            .policy
+            .map_or_else(view::RunPolicyView::default, |policy| view::RunPolicyView {
+                allowed_capabilities: policy.allowed_capabilities,
+                denied_capabilities: policy.denied_capabilities,
+                allowed_tools: policy.allowed_tools,
+                denied_tools: policy.denied_tools,
+                tool_profile: policy.tool_profile,
+                task_shape: policy.task_shape,
+                output_contract: policy.output_contract,
+                timeout_seconds: policy.timeout_seconds,
+                max_turns: policy.max_turns,
+                can_delegate: policy.can_delegate,
+                max_delegation_depth: policy.max_delegation_depth,
+                remaining_delegation_depth: policy.remaining_delegation_depth,
+                require_parent_attribution: policy.require_parent_attribution,
+                truncated_fields: policy.truncated_fields,
+            }),
+        tool_denials: value
+            .tool_denials
+            .into_iter()
+            .map(|denial| view::RunToolDenialView {
+                entry_id: denial.entry_id,
+                tool: denial.tool,
+                reason: denial.reason,
+                tool_start_byte: denial.tool_start_byte,
+                tool_total_bytes: denial.tool_total_bytes,
+                reason_start_byte: denial.reason_start_byte,
+                reason_total_bytes: denial.reason_total_bytes,
+            })
+            .collect(),
+        tool_denials_retained_total: value.tool_denials_retained_total,
         native_session_id: value.native_session_id,
         usage: token_usage(value.usage.unwrap_or_default()),
         objective: value.objective,

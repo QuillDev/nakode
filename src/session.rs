@@ -103,6 +103,20 @@ impl SubagentStatus {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SubagentObservability {
+    pub parent_run_id: Option<String>,
+    pub archetype_purpose: String,
+    /// Exact delegated archetype definition used for this run, serialized at acceptance time.
+    pub policy_json: String,
+    pub remaining_delegation_depth: u32,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub termination_kind: Option<String>,
+    pub termination_detail: Option<String>,
+    pub objective_mismatch_handoff: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubagentRecord {
     pub parent_session_id: String,
@@ -118,6 +132,7 @@ pub struct SubagentRecord {
     pub objective: String,
     pub status: SubagentStatus,
     pub latest_activity: String,
+    pub observability: SubagentObservability,
     pub transcript: Vec<TranscriptEntry>,
 }
 
@@ -451,6 +466,15 @@ impl SqliteSessionRepository {
                objective TEXT NOT NULL,
                status TEXT NOT NULL,
                latest_activity TEXT NOT NULL,
+               parent_run_id TEXT,
+               archetype_purpose TEXT NOT NULL DEFAULT '',
+               policy_json TEXT NOT NULL DEFAULT '{}',
+               remaining_delegation_depth INTEGER NOT NULL DEFAULT 0,
+               started_at_ms INTEGER NOT NULL DEFAULT 0,
+               ended_at_ms INTEGER,
+               termination_kind TEXT,
+               termination_detail TEXT,
+               objective_mismatch_handoff TEXT,
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL,
                PRIMARY KEY(parent_session_id, id)
@@ -491,6 +515,15 @@ impl SqliteSessionRepository {
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cached_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_write_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("parent_run_id", "TEXT"),
+            ("archetype_purpose", "TEXT NOT NULL DEFAULT ''"),
+            ("policy_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("remaining_delegation_depth", "INTEGER NOT NULL DEFAULT 0"),
+            ("started_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("ended_at_ms", "INTEGER"),
+            ("termination_kind", "TEXT"),
+            ("termination_detail", "TEXT"),
+            ("objective_mismatch_handoff", "TEXT"),
         ] {
             if !orchestration_columns
                 .iter()
@@ -1121,8 +1154,11 @@ impl SessionRepository for SqliteSessionRepository {
             "INSERT INTO orchestration_runs
                (parent_session_id, id, agent_slug, provider, model, provider_session_id,
                 input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, objective,
-                status, latest_activity, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+                status, latest_activity, parent_run_id, archetype_purpose, policy_json,
+                remaining_delegation_depth, started_at_ms, ended_at_ms, termination_kind,
+                termination_detail, objective_mismatch_handoff, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23)
              ON CONFLICT(parent_session_id, id) DO UPDATE SET
                agent_slug = excluded.agent_slug,
                provider = excluded.provider,
@@ -1135,6 +1171,15 @@ impl SessionRepository for SqliteSessionRepository {
                objective = excluded.objective,
                status = excluded.status,
                latest_activity = excluded.latest_activity,
+               parent_run_id = excluded.parent_run_id,
+               archetype_purpose = excluded.archetype_purpose,
+               policy_json = excluded.policy_json,
+               remaining_delegation_depth = excluded.remaining_delegation_depth,
+               started_at_ms = excluded.started_at_ms,
+               ended_at_ms = excluded.ended_at_ms,
+               termination_kind = excluded.termination_kind,
+               termination_detail = excluded.termination_detail,
+               objective_mismatch_handoff = excluded.objective_mismatch_handoff,
                updated_at = excluded.updated_at",
             params![
                 record.parent_session_id,
@@ -1150,6 +1195,18 @@ impl SessionRepository for SqliteSessionRepository {
                 record.objective,
                 record.status.database_value(),
                 record.latest_activity,
+                record.observability.parent_run_id,
+                record.observability.archetype_purpose,
+                record.observability.policy_json,
+                i64::from(record.observability.remaining_delegation_depth),
+                i64::try_from(record.observability.started_at_ms).unwrap_or(i64::MAX),
+                record
+                    .observability
+                    .ended_at_ms
+                    .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+                record.observability.termination_kind,
+                record.observability.termination_detail,
+                record.observability.objective_mismatch_handoff,
                 now,
             ],
         )?;
@@ -1194,7 +1251,9 @@ impl SessionRepository for SqliteSessionRepository {
         let mut statement = connection.prepare(
             "SELECT id, agent_slug, provider, model, provider_session_id,
                     input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
-                    objective, status, latest_activity
+                    objective, status, latest_activity, parent_run_id, archetype_purpose,
+                    policy_json, remaining_delegation_depth, started_at_ms, ended_at_ms,
+                    termination_kind, termination_detail, objective_mismatch_handoff
              FROM orchestration_runs
              WHERE parent_session_id = ?1
              ORDER BY created_at, id",
@@ -1213,6 +1272,16 @@ impl SessionRepository for SqliteSessionRepository {
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, String>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+                u32::try_from(row.get::<_, i64>(15)?).unwrap_or_default(),
+                u64::try_from(row.get::<_, i64>(16)?).unwrap_or_default(),
+                row.get::<_, Option<i64>>(17)?
+                    .map(|value| u64::try_from(value).unwrap_or_default()),
+                row.get::<_, Option<String>>(18)?,
+                row.get::<_, Option<String>>(19)?,
+                row.get::<_, Option<String>>(20)?,
             ))
         })?;
         let stored_runs = rows.collect::<Result<Vec<_>, _>>()?;
@@ -1230,6 +1299,15 @@ impl SessionRepository for SqliteSessionRepository {
             objective,
             status,
             latest_activity,
+            parent_run_id,
+            archetype_purpose,
+            policy_json,
+            remaining_delegation_depth,
+            started_at_ms,
+            ended_at_ms,
+            termination_kind,
+            termination_detail,
+            objective_mismatch_handoff,
         ) in stored_runs
         {
             let transcript = load_subagent_transcript(&connection, parent_session_id, &id)?;
@@ -1247,6 +1325,17 @@ impl SessionRepository for SqliteSessionRepository {
                 objective,
                 status: SubagentStatus::from_database(&status)?,
                 latest_activity,
+                observability: SubagentObservability {
+                    parent_run_id,
+                    archetype_purpose,
+                    policy_json,
+                    remaining_delegation_depth,
+                    started_at_ms,
+                    ended_at_ms,
+                    termination_kind,
+                    termination_detail,
+                    objective_mismatch_handoff,
+                },
                 transcript,
             });
         }
@@ -1847,6 +1936,7 @@ mod tests {
                 model_id: None,
                 tool_audit_json: None,
             }],
+            observability: Default::default(),
         })?;
         let native_rows = |provider_session_id: &str| -> Result<i64, SessionError> {
             let connection = store
@@ -1946,6 +2036,17 @@ mod tests {
                     ),
                 },
             ],
+            observability: SubagentObservability {
+                parent_run_id: Some("agent-root".to_owned()),
+                archetype_purpose: "Read-only persistence scout".to_owned(),
+                policy_json: r#"{"slug":"explorer","description":"Read-only persistence scout","tool_profile":"read_only","allowed_capabilities":["filesystem_read"],"denied_capabilities":["filesystem_write"],"allowed_tools":["read","grep"],"denied_tools":["write"],"timeout_seconds":300,"max_turns":5,"require_parent_attribution":true}"#.to_owned(),
+                remaining_delegation_depth: 0,
+                started_at_ms: 1_000,
+                ended_at_ms: Some(1_250),
+                termination_kind: Some("completed".to_owned()),
+                termination_detail: None,
+                objective_mismatch_handoff: None,
+            },
         };
 
         store.save_subagent(&record)?;
@@ -2044,6 +2145,7 @@ mod tests {
                 model_id: None,
                 tool_audit_json: None,
             }],
+            observability: Default::default(),
         })?;
         let connection = store.connection.lock().expect("database mutex");
         for (provider, session_id) in [

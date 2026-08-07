@@ -362,12 +362,73 @@ pub enum RunOutcome {
     Interrupted { reason: String },
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunPolicyView {
+    pub allowed_capabilities: Vec<String>,
+    pub denied_capabilities: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub denied_tools: Vec<String>,
+    pub tool_profile: String,
+    pub task_shape: String,
+    pub output_contract: String,
+    pub timeout_seconds: Option<u32>,
+    pub max_turns: Option<u32>,
+    pub can_delegate: bool,
+    pub max_delegation_depth: u32,
+    pub remaining_delegation_depth: u32,
+    pub require_parent_attribution: bool,
+    #[serde(default)]
+    pub truncated_fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunToolDenialView {
+    pub entry_id: String,
+    pub tool: String,
+    #[serde(default)]
+    pub tool_start_byte: u64,
+    #[serde(default)]
+    pub tool_total_bytes: u64,
+    pub reason: String,
+    #[serde(default)]
+    pub reason_start_byte: u64,
+    #[serde(default)]
+    pub reason_total_bytes: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunView {
     pub id: RunId,
+    #[serde(default)]
+    pub parent_run_id: Option<RunId>,
     pub agent_slug: String,
+    #[serde(default)]
+    pub archetype_purpose: String,
     pub provider_id: ProviderId,
     pub model_id: Option<ModelId>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub fast_mode: bool,
+    #[serde(default)]
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub ended_at_ms: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub termination_kind: Option<String>,
+    #[serde(default)]
+    pub termination_detail: Option<String>,
+    #[serde(default)]
+    pub objective_mismatch_handoff: Option<String>,
+    #[serde(default)]
+    pub policy: RunPolicyView,
+    #[serde(default)]
+    pub tool_denials: Vec<RunToolDenialView>,
+    /// Total denials still present in the authoritative retained transcript before projection caps.
+    #[serde(default)]
+    pub tool_denials_retained_total: u32,
     /// Provider-native child resource owned by this run, never independently mutable.
     pub native_session_id: Option<String>,
     #[serde(default)]

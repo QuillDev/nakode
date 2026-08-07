@@ -189,9 +189,22 @@ mod tests {
     fn run(status: RunStatus) -> RunView {
         RunView {
             id: RunId::from("run-7"),
+            parent_run_id: None,
             agent_slug: "reviewer".to_owned(),
+            archetype_purpose: "Review focused changes".to_owned(),
             provider_id: ProviderId::from("openai-codex"),
             model_id: None,
+            reasoning_effort: None,
+            fast_mode: false,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            duration_ms: None,
+            termination_kind: None,
+            termination_detail: None,
+            objective_mismatch_handoff: None,
+            policy: nakode_protocol::RunPolicyView::default(),
+            tool_denials: Vec::new(),
+            tool_denials_retained_total: 0,
             native_session_id: None,
             usage: nakode_protocol::TokenUsageView {
                 input_tokens: 0,

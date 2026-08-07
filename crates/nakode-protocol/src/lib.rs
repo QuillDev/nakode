@@ -37,12 +37,12 @@ pub use view::{
     InteractionQuestionView, InteractionStatus, InteractionView, MemorySettingsView,
     ModelConfigurationView, ModelView, NoticeLevel, NoticeView, OwnedProviderSessionView,
     ProviderAuthenticationView, ProviderCapabilities, ProviderCapability, ProviderView,
-    QueueItemView, RecoverablePromptView, RunMetadataView, RunOutcome, RunPage, RunStatus,
-    RunTextWindow, RunView, SessionActivity, SessionMetadataView, SessionSummary, SessionView,
-    SettingsView, SkillView, TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView,
-    TokenUsageView, TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus,
-    TranscriptEntryView, TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent,
-    VisionSettingsView, WebSettingsView,
+    QueueItemView, RecoverablePromptView, RunMetadataView, RunOutcome, RunPage, RunPolicyView,
+    RunStatus, RunTextWindow, RunToolDenialView, RunView, SessionActivity, SessionMetadataView,
+    SessionSummary, SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView,
+    TodoPhaseView, TodoStatusView, TokenUsageView, TranscriptBodyWindow, TranscriptEntryKind,
+    TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TranscriptWindowView, TurnStatus,
+    TurnView, ViewEvent, VisionSettingsView, WebSettingsView,
 };
 
 /// Maximum encoded Protobuf request or response accepted by Nakode's API.
@@ -74,3 +74,15 @@ pub const MAX_SESSION_RUNS_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum UTF-8 bytes carried by one run metadata text field.
 pub const MAX_RUN_TEXT_BYTES: usize = 64 * 1024;
+
+/// Maximum denial records embedded in one run projection; the total remains explicit.
+pub const MAX_RUN_TOOL_DENIALS: usize = 50;
+
+/// Maximum UTF-8 bytes carried by one denial tool name or reason window.
+pub const MAX_RUN_TOOL_DENIAL_TEXT_BYTES: usize = 4 * 1024;
+
+/// Maximum values projected from any one run policy array.
+pub const MAX_RUN_POLICY_ITEMS: usize = 50;
+
+/// Maximum UTF-8 bytes projected from one run policy text field.
+pub const MAX_RUN_POLICY_TEXT_BYTES: usize = 4 * 1024;
