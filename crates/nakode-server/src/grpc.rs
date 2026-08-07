@@ -370,6 +370,45 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             session_id: protocol::SessionId::from(input.session_id)
         }
     );
+
+    async fn get_soul(
+        &self,
+        request: tonic::Request<api::GetSoulRequest>,
+    ) -> Result<tonic::Response<api::SoulDocument>, tonic::Status> {
+        let request = request.into_inner();
+        let result = self
+            .query(protocol::Query::GetSoul {
+                workspace_id: protocol::WorkspaceId::from(request.workspace_id),
+            })
+            .await?;
+        let protocol::QueryResult::SoulDocument(value) = result.value else {
+            return Err(tonic::Status::internal("unexpected Soul response"));
+        };
+        let source = match value.source.as_str() {
+            "file" => api::soul_document::Source::File,
+            "missing" => api::soul_document::Source::Missing,
+            _ => api::soul_document::Source::Unspecified,
+        };
+        Ok(tonic::Response::new(api::SoulDocument {
+            workspace_id: value.workspace_id.to_string(),
+            content: value.content,
+            path: value.path,
+            source: source.into(),
+            exists: value.exists,
+            digest: value.digest,
+        }))
+    }
+
+    command_rpc!(
+        save_soul,
+        api::SaveSoulRequest,
+        input,
+        protocol::Command::SaveSoul {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            content: input.content,
+            expected_digest: input.expected_digest,
+        }
+    );
     command_rpc!(
         create_session,
         api::CreateSessionRequest,

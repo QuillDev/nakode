@@ -53,6 +53,8 @@ pub enum NativeRuntimeError {
     Skills(#[from] SkillCatalogError),
     #[error(transparent)]
     PromptAddenda(#[from] PromptAddendaError),
+    #[error(transparent)]
+    Soul(#[from] crate::soul::SoulError),
     #[error("failed to locate the running Nakode executable: {0}")]
     CurrentExecutable(#[source] io::Error),
 }
@@ -140,6 +142,7 @@ pub(crate) struct PreparedRuntime {
     pub(crate) providers: Vec<ProviderRecord>,
     pub(crate) sessions: Vec<SessionRecord>,
     pub(crate) delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
+    pub(crate) soul_store: crate::soul::SoulStore,
 }
 
 struct PendingNativeDelegation {
@@ -151,13 +154,15 @@ struct PendingNativeDelegation {
 
 impl PreparedRuntime {
     pub(crate) fn into_actor(self) -> (NativeServerRuntime, NativeServerHandle) {
-        NativeServerRuntime::from_parts(
+        let (mut runtime, handle) = NativeServerRuntime::from_parts(
             self.engine,
             self.providers,
             self.sessions,
             self.effects,
             self.delegation_requests,
-        )
+        );
+        runtime.core.install_soul_store(self.soul_store);
+        (runtime, handle)
     }
 }
 
@@ -192,6 +197,7 @@ pub(crate) async fn prepare_runtime(
     let skills = SkillCatalog::load(&config.workspace)?;
     let prompt_addenda =
         PromptAddenda::load(config.personalities.as_deref(), config.soul.as_deref())?;
+    let soul_store = crate::soul::SoulStore::configured(config.soul.as_deref())?;
     let mut state = initial_state(config, &providers, &backends, agents, skills);
     state.install_prompt_addenda(prompt_addenda);
     let terminal_image_mode = session_repository.load_terminal_image_mode()?;
@@ -211,6 +217,7 @@ pub(crate) async fn prepare_runtime(
         providers,
         sessions,
         delegation_requests,
+        soul_store,
     })
 }
 
@@ -738,6 +745,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::QuestionTextAnswers,
             ServiceCapability::QueuedPromptSteering,
             ServiceCapability::ArchetypeManagement,
+            ServiceCapability::SoulManagement,
         ]
         .into_iter()
         .collect(),

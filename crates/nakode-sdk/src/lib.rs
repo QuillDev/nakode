@@ -580,7 +580,19 @@ impl NakodeClient {
             .into_inner())
     }
 
+    /// Reads Nakode's single configured Soul.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn get_soul(
+        &self,
+        request: api::GetSoulRequest,
+    ) -> Result<api::SoulDocument, SdkError> {
+        Ok(self.transport.clone().get_soul(request).await?.into_inner())
+    }
+
     typed_mutation!(reload_workspace, api::ReloadWorkspaceRequest);
+    typed_mutation!(save_soul, api::SaveSoulRequest);
     typed_mutation!(remove_queued_prompt, api::RemoveQueuedPromptRequest);
     typed_mutation!(cancel_turn, api::CancelTurnRequest);
     typed_mutation!(compact_context, api::CompactContextRequest);
