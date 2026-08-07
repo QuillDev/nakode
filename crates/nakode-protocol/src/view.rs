@@ -460,6 +460,9 @@ pub struct NoticeView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// Frontend-neutral projection mirrors independent configured/effective protobuf flags. A combined
+// state enum would erase the stable wire distinction between these policy dimensions.
+#[allow(clippy::struct_excessive_bools)]
 pub struct AgentDefinitionView {
     pub slug: String,
     pub description: String,

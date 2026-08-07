@@ -61,6 +61,8 @@ fn default_concurrency() -> u32 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+// Persisted archetype policy keeps these independent flags for backward-compatible definition files.
+#[allow(clippy::struct_excessive_bools)]
 pub struct AgentDefinition {
     pub slug: String,
     pub description: String,

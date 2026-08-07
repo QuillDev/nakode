@@ -674,6 +674,9 @@ impl AgentModelOption {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Editor fields mirror the persisted archetype contract one-for-one so opening and saving cannot
+// silently collapse independent policy choices.
+#[allow(clippy::struct_excessive_bools)]
 pub struct AgentEditor {
     pub original_slug: Option<String>,
     pub field: AgentEditorField,
