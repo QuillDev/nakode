@@ -351,6 +351,7 @@ pub enum ControlError {
 enum LifecycleRequest {
     Ping,
     Shutdown,
+    QuiesceShutdown,
     Transport {
         name: String,
         action: TransportAction,
@@ -406,6 +407,7 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
         lifecycle_path,
         configuration,
         transports.clone(),
+        Some(handle.clone()),
     ));
     let mut grpc = tokio::spawn(run_grpc_listener(
         grpc_listener,
@@ -449,6 +451,7 @@ async fn run_lifecycle_listener(
     path: PathBuf,
     configuration: String,
     transports: TransportSupervisor,
+    runtime: Option<crate::server::runtime::NativeServerHandle>,
 ) -> Result<(), ControlError> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
     let mut connections = tokio::task::JoinSet::new();
@@ -459,12 +462,14 @@ async fn run_lifecycle_listener(
                 let shutdown_tx = shutdown_tx.clone();
                 let configuration = configuration.clone();
                 let transports = transports.clone();
+                let runtime = runtime.clone();
                 connections.spawn(async move {
                     handle_lifecycle_connection(
                         stream,
                         shutdown_tx,
                         &configuration,
                         &transports,
+                        runtime.as_ref(),
                     )
                     .await;
                 });
@@ -489,6 +494,7 @@ async fn handle_lifecycle_connection(
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     configuration: &str,
     transports: &TransportSupervisor,
+    runtime: Option<&crate::server::runtime::NativeServerHandle>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut line = String::new();
@@ -508,12 +514,29 @@ async fn handle_lifecycle_connection(
             return;
         }
     };
-    let should_shutdown = matches!(request, LifecycleRequest::Shutdown);
+    let mut should_shutdown = matches!(request, LifecycleRequest::Shutdown);
     let response = match request {
         LifecycleRequest::Ping => LifecycleResponse::Ready {
             configuration: configuration.to_owned(),
         },
         LifecycleRequest::Shutdown => LifecycleResponse::Ok,
+        LifecycleRequest::QuiesceShutdown => match runtime {
+            Some(runtime) => match tokio::time::timeout(Duration::from_secs(3), runtime.quiesce())
+                .await
+            {
+                Ok(Ok(())) => {
+                    should_shutdown = true;
+                    LifecycleResponse::Ok
+                }
+                Ok(Err(message)) => LifecycleResponse::Error { message },
+                Err(_) => LifecycleResponse::Error {
+                    message: "timed out while atomically fencing the workspace service".to_owned(),
+                },
+            },
+            None => LifecycleResponse::Error {
+                message: "atomic quiescent shutdown is unavailable".to_owned(),
+            },
+        },
         LifecycleRequest::Transport { name, action } => {
             match transports.control(&name, action).await {
                 Ok(status) => LifecycleResponse::Transport { status },
@@ -1229,7 +1252,7 @@ async fn activate_stale_service(
         runtime_identity_label(old_record.as_ref()),
         executable_identity_label(&cli),
     );
-    if let Err(error) = restart_service(executable, config).await {
+    if let Err(error) = restart_service_quiescent(executable, config).await {
         return Err(stale_replacement_error(
             paths,
             &cli,
@@ -1361,24 +1384,37 @@ async fn ensure_stale_service_is_quiescent(
         let client = nakode_sdk::NakodeClient::connect_unix(api_path.to_path_buf())
             .await
             .map_err(|error| error.to_string())?;
-        let sessions = client
-            .list_sessions(workspace.to_string_lossy(), u32::MAX)
+        let workspace_state = client
+            .get_workspace(workspace.to_string_lossy(), None)
             .await
             .map_err(|error| error.to_string())?;
-        let running = sessions
-            .into_iter()
-            .filter(|session| session.running)
-            .map(|session| session.id)
-            .collect::<Vec<_>>();
-        if running.is_empty() {
-            Ok(())
-        } else {
-            quiescence_refusal(&running)
+        let mut running = Vec::new();
+        for summary in workspace_state.sessions {
+            let session_id = summary.id;
+            if summary.running {
+                running.push(session_id.clone());
+            }
+            match client.get_session(session_id.clone()).await {
+                Ok(session) if session_has_live_work(&session) => {
+                    if !running.contains(&session_id) {
+                        running.push(session_id);
+                    }
+                }
+                Ok(_) => {}
+                Err(nakode_sdk::SdkError::Status(status))
+                    if status.code() == tonic::Code::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
         }
+        quiescence_refusal(&running)
     };
     tokio::time::timeout(Duration::from_secs(3), query)
         .await
         .map_err(|_| "timed out while proving that the stale service has no live work".to_owned())?
+}
+
+fn session_has_live_work(session: &nakode_sdk::v1::SessionState) -> bool {
+    session.activity != nakode_sdk::v1::SessionActivity::Idle as i32 || !session.queue.is_empty()
 }
 
 fn quiescence_refusal(running: &[String]) -> Result<(), String> {
@@ -1667,9 +1703,21 @@ async fn service_running_at(service_path: &Path) -> Result<bool, ControlError> {
 /// Returns an error when the current service cannot be stopped or its
 /// replacement cannot be started.
 pub async fn restart_service(executable: &Path, config: &Config) -> Result<(), ControlError> {
+    restart_service_with_request(executable, config, LifecycleRequest::Shutdown).await
+}
+
+async fn restart_service_quiescent(executable: &Path, config: &Config) -> Result<(), ControlError> {
+    restart_service_with_request(executable, config, LifecycleRequest::QuiesceShutdown).await
+}
+
+async fn restart_service_with_request(
+    executable: &Path,
+    config: &Config,
+    request: LifecycleRequest,
+) -> Result<(), ControlError> {
     let paths = ServicePaths::of(config)?;
     let running = service_running_at(paths.lifecycle()).await?;
-    shutdown_service(&paths).await?;
+    shutdown_service_with_request(&paths, &request).await?;
 
     if running {
         for _ in 0..SERVICE_STOP_ATTEMPTS {
@@ -1694,10 +1742,17 @@ pub async fn restart_service(executable: &Path, config: &Config) -> Result<(), C
 /// # Errors
 /// Returns an error when a live server rejects or cannot read the request.
 pub async fn shutdown_service(paths: &ServicePaths) -> Result<(), ControlError> {
+    shutdown_service_with_request(paths, &LifecycleRequest::Shutdown).await
+}
+
+async fn shutdown_service_with_request(
+    paths: &ServicePaths,
+    request: &LifecycleRequest,
+) -> Result<(), ControlError> {
     if !paths.lifecycle().exists() {
         return Ok(());
     }
-    match expect_ok(paths.lifecycle(), &LifecycleRequest::Shutdown).await {
+    match expect_ok(paths.lifecycle(), request).await {
         Ok(()) => Ok(()),
         Err(ControlError::Io { source, .. })
             if matches!(
@@ -1920,7 +1975,7 @@ mod tests {
         ensure_service_at, exchange, executable_identity, expect_ok, frontend_api_endpoint_at,
         ping_at, quiescence_refusal, run_lifecycle_listener, runtime_matches_cli,
         service_arguments, service_command, service_configuration_fingerprint, service_running_at,
-        shutdown_all_services_in, workspace_runtime_directory_in,
+        session_has_live_work, shutdown_all_services_in, workspace_runtime_directory_in,
     };
     use crate::config::{Config, OpenAiReasoningEffort};
 
@@ -1980,6 +2035,32 @@ mod tests {
         assert!(error.contains("session-a, session-b"));
         assert!(error.contains("before activating the updated service"));
         assert!(quiescence_refusal(&[]).is_ok());
+    }
+
+    #[test]
+    fn stale_activation_detects_activity_and_queued_prompts() {
+        let idle = nakode_sdk::v1::SessionState {
+            activity: nakode_sdk::v1::SessionActivity::Idle as i32,
+            ..nakode_sdk::v1::SessionState::default()
+        };
+        assert!(!session_has_live_work(&idle));
+
+        let running = nakode_sdk::v1::SessionState {
+            activity: nakode_sdk::v1::SessionActivity::RunningTurn as i32,
+            ..nakode_sdk::v1::SessionState::default()
+        };
+        assert!(session_has_live_work(&running));
+
+        let queued = nakode_sdk::v1::SessionState {
+            activity: nakode_sdk::v1::SessionActivity::Idle as i32,
+            queue: vec![nakode_sdk::v1::QueueItem::default()],
+            ..nakode_sdk::v1::SessionState::default()
+        };
+        assert!(session_has_live_work(&queued));
+
+        assert!(session_has_live_work(
+            &nakode_sdk::v1::SessionState::default()
+        ));
     }
 
     #[test]
@@ -2229,6 +2310,7 @@ mod tests {
                 task_path,
                 configuration,
                 TransportSupervisor::default(),
+                None,
             )
             .await
         });
@@ -2245,6 +2327,17 @@ mod tests {
             ping_at(&path, &changed_config).await,
             Err(ControlError::ConfigurationMismatch)
         ));
+        assert!(matches!(
+            expect_ok(&path, &LifecycleRequest::QuiesceShutdown)
+                .await
+                .expect_err("legacy lifecycle cannot promise an atomic fence"),
+            ControlError::ServiceRejected(message) if message.contains("unavailable")
+        ));
+        assert!(
+            service_running_at(&path)
+                .await
+                .expect("refused quiescence leaves service running")
+        );
         expect_ok(&path, &LifecycleRequest::Shutdown)
             .await
             .expect("shutdown response");
@@ -2279,7 +2372,7 @@ mod tests {
         )]);
         let task_path = path.clone();
         let task = tokio::spawn(async move {
-            run_lifecycle_listener(listener, task_path, configuration, supervisor).await
+            run_lifecycle_listener(listener, task_path, configuration, supervisor, None).await
         });
 
         let start = exchange(
@@ -2385,6 +2478,7 @@ mod tests {
                 task_path,
                 configuration,
                 TransportSupervisor::default(),
+                None,
             )
             .await
         });
