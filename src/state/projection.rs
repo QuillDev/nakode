@@ -69,6 +69,7 @@ pub fn bootstrap(
                 active_model_id: state.selected_model.clone().map(ModelId::from),
                 updated_at_ms: 0,
                 owned_provider_sessions: owned_provider_sessions(state),
+                running: state.is_busy(),
             },
         );
     }
@@ -1206,6 +1207,10 @@ fn empty_transcript_page() -> TranscriptPage {
     }
 }
 
+fn unix_seconds_to_milliseconds(seconds: i64) -> i64 {
+    seconds.saturating_mul(1_000)
+}
+
 fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> SessionSummary {
     SessionSummary {
         id: SessionId::from(session.id.clone()),
@@ -1213,7 +1218,7 @@ fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> Sessi
         title: session.title.clone(),
         active_provider_id: provider_id(&session.provider),
         active_model_id: session.model.clone().map(ModelId::from),
-        updated_at_ms: session.updated_at.saturating_mul(1_000),
+        updated_at_ms: unix_seconds_to_milliseconds(session.updated_at),
         owned_provider_sessions: owned_provider_session(
             &session.provider,
             Some(&session.provider_session_id),
@@ -1225,6 +1230,7 @@ fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> Sessi
             },
         ))
         .collect(),
+        running: false,
     }
 }
 

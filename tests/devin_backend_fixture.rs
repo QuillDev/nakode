@@ -203,6 +203,8 @@ async fn verify_resume_and_cancellation(
         .send(BackendCommand::ResumeSession {
             provider_session_id: session_id.to_owned(),
             owner_session_id: None,
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
         })
         .await?;
     match next_event(backend).await? {

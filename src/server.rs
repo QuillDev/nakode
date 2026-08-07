@@ -371,9 +371,12 @@ impl ServerCore {
                 workspace_id,
                 model_id,
                 options,
+                tools,
                 ..
-            } => self.create_session_command(&workspace_id, model_id.as_ref(), &options),
-            Command::OpenSession { session_id } => self.open_session_command(&session_id),
+            } => self.create_session_command(&workspace_id, model_id.as_ref(), &options, tools),
+            Command::OpenSession { session_id, tools } => {
+                self.open_session_command(&session_id, tools)
+            }
             Command::SendPrompt { session_id, prompt } => {
                 let enqueue = self
                     .engine_for(&session_id)
@@ -485,6 +488,7 @@ impl ServerCore {
         workspace_id: &WorkspaceId,
         model_id: Option<&nakode_protocol::ModelId>,
         options: &nakode_protocol::ModelOptions,
+        tools: Option<nakode_protocol::SessionToolConfiguration>,
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
         if model_id.is_none() && (options.reasoning_effort.is_some() || options.fast_mode) {
@@ -504,11 +508,22 @@ impl ServerCore {
                 options,
             )?);
         }
+        if let Some(tools) = tools {
+            effects.extend(
+                engine
+                    .state_mut()
+                    .configure_external_tools(tools.tools, tools.replace_builtin_tools)?,
+            );
+        }
         self.sessions_by_id.insert(session_id.clone(), engine);
         Ok(Self::accepted(Some(session_id.to_string()), effects))
     }
 
-    fn open_session_command(&mut self, session_id: &SessionId) -> DomainCommandOutcome {
+    fn open_session_command(
+        &mut self,
+        session_id: &SessionId,
+        tools: Option<nakode_protocol::SessionToolConfiguration>,
+    ) -> DomainCommandOutcome {
         let loaded = self
             .sessions_by_id
             .keys()
@@ -524,6 +539,14 @@ impl ServerCore {
                         .any(|record| record.id == loaded.as_str())
                 {
                     return Err(DomainCommandError::NotFound(session_id.to_string()));
+                }
+                if let Some(tools) = tools {
+                    self.session_engine_mut(loaded)?
+                        .state_mut()
+                        .configure_or_validate_external_tools(
+                            &tools.tools,
+                            tools.replace_builtin_tools,
+                        )?;
                 }
                 return Ok(Self::accepted(Some(loaded.to_string()), Vec::new()));
             }
@@ -550,6 +573,14 @@ impl ServerCore {
             }
         };
         let mut engine = ServiceEngine::new(self.session_template.clone());
+        // The workspace template may still carry the bootstrap provider/session identity. Reset that
+        // clone before installing client-owned tools; restoration begins only after validation.
+        let _discarded_template_effects = engine.state_mut().create_logical_session()?;
+        if let Some(tools) = tools {
+            engine
+                .state_mut()
+                .configure_external_tools(tools.tools, tools.replace_builtin_tools)?;
+        }
         let effects = engine.state_mut().begin_resume(session.clone());
         let loaded_id = SessionId::from(session.id.clone());
         self.sessions_by_id.insert(loaded_id.clone(), engine);
@@ -1715,6 +1746,7 @@ impl ServerCore {
                 active_model_id: session.selected_model_id,
                 updated_at_ms,
                 owned_provider_sessions,
+                running: !matches!(session.activity, nakode_protocol::SessionActivity::Idle),
             };
             if let Some(position) = position {
                 bootstrap.sessions[position] = summary;
@@ -1902,7 +1934,7 @@ impl ServerCore {
                 target: ModelTarget::Session { session_id },
                 ..
             } => Some(session_id.clone()),
-            Command::OpenSession { session_id } => self
+            Command::OpenSession { session_id, .. } => self
                 .sessions_by_id
                 .keys()
                 .find(|loaded| loaded.as_str().starts_with(session_id.as_str()))
@@ -2471,12 +2503,12 @@ mod tests {
     use std::collections::BTreeSet;
 
     use nakode_protocol::{
-        AgentDefinitionInput, ClientId, Command, ErrorCode, IdempotencyKey, MAX_API_MESSAGE_BYTES,
-        MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES, ModelId, ModelOptions,
-        ModelTarget, PromptAttachment as ProtocolPromptAttachment, PromptInput,
-        ProviderAuthenticationView, ProviderId, Query, QueryResult, RunId, RunTextField,
-        ServiceCapabilities, ServiceCapability, SessionId, SubscriptionScope, SubscriptionView,
-        TranscriptOwner, ViewEvent, WorkspaceId,
+        AgentDefinitionInput, ClientId, Command, ErrorCode, ExternalToolDefinition, IdempotencyKey,
+        MAX_API_MESSAGE_BYTES, MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES,
+        ModelId, ModelOptions, ModelTarget, PromptAttachment as ProtocolPromptAttachment,
+        PromptInput, ProviderAuthenticationView, ProviderId, Query, QueryResult, RunId,
+        RunTextField, ServiceCapabilities, ServiceCapability, SessionId, SessionToolConfiguration,
+        SubscriptionScope, SubscriptionView, TranscriptOwner, ViewEvent, WorkspaceId,
     };
     use nakode_server::{PublishedEvent, ServerEndpoint, ServerRequest};
     use tokio::sync::broadcast;
@@ -2493,6 +2525,17 @@ mod tests {
         session::{ProviderRecord, SessionRecord, SubagentRecord},
         state::{AppState, DomainCommandError},
     };
+
+    fn dashboard_tools(name: &str, replace_builtin_tools: bool) -> SessionToolConfiguration {
+        SessionToolConfiguration {
+            tools: vec![ExternalToolDefinition {
+                name: name.to_owned(),
+                description: format!("Run {name}"),
+                input_schema_json: r#"{"type":"object","properties":{}}"#.to_owned(),
+            }],
+            replace_builtin_tools,
+        }
+    }
 
     fn drain_publications(
         receiver: &mut broadcast::Receiver<PublishedEvent>,
@@ -2532,11 +2575,35 @@ mod tests {
         )
     }
 
+    fn ready_external_tools_server() -> (ServerCore, SessionId) {
+        let mut state =
+            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities {
+                    external_tools: CapabilitySupport::Supported,
+                    resume: CapabilitySupport::Supported,
+                    ..BackendCapabilities::default()
+                },
+            }),
+        );
+        state.provider_session_id = Some("thread-1".to_owned());
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        (
+            ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new()),
+            session_id,
+        )
+    }
+
     fn create_default_session(
         core: &mut ServerCore,
         workspace_id: &WorkspaceId,
     ) -> super::DomainCommandOutcome {
-        core.create_session_command(workspace_id, None, &ModelOptions::default())
+        core.create_session_command(workspace_id, None, &ModelOptions::default(), None)
     }
 
     fn shell_command(session_id: &SessionId, command: &str) -> Command {
@@ -2583,18 +2650,171 @@ mod tests {
                 .all(|session| session.id != initial_id)
         );
         assert!(matches!(
-            core.open_session_command(&initial_id),
+            core.open_session_command(&initial_id, None),
             Err(DomainCommandError::NotFound(_))
         ));
 
         let (created, _) = core
-            .create_session_command(&workspace.workspace_id, None, &ModelOptions::default())
+            .create_session_command(
+                &workspace.workspace_id,
+                None,
+                &ModelOptions::default(),
+                None,
+            )
             .expect("explicit logical session");
         let created_id = SessionId::from(created.resource_id.expect("created session id"));
         let discovered = core.workspace_bootstrap();
         assert_eq!(discovered.sessions.len(), 1);
         assert_eq!(discovered.sessions[0].id, created_id);
         assert_eq!(discovered.sessions[0].updated_at_ms, 0);
+    }
+
+    #[test]
+    fn fresh_session_tools_are_installed_before_the_first_provider_effect() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let tools = dashboard_tools("DashboardRead", true);
+        let (created, creation_effects) = core
+            .create_session_command(
+                &workspace_id,
+                None,
+                &ModelOptions::default(),
+                Some(tools.clone()),
+            )
+            .expect("session with initial tools");
+        assert!(
+            creation_effects.iter().all(|effect| !matches!(
+                effect,
+                crate::state::Effect::Backend(
+                    BackendCommand::StartSession { .. } | BackendCommand::ResumeSession { .. }
+                )
+            )),
+            "creation must not start or restore provider inference: {creation_effects:#?}"
+        );
+        let session_id = SessionId::from(created.resource_id.expect("logical session id"));
+
+        let (_, effects) = core
+            .try_execute_command(Command::SendPrompt {
+                session_id,
+                prompt: PromptInput {
+                    text: "Read the dashboard".to_owned(),
+                    attachments: Vec::new(),
+                },
+            })
+            .expect("first prompt");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::state::Effect::Backend(BackendCommand::StartSession {
+                    external_tools,
+                    replace_builtin_tools: true,
+                    ..
+                }) if external_tools == &tools.tools
+            )),
+            "{effects:#?}"
+        );
+    }
+
+    #[test]
+    fn persisted_session_tools_are_installed_before_provider_resume() {
+        let (mut core, _) = ready_external_tools_server();
+        let restored_id = SessionId::from("restored-tools-session");
+        core.replace_session_records(vec![SessionRecord {
+            id: restored_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-restored".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            title: "Old dashboard prompt".to_owned(),
+            model: None,
+            created_at: 10,
+            updated_at: 12,
+            owned_provider_sessions: Vec::new(),
+        }]);
+        let tools = dashboard_tools("DashboardRead", true);
+
+        let (_, effects) = core
+            .open_session_command(&restored_id, Some(tools.clone()))
+            .expect("atomic restored open");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::state::Effect::Backend(BackendCommand::ResumeSession {
+                    provider_session_id,
+                    external_tools,
+                    replace_builtin_tools: true,
+                    ..
+                }) if provider_session_id == "thread-restored" && external_tools == &tools.tools
+            )),
+            "{effects:#?}"
+        );
+    }
+
+    #[test]
+    fn attached_session_tool_reattach_is_idempotent_and_rejects_a_different_table() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let tools = dashboard_tools("ReadAssociatedTicket", false);
+        let (created, _) = core
+            .create_session_command(
+                &workspace_id,
+                None,
+                &ModelOptions::default(),
+                Some(tools.clone()),
+            )
+            .expect("configured coding session");
+        let session_id = SessionId::from(created.resource_id.expect("logical session id"));
+
+        let (_, effects) = core
+            .open_session_command(&session_id, Some(tools))
+            .expect("identical reattach");
+        assert!(effects.is_empty());
+        let error = core
+            .open_session_command(
+                &session_id,
+                Some(dashboard_tools("UpdateAssociatedTicket", false)),
+            )
+            .expect_err("different table must fail closed");
+        assert!(error.to_string().contains("different tool table"));
+    }
+
+    #[test]
+    fn invalid_initial_tools_publish_and_restore_nothing() {
+        let (mut core, _) = ready_external_tools_server();
+        let restored_id = SessionId::from("invalid-restored-tools-session");
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let session_count = core.sessions_by_id.len();
+        let invalid = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: true,
+        };
+        core.create_session_command(
+            &workspace_id,
+            None,
+            &ModelOptions::default(),
+            Some(invalid.clone()),
+        )
+        .expect_err("empty initial table");
+        assert_eq!(core.sessions_by_id.len(), session_count);
+
+        core.replace_session_records(vec![SessionRecord {
+            id: restored_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-old".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            title: "Old".to_owned(),
+            model: None,
+            created_at: 1,
+            updated_at: 2,
+            owned_provider_sessions: Vec::new(),
+        }]);
+        let loaded_before_open = core.sessions_by_id.len();
+        core.open_session_command(&restored_id, Some(invalid))
+            .expect_err("invalid restored table");
+        assert_eq!(core.sessions_by_id.len(), loaded_before_open);
+        assert!(
+            core.engine_for(&restored_id).is_none(),
+            "invalid restore must not publish a runtime"
+        );
     }
 
     #[test]
@@ -2617,7 +2837,7 @@ mod tests {
         assert_eq!(discovered.sessions[0].id, initial_id);
         assert_eq!(discovered.sessions[0].title, "Direct terminal session");
         assert_eq!(discovered.sessions[0].updated_at_ms, 12_000);
-        core.open_session_command(&initial_id)
+        core.open_session_command(&initial_id, None)
             .expect("persisted initial session remains resumable");
     }
 
@@ -2670,6 +2890,7 @@ mod tests {
                     reasoning_effort: Some("high".to_owned()),
                     fast_mode: false,
                 },
+                None,
             )
             .expect("configured logical session");
         let session_id = SessionId::from(accepted.resource_id.expect("created session id"));
@@ -2694,7 +2915,7 @@ mod tests {
         );
 
         core.session_template.selected_model = Some("openai-codex/model-a".to_owned());
-        core.open_session_command(&session_id)
+        core.open_session_command(&session_id, None)
             .expect("existing logical session resumes");
         let resumed_state = core
             .engine_for(&session_id)
@@ -2729,6 +2950,7 @@ mod tests {
                     reasoning_effort: Some("impossible".to_owned()),
                     fast_mode: false,
                 },
+                None,
             )
             .expect_err("stale initial model must be rejected");
 
@@ -2751,6 +2973,7 @@ mod tests {
                     reasoning_effort: Some("high".to_owned()),
                     fast_mode: false,
                 },
+                None,
             )
             .expect_err("orphan initial options must be rejected");
 
@@ -2764,7 +2987,7 @@ mod tests {
         let workspace_id = core.workspace_bootstrap().workspace_id;
 
         let (accepted, _) = core
-            .create_session_command(&workspace_id, None, &ModelOptions::default())
+            .create_session_command(&workspace_id, None, &ModelOptions::default(), None)
             .expect("default logical session");
         let session_id = SessionId::from(accepted.resource_id.expect("created session id"));
         assert_eq!(

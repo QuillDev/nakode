@@ -14,6 +14,8 @@ pub enum ServiceCapability {
     MultipleClients,
     ArtifactTransfer,
     ExternalTools,
+    /// `CreateSession` and `OpenSession` atomically install client-owned tools before provider work.
+    InitialSessionTools,
     /// `CreateSession` can validate and apply an initial model/options before publication.
     InitialSessionModel,
     /// `DeleteSession` is served: a logical session and its persisted history can be removed.

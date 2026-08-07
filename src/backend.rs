@@ -555,6 +555,9 @@ pub enum BackendCommand {
         provider_session_id: String,
         /// Logical Nakode owner bound by the control plane, never provider/model input.
         owner_session_id: Option<String>,
+        /// Client-owned tools installed before provider restoration.
+        external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
+        replace_builtin_tools: bool,
     },
     UnsubscribeSession {
         provider_session_id: String,

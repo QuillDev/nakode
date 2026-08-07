@@ -147,6 +147,23 @@ fn model_options(value: Option<api::ModelOptions>) -> protocol::ModelOptions {
     })
 }
 
+fn session_tools(
+    value: Option<api::SessionToolConfiguration>,
+) -> Option<protocol::SessionToolConfiguration> {
+    value.map(|value| protocol::SessionToolConfiguration {
+        tools: value
+            .tools
+            .into_iter()
+            .map(|tool| protocol::ExternalToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                input_schema_json: tool.input_schema_json,
+            })
+            .collect(),
+        replace_builtin_tools: value.replace_builtin_tools,
+    })
+}
+
 fn model_target(value: Option<api::ModelTarget>) -> Result<protocol::ModelTarget, tonic::Status> {
     use api::model_target::Target;
     match value
@@ -361,7 +378,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             workspace_id: protocol::WorkspaceId::from(input.workspace_id),
             title: input.title,
             model_id: input.model_id.map(protocol::ModelId::from),
-            options: model_options(input.options)
+            options: model_options(input.options),
+            tools: session_tools(input.tools)
         }
     );
     command_rpc!(
@@ -369,7 +387,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         api::OpenSessionRequest,
         input,
         protocol::Command::OpenSession {
-            session_id: protocol::SessionId::from(input.session_id)
+            session_id: protocol::SessionId::from(input.session_id),
+            tools: session_tools(input.tools)
         }
     );
 
@@ -1345,6 +1364,7 @@ pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSu
                 native_session_id: resource.native_session_id,
             })
             .collect(),
+        running: value.running,
     }
 }
 

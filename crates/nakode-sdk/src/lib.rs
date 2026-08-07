@@ -184,7 +184,7 @@ impl NakodeClient {
         workspace_id: impl Into<String>,
         title: Option<String>,
     ) -> Result<String, SdkError> {
-        self.create_session_with_model(workspace_id, title, None, None)
+        self.create_session_with_configuration(workspace_id, title, None, None, None)
             .await
     }
 
@@ -201,6 +201,22 @@ impl NakodeClient {
         model_id: Option<String>,
         options: Option<api::ModelOptions>,
     ) -> Result<String, SdkError> {
+        self.create_session_with_configuration(workspace_id, title, model_id, options, None)
+            .await
+    }
+
+    /// Creates a logical session with model/options and client-owned tools committed atomically.
+    ///
+    /// # Errors
+    /// Returns a transport, server validation, or missing-identifier error.
+    pub async fn create_session_with_configuration(
+        &self,
+        workspace_id: impl Into<String>,
+        title: Option<String>,
+        model_id: Option<String>,
+        options: Option<api::ModelOptions>,
+        tools: Option<api::SessionToolConfiguration>,
+    ) -> Result<String, SdkError> {
         let result = send_mutation!(
             self,
             create_session,
@@ -210,6 +226,7 @@ impl NakodeClient {
                 title,
                 model_id,
                 options,
+                tools,
             }
         )?;
         result
@@ -220,14 +237,27 @@ impl NakodeClient {
     /// Opens a persisted logical session in the server and returns its full ID.
     ///
     /// # Errors
-    /// Returns a transport, server status, or missing-identifier error.
+    /// Returns a transport or server status error.
     pub async fn open_session(&self, session_id: impl Into<String>) -> Result<String, SdkError> {
+        self.open_session_with_tools(session_id, None).await
+    }
+
+    /// Opens or reattaches to a logical session with its client-owned tools established first.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn open_session_with_tools(
+        &self,
+        session_id: impl Into<String>,
+        tools: Option<api::SessionToolConfiguration>,
+    ) -> Result<String, SdkError> {
         let result = send_mutation!(
             self,
             open_session,
             api::OpenSessionRequest {
                 mutation: Some(mutation(None)),
                 session_id: session_id.into(),
+                tools,
             }
         )?;
         result

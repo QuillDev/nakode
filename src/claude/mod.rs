@@ -420,6 +420,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         BackendCommand::ResumeSession {
             provider_session_id,
             owner_session_id,
+            ..
         } => (
             "resume",
             json!({"sessionId":provider_session_id,"ownerSessionId":owner_session_id}),
