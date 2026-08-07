@@ -96,6 +96,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NakodeCommand::PurgeUnsafe => {
             purge::run().await?;
         }
+        NakodeCommand::RestartStale => {
+            service_cli::restart_stale().await?;
+        }
         NakodeCommand::Service { .. } => {
             unreachable!("deprecated service actions are rewritten before dispatch")
         }

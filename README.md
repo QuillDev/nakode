@@ -38,7 +38,11 @@ succeeds. `restart` starts a stopped service as well as replacing a running one.
 
 `--workspace <path>` selects the workspace service, defaulting to the current
 directory exactly as before. Each canonical workspace has its own sockets, log,
-and running process; no command reaches a workspace you did not name.
+and running process; no command reaches a workspace you did not name. After an
+installation, Nakode scans all known workspace services once, skips services
+already running the installed executable, and refreshes idle stale services
+with a bounded amount of concurrency. Active or unidentified services are left
+running and reported.
 
 The interactive terminal client is one frontend over that service:
 
@@ -213,10 +217,10 @@ Devin, GLM, and Kimi sessions receive an authoritative Nakode builtin-tool allow
 applies the equivalent SDK allowlist and permission hook. Empty custom policy retains compatibility
 with definitions written before policy fields existed.
 
-Catalogue changes are loaded without restarting the service. After installing a Nakode binary whose
-public protocol changed, restart each workspace service that a frontend uses—for the FStack dashboard,
-`nakode --workspace "$FSTACK_HOME" restart`—and relaunch that frontend so both ends use the same
-protobuf and capability table.
+Catalogue changes are loaded without restarting the service. The installer refreshes idle stale
+workspace services after installing a Nakode binary whose public protocol changed. Active services
+remain available until their work finishes, and the next frontend endpoint discovery can refresh
+one of them on demand.
 
 ```toml
 slug = "code-reviewer"

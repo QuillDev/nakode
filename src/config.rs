@@ -157,6 +157,9 @@ pub enum NakodeCommand {
     },
     /// Remove every Nakode session and its persisted session state after confirmation.
     PurgeUnsafe,
+    /// Refresh every stale workspace service after installation.
+    #[command(hide = true)]
+    RestartStale,
     /// Update the managed source checkout and reinstall Nakode.
     Update,
     /// Invoke a predefined agent through the native Nakode server.
@@ -323,6 +326,8 @@ pub enum DiscordAction {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("invalid command-line configuration: {0}")]
+    Parse(#[from] clap::Error),
     #[error("workspace does not exist: {0}")]
     MissingWorkspace(PathBuf),
     #[error("workspace is not a directory: {0}")]
@@ -344,6 +349,25 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// Builds the default service configuration for a known canonical workspace.
+    ///
+    /// Global service maintenance has no single caller workspace from which to inherit command
+    /// line options, so it uses the normal CLI defaults for each discovered workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the canonical workspace is invalid or the default configuration
+    /// cannot be validated.
+    pub fn for_workspace(workspace: PathBuf) -> Result<Self, ConfigError> {
+        let arguments = [
+            std::ffi::OsString::from("nakode"),
+            std::ffi::OsString::from("--workspace"),
+            workspace.into_os_string(),
+        ];
+        let config = Self::try_parse_from(arguments)?;
+        config.validated()
+    }
+
     /// Loads configuration from command-line arguments and the environment.
     ///
     /// # Errors
@@ -404,7 +428,11 @@ impl Config {
         if self.update
             || matches!(
                 self.command.as_ref(),
-                Some(NakodeCommand::Update | NakodeCommand::PurgeUnsafe)
+                Some(
+                    NakodeCommand::Update
+                        | NakodeCommand::PurgeUnsafe
+                        | NakodeCommand::RestartStale,
+                )
             )
         {
             return Ok(self);

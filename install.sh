@@ -182,12 +182,12 @@ else
 fi
 
 # A running service keeps executing the inode it started from after an atomic
-# replacement. Stop it only after the new executable is in place; attached TUIs
-# will detect the disconnect and launch this newly installed version. This stops
-# the service for the default workspace; a service started for another workspace
-# keeps running the executable it launched from until it is stopped itself.
-printf '%s\n' 'Refreshing the Nakode service...'
-"$destination" stop
+# replacement. Refresh every idle stale workspace service only after the new
+# executable is in place. The helper is invoked by explicit path so this works
+# even when the caller is still running the previous Nakode binary.
+printf '%s\n' 'Refreshing stale Nakode services...'
+"$destination" restart-stale ||
+  printf '%s\n' 'Nakode installed, but stale workspace services could not be refreshed.' >&2
 
 printf '\nInstalled %s\n' "$destination"
 printf '%s\n' "$built_version"

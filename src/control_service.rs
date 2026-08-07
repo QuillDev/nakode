@@ -10,6 +10,7 @@ use std::{
 
 use directories::ProjectDirs;
 use futures_util::future::BoxFuture;
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -76,6 +77,9 @@ pub struct ServiceRuntimeRecord {
     pub pid: u32,
     pub started_at_unix_ms: u64,
     pub version: String,
+    /// Canonical workspace served by this process. Old records omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
     /// Immutable identity captured from the executable vnode when this process started.
     ///
     /// Old runtime records omit this field. That is intentionally distinct from a match: a new
@@ -228,6 +232,18 @@ pub struct BulkServiceShutdownReport {
     pub failures: Vec<String>,
 }
 
+/// Result of the post-install stale-service refresh.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StaleServiceRefreshReport {
+    pub current: usize,
+    pub restarted: usize,
+    pub active: Vec<String>,
+    pub unknown: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+const STALE_SERVICE_CONCURRENCY: usize = 4;
+
 /// Runtime state reported for a frontend transport.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TransportStatus {
@@ -376,7 +392,7 @@ enum LifecycleResponse {
 /// fails.
 pub async fn run_service(config: Config) -> Result<(), ControlError> {
     let paths = ServicePaths::of(&config)?;
-    let mut lease = WorkspaceServerLease::acquire(&paths).await?;
+    let mut lease = WorkspaceServerLease::acquire(&paths, &config.workspace).await?;
     // Only a backgrounded service writes into the captured log, and only it may
     // rotate that file. A foreground run owns a terminal instead.
     if let Some(log) = std::env::var_os(crate::service_log::LOG_PATH_ENVIRONMENT) {
@@ -592,7 +608,7 @@ struct WorkspaceServerLease {
 }
 
 impl WorkspaceServerLease {
-    async fn acquire(paths: &ServicePaths) -> Result<Self, ControlError> {
+    async fn acquire(paths: &ServicePaths, workspace: &Path) -> Result<Self, ControlError> {
         let lifecycle_path = paths.lifecycle().to_path_buf();
         let grpc_path = paths.api().to_path_buf();
         let runtime_path = paths.runtime().to_path_buf();
@@ -607,7 +623,7 @@ impl WorkspaceServerLease {
         };
         // Never leave a prior owner's identity beside newly acquired sockets if publication fails.
         let _ = std::fs::remove_file(&runtime_path);
-        publish_runtime_record(&runtime_path);
+        publish_runtime_record(&runtime_path, workspace);
         Ok(Self {
             lifecycle_path,
             grpc_path,
@@ -630,7 +646,7 @@ impl Drop for WorkspaceServerLease {
 ///
 /// A service that cannot publish its process record still serves clients, so a
 /// write failure only costs `nakode status` its process detail.
-fn publish_runtime_record(runtime_path: &Path) {
+fn publish_runtime_record(runtime_path: &Path, workspace: &Path) {
     let executable = std::env::var(SERVICE_EXECUTABLE_IDENTITY_ENVIRONMENT)
         .ok()
         .and_then(|encoded| serde_json::from_str::<ExecutableIdentity>(&encoded).ok())
@@ -651,6 +667,7 @@ fn publish_runtime_record(runtime_path: &Path) {
         pid: std::process::id(),
         started_at_unix_ms: crate::diagnostics::unix_time_ms(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        workspace: Some(workspace.to_path_buf()),
         executable,
     };
     match serde_json::to_vec(&record) {
@@ -1780,15 +1797,144 @@ pub async fn shutdown_all_services() -> Result<BulkServiceShutdownReport, Contro
     shutdown_all_services_in(&control_directory()?).await
 }
 
-async fn shutdown_all_services_in(
-    control_root: &Path,
-) -> Result<BulkServiceShutdownReport, ControlError> {
+/// Restarts stale workspace services after a new executable has been installed.
+///
+/// Runtime directories are scanned once, current services are discarded without opening their
+/// sockets, stale services are probed concurrently with a small fixed bound, and replacements
+/// are started only after the old service reports no live work. Older services that predate the
+/// quiescent lifecycle request use the legacy shutdown request only after that read-only check.
+/// Services with active work or no recoverable workspace identity are left untouched.
+///
+/// # Errors
+///
+/// Returns an error when the executable identity or private control directory cannot be read.
+pub async fn restart_stale_services(
+    executable: &Path,
+) -> Result<StaleServiceRefreshReport, ControlError> {
+    let cli = executable_identity(executable)?;
+    let directories = runtime_directories(&control_directory()?)?;
+    let mut report = StaleServiceRefreshReport::default();
+    let mut candidates = Vec::new();
+
+    for directory in directories {
+        let paths = ServicePaths::in_directory(&directory);
+        if !paths.lifecycle().exists() && !paths.api().exists() {
+            continue;
+        }
+        let record = read_runtime_record(paths.runtime());
+        if runtime_matches_cli(record.as_ref(), &cli) {
+            report.current += 1;
+            continue;
+        }
+        let workspace = record
+            .as_ref()
+            .and_then(|record| record.workspace.clone())
+            .or_else(|| workspace_from_log(paths.log()));
+        candidates.push((directory, workspace));
+    }
+
+    let results = stream::iter(candidates.into_iter().map(|(directory, workspace)| {
+        let executable = executable.to_path_buf();
+        async move { refresh_stale_service(&executable, &directory, workspace).await }
+    }))
+    .buffer_unordered(STALE_SERVICE_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    for result in results {
+        match result {
+            StaleServiceRefreshOutcome::Restarted => report.restarted += 1,
+            StaleServiceRefreshOutcome::Active(workspace) => report.active.push(workspace),
+            StaleServiceRefreshOutcome::Unknown(detail) => report.unknown.push(detail),
+            StaleServiceRefreshOutcome::Failure(detail) => report.failures.push(detail),
+        }
+    }
+    report.active.sort_unstable();
+    report.unknown.sort_unstable();
+    report.failures.sort_unstable();
+    Ok(report)
+}
+
+#[derive(Debug)]
+enum StaleServiceRefreshOutcome {
+    Restarted,
+    Active(String),
+    Unknown(String),
+    Failure(String),
+}
+
+async fn refresh_stale_service(
+    executable: &Path,
+    directory: &Path,
+    workspace: Option<PathBuf>,
+) -> StaleServiceRefreshOutcome {
+    let Some(workspace) = workspace else {
+        return StaleServiceRefreshOutcome::Unknown(directory.display().to_string());
+    };
+    let config = match crate::config::Config::for_workspace(workspace.clone()) {
+        Ok(config) => config,
+        Err(error) => {
+            return StaleServiceRefreshOutcome::Failure(format!(
+                "{}: {error}",
+                workspace.display()
+            ));
+        }
+    };
+    let paths = ServicePaths::in_directory(directory);
+    if let Err(reason) = ensure_stale_service_is_quiescent(paths.api(), &config.workspace).await {
+        if reason.starts_with("live work is still owned") {
+            return StaleServiceRefreshOutcome::Active(workspace.display().to_string());
+        }
+        return StaleServiceRefreshOutcome::Failure(format!("{}: {reason}", workspace.display()));
+    }
+
+    let restart = match restart_service_quiescent(executable, &config).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_legacy_quiescent_rejection(&error) => {
+            restart_service(executable, &config).await
+        }
+        Err(error) => Err(error),
+    };
+    match restart {
+        Ok(()) => StaleServiceRefreshOutcome::Restarted,
+        Err(error) => {
+            StaleServiceRefreshOutcome::Failure(format!("{}: {error}", workspace.display()))
+        }
+    }
+}
+
+fn is_legacy_quiescent_rejection(error: &ControlError) -> bool {
+    matches!(
+        error,
+        ControlError::ServiceRejected(message)
+            if message.contains("unknown variant") && message.contains("quiesce_shutdown")
+    )
+}
+
+fn workspace_from_log(log: &Path) -> Option<PathBuf> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const LOG_TAIL_BYTES: u64 = 64 * 1024;
+    let mut file = std::fs::File::open(log).ok()?;
+    let length = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(LOG_TAIL_BYTES)))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.strip_prefix("nakode service started for workspace ")
+                .map(PathBuf::from)
+        })
+}
+
+fn runtime_directories(control_root: &Path) -> Result<Vec<PathBuf>, ControlError> {
     let workspace_root = control_root.join("w");
     let entries = match std::fs::read_dir(&workspace_root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(BulkServiceShutdownReport::default());
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => return Err(socket_error(&workspace_root, source)),
     };
     let mut directories = Vec::new();
@@ -1804,6 +1950,13 @@ async fn shutdown_all_services_in(
         }
     }
     directories.sort_unstable();
+    Ok(directories)
+}
+
+async fn shutdown_all_services_in(
+    control_root: &Path,
+) -> Result<BulkServiceShutdownReport, ControlError> {
+    let directories = runtime_directories(control_root)?;
 
     let mut report = BulkServiceShutdownReport::default();
     for directory in directories {
@@ -1975,7 +2128,8 @@ mod tests {
         ensure_service_at, exchange, executable_identity, expect_ok, frontend_api_endpoint_at,
         ping_at, quiescence_refusal, run_lifecycle_listener, runtime_matches_cli,
         service_arguments, service_command, service_configuration_fingerprint, service_running_at,
-        session_has_live_work, shutdown_all_services_in, workspace_runtime_directory_in,
+        session_has_live_work, shutdown_all_services_in, workspace_from_log,
+        workspace_runtime_directory_in,
     };
     use crate::config::{Config, OpenAiReasoningEffort};
 
@@ -1997,6 +2151,7 @@ mod tests {
             pid: 42,
             started_at_unix_ms: 10,
             version: "0.3.0".to_owned(),
+            workspace: None,
             executable: Some(identity("/same/display/path", "new-hash", 200)),
         };
         let same_version_old_build = ServiceRuntimeRecord {
@@ -2011,6 +2166,21 @@ mod tests {
         assert!(!runtime_matches_cli(Some(&same_version_old_build), &cli));
         assert!(!runtime_matches_cli(Some(&old_record), &cli));
         assert!(!runtime_matches_cli(None, &cli));
+    }
+
+    #[test]
+    fn legacy_service_workspace_is_recovered_from_the_latest_log_start() {
+        let directory = tempfile::tempdir().expect("log directory");
+        let log = directory.path().join("service.log");
+        std::fs::write(
+            &log,
+            "nakode service started for workspace /old\n".to_owned()
+                + "nakode service stopped for workspace /old\n"
+                + "nakode service started for workspace /new\n",
+        )
+        .expect("service log");
+
+        assert_eq!(workspace_from_log(&log), Some(PathBuf::from("/new")));
     }
 
     #[test]
