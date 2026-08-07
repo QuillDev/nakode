@@ -980,7 +980,7 @@ impl AgentRuntime {
                 batch.push(pending.next().expect("peeked read-only tool call"));
             }
             let executions = futures_util::future::join_all(batch.into_iter().map(|call| {
-                self.execute_read_only_tool(turn_id, call, backend_events, cancellation)
+                self.execute_read_only_tool(session, turn_id, call, backend_events, cancellation)
             }))
             .await;
             for executed in executions {
@@ -1113,6 +1113,7 @@ impl AgentRuntime {
 
     async fn execute_read_only_tool(
         &self,
+        session: &RuntimeSession,
         turn_id: &str,
         tool_call: ToolCall,
         backend_events: &mpsc::Sender<BackendEvent>,
@@ -1140,7 +1141,10 @@ impl AgentRuntime {
         let arguments = tool_call.arguments.clone();
         let started_at_ms = unix_time_ms();
         let started = Instant::now();
-        let mut isolated_session = RuntimeSession::new(String::new(), String::new());
+        let mut isolated_session = RuntimeSession::new(String::new(), String::new()).with_owner(
+            session.owner_session_id.clone(),
+            session.parent_run_id.clone(),
+        );
         let result = match prepare_and_validate(tool.as_ref(), arguments.clone()) {
             Ok(arguments) => {
                 tool.execute(
@@ -2672,6 +2676,53 @@ mod tests {
         assert!(warnings[0].contains("2 provider retries"));
         assert!(warnings[0].contains("will continue"));
         assert_eq!(session.telemetry.tools[0].name, "todo");
+    }
+
+    #[tokio::test]
+    async fn read_only_native_delegation_preserves_session_owner_context() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (delegation_tx, mut delegation_rx) = mpsc::channel(1);
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider)
+            .with_native_delegation(delegation_tx);
+        let session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned()).with_owner(
+            Some("logical-session".to_owned()),
+            Some("parent-run".to_owned()),
+        );
+        let (events, _receiver) = mpsc::channel(32);
+        let cancellation = CancellationToken::new();
+        let execution = runtime.execute_read_only_tool(
+            &session,
+            "turn-native-delegation",
+            ToolCall {
+                id: "delegate-1".to_owned(),
+                name: crate::tools::NAKODE_AGENT_TOOL_NAME.to_owned(),
+                arguments: json!({
+                    "agent": "repo-explorer",
+                    "task": "Inspect the runtime boundary."
+                }),
+            },
+            &events,
+            &cancellation,
+        );
+        tokio::pin!(execution);
+
+        let request = tokio::select! {
+            request = delegation_rx.recv() => request.expect("native delegation request"),
+            _result = &mut execution => panic!("tool settled before dispatch"),
+        };
+        assert_eq!(request.owner_session_id, "logical-session");
+        assert_eq!(request.parent_run_id.as_deref(), Some("parent-run"));
+        request
+            .respond
+            .send(Ok("attributed child completed".to_owned()))
+            .expect("native delegation response receiver");
+
+        let executed = execution.await.expect("native tool execution");
+        assert!(!executed.failed);
+        assert_eq!(executed.output, "attributed child completed");
     }
 
     #[tokio::test]
