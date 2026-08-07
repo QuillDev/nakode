@@ -717,6 +717,9 @@ async fn start_turn(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+// Session startup mirrors the complete backend command contract; grouping only policy fields here
+// would create a provider-local shape that the other native backends must duplicate.
 async fn start_session(
     model: Option<String>,
     instructions: Option<String>,

@@ -10,6 +10,9 @@ use nakode_sdk::v1 as api;
 /// the server's internal command enum: dispatch below calls distinct public
 /// SDK methods for every action.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+// Actions remain value-shaped so controls and the SDK adapter share one explicit semantic request;
+// boxing only agent saves would complicate this short-lived presentation boundary.
 pub(crate) enum TuiAction {
     CreateSession {
         workspace_id: view::WorkspaceId,

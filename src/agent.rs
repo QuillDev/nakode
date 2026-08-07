@@ -20,6 +20,17 @@ pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "browser",
 ];
 
+const CANONICAL_CAPABILITIES: &[&str] = &[
+    "filesystem_read",
+    "filesystem_write",
+    "command_execution",
+    "network",
+    "memory",
+    "vision",
+    "interaction",
+    "delegation",
+];
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentOwnership {
@@ -61,6 +72,8 @@ fn default_concurrency() -> u32 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+// Persisted archetype policy keeps these independent flags for backward-compatible definition files.
+#[allow(clippy::struct_excessive_bools)]
 pub struct AgentDefinition {
     pub slug: String,
     pub description: String,
@@ -130,18 +143,24 @@ pub struct AgentDefinition {
     pub require_parent_attribution: bool,
 }
 
+// Serde's `skip_serializing_if` callback contract passes the field by reference, including Copy
+// fields, so these predicates cannot take their arguments by value.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_owner_defined(value: &AgentOwnership) -> bool {
     *value == AgentOwnership::OwnerDefined
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_enabled(value: &bool) -> bool {
     *value
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_attributed(value: &bool) -> bool {
     *value
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_default_concurrency(value: &u32) -> bool {
     *value == default_concurrency()
 }
@@ -607,6 +626,9 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
+// Validation deliberately reports one policy-specific error at a time from this persisted shape;
+// splitting the ordered checks would obscure the single authoritative validation boundary.
 fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalogError> {
     if definition.slug.is_empty()
         || !definition.slug.chars().all(|character| {
@@ -741,16 +763,6 @@ fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalog
                     .to_owned(),
         });
     }
-    const CANONICAL_CAPABILITIES: &[&str] = &[
-        "filesystem_read",
-        "filesystem_write",
-        "command_execution",
-        "network",
-        "memory",
-        "vision",
-        "interaction",
-        "delegation",
-    ];
     if let Some(name) = definition
         .allowed_tools
         .iter()

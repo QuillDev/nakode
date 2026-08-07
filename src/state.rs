@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
@@ -40,6 +41,47 @@ const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 fn model_supports_options(model: &ModelInfo) -> bool {
     let configuration = projection::model_configuration(model);
     configuration.fast_mode_configurable || !configuration.reasoning_efforts.is_empty()
+}
+
+fn append_archetype_policy_instructions(instructions: &mut String, policy: &AgentDefinition) {
+    let allowed_tools = if policy.allowed_tools.is_empty() {
+        "none".to_owned()
+    } else {
+        policy.allowed_tools.join(", ")
+    };
+    let denied_tools = if policy.denied_tools.is_empty() {
+        "none".to_owned()
+    } else {
+        policy.denied_tools.join(", ")
+    };
+    let network = if policy
+        .allowed_capabilities
+        .iter()
+        .any(|name| name == "network")
+    {
+        "allowed"
+    } else {
+        "denied"
+    };
+    let file_writes = if policy
+        .allowed_tools
+        .iter()
+        .any(|name| name == "write" || name == "edit" || name == "bash")
+    {
+        "allowed only through listed tools"
+    } else {
+        "denied"
+    };
+    let delegation = if policy.can_delegate {
+        "allowed"
+    } else {
+        "denied"
+    };
+    let _ = write!(
+        instructions,
+        "\n\n[Nakode Archetype Policy]\nTool profile: {:?}\nAllowed tools: {allowed_tools}\nDenied tools: {denied_tools}\nNetwork is {network}. File writes are {file_writes}. Recursive delegation is {delegation} (maximum depth {}). Parent attribution is required.\nExpected task shape: {}\nOutput contract: {}\n[/Nakode Archetype Policy]",
+        policy.tool_profile, policy.max_delegation_depth, policy.task_shape, policy.output_contract,
+    );
 }
 
 #[cfg(test)]
@@ -6517,6 +6559,10 @@ impl DomainState {
     }
 
     /// Validates deletion while the authoritative catalogue is still in memory.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown definition or a built-in definition, which is immutable.
     pub fn validate_agent_deletion(&self, slug: &str) -> Result<(), DomainCommandError> {
         let definition = self
             .agents
@@ -7115,23 +7161,13 @@ impl DomainState {
             .map(|model| format!("{}/{model}", target.provider));
         let mut validator_instructions = execution.definition.instructions().to_owned();
         let policy = &execution.definition;
-        validator_instructions.push_str(&format!(
-            "\n\n[Nakode Archetype Policy]\nTool profile: {:?}\nAllowed tools: {}\nDenied tools: {}\nNetwork is {}. File writes are {}. Recursive delegation is {} (maximum depth {}). Parent attribution is required.\nExpected task shape: {}\nOutput contract: {}\n[/Nakode Archetype Policy]",
-            policy.tool_profile,
-            if policy.allowed_tools.is_empty() { "none".to_owned() } else { policy.allowed_tools.join(", ") },
-            if policy.denied_tools.is_empty() { "none".to_owned() } else { policy.denied_tools.join(", ") },
-            if policy.allowed_capabilities.iter().any(|name| name == "network") { "allowed" } else { "denied" },
-            if policy.allowed_tools.iter().any(|name| name == "write" || name == "edit" || name == "bash") { "allowed only through listed tools" } else { "denied" },
-            if policy.can_delegate { "allowed" } else { "denied" },
-            policy.max_delegation_depth,
-            policy.task_shape,
-            policy.output_contract,
-        ));
-        validator_instructions.push_str(&format!(
+        append_archetype_policy_instructions(&mut validator_instructions, policy);
+        let _ = write!(
+            validator_instructions,
             "\n\n[Nakode Run Attribution]\nRun ID: {run_id}\nParent run: {}\nRemaining delegation depth: {}\n[/Nakode Run Attribution]",
             execution.parent_run_id.as_deref().unwrap_or("root"),
             execution.remaining_delegation_depth,
-        ));
+        );
         let validator_slug = std::env::var("NAKODE_SECURITY_VALIDATOR_AGENT")
             .unwrap_or_else(|_| "security-validator".to_owned());
         if execution.definition.slug == validator_slug {
