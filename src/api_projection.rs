@@ -10,6 +10,7 @@ use nakode_sdk::v1 as api;
 /// the server's internal command enum: dispatch below calls distinct public
 /// SDK methods for every action.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum TuiAction {
     CreateSession {
         workspace_id: view::WorkspaceId,

@@ -6523,6 +6523,9 @@ impl DomainState {
     }
 
     /// Validates deletion while the authoritative catalogue is still in memory.
+    ///
+    /// # Errors
+    /// Rejects unknown archetypes and immutable built-in definitions.
     pub fn validate_agent_deletion(&self, slug: &str) -> Result<(), DomainCommandError> {
         let definition = self
             .agents
@@ -6630,6 +6633,7 @@ impl DomainState {
     /// # Errors
     /// Rejects missing/inactive parents, disallowed delegation, exhausted depth, and invalid
     /// archetype requests.
+    #[allow(clippy::too_many_lines)]
     pub fn delegate_agent_attributed(
         &mut self,
         agent_slug: &str,
@@ -7098,6 +7102,7 @@ impl DomainState {
         self.finish_subagent(run_id, Err(message))
     }
 
+    #[allow(clippy::format_push_string)]
     fn start_subagent_session(
         &mut self,
         run_id: &str,

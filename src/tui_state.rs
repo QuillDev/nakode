@@ -674,6 +674,7 @@ impl AgentModelOption {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AgentEditor {
     pub original_slug: Option<String>,
     pub field: AgentEditorField,

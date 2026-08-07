@@ -1936,7 +1936,7 @@ mod tests {
                 model_id: None,
                 tool_audit_json: None,
             }],
-            observability: Default::default(),
+            observability: SubagentObservability::default(),
         })?;
         let native_rows = |provider_session_id: &str| -> Result<i64, SessionError> {
             let connection = store
@@ -2145,7 +2145,7 @@ mod tests {
                 model_id: None,
                 tool_audit_json: None,
             }],
-            observability: Default::default(),
+            observability: SubagentObservability::default(),
         })?;
         let connection = store.connection.lock().expect("database mutex");
         for (provider, session_id) in [

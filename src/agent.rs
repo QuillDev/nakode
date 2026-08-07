@@ -60,6 +60,7 @@ fn default_concurrency() -> u32 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentDefinition {
     pub slug: String,
@@ -130,18 +131,22 @@ pub struct AgentDefinition {
     pub require_parent_attribution: bool,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_owner_defined(value: &AgentOwnership) -> bool {
     *value == AgentOwnership::OwnerDefined
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_enabled(value: &bool) -> bool {
     *value
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_attributed(value: &bool) -> bool {
     *value
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_default_concurrency(value: &u32) -> bool {
     *value == default_concurrency()
 }
@@ -607,6 +612,7 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(clippy::items_after_statements, clippy::too_many_lines)]
 fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalogError> {
     if definition.slug.is_empty()
         || !definition.slug.chars().all(|character| {

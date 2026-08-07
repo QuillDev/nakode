@@ -43,6 +43,7 @@ pub fn workspace_id(workspace: &str) -> WorkspaceId {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn bootstrap(
     state: &DomainState,
     revision: u64,
@@ -668,7 +669,7 @@ fn run_policy(run: &SubagentRun) -> (RunPolicyView, Option<String>, bool) {
     let mut truncated_fields = Vec::new();
     let reasoning_effort = definition
         .reasoning_effort
-        .clone()
+        .as_deref()
         .map(|value| bounded_policy_text(value, "reasoning_effort", &mut truncated_fields));
     let fast_mode = definition.fast_mode;
     let allowed_capabilities = bounded_policy_list(
@@ -692,9 +693,9 @@ fn run_policy(run: &SubagentRun) -> (RunPolicyView, Option<String>, bool) {
         &mut truncated_fields,
     );
     let task_shape =
-        bounded_policy_text(definition.task_shape, "task_shape", &mut truncated_fields);
+        bounded_policy_text(&definition.task_shape, "task_shape", &mut truncated_fields);
     let output_contract = bounded_policy_text(
-        definition.output_contract,
+        &definition.output_contract,
         "output_contract",
         &mut truncated_fields,
     );
@@ -738,8 +739,8 @@ fn bounded_policy_list(
     values
 }
 
-fn bounded_policy_text(value: String, name: &str, truncated_fields: &mut Vec<String>) -> String {
-    let bounded = bounded_text_to(&value, MAX_RUN_POLICY_TEXT_BYTES);
+fn bounded_policy_text(value: &str, name: &str, truncated_fields: &mut Vec<String>) -> String {
+    let bounded = bounded_text_to(value, MAX_RUN_POLICY_TEXT_BYTES);
     if bounded.start_byte > 0 {
         truncated_fields.push(name.to_owned());
     }
@@ -1794,7 +1795,7 @@ mod tests {
                     status: SubagentStatus::Completed,
                     latest_activity: "Completed".to_owned(),
                     transcript: Vec::new(),
-                    observability: Default::default(),
+                    observability: SubagentObservability::default(),
                 })
                 .collect(),
         );
@@ -2008,7 +2009,7 @@ mod tests {
             objective: "Review".to_owned(),
             status: SubagentStatus::Working,
             latest_activity: "Working".to_owned(),
-            observability: Default::default(),
+            observability: SubagentObservability::default(),
         });
         state.subagent_chats.insert(
             "run-1".to_owned(),

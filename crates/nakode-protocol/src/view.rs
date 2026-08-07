@@ -521,6 +521,7 @@ pub struct NoticeView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AgentDefinitionView {
     pub slug: String,
     pub description: String,

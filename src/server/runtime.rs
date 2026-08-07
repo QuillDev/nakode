@@ -1722,18 +1722,21 @@ fn load_subagents(
 ) {
     match sessions.list_subagents(parent_session_id) {
         Ok(mut records) => {
-            let ended_at_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let ended_at_ms = u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
             for record in &mut records {
                 if matches!(
                     record.status,
                     SubagentStatus::Starting | SubagentStatus::Working
                 ) {
                     record.status = SubagentStatus::Interrupted;
-                    record.latest_activity =
-                        "Interrupted when the previous server stopped".to_owned();
+                    "Interrupted when the previous server stopped"
+                        .clone_into(&mut record.latest_activity);
                     record.observability.ended_at_ms = Some(ended_at_ms);
                     record.observability.termination_kind = Some("interrupted".to_owned());
                     record.observability.termination_detail =

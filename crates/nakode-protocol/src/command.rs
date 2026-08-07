@@ -55,6 +55,7 @@ pub enum RunTextField {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AgentDefinitionInput {
     pub slug: String,
     pub description: String,
@@ -218,6 +219,7 @@ pub enum SettingsPatch {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     CreateSession {

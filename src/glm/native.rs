@@ -703,6 +703,7 @@ async fn start_turn(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_session(
     model: Option<String>,
     instructions: Option<String>,

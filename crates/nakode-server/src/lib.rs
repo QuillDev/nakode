@@ -26,6 +26,7 @@ const DEFAULT_PUBLICATION_CAPACITY: usize = 256;
 pub struct PublishError;
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ServerRequest {
     Command {
         client_id: ClientId,
