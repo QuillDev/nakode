@@ -145,6 +145,11 @@ pub fn bootstrap(
                 can_delegate: definition.can_delegate,
                 max_delegation_depth: definition.max_delegation_depth,
                 require_parent_attribution: definition.require_parent_attribution,
+                effective_builtin_tools: definition.builtin_tool_allowlist(),
+                effective_capabilities: definition.effective_capabilities(),
+                policy_warnings: definition.policy_warnings(),
+                dashboard_tools_injected: false,
+                policy_projection_version: 1,
             })
             .collect(),
         skills: state

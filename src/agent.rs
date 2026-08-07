@@ -3,7 +3,7 @@ use std::{collections::HashSet, fs, path::Path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const CANONICAL_AGENT_TOOLS: &[&str] = &[
+pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "read",
     "grep",
     "find",
@@ -205,21 +205,101 @@ impl AgentDefinition {
         }
     }
 
+    /// The exact built-ins a delegated run receives, or `None` when a legacy custom definition
+    /// intentionally retains the provider runtime's defaults.
+    ///
+    /// Capabilities are structural enforcement, not labels: a configured tool that requires an
+    /// absent capability is removed from the runtime allowlist even for legacy deny-only policy.
     #[must_use]
     pub fn builtin_tool_allowlist(&self) -> Option<Vec<String>> {
-        if self.tool_profile == AgentToolProfile::Custom && self.allowed_tools.is_empty() {
-            if self.denied_tools.is_empty() {
-                return None;
-            }
-            return Some(
+        let configured =
+            if self.tool_profile == AgentToolProfile::Custom && self.allowed_tools.is_empty() {
+                if self.denied_tools.is_empty() {
+                    return None;
+                }
                 CANONICAL_AGENT_TOOLS
                     .iter()
                     .filter(|tool| !self.denied_tools.iter().any(|denied| denied == *tool))
                     .map(|tool| (*tool).to_owned())
-                    .collect(),
+                    .collect()
+            } else {
+                self.allowed_tools.clone()
+            };
+        Some(
+            configured
+                .into_iter()
+                .filter(|tool| {
+                    required_capability(tool).is_none_or(|required| {
+                        self.allowed_capabilities
+                            .iter()
+                            .any(|capability| capability == required)
+                            && !self
+                                .denied_capabilities
+                                .iter()
+                                .any(|capability| capability == required)
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// The exact declared capability boundary paired with the interpreted built-in set.
+    /// `None` is reserved for the same legacy runtime-default case as the tool projection.
+    #[must_use]
+    pub fn effective_capabilities(&self) -> Option<Vec<String>> {
+        self.builtin_tool_allowlist()
+            .map(|_| self.allowed_capabilities.clone())
+    }
+
+    /// Nakode-owned findings that explain security-relevant consequences of the interpreted policy.
+    #[must_use]
+    pub fn policy_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let effective = self.builtin_tool_allowlist();
+        if effective.is_none() {
+            warnings.push(
+                "Legacy custom policy has no allow/deny boundary; the provider runtime's default built-ins remain available and the capability boundary is ambiguous."
+                    .to_owned(),
             );
         }
-        Some(self.allowed_tools.clone())
+        if self.tool_profile == AgentToolProfile::Custom
+            && self.allowed_tools.is_empty()
+            && !self.denied_tools.is_empty()
+        {
+            warnings.push(
+                "Legacy deny-only policy is reconciled against canonical tool capabilities; tools missing their required capability are not runnable."
+                    .to_owned(),
+            );
+        }
+        if let Some(tools) = &effective {
+            if tools.iter().any(|tool| tool == "bash") {
+                warnings.push(
+                    "bash grants general command execution. System-prompt instructions such as read-only Git usage are behavioral guidance, not subcommand-level enforcement."
+                        .to_owned(),
+                );
+            }
+            if tools.iter().any(|tool| tool == "write" || tool == "edit") {
+                warnings.push("Direct filesystem mutation tools are runnable.".to_owned());
+            }
+            if tools.iter().any(|tool| tool == "eval") {
+                warnings.push(
+                    "eval can execute code through an available language runtime.".to_owned(),
+                );
+            }
+            if tools.iter().any(|tool| tool == "browser") {
+                warnings.push(
+                    "browser can reach network resources through the configured browser runtime."
+                        .to_owned(),
+                );
+            }
+        }
+        if self.can_delegate {
+            warnings.push(format!(
+                "Recursive delegation is enabled to depth {}; every child remains parent-attributed.",
+                self.max_delegation_depth
+            ));
+        }
+        warnings
     }
 
     /// Whether this definition needs provider-side enforcement beyond ordinary unrestricted turns.
@@ -512,6 +592,21 @@ fn remove_if_present(path: &Path) -> Result<(), AgentCatalogError> {
     })
 }
 
+/// The capability that must be present for a canonical built-in to survive into a run.
+#[must_use]
+pub fn required_capability(tool: &str) -> Option<&'static str> {
+    match tool {
+        "read" | "grep" | "find" | "ls" => Some("filesystem_read"),
+        "write" | "edit" => Some("filesystem_write"),
+        "bash" => Some("command_execution"),
+        "eval" | "ask" => Some("interaction"),
+        "browser" => Some("network"),
+        "memory_store" | "memory_search" => Some("memory"),
+        "vision" => Some("vision"),
+        _ => None,
+    }
+}
+
 fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalogError> {
     if definition.slug.is_empty()
         || !definition.slug.chars().all(|character| {
@@ -721,20 +816,8 @@ fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalog
             detail: "restrictive tool profiles cannot allow network or filesystem_write".to_owned(),
         });
     }
-    for (tool, capability) in [
-        ("read", "filesystem_read"),
-        ("grep", "filesystem_read"),
-        ("find", "filesystem_read"),
-        ("ls", "filesystem_read"),
-        ("browser", "network"),
-        ("write", "filesystem_write"),
-        ("edit", "filesystem_write"),
-        ("bash", "command_execution"),
-        ("memory_store", "memory"),
-        ("memory_search", "memory"),
-        ("vision", "vision"),
-    ] {
-        if definition.allowed_tools.iter().any(|name| name == tool)
+    for tool in &definition.allowed_tools {
+        if let Some(capability) = required_capability(tool)
             && !definition
                 .allowed_capabilities
                 .iter()
@@ -1020,7 +1103,79 @@ description = "Research the requested topic and report concrete findings"
                 .iter()
                 .any(|tool| tool == "bash" || tool == "write" || tool == "edit")
         );
+        assert_eq!(allowed, vec!["todo".to_owned()]);
+        definition.allowed_capabilities = vec!["filesystem_read".to_owned()];
+        let allowed = definition
+            .builtin_tool_allowlist()
+            .expect("capability-filtered deny-only policy is bounded");
         assert!(allowed.iter().any(|tool| tool == "read"));
+        assert_eq!(
+            definition.effective_capabilities(),
+            Some(vec!["filesystem_read".to_owned()])
+        );
+    }
+
+    #[test]
+    fn named_profiles_project_exact_capability_filtered_boundaries_and_warnings() {
+        let no_tools = AgentDefinition {
+            tool_profile: AgentToolProfile::None,
+            ..AgentDefinition::default()
+        };
+        assert_eq!(no_tools.builtin_tool_allowlist(), Some(Vec::new()));
+        assert_eq!(no_tools.effective_capabilities(), Some(Vec::new()));
+        assert!(no_tools.policy_warnings().is_empty());
+
+        let read_only = AgentDefinition {
+            tool_profile: AgentToolProfile::ReadOnly,
+            allowed_capabilities: vec!["filesystem_read".to_owned()],
+            allowed_tools: vec!["read".to_owned(), "grep".to_owned()],
+            ..AgentDefinition::default()
+        };
+        assert_eq!(
+            read_only.builtin_tool_allowlist(),
+            Some(vec!["read".to_owned(), "grep".to_owned()])
+        );
+        assert_eq!(
+            read_only.effective_capabilities(),
+            Some(vec!["filesystem_read".to_owned()])
+        );
+
+        let command_runner = AgentDefinition {
+            tool_profile: AgentToolProfile::CommandRunner,
+            allowed_capabilities: vec![
+                "filesystem_read".to_owned(),
+                "command_execution".to_owned(),
+            ],
+            allowed_tools: vec!["read".to_owned(), "bash".to_owned()],
+            ..AgentDefinition::default()
+        };
+        assert_eq!(
+            command_runner.builtin_tool_allowlist(),
+            Some(vec!["read".to_owned(), "bash".to_owned()])
+        );
+        assert!(
+            command_runner
+                .policy_warnings()
+                .iter()
+                .any(|warning| warning.contains("general command execution"))
+        );
+
+        let watcher = AgentDefinition {
+            tool_profile: AgentToolProfile::BoundedWatcher,
+            allowed_capabilities: vec!["filesystem_read".to_owned()],
+            allowed_tools: vec!["read".to_owned()],
+            timeout_seconds: Some(30),
+            poll_interval_ms: Some(500),
+            ..AgentDefinition::default()
+        };
+        assert_eq!(
+            watcher.builtin_tool_allowlist(),
+            Some(vec!["read".to_owned()])
+        );
+        assert_eq!(
+            watcher.effective_capabilities(),
+            Some(vec!["filesystem_read".to_owned()])
+        );
     }
 
     #[test]
