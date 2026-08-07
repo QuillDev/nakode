@@ -46,7 +46,9 @@ pub struct SessionRecord {
     pub workspace: String,
     pub title: String,
     pub model: Option<String>,
+    /// Unix epoch seconds at initial persistence; converted exactly once at API projection.
     pub created_at: i64,
+    /// Unix epoch seconds at the latest persistence touch; converted exactly once at API projection.
     pub updated_at: i64,
     /// Additional provider-native resources owned by delegated runs beneath this session.
     pub owned_provider_sessions: Vec<(String, String)>,

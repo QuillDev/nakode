@@ -118,6 +118,9 @@ pub struct SessionSummary {
     /// Provider-native resources whose lifecycle belongs to this logical session.
     #[serde(default)]
     pub owned_provider_sessions: Vec<OwnedProviderSessionView>,
+    /// True only while the service still owns live work for this logical session.
+    #[serde(default)]
+    pub running: bool,
 }
 
 /// An opaque provider resource claimed by one Nakode logical session.

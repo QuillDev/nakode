@@ -500,6 +500,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::MultipleClients,
             ServiceCapability::ArtifactTransfer,
             ServiceCapability::ExternalTools,
+            ServiceCapability::InitialSessionTools,
             ServiceCapability::InitialSessionModel,
             ServiceCapability::SessionDeletion,
             ServiceCapability::QuestionTextAnswers,
@@ -2589,6 +2590,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn attributed_primary_events_never_cross_logical_sessions() {
         let workspace = tempfile::tempdir().expect("workspace");
         let database = workspace.path().join("sessions.sqlite3");
@@ -2635,6 +2637,7 @@ mod tests {
                 &workspace_id,
                 None,
                 &nakode_protocol::ModelOptions::default(),
+                None,
             )
             .expect("second logical session");
         let second_id = SessionId::from(created.resource_id.expect("second logical session id"));

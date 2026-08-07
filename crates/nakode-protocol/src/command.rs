@@ -157,6 +157,12 @@ pub struct ExternalToolDefinition {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionToolConfiguration {
+    pub tools: Vec<ExternalToolDefinition>,
+    pub replace_builtin_tools: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum ModelTarget {
     ProviderDefault { provider_id: ProviderId },
@@ -232,9 +238,13 @@ pub enum Command {
         /// A provider-qualified initial selection. `None` inherits the workspace/provider default.
         model_id: Option<ModelId>,
         options: ModelOptions,
+        /// Client-owned tools installed before this session can accept a prompt.
+        tools: Option<SessionToolConfiguration>,
     },
     OpenSession {
         session_id: SessionId,
+        /// Tools for closed-session restoration, or the identical table for idempotent reattachment.
+        tools: Option<SessionToolConfiguration>,
     },
     /// Sends a prompt using server-owned queue-versus-start policy.
     SendPrompt {
@@ -438,6 +448,7 @@ mod tests {
                 reasoning_effort: Some("high".to_owned()),
                 fast_mode: false,
             },
+            tools: None,
         };
         assert_eq!(
             serde_json::to_value(creation).expect("serialize configured session creation"),
@@ -449,7 +460,8 @@ mod tests {
                 "options": {
                     "reasoning_effort": "high",
                     "fast_mode": false
-                }
+                },
+                "tools": null
             }),
         );
         let selection = Command::SelectModel {

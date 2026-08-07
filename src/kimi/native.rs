@@ -429,8 +429,27 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         }
         BackendCommand::ResumeSession {
             provider_session_id,
+            external_tools,
+            replace_builtin_tools,
             ..
-        } => resume_session(provider_session_id, context).await,
+        } => {
+            if let Some(runtime) = context.runtime
+                && let Err(error) = runtime
+                    .configure_external_tools(
+                        &provider_session_id,
+                        external_tools,
+                        replace_builtin_tools,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            {
+                request_failed(context.events, BackendOperation::ResumeSession, error).await;
+                return;
+            }
+            resume_session(provider_session_id, context).await;
+        }
         BackendCommand::UnsubscribeSession {
             provider_session_id,
         } => {

@@ -825,6 +825,7 @@ fn session_summary(value: api::SessionSummary) -> view::SessionSummary {
                 native_session_id: resource.native_session_id,
             })
             .collect(),
+        running: value.running,
     }
 }
 

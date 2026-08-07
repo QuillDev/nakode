@@ -2859,6 +2859,8 @@ impl DomainState {
         effects.push(Effect::Backend(BackendCommand::ResumeSession {
             provider_session_id: session.provider_session_id,
             owner_session_id: Some(self.nakode_session_id.clone()),
+            external_tools: self.external_tools.clone(),
+            replace_builtin_tools: self.replace_builtin_tools,
         }));
         effects
     }
@@ -5037,6 +5039,32 @@ impl DomainState {
                 "session tools must be configured before the first prompt".to_owned(),
             ));
         }
+        self.validate_and_install_external_tools(tools, replace_builtin_tools)
+    }
+
+    /// Verifies that an already-loaded session has the exact requested tool boundary.
+    ///
+    /// # Errors
+    /// Rejects every attempt to mutate the table after the logical session was published, even when
+    /// no prompt has started yet. Atomic create/open is the only installation boundary.
+    pub fn configure_or_validate_external_tools(
+        &mut self,
+        tools: &[nakode_protocol::ExternalToolDefinition],
+        replace_builtin_tools: bool,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        if self.external_tools == tools && self.replace_builtin_tools == replace_builtin_tools {
+            return Ok(Vec::new());
+        }
+        Err(DomainCommandError::Invalid(
+            "the attached session already started with a different tool table".to_owned(),
+        ))
+    }
+
+    fn validate_and_install_external_tools(
+        &mut self,
+        tools: Vec<nakode_protocol::ExternalToolDefinition>,
+        replace_builtin_tools: bool,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
         if tools.is_empty() {
             return Err(DomainCommandError::Invalid(
                 "at least one external tool is required".to_owned(),
@@ -6806,16 +6834,18 @@ impl DomainState {
 
     fn rendered_agent_catalogue(&self) -> String {
         let executable = shell_quote(&self.nakode_executable);
+        let workspace = shell_quote(&self.workspace);
         let agents = self
             .agents
             .definitions()
             .iter()
             .map(|agent| {
                 format!(
-                    "- {}: {}\n  Command: {} agent {} --session-id={} --task '<bounded task>'",
+                    "- {}: {}\n  Command: {} --workspace={} agent {} --session-id={} --task '<bounded task>'",
                     agent.slug,
                     agent.description.trim(),
                     executable,
+                    workspace,
                     agent.slug,
                     self.nakode_session_id,
                 )
@@ -11755,7 +11785,7 @@ tool_profile = "none"
         assert!(instructions.contains("Provider: openai-codex"));
         assert!(instructions.contains("- explorer: Explores code context"));
         assert!(instructions.contains(&format!(
-            "'/opt/nakode/bin/nakode' agent explorer --session-id={}",
+            "'/opt/nakode/bin/nakode' --workspace='/tmp/project' agent explorer --session-id={}",
             state.nakode_session_id
         )));
         assert!(instructions.contains("execute the matching absolute-path Nakode command exactly"));
@@ -11789,7 +11819,7 @@ tool_profile = "none"
         assert!(prompt.contains("supersedes the initial Available agents list"));
         assert!(prompt.contains("- explorer: Explores code context"));
         assert!(prompt.contains(&format!(
-            "'/opt/nakode/bin/nakode' agent explorer --session-id={}",
+            "'/opt/nakode/bin/nakode' --workspace='/tmp/project' agent explorer --session-id={}",
             state.nakode_session_id
         )));
     }

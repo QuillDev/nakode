@@ -81,10 +81,15 @@ message WatchWorkspaceRequest { string workspace_id = 1; optional Cursor after =
 message ReloadWorkspaceRequest { MutationOptions mutation = 1; string workspace_id = 2; string session_id = 3; }
 message WorkspaceSnapshot { Cursor cursor = 1; WorkspaceState state = 2; }
 
-// A fresh session may carry its provider-qualified model and options in the creation mutation. This
-// prevents clients from exposing or sending a first turn through a transient server default. Omitted
-// selection means the workspace/provider default. OpenSession never takes these fields: resume keeps
-// the persisted session configuration.
+message SessionToolConfiguration {
+  repeated ExternalToolDefinition tools = 1;
+  bool replace_builtin_tools = 2;
+}
+
+// A fresh session may carry its provider-qualified model, options, and client-owned tool surface in
+// the creation mutation. This prevents clients from exposing or sending a first turn through a
+// transient configuration. Omitted selection means the workspace/provider default; omitted tools
+// keep Nakode's built-ins.
 message CreateSessionRequest {
   MutationOptions mutation = 1;
   string workspace_id = 2;
@@ -94,8 +99,17 @@ message CreateSessionRequest {
   optional string model_id = 4;
   // Invalid without model_id; omission uses that model's own default options.
   ModelOptions options = 5;
+  // Atomically validated and installed before publication. Requires `InitialSessionTools`.
+  optional SessionToolConfiguration tools = 6;
 }
-message OpenSessionRequest { MutationOptions mutation = 1; string session_id = 2; }
+// Supplying tools installs them before a closed session begins provider restoration. An already
+// attached session accepts only the identical table, making client reattachment idempotent without
+// permitting late reconfiguration.
+message OpenSessionRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  optional SessionToolConfiguration tools = 3;
+}
 message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // Removes a logical session and its persisted history. Deletion is AUTHORITATIVE: a
 // session still attached is closed and released by the service, because there is no
@@ -331,10 +345,13 @@ message SessionSummary {
   string title = 3;
   optional string active_provider_id = 4;
   optional string active_model_id = 5;
+  // Unix epoch milliseconds. Persistence stores seconds and the server converts exactly once.
   int64 updated_at_ms = 6;
   // Opaque provider resources claimed by this logical session. Clients use these only to suppress
   // duplicate native discovery; lifecycle mutations continue to address Nakode.
   repeated OwnedProviderSession owned_provider_sessions = 7;
+  // True while the service still owns work in flight for this logical session.
+  bool running = 8;
 }
 enum SessionActivity { SESSION_ACTIVITY_UNSPECIFIED = 0; SESSION_ACTIVITY_IDLE = 1; SESSION_ACTIVITY_CREATING_AGENT_SESSION = 2; SESSION_ACTIVITY_STARTING_TURN = 3; SESSION_ACTIVITY_RUNNING_TURN = 4; SESSION_ACTIVITY_COMPACTING_CONTEXT = 5; SESSION_ACTIVITY_RUNNING_DELEGATES = 6; SESSION_ACTIVITY_RUNNING_SHELL = 7; }
 message TokenUsage { uint64 input_tokens = 1; uint64 output_tokens = 2; uint64 cached_input_tokens = 3; uint64 cache_write_tokens = 4; }
