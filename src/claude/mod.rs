@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::backend::{
     ApprovalDecision, ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand,
     BackendError, BackendEvent, BackendHandle, BackendIdentity, BackendOperation,
-    BackendTokenUsage, CLAUDE_PROVIDER, CapabilitySupport, DeltaKind, ItemKind, ItemStatus,
-    ModelInfo, NormalizedItem, TurnOutcome, request_failed,
+    BackendTokenUsage, CLAUDE_PROVIDER, CapabilitySupport, DeltaKind, ExternalToolRequest,
+    ItemKind, ItemStatus, ModelInfo, NormalizedItem, TurnOutcome, request_failed,
 };
 
 const COMMAND_CAPACITY: usize = 128;
@@ -409,22 +409,23 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             instructions,
             owner_session_id,
             parent_run_id: _,
-            external_tools: _,
-            replace_builtin_tools: _,
+            external_tools,
+            replace_builtin_tools,
             allowed_builtin_tools: _,
             max_turns,
             timeout_seconds,
         } => (
             "create",
-            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id,"maxTurns":max_turns,"timeoutSeconds":timeout_seconds}),
+            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id,"maxTurns":max_turns,"timeoutSeconds":timeout_seconds,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools}),
         ),
         BackendCommand::ResumeSession {
             provider_session_id,
             owner_session_id,
-            ..
+            external_tools,
+            replace_builtin_tools,
         } => (
             "resume",
-            json!({"sessionId":provider_session_id,"ownerSessionId":owner_session_id}),
+            json!({"sessionId":provider_session_id,"ownerSessionId":owner_session_id,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools}),
         ),
         BackendCommand::UnsubscribeSession {
             provider_session_id,
@@ -482,8 +483,11 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
                 }
             }),
         ),
+        BackendCommand::ResolveExternalTool { id, output, failed } => (
+            "resolve_external_tool",
+            json!({"id":id,"output":output,"failed":failed}),
+        ),
         BackendCommand::ResolveQuestion { .. }
-        | BackendCommand::ResolveExternalTool { .. }
         | BackendCommand::BeginAuthentication
         | BackendCommand::Shutdown => return Ok(None),
     };
@@ -587,6 +591,7 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
         }
         "delta" => delta_event(message),
         "tool_call" => tool_call_event(message),
+        "external_tool_request" => external_tool_request_event(message),
         "plan" => BackendEvent::TurnPlan {
             turn_id: string(message, "turnId"),
             plan: string(message, "text"),
@@ -616,6 +621,14 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
         _ => BackendEvent::ProtocolDiagnostic(string(message, "message")),
     };
     let _ = events.send(event).await;
+}
+
+fn external_tool_request_event(message: &Value) -> BackendEvent {
+    BackendEvent::ExternalToolRequested(ExternalToolRequest {
+        id: string(message, "id"),
+        name: string(message, "name"),
+        arguments_json: string(message, "argumentsJson"),
+    })
 }
 
 fn claude_content_block_id(message: &Value) -> String {
@@ -841,6 +854,7 @@ fn capabilities() -> BackendCapabilities {
         approvals: CapabilitySupport::Supported,
         native_tools: CapabilitySupport::Supported,
         scoped_runtime_policy: CapabilitySupport::Supported,
+        external_tools: CapabilitySupport::Supported,
         close_session: CapabilitySupport::Supported,
         ..BackendCapabilities::default()
     }
@@ -862,6 +876,57 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("Archetype policy does not allow"));
         assert!(BRIDGE_SOURCE.contains("maxTurns: session.maxTurns"));
         assert!(BRIDGE_SOURCE.contains("session.timeoutSeconds * 1000"));
+    }
+
+    #[test]
+    fn claude_external_tools_cross_the_mcp_bridge() {
+        let tool = nakode_protocol::ExternalToolDefinition {
+            name: "ReadAssociatedTicket".to_owned(),
+            description: "Read the attached ticket".to_owned(),
+            input_schema_json: r#"{"type":"object","properties":{}}"#.to_owned(),
+        };
+        let create = bridge_request(BackendCommand::StartSession {
+            model: Some("opus".to_owned()),
+            instructions: None,
+            owner_session_id: Some("owner".to_owned()),
+            parent_run_id: None,
+            external_tools: vec![tool],
+            replace_builtin_tools: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
+        })
+        .expect("Claude supports session tools")
+        .expect("bridge request");
+        assert_eq!(
+            create.payload["externalTools"][0]["name"],
+            "ReadAssociatedTicket"
+        );
+        assert_eq!(create.payload["replaceBuiltinTools"], false);
+
+        let resolve = bridge_request(BackendCommand::ResolveExternalTool {
+            id: "external-1".to_owned(),
+            output: "ticket".to_owned(),
+            failed: false,
+        })
+        .expect("Claude supports external tool results")
+        .expect("bridge request");
+        assert_eq!(resolve.method, "resolve_external_tool");
+        assert_eq!(resolve.payload["id"], "external-1");
+        assert!(capabilities().external_tools.is_supported());
+        assert!(BRIDGE_SOURCE.contains("createSdkMcpServer"));
+        assert!(BRIDGE_SOURCE.contains("event: \"external_tool_request\""));
+        assert!(BRIDGE_SOURCE.contains("case \"resolve_external_tool\""));
+        assert!(BRIDGE_SOURCE.contains("mcp__nakode_external__"));
+        assert!(matches!(
+            external_tool_request_event(&json!({
+                "id": "external-1",
+                "name": "ReadAssociatedTicket",
+                "argumentsJson": "{}"
+            })),
+            BackendEvent::ExternalToolRequested(ExternalToolRequest { id, name, arguments_json })
+                if id == "external-1" && name == "ReadAssociatedTicket" && arguments_json == "{}"
+        ));
     }
 
     #[test]

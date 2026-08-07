@@ -17,6 +17,7 @@ import { createInterface } from "node:readline";
 const sessions = new Map();
 const runs = new Map();
 const approvals = new Map();
+const externalToolCalls = new Map();
 const providerToolCalls = new Map();
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
@@ -109,6 +110,95 @@ function nakodeServer(ownerSessionId, parentRunId) {
       ),
     ],
   });
+}
+
+function externalToolShape(definition) {
+  const schema = JSON.parse(definition.input_schema_json || "{}");
+  if (schema?.type !== "object" || Array.isArray(schema?.properties)) {
+    throw new Error(
+      `External tool ${definition.name} must have an object input schema`,
+    );
+  }
+  const required = new Set(schema.required || []);
+  return Object.fromEntries(
+    Object.entries(schema.properties || {}).map(([name, property]) => {
+      const value = z.fromJSONSchema(property);
+      return [name, required.has(name) ? value : value.optional()];
+    }),
+  );
+}
+
+function resolveExternalToolCall(id, output, failed) {
+  const pending = externalToolCalls.get(id);
+  if (!pending) return;
+  externalToolCalls.delete(id);
+  pending.resolve({
+    isError: failed === true,
+    content: [{ type: "text", text: output || "" }],
+  });
+}
+
+function interruptExternalToolCalls(predicate, message) {
+  for (const [id, pending] of externalToolCalls) {
+    if (!predicate(pending)) continue;
+    externalToolCalls.delete(id);
+    pending.resolve({
+      isError: true,
+      content: [{ type: "text", text: message }],
+    });
+  }
+}
+
+function externalToolsServer(session, turnId) {
+  return createSdkMcpServer({
+    name: "nakode_external",
+    version: "1.0.0",
+    instructions:
+      "Tools executed by the Nakode client that owns this logical session.",
+    tools: session.externalTools.map((definition) =>
+      tool(
+        definition.name,
+        definition.description,
+        externalToolShape(definition),
+        async (args) =>
+          new Promise((resolve) => {
+            const id = randomUUID();
+            externalToolCalls.set(id, {
+              resolve,
+              sessionId: session.sessionId,
+              turnId,
+            });
+            write({
+              event: "external_tool_request",
+              id,
+              turnId,
+              name: definition.name,
+              argumentsJson: JSON.stringify(args),
+            });
+          }),
+      ),
+    ),
+  });
+}
+
+function externalToolNames(session) {
+  return session.externalTools.map(
+    (definition) => `mcp__nakode_external__${definition.name}`,
+  );
+}
+
+function providerToolName(name) {
+  const prefix = "mcp__nakode_external__";
+  return typeof name === "string" && name.startsWith(prefix)
+    ? name.slice(prefix.length)
+    : name || "Tool";
+}
+
+function effectiveAllowedTools(session) {
+  const external = externalToolNames(session);
+  if (session.replaceBuiltinTools) return external;
+  if (session.allowedTools === null) return null;
+  return [...session.allowedTools, ...external];
 }
 
 function errorMessage(error) {
@@ -314,7 +404,7 @@ function savedHistory(messages, sessionId) {
         body = block.thinking || "";
       } else if (block.type === "tool_use") {
         kind = "tool";
-        title = block.name || "Tool";
+        title = providerToolName(block.name);
         historicalTools.set(block.id, { name: title, input: block.input });
         body = JSON.stringify({ input: block.input });
       } else if (block.type === "tool_result") {
@@ -368,6 +458,10 @@ async function createSession(command, resumed) {
     deniedTools: policy?.deniedTools ?? [],
     maxTurns: command.maxTurns || null,
     timeoutSeconds: command.timeoutSeconds || null,
+    externalTools: Array.isArray(command.externalTools)
+      ? command.externalTools
+      : [],
+    replaceBuiltinTools: command.replaceBuiltinTools === true,
   });
   let history = [];
   if (resumed) {
@@ -505,7 +599,7 @@ async function securityValidation(ownerSessionId, toolName, input, options) {
   }
 }
 
-function permissionHandler(turnId, session, mode) {
+function permissionHandler(turnId, session, mode, allowedTools) {
   return async (toolName, input, options) => {
     if (session.deniedTools.includes(toolName)) {
       return {
@@ -514,12 +608,15 @@ function permissionHandler(turnId, session, mode) {
         toolUseID: options.toolUseID,
       };
     }
-    if (session.allowedTools !== null && !session.allowedTools.includes(toolName)) {
+    if (allowedTools !== null && !allowedTools.includes(toolName)) {
       return {
         behavior: "deny",
         message: `Archetype policy does not allow ${toolName}.`,
         toolUseID: options.toolUseID,
       };
+    }
+    if (externalToolNames(session).includes(toolName)) {
+      return { behavior: "allow", updatedInput: input };
     }
     if (
       toolName !== "AskUserQuestion" &&
@@ -615,12 +712,13 @@ function emitContent(turnId, message) {
   if (!Array.isArray(content)) return;
   for (const block of content) {
     if (block.type === "tool_use") {
-      providerToolCalls.set(block.id, { name: block.name, input: block.input });
+      const name = providerToolName(block.name);
+      providerToolCalls.set(block.id, { name, input: block.input });
       write({
         event: "tool_call",
         turnId,
         callId: block.id,
-        name: block.name,
+        name,
         status: "running",
         args: block.input,
       });
@@ -655,12 +753,13 @@ function emitStreamEvent(turnId, message) {
   if (event?.type === "content_block_start") {
     const block = event.content_block;
     if (block?.type === "tool_use") {
-      providerToolCalls.set(block.id, { name: block.name, input: block.input });
+      const name = providerToolName(block.name);
+      providerToolCalls.set(block.id, { name, input: block.input });
       write({
         event: "tool_call",
         turnId,
         callId: block.id,
-        name: block.name,
+        name,
         status: "running",
         args: block.input,
       });
@@ -703,6 +802,21 @@ async function sendTurn(command) {
     ? "dontAsk"
     : await permissionMode(command.workspace);
   const processLifecycle = providerProcessLifecycle();
+  const allowedTools = effectiveAllowedTools(session);
+  const mcpServers = {};
+  if (
+    session.ownerSessionId &&
+    session.validationEnabled &&
+    session.delegationEnabled
+  ) {
+    mcpServers.nakode = nakodeServer(
+      session.ownerSessionId,
+      session.attributedRunId,
+    );
+  }
+  if (session.externalTools.length > 0) {
+    mcpServers.nakode_external = externalToolsServer(session, command.turnId);
+  }
   const options = {
     cwd: command.workspace,
     pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE || "claude",
@@ -715,19 +829,10 @@ async function sendTurn(command) {
     abortController,
     permissionMode: mode,
     ...(session.maxTurns ? { maxTurns: session.maxTurns } : {}),
-    ...(session.allowedTools !== null ? { allowedTools: session.allowedTools } : {}),
-    canUseTool: permissionHandler(command.turnId, session, mode),
+    ...(allowedTools !== null ? { allowedTools } : {}),
+    canUseTool: permissionHandler(command.turnId, session, mode, allowedTools),
     spawnClaudeCodeProcess: processLifecycle.spawn,
-    ...(session.ownerSessionId && session.validationEnabled && session.delegationEnabled
-      ? {
-          mcpServers: {
-            nakode: nakodeServer(
-              session.ownerSessionId,
-              session.attributedRunId,
-            ),
-          },
-        }
-      : {}),
+    ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
     ...(session.started
       ? { resume: session.sessionId }
       : { sessionId: session.sessionId }),
@@ -792,6 +897,10 @@ async function sendTurn(command) {
     };
   } finally {
     if (timeout !== null) clearTimeout(timeout);
+    interruptExternalToolCalls(
+      (pending) => pending.turnId === command.turnId,
+      "External tool call interrupted",
+    );
     runs.delete(command.turnId);
   }
 
@@ -930,7 +1039,18 @@ async function handle(command) {
       write({ event: "approval_resolved", approvalId: command.approvalId });
       break;
     }
+    case "resolve_external_tool":
+      resolveExternalToolCall(
+        command.id,
+        command.output,
+        command.failed === true,
+      );
+      break;
     case "cancel": {
+      interruptExternalToolCalls(
+        (pending) => pending.turnId === command.turnId,
+        "External tool call interrupted",
+      );
       runs.get(command.turnId)?.abort();
       write({
         event: "interrupt_accepted",
@@ -940,6 +1060,10 @@ async function handle(command) {
       break;
     }
     case "close":
+      interruptExternalToolCalls(
+        (pending) => pending.sessionId === command.sessionId,
+        "External tool session closed",
+      );
       sessions.delete(command.sessionId);
       write({
         event: "session_closed",
@@ -949,6 +1073,10 @@ async function handle(command) {
       break;
     case "shutdown":
       for (const controller of runs.values()) controller.abort();
+      interruptExternalToolCalls(
+        () => true,
+        "External tool bridge shut down",
+      );
       process.exit(0);
       break;
     default:
