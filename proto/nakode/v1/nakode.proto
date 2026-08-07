@@ -413,7 +413,66 @@ message Notice { string id = 1; NoticeLevel level = 2; string message = 3; }
 
 enum RunStatus { RUN_STATUS_UNSPECIFIED = 0; RUN_STATUS_STARTING = 1; RUN_STATUS_WORKING = 2; RUN_STATUS_COMPLETED = 3; RUN_STATUS_INTERRUPTED = 4; RUN_STATUS_FAILED = 5; }
 message RunOutcome { enum Kind { KIND_UNSPECIFIED = 0; KIND_COMPLETED = 1; KIND_FAILED = 2; KIND_INTERRUPTED = 3; } Kind kind = 1; string body = 2; }
-message RunState { string id = 1; string agent_slug = 2; string provider_id = 3; string objective = 4; uint64 objective_start_byte = 5; uint64 objective_total_bytes = 6; RunStatus status = 7; string latest_activity = 8; uint64 latest_activity_start_byte = 9; uint64 latest_activity_total_bytes = 10; optional RunOutcome outcome = 11; uint64 outcome_start_byte = 12; uint64 outcome_total_bytes = 13; optional string result = 14; uint64 result_start_byte = 15; uint64 result_total_bytes = 16; TranscriptPage transcript = 17; optional string model_id = 18; optional string native_session_id = 19; TokenUsage usage = 20; }
+message RunPolicy {
+  repeated string allowed_capabilities = 1;
+  repeated string denied_capabilities = 2;
+  repeated string allowed_tools = 3;
+  repeated string denied_tools = 4;
+  string tool_profile = 5;
+  string task_shape = 6;
+  string output_contract = 7;
+  optional uint32 timeout_seconds = 8;
+  optional uint32 max_turns = 9;
+  bool can_delegate = 10;
+  uint32 max_delegation_depth = 11;
+  uint32 remaining_delegation_depth = 12;
+  bool require_parent_attribution = 13;
+  repeated string truncated_fields = 14;
+}
+message RunToolDenial {
+  string entry_id = 1;
+  string tool = 2;
+  string reason = 3;
+  uint64 tool_start_byte = 4;
+  uint64 tool_total_bytes = 5;
+  uint64 reason_start_byte = 6;
+  uint64 reason_total_bytes = 7;
+}
+message RunState {
+  string id = 1;
+  string agent_slug = 2;
+  string provider_id = 3;
+  string objective = 4;
+  uint64 objective_start_byte = 5;
+  uint64 objective_total_bytes = 6;
+  RunStatus status = 7;
+  string latest_activity = 8;
+  uint64 latest_activity_start_byte = 9;
+  uint64 latest_activity_total_bytes = 10;
+  optional RunOutcome outcome = 11;
+  uint64 outcome_start_byte = 12;
+  uint64 outcome_total_bytes = 13;
+  optional string result = 14;
+  uint64 result_start_byte = 15;
+  uint64 result_total_bytes = 16;
+  TranscriptPage transcript = 17;
+  optional string model_id = 18;
+  optional string native_session_id = 19;
+  TokenUsage usage = 20;
+  optional string parent_run_id = 21;
+  string archetype_purpose = 22;
+  optional string reasoning_effort = 23;
+  bool fast_mode = 24;
+  uint64 started_at_ms = 25;
+  optional uint64 ended_at_ms = 26;
+  optional uint64 duration_ms = 27;
+  optional string termination_kind = 28;
+  optional string termination_detail = 29;
+  optional string objective_mismatch_handoff = 30;
+  RunPolicy policy = 31;
+  repeated RunToolDenial tool_denials = 32;
+  uint32 tool_denials_retained_total = 33;
+}
 message RunTextWindow { string run_id = 1; RunTextField field = 2; string text = 3; uint64 start_byte = 4; uint64 total_bytes = 5; bool has_earlier = 6; }
 message Artifact { string id = 1; string label = 2; string media_type = 3; uint64 byte_length = 4; bytes data = 5; }
 

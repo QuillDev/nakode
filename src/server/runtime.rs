@@ -9,7 +9,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::sync::mpsc;
@@ -36,7 +36,7 @@ use crate::{
     },
     shell::{ShellEvent, ShellProcesses},
     skill::{SkillCatalog, SkillCatalogError},
-    state::{AgentBrowserStatus, DomainState, Effect},
+    state::{AgentBrowserStatus, DomainState, Effect, SubagentStatus},
 };
 
 use super::ServerCore;
@@ -1721,7 +1721,34 @@ fn load_subagents(
     parent_session_id: &str,
 ) {
     match sessions.list_subagents(parent_session_id) {
-        Ok(records) => state.install_subagents(records),
+        Ok(mut records) => {
+            let ended_at_ms = u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            for record in &mut records {
+                if matches!(
+                    record.status,
+                    SubagentStatus::Starting | SubagentStatus::Working
+                ) {
+                    record.status = SubagentStatus::Interrupted;
+                    "Interrupted when the previous server stopped"
+                        .clone_into(&mut record.latest_activity);
+                    record.observability.ended_at_ms = Some(ended_at_ms);
+                    record.observability.termination_kind = Some("interrupted".to_owned());
+                    record.observability.termination_detail =
+                        Some("Interrupted when the previous server stopped".to_owned());
+                    if let Err(error) = sessions.save_subagent(record) {
+                        state.session_store_failed(error.to_string());
+                        return;
+                    }
+                }
+            }
+            state.install_subagents(records);
+        }
         Err(error) => state.session_store_failed(error.to_string()),
     }
 }
@@ -1933,7 +1960,7 @@ mod tests {
 
     use super::{
         BackendRegistry, BackendSource, EffectExecutor, EffectOrigin, NativeServerRuntime,
-        PersistenceServices, ProviderCredentialInput, native_service_capabilities,
+        PersistenceServices, ProviderCredentialInput, load_subagents, native_service_capabilities,
         provider_enablement_changes, save_provider_credential,
     };
     use crate::{
@@ -1941,8 +1968,10 @@ mod tests {
         config::{Config, OpenAiReasoningEffort},
         credential::{CredentialStore, SqliteCredentialStore},
         service::ServiceEngine,
-        session::SqliteSessionRepository,
-        state::{DomainState, Effect},
+        session::{
+            SessionRepository, SqliteSessionRepository, SubagentObservability, SubagentRecord,
+        },
+        state::{DomainState, Effect, SubagentStatus},
     };
 
     fn provider(provider: &str, enabled: bool, credential: bool) -> crate::session::ProviderRecord {
@@ -1956,6 +1985,64 @@ mod tests {
                 updated_at: 1,
             }),
         }
+    }
+
+    #[test]
+    fn restoring_active_subagents_durably_marks_them_interrupted() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions = SqliteSessionRepository::open(workspace.path().join("sessions.sqlite3"))
+            .expect("session repository");
+        let parent = sessions
+            .create(
+                CODEX_PROVIDER,
+                "provider-parent",
+                workspace.path().to_str().expect("utf8 workspace"),
+                "Parent",
+                None,
+            )
+            .expect("parent session");
+        sessions
+            .save_subagent(&SubagentRecord {
+                parent_session_id: parent.id.clone(),
+                id: "run-active".to_owned(),
+                agent: "repo-explorer".to_owned(),
+                provider: CODEX_PROVIDER.to_owned(),
+                model: None,
+                provider_session_id: Some("provider-child".to_owned()),
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                objective: "Inspect restore".to_owned(),
+                status: SubagentStatus::Working,
+                latest_activity: "Working".to_owned(),
+                transcript: Vec::new(),
+                observability: SubagentObservability {
+                    started_at_ms: 100,
+                    ..SubagentObservability::default()
+                },
+            })
+            .expect("active run");
+
+        let mut state = DomainState::new_unconfigured(
+            workspace.path().to_str().expect("utf8 workspace"),
+            None,
+            100,
+        );
+        load_subagents(&mut state, &sessions, &parent.id);
+
+        let restored = sessions
+            .list_subagents(&parent.id)
+            .expect("restored runs")
+            .pop()
+            .expect("run");
+        assert_eq!(restored.status, SubagentStatus::Interrupted);
+        assert_eq!(
+            restored.observability.termination_kind.as_deref(),
+            Some("interrupted")
+        );
+        assert!(restored.observability.ended_at_ms.is_some());
+        assert_eq!(state.subagents[0].status, SubagentStatus::Interrupted);
     }
 
     #[test]

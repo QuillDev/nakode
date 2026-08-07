@@ -482,6 +482,7 @@ impl AgentRuntime {
     /// # Errors
     ///
     /// Returns an error when inference, tool execution, cancellation, or event delivery fails.
+    #[allow(clippy::single_match_else)]
     pub async fn run_turn(
         &self,
         session: &mut RuntimeSession,

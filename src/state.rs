@@ -20,7 +20,7 @@ use crate::{
     handoff::HandoffPackage,
     memory::{MemoryBackend, MemoryConfig},
     personality::PromptAddenda,
-    session::{SessionRecord, SubagentRecord},
+    session::{SessionRecord, SubagentObservability, SubagentRecord},
     settings::TerminalImageMode,
     skill::SkillCatalog,
     web::{WebBackend, WebConfig},
@@ -678,6 +678,7 @@ pub struct SubagentRun {
     pub objective: String,
     pub status: SubagentStatus,
     pub latest_activity: String,
+    pub observability: SubagentObservability,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2355,21 +2356,21 @@ impl DomainState {
         self.subagents.clear();
         self.subagent_executions.clear();
         self.subagent_chats.clear();
-        for record in records {
+        for mut record in records {
             let mut status = record.status;
             let mut latest_activity = record.latest_activity;
             if matches!(status, SubagentStatus::Starting | SubagentStatus::Working) {
                 status = SubagentStatus::Interrupted;
                 "Interrupted when the previous server stopped".clone_into(&mut latest_activity);
+                record.observability.ended_at_ms = Some(unix_time_ms());
+                record.observability.termination_kind = Some("interrupted".to_owned());
+                record.observability.termination_detail =
+                    Some("Interrupted when the previous server stopped".to_owned());
             }
             let mut transcript = DomainTranscript::new(self.transcript_limit);
             transcript.set_stream_label(record.agent.clone());
             for entry in record.transcript {
-                if let Some(key) = entry.key {
-                    transcript.upsert(key, entry.kind, entry.title, entry.body, entry.status);
-                } else {
-                    transcript.push(entry.kind, entry.title, entry.body, entry.status);
-                }
+                transcript.restore(entry);
             }
             if status == SubagentStatus::Interrupted {
                 transcript.finish_running(EntryStatus::Interrupted);
@@ -2389,6 +2390,7 @@ impl DomainState {
                 objective: record.objective,
                 status,
                 latest_activity,
+                observability: record.observability,
             };
             self.subagents.push(run.clone());
             self.sync_inline_subagent(&run);
@@ -4000,6 +4002,10 @@ impl DomainState {
         };
         execution.run.status = SubagentStatus::Interrupted;
         "Interrupted".clone_into(&mut execution.run.latest_activity);
+        execution.run.observability.ended_at_ms = Some(unix_time_ms());
+        execution.run.observability.termination_kind = Some("cancelled".to_owned());
+        execution.run.observability.termination_detail =
+            Some("Interrupted by a client.".to_owned());
         if let Some(run) = self.subagents.iter_mut().find(|run| run.id == run_id) {
             run.clone_from(&execution.run);
         }
@@ -6670,6 +6676,7 @@ impl DomainState {
     /// # Errors
     /// Rejects missing/inactive parents, disallowed delegation, exhausted depth, and invalid
     /// archetype requests.
+    #[allow(clippy::too_many_lines)]
     pub fn delegate_agent_attributed(
         &mut self,
         agent_slug: &str,
@@ -6729,6 +6736,14 @@ impl DomainState {
             objective: task.to_owned(),
             status: SubagentStatus::Starting,
             latest_activity: "Starting provider…".to_owned(),
+            observability: SubagentObservability {
+                parent_run_id: parent_run_id.clone(),
+                archetype_purpose: definition.description.clone(),
+                policy_json: serde_json::to_string(&definition).unwrap_or_else(|_| "{}".to_owned()),
+                remaining_delegation_depth,
+                started_at_ms: unix_time_ms(),
+                ..SubagentObservability::default()
+            },
         };
         self.subagents.push(run.clone());
         self.sync_inline_subagent(&run);
@@ -7130,6 +7145,7 @@ impl DomainState {
         self.finish_subagent(run_id, Err(message))
     }
 
+    #[allow(clippy::format_push_string)]
     fn start_subagent_session(
         &mut self,
         run_id: &str,
@@ -7162,6 +7178,9 @@ impl DomainState {
         let mut validator_instructions = execution.definition.instructions().to_owned();
         let policy = &execution.definition;
         append_archetype_policy_instructions(&mut validator_instructions, policy);
+        validator_instructions.push_str(
+            "\n\nIf the delegated objective materially requires capabilities this archetype does not have, do not attempt it. Return this exact bounded handoff block as the final report:\n[Nakode Objective Mismatch]\nMissing capability: <one concise line>\nBetter archetype: <slug or concise archetype description>\n[/Nakode Objective Mismatch]",
+        );
         let _ = write!(
             validator_instructions,
             "\n\n[Nakode Run Attribution]\nRun ID: {run_id}\nParent run: {}\nRemaining delegation depth: {}\n[/Nakode Run Attribution]",
@@ -7445,6 +7464,10 @@ impl DomainState {
             };
             execution.run.status = SubagentStatus::Interrupted;
             "Interrupted by parent".clone_into(&mut execution.run.latest_activity);
+            execution.run.observability.ended_at_ms = Some(unix_time_ms());
+            execution.run.observability.termination_kind = Some("cancelled".to_owned());
+            execution.run.observability.termination_detail =
+                Some("Interrupted by the parent agent.".to_owned());
             if let Some(displayed) = self.subagents.iter_mut().find(|run| run.id == *run_id) {
                 displayed.clone_from(&execution.run);
             }
@@ -7479,15 +7502,22 @@ impl DomainState {
         let Some(mut execution) = self.subagent_executions.remove(run_id) else {
             return Vec::new();
         };
+        execution.run.observability.objective_mismatch_handoff =
+            objective_mismatch_handoff(&execution.response);
         let (success, body) = match outcome {
             Ok(()) if !execution.response.trim().is_empty() => {
                 execution.run.status = SubagentStatus::Completed;
                 "Completed".clone_into(&mut execution.run.latest_activity);
+                execution.run.observability.termination_kind = Some("completed".to_owned());
+                execution.run.observability.termination_detail = None;
                 (true, execution.response.trim().to_owned())
             }
             Ok(()) => {
                 execution.run.status = SubagentStatus::Failed;
                 "Returned no response".clone_into(&mut execution.run.latest_activity);
+                execution.run.observability.termination_kind = Some("failed".to_owned());
+                execution.run.observability.termination_detail =
+                    Some("Subagent returned no assistant response.".to_owned());
                 if let Some(chat) = self.subagent_chats.get_mut(run_id) {
                     chat.transcript.push(
                         EntryKind::Error,
@@ -7502,6 +7532,15 @@ impl DomainState {
             Err(message) => {
                 execution.run.status = SubagentStatus::Failed;
                 execution.run.latest_activity = summarize_activity(&message, "Failed");
+                execution.run.observability.termination_kind = Some(
+                    if message.starts_with("archetype runtime exceeded its configured") {
+                        "timed_out"
+                    } else {
+                        "failed"
+                    }
+                    .to_owned(),
+                );
+                execution.run.observability.termination_detail = Some(message.clone());
                 if let Some(chat) = self.subagent_chats.get_mut(run_id) {
                     if !chat
                         .transcript
@@ -7521,6 +7560,7 @@ impl DomainState {
                 (false, message)
             }
         };
+        execution.run.observability.ended_at_ms = Some(unix_time_ms());
         if let Some(displayed) = self.subagents.iter_mut().find(|run| run.id == run_id) {
             displayed.clone_from(&execution.run);
         }
@@ -7557,6 +7597,7 @@ impl DomainState {
             objective: run.objective.clone(),
             status: run.status,
             latest_activity: run.latest_activity.clone(),
+            observability: run.observability.clone(),
             transcript: chat.transcript.entries().to_vec(),
         }))
     }
@@ -7721,6 +7762,14 @@ impl DomainState {
     }
 }
 
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 #[cfg(test)]
 fn offset_index(index: usize, len: usize, delta: isize) -> usize {
     debug_assert!(len > 0);
@@ -7788,6 +7837,28 @@ fn latest_reasoning_summary(text: &str) -> &str {
         .find(|line| !line.trim().is_empty())
         .map(str::trim)
         .unwrap_or_default()
+}
+
+fn objective_mismatch_handoff(text: &str) -> Option<String> {
+    const START: &str = "[Nakode Objective Mismatch]";
+    const END: &str = "[/Nakode Objective Mismatch]";
+    let block = text.split_once(START)?.1.split_once(END)?.0;
+    let missing = block
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Missing capability:"))?
+        .trim();
+    let better = block
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Better archetype:"))?
+        .trim();
+    if missing.is_empty() || better.is_empty() {
+        return None;
+    }
+    let missing = missing.chars().take(512).collect::<String>();
+    let better = better.chars().take(512).collect::<String>();
+    Some(format!(
+        "Missing capability: {missing}\nBetter archetype: {better}"
+    ))
 }
 
 fn summarize_activity(text: &str, fallback: &str) -> String {
@@ -7893,7 +7964,7 @@ mod tests {
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         personality::PromptAddenda,
-        session::{SessionRecord, SubagentRecord},
+        session::{SessionRecord, SubagentObservability, SubagentRecord},
         skill::SkillCatalog,
         state::projection,
     };
@@ -7901,8 +7972,28 @@ mod tests {
 
     use super::{
         AgentEditorField, AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus,
-        model_supports_options,
+        model_supports_options, objective_mismatch_handoff,
     };
+
+    #[test]
+    fn objective_mismatch_handoff_requires_the_exact_bounded_report_protocol() {
+        let report = "Context\n[Nakode Objective Mismatch]\nMissing capability: a bounded command deadline\nBetter archetype: test-runner\n[/Nakode Objective Mismatch]";
+        assert_eq!(
+            objective_mismatch_handoff(report).as_deref(),
+            Some("Missing capability: a bounded command deadline\nBetter archetype: test-runner")
+        );
+        assert_eq!(
+            objective_mismatch_handoff("Missing capability: shell\nBetter archetype: test-runner"),
+            None
+        );
+        let oversized = format!(
+            "[Nakode Objective Mismatch]\nMissing capability: {}\nBetter archetype: {}\n[/Nakode Objective Mismatch]",
+            "x".repeat(2_000),
+            "y".repeat(2_000)
+        );
+        let handoff = objective_mismatch_handoff(&oversized).expect("structured handoff");
+        assert!(handoff.len() <= 1_100);
+    }
 
     #[test]
     fn primary_system_instructions_include_model_personality_and_soul() {
@@ -10684,10 +10775,22 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 model_id: None,
                 tool_audit_json: None,
             }],
+            observability: SubagentObservability {
+                parent_run_id: Some("root-run".to_owned()),
+                archetype_purpose: "Read-only architecture scout".to_owned(),
+                started_at_ms: 100,
+                ended_at_ms: Some(180),
+                termination_kind: Some("completed".to_owned()),
+                ..SubagentObservability::default()
+            },
         }]);
 
         assert_eq!(state.subagents.len(), 1);
         assert_eq!(state.subagents[0].objective, "Map persistence");
+        assert_eq!(
+            state.subagents[0].observability.parent_run_id.as_deref(),
+            Some("root-run")
+        );
         state.client.subagent_modal = Some("agent-1".to_owned());
         let (transcript, scroll) = state
             .selected_subagent_transcript_mut()

@@ -626,7 +626,7 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::items_after_statements, clippy::too_many_lines)]
 // Validation deliberately reports one policy-specific error at a time from this persisted shape;
 // splitting the ordered checks would obscure the single authoritative validation boundary.
 fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalogError> {

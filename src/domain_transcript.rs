@@ -190,6 +190,23 @@ impl DomainTranscript {
         self.stream_label = label.into();
     }
 
+    /// Restores one already-normalized durable entry without minting a new identity or dropping
+    /// provider attribution and structured tool-audit evidence.
+    pub fn restore(&mut self, entry: TranscriptEntry) {
+        if let Some(key) = entry.key.as_ref()
+            && let Some(index) = self.item_indices.get(key).copied()
+        {
+            self.entries[index] = entry;
+        } else {
+            let index = self.entries.len();
+            if let Some(key) = entry.key.as_ref() {
+                self.item_indices.insert(key.clone(), index);
+            }
+            self.entries.push(entry);
+        }
+        self.enforce_limit();
+    }
+
     pub fn push(
         &mut self,
         kind: EntryKind,
