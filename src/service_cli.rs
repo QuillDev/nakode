@@ -114,12 +114,17 @@ pub async fn logs(config: &Config, follow: bool, lines: u32) -> Result<(), Contr
 /// Returns an error when the endpoint cannot be reached or started.
 pub async fn endpoint(config: &Config) -> Result<(), ControlError> {
     let executable = current_executable()?;
-    let endpoint = control_service::frontend_api_endpoint(&executable, config).await?;
+    let report = control_service::frontend_api_endpoint_report(&executable, config).await?;
     let descriptor = serde_json::json!({
         "version": 1,
         "transport": "grpc+unix",
         "workspace": config.workspace,
-        "endpoint": endpoint,
+        "endpoint": report.endpoint,
+        "lifecycle_endpoint": report.lifecycle_socket,
+        "cli": report.cli,
+        "service": report.service,
+        "server": report.server,
+        "activation": report.activation,
     });
     println!("{}", serde_json::to_string(&descriptor)?);
     Ok(())
@@ -137,12 +142,34 @@ pub fn report_deprecation(deprecated: &str, replacement: &str) {
 fn render_status(status: &ServiceStatus) -> String {
     let mut rows = vec![
         ("Nakode", status.nakode_version.clone()),
+        (
+            "CLI executable",
+            format!(
+                "{} (sha256 {}, {} bytes)",
+                status.nakode_executable.path.display(),
+                status.nakode_executable.sha256,
+                status.nakode_executable.size,
+            ),
+        ),
         ("Workspace", status.workspace.display().to_string()),
         (
             "Service",
             if status.running { "running" } else { "stopped" }.to_owned(),
         ),
     ];
+    if let Some(service) = &status.service_executable {
+        rows.push((
+            "Service executable",
+            format!(
+                "{} (sha256 {}, {} bytes; device {}; inode {})",
+                service.path.display(),
+                service.sha256,
+                service.size,
+                service.device.as_deref().unwrap_or("unknown"),
+                service.inode.as_deref().unwrap_or("unknown"),
+            ),
+        ));
+    }
     if let Some(pid) = status.pid {
         rows.push(("PID", pid.to_string()));
     }
@@ -212,14 +239,28 @@ fn current_executable() -> Result<std::path::PathBuf, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::{duration, render_status};
-    use crate::control_service::{ServerReport, ServiceStatus};
+    use crate::control_service::{ExecutableIdentity, ServerReport, ServiceStatus};
     use std::path::PathBuf;
+
+    fn identity(path: &str, sha256: &str, inode: u64) -> ExecutableIdentity {
+        ExecutableIdentity {
+            path: PathBuf::from(path),
+            sha256: sha256.to_owned(),
+            size: 123,
+            modified_at_unix_ms: Some(1_754_000_000_000),
+            device: Some("7".to_owned()),
+            inode: Some(inode.to_string()),
+        }
+    }
 
     fn status(running: bool) -> ServiceStatus {
         ServiceStatus {
             running,
             workspace: PathBuf::from("/workspace"),
             nakode_version: "0.3.0".to_owned(),
+            nakode_executable: identity("/usr/local/bin/nakode", "cli-hash", 111),
+            service_executable: running
+                .then(|| identity("/usr/local/bin/nakode", "service-hash", 222)),
             pid: running.then_some(4242),
             started_at_unix_ms: running.then_some(1_754_000_000_000),
             started_at_utc: running.then(|| "2025-07-31T22:13:20Z".to_owned()),
@@ -241,6 +282,10 @@ mod tests {
 
         for expected in [
             "0.3.0",
+            "/usr/local/bin/nakode",
+            "cli-hash",
+            "service-hash",
+            "inode 222",
             "/workspace",
             "running",
             "4242",

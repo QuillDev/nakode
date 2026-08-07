@@ -408,6 +408,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             model,
             instructions,
             owner_session_id,
+            parent_run_id: _,
             external_tools: _,
             replace_builtin_tools: _,
             allowed_builtin_tools: _,

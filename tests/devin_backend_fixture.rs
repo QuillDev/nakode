@@ -289,6 +289,7 @@ async fn cached_model_selection_is_applied_before_first_prompt() -> TestResult {
             max_turns: None,
             timeout_seconds: None,
             owner_session_id: None,
+            parent_run_id: None,
         })
         .await?;
     match next_event(&mut backend).await? {

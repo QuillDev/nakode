@@ -22,7 +22,7 @@ use thiserror::Error;
 
 use crate::{
     agent::{AgentCatalog, AgentCatalogError},
-    backend::{BackendCommand, BackendError, BackendEvent, BackendHandle},
+    backend::{BackendCommand, BackendError, BackendEvent, BackendHandle, NativeDelegationRequest},
     claude, codex,
     config::Config,
     credential::{
@@ -120,6 +120,11 @@ pub(crate) struct NativeServerRuntime {
     effects: EffectExecutor,
     shell_owners: HashMap<String, nakode_protocol::SessionId>,
     shutdown: mpsc::Receiver<()>,
+    delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
+    native_cancellation_tx: mpsc::Sender<u64>,
+    native_cancellations: mpsc::Receiver<u64>,
+    pending_native_delegations: HashMap<u64, PendingNativeDelegation>,
+    next_native_delegation_request: u64,
 }
 
 pub(crate) struct PreparedRuntime {
@@ -127,11 +132,25 @@ pub(crate) struct PreparedRuntime {
     pub(crate) effects: EffectExecutor,
     pub(crate) providers: Vec<ProviderRecord>,
     pub(crate) sessions: Vec<SessionRecord>,
+    pub(crate) delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
+}
+
+struct PendingNativeDelegation {
+    session_id: nakode_protocol::SessionId,
+    run_id: String,
+    respond: tokio::sync::oneshot::Sender<Result<String, String>>,
+    cancellation_task: tokio::task::JoinHandle<()>,
 }
 
 impl PreparedRuntime {
     pub(crate) fn into_actor(self) -> (NativeServerRuntime, NativeServerHandle) {
-        NativeServerRuntime::from_parts(self.engine, self.providers, self.sessions, self.effects)
+        NativeServerRuntime::from_parts(
+            self.engine,
+            self.providers,
+            self.sessions,
+            self.effects,
+            self.delegation_requests,
+        )
     }
 }
 
@@ -146,6 +165,7 @@ pub(crate) async fn prepare_runtime(
     let providers = session_repository.list_providers()?;
     let (provider_credentials, credential_failures) =
         load_provider_credentials(&providers, credential_store.as_ref());
+    let (delegation_tx, delegation_requests) = mpsc::channel(128);
     let mut backends = BackendRegistry::spawn(
         config,
         &providers,
@@ -154,6 +174,7 @@ pub(crate) async fn prepare_runtime(
         shared_web_config(session_repository.as_ref())?,
         shared_memory_config(session_repository.as_ref())?,
         shared_vision_config(session_repository.as_ref())?,
+        delegation_tx,
     )
     .await;
     backends.failures.extend(credential_failures);
@@ -180,6 +201,7 @@ pub(crate) async fn prepare_runtime(
         effects: EffectExecutor::new(backends, persistence),
         providers,
         sessions,
+        delegation_requests,
     })
 }
 
@@ -189,11 +211,13 @@ impl NativeServerRuntime {
         providers: Vec<ProviderRecord>,
         sessions: Vec<SessionRecord>,
         effects: EffectExecutor,
+        delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
     ) -> (Self, NativeServerHandle) {
         let capabilities = native_service_capabilities();
         let (endpoint, requests) =
             ServerEndpoint::channel(env!("CARGO_PKG_VERSION"), capabilities, 256);
         let (shutdown_tx, shutdown) = mpsc::channel(1);
+        let (native_cancellation_tx, native_cancellations) = mpsc::channel(128);
         let handle = NativeServerHandle {
             endpoint: endpoint.clone(),
             shutdown: shutdown_tx,
@@ -206,6 +230,11 @@ impl NativeServerRuntime {
                 effects,
                 shell_owners: HashMap::new(),
                 shutdown,
+                delegation_requests,
+                native_cancellation_tx,
+                native_cancellations,
+                pending_native_delegations: HashMap::new(),
+                next_native_delegation_request: 1,
             },
             handle,
         )
@@ -225,6 +254,16 @@ impl NativeServerRuntime {
                         break;
                     };
                     self.handle_request(request).await;
+                }
+                request = self.delegation_requests.recv() => {
+                    if let Some(request) = request {
+                        self.handle_native_delegation(request).await;
+                    }
+                }
+                request_id = self.native_cancellations.recv() => {
+                    if let Some(request_id) = request_id {
+                        self.cancel_native_delegation(request_id).await;
+                    }
                 }
                 event = self.effects.backends.events.recv(), if backend_open => {
                     match event {
@@ -264,10 +303,137 @@ impl NativeServerRuntime {
                         None => shutdown_open = false,
                     }
                 }
-                _ = provider_sync.tick() => self.synchronize_shared_providers().await,
+                _ = provider_sync.tick() => {
+                    self.synchronize_shared_providers().await;
+                    self.cancel_abandoned_native_delegations().await;
+                },
             }
         }
+        for (_, pending) in self.pending_native_delegations.drain() {
+            pending.cancellation_task.abort();
+            let _ = pending.respond.send(Err(
+                "workspace service stopped before delegated work completed".to_owned(),
+            ));
+        }
         self.effects.shutdown().await;
+    }
+
+    async fn handle_native_delegation(&mut self, request: NativeDelegationRequest) {
+        if request.cancellation.is_cancelled() || request.respond.is_closed() {
+            return;
+        }
+        let session_id = nakode_protocol::SessionId::from(request.owner_session_id.clone());
+        let request_id = self.next_native_delegation_request;
+        self.next_native_delegation_request =
+            self.next_native_delegation_request.wrapping_add(1).max(1);
+        let delegated = self.core.delegate_agent_attributed(
+            &session_id,
+            &request.agent,
+            &request.task,
+            request.parent_run_id.as_deref(),
+            request_id,
+        );
+        let (run_id, effects) = match delegated {
+            Ok(delegated) => delegated,
+            Err(error) => {
+                let _ = request.respond.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let cancellation = request.cancellation.clone();
+        let cancellation_tx = self.native_cancellation_tx.clone();
+        let cancellation_task = tokio::spawn(async move {
+            cancellation.cancelled().await;
+            let _ = cancellation_tx.send(request_id).await;
+        });
+        self.pending_native_delegations.insert(
+            request_id,
+            PendingNativeDelegation {
+                session_id: session_id.clone(),
+                run_id,
+                respond: request.respond,
+                cancellation_task,
+            },
+        );
+        self.register_effect_owners(&session_id, &effects);
+        if let Some(engine) = self.core.engine_for_mut(&session_id) {
+            self.effects
+                .execute(
+                    &session_id,
+                    engine.state_mut(),
+                    effects,
+                    EffectOrigin::PrimarySession,
+                )
+                .await;
+        }
+        self.refresh_catalogs();
+        self.core
+            .commit_and_publish_session(&self.endpoint, &session_id);
+    }
+
+    fn complete_native_delegations(&mut self, effects: &[Effect]) {
+        for effect in effects {
+            let Effect::CompleteAgentRequest {
+                request_id,
+                result,
+                success,
+            } = effect
+            else {
+                continue;
+            };
+            if *request_id == 0 {
+                continue;
+            }
+            if let Some(pending) = self.pending_native_delegations.remove(request_id) {
+                pending.cancellation_task.abort();
+                let terminal = if *success {
+                    Ok(result.clone())
+                } else {
+                    Err(result.clone())
+                };
+                let _ = pending.respond.send(terminal);
+            }
+        }
+    }
+
+    async fn cancel_abandoned_native_delegations(&mut self) {
+        let abandoned = self
+            .pending_native_delegations
+            .iter()
+            .filter(|(_, pending)| pending.respond.is_closed())
+            .map(|(request_id, _)| *request_id)
+            .collect::<Vec<_>>();
+        for request_id in abandoned {
+            self.cancel_native_delegation(request_id).await;
+        }
+    }
+
+    async fn cancel_native_delegation(&mut self, request_id: u64) {
+        let Some(pending) = self.pending_native_delegations.remove(&request_id) else {
+            return;
+        };
+        pending.cancellation_task.abort();
+        let _ = pending.respond.send(Err(
+            "native delegation cancelled with its provider turn".to_owned()
+        ));
+        let effects = self
+            .core
+            .cancel_attributed_run(&pending.session_id, &pending.run_id);
+        let Ok(effects) = effects else {
+            return;
+        };
+        if let Some(engine) = self.core.engine_for_mut(&pending.session_id) {
+            self.effects
+                .execute(
+                    &pending.session_id,
+                    engine.state_mut(),
+                    effects,
+                    EffectOrigin::PrimarySession,
+                )
+                .await;
+        }
+        self.core
+            .commit_and_publish_session(&self.endpoint, &pending.session_id);
     }
 
     async fn handle_request(&mut self, request: nakode_server::ServerRequest) {
@@ -327,6 +493,7 @@ impl NativeServerRuntime {
             .effect_session
             .clone()
             .unwrap_or_else(|| self.core.default_session_id().clone());
+        self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);
         if let Some(engine) = self.core.engine_for_mut(&session_id) {
             self.effects
@@ -425,6 +592,7 @@ impl NativeServerRuntime {
             }
         };
         let had_effects = !effects.is_empty();
+        self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);
         if let Some(engine) = self.core.engine_for_mut(&session_id) {
             self.effects
@@ -544,6 +712,7 @@ pub(crate) struct BackendRegistry {
     pub(crate) memory_service: crate::memory::SharedMemoryService,
     pub(crate) vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
     pub(crate) vision_service: Option<crate::vision::SharedVisionService>,
+    pub(crate) native_delegation: mpsc::Sender<NativeDelegationRequest>,
 }
 
 pub(crate) struct ProviderCooldown {
@@ -575,6 +744,7 @@ impl BackendRegistry {
         web_config: Arc<RwLock<crate::web::WebConfig>>,
         memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
         vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
+        native_delegation: mpsc::Sender<NativeDelegationRequest>,
     ) -> Self {
         let (event_tx, events) = mpsc::channel(512);
         let mut failures = Vec::new();
@@ -611,6 +781,7 @@ impl BackendRegistry {
             )),
             vision_config,
             vision_service,
+            native_delegation,
         };
         for provider in providers.iter().filter(|provider| provider.enabled) {
             if let Err(error) = registry.start_provider(&provider.provider).await {
@@ -644,6 +815,7 @@ impl BackendRegistry {
                             self.config.compaction_threshold_percent,
                         ))
                         .with_session_database(self.session_database.clone())
+                        .with_native_delegation(self.native_delegation.clone())
                         .with_web_config(Arc::clone(&self.web_config))
                         .with_memory(Arc::clone(&self.memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
@@ -674,6 +846,7 @@ impl BackendRegistry {
                             self.config.compaction_threshold_percent,
                         ))
                         .with_session_database(self.session_database.clone())
+                        .with_native_delegation(self.native_delegation.clone())
                         .with_web_config(Arc::clone(&self.web_config))
                         .with_memory(Arc::clone(&self.memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
@@ -688,6 +861,7 @@ impl BackendRegistry {
                             self.config.compaction_threshold_percent,
                         ))
                         .with_session_database(self.session_database.clone())
+                        .with_native_delegation(self.native_delegation.clone())
                         .with_web_config(Arc::clone(&self.web_config))
                         .with_memory(Arc::clone(&self.memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
@@ -702,6 +876,7 @@ impl BackendRegistry {
                             self.config.compaction_threshold_percent,
                         ))
                         .with_session_database(self.session_database.clone())
+                        .with_native_delegation(self.native_delegation.clone())
                         .with_web_config(Arc::clone(&self.web_config))
                         .with_memory(Arc::clone(&self.memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
@@ -1961,8 +2136,8 @@ mod tests {
 
     use super::{
         BackendRegistry, BackendSource, EffectExecutor, EffectOrigin, NativeServerRuntime,
-        PersistenceServices, ProviderCredentialInput, load_subagents, native_service_capabilities,
-        provider_enablement_changes, save_provider_credential,
+        PendingNativeDelegation, PersistenceServices, ProviderCredentialInput, load_subagents,
+        native_service_capabilities, provider_enablement_changes, save_provider_credential,
     };
     use crate::{
         backend::{BackendCommand, BackendEvent, BackendHandle, BackendIdentity, CODEX_PROVIDER},
@@ -2084,6 +2259,7 @@ mod tests {
         let web_config = Arc::new(RwLock::new(crate::web::WebConfig::default()));
         let memory_config = Arc::new(RwLock::new(crate::memory::MemoryConfig::default()));
         let vision_config = Arc::new(RwLock::new(crate::vision::VisionConfig::default()));
+        let (delegation, _requests) = mpsc::channel(1);
         BackendRegistry::spawn(
             &config_for(workspace),
             &[],
@@ -2092,6 +2268,7 @@ mod tests {
             web_config,
             memory_config,
             vision_config,
+            delegation,
         )
         .await
     }
@@ -2137,6 +2314,7 @@ mod tests {
             providers,
             Vec::new(),
             effects,
+            mpsc::channel(1).1,
         );
 
         shared
@@ -2151,6 +2329,46 @@ mod tests {
                 .iter()
                 .any(|provider| provider.provider == CODEX_PROVIDER && !provider.enabled)
         );
+    }
+
+    #[tokio::test]
+    async fn native_cancellation_settles_waiter_and_removes_correlation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let (respond, response) = tokio::sync::oneshot::channel();
+        runtime.pending_native_delegations.insert(
+            91,
+            PendingNativeDelegation {
+                session_id: SessionId::from("missing-owner"),
+                run_id: "missing-run".to_owned(),
+                respond,
+                cancellation_task: tokio::spawn(std::future::pending()),
+            },
+        );
+
+        runtime.cancel_native_delegation(91).await;
+
+        assert!(runtime.pending_native_delegations.is_empty());
+        let error = response
+            .await
+            .expect("waiter settled")
+            .expect_err("cancellation is terminal failure");
+        assert!(error.contains("cancelled with its provider turn"));
     }
 
     fn test_persistence(workspace: &Path) -> (PersistenceServices, Arc<SqliteCredentialStore>) {
@@ -2186,6 +2404,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             effects,
+            mpsc::channel(1).1,
         );
         let endpoint = handle.endpoint().clone();
         let runtime = tokio::spawn(runtime.run());
@@ -2244,6 +2463,7 @@ mod tests {
                     max_turns: None,
                     timeout_seconds: None,
                     owner_session_id: None,
+                    parent_run_id: None,
                 },
             )
             .await
@@ -2294,6 +2514,7 @@ mod tests {
                     max_turns: None,
                     timeout_seconds: None,
                     owner_session_id: None,
+                    parent_run_id: None,
                 },
             )
             .await
@@ -2311,6 +2532,7 @@ mod tests {
                     max_turns: None,
                     timeout_seconds: None,
                     owner_session_id: None,
+                    parent_run_id: None,
                 },
             )
             .await
@@ -2630,6 +2852,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             effects,
+            mpsc::channel(1).1,
         );
         let (created, _) = runtime
             .core

@@ -69,6 +69,7 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
             max_turns: None,
             timeout_seconds: None,
             owner_session_id: None,
+            parent_run_id: None,
         })
         .await?;
 
@@ -310,6 +311,7 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
             max_turns: None,
             timeout_seconds: None,
             owner_session_id: None,
+            parent_run_id: None,
         })
         .await?;
     let mut gate_writer = open_gate_writer(&gate).await?;

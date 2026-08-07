@@ -3,6 +3,8 @@ use std::{collections::HashSet, fs, path::Path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::NAKODE_AGENT_TOOL_NAME;
+
 pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "read",
     "grep",
@@ -18,6 +20,7 @@ pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "memory_store",
     "vision",
     "browser",
+    NAKODE_AGENT_TOOL_NAME,
 ];
 
 const CANONICAL_CAPABILITIES: &[&str] = &[
@@ -248,15 +251,17 @@ impl AgentDefinition {
             configured
                 .into_iter()
                 .filter(|tool| {
-                    required_capability(tool).is_none_or(|required| {
-                        self.allowed_capabilities
-                            .iter()
-                            .any(|capability| capability == required)
-                            && !self
-                                .denied_capabilities
+                    (*tool != NAKODE_AGENT_TOOL_NAME
+                        || (self.can_delegate && self.max_delegation_depth > 0))
+                        && required_capability(tool).is_none_or(|required| {
+                            self.allowed_capabilities
                                 .iter()
                                 .any(|capability| capability == required)
-                    })
+                                && !self
+                                    .denied_capabilities
+                                    .iter()
+                                    .any(|capability| capability == required)
+                        })
                 })
                 .collect(),
         )
@@ -622,6 +627,7 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
         "browser" => Some("network"),
         "memory_store" | "memory_search" => Some("memory"),
         "vision" => Some("vision"),
+        NAKODE_AGENT_TOOL_NAME => Some("delegation"),
         _ => None,
     }
 }

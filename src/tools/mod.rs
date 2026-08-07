@@ -8,6 +8,8 @@ mod grep;
 mod hypa;
 mod ls;
 mod memory;
+mod nakode_agent;
+pub(crate) use nakode_agent::NAKODE_AGENT_TOOL_NAME;
 mod process;
 mod read;
 mod todo;
@@ -22,7 +24,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    backend::BackendEvent,
+    backend::{BackendEvent, NativeDelegationRequest},
     runtime::{QuestionBroker, RuntimeSession, ToolDefinition},
 };
 
@@ -43,6 +45,7 @@ pub struct ToolContext<'a> {
     pub backend_events: &'a mpsc::Sender<BackendEvent>,
     pub turn_id: &'a str,
     pub questions: &'a QuestionBroker,
+    pub delegation: Option<&'a mpsc::Sender<NativeDelegationRequest>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,6 +136,12 @@ impl ToolRegistry {
     #[must_use]
     pub fn with_memory(mut self, service: crate::memory::SharedMemoryService) -> Self {
         self.tools.extend(memory::tools(service));
+        self
+    }
+
+    #[must_use]
+    pub fn with_native_delegation(mut self) -> Self {
+        self.tools.push(Arc::new(nakode_agent::NakodeAgentTool));
         self
     }
 
@@ -821,6 +830,65 @@ mod tests {
         format!("{}:/usr/bin:/bin", bin_directory.display())
     }
 
+    #[test]
+    fn native_delegation_schema_is_registered_only_with_a_server_route() {
+        assert!(ToolRegistry::base().find("nakode_agent").is_none());
+        let registry = ToolRegistry::base().with_native_delegation();
+        let definition = registry
+            .find("nakode_agent")
+            .expect("native delegation tool")
+            .definition();
+        assert_eq!(definition.name, "nakode_agent");
+        assert_eq!(definition.parameters["required"], json!(["agent", "task"]));
+        assert_eq!(definition.parameters["additionalProperties"], false);
+    }
+
+    #[tokio::test]
+    async fn native_delegation_binds_owner_parent_and_terminal_response() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let registry = ToolRegistry::base().with_native_delegation();
+        let tool = registry
+            .find("nakode_agent")
+            .expect("native delegation tool")
+            .clone();
+        let (requests, mut receiver) = mpsc::channel(1);
+        let (events, _event_receiver) = mpsc::channel(1);
+        let questions = QuestionBroker::default();
+        let cancellation = CancellationToken::new();
+        let mut session = RuntimeSession::new("test-model".to_owned(), String::new()).with_owner(
+            Some("logical-session".to_owned()),
+            Some("parent-run".to_owned()),
+        );
+        let invocation = tool.execute(
+            ToolContext {
+                workspace: directory.path(),
+                session: &mut session,
+                backend_events: &events,
+                turn_id: "turn-native",
+                questions: &questions,
+                delegation: Some(&requests),
+            },
+            json!({"agent":"repo-explorer","task":"Inspect routing"}),
+            &cancellation,
+        );
+        let server = async {
+            let request = receiver.recv().await.expect("server request");
+            assert_eq!(request.owner_session_id, "logical-session");
+            assert_eq!(request.parent_run_id.as_deref(), Some("parent-run"));
+            assert_eq!(request.agent, "repo-explorer");
+            assert_eq!(request.task, "Inspect routing");
+            request
+                .respond
+                .send(Ok(
+                    "[Subagent Result] [run] [repo-explorer]\nDone".to_owned()
+                ))
+                .expect("tool waiter");
+        };
+        let (result, ()) = tokio::join!(invocation, server);
+        assert!(!result.failed, "{}", result.output);
+        assert!(result.output.contains("[Subagent Result]"));
+    }
+
     struct ToolHarness<'a> {
         registry: ToolRegistry,
         workspace: &'a std::path::Path,
@@ -844,6 +912,7 @@ mod tests {
                     backend_events: &self.events,
                     turn_id: "turn-1",
                     questions: &self.questions,
+                    delegation: None,
                 },
                 arguments,
                 &self.cancellation,

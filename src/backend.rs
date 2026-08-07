@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 
 pub use crate::media::ImageData as PromptImage;
 
@@ -533,6 +536,19 @@ pub struct ExternalToolRequest {
     pub arguments_json: String,
 }
 
+pub struct NativeDelegationRequest {
+    /// Logical Nakode session owning the provider tool invocation.
+    pub owner_session_id: String,
+    /// Active delegated run when this is recursive; absent for a primary session.
+    pub parent_run_id: Option<String>,
+    pub agent: String,
+    pub task: String,
+    /// Provider turn cancellation, observed by the server before and after child creation.
+    pub cancellation: tokio_util::sync::CancellationToken,
+    /// Completion is terminal and carries the same durable result projected to the dashboard.
+    pub respond: oneshot::Sender<Result<String, String>>,
+}
+
 /// Provider-neutral commands understood by an agent backend adapter.
 #[derive(Clone, Debug)]
 pub enum BackendCommand {
@@ -542,6 +558,8 @@ pub enum BackendCommand {
         instructions: Option<String>,
         /// Logical Nakode owner bound by the control plane, never provider/model input.
         owner_session_id: Option<String>,
+        /// Active delegated run that owns this provider session, absent for primary sessions.
+        parent_run_id: Option<String>,
         external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
         /// Canonical Nakode builtin names allowed for this provider session. `None` keeps the
