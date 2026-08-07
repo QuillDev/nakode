@@ -1275,6 +1275,13 @@ fn agent(value: protocol::AgentDefinitionView) -> api::AgentDefinition {
         can_delegate: value.can_delegate,
         max_delegation_depth: value.max_delegation_depth,
         require_parent_attribution: Some(value.require_parent_attribution),
+        effective_builtin_tools: value.effective_builtin_tools.clone().unwrap_or_default(),
+        effective_builtin_tools_uses_runtime_default: value.effective_builtin_tools.is_none(),
+        effective_capabilities: value.effective_capabilities.clone().unwrap_or_default(),
+        effective_capabilities_use_runtime_default: value.effective_capabilities.is_none(),
+        policy_warnings: value.policy_warnings,
+        dashboard_tools_injected: value.dashboard_tools_injected,
+        policy_projection_version: value.policy_projection_version,
     }
 }
 
@@ -1787,6 +1794,61 @@ mod tests {
         assert_eq!(projected.text, "run next");
         assert_eq!(projected.attachment_count, 1);
         assert!(projected.redirecting);
+    }
+
+    #[test]
+    fn interpreted_agent_policy_projects_exact_and_ambiguous_boundaries() {
+        let base = protocol::AgentDefinitionView {
+            slug: "reviewer".to_owned(),
+            description: "Reviews changes".to_owned(),
+            system_prompt: String::new(),
+            first_message: String::new(),
+            model_id: None,
+            fallback_models: Vec::new(),
+            fast_mode: false,
+            reasoning_effort: None,
+            ownership: "owner_defined".to_owned(),
+            enabled: true,
+            allowed_capabilities: vec!["filesystem_read".to_owned()],
+            denied_capabilities: Vec::new(),
+            allowed_tools: vec!["read".to_owned()],
+            denied_tools: Vec::new(),
+            tool_profile: "read_only".to_owned(),
+            task_shape: String::new(),
+            output_contract: String::new(),
+            timeout_seconds: None,
+            poll_interval_ms: None,
+            max_turns: None,
+            max_concurrency: 1,
+            fallback_policy: "configured_only".to_owned(),
+            can_delegate: false,
+            max_delegation_depth: 0,
+            require_parent_attribution: true,
+            effective_builtin_tools: Some(vec!["read".to_owned()]),
+            effective_capabilities: Some(vec!["filesystem_read".to_owned()]),
+            policy_warnings: vec!["authoritative warning".to_owned()],
+            dashboard_tools_injected: false,
+            policy_projection_version: 1,
+        };
+
+        let exact = agent(base.clone());
+        assert_eq!(exact.effective_builtin_tools, vec!["read"]);
+        assert!(!exact.effective_builtin_tools_uses_runtime_default);
+        assert_eq!(exact.effective_capabilities, vec!["filesystem_read"]);
+        assert!(!exact.effective_capabilities_use_runtime_default);
+        assert_eq!(exact.policy_warnings, vec!["authoritative warning"]);
+        assert!(!exact.dashboard_tools_injected);
+        assert_eq!(exact.policy_projection_version, 1);
+
+        let ambiguous = agent(protocol::AgentDefinitionView {
+            effective_builtin_tools: None,
+            effective_capabilities: None,
+            ..base
+        });
+        assert!(ambiguous.effective_builtin_tools.is_empty());
+        assert!(ambiguous.effective_builtin_tools_uses_runtime_default);
+        assert!(ambiguous.effective_capabilities.is_empty());
+        assert!(ambiguous.effective_capabilities_use_runtime_default);
     }
 
     #[test]
