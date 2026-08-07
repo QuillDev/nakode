@@ -238,6 +238,8 @@ pub struct StaleServiceRefreshReport {
     pub current: usize,
     pub restarted: usize,
     pub active: Vec<String>,
+    pub inactive: Vec<String>,
+    pub unavailable: Vec<String>,
     pub unknown: Vec<String>,
     pub failures: Vec<String>,
 }
@@ -1801,9 +1803,12 @@ pub async fn shutdown_all_services() -> Result<BulkServiceShutdownReport, Contro
 ///
 /// Runtime directories are scanned once, current services are discarded without opening their
 /// sockets, stale services are probed concurrently with a small fixed bound, and replacements
-/// are started only after the old service reports no live work. Older services that predate the
-/// quiescent lifecycle request use the legacy shutdown request only after that read-only check.
-/// Services with active work or no recoverable workspace identity are left untouched.
+/// are started only after the old service reports no live work. Stale socket sets with no reachable
+/// listener are reported as inactive without starting a service or touching workspace, log,
+/// runtime-record, socket, or session state. Socket sets observed as partly reachable are reported
+/// as unavailable and likewise left untouched. Older services that predate the quiescent lifecycle
+/// request use the legacy shutdown request only after that read-only check. Reachable services with
+/// active work or no recoverable workspace identity are left untouched.
 ///
 /// # Errors
 ///
@@ -1845,11 +1850,15 @@ pub async fn restart_stale_services(
         match result {
             StaleServiceRefreshOutcome::Restarted => report.restarted += 1,
             StaleServiceRefreshOutcome::Active(workspace) => report.active.push(workspace),
+            StaleServiceRefreshOutcome::Inactive(detail) => report.inactive.push(detail),
+            StaleServiceRefreshOutcome::Unavailable(detail) => report.unavailable.push(detail),
             StaleServiceRefreshOutcome::Unknown(detail) => report.unknown.push(detail),
             StaleServiceRefreshOutcome::Failure(detail) => report.failures.push(detail),
         }
     }
     report.active.sort_unstable();
+    report.inactive.sort_unstable();
+    report.unavailable.sort_unstable();
     report.unknown.sort_unstable();
     report.failures.sort_unstable();
     Ok(report)
@@ -1859,6 +1868,8 @@ pub async fn restart_stale_services(
 enum StaleServiceRefreshOutcome {
     Restarted,
     Active(String),
+    Inactive(String),
+    Unavailable(String),
     Unknown(String),
     Failure(String),
 }
@@ -1868,8 +1879,26 @@ async fn refresh_stale_service(
     directory: &Path,
     workspace: Option<PathBuf>,
 ) -> StaleServiceRefreshOutcome {
+    let paths = ServicePaths::in_directory(directory);
+    let lifecycle_reachable = socket_is_live(paths.lifecycle()).await;
+    let api_reachable = socket_is_live(paths.api()).await;
+    match (lifecycle_reachable, api_reachable) {
+        (false, false) => {
+            return StaleServiceRefreshOutcome::Inactive(stale_service_diagnostic(
+                &paths,
+                workspace.as_deref(),
+            ));
+        }
+        (true, true) => {}
+        _ => {
+            return StaleServiceRefreshOutcome::Unavailable(format!(
+                "{} lifecycle_reachable={lifecycle_reachable} api_reachable={api_reachable}",
+                stale_service_diagnostic(&paths, workspace.as_deref())
+            ));
+        }
+    }
     let Some(workspace) = workspace else {
-        return StaleServiceRefreshOutcome::Unknown(directory.display().to_string());
+        return StaleServiceRefreshOutcome::Unknown(stale_service_diagnostic(&paths, None));
     };
     let config = match crate::config::Config::for_workspace(workspace.clone()) {
         Ok(config) => config,
@@ -1880,7 +1909,6 @@ async fn refresh_stale_service(
             ));
         }
     };
-    let paths = ServicePaths::in_directory(directory);
     if let Err(reason) = ensure_stale_service_is_quiescent(paths.api(), &config.workspace).await {
         if reason.starts_with("live work is still owned") {
             return StaleServiceRefreshOutcome::Active(workspace.display().to_string());
@@ -1901,6 +1929,16 @@ async fn refresh_stale_service(
             StaleServiceRefreshOutcome::Failure(format!("{}: {error}", workspace.display()))
         }
     }
+}
+
+fn stale_service_diagnostic(paths: &ServicePaths, workspace: Option<&Path>) -> String {
+    format!(
+        "workspace={} runtime_record={} lifecycle={} api={}",
+        workspace.map_or_else(|| "unknown".to_owned(), |path| path.display().to_string()),
+        paths.runtime().display(),
+        paths.lifecycle().display(),
+        paths.api().display(),
+    )
 }
 
 fn is_legacy_quiescent_rejection(error: &ControlError) -> bool {
@@ -2122,13 +2160,13 @@ mod tests {
 
     use super::{
         ControlError, ExecutableIdentity, LifecycleRequest, LifecycleResponse,
-        RESUME_ENVIRONMENT_KEYS, ServicePaths, ServiceRuntimeRecord, TransportAction,
-        TransportController, TransportStatus, TransportSupervisor, UnixListener,
+        RESUME_ENVIRONMENT_KEYS, ServicePaths, ServiceRuntimeRecord, StaleServiceRefreshOutcome,
+        TransportAction, TransportController, TransportStatus, TransportSupervisor, UnixListener,
         activation_lock_owner_is_abandoned, bind_service_listener, detach_service_process,
         ensure_service_at, exchange, executable_identity, expect_ok, frontend_api_endpoint_at,
-        ping_at, quiescence_refusal, run_lifecycle_listener, runtime_matches_cli,
-        service_arguments, service_command, service_configuration_fingerprint, service_running_at,
-        session_has_live_work, shutdown_all_services_in, workspace_from_log,
+        ping_at, quiescence_refusal, refresh_stale_service, run_lifecycle_listener,
+        runtime_matches_cli, service_arguments, service_command, service_configuration_fingerprint,
+        service_running_at, session_has_live_work, shutdown_all_services_in, workspace_from_log,
         workspace_runtime_directory_in,
     };
     use crate::config::{Config, OpenAiReasoningEffort};
@@ -2181,6 +2219,88 @@ mod tests {
         .expect("service log");
 
         assert_eq!(workspace_from_log(&log), Some(PathBuf::from("/new")));
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_reports_unidentified_inactive_sockets_without_touching_state() {
+        let directory = tempfile::tempdir().expect("runtime directory");
+        let paths = ServicePaths::in_directory(directory.path());
+        drop(std::os::unix::net::UnixListener::bind(paths.lifecycle()).expect("lifecycle socket"));
+        drop(std::os::unix::net::UnixListener::bind(paths.api()).expect("API socket"));
+        std::fs::write(paths.log(), "preserved log\n").expect("service log");
+        std::fs::write(paths.runtime(), "preserved record\n").expect("runtime record");
+
+        let outcome =
+            refresh_stale_service(Path::new("/unused/nakode"), directory.path(), None).await;
+
+        assert!(
+            matches!(outcome, StaleServiceRefreshOutcome::Inactive(detail)
+            if detail.contains("workspace=unknown")
+                && detail.contains("service.json")
+                && detail.contains("c.sock")
+                && detail.contains("api.sock"))
+        );
+        assert!(paths.lifecycle().exists());
+        assert!(paths.api().exists());
+        assert_eq!(
+            std::fs::read_to_string(paths.log()).expect("preserved log"),
+            "preserved log\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.runtime()).expect("preserved runtime record"),
+            "preserved record\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_reports_identified_inactive_sockets_without_starting_service() {
+        let directory = tempfile::tempdir().expect("runtime directory");
+        let paths = ServicePaths::in_directory(directory.path());
+        drop(std::os::unix::net::UnixListener::bind(paths.lifecycle()).expect("lifecycle socket"));
+        drop(std::os::unix::net::UnixListener::bind(paths.api()).expect("API socket"));
+        let workspace = directory.path().join("removed-workspace");
+
+        let outcome = refresh_stale_service(
+            Path::new("/missing/nakode"),
+            directory.path(),
+            Some(workspace.clone()),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, StaleServiceRefreshOutcome::Inactive(detail)
+            if detail.contains(&format!("workspace={}", workspace.display())))
+        );
+        assert!(paths.lifecycle().exists());
+        assert!(paths.api().exists());
+        assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_reports_partly_reachable_runtime_as_unavailable() {
+        let directory = tempfile::tempdir().expect("runtime directory");
+        let paths = ServicePaths::in_directory(directory.path());
+        let lifecycle = std::os::unix::net::UnixListener::bind(paths.lifecycle())
+            .expect("live lifecycle socket");
+        drop(std::os::unix::net::UnixListener::bind(paths.api()).expect("dead API socket"));
+
+        let workspace = directory.path().join("workspace");
+        let outcome = refresh_stale_service(
+            Path::new("/unused/nakode"),
+            directory.path(),
+            Some(workspace.clone()),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, StaleServiceRefreshOutcome::Unavailable(detail)
+            if detail.contains(&format!("workspace={}", workspace.display()))
+                && detail.contains("lifecycle_reachable=true")
+                && detail.contains("api_reachable=false"))
+        );
+        assert!(paths.lifecycle().exists());
+        assert!(paths.api().exists());
+        drop(lifecycle);
     }
 
     #[test]
