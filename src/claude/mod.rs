@@ -869,7 +869,8 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("@anthropic-ai/claude-agent-sdk"));
         assert!(BRIDGE_SOURCE.contains("pathToClaudeCodeExecutable"));
         assert!(BRIDGE_SOURCE.contains("canUseTool"));
-        assert!(BRIDGE_SOURCE.contains("messageId: message.uuid"));
+        assert!(BRIDGE_SOURCE.contains("event.message?.id || message.uuid"));
+        assert!(BRIDGE_SOURCE.contains("message.message.id || message.uuid"));
         assert!(BRIDGE_SOURCE.contains("blockIndex: event.index"));
         assert!(BRIDGE_SOURCE.contains("`claude:${messageId}:${blockIndex}`"));
         assert!(BRIDGE_SOURCE.contains("allowedTools: securityValidator ? []"));
@@ -1127,6 +1128,80 @@ await eval(`(async () => {
         assert_eq!(intro_id, "claude:message-a:1");
         assert_eq!(final_id, "claude:message-b:0");
         assert_ne!(intro_id, final_id);
+    }
+
+    #[test]
+    fn claude_partial_wrapper_uuids_do_not_split_one_content_block() {
+        let directory = tempfile::tempdir().expect("temporary stream identity test directory");
+        let bridge = directory.path().join("bridge.mjs");
+        let test = directory.path().join("stream-identity-test.mjs");
+        std::fs::write(&bridge, BRIDGE_SOURCE).expect("bridge fixture");
+        std::fs::write(
+            &test,
+            r#"
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const source = readFileSync(process.argv[2], "utf8");
+const start = source.indexOf("function emitStreamEvent");
+const end = source.indexOf("async function sendTurn", start);
+assert.notEqual(start, -1);
+assert.notEqual(end, -1);
+const handler = source.slice(start, end);
+const streamMessageIds = new Map();
+const emitted = [];
+const write = (message) => emitted.push(message);
+
+await eval(`(async () => {
+  ${handler}
+  emitStreamEvent("turn-1", {
+    uuid: "wrapper-start",
+    event: { type: "message_start", message: { id: "api-message-1" } },
+  });
+  emitStreamEvent("turn-1", {
+    uuid: "wrapper-delta-a",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "alpha " },
+    },
+  });
+  emitStreamEvent("turn-1", {
+    uuid: "wrapper-delta-b",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "beta" },
+    },
+  });
+  emitStreamEvent("turn-1", {
+    uuid: "wrapper-stop",
+    event: { type: "message_stop" },
+  });
+})()`);
+
+assert.deepEqual(
+  emitted.map(({ messageId, blockIndex, text }) => ({ messageId, blockIndex, text })),
+  [
+    { messageId: "api-message-1", blockIndex: 0, text: "alpha " },
+    { messageId: "api-message-1", blockIndex: 0, text: "beta" },
+  ],
+);
+assert.equal(streamMessageIds.size, 0);
+"#,
+        )
+        .expect("stream identity test script");
+
+        let output = std::process::Command::new("node")
+            .arg(&test)
+            .arg(&bridge)
+            .output()
+            .expect("run stream identity test with Node");
+        assert!(
+            output.status.success(),
+            "stream identity test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
