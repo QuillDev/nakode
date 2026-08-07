@@ -1466,6 +1466,10 @@ fn capabilities_view(capabilities: &BackendCapabilities) -> ProviderCapabilities
         (ProviderCapability::NativeTools, capabilities.native_tools),
         (ProviderCapability::Mcp, capabilities.mcp),
         (ProviderCapability::CloseSession, capabilities.close_session),
+        (
+            ProviderCapability::ExternalTools,
+            capabilities.external_tools,
+        ),
     ]
     .into_iter()
     .filter_map(|(capability, support)| {
@@ -1604,13 +1608,33 @@ mod tests {
         TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
     };
 
-    use super::{artifact_view, bootstrap, model_configuration, run_outcome};
+    use super::{artifact_view, bootstrap, capabilities_view, model_configuration, run_outcome};
     use crate::{
-        backend::{CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER, ModelInfo, PromptImage},
+        backend::{
+            BackendCapabilities, CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER,
+            CapabilitySupport, ModelInfo, PromptImage,
+        },
         domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
         session::{SubagentObservability, SubagentRecord},
         state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
     };
+
+    #[test]
+    fn provider_configuration_reports_external_tool_support() {
+        let capabilities = BackendCapabilities {
+            external_tools: CapabilitySupport::Supported,
+            ..BackendCapabilities::default()
+        };
+
+        assert!(
+            capabilities_view(&capabilities)
+                .supports(nakode_protocol::ProviderCapability::ExternalTools)
+        );
+        assert!(
+            !capabilities_view(&BackendCapabilities::default())
+                .supports(nakode_protocol::ProviderCapability::ExternalTools)
+        );
+    }
 
     #[test]
     fn model_configuration_is_derived_before_reaching_frontends() {

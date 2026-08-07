@@ -662,6 +662,9 @@ fn capabilities(value: api::ProviderCapabilities) -> Result<view::ProviderCapabi
                 api::ProviderCapability::NativeTools => Ok(view::ProviderCapability::NativeTools),
                 api::ProviderCapability::Mcp => Ok(view::ProviderCapability::Mcp),
                 api::ProviderCapability::CloseSession => Ok(view::ProviderCapability::CloseSession),
+                api::ProviderCapability::ExternalTools => {
+                    Ok(view::ProviderCapability::ExternalTools)
+                }
                 api::ProviderCapability::Unspecified => {
                     Err("unspecified provider capability".into())
                 }

@@ -22,6 +22,7 @@ pub enum ProviderCapability {
     NativeTools,
     Mcp,
     CloseSession,
+    ExternalTools,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
