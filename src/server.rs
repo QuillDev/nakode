@@ -2522,7 +2522,7 @@ mod tests {
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         service::ServiceEngine,
-        session::{ProviderRecord, SessionRecord, SubagentRecord},
+        session::{ProviderRecord, SessionRecord, SubagentObservability, SubagentRecord},
         state::{AppState, DomainCommandError},
     };
 
@@ -3796,6 +3796,7 @@ first_message = "Starting review"
                     status: crate::state::SubagentStatus::Completed,
                     latest_activity: "Completed".to_owned(),
                     transcript: Vec::new(),
+                    observability: SubagentObservability::default(),
                 })
                 .collect(),
         );
@@ -3862,6 +3863,7 @@ first_message = "Starting review"
                 model_id: None,
                 tool_audit_json: None,
             }],
+            observability: SubagentObservability::default(),
         }]);
         let core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
         let run_id = RunId::from("run-long-text");
@@ -3915,6 +3917,7 @@ first_message = "Starting review"
                     tool_audit_json: None,
                 })
                 .collect(),
+            observability: SubagentObservability::default(),
         }]);
         let core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
         let run_id = RunId::from("run-history");
@@ -4141,6 +4144,7 @@ first_message = "Starting review"
                 model_id: None,
                 tool_audit_json: None,
             }],
+            observability: SubagentObservability::default(),
         }]);
         state.client.subagent_modal = Some("run-stream".to_owned());
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
@@ -4430,6 +4434,7 @@ first_message = "Starting review"
                 objective: "review the diff".to_owned(),
                 status: crate::session::SubagentStatus::Working,
                 latest_activity: String::new(),
+                observability: SubagentObservability::default(),
             });
             state.handle_provider_backend(
                 CODEX_PROVIDER,

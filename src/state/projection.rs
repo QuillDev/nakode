@@ -4,16 +4,18 @@ use nakode_protocol::{
     AgentBrowserView, AgentDefinitionView, AgentSessionId, AgentSessionView, ArtifactId,
     ArtifactView, BootstrapView, ConnectionView, ContextUsageView, EntryId, ExternalToolCallView,
     InteractionId, InteractionKind, InteractionOptionView, InteractionStatus, InteractionView,
-    MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_SESSION_RUNS, MAX_SESSION_RUNS_BYTES,
+    MAX_ARTIFACT_BYTES, MAX_RUN_POLICY_ITEMS, MAX_RUN_POLICY_TEXT_BYTES, MAX_RUN_TEXT_BYTES,
+    MAX_RUN_TOOL_DENIAL_TEXT_BYTES, MAX_RUN_TOOL_DENIALS, MAX_SESSION_RUNS, MAX_SESSION_RUNS_BYTES,
     MAX_TRANSCRIPT_ENTRY_BODY_BYTES, MAX_TRANSCRIPT_PAGE_BODY_BYTES, MAX_TRANSCRIPT_PAGE_ENTRIES,
     MemorySettingsView, ModelConfigurationView, ModelId, ModelOptions as ProtocolModelOptions,
     ModelView, NoticeLevel, NoticeView, PromptAttachment as ProtocolPromptAttachment, PromptId,
     ProviderAuthenticationView, ProviderCapabilities, ProviderCapability, ProviderId, ProviderView,
-    QueueItemView, RecoverablePromptView, RunId, RunOutcome, RunPage, RunStatus, RunTextField,
-    RunTextWindow, RunView, SessionActivity, SessionId, SessionSummary, SessionView, SettingsView,
-    SkillView, TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView,
-    TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView,
-    TranscriptPage, TurnId, TurnStatus, TurnView, VisionSettingsView, WebSettingsView, WorkspaceId,
+    QueueItemView, RecoverablePromptView, RunId, RunOutcome, RunPage, RunPolicyView, RunStatus,
+    RunTextField, RunTextWindow, RunToolDenialView, RunView, SessionActivity, SessionId,
+    SessionSummary, SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView,
+    TodoPhaseView, TodoStatusView, TranscriptBodyWindow, TranscriptEntryKind,
+    TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TurnId, TurnStatus, TurnView,
+    VisionSettingsView, WebSettingsView, WorkspaceId,
 };
 
 use super::{
@@ -21,6 +23,7 @@ use super::{
     SubagentRun, SubagentStatus,
 };
 use crate::{
+    agent::{AgentDefinition, AgentToolProfile},
     backend::{
         BackendCapabilities, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, ModelInfo,
         TodoStatus,
@@ -611,11 +614,27 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
         )
     });
     let (outcome, outcome_window) = run_outcome_projection(status, &latest_activity, &transcript);
+    let (policy, reasoning_effort, fast_mode) = run_policy(run);
+    let (tool_denials, tool_denials_retained_total) = projected_tool_denials(state, run);
+    let ended_at_ms = run.observability.ended_at_ms;
     RunView {
         id: RunId::from(run.id.clone()),
+        parent_run_id: run.observability.parent_run_id.clone().map(RunId::from),
         agent_slug: run.agent.clone(),
+        archetype_purpose: run.observability.archetype_purpose.clone(),
         provider_id: ProviderId::from(run.provider.clone()),
         model_id: run.model.clone().map(ModelId::from),
+        reasoning_effort,
+        fast_mode,
+        started_at_ms: run.observability.started_at_ms,
+        ended_at_ms,
+        duration_ms: ended_at_ms.map(|ended| ended.saturating_sub(run.observability.started_at_ms)),
+        termination_kind: run.observability.termination_kind.clone(),
+        termination_detail: run.observability.termination_detail.clone(),
+        objective_mismatch_handoff: run.observability.objective_mismatch_handoff.clone(),
+        policy,
+        tool_denials,
+        tool_denials_retained_total,
         native_session_id: run.provider_session_id.clone(),
         usage: token_usage_view(run.usage),
         objective: objective.value,
@@ -633,6 +652,149 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
         result_total_bytes: result.as_ref().map_or(0, |window| window.total_bytes),
         transcript,
     }
+}
+
+fn run_policy(run: &SubagentRun) -> (RunPolicyView, Option<String>, bool) {
+    let definition = serde_json::from_str::<AgentDefinition>(&run.observability.policy_json)
+        .unwrap_or_else(|_| AgentDefinition {
+            slug: run.agent.clone(),
+            description: run.observability.archetype_purpose.clone(),
+            ..AgentDefinition::default()
+        });
+    let tool_profile = match definition.tool_profile {
+        AgentToolProfile::None => "none",
+        AgentToolProfile::ReadOnly => "read_only",
+        AgentToolProfile::CommandRunner => "command_runner",
+        AgentToolProfile::BoundedWatcher => "bounded_watcher",
+        AgentToolProfile::Custom => "custom",
+    }
+    .to_owned();
+    let mut truncated_fields = Vec::new();
+    let reasoning_effort = definition
+        .reasoning_effort
+        .as_deref()
+        .map(|value| bounded_policy_text(value, "reasoning_effort", &mut truncated_fields));
+    let fast_mode = definition.fast_mode;
+    let allowed_capabilities = bounded_policy_list(
+        definition.allowed_capabilities,
+        "allowed_capabilities",
+        &mut truncated_fields,
+    );
+    let denied_capabilities = bounded_policy_list(
+        definition.denied_capabilities,
+        "denied_capabilities",
+        &mut truncated_fields,
+    );
+    let allowed_tools = bounded_policy_list(
+        definition.allowed_tools,
+        "allowed_tools",
+        &mut truncated_fields,
+    );
+    let denied_tools = bounded_policy_list(
+        definition.denied_tools,
+        "denied_tools",
+        &mut truncated_fields,
+    );
+    let task_shape =
+        bounded_policy_text(&definition.task_shape, "task_shape", &mut truncated_fields);
+    let output_contract = bounded_policy_text(
+        &definition.output_contract,
+        "output_contract",
+        &mut truncated_fields,
+    );
+    (
+        RunPolicyView {
+            allowed_capabilities,
+            denied_capabilities,
+            allowed_tools,
+            denied_tools,
+            tool_profile,
+            task_shape,
+            output_contract,
+            timeout_seconds: definition.timeout_seconds,
+            max_turns: definition.max_turns,
+            can_delegate: definition.can_delegate,
+            max_delegation_depth: definition.max_delegation_depth,
+            remaining_delegation_depth: run.observability.remaining_delegation_depth,
+            require_parent_attribution: definition.require_parent_attribution,
+            truncated_fields,
+        },
+        reasoning_effort,
+        fast_mode,
+    )
+}
+
+fn bounded_policy_list(
+    mut values: Vec<String>,
+    name: &str,
+    truncated_fields: &mut Vec<String>,
+) -> Vec<String> {
+    let mut truncated = values.len() > MAX_RUN_POLICY_ITEMS;
+    values.truncate(MAX_RUN_POLICY_ITEMS);
+    for value in &mut values {
+        let bounded = bounded_text_to(value, MAX_RUN_POLICY_TEXT_BYTES);
+        truncated |= bounded.start_byte > 0;
+        *value = bounded.value;
+    }
+    if truncated {
+        truncated_fields.push(name.to_owned());
+    }
+    values
+}
+
+fn bounded_policy_text(value: &str, name: &str, truncated_fields: &mut Vec<String>) -> String {
+    let bounded = bounded_text_to(value, MAX_RUN_POLICY_TEXT_BYTES);
+    if bounded.start_byte > 0 {
+        truncated_fields.push(name.to_owned());
+    }
+    bounded.value
+}
+
+fn projected_tool_denials(state: &DomainState, run: &SubagentRun) -> (Vec<RunToolDenialView>, u32) {
+    let Some(chat) = state.subagent_chats.get(&run.id) else {
+        return (Vec::new(), 0);
+    };
+    let mut denials = chat
+        .transcript
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let audit =
+                serde_json::from_str::<serde_json::Value>(entry.tool_audit_json.as_deref()?)
+                    .ok()?;
+            if audit.get("denied").and_then(serde_json::Value::as_bool) != Some(true) {
+                return None;
+            }
+            let tool = bounded_text_to(
+                audit
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&entry.title),
+                MAX_RUN_TOOL_DENIAL_TEXT_BYTES,
+            );
+            let reason = bounded_text_to(
+                audit
+                    .get("denialReason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&entry.body),
+                MAX_RUN_TOOL_DENIAL_TEXT_BYTES,
+            );
+            Some(RunToolDenialView {
+                entry_id: entry.id.clone(),
+                tool: tool.value,
+                tool_start_byte: tool.start_byte,
+                tool_total_bytes: tool.total_bytes,
+                reason: reason.value,
+                reason_start_byte: reason.start_byte,
+                reason_total_bytes: reason.total_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let total = u32::try_from(denials.len()).unwrap_or(u32::MAX);
+    if denials.len() > MAX_RUN_TOOL_DENIALS {
+        denials.drain(..denials.len() - MAX_RUN_TOOL_DENIALS);
+    }
+    (denials, total)
 }
 
 #[cfg(test)]
@@ -733,7 +895,11 @@ impl BoundedText {
 }
 
 fn bounded_text(value: &str) -> BoundedText {
-    let tail = utf8_tail(value, MAX_RUN_TEXT_BYTES);
+    bounded_text_to(value, MAX_RUN_TEXT_BYTES)
+}
+
+fn bounded_text_to(value: &str, limit: usize) -> BoundedText {
+    let tail = utf8_tail(value, limit);
     BoundedText {
         value: tail.to_owned(),
         start_byte: u64::try_from(value.len().saturating_sub(tail.len())).unwrap_or(u64::MAX),
@@ -1423,16 +1589,18 @@ fn scoped_id(kind: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use nakode_protocol::{
-        EntryId, MAX_API_MESSAGE_BYTES, MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_SESSION_RUNS,
-        MAX_TRANSCRIPT_ENTRY_BODY_BYTES, MAX_TRANSCRIPT_PAGE_BODY_BYTES, RunId, RunOutcome,
-        RunStatus, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
+        EntryId, MAX_API_MESSAGE_BYTES, MAX_ARTIFACT_BYTES, MAX_RUN_POLICY_ITEMS,
+        MAX_RUN_POLICY_TEXT_BYTES, MAX_RUN_TEXT_BYTES, MAX_RUN_TOOL_DENIAL_TEXT_BYTES,
+        MAX_RUN_TOOL_DENIALS, MAX_SESSION_RUNS, MAX_TRANSCRIPT_ENTRY_BODY_BYTES,
+        MAX_TRANSCRIPT_PAGE_BODY_BYTES, RunId, RunOutcome, RunStatus, TranscriptEntryKind,
+        TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
     };
 
     use super::{artifact_view, bootstrap, model_configuration, run_outcome};
     use crate::{
         backend::{CODEX_PROVIDER, CURSOR_PROVIDER, ModelInfo, PromptImage},
         domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
-        session::SubagentRecord,
+        session::{SubagentObservability, SubagentRecord},
         state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
     };
 
@@ -1635,6 +1803,7 @@ mod tests {
                     status: SubagentStatus::Completed,
                     latest_activity: "Completed".to_owned(),
                     transcript: Vec::new(),
+                    observability: SubagentObservability::default(),
                 })
                 .collect(),
         );
@@ -1670,6 +1839,20 @@ mod tests {
     fn run_metadata_and_outcomes_expose_their_bounded_text_windows() {
         let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
         let body = "r".repeat(MAX_TRANSCRIPT_ENTRY_BODY_BYTES * 2);
+        let policy_json = serde_json::json!({
+            "slug": "reviewer",
+            "description": "Bounded reviewer",
+            "tool_profile": "read_only",
+            "denied_capabilities": ["filesystem_write"],
+            "allowed_tools": (0..75).map(|index| format!("tool-{index}")).collect::<Vec<_>>(),
+            "denied_tools": ["write"],
+            "output_contract": "p".repeat(MAX_RUN_POLICY_TEXT_BYTES * 2),
+            "reasoning_effort": "e".repeat(MAX_RUN_POLICY_TEXT_BYTES * 2),
+            "timeout_seconds": 300,
+            "max_turns": 5,
+            "require_parent_attribution": true,
+        })
+        .to_string();
         state.install_subagents(vec![SubagentRecord {
             parent_session_id: state.nakode_session_id.clone(),
             id: "run-large".to_owned(),
@@ -1684,20 +1867,67 @@ mod tests {
             objective: "o".repeat(MAX_RUN_TEXT_BYTES * 2),
             status: SubagentStatus::Completed,
             latest_activity: "a".repeat(MAX_RUN_TEXT_BYTES * 2),
-            transcript: vec![TranscriptEntry {
-                id: "run-entry".to_owned(),
-                key: Some("assistant".to_owned()),
-                kind: EntryKind::Assistant,
-                title: "reviewer".to_owned(),
-                body,
-                status: EntryStatus::Complete,
-                provider_id: None,
-                model_id: None,
-                tool_audit_json: None,
-            }],
+            transcript: (0..75)
+                .map(|index| TranscriptEntry {
+                    id: format!("run-entry-{index:02}"),
+                    key: Some(format!("assistant-{index}")),
+                    kind: EntryKind::Assistant,
+                    title: "reviewer".to_owned(),
+                    body: body.clone(),
+                    status: EntryStatus::Complete,
+                    provider_id: None,
+                    model_id: None,
+                    tool_audit_json: Some(
+                        serde_json::json!({
+                            "denied": true,
+                            "name": "write",
+                            "denialReason": "d".repeat(MAX_RUN_TOOL_DENIAL_TEXT_BYTES * 2),
+                        })
+                        .to_string(),
+                    ),
+                })
+                .collect(),
+            observability: SubagentObservability {
+                parent_run_id: Some("root-run".to_owned()),
+                archetype_purpose: "Bounded reviewer".to_owned(),
+                policy_json,
+                started_at_ms: 100,
+                ended_at_ms: Some(150),
+                termination_kind: Some("completed".to_owned()),
+                ..SubagentObservability::default()
+            },
         }]);
 
         let run = super::run_view(&state, &RunId::from("run-large")).expect("run projection");
+        assert_eq!(run.parent_run_id, Some(RunId::from("root-run")));
+        assert_eq!(run.archetype_purpose, "Bounded reviewer");
+        assert_eq!(run.duration_ms, Some(50));
+        assert_eq!(run.termination_kind.as_deref(), Some("completed"));
+        assert_eq!(run.policy.tool_profile, "read_only");
+        assert_eq!(run.policy.denied_tools, ["write"]);
+        assert_eq!(run.policy.allowed_tools.len(), MAX_RUN_POLICY_ITEMS);
+        assert_eq!(run.policy.output_contract.len(), MAX_RUN_POLICY_TEXT_BYTES);
+        assert_eq!(
+            run.reasoning_effort.as_ref().map(String::len),
+            Some(MAX_RUN_POLICY_TEXT_BYTES)
+        );
+        assert_eq!(
+            run.policy.truncated_fields,
+            ["reasoning_effort", "allowed_tools", "output_contract"]
+        );
+        assert_eq!(run.tool_denials.len(), MAX_RUN_TOOL_DENIALS);
+        assert_eq!(run.tool_denials_retained_total, 75);
+        assert_eq!(run.tool_denials[0].entry_id, "run-entry-25");
+        assert_eq!(run.tool_denials[0].tool, "write");
+        assert_eq!(
+            run.tool_denials[0].reason.len(),
+            MAX_RUN_TOOL_DENIAL_TEXT_BYTES
+        );
+        assert!(run.tool_denials[0].reason_start_byte > 0);
+        assert_eq!(
+            run.tool_denials[0].reason_total_bytes,
+            u64::try_from(MAX_RUN_TOOL_DENIAL_TEXT_BYTES * 2).unwrap()
+        );
         assert!(run.objective_start_byte > 0);
         assert_eq!(run.objective.len(), MAX_RUN_TEXT_BYTES);
         assert!(run.latest_activity_start_byte > 0);
@@ -1787,6 +2017,7 @@ mod tests {
             objective: "Review".to_owned(),
             status: SubagentStatus::Working,
             latest_activity: "Working".to_owned(),
+            observability: SubagentObservability::default(),
         });
         state.subagent_chats.insert(
             "run-1".to_owned(),
