@@ -71,15 +71,25 @@ pub async fn restart_stale() -> Result<(), ControlError> {
     let executable = current_executable()?;
     let report = control_service::restart_stale_services(&executable).await?;
     println!(
-        "Nakode services: {} current, {} restarted, {} active, {} unknown, {} failed",
+        "Nakode services: {} current, {} restarted, {} active, {} inactive, {} unavailable, {} unknown, {} failed",
         report.current,
         report.restarted,
         report.active.len(),
+        report.inactive.len(),
+        report.unavailable.len(),
         report.unknown.len(),
         report.failures.len()
     );
     for workspace in report.active {
         eprintln!("nakode: left active stale service running: {workspace}");
+    }
+    for detail in report.inactive {
+        eprintln!(
+            "nakode: left inactive stale service state untouched (no reachable socket listener): {detail}"
+        );
+    }
+    for detail in report.unavailable {
+        eprintln!("nakode: left partly reachable stale service state untouched: {detail}");
     }
     for detail in report.unknown {
         eprintln!("nakode: could not identify stale service workspace: {detail}");
