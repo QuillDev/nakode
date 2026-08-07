@@ -40,6 +40,9 @@ pub fn workspace_id(workspace: &str) -> WorkspaceId {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
+// Bootstrap is the exhaustive authoritative snapshot projection. Keeping the field mapping together
+// makes omissions visible when the protocol evolves and avoids partial competing projections.
 pub fn bootstrap(
     state: &DomainState,
     revision: u64,
