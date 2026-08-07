@@ -1717,6 +1717,22 @@ impl ServerCore {
         })
     }
 
+    pub(crate) fn live_work_session_ids(&self) -> Vec<String> {
+        // In-memory turns, queues, shells, and delegates exist only in attached engines. Persisted
+        // records outside this map are closed snapshots and cannot own process-local live work.
+        self.sessions_by_id
+            .iter()
+            .filter_map(|(session_id, engine)| {
+                let session = engine
+                    .bootstrap_view(&self.providers, &self.sessions)
+                    .active_session?;
+                (!matches!(session.activity, nakode_protocol::SessionActivity::Idle)
+                    || !session.queue.is_empty())
+                .then(|| session_id.to_string())
+            })
+            .collect()
+    }
+
     fn workspace_bootstrap(&self) -> nakode_protocol::BootstrapView {
         let mut bootstrap = self
             .engine()

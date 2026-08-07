@@ -111,6 +111,11 @@ enum EffectOrigin {
 pub(crate) struct NativeServerHandle {
     endpoint: ServerEndpoint,
     shutdown: mpsc::Sender<()>,
+    quiesce: mpsc::Sender<QuiesceRequest>,
+}
+
+struct QuiesceRequest {
+    respond: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
 pub(crate) struct NativeServerRuntime {
@@ -120,6 +125,8 @@ pub(crate) struct NativeServerRuntime {
     effects: EffectExecutor,
     shell_owners: HashMap<String, nakode_protocol::SessionId>,
     shutdown: mpsc::Receiver<()>,
+    quiesce: mpsc::Receiver<QuiesceRequest>,
+    accepting_work: bool,
     delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
     native_cancellation_tx: mpsc::Sender<u64>,
     native_cancellations: mpsc::Receiver<u64>,
@@ -219,10 +226,12 @@ impl NativeServerRuntime {
         let (endpoint, requests) =
             ServerEndpoint::channel(env!("CARGO_PKG_VERSION"), capabilities, 256);
         let (shutdown_tx, shutdown) = mpsc::channel(1);
+        let (quiesce_tx, quiesce) = mpsc::channel(1);
         let (native_cancellation_tx, native_cancellations) = mpsc::channel(128);
         let handle = NativeServerHandle {
             endpoint: endpoint.clone(),
             shutdown: shutdown_tx,
+            quiesce: quiesce_tx,
         };
         (
             Self {
@@ -232,6 +241,8 @@ impl NativeServerRuntime {
                 effects,
                 shell_owners: HashMap::new(),
                 shutdown,
+                quiesce,
+                accepting_work: true,
                 delegation_requests,
                 native_cancellation_tx,
                 native_cancellations,
@@ -256,6 +267,11 @@ impl NativeServerRuntime {
                         break;
                     };
                     self.handle_request(request).await;
+                }
+                request = self.quiesce.recv() => {
+                    if let Some(request) = request {
+                        self.handle_quiesce(request);
+                    }
                 }
                 request = self.delegation_requests.recv() => {
                     if let Some(request) = request {
@@ -320,7 +336,37 @@ impl NativeServerRuntime {
         self.effects.shutdown().await;
     }
 
+    fn handle_quiesce(&mut self, request: QuiesceRequest) {
+        let mut running = self.core.live_work_session_ids();
+        running.extend(
+            self.pending_native_delegations
+                .values()
+                .map(|pending| pending.session_id.to_string()),
+        );
+        running.sort();
+        running.dedup();
+        if running.is_empty() {
+            self.accepting_work = false;
+            if request.respond.send(Ok(())).is_err() {
+                // A bounded lifecycle caller abandoned the response. No other actor branch can run
+                // between the fence and this rollback, so work was never accepted while ambiguous.
+                self.accepting_work = true;
+            }
+        } else {
+            let _ = request.respond.send(Err(format!(
+                "live work is still owned by session(s) {}",
+                running.join(", ")
+            )));
+        }
+    }
+
     async fn handle_native_delegation(&mut self, request: NativeDelegationRequest) {
+        if !self.accepting_work {
+            let _ = request.respond.send(Err(
+                "workspace service is fenced for executable replacement".to_owned(),
+            ));
+            return;
+        }
         if request.cancellation.is_cancelled() || request.respond.is_closed() {
             return;
         }
@@ -439,6 +485,22 @@ impl NativeServerRuntime {
     }
 
     async fn handle_request(&mut self, request: nakode_server::ServerRequest) {
+        let request = if self.accepting_work {
+            request
+        } else {
+            match request {
+                nakode_server::ServerRequest::Command { respond, .. } => {
+                    let _ = respond.send(Err(ServiceError {
+                        code: ErrorCode::Conflict,
+                        message: "workspace service is fenced for executable replacement"
+                            .to_owned(),
+                        retryable: true,
+                    }));
+                    return;
+                }
+                request => request,
+            }
+        };
         let request = match request {
             nakode_server::ServerRequest::Query {
                 query:
@@ -685,6 +747,17 @@ fn native_service_capabilities() -> ServiceCapabilities {
 impl NativeServerHandle {
     pub(crate) const fn endpoint(&self) -> &ServerEndpoint {
         &self.endpoint
+    }
+
+    pub(crate) async fn quiesce(&self) -> Result<(), String> {
+        let (respond, response) = tokio::sync::oneshot::channel();
+        self.quiesce
+            .send(QuiesceRequest { respond })
+            .await
+            .map_err(|_| "native runtime stopped before quiescence could be checked".to_owned())?;
+        response
+            .await
+            .map_err(|_| "native runtime dropped the quiescence response".to_owned())?
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -2145,7 +2218,10 @@ mod tests {
         sync::{Arc, RwLock},
     };
 
-    use nakode_protocol::{ClientId, ErrorCode, Query, QueryResult, ServiceCapability, SessionId};
+    use nakode_protocol::{
+        ClientId, Command, ErrorCode, IdempotencyKey, Query, QueryResult, ServiceCapability,
+        SessionId,
+    };
     use tokio::sync::mpsc;
 
     use super::{
@@ -2455,6 +2531,80 @@ mod tests {
             .await
             .expect_err("invalid diagnostics query");
         assert_eq!(error.code, ErrorCode::InvalidRequest);
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
+    }
+
+    #[tokio::test]
+    async fn abandoned_quiescence_does_not_leave_runtime_fenced() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let (respond, response) = tokio::sync::oneshot::channel();
+        drop(response);
+
+        runtime.handle_quiesce(super::QuiesceRequest { respond });
+
+        assert!(runtime.accepting_work);
+    }
+
+    #[tokio::test]
+    async fn quiescence_fences_new_mutations_before_shutdown() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let workspace_id = crate::state::projection::workspace_id(&state.workspace);
+        let (runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+
+        handle.quiesce().await.expect("idle runtime quiesces");
+        let error = endpoint
+            .execute_command(
+                ClientId::from("quiescence-test"),
+                IdempotencyKey::from("after-fence"),
+                None,
+                false,
+                Command::CreateSession {
+                    workspace_id,
+                    title: None,
+                    model_id: None,
+                    options: nakode_protocol::ModelOptions::default(),
+                    tools: None,
+                },
+            )
+            .await
+            .expect_err("mutations after the fence are rejected");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(error.message.contains("fenced"));
 
         handle.shutdown().await;
         runtime.await.expect("runtime task");
