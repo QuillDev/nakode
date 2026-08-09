@@ -408,15 +408,15 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             model,
             instructions,
             owner_session_id,
-            parent_run_id: _,
+            parent_run_id,
             external_tools,
             replace_builtin_tools,
-            allowed_builtin_tools: _,
+            allowed_builtin_tools,
             max_turns,
             timeout_seconds,
         } => (
             "create",
-            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id,"maxTurns":max_turns,"timeoutSeconds":timeout_seconds,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools}),
+            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id,"parentRunId":parent_run_id,"maxTurns":max_turns,"timeoutSeconds":timeout_seconds,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools,"allowedBuiltinTools":allowed_builtin_tools}),
         ),
         BackendCommand::ResumeSession {
             provider_session_id,
@@ -873,10 +873,65 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("message.message.id || message.uuid"));
         assert!(BRIDGE_SOURCE.contains("blockIndex: event.index"));
         assert!(BRIDGE_SOURCE.contains("`claude:${messageId}:${blockIndex}`"));
-        assert!(BRIDGE_SOURCE.contains("allowedTools: securityValidator ? []"));
+        assert!(BRIDGE_SOURCE.contains("allowedTools: securityValidator"));
+        assert!(BRIDGE_SOURCE.contains("? []"));
+        assert!(BRIDGE_SOURCE.contains("authoritativeAllowedTools(command.allowedBuiltinTools)"));
         assert!(BRIDGE_SOURCE.contains("Archetype policy does not allow"));
         assert!(BRIDGE_SOURCE.contains("maxTurns: session.maxTurns"));
         assert!(BRIDGE_SOURCE.contains("session.timeoutSeconds * 1000"));
+    }
+
+    #[test]
+    fn claude_structured_tool_policy_is_exhaustive_and_fail_closed() {
+        let mappings = BRIDGE_SOURCE
+            .split("const POLICY_TOOL_NAMES = new Map([")
+            .nth(1)
+            .and_then(|source| source.split("]);\n\nconst CANONICAL_POLICY_TOOLS").next())
+            .expect("Claude policy mapping table");
+        for (canonical, provider) in [
+            ("read", "Read"),
+            ("grep", "Grep"),
+            ("find", "Glob"),
+            ("bash", "Bash"),
+            ("write", "Write"),
+            ("edit", "Edit"),
+            ("ask", "AskUserQuestion"),
+        ] {
+            assert!(
+                mappings.contains(&format!(r#"["{canonical}", ["{provider}"]]"#)),
+                "missing exact Claude mapping for {canonical}"
+            );
+        }
+        for unsupported in [
+            "ls",
+            "eval",
+            "todo",
+            "memory_search",
+            "memory_store",
+            "vision",
+            "browser",
+        ] {
+            assert!(
+                !mappings.contains(&format!(r#"["{unsupported}","#)),
+                "{unsupported} must not map to a broader Claude capability"
+            );
+            assert!(
+                BRIDGE_SOURCE.contains(&format!("  \"{unsupported}\",\n")),
+                "{unsupported} must remain explicit in the canonical policy table"
+            );
+        }
+        assert!(BRIDGE_SOURCE.contains("if (!Array.isArray(configured)) return null"));
+        assert!(BRIDGE_SOURCE.contains("if (!Array.isArray(configured)) return []"));
+        assert!(BRIDGE_SOURCE.contains("command.parentRunId || policy?.runId || null"));
+        assert!(BRIDGE_SOURCE.contains("!CANONICAL_POLICY_TOOLS.has(name)"));
+        assert!(BRIDGE_SOURCE.contains("!POLICY_TOOL_NAMES.has(name)"));
+        assert!(
+            BRIDGE_SOURCE
+                .contains("Claude cannot safely represent Nakode canonical tools; denied:")
+        );
+        assert!(
+            BRIDGE_SOURCE.contains("notably `ls`, which must not broaden into recursive `Glob`")
+        );
     }
 
     #[test]
@@ -890,7 +945,7 @@ mod tests {
             model: Some("opus".to_owned()),
             instructions: None,
             owner_session_id: Some("owner".to_owned()),
-            parent_run_id: None,
+            parent_run_id: Some("parent-run".to_owned()),
             external_tools: vec![tool],
             replace_builtin_tools: false,
             allowed_builtin_tools: None,
@@ -904,6 +959,41 @@ mod tests {
             "ReadAssociatedTicket"
         );
         assert_eq!(create.payload["replaceBuiltinTools"], false);
+        assert_eq!(create.payload["parentRunId"], "parent-run");
+        assert!(create.payload["allowedBuiltinTools"].is_null());
+
+        let restricted = bridge_request(BackendCommand::StartSession {
+            model: None,
+            instructions: None,
+            owner_session_id: Some("owner".to_owned()),
+            parent_run_id: None,
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(vec!["read".to_owned(), "find".to_owned()]),
+            max_turns: None,
+            timeout_seconds: None,
+        })
+        .expect("Claude supports restricted built-in tools")
+        .expect("bridge request");
+        assert_eq!(
+            restricted.payload["allowedBuiltinTools"],
+            json!(["read", "find"])
+        );
+
+        let denied = bridge_request(BackendCommand::StartSession {
+            model: None,
+            instructions: None,
+            owner_session_id: Some("owner".to_owned()),
+            parent_run_id: None,
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(Vec::new()),
+            max_turns: None,
+            timeout_seconds: None,
+        })
+        .expect("Claude supports an empty built-in boundary")
+        .expect("bridge request");
+        assert_eq!(denied.payload["allowedBuiltinTools"], json!([]));
 
         let resolve = bridge_request(BackendCommand::ResolveExternalTool {
             id: "external-1".to_owned(),
