@@ -445,6 +445,12 @@ async function createSession(command, resumed) {
   const instructions = command.instructions || "";
   const policy = archetypePolicy(instructions);
   const securityValidator = validatorSession(instructions);
+  const structuredAllowed = securityValidator
+    ? []
+    : authoritativeAllowedTools(command.allowedBuiltinTools);
+  const unsupportedAllowed = securityValidator
+    ? []
+    : unsupportedAllowedTools(command.allowedBuiltinTools);
   sessions.set(sessionId, {
     sessionId,
     resumed,
@@ -453,11 +459,13 @@ async function createSession(command, resumed) {
     model: command.model || "sonnet",
     options: {},
     ownerSessionId: command.ownerSessionId || null,
-    attributedRunId: policy?.runId ?? null,
+    attributedRunId: command.parentRunId || policy?.runId || null,
     securityValidator,
     validationEnabled: Boolean(command.ownerSessionId) && !securityValidator,
     delegationEnabled: policy?.canDelegate ?? true,
-    allowedTools: securityValidator ? [] : (policy?.allowedTools ?? null),
+    allowedTools: securityValidator
+      ? []
+      : (structuredAllowed ?? policy?.allowedTools ?? null),
     deniedTools: policy?.deniedTools ?? [],
     maxTurns: command.maxTurns || null,
     timeoutSeconds: command.timeoutSeconds || null,
@@ -466,6 +474,12 @@ async function createSession(command, resumed) {
       : [],
     replaceBuiltinTools: command.replaceBuiltinTools === true,
   });
+  if (unsupportedAllowed.length > 0) {
+    write({
+      event: "diagnostic",
+      message: `Claude cannot safely represent Nakode canonical tools; denied: ${unsupportedAllowed.join(", ")}`,
+    });
+  }
   let history = [];
   if (resumed) {
     try {
@@ -497,16 +511,64 @@ function validatorSession(instructions) {
 }
 
 const POLICY_TOOL_NAMES = new Map([
-  ["read", "Read"],
-  ["grep", "Grep"],
-  ["find", "Glob"],
-  ["ls", "Glob"],
-  ["bash", "Bash"],
-  ["write", "Write"],
-  ["edit", "Edit"],
-  ["browser", "WebFetch"],
-  ["ask", "AskUserQuestion"],
+  ["read", ["Read"]],
+  ["grep", ["Grep"]],
+  ["find", ["Glob"]],
+  ["bash", ["Bash"]],
+  ["write", ["Write"]],
+  ["edit", ["Edit"]],
+  ["ask", ["AskUserQuestion"]],
 ]);
+
+const CANONICAL_POLICY_TOOLS = new Set([
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "bash",
+  "write",
+  "edit",
+  "eval",
+  "todo",
+  "ask",
+  "memory_search",
+  "memory_store",
+  "vision",
+  "browser",
+]);
+
+/**
+ * Translate Nakode's authoritative canonical built-in boundary for Claude.
+ *
+ * `null` means the caller supplied no structured boundary, so legacy prompt-policy parsing remains
+ * available. An explicit empty array is deny-all. Canonical tools without an exact provider
+ * equivalent — notably `ls`, which must not broaden into recursive `Glob` — and unknown names stay
+ * denied and are reported through a protocol diagnostic.
+ */
+function authoritativeAllowedTools(configured) {
+  if (!Array.isArray(configured)) return null;
+  return [
+    ...new Set(
+      configured.flatMap((name) =>
+        typeof name === "string" ? (POLICY_TOOL_NAMES.get(name) ?? []) : [],
+      ),
+    ),
+  ];
+}
+
+function unsupportedAllowedTools(configured) {
+  if (!Array.isArray(configured)) return [];
+  return [
+    ...new Set(
+      configured.filter(
+        (name) =>
+          typeof name !== "string" ||
+          !CANONICAL_POLICY_TOOLS.has(name) ||
+          !POLICY_TOOL_NAMES.has(name),
+      ),
+    ),
+  ].map(String);
+}
 
 function archetypePolicy(instructions) {
   const start = instructions.lastIndexOf("[Nakode Archetype Policy]");
@@ -517,16 +579,12 @@ function archetypePolicy(instructions) {
   const configured = /Allowed tools: ([^\n]+)/.exec(policy)?.[1] || "none";
   const denied = /Denied tools: ([^\n]+)/.exec(policy)?.[1] || "none";
   const names = configured === "none" ? [] : configured.split(",").map((name) => name.trim());
-  const mapped = names.flatMap((name) => {
-    const toolName = POLICY_TOOL_NAMES.get(name);
-    return toolName ? [toolName] : [];
-  });
+  const mapped = names.flatMap((name) => POLICY_TOOL_NAMES.get(name) ?? []);
   const deniedTools = denied === "none"
     ? []
     : denied
         .split(",")
-        .map((name) => POLICY_TOOL_NAMES.get(name.trim()))
-        .filter((name) => name !== undefined);
+        .flatMap((name) => POLICY_TOOL_NAMES.get(name.trim()) ?? []);
   let allowedTools;
   if (profile === "none") allowedTools = [];
   // Empty custom policy preserves legacy definitions; restrictive profiles never do.
