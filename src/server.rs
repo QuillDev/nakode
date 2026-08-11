@@ -2655,6 +2655,7 @@ mod tests {
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendIdentity, BackendOperation,
             CODEX_PROVIDER, CapabilitySupport, ModelCapabilities, ModelInfo, PromptImage,
+            TurnOutcome,
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         personality::PromptAddenda,
@@ -4922,6 +4923,149 @@ first_message = "Starting review"
                 .as_ref()
                 .is_some_and(|turn| turn.cancelling)
         );
+    }
+
+    #[test]
+    fn current_session_cancellation_overrides_intervening_revision_progress() {
+        let mut state =
+            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities {
+                    interruption: CapabilitySupport::Supported,
+                    ..BackendCapabilities::default()
+                },
+            }),
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::SessionCreated {
+                provider_session_id: "provider-session".to_owned(),
+                model: "model-a".to_owned(),
+            },
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::TurnStarted {
+                turn_id: "provider-turn".to_owned(),
+            },
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+        let observed_revision = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+
+        // Primary and delegated backend events share this revision boundary. Advancing it after the
+        // client observation deterministically models the race without making cancellation timing
+        // dependent on an asynchronous provider.
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .note_state_change();
+
+        let (fenced_result, fenced_effects, _, fenced_changed) = core.execute_idempotent(
+            IdempotencyKey::from("revision-fenced-cancel"),
+            Some(observed_revision),
+            false,
+            Command::CancelSessionWork {
+                session_id: session_id.clone(),
+            },
+        );
+        assert!(matches!(
+            fenced_result,
+            Err(error)
+                if error.code == ErrorCode::Conflict
+                    && error.message == "the expected revision is stale"
+        ));
+        assert!(fenced_effects.is_empty());
+        assert!(!fenced_changed);
+
+        let (result, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("priority-current-work-cancel"),
+            None,
+            false,
+            Command::CancelSessionWork { session_id },
+        );
+        result.expect("unfenced current-work cancellation is accepted");
+        assert!(changed);
+        assert!(matches!(
+            effects.as_slice(),
+            [crate::state::Effect::Backend(BackendCommand::InterruptTurn { turn_id, .. })]
+                if turn_id == "provider-turn"
+        ));
+    }
+
+    #[test]
+    fn current_session_cancellation_targets_a_successor_current_at_execution() {
+        let mut state =
+            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities {
+                    interruption: CapabilitySupport::Supported,
+                    ..BackendCapabilities::default()
+                },
+            }),
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::SessionCreated {
+                provider_session_id: "provider-session".to_owned(),
+                model: "model-a".to_owned(),
+            },
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::TurnStarted {
+                turn_id: "turn-1".to_owned(),
+            },
+        );
+        state
+            .enqueue_prompt("successor".to_owned(), Vec::new())
+            .expect("queue successor");
+        let completion_effects = state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::TurnCompleted {
+                turn_id: "turn-1".to_owned(),
+                outcome: TurnOutcome::Completed,
+                error: None,
+            },
+        );
+        assert!(completion_effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::StartTurn { .. })
+        )));
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::TurnStarted {
+                turn_id: "turn-2".to_owned(),
+            },
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+
+        let (result, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("cancel-current-successor"),
+            None,
+            false,
+            Command::CancelSessionWork { session_id },
+        );
+        result.expect("current successor cancellation is accepted");
+        assert!(changed);
+        assert!(matches!(
+            effects.as_slice(),
+            [crate::state::Effect::Backend(BackendCommand::InterruptTurn { turn_id, .. })]
+                if turn_id == "turn-2"
+        ));
     }
 
     #[test]

@@ -406,7 +406,11 @@ impl NakodeClient {
         )
     }
 
-    /// Cancels server-owned work for a logical session.
+    /// Cancels server-owned work current for a logical session when the command executes.
+    ///
+    /// Omitting `expected_revision` makes this a priority lifecycle operation: newer provider or
+    /// delegated-run progress does not invalidate it, and a successor turn that became current before
+    /// execution is included in the cancellation scope.
     ///
     /// # Errors
     /// Returns a transport or server status error.
