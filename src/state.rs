@@ -3325,9 +3325,10 @@ impl DomainState {
 
     /// Cancels the cancellable work owned by this logical session.
     ///
-    /// This is the server-side policy boundary used by thin clients: a
-    /// frontend does not need to enumerate provider turns and delegated runs
-    /// or decide which internal cancellation operations are required.
+    /// This priority lifecycle command selects the work current when it executes. Callers omit the
+    /// expected session revision when provider and delegated-run progress must not invalidate an
+    /// explicit stop. A frontend does not need to enumerate provider turns and delegated runs or
+    /// decide which internal cancellation operations are required.
     ///
     /// # Errors
     /// Rejects the request when no cancellable work exists or when the active
@@ -8274,6 +8275,39 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
 
         assert!(matches!(effects.as_slice(), [Effect::CancelShell(cancelled)] if cancelled == &id));
         assert_eq!(state.status_message, "Interrupting shell command…");
+    }
+
+    #[test]
+    fn cancelling_session_work_interrupts_primary_and_delegated_work_together() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        let run_id = begin_mocked_subagent(&mut state);
+        state.provider_session_id = Some("primary-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "primary-turn".to_owned(),
+            model: Some("model-a".to_owned()),
+            cancelling: false,
+        });
+
+        let effects = state
+            .cancel_session_work()
+            .expect("session work cancellation");
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::InterruptTurn { turn_id, .. })
+                if turn_id == "primary-turn"
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::StopSubagent(cancelled) if cancelled == &run_id
+        )));
+        assert!(
+            state
+                .subagents
+                .iter()
+                .any(|run| { run.id == run_id && run.status == SubagentStatus::Interrupted })
+        );
     }
 
     #[test]

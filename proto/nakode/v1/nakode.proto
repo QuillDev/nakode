@@ -67,6 +67,7 @@ service NakodeService {
 message MutationOptions {
   // SDK-generated and stable across a retry of one logical operation.
   string idempotency_key = 1;
+  // When omitted, the command is evaluated against authoritative state current at execution time.
   optional uint64 expected_revision = 2;
 }
 
@@ -166,6 +167,10 @@ message RemoveQueuedPromptRequest { MutationOptions mutation = 1; string session
 message SteerQueuedPromptRequest { MutationOptions mutation = 1; string session_id = 2; string prompt_id = 3; }
 message SteerTurnRequest { MutationOptions mutation = 1; string turn_id = 2; string text = 3; }
 message CancelTurnRequest { MutationOptions mutation = 1; string turn_id = 2; }
+// Priority lifecycle command that cancels all cancellable work owned by the session when the command
+// executes, including its active turn, delegated runs, compaction, and shells. Clients that intend
+// current-session-work cancellation omit mutation.expected_revision so background progress cannot
+// invalidate the request.
 message CancelSessionWorkRequest { MutationOptions mutation = 1; string session_id = 2; }
 message CompactContextRequest { MutationOptions mutation = 1; string agent_session_id = 2; }
 message RunShellRequest { MutationOptions mutation = 1; string session_id = 2; string command = 3; }

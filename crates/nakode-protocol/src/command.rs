@@ -274,6 +274,10 @@ pub enum Command {
     CancelTurn {
         turn_id: TurnId,
     },
+    /// Cancels all cancellable work owned by the logical session when this command executes.
+    ///
+    /// This is a priority session-policy operation rather than a turn-identity operation. Callers
+    /// omit the expected revision when background progress must not invalidate the stop request.
     CancelSessionWork {
         session_id: SessionId,
     },
