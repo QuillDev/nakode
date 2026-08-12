@@ -164,6 +164,63 @@ fn session_tools(
     })
 }
 
+fn mcp_grant(
+    value: Option<api::McpSessionGrant>,
+) -> Result<Option<protocol::McpSessionGrant>, tonic::Status> {
+    value
+        .map(|value| {
+            let surface = match api::McpSessionSurface::try_from(value.surface)
+                .unwrap_or(api::McpSessionSurface::Unspecified)
+            {
+                api::McpSessionSurface::Chat => Some(protocol::McpSessionSurface::Chat),
+                api::McpSessionSurface::CodingAgent => {
+                    Some(protocol::McpSessionSurface::CodingAgent)
+                }
+                api::McpSessionSurface::Unspecified => None,
+            };
+            Ok(protocol::McpSessionGrant {
+                surface,
+                server_ids: value.server_ids,
+            })
+        })
+        .transpose()
+}
+
+fn mcp_grants(value: Option<api::McpGrantPolicy>) -> protocol::McpGrantPolicy {
+    value.map_or_else(protocol::McpGrantPolicy::default, |value| {
+        protocol::McpGrantPolicy {
+            chat: value.chat,
+            coding_agent: value.coding_agent,
+            archetype_slugs: value.archetype_slugs,
+        }
+    })
+}
+
+fn mcp_server_input(
+    value: Option<api::McpServerInput>,
+) -> Result<protocol::McpServerInput, tonic::Status> {
+    let value = value.ok_or_else(|| tonic::Status::invalid_argument("MCP server is required"))?;
+    Ok(protocol::McpServerInput {
+        id: value.id,
+        display_name: value.display_name,
+        endpoint: value.endpoint,
+        transport: value.transport,
+        enabled: value.enabled,
+        auth_kind: value.auth_kind,
+        credential_required: value.credential_required,
+        protocol_version: value.protocol_version,
+        provenance_url: value.provenance_url,
+        provenance_version: value.provenance_version,
+        provenance_commit: value.provenance_commit,
+        provenance_sha256: value.provenance_sha256,
+        license_evidence: value.license_evidence,
+        timeout_ms: value.timeout_ms,
+        max_response_bytes: value.max_response_bytes,
+        artifact_semantics: value.artifact_semantics,
+        template_id: value.template_id,
+    })
+}
+
 fn model_target(value: Option<api::ModelTarget>) -> Result<protocol::ModelTarget, tonic::Status> {
     use api::model_target::Target;
     match value
@@ -409,6 +466,92 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             expected_digest: input.expected_digest,
         }
     );
+    async fn get_mcp_management(
+        &self,
+        request: tonic::Request<api::GetMcpManagementRequest>,
+    ) -> Result<tonic::Response<api::McpManagement>, tonic::Status> {
+        let result = self
+            .query(protocol::Query::GetMcpManagement {
+                workspace_id: protocol::WorkspaceId::from(request.into_inner().workspace_id),
+            })
+            .await?;
+        let protocol::QueryResult::McpManagement(value) = result.value else {
+            return Err(tonic::Status::internal(
+                "unexpected MCP management response",
+            ));
+        };
+        Ok(tonic::Response::new(mcp_management(value)))
+    }
+
+    command_rpc!(
+        save_mcp_server,
+        api::SaveMcpServerRequest,
+        input,
+        protocol::Command::SaveMcpServer {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            server: mcp_server_input(input.server)?,
+            grants: mcp_grants(input.grants),
+        }
+    );
+    command_rpc!(
+        delete_mcp_server,
+        api::DeleteMcpServerRequest,
+        input,
+        protocol::Command::DeleteMcpServer {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            server_id: input.server_id
+        }
+    );
+    command_rpc!(
+        set_mcp_server_enabled,
+        api::SetMcpServerEnabledRequest,
+        input,
+        protocol::Command::SetMcpServerEnabled {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            server_id: input.server_id,
+            enabled: input.enabled
+        }
+    );
+    command_rpc!(
+        refresh_mcp_server,
+        api::RefreshMcpServerRequest,
+        input,
+        protocol::Command::RefreshMcpServer {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            server_id: input.server_id
+        }
+    );
+    command_rpc!(
+        set_mcp_server_credential,
+        api::SetMcpServerCredentialRequest,
+        input,
+        protocol::Command::SetMcpServerCredential {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            server_id: input.server_id,
+            kind: input.kind,
+            credential: protocol::CredentialInput(input.credential)
+        }
+    );
+    command_rpc!(
+        clear_mcp_server_credential,
+        api::ClearMcpServerCredentialRequest,
+        input,
+        protocol::Command::ClearMcpServerCredential {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            server_id: input.server_id
+        }
+    );
+    command_rpc!(
+        set_mcp_server_grants,
+        api::SetMcpServerGrantsRequest,
+        input,
+        protocol::Command::SetMcpServerGrants {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            server_id: input.server_id,
+            grants: mcp_grants(input.grants)
+        }
+    );
+
     command_rpc!(
         create_session,
         api::CreateSessionRequest,
@@ -418,7 +561,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             title: input.title,
             model_id: input.model_id.map(protocol::ModelId::from),
             options: model_options(input.options),
-            tools: session_tools(input.tools)
+            tools: session_tools(input.tools),
+            mcp_grant: mcp_grant(input.mcp_grant)?,
         }
     );
     command_rpc!(
@@ -427,7 +571,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         input,
         protocol::Command::OpenSession {
             session_id: protocol::SessionId::from(input.session_id),
-            tools: session_tools(input.tools)
+            tools: session_tools(input.tools),
+            mcp_grant: mcp_grant(input.mcp_grant)?,
         }
     );
 
@@ -1164,6 +1309,76 @@ pub(crate) fn cursor(value: &protocol::Cursor) -> api::Cursor {
     api::Cursor {
         server_epoch: value.server_epoch.to_string(),
         sequence: value.sequence,
+    }
+}
+
+pub(crate) fn mcp_management(value: protocol::McpManagementView) -> api::McpManagement {
+    api::McpManagement {
+        workspace_id: value.workspace_id.to_string(),
+        servers: value
+            .servers
+            .into_iter()
+            .map(|server| api::McpServer {
+                id: server.id,
+                workspace_id: server.workspace_id.to_string(),
+                display_name: server.display_name,
+                endpoint: server.endpoint,
+                transport: server.transport,
+                enabled: server.enabled,
+                health: server.health,
+                credential_required: server.credential_required,
+                credential_configured: server.credential_configured,
+                credential_kind: server.credential_kind,
+                protocol_version: server.protocol_version,
+                server_name: server.server_name,
+                server_version: server.server_version,
+                provenance_url: server.provenance_url,
+                provenance_version: server.provenance_version,
+                provenance_commit: server.provenance_commit,
+                provenance_sha256: server.provenance_sha256,
+                license_evidence: server.license_evidence,
+                last_error: server.last_error,
+                last_connected_at_ms: server.last_connected_at_ms,
+                updated_at_ms: server.updated_at_ms,
+                timeout_ms: server.timeout_ms,
+                max_response_bytes: server.max_response_bytes,
+                artifact_semantics: server.artifact_semantics,
+                template_id: server.template_id,
+                tools: server
+                    .tools
+                    .into_iter()
+                    .map(|tool| api::McpTool {
+                        remote_name: tool.remote_name,
+                        exposed_name: tool.exposed_name,
+                        description: tool.description,
+                        input_schema_json: tool.input_schema_json,
+                        app_only: tool.app_only,
+                    })
+                    .collect(),
+                grants: Some(api::McpGrantPolicy {
+                    chat: server.grants.chat,
+                    coding_agent: server.grants.coding_agent,
+                    archetype_slugs: server.grants.archetype_slugs,
+                }),
+            })
+            .collect(),
+        templates: value
+            .templates
+            .into_iter()
+            .map(|template| api::McpTemplate {
+                id: template.id,
+                display_name: template.display_name,
+                description: template.description,
+                endpoint: template.endpoint,
+                provenance_url: template.provenance_url,
+                provenance_version: template.provenance_version,
+                provenance_commit: template.provenance_commit,
+                provenance_sha256: template.provenance_sha256,
+                license_evidence: template.license_evidence,
+                artifact_semantics: template.artifact_semantics,
+                credential_required: template.credential_required,
+            })
+            .collect(),
     }
 }
 

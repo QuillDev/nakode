@@ -857,6 +857,22 @@ pub enum Effect {
         kind: String,
         metadata: serde_json::Value,
     },
+    SaveMcpServer(crate::mcp::McpServerRecord),
+    RefreshMcpServer(crate::mcp::McpServerRecord),
+    DeleteMcpServer {
+        workspace: String,
+        server_id: String,
+    },
+    SaveMcpCredential {
+        workspace: String,
+        server_id: String,
+        kind: String,
+        secret: String,
+    },
+    ClearMcpCredential {
+        workspace: String,
+        server_id: String,
+    },
     ClearProviderCredential(String),
     ReloadProvider(String),
     #[cfg(test)]
@@ -976,6 +992,8 @@ pub struct DomainState {
     pub questions: VecDeque<QuestionPrompt>,
     pub external_tool_calls: Vec<crate::backend::ExternalToolRequest>,
     external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
+    mcp_tools: Vec<nakode_protocol::ExternalToolDefinition>,
+    mcp_archetype_grants: HashMap<String, HashSet<String>>,
     replace_builtin_tools: bool,
     pub todo_phases: Vec<TodoPhase>,
     pub status_message: String,
@@ -1636,6 +1654,8 @@ impl DomainState {
             questions: VecDeque::new(),
             external_tool_calls: Vec::new(),
             external_tools: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_archetype_grants: HashMap::new(),
             replace_builtin_tools: false,
             todo_phases: Vec::new(),
             status_message: format!("Connecting to {backend_name}…"),
@@ -2863,7 +2883,7 @@ impl DomainState {
         effects.push(Effect::Backend(BackendCommand::ResumeSession {
             provider_session_id: session.provider_session_id,
             owner_session_id: Some(self.nakode_session_id.clone()),
-            external_tools: self.external_tools.clone(),
+            external_tools: self.provider_external_tools(),
             replace_builtin_tools: self.replace_builtin_tools,
         }));
         effects
@@ -5096,6 +5116,82 @@ impl DomainState {
         Ok(Vec::new())
     }
 
+    /// Installs the exact Nakode-owned MCP tool table before provider start.
+    ///
+    /// # Errors
+    /// Returns an error when the session is already active or tool identities collide.
+    pub fn configure_mcp_tools(
+        &mut self,
+        tools: Vec<nakode_protocol::ExternalToolDefinition>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        if self.is_busy() || self.provider_session_id.is_some() {
+            return Err(DomainCommandError::Invalid(
+                "MCP tools must be granted before the first prompt".to_owned(),
+            ));
+        }
+        let mut names = HashSet::new();
+        for tool in &tools {
+            if !tool.name.starts_with(nakode_protocol::MCP_TOOL_PREFIX)
+                || !names.insert(tool.name.as_str())
+            {
+                return Err(DomainCommandError::Invalid(
+                    "MCP tool names must use the reserved prefix and be unique".to_owned(),
+                ));
+            }
+            serde_json::from_str::<serde_json::Value>(&tool.input_schema_json).map_err(
+                |error| {
+                    DomainCommandError::Invalid(format!(
+                        "invalid schema for MCP tool {}: {error}",
+                        tool.name
+                    ))
+                },
+            )?;
+        }
+        if tools
+            .iter()
+            .any(|mcp| self.external_tools.iter().any(|tool| tool.name == mcp.name))
+        {
+            return Err(DomainCommandError::Invalid(
+                "client-owned tools cannot collide with Nakode MCP tools".to_owned(),
+            ));
+        }
+        self.mcp_tools = tools;
+        Ok(Vec::new())
+    }
+
+    pub fn configure_mcp_archetype_grants(&mut self, grants: HashMap<String, HashSet<String>>) {
+        self.mcp_archetype_grants = grants;
+    }
+
+    #[must_use]
+    pub fn has_mcp_tool(&self, name: &str) -> bool {
+        self.mcp_tools.iter().any(|tool| tool.name == name)
+    }
+
+    #[must_use]
+    pub fn subagent_has_mcp_tool(&self, run_id: &str, name: &str) -> bool {
+        self.subagent_executions
+            .get(run_id)
+            .is_some_and(|execution| {
+                self.has_mcp_tool(name)
+                    && self.mcp_archetype_grants.get(name).is_some_and(|slugs| {
+                        slugs.contains(&execution.definition.slug)
+                            && execution
+                                .definition
+                                .allowed_tools
+                                .contains(&name.to_owned())
+                    })
+            })
+    }
+
+    fn provider_external_tools(&self) -> Vec<nakode_protocol::ExternalToolDefinition> {
+        self.external_tools
+            .iter()
+            .chain(self.mcp_tools.iter())
+            .cloned()
+            .collect()
+    }
+
     /// Resolves a pending external tool request.
     ///
     /// # Errors
@@ -6120,7 +6216,7 @@ impl DomainState {
                 instructions: Some(self.nakode_system_instructions()),
                 owner_session_id: Some(self.nakode_session_id.clone()),
                 parent_run_id: None,
-                external_tools: self.external_tools.clone(),
+                external_tools: self.provider_external_tools(),
                 replace_builtin_tools: self.replace_builtin_tools,
                 allowed_builtin_tools: None,
                 max_turns: None,
@@ -7276,6 +7372,19 @@ impl DomainState {
         let timeout_seconds = execution.definition.timeout_seconds;
         let instructions =
             Some(prompt_addenda.apply(&validator_instructions, qualified_model.as_deref()));
+        let mcp_tools = self.mcp_tools.clone();
+        let mcp_archetype_grants = self.mcp_archetype_grants.clone();
+        let archetype_slug = execution.definition.slug.clone();
+        let external_tools = mcp_tools
+            .iter()
+            .filter(|tool| {
+                execution.definition.allowed_tools.contains(&tool.name)
+                    && mcp_archetype_grants
+                        .get(&tool.name)
+                        .is_some_and(|slugs| slugs.contains(&archetype_slug))
+            })
+            .cloned()
+            .collect();
         self.sync_subagent(run_id);
         vec![Effect::SubagentBackend {
             run_id: run_id.to_owned(),
@@ -7284,7 +7393,7 @@ impl DomainState {
                 instructions,
                 owner_session_id: Some(self.nakode_session_id.clone()),
                 parent_run_id: Some(run_id.to_owned()),
-                external_tools: Vec::new(),
+                external_tools,
                 replace_builtin_tools,
                 allowed_builtin_tools,
                 max_turns,

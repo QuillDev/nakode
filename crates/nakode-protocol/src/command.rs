@@ -3,8 +3,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentSessionId, ArtifactId, EntryId, InteractionId, ModelId, PromptId, ProviderId, RunId,
-    SessionId, TurnId, WorkspaceId,
+    AgentSessionId, ArtifactId, EntryId, InteractionId, McpGrantPolicy, McpServerInput,
+    McpSessionGrant, ModelId, PromptId, ProviderId, RunId, SessionId, TurnId, WorkspaceId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -240,11 +240,17 @@ pub enum Command {
         options: ModelOptions,
         /// Client-owned tools installed before this session can accept a prompt.
         tools: Option<SessionToolConfiguration>,
+        /// Explicit, deny-by-default Nakode MCP server grants for this session.
+        #[serde(default)]
+        mcp_grant: Option<McpSessionGrant>,
     },
     OpenSession {
         session_id: SessionId,
         /// Tools for closed-session restoration, or the identical table for idempotent reattachment.
         tools: Option<SessionToolConfiguration>,
+        /// Explicit MCP grant used only when restoring a closed session.
+        #[serde(default)]
+        mcp_grant: Option<McpSessionGrant>,
     },
     /// Sends a prompt using server-owned queue-versus-start policy.
     SendPrompt {
@@ -335,6 +341,39 @@ pub enum Command {
     ReloadProvider {
         provider_id: ProviderId,
     },
+    SaveMcpServer {
+        workspace_id: WorkspaceId,
+        server: McpServerInput,
+        grants: McpGrantPolicy,
+    },
+    DeleteMcpServer {
+        workspace_id: WorkspaceId,
+        server_id: String,
+    },
+    SetMcpServerEnabled {
+        workspace_id: WorkspaceId,
+        server_id: String,
+        enabled: bool,
+    },
+    RefreshMcpServer {
+        workspace_id: WorkspaceId,
+        server_id: String,
+    },
+    SetMcpServerCredential {
+        workspace_id: WorkspaceId,
+        server_id: String,
+        kind: String,
+        credential: CredentialInput,
+    },
+    ClearMcpServerCredential {
+        workspace_id: WorkspaceId,
+        server_id: String,
+    },
+    SetMcpServerGrants {
+        workspace_id: WorkspaceId,
+        server_id: String,
+        grants: McpGrantPolicy,
+    },
     SaveAgent {
         workspace_id: WorkspaceId,
         definition: AgentDefinitionInput,
@@ -377,6 +416,9 @@ pub enum Query {
         session_id: Option<SessionId>,
     },
     GetSoul {
+        workspace_id: WorkspaceId,
+    },
+    GetMcpManagement {
         workspace_id: WorkspaceId,
     },
     ListSessions {
@@ -461,6 +503,7 @@ mod tests {
                 fast_mode: false,
             },
             tools: None,
+            mcp_grant: None,
         };
         assert_eq!(
             serde_json::to_value(creation).expect("serialize configured session creation"),

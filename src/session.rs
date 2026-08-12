@@ -16,6 +16,7 @@ use crate::{
     backend::{ModelInfo, ModelOptions},
     credential::CredentialMetadata,
     domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
+    mcp::McpServerRecord,
     memory::{MemoryBackend, MemoryConfig},
     settings::TerminalImageMode,
     vision::VisionConfig,
@@ -282,6 +283,26 @@ pub trait SessionRepository: Send + Sync {
         model: &str,
         options: &ModelOptions,
     ) -> Result<(), SessionError>;
+    /// Saves a Nakode-owned MCP server definition and its redacted runtime snapshot.
+    ///
+    /// # Errors
+    /// Returns an error when the definition cannot be encoded or persisted.
+    fn save_mcp_server(&self, server: &McpServerRecord) -> Result<(), SessionError>;
+    /// Lists MCP servers scoped to one workspace.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried or decoded.
+    fn list_mcp_servers(&self, workspace: &str) -> Result<Vec<McpServerRecord>, SessionError>;
+    /// Deletes one MCP server, grants, discoveries, audits, and credential metadata reference.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
+    fn delete_mcp_server(&self, workspace: &str, server_id: &str) -> Result<(), SessionError>;
+    /// Appends a bounded invocation audit record without credentials.
+    ///
+    /// # Errors
+    /// Returns an error when the audit record cannot be persisted.
+    fn audit_mcp_invocation(&self, audit: &McpInvocationAudit) -> Result<(), SessionError>;
     /// Lists configured providers.
     ///
     /// # Errors
@@ -344,6 +365,19 @@ pub trait SessionRepository: Send + Sync {
     fn save_terminal_image_mode(&self, mode: TerminalImageMode) -> Result<(), SessionError>;
 }
 
+pub struct McpInvocationAudit {
+    pub id: String,
+    pub workspace: String,
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub server_id: String,
+    pub tool_name: String,
+    pub arguments_json: String,
+    pub result_json: String,
+    pub status: String,
+    pub started_at_ms: u64,
+    pub duration_ms: u64,
+}
 pub struct SqliteSessionRepository {
     connection: Mutex<Connection>,
     path: PathBuf,
@@ -447,6 +481,61 @@ impl SqliteSessionRepository {
                credential_json TEXT NOT NULL,
                updated_at INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS mcp_servers (
+               workspace TEXT NOT NULL,
+               id TEXT NOT NULL,
+               display_name TEXT NOT NULL,
+               endpoint TEXT NOT NULL,
+               transport TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               auth_kind TEXT NOT NULL,
+               credential_required INTEGER NOT NULL,
+               protocol_version TEXT NOT NULL,
+               provenance_url TEXT NOT NULL,
+               provenance_version TEXT NOT NULL,
+               provenance_commit TEXT NOT NULL,
+               provenance_sha256 TEXT NOT NULL,
+               license_evidence TEXT NOT NULL,
+               timeout_ms INTEGER NOT NULL,
+               max_response_bytes INTEGER NOT NULL,
+               artifact_semantics TEXT NOT NULL,
+               template_id TEXT,
+               health TEXT NOT NULL,
+               server_name TEXT,
+               server_version TEXT,
+               last_error TEXT,
+               last_connected_at_ms INTEGER,
+               updated_at_ms INTEGER NOT NULL,
+               credential_kind TEXT,
+               tools_json TEXT NOT NULL DEFAULT '[]',
+               grants_json TEXT NOT NULL DEFAULT '{}',
+               PRIMARY KEY(workspace, id)
+             );
+             CREATE INDEX IF NOT EXISTS mcp_servers_workspace_name
+               ON mcp_servers(workspace, display_name COLLATE NOCASE);
+             CREATE TABLE IF NOT EXISTS mcp_credentials (
+               workspace TEXT NOT NULL,
+               server_id TEXT NOT NULL,
+               credential_kind TEXT NOT NULL,
+               credential_json TEXT NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(workspace, server_id)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_invocation_audit (
+               id TEXT PRIMARY KEY,
+               workspace TEXT NOT NULL,
+               session_id TEXT NOT NULL,
+               run_id TEXT,
+               server_id TEXT NOT NULL,
+               tool_name TEXT NOT NULL,
+               arguments_json TEXT NOT NULL,
+               result_json TEXT NOT NULL,
+               status TEXT NOT NULL,
+               started_at_ms INTEGER NOT NULL,
+               duration_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS mcp_invocation_audit_session
+               ON mcp_invocation_audit(session_id, started_at_ms DESC);
              CREATE TABLE IF NOT EXISTS native_runtime_sessions (
                provider TEXT NOT NULL,
                session_id TEXT NOT NULL,
@@ -1095,6 +1184,194 @@ impl SessionRepository for SqliteSessionRepository {
                 i64::from(options.fast_mode)
             ],
         )?;
+        Ok(())
+    }
+
+    fn save_mcp_server(&self, server: &McpServerRecord) -> Result<(), SessionError> {
+        let tools = serde_json::to_string(&server.tools).map_err(|error| {
+            SessionError::InvalidStoredValue {
+                field: "mcp_servers.tools_json",
+                value: error.to_string(),
+            }
+        })?;
+        let grants = serde_json::to_string(&server.grants).map_err(|error| {
+            SessionError::InvalidStoredValue {
+                field: "mcp_servers.grants_json",
+                value: error.to_string(),
+            }
+        })?;
+        self.connection
+            .lock()
+            .expect("session database mutex poisoned")
+            .execute(
+                "INSERT INTO mcp_servers (
+                   workspace, id, display_name, endpoint, transport, enabled, auth_kind,
+                   credential_required, protocol_version, provenance_url, provenance_version,
+                   provenance_commit, provenance_sha256, license_evidence, timeout_ms,
+                   max_response_bytes, artifact_semantics, template_id, health, server_name,
+                   server_version, last_error, last_connected_at_ms, updated_at_ms,
+                   credential_kind, tools_json, grants_json
+                 ) VALUES (
+                   ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                   ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+                 ) ON CONFLICT(workspace, id) DO UPDATE SET
+                   display_name=excluded.display_name, endpoint=excluded.endpoint,
+                   transport=excluded.transport, enabled=excluded.enabled,
+                   auth_kind=excluded.auth_kind, credential_required=excluded.credential_required,
+                   protocol_version=excluded.protocol_version, provenance_url=excluded.provenance_url,
+                   provenance_version=excluded.provenance_version,
+                   provenance_commit=excluded.provenance_commit,
+                   provenance_sha256=excluded.provenance_sha256,
+                   license_evidence=excluded.license_evidence, timeout_ms=excluded.timeout_ms,
+                   max_response_bytes=excluded.max_response_bytes,
+                   artifact_semantics=excluded.artifact_semantics, template_id=excluded.template_id,
+                   health=excluded.health, server_name=excluded.server_name,
+                   server_version=excluded.server_version, last_error=excluded.last_error,
+                   last_connected_at_ms=excluded.last_connected_at_ms,
+                   updated_at_ms=excluded.updated_at_ms, credential_kind=excluded.credential_kind,
+                   tools_json=excluded.tools_json, grants_json=excluded.grants_json",
+                params![
+                    server.workspace,
+                    server.id,
+                    server.display_name,
+                    server.endpoint,
+                    server.transport,
+                    i64::from(server.enabled),
+                    server.auth_kind,
+                    i64::from(server.credential_required),
+                    server.protocol_version,
+                    server.provenance_url,
+                    server.provenance_version,
+                    server.provenance_commit,
+                    server.provenance_sha256,
+                    server.license_evidence,
+                    i64::from(server.timeout_ms),
+                    i64::from(server.max_response_bytes),
+                    server.artifact_semantics,
+                    server.template_id,
+                    server.health,
+                    server.server_name,
+                    server.server_version,
+                    server.last_error,
+                    server.last_connected_at_ms.and_then(|value| i64::try_from(value).ok()),
+                    i64::try_from(server.updated_at_ms).unwrap_or(i64::MAX),
+                    server.credential_kind,
+                    tools,
+                    grants,
+                ],
+            )?;
+        Ok(())
+    }
+
+    fn list_mcp_servers(&self, workspace: &str) -> Result<Vec<McpServerRecord>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, display_name, endpoint, transport, enabled, auth_kind,
+                    credential_required, protocol_version, provenance_url, provenance_version,
+                    provenance_commit, provenance_sha256, license_evidence, timeout_ms,
+                    max_response_bytes, artifact_semantics, template_id, health, server_name,
+                    server_version, last_error, last_connected_at_ms, updated_at_ms,
+                    credential_kind, tools_json, grants_json
+             FROM mcp_servers WHERE workspace = ?1 ORDER BY display_name COLLATE NOCASE, id",
+        )?;
+        statement
+            .query_map([workspace], |row| {
+                let tools_source = row.get::<_, String>(24)?;
+                let grants_source = row.get::<_, String>(25)?;
+                let tools = serde_json::from_str(&tools_source).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        tools_source.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                let grants = serde_json::from_str(&grants_source).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        grants_source.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(McpServerRecord {
+                    id: row.get(0)?,
+                    workspace: workspace.to_owned(),
+                    display_name: row.get(1)?,
+                    endpoint: row.get(2)?,
+                    transport: row.get(3)?,
+                    enabled: row.get::<_, i64>(4)? != 0,
+                    auth_kind: row.get(5)?,
+                    credential_required: row.get::<_, i64>(6)? != 0,
+                    protocol_version: row.get(7)?,
+                    provenance_url: row.get(8)?,
+                    provenance_version: row.get(9)?,
+                    provenance_commit: row.get(10)?,
+                    provenance_sha256: row.get(11)?,
+                    license_evidence: row.get(12)?,
+                    timeout_ms: u32::try_from(row.get::<_, i64>(13)?).unwrap_or(u32::MAX),
+                    max_response_bytes: u32::try_from(row.get::<_, i64>(14)?).unwrap_or(u32::MAX),
+                    artifact_semantics: row.get(15)?,
+                    template_id: row.get(16)?,
+                    health: row.get(17)?,
+                    server_name: row.get(18)?,
+                    server_version: row.get(19)?,
+                    last_error: row.get(20)?,
+                    last_connected_at_ms: row
+                        .get::<_, Option<i64>>(21)?
+                        .and_then(|value| u64::try_from(value).ok()),
+                    updated_at_ms: u64::try_from(row.get::<_, i64>(22)?).unwrap_or_default(),
+                    credential_kind: row.get(23)?,
+                    tools,
+                    grants,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn delete_mcp_server(&self, workspace: &str, server_id: &str) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM mcp_credentials WHERE workspace = ?1 AND server_id = ?2",
+            params![workspace, server_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM mcp_servers WHERE workspace = ?1 AND id = ?2",
+            params![workspace, server_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn audit_mcp_invocation(&self, audit: &McpInvocationAudit) -> Result<(), SessionError> {
+        self.connection
+            .lock()
+            .expect("session database mutex poisoned")
+            .execute(
+                "INSERT INTO mcp_invocation_audit (
+                   id, workspace, session_id, run_id, server_id, tool_name, arguments_json,
+                   result_json, status, started_at_ms, duration_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    audit.id,
+                    audit.workspace,
+                    audit.session_id,
+                    audit.run_id,
+                    audit.server_id,
+                    audit.tool_name,
+                    audit.arguments_json,
+                    audit.result_json,
+                    audit.status,
+                    i64::try_from(audit.started_at_ms).unwrap_or(i64::MAX),
+                    i64::try_from(audit.duration_ms).unwrap_or(i64::MAX),
+                ],
+            )?;
         Ok(())
     }
 

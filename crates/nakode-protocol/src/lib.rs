@@ -9,6 +9,7 @@ mod command;
 mod diagnostics;
 mod error;
 mod ids;
+mod mcp;
 mod service;
 mod view;
 
@@ -26,6 +27,10 @@ pub use ids::{
     AgentSessionId, ArtifactId, ClientId, EntryId, IdempotencyKey, InteractionId, ModelId,
     PromptId, ProviderId, RequestId, RunId, ServerEpoch, SessionId, SubscriptionId, TurnId,
     WorkspaceId,
+};
+pub use mcp::{
+    MCP_TOOL_PREFIX, McpGrantPolicy, McpManagementView, McpServerInput, McpServerView,
+    McpSessionGrant, McpSessionSurface, McpTemplateView, McpToolView,
 };
 pub use service::{
     CommandAccepted, Cursor, QueryResult, ServiceCapabilities, ServiceCapability, Snapshot,

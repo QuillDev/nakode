@@ -17,6 +17,16 @@ service NakodeService {
   rpc GetSoul(GetSoulRequest) returns (SoulDocument);
   rpc SaveSoul(SaveSoulRequest) returns (MutationResult);
 
+  // Nakode-owned, workspace-scoped MCP authority. Returned records are always redacted.
+  rpc GetMcpManagement(GetMcpManagementRequest) returns (McpManagement);
+  rpc SaveMcpServer(SaveMcpServerRequest) returns (MutationResult);
+  rpc DeleteMcpServer(DeleteMcpServerRequest) returns (MutationResult);
+  rpc SetMcpServerEnabled(SetMcpServerEnabledRequest) returns (MutationResult);
+  rpc RefreshMcpServer(RefreshMcpServerRequest) returns (MutationResult);
+  rpc SetMcpServerCredential(SetMcpServerCredentialRequest) returns (MutationResult);
+  rpc ClearMcpServerCredential(ClearMcpServerCredentialRequest) returns (MutationResult);
+  rpc SetMcpServerGrants(SetMcpServerGrantsRequest) returns (MutationResult);
+
   rpc CreateSession(CreateSessionRequest) returns (MutationResult);
   rpc OpenSession(OpenSessionRequest) returns (MutationResult);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
@@ -128,6 +138,8 @@ message CreateSessionRequest {
   ModelOptions options = 5;
   // Atomically validated and installed before publication. Requires `InitialSessionTools`.
   optional SessionToolConfiguration tools = 6;
+  // Explicit, deny-by-default Nakode MCP grant; omitted means no MCP access.
+  optional McpSessionGrant mcp_grant = 7;
 }
 // Supplying tools installs them before a closed session begins provider restoration. An already
 // attached session accepts only the identical table, making client reattachment idempotent without
@@ -136,6 +148,7 @@ message OpenSessionRequest {
   MutationOptions mutation = 1;
   string session_id = 2;
   optional SessionToolConfiguration tools = 3;
+  optional McpSessionGrant mcp_grant = 4;
 }
 message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // Removes a logical session and its persisted history. Deletion is AUTHORITATIVE: a
@@ -211,6 +224,91 @@ message SubmitExternalToolResultRequest {
   string output = 4;
   bool failed = 5;
 }
+
+enum McpSessionSurface {
+  MCP_SESSION_SURFACE_UNSPECIFIED = 0;
+  MCP_SESSION_SURFACE_CHAT = 1;
+  MCP_SESSION_SURFACE_CODING_AGENT = 2;
+}
+message McpSessionGrant { McpSessionSurface surface = 1; repeated string server_ids = 2; }
+message McpGrantPolicy { bool chat = 1; bool coding_agent = 2; repeated string archetype_slugs = 3; }
+message McpServerInput {
+  string id = 1;
+  string display_name = 2;
+  string endpoint = 3;
+  string transport = 4;
+  bool enabled = 5;
+  string auth_kind = 6;
+  bool credential_required = 7;
+  string protocol_version = 8;
+  string provenance_url = 9;
+  string provenance_version = 10;
+  string provenance_commit = 11;
+  string provenance_sha256 = 12;
+  string license_evidence = 13;
+  uint32 timeout_ms = 14;
+  uint32 max_response_bytes = 15;
+  string artifact_semantics = 16;
+  optional string template_id = 17;
+}
+message McpTool {
+  string remote_name = 1;
+  string exposed_name = 2;
+  string description = 3;
+  string input_schema_json = 4;
+  bool app_only = 5;
+}
+message McpServer {
+  string id = 1;
+  string workspace_id = 2;
+  string display_name = 3;
+  string endpoint = 4;
+  string transport = 5;
+  bool enabled = 6;
+  string health = 7;
+  bool credential_required = 8;
+  bool credential_configured = 9;
+  optional string credential_kind = 10;
+  string protocol_version = 11;
+  optional string server_name = 12;
+  optional string server_version = 13;
+  string provenance_url = 14;
+  string provenance_version = 15;
+  string provenance_commit = 16;
+  string provenance_sha256 = 17;
+  string license_evidence = 18;
+  optional string last_error = 19;
+  optional uint64 last_connected_at_ms = 20;
+  uint64 updated_at_ms = 21;
+  uint32 timeout_ms = 22;
+  uint32 max_response_bytes = 23;
+  string artifact_semantics = 24;
+  optional string template_id = 25;
+  repeated McpTool tools = 26;
+  McpGrantPolicy grants = 27;
+}
+message McpTemplate {
+  string id = 1;
+  string display_name = 2;
+  string description = 3;
+  string endpoint = 4;
+  string provenance_url = 5;
+  string provenance_version = 6;
+  string provenance_commit = 7;
+  string provenance_sha256 = 8;
+  string license_evidence = 9;
+  string artifact_semantics = 10;
+  bool credential_required = 11;
+}
+message McpManagement { string workspace_id = 1; repeated McpServer servers = 2; repeated McpTemplate templates = 3; }
+message GetMcpManagementRequest { string workspace_id = 1; }
+message SaveMcpServerRequest { MutationOptions mutation = 1; string workspace_id = 2; McpServerInput server = 3; McpGrantPolicy grants = 4; }
+message DeleteMcpServerRequest { MutationOptions mutation = 1; string workspace_id = 2; string server_id = 3; }
+message SetMcpServerEnabledRequest { MutationOptions mutation = 1; string workspace_id = 2; string server_id = 3; bool enabled = 4; }
+message RefreshMcpServerRequest { MutationOptions mutation = 1; string workspace_id = 2; string server_id = 3; }
+message SetMcpServerCredentialRequest { MutationOptions mutation = 1; string workspace_id = 2; string server_id = 3; string kind = 4; string credential = 5; }
+message ClearMcpServerCredentialRequest { MutationOptions mutation = 1; string workspace_id = 2; string server_id = 3; }
+message SetMcpServerGrantsRequest { MutationOptions mutation = 1; string workspace_id = 2; string server_id = 3; McpGrantPolicy grants = 4; }
 
 message ModelOptions { optional string reasoning_effort = 1; bool fast_mode = 2; }
 message ModelTarget {

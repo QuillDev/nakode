@@ -13,12 +13,12 @@ use std::{
 
 use nakode_protocol::{
     AgentDefinitionInput, AgentSessionId, Command, CommandAccepted, CredentialInput, EntryId,
-    ErrorCode, IdempotencyKey, MAX_ARTIFACT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES, ModelTarget,
-    PromptInput, ProviderId, Query, QueryResult, RunId, RunMetadataView, RunTextField, RunView,
-    ServiceCapability, ServiceError, SessionId, SessionMetadataView, SessionView, Snapshot,
-    SoulDocumentView, SubscriptionScope, SubscriptionView, TranscriptEntryStatus,
-    TranscriptEntryView, TranscriptOwner, TranscriptPage, TranscriptWindowView, ViewEvent,
-    WorkspaceId,
+    ErrorCode, IdempotencyKey, MAX_ARTIFACT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES, McpGrantPolicy,
+    McpServerInput, McpSessionGrant, ModelTarget, PromptInput, ProviderId, Query, QueryResult,
+    RunId, RunMetadataView, RunTextField, RunView, ServiceCapability, ServiceError, SessionId,
+    SessionMetadataView, SessionView, Snapshot, SoulDocumentView, SubscriptionScope,
+    SubscriptionView, TranscriptEntryStatus, TranscriptEntryView, TranscriptOwner, TranscriptPage,
+    TranscriptWindowView, ViewEvent, WorkspaceId,
 };
 use nakode_server::{ServerEndpoint, ServerRequest};
 use sha2::{Digest, Sha256};
@@ -36,6 +36,11 @@ use crate::{
 const IDEMPOTENCY_CAPACITY: usize = 1_024;
 
 type DomainCommandOutcome = Result<(CommandAccepted, Vec<Effect>), DomainCommandError>;
+type McpArchetypeGrants = HashMap<String, std::collections::HashSet<String>>;
+type McpInstalledGrant = (
+    Vec<nakode_protocol::ExternalToolDefinition>,
+    McpArchetypeGrants,
+);
 
 pub(crate) struct DispatchOutcome {
     pub(crate) effects: Vec<Effect>,
@@ -71,6 +76,7 @@ pub struct ServerCore {
     sessions_by_id: HashMap<SessionId, ServiceEngine>,
     default_session: SessionId,
     session_template: crate::state::DomainState,
+    mcp_servers: Vec<crate::mcp::McpServerRecord>,
     providers: Vec<ProviderRecord>,
     sessions: Vec<SessionRecord>,
     command_cache: HashMap<IdempotencyKey, CachedCommand>,
@@ -94,6 +100,7 @@ impl ServerCore {
             sessions_by_id,
             default_session,
             session_template,
+            mcp_servers: Vec::new(),
             providers,
             sessions,
             command_cache: HashMap::new(),
@@ -147,7 +154,46 @@ impl ServerCore {
             .expect("the default session runtime always exists")
     }
 
+    pub(crate) fn install_mcp_servers(&mut self, servers: Vec<crate::mcp::McpServerRecord>) {
+        self.mcp_servers = servers;
+    }
+
     #[must_use]
+    pub(crate) fn mcp_servers(&self) -> &[crate::mcp::McpServerRecord] {
+        &self.mcp_servers
+    }
+
+    pub(crate) fn replace_mcp_server(&mut self, server: crate::mcp::McpServerRecord) {
+        if let Some(existing) = self
+            .mcp_servers
+            .iter_mut()
+            .find(|item| item.id == server.id)
+        {
+            *existing = server;
+        } else {
+            self.mcp_servers.push(server);
+            self.mcp_servers
+                .sort_by(|left, right| left.display_name.cmp(&right.display_name));
+        }
+    }
+
+    pub(crate) fn remove_mcp_server(&mut self, server_id: &str) {
+        self.mcp_servers.retain(|server| server.id != server_id);
+    }
+
+    #[must_use]
+    pub(crate) fn mcp_management(&self) -> nakode_protocol::McpManagementView {
+        nakode_protocol::McpManagementView {
+            workspace_id: WorkspaceId::from(self.engine().state().workspace.clone()),
+            servers: self
+                .mcp_servers
+                .iter()
+                .map(crate::mcp::McpServerRecord::view)
+                .collect(),
+            templates: vec![crate::mcp::excalidraw_template()],
+        }
+    }
+
     pub(crate) fn default_session_id(&self) -> &SessionId {
         &self.default_session
     }
@@ -380,11 +426,20 @@ impl ServerCore {
                 model_id,
                 options,
                 tools,
+                mcp_grant,
                 ..
-            } => self.create_session_command(&workspace_id, model_id.as_ref(), &options, tools),
-            Command::OpenSession { session_id, tools } => {
-                self.open_session_command(&session_id, tools)
-            }
+            } => self.create_session_command_with_mcp(
+                &workspace_id,
+                model_id.as_ref(),
+                &options,
+                tools,
+                mcp_grant.as_ref(),
+            ),
+            Command::OpenSession {
+                session_id,
+                tools,
+                mcp_grant,
+            } => self.open_session_command_with_mcp(&session_id, tools, mcp_grant.as_ref()),
             Command::SendPrompt { session_id, prompt } => {
                 let enqueue = self
                     .engine_for(&session_id)
@@ -472,6 +527,41 @@ impl ServerCore {
                 self.clear_provider_credential_command(&provider_id)
             }
             Command::ReloadProvider { provider_id } => self.reload_provider_command(&provider_id),
+            Command::SaveMcpServer {
+                workspace_id,
+                server,
+                grants,
+            } => self.save_mcp_server_command(&workspace_id, server, grants),
+            Command::DeleteMcpServer {
+                workspace_id,
+                server_id,
+            } => self.delete_mcp_server_command(&workspace_id, &server_id),
+            Command::SetMcpServerEnabled {
+                workspace_id,
+                server_id,
+                enabled,
+            } => self.set_mcp_server_enabled_command(&workspace_id, &server_id, enabled),
+            Command::RefreshMcpServer {
+                workspace_id,
+                server_id,
+            } => self.refresh_mcp_server_command(&workspace_id, &server_id),
+            Command::SetMcpServerCredential {
+                workspace_id,
+                server_id,
+                kind,
+                credential,
+            } => {
+                self.set_mcp_server_credential_command(&workspace_id, &server_id, kind, credential)
+            }
+            Command::ClearMcpServerCredential {
+                workspace_id,
+                server_id,
+            } => self.clear_mcp_server_credential_command(&workspace_id, &server_id),
+            Command::SetMcpServerGrants {
+                workspace_id,
+                server_id,
+                grants,
+            } => self.set_mcp_server_grants_command(&workspace_id, &server_id, grants),
             Command::SaveAgent {
                 workspace_id,
                 definition,
@@ -496,12 +586,24 @@ impl ServerCore {
         }
     }
 
+    #[cfg(test)]
     fn create_session_command(
         &mut self,
         workspace_id: &WorkspaceId,
         model_id: Option<&nakode_protocol::ModelId>,
         options: &nakode_protocol::ModelOptions,
         tools: Option<nakode_protocol::SessionToolConfiguration>,
+    ) -> DomainCommandOutcome {
+        self.create_session_command_with_mcp(workspace_id, model_id, options, tools, None)
+    }
+
+    fn create_session_command_with_mcp(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        model_id: Option<&nakode_protocol::ModelId>,
+        options: &nakode_protocol::ModelOptions,
+        tools: Option<nakode_protocol::SessionToolConfiguration>,
+        mcp_grant: Option<&McpSessionGrant>,
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
         if model_id.is_none() && (options.reasoning_effort.is_some() || options.fast_mode) {
@@ -529,14 +631,31 @@ impl ServerCore {
                     .configure_external_tools(tools.tools, tools.replace_builtin_tools)?,
             );
         }
+        if let Some(grant) = mcp_grant {
+            let (mcp_tools, archetype_grants) = self.mcp_tools_for_grant(grant)?;
+            effects.extend(engine.state_mut().configure_mcp_tools(mcp_tools)?);
+            engine
+                .state_mut()
+                .configure_mcp_archetype_grants(archetype_grants);
+        }
         self.sessions_by_id.insert(session_id.clone(), engine);
         Ok(Self::accepted(Some(session_id.to_string()), effects))
     }
 
+    #[cfg(test)]
     fn open_session_command(
         &mut self,
         session_id: &SessionId,
         tools: Option<nakode_protocol::SessionToolConfiguration>,
+    ) -> DomainCommandOutcome {
+        self.open_session_command_with_mcp(session_id, tools, None)
+    }
+
+    fn open_session_command_with_mcp(
+        &mut self,
+        session_id: &SessionId,
+        tools: Option<nakode_protocol::SessionToolConfiguration>,
+        mcp_grant: Option<&McpSessionGrant>,
     ) -> DomainCommandOutcome {
         let loaded = self
             .sessions_by_id
@@ -561,6 +680,11 @@ impl ServerCore {
                             &tools.tools,
                             tools.replace_builtin_tools,
                         )?;
+                }
+                if mcp_grant.is_some() {
+                    return Err(DomainCommandError::Invalid(
+                        "an attached session cannot change its MCP grant".to_owned(),
+                    ));
                 }
                 return Ok(Self::accepted(Some(loaded.to_string()), Vec::new()));
             }
@@ -595,6 +719,13 @@ impl ServerCore {
             engine
                 .state_mut()
                 .configure_external_tools(tools.tools, tools.replace_builtin_tools)?;
+        }
+        if let Some(grant) = mcp_grant {
+            let (mcp_tools, archetype_grants) = self.mcp_tools_for_grant(grant)?;
+            engine.state_mut().configure_mcp_tools(mcp_tools)?;
+            engine
+                .state_mut()
+                .configure_mcp_archetype_grants(archetype_grants);
         }
         let effects = engine.state_mut().begin_resume(session.clone());
         let loaded_id = SessionId::from(session.id.clone());
@@ -904,6 +1035,166 @@ impl ServerCore {
         Ok(Self::accepted(None, effects))
     }
 
+    fn mcp_tools_for_grant(
+        &self,
+        grant: &McpSessionGrant,
+    ) -> Result<McpInstalledGrant, DomainCommandError> {
+        crate::mcp::validate_grant(grant, &self.mcp_servers)
+            .map(|servers| {
+                let mut archetype_grants = HashMap::new();
+                let tools = servers
+                    .into_iter()
+                    .flat_map(|server| {
+                        server
+                            .tools
+                            .into_iter()
+                            .filter(|tool| !tool.app_only)
+                            .map(move |tool| (tool, server.grants.archetype_slugs.clone()))
+                    })
+                    .map(|(tool, slugs)| {
+                        archetype_grants
+                            .insert(tool.exposed_name.clone(), slugs.into_iter().collect());
+                        tool.external_definition()
+                    })
+                    .collect();
+                (tools, archetype_grants)
+            })
+            .map_err(|error| DomainCommandError::Invalid(error.to_string()))
+    }
+
+    fn save_mcp_server_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        server: McpServerInput,
+        grants: McpGrantPolicy,
+    ) -> DomainCommandOutcome {
+        self.ensure_workspace(workspace_id)?;
+        let server = crate::mcp::input_record(workspace_id, server, grants);
+        crate::mcp::validate_server(&server)
+            .map_err(|error| DomainCommandError::Invalid(error.to_string()))?;
+        Ok(Self::accepted(
+            Some(server.id.clone()),
+            vec![Effect::SaveMcpServer(server)],
+        ))
+    }
+
+    fn delete_mcp_server_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        server_id: &str,
+    ) -> DomainCommandOutcome {
+        self.ensure_workspace(workspace_id)?;
+        self.ensure_mcp_server(server_id)?;
+        Ok(Self::accepted(
+            Some(server_id.to_owned()),
+            vec![Effect::DeleteMcpServer {
+                workspace: workspace_id.to_string(),
+                server_id: server_id.to_owned(),
+            }],
+        ))
+    }
+
+    fn set_mcp_server_enabled_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        server_id: &str,
+        enabled: bool,
+    ) -> DomainCommandOutcome {
+        self.ensure_workspace(workspace_id)?;
+        let mut server = self.mcp_server(server_id)?.clone();
+        server.enabled = enabled;
+        (if enabled { "saved" } else { "disabled" }).clone_into(&mut server.health);
+        server.updated_at_ms = crate::mcp::unix_time_ms();
+        Ok(Self::accepted(
+            Some(server_id.to_owned()),
+            vec![Effect::SaveMcpServer(server)],
+        ))
+    }
+
+    fn refresh_mcp_server_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        server_id: &str,
+    ) -> DomainCommandOutcome {
+        self.ensure_workspace(workspace_id)?;
+        let server = self.mcp_server(server_id)?.clone();
+        Ok(Self::accepted(
+            Some(server_id.to_owned()),
+            vec![Effect::RefreshMcpServer(server)],
+        ))
+    }
+
+    fn set_mcp_server_credential_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        server_id: &str,
+        kind: String,
+        credential: CredentialInput,
+    ) -> DomainCommandOutcome {
+        self.ensure_workspace(workspace_id)?;
+        self.ensure_mcp_server(server_id)?;
+        if credential.0.is_empty() {
+            return Err(DomainCommandError::Invalid(
+                "MCP credential cannot be empty".to_owned(),
+            ));
+        }
+        Ok(Self::accepted(
+            Some(server_id.to_owned()),
+            vec![Effect::SaveMcpCredential {
+                workspace: workspace_id.to_string(),
+                server_id: server_id.to_owned(),
+                kind,
+                secret: credential.0,
+            }],
+        ))
+    }
+
+    fn clear_mcp_server_credential_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        server_id: &str,
+    ) -> DomainCommandOutcome {
+        self.ensure_workspace(workspace_id)?;
+        self.ensure_mcp_server(server_id)?;
+        Ok(Self::accepted(
+            Some(server_id.to_owned()),
+            vec![Effect::ClearMcpCredential {
+                workspace: workspace_id.to_string(),
+                server_id: server_id.to_owned(),
+            }],
+        ))
+    }
+
+    fn set_mcp_server_grants_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        server_id: &str,
+        grants: McpGrantPolicy,
+    ) -> DomainCommandOutcome {
+        self.ensure_workspace(workspace_id)?;
+        let mut server = self.mcp_server(server_id)?.clone();
+        server.grants = grants;
+        server.updated_at_ms = crate::mcp::unix_time_ms();
+        Ok(Self::accepted(
+            Some(server_id.to_owned()),
+            vec![Effect::SaveMcpServer(server)],
+        ))
+    }
+
+    fn mcp_server(
+        &self,
+        server_id: &str,
+    ) -> Result<&crate::mcp::McpServerRecord, DomainCommandError> {
+        self.mcp_servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .ok_or_else(|| DomainCommandError::NotFound(format!("MCP server {server_id}")))
+    }
+
+    fn ensure_mcp_server(&self, server_id: &str) -> Result<(), DomainCommandError> {
+        self.mcp_server(server_id).map(|_| ())
+    }
+
     fn set_provider_enabled_command(
         &self,
         provider_id: &ProviderId,
@@ -1186,6 +1477,10 @@ impl ServerCore {
                 Ok(QueryResult::Bootstrap(Box::new(view)))
             }
             Query::GetSoul { workspace_id } => self.query_soul(workspace_id),
+            Query::GetMcpManagement { workspace_id } => {
+                self.ensure_workspace(&workspace_id).map_err(domain_error)?;
+                Ok(QueryResult::McpManagement(self.mcp_management()))
+            }
             Query::ListSessions {
                 workspace_id,
                 limit,
@@ -2075,6 +2370,13 @@ impl ServerCore {
             | Command::SetProviderCredential { .. }
             | Command::ClearProviderCredential { .. }
             | Command::ReloadProvider { .. }
+            | Command::SaveMcpServer { .. }
+            | Command::DeleteMcpServer { .. }
+            | Command::SetMcpServerEnabled { .. }
+            | Command::RefreshMcpServer { .. }
+            | Command::SetMcpServerCredential { .. }
+            | Command::ClearMcpServerCredential { .. }
+            | Command::SetMcpServerGrants { .. }
             | Command::SaveAgent { .. }
             | Command::SaveSoul { .. }
             | Command::DeleteAgent { .. }
