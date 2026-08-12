@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArtifactView, BootstrapView, RunId, RunTextWindow, RunView, ServerEpoch, SessionId,
-    SessionSummary, SessionView, TranscriptBodyWindow, WorkspaceId,
+    ArtifactView, BootstrapView, McpManagementView, RunId, RunTextWindow, RunView, ServerEpoch,
+    SessionId, SessionSummary, SessionView, TranscriptBodyWindow, WorkspaceId,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -31,6 +31,8 @@ pub enum ServiceCapability {
     ArchetypeManagement,
     /// Owner-facing clients may inspect and atomically mutate Nakode's one configured SOUL.md.
     SoulManagement,
+    /// Nakode owns MCP configuration, credentials, discovery, grants, invocation, and audit.
+    McpManagement,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -87,6 +89,7 @@ pub struct CommandAccepted {
 pub enum QueryResult {
     Bootstrap(Box<BootstrapView>),
     SoulDocument(SoulDocumentView),
+    McpManagement(McpManagementView),
     Sessions(Vec<SessionSummary>),
     Session(Box<SessionView>),
     Transcript(crate::TranscriptPage),

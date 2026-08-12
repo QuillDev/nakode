@@ -98,6 +98,7 @@ pub(crate) struct PersistenceServices {
 pub(crate) struct EffectExecutor {
     pub(crate) backends: BackendRegistry,
     pub(crate) persistence: PersistenceServices,
+    pub(crate) mcp: crate::mcp::McpClient,
     pub(crate) shell_processes: ShellProcesses,
 }
 
@@ -120,6 +121,35 @@ struct QuiesceRequest {
     respond: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
+struct PendingMcpCall {
+    source: BackendSource,
+    session_id: nakode_protocol::SessionId,
+    run_id: Option<String>,
+    server_id: String,
+    remote_name: String,
+    arguments_json: String,
+    started_at_ms: u64,
+    started: Instant,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+struct McpCallCompletion {
+    call_id: String,
+    result: Result<String, crate::mcp::McpError>,
+}
+
+struct PendingMcpDiscovery {
+    request_id: u64,
+    server_id: String,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+struct McpDiscoveryCompletion {
+    request_id: u64,
+    server: crate::mcp::McpServerRecord,
+    result: Result<crate::mcp::DiscoveryResult, crate::mcp::McpError>,
+}
+
 pub(crate) struct NativeServerRuntime {
     core: ServerCore,
     endpoint: ServerEndpoint,
@@ -134,6 +164,13 @@ pub(crate) struct NativeServerRuntime {
     native_cancellations: mpsc::Receiver<u64>,
     pending_native_delegations: HashMap<u64, PendingNativeDelegation>,
     next_native_delegation_request: u64,
+    mcp_call_tx: mpsc::Sender<McpCallCompletion>,
+    mcp_calls: mpsc::Receiver<McpCallCompletion>,
+    pending_mcp_calls: HashMap<String, PendingMcpCall>,
+    mcp_discovery_tx: mpsc::Sender<McpDiscoveryCompletion>,
+    mcp_discoveries: mpsc::Receiver<McpDiscoveryCompletion>,
+    pending_mcp_discoveries: HashMap<String, PendingMcpDiscovery>,
+    next_mcp_discovery_request: u64,
 }
 
 pub(crate) struct PreparedRuntime {
@@ -235,14 +272,21 @@ impl NativeServerRuntime {
         let (shutdown_tx, shutdown) = mpsc::channel(1);
         let (quiesce_tx, quiesce) = mpsc::channel(1);
         let (native_cancellation_tx, native_cancellations) = mpsc::channel(128);
+        let (mcp_call_tx, mcp_calls) = mpsc::channel(128);
+        let (mcp_discovery_tx, mcp_discoveries) = mpsc::channel(32);
         let handle = NativeServerHandle {
             endpoint: endpoint.clone(),
             shutdown: shutdown_tx,
             quiesce: quiesce_tx,
         };
+        let mut core = ServerCore::new(engine, providers, sessions);
+        let workspace = core.engine().state().workspace.clone();
+        if let Ok(servers) = effects.persistence.sessions.list_mcp_servers(&workspace) {
+            core.install_mcp_servers(servers);
+        }
         (
             Self {
-                core: ServerCore::new(engine, providers, sessions),
+                core,
                 endpoint,
                 requests,
                 effects,
@@ -255,6 +299,13 @@ impl NativeServerRuntime {
                 native_cancellations,
                 pending_native_delegations: HashMap::new(),
                 next_native_delegation_request: 1,
+                mcp_call_tx,
+                mcp_calls,
+                pending_mcp_calls: HashMap::new(),
+                mcp_discovery_tx,
+                mcp_discoveries,
+                pending_mcp_discoveries: HashMap::new(),
+                next_mcp_discovery_request: 1,
             },
             handle,
         )
@@ -288,6 +339,16 @@ impl NativeServerRuntime {
                 request_id = self.native_cancellations.recv() => {
                     if let Some(request_id) = request_id {
                         self.cancel_native_delegation(request_id).await;
+                    }
+                }
+                completion = self.mcp_calls.recv() => {
+                    if let Some(completion) = completion {
+                        self.complete_mcp_call(completion).await;
+                    }
+                }
+                completion = self.mcp_discoveries.recv() => {
+                    if let Some(completion) = completion {
+                        self.complete_mcp_discovery(completion);
                     }
                 }
                 event = self.effects.backends.events.recv(), if backend_open => {
@@ -339,6 +400,12 @@ impl NativeServerRuntime {
             let _ = pending.respond.send(Err(
                 "workspace service stopped before delegated work completed".to_owned(),
             ));
+        }
+        for pending in self.pending_mcp_calls.values() {
+            pending.cancellation.cancel();
+        }
+        for pending in self.pending_mcp_discoveries.values() {
+            pending.cancellation.cancel();
         }
         self.effects.shutdown().await;
     }
@@ -566,16 +633,9 @@ impl NativeServerRuntime {
             .unwrap_or_else(|| self.core.default_session_id().clone());
         self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);
-        if let Some(engine) = self.core.engine_for_mut(&session_id) {
-            self.effects
-                .execute(
-                    &session_id,
-                    engine.state_mut(),
-                    effects,
-                    EffectOrigin::ClientCommand,
-                )
-                .await;
-        }
+        self.execute_effects(&session_id, effects, EffectOrigin::ClientCommand)
+            .await;
+        self.refresh_mcp_servers();
         if had_effects {
             self.refresh_catalogs();
         }
@@ -617,6 +677,12 @@ impl NativeServerRuntime {
     }
 
     async fn handle_backend_event(&mut self, source: BackendSource, event: BackendEvent) {
+        if let BackendEvent::ExternalToolRequested(request) = &event
+            && request.name.starts_with(nakode_protocol::MCP_TOOL_PREFIX)
+        {
+            self.handle_mcp_tool_request(source, request.clone()).await;
+            return;
+        }
         let origin = match &source {
             BackendSource::ProviderControl(_) => EffectOrigin::ProviderControl,
             BackendSource::Primary { .. } => EffectOrigin::PrimarySession,
@@ -675,6 +741,401 @@ impl NativeServerRuntime {
         }
         self.core
             .commit_and_publish_session(&self.endpoint, &session_id);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_mcp_tool_request(
+        &mut self,
+        source: BackendSource,
+        request: crate::backend::ExternalToolRequest,
+    ) {
+        let Some((server, remote_name)) = self.core.mcp_servers().iter().find_map(|server| {
+            server
+                .tools
+                .iter()
+                .find(|tool| tool.exposed_name == request.name && !tool.app_only)
+                .map(|tool| (server.clone(), tool.remote_name.clone()))
+        }) else {
+            self.resolve_mcp_tool(
+                &source,
+                &request.id,
+                "MCP tool grant is no longer available".to_owned(),
+                true,
+            )
+            .await;
+            return;
+        };
+        let (session_id, run_id) = match &source {
+            BackendSource::Primary { session_id, .. } => (session_id.clone(), None),
+            BackendSource::Subagent(run_id) => (
+                self.core
+                    .session_for_run_id(run_id)
+                    .unwrap_or_else(|| self.core.default_session_id().clone()),
+                Some(run_id.clone()),
+            ),
+            BackendSource::ProviderControl(_) => return,
+        };
+        let currently_granted = self.core.engine_for(&session_id).is_some_and(|engine| {
+            if let BackendSource::Subagent(run_id) = &source {
+                engine.state().subagent_has_mcp_tool(run_id, &request.name)
+            } else {
+                engine.state().has_mcp_tool(&request.name)
+            }
+        });
+        if !currently_granted || !server.usable() {
+            self.resolve_mcp_tool(
+                &source,
+                &request.id,
+                "MCP server is disabled, unavailable, or no longer granted".to_owned(),
+                true,
+            )
+            .await;
+            return;
+        }
+        let credential = self
+            .effects
+            .persistence
+            .credentials
+            .get_mcp(&server.workspace, &server.id)
+            .ok()
+            .flatten()
+            .and_then(|stored| {
+                let secret = stored.secret.expose().get("secret")?.as_str()?.to_owned();
+                Some(crate::mcp::McpCredential {
+                    kind: stored.kind,
+                    secret,
+                })
+            });
+        if server.credential_required && credential.is_none() {
+            self.resolve_mcp_tool(
+                &source,
+                &request.id,
+                "MCP server credential is missing or revoked".to_owned(),
+                true,
+            )
+            .await;
+            return;
+        }
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let client = self.effects.mcp.clone();
+        let completion_tx = self.mcp_call_tx.clone();
+        let call_id = request.id.clone();
+        let task_server = server.clone();
+        let task_remote_name = remote_name.clone();
+        let task_arguments = request.arguments_json.clone();
+        let task_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            let result = client
+                .invoke(
+                    &task_server,
+                    &task_remote_name,
+                    &task_arguments,
+                    credential.as_ref(),
+                    &task_cancellation,
+                )
+                .await;
+            let _ = completion_tx
+                .send(McpCallCompletion { call_id, result })
+                .await;
+        });
+        self.pending_mcp_calls.insert(
+            request.id,
+            PendingMcpCall {
+                source,
+                session_id,
+                run_id,
+                server_id: server.id,
+                remote_name,
+                arguments_json: request.arguments_json,
+                started_at_ms: crate::mcp::unix_time_ms(),
+                started: Instant::now(),
+                cancellation,
+            },
+        );
+    }
+
+    async fn complete_mcp_call(&mut self, completion: McpCallCompletion) {
+        let Some(pending) = self.pending_mcp_calls.remove(&completion.call_id) else {
+            return;
+        };
+        let (output, failed, status) = match completion.result {
+            Ok(output) => (output, false, "succeeded"),
+            Err(error) => (
+                error.to_string(),
+                true,
+                if matches!(error, crate::mcp::McpError::Cancelled) {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+            ),
+        };
+        let bounded_arguments = crate::tools::model_facing_output(&pending.arguments_json);
+        let bounded_output = crate::tools::model_facing_output(&output);
+        let _ = self.effects.persistence.sessions.audit_mcp_invocation(
+            &crate::session::McpInvocationAudit {
+                id: uuid::Uuid::now_v7().to_string(),
+                workspace: self.core.engine().state().workspace.clone(),
+                session_id: pending.session_id.to_string(),
+                run_id: pending.run_id,
+                server_id: pending.server_id,
+                tool_name: pending.remote_name,
+                arguments_json: bounded_arguments,
+                result_json: bounded_output.clone(),
+                status: status.to_owned(),
+                started_at_ms: pending.started_at_ms,
+                duration_ms: u64::try_from(pending.started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+            },
+        );
+        self.resolve_mcp_tool(&pending.source, &completion.call_id, bounded_output, failed)
+            .await;
+    }
+
+    async fn resolve_mcp_tool(
+        &mut self,
+        source: &BackendSource,
+        call_id: &str,
+        output: String,
+        failed: bool,
+    ) {
+        let command = BackendCommand::ResolveExternalTool {
+            id: call_id.to_owned(),
+            output,
+            failed,
+        };
+        match source {
+            BackendSource::Primary {
+                session_id,
+                provider,
+            } => {
+                let _ = self
+                    .effects
+                    .backends
+                    .send_session(session_id, provider, command)
+                    .await;
+            }
+            BackendSource::Subagent(run_id) => {
+                let _ = self.effects.backends.send_subagent(run_id, command).await;
+            }
+            BackendSource::ProviderControl(_) => {}
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_effects(
+        &mut self,
+        session_id: &nakode_protocol::SessionId,
+        effects: Vec<Effect>,
+        origin: EffectOrigin,
+    ) {
+        let mut ordinary = Vec::new();
+        for effect in effects {
+            match effect {
+                Effect::SaveMcpServer(server) => {
+                    self.cancel_mcp_server_work(&server.id);
+                    if self
+                        .effects
+                        .persistence
+                        .sessions
+                        .save_mcp_server(&server)
+                        .is_ok()
+                    {
+                        self.core.replace_mcp_server(server);
+                    }
+                }
+                Effect::DeleteMcpServer {
+                    workspace,
+                    server_id,
+                } => {
+                    self.cancel_mcp_server_work(&server_id);
+                    let _ = self
+                        .effects
+                        .persistence
+                        .credentials
+                        .delete_mcp(&workspace, &server_id);
+                    if self
+                        .effects
+                        .persistence
+                        .sessions
+                        .delete_mcp_server(&workspace, &server_id)
+                        .is_ok()
+                    {
+                        self.core.remove_mcp_server(&server_id);
+                    }
+                }
+                Effect::SaveMcpCredential {
+                    workspace,
+                    server_id,
+                    kind,
+                    secret,
+                } => {
+                    let credential = crate::credential::Credential {
+                        kind: kind.clone(),
+                        secret: crate::credential::SecretValue::new(
+                            serde_json::json!({"secret": secret}),
+                        ),
+                    };
+                    if self
+                        .effects
+                        .persistence
+                        .credentials
+                        .put_mcp(&workspace, &server_id, &credential)
+                        .is_ok()
+                        && let Some(existing) = self
+                            .core
+                            .mcp_servers()
+                            .iter()
+                            .find(|server| server.id == server_id)
+                            .cloned()
+                    {
+                        let mut server = existing;
+                        server.credential_kind = Some(kind);
+                        server.updated_at_ms = crate::mcp::unix_time_ms();
+                        let _ = self.effects.persistence.sessions.save_mcp_server(&server);
+                        self.core.replace_mcp_server(server);
+                    }
+                }
+                Effect::ClearMcpCredential {
+                    workspace,
+                    server_id,
+                } => {
+                    self.cancel_mcp_server_work(&server_id);
+                    let _ = self
+                        .effects
+                        .persistence
+                        .credentials
+                        .delete_mcp(&workspace, &server_id);
+                    if let Some(existing) = self
+                        .core
+                        .mcp_servers()
+                        .iter()
+                        .find(|server| server.id == server_id)
+                        .cloned()
+                    {
+                        let mut server = existing;
+                        server.credential_kind = None;
+                        "credential_required".clone_into(&mut server.health);
+                        server.updated_at_ms = crate::mcp::unix_time_ms();
+                        let _ = self.effects.persistence.sessions.save_mcp_server(&server);
+                        self.core.replace_mcp_server(server);
+                    }
+                }
+                Effect::RefreshMcpServer(mut server) => {
+                    self.cancel_mcp_discovery(&server.id);
+                    "connecting".clone_into(&mut server.health);
+                    server.last_error = None;
+                    let credential = self
+                        .effects
+                        .persistence
+                        .credentials
+                        .get_mcp(&server.workspace, &server.id)
+                        .ok()
+                        .flatten()
+                        .and_then(|stored| {
+                            let secret = stored.secret.expose().get("secret")?.as_str()?.to_owned();
+                            Some(crate::mcp::McpCredential {
+                                kind: stored.kind,
+                                secret,
+                            })
+                        });
+                    let cancellation = tokio_util::sync::CancellationToken::new();
+                    let client = self.effects.mcp.clone();
+                    let completion_tx = self.mcp_discovery_tx.clone();
+                    let task_server = server.clone();
+                    let task_cancellation = cancellation.clone();
+                    let server_id = server.id.clone();
+                    let request_id = self.next_mcp_discovery_request;
+                    self.next_mcp_discovery_request =
+                        self.next_mcp_discovery_request.wrapping_add(1).max(1);
+                    let _ = self.effects.persistence.sessions.save_mcp_server(&server);
+                    self.core.replace_mcp_server(server);
+                    tokio::spawn(async move {
+                        let result = client
+                            .discover(&task_server, credential.as_ref(), &task_cancellation)
+                            .await;
+                        let _ = completion_tx
+                            .send(McpDiscoveryCompletion {
+                                request_id,
+                                server: task_server,
+                                result,
+                            })
+                            .await;
+                    });
+                    self.pending_mcp_discoveries.insert(
+                        server_id.clone(),
+                        PendingMcpDiscovery {
+                            request_id,
+                            server_id,
+                            cancellation,
+                        },
+                    );
+                }
+                effect => ordinary.push(effect),
+            }
+        }
+        if let Some(engine) = self.core.engine_for_mut(session_id) {
+            self.effects
+                .execute(session_id, engine.state_mut(), ordinary, origin)
+                .await;
+        }
+    }
+
+    fn complete_mcp_discovery(&mut self, completion: McpDiscoveryCompletion) {
+        let Some(pending) = self.pending_mcp_discoveries.remove(&completion.server.id) else {
+            return;
+        };
+        if pending.cancellation.is_cancelled()
+            || pending.server_id != completion.server.id
+            || pending.request_id != completion.request_id
+        {
+            return;
+        }
+        let mut server = completion.server;
+        match completion.result {
+            Ok(discovery) => {
+                "connected".clone_into(&mut server.health);
+                server.server_name = discovery.server_name;
+                server.server_version = discovery.server_version;
+                server.tools = discovery.tools;
+                server.last_error = None;
+                server.last_connected_at_ms = Some(crate::mcp::unix_time_ms());
+            }
+            Err(error) => {
+                "error".clone_into(&mut server.health);
+                server.last_error = Some(error.to_string());
+            }
+        }
+        server.updated_at_ms = crate::mcp::unix_time_ms();
+        let _ = self.effects.persistence.sessions.save_mcp_server(&server);
+        self.core.replace_mcp_server(server);
+    }
+
+    fn cancel_mcp_discovery(&mut self, server_id: &str) {
+        if let Some(pending) = self.pending_mcp_discoveries.remove(server_id) {
+            pending.cancellation.cancel();
+        }
+    }
+
+    fn cancel_mcp_server_work(&mut self, server_id: &str) {
+        self.cancel_mcp_discovery(server_id);
+        for pending in self.pending_mcp_calls.values() {
+            if pending.server_id == server_id {
+                pending.cancellation.cancel();
+            }
+        }
+    }
+
+    fn refresh_mcp_servers(&mut self) {
+        let workspace = self.core.engine().state().workspace.clone();
+        if let Ok(servers) = self
+            .effects
+            .persistence
+            .sessions
+            .list_mcp_servers(&workspace)
+        {
+            self.core.install_mcp_servers(servers);
+        }
     }
 
     fn register_effect_owners(
@@ -746,6 +1207,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::QueuedPromptSteering,
             ServiceCapability::ArchetypeManagement,
             ServiceCapability::SoulManagement,
+            ServiceCapability::McpManagement,
         ]
         .into_iter()
         .collect(),
@@ -1292,6 +1754,7 @@ impl EffectExecutor {
         Self {
             backends,
             persistence,
+            mcp: crate::mcp::McpClient::default(),
             shell_processes: ShellProcesses::new(),
         }
     }
@@ -1310,6 +1773,7 @@ impl EffectExecutor {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute_one(
         &mut self,
         session_id: &nakode_protocol::SessionId,
@@ -1411,6 +1875,13 @@ impl EffectExecutor {
                 save_terminal_image_mode(state, sessions, mode);
             }
             Effect::CheckAgentBrowser => check_agent_browser(state).await,
+            Effect::SaveMcpServer(_)
+            | Effect::RefreshMcpServer(_)
+            | Effect::DeleteMcpServer { .. }
+            | Effect::SaveMcpCredential { .. }
+            | Effect::ClearMcpCredential { .. } => {
+                unreachable!("MCP authority effects are handled by NativeServerRuntime")
+            }
         }
     }
 
@@ -2607,6 +3078,7 @@ mod tests {
                     model_id: None,
                     options: nakode_protocol::ModelOptions::default(),
                     tools: None,
+                    mcp_grant: None,
                 },
             )
             .await

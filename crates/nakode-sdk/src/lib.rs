@@ -227,6 +227,7 @@ impl NakodeClient {
                 model_id,
                 options,
                 tools,
+                mcp_grant: None,
             }
         )?;
         result
@@ -258,6 +259,7 @@ impl NakodeClient {
                 mutation: Some(mutation(None)),
                 session_id: session_id.into(),
                 tools,
+                mcp_grant: None,
             }
         )?;
         result
@@ -613,6 +615,19 @@ impl NakodeClient {
         api::ClearProviderCredentialRequest
     );
     typed_mutation!(reload_provider, api::ReloadProviderRequest);
+    typed_mutation!(save_mcp_server, api::SaveMcpServerRequest);
+    typed_mutation!(delete_mcp_server, api::DeleteMcpServerRequest);
+    typed_mutation!(set_mcp_server_enabled, api::SetMcpServerEnabledRequest);
+    typed_mutation!(refresh_mcp_server, api::RefreshMcpServerRequest);
+    typed_mutation!(
+        set_mcp_server_credential,
+        api::SetMcpServerCredentialRequest
+    );
+    typed_mutation!(
+        clear_mcp_server_credential,
+        api::ClearMcpServerCredentialRequest
+    );
+    typed_mutation!(set_mcp_server_grants, api::SetMcpServerGrantsRequest);
     typed_mutation!(save_agent, api::SaveAgentRequest);
     typed_mutation!(delete_agent, api::DeleteAgentRequest);
     typed_mutation!(delete_session, api::DeleteSessionRequest);
@@ -696,6 +711,24 @@ impl NakodeClient {
             .transport
             .clone()
             .get_diagnostics(request)
+            .await?
+            .into_inner())
+    }
+
+    /// Returns Nakode's redacted, workspace-scoped MCP management snapshot.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn get_mcp_management(
+        &self,
+        workspace_id: impl Into<String>,
+    ) -> Result<api::McpManagement, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .get_mcp_management(api::GetMcpManagementRequest {
+                workspace_id: workspace_id.into(),
+            })
             .await?
             .into_inner())
     }

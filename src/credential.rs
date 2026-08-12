@@ -69,6 +69,33 @@ pub trait CredentialStore: Send + Sync {
     /// Returns an error when the value is too large or cannot be persisted.
     fn put(&self, provider: &str, credential: &Credential) -> Result<(), CredentialError>;
 
+    /// Loads one MCP server credential from Nakode's protected credential authority.
+    ///
+    /// # Errors
+    /// Returns an error when storage is unavailable or the stored value is malformed.
+    fn get_mcp(
+        &self,
+        workspace: &str,
+        server_id: &str,
+    ) -> Result<Option<Credential>, CredentialError>;
+
+    /// Atomically saves one MCP server credential.
+    ///
+    /// # Errors
+    /// Returns an error when the value is too large or cannot be persisted.
+    fn put_mcp(
+        &self,
+        workspace: &str,
+        server_id: &str,
+        credential: &Credential,
+    ) -> Result<(), CredentialError>;
+
+    /// Removes one MCP server credential.
+    ///
+    /// # Errors
+    /// Returns an error when storage cannot be updated.
+    fn delete_mcp(&self, workspace: &str, server_id: &str) -> Result<(), CredentialError>;
+
     /// Removes one provider credential.
     ///
     /// # Errors
@@ -169,6 +196,112 @@ impl CredentialStore for SqliteCredentialStore {
             )?;
         Ok(())
     }
+
+    fn get_mcp(
+        &self,
+        workspace: &str,
+        server_id: &str,
+    ) -> Result<Option<Credential>, CredentialError> {
+        let stored = self
+            .connection
+            .lock()
+            .expect("credential database mutex poisoned")
+            .query_row(
+                "SELECT credential_kind, credential_json FROM mcp_credentials
+                 WHERE workspace = ?1 AND server_id = ?2",
+                rusqlite::params![workspace, server_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        stored
+            .map(|(kind, source)| parse_stored_credential(server_id, kind, &source))
+            .transpose()
+    }
+
+    fn put_mcp(
+        &self,
+        workspace: &str,
+        server_id: &str,
+        credential: &Credential,
+    ) -> Result<(), CredentialError> {
+        let serialized = serialize_credential(server_id, credential)?;
+        self.connection
+            .lock()
+            .expect("credential database mutex poisoned")
+            .execute(
+                "INSERT INTO mcp_credentials
+                   (workspace, server_id, credential_kind, credential_json, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(workspace, server_id) DO UPDATE SET
+                   credential_kind=excluded.credential_kind,
+                   credential_json=excluded.credential_json,
+                   updated_at_ms=excluded.updated_at_ms",
+                rusqlite::params![
+                    workspace,
+                    server_id,
+                    credential.kind,
+                    serialized,
+                    unix_time_ms()
+                ],
+            )?;
+        Ok(())
+    }
+
+    fn delete_mcp(&self, workspace: &str, server_id: &str) -> Result<(), CredentialError> {
+        self.connection
+            .lock()
+            .expect("credential database mutex poisoned")
+            .execute(
+                "DELETE FROM mcp_credentials WHERE workspace = ?1 AND server_id = ?2",
+                rusqlite::params![workspace, server_id],
+            )?;
+        Ok(())
+    }
+}
+
+fn parse_stored_credential(
+    owner: &str,
+    kind: String,
+    source: &str,
+) -> Result<Credential, CredentialError> {
+    if source.len() > MAX_CREDENTIAL_BYTES {
+        return Err(CredentialError::TooLarge {
+            provider: owner.to_owned(),
+            maximum: MAX_CREDENTIAL_BYTES,
+        });
+    }
+    let secret = serde_json::from_str(source).map_err(|error| CredentialError::Invalid {
+        provider: owner.to_owned(),
+        reason: error.to_string(),
+    })?;
+    Ok(Credential {
+        kind,
+        secret: SecretValue::new(secret),
+    })
+}
+
+fn serialize_credential(owner: &str, credential: &Credential) -> Result<String, CredentialError> {
+    let serialized = serde_json::to_string(credential.secret.expose()).map_err(|error| {
+        CredentialError::Invalid {
+            provider: owner.to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    if serialized.len() > MAX_CREDENTIAL_BYTES {
+        return Err(CredentialError::TooLarge {
+            provider: owner.to_owned(),
+            maximum: MAX_CREDENTIAL_BYTES,
+        });
+    }
+    Ok(serialized)
+}
+
+fn unix_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 #[cfg(test)]

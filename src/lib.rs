@@ -22,6 +22,7 @@ pub mod handoff;
 mod herdr;
 pub mod kimi;
 mod markdown;
+pub mod mcp;
 mod media;
 pub mod memory;
 mod native_client;
