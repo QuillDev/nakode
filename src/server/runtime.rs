@@ -280,7 +280,8 @@ impl NativeServerRuntime {
             quiesce: quiesce_tx,
         };
         let mut core = ServerCore::new(engine, providers, sessions);
-        let workspace = core.engine().state().workspace.clone();
+        let workspace =
+            crate::state::projection::workspace_id(&core.engine().state().workspace).to_string();
         if let Ok(servers) = effects.persistence.sessions.list_mcp_servers(&workspace) {
             let servers = servers
                 .into_iter()
@@ -890,7 +891,10 @@ impl NativeServerRuntime {
         let _ = self.effects.persistence.sessions.audit_mcp_invocation(
             &crate::session::McpInvocationAudit {
                 id: uuid::Uuid::now_v7().to_string(),
-                workspace: self.core.engine().state().workspace.clone(),
+                workspace: crate::state::projection::workspace_id(
+                    &self.core.engine().state().workspace,
+                )
+                .to_string(),
                 session_id: pending.session_id.to_string(),
                 run_id: pending.run_id,
                 server_id: pending.server_id,
@@ -1153,7 +1157,9 @@ impl NativeServerRuntime {
     }
 
     fn refresh_mcp_servers(&mut self) {
-        let workspace = self.core.engine().state().workspace.clone();
+        let workspace =
+            crate::state::projection::workspace_id(&self.core.engine().state().workspace)
+                .to_string();
         if let Ok(servers) = self
             .effects
             .persistence
@@ -2738,8 +2744,8 @@ mod tests {
     };
 
     use nakode_protocol::{
-        ClientId, Command, ErrorCode, IdempotencyKey, Query, QueryResult, ServiceCapability,
-        SessionId,
+        ClientId, Command, CredentialInput, ErrorCode, IdempotencyKey, McpGrantPolicy, Query,
+        QueryResult, ServiceCapability, SessionId,
     };
     use tokio::sync::mpsc;
 
@@ -2996,6 +3002,191 @@ mod tests {
             },
             credentials,
         )
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mcp_registration_and_credentials_share_the_canonical_workspace_id() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, credentials) = test_persistence(workspace.path());
+        let sessions = Arc::clone(&persistence.sessions);
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let workspace_id = crate::state::projection::workspace_id(&state.workspace);
+        let (runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+
+        endpoint
+            .execute_command(
+                ClientId::from("mcp-setup-test"),
+                IdempotencyKey::from("register-excalidraw"),
+                None,
+                false,
+                Command::SaveMcpServer {
+                    workspace_id: workspace_id.clone(),
+                    server: crate::mcp::excalidraw_input(),
+                    grants: McpGrantPolicy::default(),
+                },
+            )
+            .await
+            .expect("register Excalidraw");
+        endpoint
+            .execute_command(
+                ClientId::from("mcp-setup-test"),
+                IdempotencyKey::from("credential-excalidraw"),
+                None,
+                false,
+                Command::SetMcpServerCredential {
+                    workspace_id: workspace_id.clone(),
+                    server_id: crate::mcp::EXCALIDRAW_SERVER_ID.to_owned(),
+                    kind: "bearer".to_owned(),
+                    credential: CredentialInput("test-token".to_owned()),
+                },
+            )
+            .await
+            .expect("set Excalidraw credential");
+
+        let QueryResult::McpManagement(management) = endpoint
+            .execute_query(
+                ClientId::from("mcp-setup-test"),
+                Query::GetMcpManagement {
+                    workspace_id: workspace_id.clone(),
+                },
+            )
+            .await
+            .expect("MCP management")
+            .value
+        else {
+            panic!("MCP management result");
+        };
+        assert_eq!(management.workspace_id, workspace_id);
+        assert_eq!(management.servers.len(), 1);
+        assert_eq!(management.servers[0].id, crate::mcp::EXCALIDRAW_SERVER_ID);
+        assert!(management.servers[0].credential_configured);
+        assert_eq!(
+            sessions
+                .list_mcp_servers(workspace_id.as_str())
+                .expect("persisted MCP servers")
+                .len(),
+            1
+        );
+        assert_eq!(
+            credentials
+                .get_mcp(workspace_id.as_str(), crate::mcp::EXCALIDRAW_SERVER_ID)
+                .expect("credential lookup")
+                .expect("persisted credential")
+                .kind,
+            "bearer"
+        );
+        assert!(
+            sessions
+                .list_mcp_servers(workspace.path().to_string_lossy().as_ref())
+                .expect("legacy path lookup")
+                .is_empty(),
+            "MCP state must not be persisted under the raw workspace path"
+        );
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
+
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let restarted_state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let (restarted, restarted_handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(restarted_state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = restarted_handle.endpoint().clone();
+        let restarted = tokio::spawn(restarted.run());
+        let QueryResult::McpManagement(management) = endpoint
+            .execute_query(
+                ClientId::from("mcp-restart-test"),
+                Query::GetMcpManagement { workspace_id },
+            )
+            .await
+            .expect("restarted MCP management")
+            .value
+        else {
+            panic!("MCP management result after restart");
+        };
+        assert_eq!(management.servers.len(), 1);
+        assert!(management.servers[0].credential_configured);
+
+        restarted_handle.shutdown().await;
+        restarted.await.expect("restarted runtime task");
+    }
+
+    #[tokio::test]
+    async fn missing_mcp_server_credentials_remain_actionable_not_found_errors() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, credentials) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let workspace_id = crate::state::projection::workspace_id(&state.workspace);
+        let (runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+
+        let error = endpoint
+            .execute_command(
+                ClientId::from("mcp-missing-test"),
+                IdempotencyKey::from("credential-missing"),
+                None,
+                false,
+                Command::SetMcpServerCredential {
+                    workspace_id: workspace_id.clone(),
+                    server_id: "unknown-server".to_owned(),
+                    kind: "bearer".to_owned(),
+                    credential: CredentialInput("test-token".to_owned()),
+                },
+            )
+            .await
+            .expect_err("unknown server must be rejected");
+        assert_eq!(error.code, ErrorCode::NotFound);
+        assert!(error.message.contains("MCP server unknown-server"));
+        assert!(
+            credentials
+                .get_mcp(workspace_id.as_str(), "unknown-server")
+                .expect("credential lookup")
+                .is_none()
+        );
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
     }
 
     #[tokio::test]

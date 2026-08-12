@@ -184,7 +184,7 @@ impl ServerCore {
     #[must_use]
     pub(crate) fn mcp_management(&self) -> nakode_protocol::McpManagementView {
         nakode_protocol::McpManagementView {
-            workspace_id: WorkspaceId::from(self.engine().state().workspace.clone()),
+            workspace_id: crate::state::projection::workspace_id(&self.engine().state().workspace),
             servers: self
                 .mcp_servers
                 .iter()
