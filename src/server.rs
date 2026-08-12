@@ -1132,8 +1132,14 @@ impl ServerCore {
         credential: CredentialInput,
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
-        self.ensure_mcp_server(server_id)?;
-        if credential.0.is_empty() {
+        let server = self.mcp_server(server_id)?;
+        if kind != server.auth_kind {
+            return Err(DomainCommandError::Invalid(format!(
+                "MCP server {server_id:?} requires credential kind {:?}",
+                server.auth_kind
+            )));
+        }
+        if credential.0.trim().is_empty() {
             return Err(DomainCommandError::Invalid(
                 "MCP credential cannot be empty".to_owned(),
             ));

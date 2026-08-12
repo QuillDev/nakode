@@ -282,6 +282,21 @@ impl NativeServerRuntime {
         let mut core = ServerCore::new(engine, providers, sessions);
         let workspace = core.engine().state().workspace.clone();
         if let Ok(servers) = effects.persistence.sessions.list_mcp_servers(&workspace) {
+            let servers = servers
+                .into_iter()
+                .map(|mut server| {
+                    server.credential_kind = effects
+                        .persistence
+                        .credentials
+                        .get_mcp(&workspace, &server.id)
+                        .ok()
+                        .flatten()
+                        .map(|credential| credential.kind);
+                    let normalized = crate::mcp::normalize_builtin_server(server);
+                    let _ = effects.persistence.sessions.save_mcp_server(&normalized);
+                    normalized
+                })
+                .collect();
             core.install_mcp_servers(servers);
         }
         (
@@ -970,6 +985,7 @@ impl NativeServerRuntime {
                     kind,
                     secret,
                 } => {
+                    self.cancel_mcp_server_work(&server_id);
                     let credential = crate::credential::Credential {
                         kind: kind.clone(),
                         secret: crate::credential::SecretValue::new(
@@ -1016,6 +1032,10 @@ impl NativeServerRuntime {
                         let mut server = existing;
                         server.credential_kind = None;
                         "credential_required".clone_into(&mut server.health);
+                        server.server_name = None;
+                        server.server_version = None;
+                        server.last_error = None;
+                        server.tools.clear();
                         server.updated_at_ms = crate::mcp::unix_time_ms();
                         let _ = self.effects.persistence.sessions.save_mcp_server(&server);
                         self.core.replace_mcp_server(server);
@@ -1119,8 +1139,14 @@ impl NativeServerRuntime {
 
     fn cancel_mcp_server_work(&mut self, server_id: &str) {
         self.cancel_mcp_discovery(server_id);
-        for pending in self.pending_mcp_calls.values() {
-            if pending.server_id == server_id {
+        let call_ids = self
+            .pending_mcp_calls
+            .iter()
+            .filter(|(_, pending)| pending.server_id == server_id)
+            .map(|(call_id, _)| call_id.clone())
+            .collect::<Vec<_>>();
+        for call_id in call_ids {
+            if let Some(pending) = self.pending_mcp_calls.remove(&call_id) {
                 pending.cancellation.cancel();
             }
         }
@@ -1134,6 +1160,20 @@ impl NativeServerRuntime {
             .sessions
             .list_mcp_servers(&workspace)
         {
+            let servers = servers
+                .into_iter()
+                .map(|mut server| {
+                    server.credential_kind = self
+                        .effects
+                        .persistence
+                        .credentials
+                        .get_mcp(&workspace, &server.id)
+                        .ok()
+                        .flatten()
+                        .map(|credential| credential.kind);
+                    crate::mcp::normalize_builtin_server(server)
+                })
+                .collect();
             self.core.install_mcp_servers(servers);
         }
     }

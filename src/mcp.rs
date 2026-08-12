@@ -352,7 +352,9 @@ impl McpClient {
                 response.status().as_u16()
             )));
         }
-        let value = read_response(response, server.max_response_bytes, cancellation).await?;
+        let value = read_response(response, server.max_response_bytes, cancellation)
+            .await
+            .map_err(|error| redact_mcp_error(error, credential))?;
         if let Some(error) = value.get("error") {
             return Err(McpError::Protocol(redact_error(
                 error.to_string(),
@@ -384,7 +386,7 @@ impl McpClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .resolve(host, address)
                 .build()
-                .map_err(|error| McpError::Transport(error.to_string()))?
+                .map_err(|error| McpError::Transport(redact_error(error.to_string(), credential)))?
                 .post(&server.endpoint)
         } else {
             self.http.post(&server.endpoint)
@@ -736,7 +738,7 @@ pub fn excalidraw_template() -> McpTemplateView {
         provenance_sha256: EXCALIDRAW_SHA256.to_owned(),
         license_evidence: EXCALIDRAW_LICENSE_EVIDENCE.to_owned(),
         artifact_semantics: EXCALIDRAW_ARTIFACT_SEMANTICS.to_owned(),
-        credential_required: false,
+        credential_required: true,
     }
 }
 
@@ -748,8 +750,8 @@ pub fn excalidraw_input() -> McpServerInput {
         endpoint: EXCALIDRAW_ENDPOINT.to_owned(),
         transport: "streamable_http".to_owned(),
         enabled: true,
-        auth_kind: "none".to_owned(),
-        credential_required: false,
+        auth_kind: "bearer".to_owned(),
+        credential_required: true,
         protocol_version: DEFAULT_PROTOCOL_VERSION.to_owned(),
         provenance_url: EXCALIDRAW_REPOSITORY.to_owned(),
         provenance_version: EXCALIDRAW_VERSION.to_owned(),
@@ -804,12 +806,36 @@ pub fn validate_grant(
 }
 
 #[must_use]
+pub fn normalize_builtin_server(mut server: McpServerRecord) -> McpServerRecord {
+    if server.id == EXCALIDRAW_SERVER_ID
+        && server.template_id.as_deref() == Some(EXCALIDRAW_TEMPLATE_ID)
+    {
+        "bearer".clone_into(&mut server.auth_kind);
+        server.credential_required = true;
+        if server.credential_kind.is_none() {
+            "credential_required".clone_into(&mut server.health);
+            server.tools.clear();
+        }
+    }
+    server
+}
+
+#[must_use]
 pub fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+fn redact_mcp_error(error: McpError, credential: Option<&McpCredential>) -> McpError {
+    match error {
+        McpError::Invalid(message) => McpError::Invalid(redact_error(message, credential)),
+        McpError::Transport(message) => McpError::Transport(redact_error(message, credential)),
+        McpError::Protocol(message) => McpError::Protocol(redact_error(message, credential)),
+        other => other,
+    }
 }
 
 fn redact_error(mut message: String, credential: Option<&McpCredential>) -> String {
@@ -824,6 +850,58 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn every_message_error_is_redacted() {
+        let credential = McpCredential {
+            kind: "bearer".to_owned(),
+            secret: "sensitive-token".to_owned(),
+        };
+        for error in [
+            McpError::Invalid("bad sensitive-token".to_owned()),
+            McpError::Transport("failed sensitive-token".to_owned()),
+            McpError::Protocol("invalid sensitive-token".to_owned()),
+        ] {
+            let message = redact_mcp_error(error, Some(&credential)).to_string();
+            assert!(!message.contains("sensitive-token"));
+            assert!(message.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn excalidraw_requires_a_bearer_token() {
+        let input = excalidraw_input();
+        assert_eq!(input.auth_kind, "bearer");
+        assert!(input.credential_required);
+        assert!(excalidraw_template().credential_required);
+    }
+
+    #[test]
+    fn legacy_excalidraw_records_are_migrated_without_a_secret() {
+        let workspace = WorkspaceId::from("workspace");
+        let mut server = input_record(&workspace, excalidraw_input(), McpGrantPolicy::default());
+        server.auth_kind = "none".to_owned();
+        server.credential_required = false;
+        server.health = "connected".to_owned();
+        server.tools.push(McpToolView {
+            remote_name: "create_view".to_owned(),
+            exposed_name: "mcp__excalidraw__create_view".to_owned(),
+            description: String::new(),
+            input_schema_json: "{}".to_owned(),
+            app_only: false,
+        });
+
+        let migrated = normalize_builtin_server(server.clone());
+        assert_eq!(migrated.auth_kind, "bearer");
+        assert!(migrated.credential_required);
+        assert_eq!(migrated.health, "credential_required");
+        assert!(migrated.tools.is_empty());
+        server.credential_kind = Some("bearer".to_owned());
+        server.health = "connected".to_owned();
+        let normalized = normalize_builtin_server(server);
+        assert_eq!(normalized.health, "connected");
+        assert_eq!(normalized.credential_kind.as_deref(), Some("bearer"));
+    }
 
     #[test]
     fn app_only_tools_are_filtered_and_names_are_stable() {

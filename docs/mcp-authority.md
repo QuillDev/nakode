@@ -34,6 +34,12 @@ Remote endpoints require HTTPS, reject URL credentials and local/private/link-lo
 
 ## Excalidraw template
 
+The built-in Excalidraw template requires an owner-supplied MCP token. Nakode records it as a `bearer` credential and sends it only as the HTTP Authorization header for discovery and invocation. It is an MCP service token, not an Excalidraw Plus login or account API credential.
+
+FStack submits the token once through `SetMcpServerCredential`; Nakode validates the credential kind against the server definition, upserts the secret in `mcp_credentials`, and returns only configured/kind status. Replacement uses the same upsert after cancelling matching in-flight discovery/invocation work, so no completion authenticated with the old token can update current state. Removal uses `ClearMcpServerCredential`, cancels matching work, deletes the credential, clears discovered usability, and requires a new token before refresh or session access. Authentication failures are projected as non-secret transport status and the runtime replaces any occurrence of the submitted secret with `[REDACTED]` before persisting or returning an error.
+
+On restart Nakode restores the Excalidraw definition and safe discovery snapshot from `mcp_servers`, and resolves the secret from its credential authority only when refreshing or invoking. Existing legacy Excalidraw definitions are normalized to bearer/credential-required at startup; stale discovered tools are removed when no credential exists. FStack never resubmits the token on restart, resume, session creation, or tool invocation.
+
 The built-in template uses the Excalidraw organization server:
 
 - endpoint: `https://mcp.excalidraw.com/mcp`
@@ -42,8 +48,9 @@ The built-in template uses the Excalidraw organization server:
 - commit: `157aa23ceb1976008aadc89eb05e3444060f09d6`
 - recorded SHA-256: `2b494012b5fee5937f9f7b86f04a76cc4a91ec843ee3339b93e4e15e415274ff`
 - negotiated MCP protocol: `2025-06-18`
+- MCP authentication: owner-supplied bearer token
 
-The public endpoint did not require authentication during investigation. It is not an Excalidraw Plus account API and does not associate output with a Plus workspace.
+The MCP token authenticates the remote service but does not make this an Excalidraw Plus account API and does not by itself associate output with a Plus workspace.
 
 Model-visible operations include usage guidance, view creation, and checkpoint continuation. `export_to_excalidraw` is app-only and filtered. A checkpoint ID is a temporary continuation handle, not a durable/public drawing: server storage may be in-memory or optional Redis with a 30-day TTL. Continue editing by retaining the checkpoint ID, reading it, and applying explicit element additions/deletions. Export/share is a separate app UI upload action and Nakode never invokes it automatically. Therefore no handoff should claim a durable document or public link without explicit export evidence.
 
