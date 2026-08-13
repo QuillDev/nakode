@@ -2867,6 +2867,20 @@ impl DomainState {
             self.status_message = format!("{} does not support session resume.", self.backend_name);
             return Vec::new();
         }
+        if (!self.external_tools.is_empty() || !self.mcp_tools.is_empty())
+            && !self.backend_capabilities.external_tools.is_supported()
+        {
+            let boundary = if self.mcp_tools.is_empty() {
+                "externally executed tools"
+            } else {
+                "granted Nakode MCP tools"
+            };
+            self.status_message = format!(
+                "{} does not support {boundary}; select a native Nakode provider before resuming this session.",
+                self.backend_name
+            );
+            return Vec::new();
+        }
         self.pending_handoff = None;
         let old_provider_session = self.provider_session_id.clone();
         self.resuming_session = Some(session.clone());
@@ -3070,11 +3084,16 @@ impl DomainState {
                 "the session is busy; enqueue the prompt instead".to_owned(),
             ));
         }
-        if !self.external_tools.is_empty()
+        if (!self.external_tools.is_empty() || !self.mcp_tools.is_empty())
             && !self.backend_capabilities.external_tools.is_supported()
         {
+            let boundary = if self.mcp_tools.is_empty() {
+                "externally executed tools"
+            } else {
+                "granted Nakode MCP tools"
+            };
             return Err(DomainCommandError::Invalid(format!(
-                "{} does not support externally executed tools; select a native Nakode provider before sending this prompt",
+                "{} does not support {boundary}; select a native Nakode provider before sending this prompt",
                 self.backend_name
             )));
         }
@@ -8323,6 +8342,91 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             .expect_err("unsupported providers must reject external tool sessions");
 
         assert!(error.to_string().contains("native Nakode provider"));
+    }
+
+    #[test]
+    fn mcp_tools_accept_a_provider_with_external_callback_support() {
+        let mut state = ready_state();
+        state
+            .configure_mcp_tools(vec![nakode_protocol::ExternalToolDefinition {
+                name: "mcp__excalidraw__create_view".to_owned(),
+                description: "Create an Excalidraw view".to_owned(),
+                input_schema_json: r#"{"type":"object"}"#.to_owned(),
+            }])
+            .expect("MCP tools configure before the first prompt");
+        state.backend_capabilities.mcp = CapabilitySupport::Unsupported;
+
+        let effects = state
+            .submit_prompt("draw the architecture".to_owned(), Vec::new())
+            .expect("Nakode callbacks do not require provider-native MCP support");
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartSession { external_tools, .. })
+                if external_tools.iter().any(|tool| tool.name == "mcp__excalidraw__create_view")
+        )));
+    }
+
+    #[test]
+    fn mcp_tools_reject_a_provider_that_cannot_execute_external_callbacks() {
+        let mut state = ready_state();
+        state
+            .configure_mcp_tools(vec![nakode_protocol::ExternalToolDefinition {
+                name: "mcp__excalidraw__create_view".to_owned(),
+                description: "Create an Excalidraw view".to_owned(),
+                input_schema_json: r#"{"type":"object"}"#.to_owned(),
+            }])
+            .expect("MCP tools configure before the first prompt");
+        state.backend_name = "Devin ACP".to_owned();
+        state.backend_capabilities.external_tools = CapabilitySupport::Unsupported;
+        state.backend_capabilities.mcp = CapabilitySupport::Supported;
+
+        let error = state
+            .submit_prompt("draw the architecture".to_owned(), Vec::new())
+            .expect_err("ACP MCP metadata cannot substitute for Nakode's callback tool contract");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not support granted Nakode MCP tools"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn mcp_tools_reject_resume_for_a_provider_without_external_callbacks() {
+        let mut state = ready_state();
+        state
+            .configure_mcp_tools(vec![nakode_protocol::ExternalToolDefinition {
+                name: "mcp__excalidraw__create_view".to_owned(),
+                description: "Create an Excalidraw view".to_owned(),
+                input_schema_json: r#"{"type":"object"}"#.to_owned(),
+            }])
+            .expect("MCP tools configure before resume");
+        state.backend_name = "Devin ACP".to_owned();
+        state.backend_capabilities.external_tools = CapabilitySupport::Unsupported;
+        state.backend_capabilities.mcp = CapabilitySupport::Supported;
+        let session = SessionRecord {
+            id: "01950000-0000-7000-8000-000000000001".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-with-mcp".to_owned(),
+            workspace: state.workspace.clone(),
+            title: "Diagram work".to_owned(),
+            model: Some("model-a".to_owned()),
+            created_at: 1,
+            updated_at: 2,
+            owned_provider_sessions: Vec::new(),
+        };
+
+        let effects = state.begin_resume(session);
+
+        assert!(effects.is_empty());
+        assert!(state.resuming_session.is_none());
+        assert!(
+            state
+                .status_message
+                .contains("does not support granted Nakode MCP tools")
+        );
     }
 
     #[test]
