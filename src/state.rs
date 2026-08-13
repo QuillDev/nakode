@@ -6387,6 +6387,7 @@ impl DomainState {
                 turn_id,
                 provider_id,
                 model_id,
+                attachments,
                 item,
             } = history_item;
             if hides_subagent_item(&item) {
@@ -6406,6 +6407,15 @@ impl DomainState {
                 .set_tool_audit(&item_id, tool_audit_json.map(Into::into));
             self.transcript
                 .set_origin(&item_id, provider_id.as_deref(), model_id.as_deref());
+            self.transcript.set_labeled_images(
+                &item_id,
+                attachments
+                    .into_iter()
+                    .filter_map(|attachment| {
+                        attachment.image.map(|image| (attachment.label, image))
+                    })
+                    .collect(),
+            );
         }
         if self.transcript.entries().is_empty() {
             self.transcript.push(
@@ -10230,6 +10240,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn interleaved_content_blocks_converge_across_live_updates_and_history() {
         let mut state = ready_state();
         state.backend_provider = crate::backend::CLAUDE_PROVIDER.to_owned();
@@ -10309,6 +10320,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 turn_id: "turn-1".to_owned(),
                 provider_id: Some(crate::backend::CLAUDE_PROVIDER.to_owned()),
                 model_id: Some("claude-agent/opus".to_owned()),
+                attachments: Vec::new(),
                 item: NormalizedItem {
                     id: id.clone(),
                     kind: match kind {
@@ -10934,6 +10946,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 turn_id: "turn-1".to_owned(),
                 provider_id: None,
                 model_id: None,
+                attachments: Vec::new(),
                 item: NormalizedItem {
                     id: "user-1".to_owned(),
                     kind: ItemKind::User,
