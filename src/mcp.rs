@@ -916,6 +916,58 @@ mod tests {
     }
 
     #[test]
+    fn grant_validation_distinguishes_stable_renames_from_removed_and_unavailable_servers() {
+        let workspace = WorkspaceId::from("workspace");
+        let mut server = input_record(
+            &workspace,
+            excalidraw_input(),
+            McpGrantPolicy {
+                chat: true,
+                coding_agent: true,
+                archetype_slugs: Vec::new(),
+            },
+        );
+        server.health = "connected".to_owned();
+        server.credential_kind = Some("bearer".to_owned());
+        server.display_name = "Diagram workspace".to_owned();
+        let grant = McpSessionGrant {
+            surface: Some(McpSessionSurface::Chat),
+            server_ids: vec![server.id.clone()],
+        };
+
+        assert_eq!(
+            validate_grant(&grant, &[server.clone()]).unwrap()[0].id,
+            server.id
+        );
+        assert!(
+            validate_grant(&grant, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("unknown")
+        );
+
+        let mut unavailable = server.clone();
+        unavailable.health = "disconnected".to_owned();
+        assert!(
+            validate_grant(&grant, &[unavailable])
+                .unwrap_err()
+                .to_string()
+                .contains("not enabled")
+        );
+
+        let renamed_id = McpServerRecord {
+            id: "diagram-v2".to_owned(),
+            ..server
+        };
+        assert!(
+            validate_grant(&grant, &[renamed_id])
+                .unwrap_err()
+                .to_string()
+                .contains("unknown")
+        );
+    }
+
+    #[test]
     fn grants_are_deny_by_default() {
         let workspace = WorkspaceId::from("workspace");
         let mut server = input_record(&workspace, excalidraw_input(), McpGrantPolicy::default());

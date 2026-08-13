@@ -352,6 +352,9 @@ pub struct SessionHistoryItem {
     pub provider_id: Option<String>,
     /// Canonical provider-qualified model captured for the turn.
     pub model_id: Option<String>,
+    /// Image content attached to a user history item. Provider-native runtime persistence owns the
+    /// single durable byte copy; transcript artifacts are rebuilt from it when a session resumes.
+    pub attachments: Vec<PromptAttachment>,
     pub item: NormalizedItem,
 }
 

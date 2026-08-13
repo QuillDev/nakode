@@ -1615,6 +1615,7 @@ fn normalize_history_item(
         turn_id: turn_id.clone(),
         provider_id: None,
         model_id: None,
+        attachments: Vec::new(),
         item: NormalizedItem {
             id: item_id(suffix),
             kind,
@@ -1625,8 +1626,10 @@ fn normalize_history_item(
         },
     };
     match item {
-        ConversationItem::User { text, .. } => {
-            vec![normalized(ItemKind::User, "You", text.clone(), "user")]
+        ConversationItem::User { text, attachments } => {
+            let mut item = normalized(ItemKind::User, "You", text.clone(), "user");
+            item.attachments.clone_from(attachments);
+            vec![item]
         }
         ConversationItem::Assistant {
             text,
@@ -1685,6 +1688,7 @@ fn normalize_history_item(
                 turn_id: turn_id.clone(),
                 provider_id: None,
                 model_id: None,
+                attachments: Vec::new(),
                 item: NormalizedItem {
                     id: id.clone(),
                     kind: ItemKind::System,
@@ -1721,6 +1725,7 @@ fn normalize_tool_history_item(
         turn_id: turn_id.to_owned(),
         provider_id: None,
         model_id: None,
+        attachments: Vec::new(),
         item: NormalizedItem {
             id: item_id,
             kind: ItemKind::Tool,
@@ -2188,6 +2193,34 @@ mod tests {
     };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn native_runtime_history_restores_user_image_attachments() {
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        session.history.push(ConversationItem::User {
+            text: "inspect this".to_owned(),
+            attachments: vec![crate::backend::PromptAttachment {
+                label: "diagram.png".to_owned(),
+                path: None,
+                image: Some(crate::backend::PromptImage {
+                    mime_type: "image/png".to_owned(),
+                    data: vec![1, 2, 3, 4],
+                }),
+            }],
+        });
+
+        let history = session.normalized_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].attachments[0].label, "diagram.png");
+        assert_eq!(
+            history[0].attachments[0]
+                .image
+                .as_ref()
+                .expect("image")
+                .data,
+            [1, 2, 3, 4]
+        );
+    }
 
     #[test]
     fn native_runtime_tool_audit_survives_history_hydration() {

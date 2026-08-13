@@ -1261,6 +1261,7 @@ async fn normalize_message_chunk(
                 turn_id: turn_id.to_owned(),
                 provider_id: None,
                 model_id: None,
+                attachments: Vec::new(),
                 item: NormalizedItem {
                     id: item_id,
                     kind: item_kind,
