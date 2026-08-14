@@ -375,11 +375,23 @@ pub enum RunOutcome {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RunPolicyView {
     pub allowed_capabilities: Vec<String>,
     pub denied_capabilities: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub denied_tools: Vec<String>,
+    /// Provider adapter and exact call identities enforced for this immutable launch snapshot.
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub policy_available: bool,
+    #[serde(default)]
+    pub provider_tools_restricted: bool,
+    #[serde(default)]
+    pub provider_allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub unsupported_canonical_tools: Vec<String>,
     pub tool_profile: String,
     pub task_shape: String,
     pub output_contract: String,

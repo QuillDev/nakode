@@ -20,6 +20,7 @@ const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
 const SDK_VERSION: &str = "0.3.220";
 const BRIDGE_SOURCE: &str = include_str!("bridge.mjs");
+const TOOL_POLICY_SOURCE: &str = include_str!("tool_policy.mjs");
 
 #[derive(Clone)]
 pub struct BackendConfig {
@@ -140,6 +141,12 @@ async fn prepare_bridge_directory() -> Result<PathBuf, BackendError> {
             detail: error.to_string(),
         })?;
     tokio::fs::write(directory.join("bridge.mjs"), BRIDGE_SOURCE)
+        .await
+        .map_err(|error| BackendError::BridgeSetup {
+            provider: CLAUDE_PROVIDER.to_owned(),
+            detail: error.to_string(),
+        })?;
+    tokio::fs::write(directory.join("tool_policy.mjs"), TOOL_POLICY_SOURCE)
         .await
         .map_err(|error| BackendError::BridgeSetup {
             provider: CLAUDE_PROVIDER.to_owned(),
@@ -423,9 +430,12 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             owner_session_id,
             external_tools,
             replace_builtin_tools,
+            allowed_builtin_tools,
+            max_turns,
+            timeout_seconds,
         } => (
             "resume",
-            json!({"sessionId":provider_session_id,"ownerSessionId":owner_session_id,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools}),
+            json!({"sessionId":provider_session_id,"ownerSessionId":owner_session_id,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools,"allowedBuiltinTools":allowed_builtin_tools,"maxTurns":max_turns,"timeoutSeconds":timeout_seconds}),
         ),
         BackendCommand::UnsubscribeSession {
             provider_session_id,
@@ -782,13 +792,44 @@ fn tool_call_event(message: &Value) -> BackendEvent {
         .get("result")
         .or_else(|| message.get("args"))
         .map_or_else(String::new, display_value);
+    let name = string(message, "name");
+    let arguments = message
+        .get("args")
+        .or_else(|| message.pointer("/result/input"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let output = message.pointer("/result/output").cloned();
+    let tool_audit_json = serde_json::to_string(&json!({
+        "version": 1,
+        "callId": string(message, "callId"),
+        "name": name,
+        "input": bounded_claude_audit_value(&arguments),
+        "output": output.as_ref().map(bounded_claude_audit_value),
+        "kind": if message.get("external").and_then(Value::as_bool) == Some(true) {
+            "custom"
+        } else {
+            "native"
+        },
+        "providerType": "claudeAgentSdkTool",
+        "authoritative": "Nakode Claude adapter authorization",
+        "failed": status == ItemStatus::Failed,
+        "status": match status {
+            ItemStatus::Running => "running",
+            ItemStatus::Failed => "failed",
+            _ => "completed",
+        },
+        "denied": message.get("denied").and_then(Value::as_bool).unwrap_or(false),
+        "denialReason": message.get("denialReason").and_then(Value::as_str),
+    }))
+    .ok()
+    .map(String::into_boxed_str);
     let item = NormalizedItem {
         id: string(message, "callId"),
         kind: ItemKind::Tool,
-        title: string(message, "name"),
+        title: name,
         body,
         status,
-        tool_audit_json: None,
+        tool_audit_json,
     };
     if status == ItemStatus::Running {
         BackendEvent::ItemStarted {
@@ -801,6 +842,22 @@ fn tool_call_event(message: &Value) -> BackendEvent {
             item,
         }
     }
+}
+
+fn bounded_claude_audit_value(value: &Value) -> Value {
+    let rendered = serde_json::to_string_pretty(value).unwrap_or_default();
+    let mut end = rendered.len().min(64 * 1024);
+    while !rendered.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    json!({
+        "format": "json",
+        "value": &rendered[..end],
+        "bytes": rendered.len(),
+        "truncated": end < rendered.len(),
+        "redacted": rendered.to_ascii_lowercase().contains("[redacted]")
+            || rendered.to_ascii_lowercase().contains("<redacted>"),
+    })
 }
 
 fn string(value: &Value, key: &str) -> String {
@@ -870,6 +927,10 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("@anthropic-ai/claude-agent-sdk"));
         assert!(BRIDGE_SOURCE.contains("pathToClaudeCodeExecutable"));
         assert!(BRIDGE_SOURCE.contains("canUseTool"));
+        assert!(BRIDGE_SOURCE.contains("PreToolUse"));
+        assert!(BRIDGE_SOURCE.contains("preToolUseHook(command.turnId"));
+        assert!(TOOL_POLICY_SOURCE.contains("permissionDecision: \"deny\""));
+        assert!(BRIDGE_SOURCE.contains("mode === \"bypassPermissions\""));
         assert!(BRIDGE_SOURCE.contains("event.message?.id || message.uuid"));
         assert!(BRIDGE_SOURCE.contains("message.message.id || message.uuid"));
         assert!(BRIDGE_SOURCE.contains("blockIndex: event.index"));
@@ -877,61 +938,88 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("allowedTools: securityValidator"));
         assert!(BRIDGE_SOURCE.contains("? []"));
         assert!(BRIDGE_SOURCE.contains("authoritativeAllowedTools(command.allowedBuiltinTools)"));
-        assert!(BRIDGE_SOURCE.contains("Archetype policy does not allow"));
+        assert!(TOOL_POLICY_SOURCE.contains("Archetype policy does not allow"));
         assert!(BRIDGE_SOURCE.contains("maxTurns: session.maxTurns"));
         assert!(BRIDGE_SOURCE.contains("session.timeoutSeconds * 1000"));
     }
 
     #[test]
     fn claude_structured_tool_policy_is_exhaustive_and_fail_closed() {
-        let mappings = BRIDGE_SOURCE
-            .split("const POLICY_TOOL_NAMES = new Map([")
+        let projected = BRIDGE_SOURCE
+            .split("const CLAUDE_POLICY_TOOLS = new Set([")
             .nth(1)
-            .and_then(|source| source.split("]);\n\nconst CANONICAL_POLICY_TOOLS").next())
-            .expect("Claude policy mapping table");
-        for (canonical, provider) in [
-            ("read", "Read"),
-            ("grep", "Grep"),
-            ("find", "Glob"),
-            ("bash", "Bash"),
-            ("write", "Write"),
-            ("edit", "Edit"),
-            ("ask", "AskUserQuestion"),
+            .and_then(|source| source.split("]);\n\n/**").next())
+            .expect("Claude projected identity set");
+        for provider in [
+            "Read",
+            "Grep",
+            "Glob",
+            "Bash",
+            "Write",
+            "Edit",
+            "AskUserQuestion",
+            "mcp__nakode__delegate",
         ] {
             assert!(
-                mappings.contains(&format!(r#"["{canonical}", ["{provider}"]]"#)),
-                "missing exact Claude mapping for {canonical}"
+                projected.contains(&format!("  \"{provider}\",")),
+                "missing exact Claude provider identity {provider}"
             );
         }
-        for unsupported in [
-            "ls",
-            "eval",
-            "todo",
-            "memory_search",
-            "memory_store",
-            "vision",
-            "browser",
-        ] {
+        for unprojected in ["read", "bash", "BASH", "ls", "mcp__nakode_external__Bash"] {
             assert!(
-                !mappings.contains(&format!(r#"["{unsupported}","#)),
-                "{unsupported} must not map to a broader Claude capability"
-            );
-            assert!(
-                BRIDGE_SOURCE.contains(&format!("  \"{unsupported}\",\n")),
-                "{unsupported} must remain explicit in the canonical policy table"
+                !projected.contains(&format!("  \"{unprojected}\",")),
+                "undeclared identity {unprojected} must remain distinct"
             );
         }
         assert!(BRIDGE_SOURCE.contains("if (!Array.isArray(configured)) return null"));
-        assert!(BRIDGE_SOURCE.contains("if (!Array.isArray(configured)) return []"));
         assert!(BRIDGE_SOURCE.contains("command.parentRunId || policy?.runId || null"));
-        assert!(BRIDGE_SOURCE.contains("!CANONICAL_POLICY_TOOLS.has(name)"));
-        assert!(BRIDGE_SOURCE.contains("!POLICY_TOOL_NAMES.has(name)"));
+        assert!(BRIDGE_SOURCE.contains("CLAUDE_POLICY_TOOLS.has(name)"));
+        assert!(BRIDGE_SOURCE.contains("denied: true"));
+        assert!(BRIDGE_SOURCE.contains("denialReason: message"));
+        assert!(BRIDGE_SOURCE.contains("tools: builtinTools"));
+        assert!(!BRIDGE_SOURCE.contains("tools: allowedTools"));
+        assert!(BRIDGE_SOURCE.contains("disallowedTools: session.deniedTools"));
+    }
+
+    #[test]
+    fn completed_claude_denial_audit_retains_input_output_and_reason() {
+        let event = tool_call_event(&json!({
+            "event": "tool_call",
+            "turnId": "turn-1",
+            "callId": "call-1",
+            "name": "Bash",
+            "status": "error",
+            "result": {
+                "input": {"command": "echo denied"},
+                "output": "permission denied"
+            },
+            "denied": true,
+            "denialReason": "Archetype policy does not allow Bash."
+        }));
+        let BackendEvent::ItemCompleted { item, .. } = event else {
+            panic!("expected completed tool event");
+        };
+        let audit: Value = serde_json::from_str(
+            item.tool_audit_json
+                .as_deref()
+                .expect("authoritative audit"),
+        )
+        .expect("audit json");
+        assert_eq!(audit["denied"], true);
+        assert_eq!(audit["name"], "Bash");
         assert!(
-            BRIDGE_SOURCE
-                .contains("Claude cannot safely represent Nakode canonical tools; denied:")
+            audit["input"]["value"]
+                .as_str()
+                .is_some_and(|value| value.contains("echo denied"))
         );
         assert!(
-            BRIDGE_SOURCE.contains("notably `ls`, which must not broaden into recursive `Glob`")
+            audit["output"]["value"]
+                .as_str()
+                .is_some_and(|value| value.contains("permission denied"))
+        );
+        assert_eq!(
+            audit["denialReason"],
+            "Archetype policy does not allow Bash."
         );
     }
 
@@ -970,7 +1058,7 @@ mod tests {
             parent_run_id: None,
             external_tools: Vec::new(),
             replace_builtin_tools: false,
-            allowed_builtin_tools: Some(vec!["read".to_owned(), "find".to_owned()]),
+            allowed_builtin_tools: Some(vec!["Read".to_owned(), "Glob".to_owned()]),
             max_turns: None,
             timeout_seconds: None,
         })
@@ -978,7 +1066,7 @@ mod tests {
         .expect("bridge request");
         assert_eq!(
             restricted.payload["allowedBuiltinTools"],
-            json!(["read", "find"])
+            json!(["Read", "Glob"])
         );
 
         let denied = bridge_request(BackendCommand::StartSession {

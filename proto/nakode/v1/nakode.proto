@@ -585,6 +585,11 @@ message RunPolicy {
   uint32 remaining_delegation_depth = 12;
   bool require_parent_attribution = 13;
   repeated string truncated_fields = 14;
+  string provider = 15;
+  repeated string provider_allowed_tools = 16;
+  repeated string unsupported_canonical_tools = 17;
+  bool provider_tools_restricted = 18;
+  bool policy_available = 19;
 }
 message RunToolDenial {
   string entry_id = 1;

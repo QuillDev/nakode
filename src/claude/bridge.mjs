@@ -7,6 +7,10 @@ import {
   tool,
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
+import {
+  immediateProviderToolDecision,
+  preToolUseOutput,
+} from "./tool_policy.mjs";
 import { spawn as spawnChild } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -19,6 +23,7 @@ const runs = new Map();
 const approvals = new Map();
 const externalToolCalls = new Map();
 const providerToolCalls = new Map();
+const deniedProviderToolCalls = new Map();
 const streamMessageIds = new Map();
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
@@ -197,9 +202,16 @@ function providerToolName(name) {
 
 function effectiveAllowedTools(session) {
   const external = externalToolNames(session);
-  if (session.replaceBuiltinTools) return external;
+  if (session.replaceBuiltinTools) {
+    return [
+      ...external,
+      ...(session.allowedTools?.filter((name) => name === "mcp__nakode__delegate") ?? []),
+    ];
+  }
   if (session.allowedTools === null) return null;
-  return [...session.allowedTools, ...external];
+  return [...session.allowedTools, ...external].filter(
+    (name) => !session.deniedTools.includes(name),
+  );
 }
 
 function errorMessage(error) {
@@ -448,9 +460,6 @@ async function createSession(command, resumed) {
   const structuredAllowed = securityValidator
     ? []
     : authoritativeAllowedTools(command.allowedBuiltinTools);
-  const unsupportedAllowed = securityValidator
-    ? []
-    : unsupportedAllowedTools(command.allowedBuiltinTools);
   sessions.set(sessionId, {
     sessionId,
     resumed,
@@ -474,12 +483,6 @@ async function createSession(command, resumed) {
       : [],
     replaceBuiltinTools: command.replaceBuiltinTools === true,
   });
-  if (unsupportedAllowed.length > 0) {
-    write({
-      event: "diagnostic",
-      message: `Claude cannot safely represent Nakode canonical tools; denied: ${unsupportedAllowed.join(", ")}`,
-    });
-  }
   let history = [];
   if (resumed) {
     try {
@@ -520,54 +523,34 @@ const POLICY_TOOL_NAMES = new Map([
   ["ask", ["AskUserQuestion"]],
 ]);
 
-const CANONICAL_POLICY_TOOLS = new Set([
-  "read",
-  "grep",
-  "find",
-  "ls",
-  "bash",
-  "write",
-  "edit",
-  "eval",
-  "todo",
-  "ask",
-  "memory_search",
-  "memory_store",
-  "vision",
-  "browser",
+const CLAUDE_POLICY_TOOLS = new Set([
+  "Read",
+  "Grep",
+  "Glob",
+  "Bash",
+  "Write",
+  "Edit",
+  "AskUserQuestion",
+  "mcp__nakode__delegate",
 ]);
 
 /**
- * Translate Nakode's authoritative canonical built-in boundary for Claude.
+ * Accept Nakode's authoritative, already-projected Claude tool boundary.
  *
  * `null` means the caller supplied no structured boundary, so legacy prompt-policy parsing remains
- * available. An explicit empty array is deny-all. Canonical tools without an exact provider
- * equivalent — notably `ls`, which must not broaden into recursive `Glob` — and unknown names stay
- * denied and are reported through a protocol diagnostic.
+ * available. An explicit empty array is deny-all. Exact provider identities only are accepted;
+ * unknown names remain denied. Unsupported canonical names are reported by the upstream provider
+ * projection and inspection view before this already-projected boundary reaches the bridge.
  */
 function authoritativeAllowedTools(configured) {
   if (!Array.isArray(configured)) return null;
   return [
     ...new Set(
-      configured.flatMap((name) =>
-        typeof name === "string" ? (POLICY_TOOL_NAMES.get(name) ?? []) : [],
+      configured.filter(
+        (name) => typeof name === "string" && CLAUDE_POLICY_TOOLS.has(name),
       ),
     ),
   ];
-}
-
-function unsupportedAllowedTools(configured) {
-  if (!Array.isArray(configured)) return [];
-  return [
-    ...new Set(
-      configured.filter(
-        (name) =>
-          typeof name !== "string" ||
-          !CANONICAL_POLICY_TOOLS.has(name) ||
-          !POLICY_TOOL_NAMES.has(name),
-      ),
-    ),
-  ].map(String);
 }
 
 function archetypePolicy(instructions) {
@@ -662,19 +645,39 @@ async function securityValidation(ownerSessionId, toolName, input, options) {
 
 function permissionHandler(turnId, session, mode, allowedTools) {
   return async (toolName, input, options) => {
-    if (session.deniedTools.includes(toolName)) {
-      return {
-        behavior: "deny",
-        message: `Archetype policy explicitly denies ${toolName}.`,
-        toolUseID: options.toolUseID,
-      };
+    const deny = (message) => {
+      const callId = options.toolUseID || randomUUID();
+      if (options.toolUseID) {
+        deniedProviderToolCalls.set(options.toolUseID, {
+          name: providerToolName(toolName),
+          reason: message,
+          turnId,
+        });
+      }
+      write({
+        event: "tool_call",
+        turnId,
+        callId,
+        name: providerToolName(toolName) || "UnknownProviderTool",
+        status: "error",
+        args: input,
+        external: externalToolNames(session).includes(toolName),
+        denied: true,
+        denialReason: message,
+      });
+      return { behavior: "deny", message, toolUseID: options.toolUseID };
+    };
+    const immediate = immediateProviderToolDecision(
+      session.deniedTools,
+      allowedTools,
+      mode,
+      toolName,
+    );
+    if (immediate?.behavior === "deny") {
+      return deny(immediate.message);
     }
-    if (allowedTools !== null && !allowedTools.includes(toolName)) {
-      return {
-        behavior: "deny",
-        message: `Archetype policy does not allow ${toolName}.`,
-        toolUseID: options.toolUseID,
-      };
+    if (immediate?.behavior === "allow") {
+      return { ...immediate, updatedInput: input };
     }
     if (externalToolNames(session).includes(toolName)) {
       return { behavior: "allow", updatedInput: input };
@@ -705,16 +708,14 @@ function permissionHandler(turnId, session, mode, allowedTools) {
           runId: result.runId,
         },
       });
-      return result.verdict === "allow"
-        ? { behavior: "allow", updatedInput: input }
-        : {
-            behavior: "deny",
-            message:
-              result.verdict === "reject"
-                ? `Independent security validation rejected this operation: ${result.rationale}`
-                : `Security validation requires escalation; the operation was not run: ${result.rationale}`,
-            toolUseID: options.toolUseID,
-          };
+      if (result.verdict === "allow") {
+        return { behavior: "allow", updatedInput: input };
+      }
+      return deny(
+        result.verdict === "reject"
+          ? `Independent security validation rejected this operation: ${result.rationale}`
+          : `Security validation requires escalation; the operation was not run: ${result.rationale}`,
+      );
     }
     if (
       toolName !== "AskUserQuestion" &&
@@ -722,12 +723,9 @@ function permissionHandler(turnId, session, mode, allowedTools) {
       !options.matchedAskRule &&
       !session.validationEnabled
     ) {
-      return {
-        behavior: "deny",
-        message:
-          "Recursive security validation was prevented in a delegated validator context.",
-        toolUseID: options.toolUseID,
-      };
+      return deny(
+        "Recursive security validation was prevented in a delegated validator context.",
+      );
     }
     return new Promise((resolve) => {
       const approvalId = options.toolUseID || randomUUID();
@@ -737,6 +735,27 @@ function permissionHandler(turnId, session, mode, allowedTools) {
         settled = true;
         options.signal.removeEventListener("abort", abort);
         approvals.delete(approvalId);
+        if (result.behavior === "deny") {
+          const reason = result.message || "Tool use denied";
+          if (options.toolUseID) {
+            deniedProviderToolCalls.set(options.toolUseID, {
+              name: providerToolName(toolName),
+              reason,
+              turnId,
+            });
+          }
+          write({
+            event: "tool_call",
+            turnId,
+            callId: approvalId,
+            name: providerToolName(toolName) || "UnknownProviderTool",
+            status: "error",
+            args: input,
+            external: externalToolNames(session).includes(toolName),
+            denied: true,
+            denialReason: reason,
+          });
+        }
         resolve(result);
       };
       const abort = () =>
@@ -768,13 +787,26 @@ function permissionHandler(turnId, session, mode, allowedTools) {
   };
 }
 
+function preToolUseHook(turnId, session, mode, allowedTools) {
+  const authorize = permissionHandler(turnId, session, mode, allowedTools);
+  return async (hookInput, toolUseID, options) => {
+    const result = await authorize(hookInput.tool_name, hookInput.tool_input, {
+      signal: options.signal,
+      suggestions: [],
+      toolUseID: toolUseID || hookInput.tool_use_id,
+    });
+    return preToolUseOutput(result);
+  };
+}
+
 function emitContent(turnId, message) {
   const content = message?.message?.content;
   if (!Array.isArray(content)) return;
   for (const block of content) {
     if (block.type === "tool_use") {
       const name = providerToolName(block.name);
-      providerToolCalls.set(block.id, { name, input: block.input });
+      const external = block.name?.startsWith("mcp__nakode_external__") === true;
+      providerToolCalls.set(block.id, { name, input: block.input, external });
       write({
         event: "tool_call",
         turnId,
@@ -782,6 +814,7 @@ function emitContent(turnId, message) {
         name,
         status: "running",
         args: block.input,
+        external,
       });
     }
   }
@@ -794,13 +827,18 @@ function emitUserToolResults(turnId, message) {
     if (block.type === "tool_result") {
       const started = providerToolCalls.get(block.tool_use_id);
       providerToolCalls.delete(block.tool_use_id);
+      const denied = deniedProviderToolCalls.get(block.tool_use_id);
+      deniedProviderToolCalls.delete(block.tool_use_id);
       write({
         event: "tool_call",
         turnId,
         callId: block.tool_use_id,
-        name: started?.name || "Tool",
+        name: denied?.name || started?.name || "Tool",
         status: block.is_error ? "error" : "completed",
         result: { input: started?.input, output: block.content },
+        external: started?.external === true,
+        denied: denied !== undefined,
+        denialReason: denied?.reason,
       });
     }
   }
@@ -826,7 +864,8 @@ function emitStreamEvent(turnId, message) {
     const block = event.content_block;
     if (block?.type === "tool_use") {
       const name = providerToolName(block.name);
-      providerToolCalls.set(block.id, { name, input: block.input });
+      const external = block.name?.startsWith("mcp__nakode_external__") === true;
+      providerToolCalls.set(block.id, { name, input: block.input, external });
       write({
         event: "tool_call",
         turnId,
@@ -834,6 +873,7 @@ function emitStreamEvent(turnId, message) {
         name,
         status: "running",
         args: block.input,
+        external,
       });
     }
     return;
@@ -879,7 +919,8 @@ async function sendTurn(command) {
   if (
     session.ownerSessionId &&
     session.validationEnabled &&
-    session.delegationEnabled
+    session.delegationEnabled &&
+    (allowedTools === null || allowedTools.includes("mcp__nakode__delegate"))
   ) {
     mcpServers.nakode = nakodeServer(
       session.ownerSessionId,
@@ -889,6 +930,9 @@ async function sendTurn(command) {
   if (session.externalTools.length > 0) {
     mcpServers.nakode_external = externalToolsServer(session, command.turnId);
   }
+  const builtinTools = allowedTools === null
+    ? null
+    : allowedTools.filter((name) => !name.startsWith("mcp__"));
   const options = {
     cwd: command.workspace,
     pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE || "claude",
@@ -901,8 +945,28 @@ async function sendTurn(command) {
     abortController,
     permissionMode: mode,
     ...(session.maxTurns ? { maxTurns: session.maxTurns } : {}),
-    ...(allowedTools !== null ? { allowedTools } : {}),
-    canUseTool: permissionHandler(command.turnId, session, mode, allowedTools),
+    ...(builtinTools !== null ? { tools: builtinTools } : {}),
+    ...(session.deniedTools.length > 0
+      ? { disallowedTools: session.deniedTools }
+      : {}),
+    ...(mode === "bypassPermissions"
+      ? {
+          hooks: {
+            PreToolUse: [
+              {
+                hooks: [preToolUseHook(command.turnId, session, mode, allowedTools)],
+              },
+            ],
+          },
+        }
+      : {
+          canUseTool: permissionHandler(
+            command.turnId,
+            session,
+            mode,
+            allowedTools,
+          ),
+        }),
     spawnClaudeCodeProcess: processLifecycle.spawn,
     ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
     ...(session.started
@@ -974,6 +1038,9 @@ async function sendTurn(command) {
       "External tool call interrupted",
     );
     streamMessageIds.delete(command.turnId);
+    for (const [callId, denied] of deniedProviderToolCalls) {
+      if (denied.turnId === command.turnId) deniedProviderToolCalls.delete(callId);
+    }
     runs.delete(command.turnId);
   }
 

@@ -79,10 +79,17 @@ fn append_archetype_policy_instructions(instructions: &mut String, policy: &Agen
     } else {
         "denied"
     };
+    let tool_profile = match policy.tool_profile {
+        AgentToolProfile::None => "none",
+        AgentToolProfile::ReadOnly => "read_only",
+        AgentToolProfile::CommandRunner => "command_runner",
+        AgentToolProfile::BoundedWatcher => "bounded_watcher",
+        AgentToolProfile::Custom => "custom",
+    };
     let _ = write!(
         instructions,
-        "\n\n[Nakode Archetype Policy]\nTool profile: {:?}\nAllowed tools: {allowed_tools}\nDenied tools: {denied_tools}\nNetwork is {network}. File writes are {file_writes}. Recursive delegation is {delegation} (maximum depth {}). Parent attribution is required.\nExpected task shape: {}\nOutput contract: {}\n[/Nakode Archetype Policy]",
-        policy.tool_profile, policy.max_delegation_depth, policy.task_shape, policy.output_contract,
+        "\n\n[Nakode Archetype Policy]\nTool profile: {tool_profile}\nAllowed tools: {allowed_tools}\nDenied tools: {denied_tools}\nNetwork is {network}. File writes are {file_writes}. Recursive delegation is {delegation} (maximum depth {}). Parent attribution is required.\nExpected task shape: {}\nOutput contract: {}\n[/Nakode Archetype Policy]",
+        policy.max_delegation_depth, policy.task_shape, policy.output_contract,
     );
 }
 
@@ -2901,6 +2908,9 @@ impl DomainState {
             owner_session_id: Some(self.nakode_session_id.clone()),
             external_tools: self.provider_external_tools(),
             replace_builtin_tools: self.replace_builtin_tools,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
         }));
         effects
     }
@@ -5123,6 +5133,14 @@ impl DomainState {
                     "external tool names must be non-empty and unique".to_owned(),
                 ));
             }
+            if !replace_builtin_tools
+                && crate::agent::CANONICAL_AGENT_TOOLS.contains(&tool.name.as_str())
+            {
+                return Err(DomainCommandError::Invalid(format!(
+                    "external tool name collides with canonical builtin: {}",
+                    tool.name
+                )));
+            }
             serde_json::from_str::<serde_json::Value>(&tool.input_schema_json).map_err(
                 |error| {
                     DomainCommandError::Invalid(format!(
@@ -5195,13 +5213,10 @@ impl DomainState {
             .get(run_id)
             .is_some_and(|execution| {
                 self.has_mcp_tool(name)
-                    && self.mcp_archetype_grants.get(name).is_some_and(|slugs| {
-                        slugs.contains(&execution.definition.slug)
-                            && execution
-                                .definition
-                                .allowed_tools
-                                .contains(&name.to_owned())
-                    })
+                    && self
+                        .mcp_archetype_grants
+                        .get(name)
+                        .is_some_and(|slugs| slugs.contains(&execution.definition.slug))
             })
     }
 
@@ -7430,7 +7445,28 @@ impl DomainState {
             );
         }
         let replace_builtin_tools = execution.definition.tool_profile == AgentToolProfile::None;
-        let allowed_builtin_tools = execution.definition.builtin_tool_allowlist();
+        let canonical_builtin_tools = execution.definition.builtin_tool_allowlist();
+        let provider_projection = crate::backend::project_provider_tools(
+            &target.provider,
+            canonical_builtin_tools.as_deref(),
+        );
+        if canonical_builtin_tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+            && provider_projection
+                .allowed_tools
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        {
+            let message = format!(
+                "provider {} cannot represent any allowed builtin tools for archetype {:?}: {}",
+                target.provider,
+                execution.definition.slug,
+                provider_projection.unsupported_canonical_tools.join(", ")
+            );
+            return self.retry_subagent_or_finish(run_id, message);
+        }
+        let allowed_builtin_tools = provider_projection.allowed_tools;
         let max_turns = execution.definition.max_turns;
         let timeout_seconds = execution.definition.timeout_seconds;
         let instructions =
@@ -7441,10 +7477,9 @@ impl DomainState {
         let external_tools = mcp_tools
             .iter()
             .filter(|tool| {
-                execution.definition.allowed_tools.contains(&tool.name)
-                    && mcp_archetype_grants
-                        .get(&tool.name)
-                        .is_some_and(|slugs| slugs.contains(&archetype_slug))
+                mcp_archetype_grants
+                    .get(&tool.name)
+                    .is_some_and(|slugs| slugs.contains(&archetype_slug))
             })
             .cloned()
             .collect();

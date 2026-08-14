@@ -17,6 +17,87 @@ pub const CLAUDE_PROVIDER: &str = "claude-agent";
 pub const KIMI_PROVIDER: &str = "kimi-coding";
 pub const GLM_PROVIDER: &str = "zai-coding";
 
+/// Exact provider-call identities projected from Nakode's canonical built-ins.
+///
+/// This table is deliberately case-sensitive and exhaustive. Custom and MCP tools never enter it;
+/// adapters keep those identities in their separately configured namespace.
+const PROVIDER_TOOL_IDENTITIES: &[(&str, &str, &str)] = &[
+    (CLAUDE_PROVIDER, "read", "Read"),
+    (CLAUDE_PROVIDER, "grep", "Grep"),
+    (CLAUDE_PROVIDER, "find", "Glob"),
+    (CLAUDE_PROVIDER, "bash", "Bash"),
+    (CLAUDE_PROVIDER, "write", "Write"),
+    (CLAUDE_PROVIDER, "edit", "Edit"),
+    (CLAUDE_PROVIDER, "ask", "AskUserQuestion"),
+    (
+        CLAUDE_PROVIDER,
+        crate::tools::NAKODE_AGENT_TOOL_NAME,
+        "mcp__nakode__delegate",
+    ),
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderToolProjection {
+    pub provider: String,
+    pub enforced: bool,
+    pub allowed_tools: Option<Vec<String>>,
+    pub unsupported_canonical_tools: Vec<String>,
+}
+
+/// Project a canonical launch boundary to the exact identities accepted and emitted by an adapter.
+/// Native runtime providers intentionally use exact canonical identities; Claude uses only declared
+/// equivalents. Cursor has no scoped builtin bridge and therefore projects no canonical tools.
+#[must_use]
+pub fn project_provider_tools(
+    provider: &str,
+    canonical_tools: Option<&[String]>,
+) -> ProviderToolProjection {
+    let Some(canonical_tools) = canonical_tools else {
+        return ProviderToolProjection {
+            provider: provider.to_owned(),
+            enforced: matches!(
+                provider,
+                CLAUDE_PROVIDER | CODEX_PROVIDER | DEVIN_PROVIDER | KIMI_PROVIDER | GLM_PROVIDER
+            ),
+            allowed_tools: None,
+            unsupported_canonical_tools: Vec::new(),
+        };
+    };
+    let identity_provider = matches!(
+        provider,
+        CODEX_PROVIDER | DEVIN_PROVIDER | KIMI_PROVIDER | GLM_PROVIDER
+    );
+    let mut allowed_tools = Vec::new();
+    let mut unsupported_canonical_tools = Vec::new();
+    for canonical in canonical_tools {
+        let projected = if identity_provider {
+            crate::agent::CANONICAL_AGENT_TOOLS
+                .contains(&canonical.as_str())
+                .then_some(canonical.as_str())
+        } else {
+            PROVIDER_TOOL_IDENTITIES
+                .iter()
+                .find(|(mapped_provider, mapped_canonical, _)| {
+                    *mapped_provider == provider && *mapped_canonical == canonical
+                })
+                .map(|(_, _, identity)| *identity)
+        };
+        if let Some(projected) = projected {
+            if !allowed_tools.iter().any(|allowed| allowed == projected) {
+                allowed_tools.push(projected.to_owned());
+            }
+        } else {
+            unsupported_canonical_tools.push(canonical.clone());
+        }
+    }
+    ProviderToolProjection {
+        provider: provider.to_owned(),
+        enforced: provider == CLAUDE_PROVIDER || identity_provider,
+        allowed_tools: Some(allowed_tools),
+        unsupported_canonical_tools,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApiKeyProviderSetup {
     pub dashboard_url: &'static str,
@@ -565,8 +646,9 @@ pub enum BackendCommand {
         parent_run_id: Option<String>,
         external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
-        /// Canonical Nakode builtin names allowed for this provider session. `None` keeps the
-        /// ordinary full registry; `Some` is authoritative even when empty.
+        /// Exact provider-call identities allowed for this provider session. `None` keeps the
+        /// ordinary full registry; `Some` is authoritative even when empty. Canonical archetype
+        /// names are projected before crossing the adapter boundary.
         allowed_builtin_tools: Option<Vec<String>>,
         /// Maximum provider/tool inference rounds and wall-clock lifetime for delegated runs.
         max_turns: Option<u32>,
@@ -579,6 +661,11 @@ pub enum BackendCommand {
         /// Client-owned tools installed before provider restoration.
         external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
+        /// Provider identities and bounds to apply if this resume is scoped. Active delegated runs
+        /// are restored as interrupted, while ordinary primary resumes intentionally pass `None`.
+        allowed_builtin_tools: Option<Vec<String>>,
+        max_turns: Option<u32>,
+        timeout_seconds: Option<u32>,
     },
     UnsubscribeSession {
         provider_session_id: String,
@@ -718,7 +805,10 @@ impl BackendHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{CODEX_PROVIDER, DEVIN_PROVIDER, display_model_name};
+    use super::{
+        CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER, DEVIN_PROVIDER, GLM_PROVIDER,
+        KIMI_PROVIDER, display_model_name, project_provider_tools,
+    };
 
     #[test]
     fn model_ids_are_normalized_for_display_without_changing_provider_ids() {
@@ -735,5 +825,67 @@ mod tests {
             "SWE 1.6 Fast"
         );
         assert_eq!(display_model_name(CODEX_PROVIDER, "o3"), "o3");
+    }
+
+    #[test]
+    fn provider_tool_projection_is_explicit_case_sensitive_and_fail_closed() {
+        let canonical = vec![
+            "read".to_owned(),
+            "grep".to_owned(),
+            "find".to_owned(),
+            "bash".to_owned(),
+            "ask".to_owned(),
+            crate::tools::NAKODE_AGENT_TOOL_NAME.to_owned(),
+            "ls".to_owned(),
+            "Bash".to_owned(),
+            "mcp__nakode_external__bash".to_owned(),
+        ];
+        let claude = project_provider_tools(CLAUDE_PROVIDER, Some(&canonical));
+        assert_eq!(
+            claude.allowed_tools,
+            Some(
+                vec![
+                    "Read",
+                    "Grep",
+                    "Glob",
+                    "Bash",
+                    "AskUserQuestion",
+                    "mcp__nakode__delegate",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+            )
+        );
+        assert_eq!(
+            claude.unsupported_canonical_tools,
+            vec!["ls", "Bash", "mcp__nakode_external__bash"]
+        );
+
+        for provider in [CODEX_PROVIDER, DEVIN_PROVIDER, KIMI_PROVIDER, GLM_PROVIDER] {
+            let projection = project_provider_tools(provider, Some(&canonical));
+            assert_eq!(
+                projection.allowed_tools,
+                Some(
+                    vec!["read", "grep", "find", "bash", "ask", "nakode_agent", "ls"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                ),
+                "{provider} uses exact canonical identities"
+            );
+            assert_eq!(
+                projection.unsupported_canonical_tools,
+                vec!["Bash", "mcp__nakode_external__bash"]
+            );
+        }
+
+        let cursor = project_provider_tools(CURSOR_PROVIDER, Some(&canonical));
+        assert_eq!(cursor.allowed_tools, Some(Vec::new()));
+        assert_eq!(cursor.unsupported_canonical_tools, canonical);
+        assert_eq!(
+            project_provider_tools(CLAUDE_PROVIDER, None).allowed_tools,
+            None
+        );
     }
 }
