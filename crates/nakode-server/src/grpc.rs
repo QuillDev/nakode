@@ -562,6 +562,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             model_id: input.model_id.map(protocol::ModelId::from),
             options: model_options(input.options),
             tools: session_tools(input.tools),
+            initial_instructions: input.initial_instructions,
             mcp_grant: mcp_grant(input.mcp_grant)?,
         }
     );

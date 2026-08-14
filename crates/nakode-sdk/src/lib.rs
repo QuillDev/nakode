@@ -227,7 +227,41 @@ impl NakodeClient {
                 model_id,
                 options,
                 tools,
+                initial_instructions: None,
                 mcp_grant: None,
+            }
+        )?;
+        result
+            .resource_id
+            .ok_or(SdkError::MissingState("created session identifier"))
+    }
+
+    /// Creates a logical session with model/options, client-owned tools, and optional provider
+    /// system instructions committed atomically.
+    ///
+    /// # Errors
+    /// Returns a transport, server validation, or missing-identifier error.
+    pub async fn create_session_with_initial_instructions(
+        &self,
+        workspace_id: impl Into<String>,
+        title: Option<String>,
+        model_id: Option<String>,
+        options: Option<api::ModelOptions>,
+        tools: Option<api::SessionToolConfiguration>,
+        initial_instructions: Option<String>,
+    ) -> Result<String, SdkError> {
+        let result = send_mutation!(
+            self,
+            create_session,
+            api::CreateSessionRequest {
+                mutation: Some(mutation(None)),
+                workspace_id: workspace_id.into(),
+                title,
+                model_id,
+                options,
+                tools,
+                mcp_grant: None,
+                initial_instructions,
             }
         )?;
         result

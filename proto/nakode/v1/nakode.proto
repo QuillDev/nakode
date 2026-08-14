@@ -140,6 +140,9 @@ message CreateSessionRequest {
   optional SessionToolConfiguration tools = 6;
   // Explicit, deny-by-default Nakode MCP grant; omitted means no MCP access.
   optional McpSessionGrant mcp_grant = 7;
+  // Bounded client context merged into Nakode-owned provider system instructions.
+  // Omission preserves legacy session creation behavior. Requires `InitialSessionInstructions`.
+  optional string initial_instructions = 8;
 }
 // Supplying tools installs them before a closed session begins provider restoration. An already
 // attached session accepts only the identical table, making client reattachment idempotent without

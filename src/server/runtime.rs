@@ -1248,6 +1248,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::ExternalTools,
             ServiceCapability::InitialSessionTools,
             ServiceCapability::InitialSessionModel,
+            ServiceCapability::InitialSessionInstructions,
             ServiceCapability::SessionDeletion,
             ServiceCapability::QuestionTextAnswers,
             ServiceCapability::QueuedPromptSteering,
@@ -3309,6 +3310,7 @@ mod tests {
                     model_id: None,
                     options: nakode_protocol::ModelOptions::default(),
                     tools: None,
+                    initial_instructions: None,
                     mcp_grant: None,
                 },
             )

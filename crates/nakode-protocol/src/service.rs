@@ -18,6 +18,8 @@ pub enum ServiceCapability {
     InitialSessionTools,
     /// `CreateSession` can validate and apply an initial model/options before publication.
     InitialSessionModel,
+    /// `CreateSession` accepts bounded client context merged into provider system instructions.
+    InitialSessionInstructions,
     /// `DeleteSession` is served: a logical session and its persisted history can be removed.
     ///
     /// Declared rather than assumed so a client can degrade its own affordance instead of offering a

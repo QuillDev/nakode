@@ -426,6 +426,7 @@ impl ServerCore {
                 model_id,
                 options,
                 tools,
+                initial_instructions,
                 mcp_grant,
                 ..
             } => self.create_session_command_with_mcp(
@@ -433,6 +434,7 @@ impl ServerCore {
                 model_id.as_ref(),
                 &options,
                 tools,
+                initial_instructions.as_deref(),
                 mcp_grant.as_ref(),
             ),
             Command::OpenSession {
@@ -594,7 +596,7 @@ impl ServerCore {
         options: &nakode_protocol::ModelOptions,
         tools: Option<nakode_protocol::SessionToolConfiguration>,
     ) -> DomainCommandOutcome {
-        self.create_session_command_with_mcp(workspace_id, model_id, options, tools, None)
+        self.create_session_command_with_mcp(workspace_id, model_id, options, tools, None, None)
     }
 
     fn create_session_command_with_mcp(
@@ -603,6 +605,7 @@ impl ServerCore {
         model_id: Option<&nakode_protocol::ModelId>,
         options: &nakode_protocol::ModelOptions,
         tools: Option<nakode_protocol::SessionToolConfiguration>,
+        initial_instructions: Option<&str>,
         mcp_grant: Option<&McpSessionGrant>,
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
@@ -613,6 +616,9 @@ impl ServerCore {
         }
         self.refresh_session_template_addenda()?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
+        engine
+            .state_mut()
+            .set_initial_client_instructions(initial_instructions)?;
         let mut effects = engine.state_mut().create_logical_session()?;
         let session_id = SessionId::from(engine.state().nakode_session_id.clone());
         if let Some(model_id) = model_id {
