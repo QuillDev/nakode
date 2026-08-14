@@ -1614,6 +1614,7 @@ pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSu
         active_provider_id: value.active_provider_id.map(|id| id.to_string()),
         active_model_id: value.active_model_id.map(|id| id.to_string()),
         updated_at_ms: value.updated_at_ms,
+        created_at_ms: value.created_at_ms,
         owned_provider_sessions: value
             .owned_provider_sessions
             .into_iter()
@@ -1658,6 +1659,8 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
                 arguments_json: call.arguments_json,
             })
             .collect(),
+        created_at_ms: value.created_at_ms,
+        updated_at_ms: value.updated_at_ms,
     }
 }
 
@@ -1773,6 +1776,7 @@ fn transcript_entry(value: protocol::TranscriptEntryView) -> api::TranscriptEntr
         provider_id: value.provider_id,
         model_id: value.model_id.map(|id| id.to_string()),
         tool_audit_json: value.tool_audit_json,
+        created_at_ms: value.created_at_ms,
     }
 }
 

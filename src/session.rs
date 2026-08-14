@@ -585,6 +585,7 @@ impl SqliteSessionRepository {
                provider_id TEXT,
                model_id TEXT,
                tool_audit_json TEXT,
+               created_at_ms INTEGER,
                PRIMARY KEY(parent_session_id, run_id, sequence),
                FOREIGN KEY(parent_session_id, run_id)
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
@@ -653,6 +654,15 @@ impl SqliteSessionRepository {
                     &format!("ALTER TABLE agent_turns ADD COLUMN {column} TEXT;"),
                 )?;
             }
+        }
+        if !agent_turn_columns
+            .iter()
+            .any(|existing| existing == "created_at_ms")
+        {
+            execute_batch_with_busy_retry(
+                &connection,
+                "ALTER TABLE agent_turns ADD COLUMN created_at_ms INTEGER;",
+            )?;
         }
         let has_model_specific_options = {
             let mut statement = connection.prepare("PRAGMA table_info(provider_model_options)")?;
@@ -1497,8 +1507,8 @@ impl SessionRepository for SqliteSessionRepository {
             let mut statement = transaction.prepare(
                 "INSERT INTO agent_turns
                    (parent_session_id, run_id, sequence, entry_id, item_key, kind, title, body, status,
-                    provider_id, model_id, tool_audit_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    provider_id, model_id, tool_audit_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
             for (sequence, entry) in record.transcript.iter().enumerate() {
                 let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
@@ -1515,6 +1525,9 @@ impl SessionRepository for SqliteSessionRepository {
                     entry.provider_id,
                     entry.model_id,
                     entry.tool_audit_json,
+                    entry
+                        .created_at_ms
+                        .and_then(|value| i64::try_from(value).ok()),
                 ])?;
             }
         }
@@ -1802,7 +1815,7 @@ fn load_subagent_transcript(
 ) -> Result<Vec<TranscriptEntry>, SessionError> {
     let mut statement = connection.prepare(
         "SELECT entry_id, item_key, kind, title, body, status, provider_id, model_id,
-                tool_audit_json
+                tool_audit_json, created_at_ms
          FROM agent_turns
          WHERE parent_session_id = ?1 AND run_id = ?2
          ORDER BY sequence",
@@ -1818,10 +1831,22 @@ fn load_subagent_transcript(
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
             row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<i64>>(9)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, key, kind, title, body, status, provider_id, model_id, tool_audit_json) = row?;
+        let (
+            id,
+            key,
+            kind,
+            title,
+            body,
+            status,
+            provider_id,
+            model_id,
+            tool_audit_json,
+            created_at_ms,
+        ) = row?;
         Ok(TranscriptEntry {
             id,
             key,
@@ -1829,6 +1854,7 @@ fn load_subagent_transcript(
             title,
             body,
             status: entry_status_from_value(&status)?,
+            created_at_ms: created_at_ms.and_then(|value| u64::try_from(value).ok()),
             provider_id,
             model_id,
             tool_audit_json,
@@ -2211,6 +2237,7 @@ mod tests {
                 title: "PARENT".to_owned(),
                 body: "Delegated task".to_owned(),
                 status: EntryStatus::Complete,
+                created_at_ms: None,
                 provider_id: None,
                 model_id: None,
                 tool_audit_json: None,
@@ -2297,6 +2324,7 @@ mod tests {
                     title: "PARENT".to_owned(),
                     body: "Delegated task: Map persistence".to_owned(),
                     status: EntryStatus::Complete,
+                    created_at_ms: Some(900),
                     provider_id: None,
                     model_id: None,
                     tool_audit_json: None,
@@ -2308,6 +2336,7 @@ mod tests {
                     title: "ASSISTANT".to_owned(),
                     body: "Persistence report".to_owned(),
                     status: EntryStatus::Complete,
+                    created_at_ms: Some(1_100),
                     provider_id: Some(CODEX_PROVIDER.to_owned()),
                     model_id: Some("openai-codex/gpt-5.4".to_owned()),
                     tool_audit_json: Some(
@@ -2420,6 +2449,7 @@ mod tests {
                 title: "ASSISTANT".to_owned(),
                 body: "partial".to_owned(),
                 status: EntryStatus::Running,
+                created_at_ms: None,
                 provider_id: None,
                 model_id: None,
                 tool_audit_json: None,

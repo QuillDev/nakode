@@ -71,6 +71,7 @@ pub fn bootstrap(
                 active_provider_id: provider_id(&state.backend_provider),
                 active_model_id: state.selected_model.clone().map(ModelId::from),
                 updated_at_ms: 0,
+                created_at_ms: 0,
                 owned_provider_sessions: owned_provider_sessions(state),
                 running: state.is_busy(),
             },
@@ -216,6 +217,15 @@ fn session_view(
     let (runs, runs_has_earlier) = run_views(state);
 
     let selected_options = state.selected_model_options();
+    let persisted = sessions
+        .iter()
+        .find(|session| session.id == state.nakode_session_id);
+    let created_at_ms = persisted.map_or(0, |session| {
+        unix_seconds_to_milliseconds(session.created_at)
+    });
+    let updated_at_ms = persisted.map_or(0, |session| {
+        unix_seconds_to_milliseconds(session.updated_at)
+    });
     SessionView {
         id: session_id.clone(),
         revision,
@@ -250,6 +260,8 @@ fn session_view(
                 arguments_json: call.arguments_json.clone(),
             })
             .collect(),
+        created_at_ms,
+        updated_at_ms,
     }
 }
 
@@ -1301,6 +1313,7 @@ fn transcript_entry_view(
             .enumerate()
             .map(|(index, _)| transcript_artifact_id(&entry.id, index))
             .collect(),
+        created_at_ms: entry.created_at_ms,
         provider_id: entry.provider_id.clone(),
         model_id: entry.model_id.clone().map(ModelId::from),
         tool_audit_json: include_audit
@@ -1393,6 +1406,7 @@ fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> Sessi
         active_provider_id: provider_id(&session.provider),
         active_model_id: session.model.clone().map(ModelId::from),
         updated_at_ms: unix_seconds_to_milliseconds(session.updated_at),
+        created_at_ms: unix_seconds_to_milliseconds(session.created_at),
         owned_provider_sessions: owned_provider_session(
             &session.provider,
             Some(&session.provider_session_id),
@@ -1919,6 +1933,7 @@ mod tests {
                     title: "reviewer".to_owned(),
                     body: body.clone(),
                     status: EntryStatus::Complete,
+                    created_at_ms: None,
                     provider_id: None,
                     model_id: None,
                     tool_audit_json: Some(
@@ -2197,6 +2212,7 @@ mod tests {
             body_total_bytes: u64::try_from(body.len()).unwrap_or(u64::MAX),
             status,
             artifacts: Vec::new(),
+            created_at_ms: None,
             provider_id: None,
             model_id: None,
             tool_audit_json: None,

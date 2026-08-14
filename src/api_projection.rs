@@ -545,6 +545,8 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
                 arguments_json: call.arguments_json,
             })
             .collect(),
+        created_at_ms: value.created_at_ms,
+        updated_at_ms: value.updated_at_ms,
     })
 }
 
@@ -821,6 +823,7 @@ fn session_summary(value: api::SessionSummary) -> view::SessionSummary {
         active_provider_id: value.active_provider_id.map(view::ProviderId::from),
         active_model_id: value.active_model_id.map(view::ModelId::from),
         updated_at_ms: value.updated_at_ms,
+        created_at_ms: value.created_at_ms,
         owned_provider_sessions: value
             .owned_provider_sessions
             .into_iter()
@@ -939,6 +942,7 @@ fn transcript_entry(value: api::TranscriptEntry) -> Result<view::TranscriptEntry
         provider_id: value.provider_id,
         model_id: value.model_id.map(view::ModelId::from),
         tool_audit_json: value.tool_audit_json,
+        created_at_ms: value.created_at_ms,
     })
 }
 

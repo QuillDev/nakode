@@ -118,6 +118,9 @@ pub struct SessionSummary {
     pub active_provider_id: Option<ProviderId>,
     pub active_model_id: Option<ModelId>,
     pub updated_at_ms: i64,
+    /// Immutable logical-session creation boundary, in Unix epoch milliseconds.
+    #[serde(default)]
+    pub created_at_ms: i64,
     /// Provider-native resources whose lifecycle belongs to this logical session.
     #[serde(default)]
     pub owned_provider_sessions: Vec<OwnedProviderSessionView>,
@@ -222,6 +225,9 @@ pub struct TranscriptEntryView {
     pub status: TranscriptEntryStatus,
     #[serde(default)]
     pub artifacts: Vec<ArtifactId>,
+    /// Immutable server entry-creation boundary in Unix epoch milliseconds.
+    #[serde(default)]
+    pub created_at_ms: Option<u64>,
     /// Provider identity captured when this turn began. Absent for legacy or non-inference entries.
     #[serde(default)]
     pub provider_id: Option<String>,
@@ -692,6 +698,11 @@ pub struct SessionView {
     pub notices: Vec<NoticeView>,
     #[serde(default)]
     pub external_tool_calls: Vec<ExternalToolCallView>,
+    /// Persisted logical-session creation and latest-update boundaries, in Unix epoch milliseconds.
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

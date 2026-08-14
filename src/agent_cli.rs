@@ -251,6 +251,7 @@ mod tests {
             provider_id: None,
             model_id: None,
             tool_audit_json: None,
+            created_at_ms: None,
         }
     }
 }
