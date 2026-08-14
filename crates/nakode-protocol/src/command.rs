@@ -240,6 +240,9 @@ pub enum Command {
         options: ModelOptions,
         /// Client-owned tools installed before this session can accept a prompt.
         tools: Option<SessionToolConfiguration>,
+        /// Optional client-owned context merged into provider system instructions for this session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_instructions: Option<String>,
         /// Explicit, deny-by-default Nakode MCP server grants for this session.
         #[serde(default)]
         mcp_grant: Option<McpSessionGrant>,
@@ -503,6 +506,7 @@ mod tests {
                 fast_mode: false,
             },
             tools: None,
+            initial_instructions: None,
             mcp_grant: None,
         };
         assert_eq!(
