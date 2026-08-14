@@ -2132,6 +2132,7 @@ impl ServerCore {
                 .iter()
                 .position(|summary| summary.id == session.id);
             let updated_at_ms = position.map_or(0, |index| bootstrap.sessions[index].updated_at_ms);
+            let created_at_ms = position.map_or(0, |index| bootstrap.sessions[index].created_at_ms);
             let mut owned_provider_sessions = session
                 .active_agent_session
                 .as_ref()
@@ -2160,6 +2161,7 @@ impl ServerCore {
                 active_provider_id: session.selected_provider_id,
                 active_model_id: session.selected_model_id,
                 updated_at_ms,
+                created_at_ms,
                 owned_provider_sessions,
                 running: !matches!(session.activity, nakode_protocol::SessionActivity::Idle),
             };
@@ -3283,7 +3285,13 @@ mod tests {
         assert_eq!(discovered.sessions.len(), 1);
         assert_eq!(discovered.sessions[0].id, initial_id);
         assert_eq!(discovered.sessions[0].title, "Direct terminal session");
+        assert_eq!(discovered.sessions[0].created_at_ms, 10_000);
         assert_eq!(discovered.sessions[0].updated_at_ms, 12_000);
+        let restored = core
+            .session_view(&initial_id)
+            .expect("persisted session state remains projectable");
+        assert_eq!(restored.created_at_ms, 10_000);
+        assert_eq!(restored.updated_at_ms, 12_000);
         core.open_session_command(&initial_id, None)
             .expect("persisted initial session remains resumable");
     }
@@ -4306,6 +4314,7 @@ first_message = "Starting review"
                 title: "reviewer".to_owned(),
                 body: result.clone(),
                 status: EntryStatus::Complete,
+                created_at_ms: None,
                 provider_id: None,
                 model_id: None,
                 tool_audit_json: None,
@@ -4359,6 +4368,7 @@ first_message = "Starting review"
                     title: "reviewer".to_owned(),
                     body: format!("entry body {index:03}"),
                     status: EntryStatus::Complete,
+                    created_at_ms: None,
                     provider_id: None,
                     model_id: None,
                     tool_audit_json: None,
@@ -4587,6 +4597,7 @@ first_message = "Starting review"
                 title: "reviewer".to_owned(),
                 body: "seed".to_owned(),
                 status: EntryStatus::Running,
+                created_at_ms: None,
                 provider_id: None,
                 model_id: None,
                 tool_audit_json: None,

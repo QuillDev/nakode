@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::media::ImageData;
 
@@ -34,6 +37,8 @@ pub struct TranscriptEntry {
     pub title: String,
     pub body: String,
     pub status: EntryStatus,
+    /// Immutable server creation boundary. Absent only for imported history without source timing.
+    pub created_at_ms: Option<u64>,
     /// The provider that produced this entry, when it belongs to an inference turn.
     pub provider_id: Option<String>,
     /// The canonical provider-qualified model used by that turn.
@@ -221,6 +226,7 @@ impl DomainTranscript {
             title: title.into(),
             body: body.into(),
             status,
+            created_at_ms: Some(unix_time_ms()),
             provider_id: None,
             model_id: None,
             tool_audit_json: None,
@@ -252,6 +258,7 @@ impl DomainTranscript {
                 title: title.into(),
                 body: body.into(),
                 status,
+                created_at_ms: Some(unix_time_ms()),
                 provider_id: None,
                 model_id: None,
                 tool_audit_json: None,
@@ -282,6 +289,7 @@ impl DomainTranscript {
                 title: title.into(),
                 body: delta.to_owned(),
                 status: EntryStatus::Running,
+                created_at_ms: Some(unix_time_ms()),
                 provider_id: None,
                 model_id: None,
                 tool_audit_json: None,
@@ -289,6 +297,12 @@ impl DomainTranscript {
             self.item_indices.insert(key, index);
         }
         self.enforce_limit();
+    }
+
+    pub fn set_created_at_ms(&mut self, key: &str, created_at_ms: Option<u64>) {
+        if let Some(index) = self.item_indices.get(key).copied() {
+            self.entries[index].created_at_ms = created_at_ms;
+        }
     }
 
     pub fn set_origin(&mut self, key: &str, provider_id: Option<&str>, model_id: Option<&str>) {
@@ -377,4 +391,12 @@ impl DomainTranscript {
         self.images
             .retain(|key, _| self.item_indices.contains_key(key));
     }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }

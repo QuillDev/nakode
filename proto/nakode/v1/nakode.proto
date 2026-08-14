@@ -482,6 +482,8 @@ message SessionSummary {
   repeated OwnedProviderSession owned_provider_sessions = 7;
   // True while the service still owns work in flight for this logical session.
   bool running = 8;
+  // Unix epoch milliseconds. The immutable logical-session creation boundary.
+  int64 created_at_ms = 9;
 }
 enum SessionActivity { SESSION_ACTIVITY_UNSPECIFIED = 0; SESSION_ACTIVITY_IDLE = 1; SESSION_ACTIVITY_CREATING_AGENT_SESSION = 2; SESSION_ACTIVITY_STARTING_TURN = 3; SESSION_ACTIVITY_RUNNING_TURN = 4; SESSION_ACTIVITY_COMPACTING_CONTEXT = 5; SESSION_ACTIVITY_RUNNING_DELEGATES = 6; SESSION_ACTIVITY_RUNNING_SHELL = 7; }
 message TokenUsage { uint64 input_tokens = 1; uint64 output_tokens = 2; uint64 cached_input_tokens = 3; uint64 cache_write_tokens = 4; }
@@ -525,6 +527,9 @@ message SessionState {
   repeated ExternalToolCall external_tool_calls = 21;
   // Effective model options for this logical session, including a session-local override.
   ModelOptions selected_model_options = 22;
+  // Unix epoch milliseconds from Nakode's persisted logical-session record.
+  int64 created_at_ms = 23;
+  int64 updated_at_ms = 24;
 }
 message ExternalToolCall { string id = 1; string name = 2; string arguments_json = 3; }
 
@@ -536,6 +541,8 @@ message TranscriptEntry {
   repeated string artifact_ids = 8; optional string provider_id = 9; optional string model_id = 10;
   // Opaque, versioned audit envelope. Its payload fields carry explicit truncation/redaction metadata.
   optional string tool_audit_json = 11;
+  // Immutable server creation boundary. Absent for imported history without source timing.
+  optional uint64 created_at_ms = 12;
 }
 message TranscriptPage { repeated TranscriptEntry entries = 1; bool has_earlier = 2; bool stream_active = 3; string stream_label = 4; }
 message TranscriptBodyWindow { string entry_id = 1; string body = 2; uint64 start_byte = 3; uint64 total_bytes = 4; bool has_earlier = 5; }

@@ -147,6 +147,7 @@ mod tests {
             title: String::new(),
             body: body.into(),
             status: EntryStatus::Complete,
+            created_at_ms: None,
             provider_id: None,
             model_id: None,
             tool_audit_json: None,

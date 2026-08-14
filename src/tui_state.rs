@@ -408,6 +408,8 @@ mod tests {
             runs_has_earlier: false,
             notices: Vec::new(),
             external_tool_calls: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
         }
     }
 

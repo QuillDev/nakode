@@ -6422,6 +6422,9 @@ impl DomainState {
                 item.body,
                 entry_status(item.status),
             );
+            // Provider history has no source timestamp. Do not relabel restored messages with the
+            // resume clock merely because normalization rebuilt their canonical rows now.
+            self.transcript.set_created_at_ms(&item_id, None);
             self.transcript
                 .set_tool_audit(&item_id, tool_audit_json.map(Into::into));
             self.transcript
@@ -11126,6 +11129,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 title: "ASSISTANT".to_owned(),
                 body: "The session store owns orchestration metadata.".to_owned(),
                 status: EntryStatus::Complete,
+                created_at_ms: None,
                 provider_id: None,
                 model_id: None,
                 tool_audit_json: None,

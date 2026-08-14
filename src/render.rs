@@ -2297,6 +2297,8 @@ mod tests {
             runs_has_earlier: false,
             notices: Vec::new(),
             external_tool_calls: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
         }
     }
 
@@ -2402,6 +2404,7 @@ mod tests {
                     provider_id: None,
                     model_id: None,
                     tool_audit_json: None,
+                    created_at_ms: None,
                 }],
                 has_earlier: false,
                 stream_active: matches!(status, RunStatus::Starting | RunStatus::Working),
