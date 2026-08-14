@@ -65,6 +65,10 @@ pub enum ConversationItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_output: Option<String>,
         failed: bool,
+        #[serde(default)]
+        denied: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        denial_reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
@@ -338,6 +342,12 @@ impl AgentRuntime {
                     tool.name
                 ));
             }
+            if !replace_builtin_tools && self.tools.find(&tool.name).is_some() {
+                return Err(format!(
+                    "external tool name collides with canonical builtin: {}",
+                    tool.name
+                ));
+            }
             let parameters = serde_json::from_str(&tool.input_schema_json).map_err(|error| {
                 format!("invalid schema for external tool {}: {error}", tool.name)
             })?;
@@ -405,6 +415,21 @@ impl AgentRuntime {
             .await
             .get(session_id)
             .is_some_and(|config| config.tools.iter().any(|tool| tool.name == name))
+    }
+
+    async fn builtin_tool_allowed(&self, session_id: &str, name: &str) -> bool {
+        self.external_tools
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .is_none_or(|config| {
+                !config.replace_builtin_tools
+                    && config
+                        .allowed_builtin_tools
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.contains(name))
+            })
     }
 
     #[must_use]
@@ -948,11 +973,12 @@ impl AgentRuntime {
         let mut failures = HashMap::<String, usize>::new();
         let mut pending = tool_calls.into_iter().peekable();
         while let Some(tool_call) = pending.next() {
-            let is_read_only = self
-                .tools
-                .find(&tool_call.name)
-                .filter(|tool| tool.available())
-                .is_some_and(|tool| tool.concurrency() == ToolConcurrency::ReadOnly);
+            let is_read_only = !self.is_external_tool(&session.id, &tool_call.name).await
+                && self
+                    .tools
+                    .find(&tool_call.name)
+                    .filter(|tool| tool.available())
+                    .is_some_and(|tool| tool.concurrency() == ToolConcurrency::ReadOnly);
             if !is_read_only {
                 let executed = self
                     .execute_exclusive_tool(
@@ -971,12 +997,16 @@ impl AgentRuntime {
             }
 
             let mut batch = vec![tool_call];
-            while pending.peek().is_some_and(|call| {
-                self.tools
-                    .find(&call.name)
-                    .filter(|tool| tool.available())
-                    .is_some_and(|tool| tool.concurrency() == ToolConcurrency::ReadOnly)
-            }) {
+            while let Some(candidate) = pending.peek() {
+                if self.is_external_tool(&session.id, &candidate.name).await
+                    || !self
+                        .tools
+                        .find(&candidate.name)
+                        .filter(|tool| tool.available())
+                        .is_some_and(|tool| tool.concurrency() == ToolConcurrency::ReadOnly)
+                {
+                    break;
+                }
                 batch.push(pending.next().expect("peeked read-only tool call"));
             }
             let executions = futures_util::future::join_all(batch.into_iter().map(|call| {
@@ -1006,6 +1036,12 @@ impl AgentRuntime {
             return self
                 .execute_external_tool(session, turn_id, tool_call, backend_events, cancellation)
                 .await;
+        }
+        if !self
+            .builtin_tool_allowed(&session.id, &tool_call.name)
+            .await
+        {
+            return Ok(ExecutedTool::denied(turn_id, tool_call));
         }
         let Some(tool) = self
             .tools
@@ -1119,6 +1155,12 @@ impl AgentRuntime {
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: &CancellationToken,
     ) -> Result<ExecutedTool, String> {
+        if !self
+            .builtin_tool_allowed(&session.id, &tool_call.name)
+            .await
+        {
+            return Ok(ExecutedTool::denied(turn_id, tool_call));
+        }
         let Some(tool) = self
             .tools
             .find(&tool_call.name)
@@ -1184,6 +1226,8 @@ struct ExecutedTool {
     output: String,
     model_output: String,
     failed: bool,
+    denied: bool,
+    denial_reason: Option<String>,
     started_at_ms: u64,
     duration_ms: u64,
 }
@@ -1208,9 +1252,30 @@ impl ExecutedTool {
             output: result.output,
             model_output,
             failed: result.failed,
+            denied: false,
+            denial_reason: None,
             started_at_ms,
             duration_ms,
         }
+    }
+
+    fn denied(turn_id: &str, tool_call: ToolCall) -> Self {
+        let reason = format!(
+            "provider tool {} is not allowed by the launch policy",
+            tool_call.name
+        );
+        let mut executed = Self::new(
+            runtime_tool_kind(&tool_call.name, false),
+            tool_call,
+            "provider tool · denied".to_owned(),
+            crate::tools::ToolResult::failure(reason.clone()),
+            unix_time_ms(),
+            0,
+        );
+        executed.denied = true;
+        executed.denial_reason = Some(reason);
+        executed.item_id = format!("{turn_id}:tool:{}", executed.call_id);
+        executed
     }
 
     fn unavailable(turn_id: &str, tool_call: &ToolCall) -> Self {
@@ -1259,6 +1324,8 @@ struct RuntimeToolAudit<'a> {
     failed: bool,
     duration_ms: Option<u64>,
     status: &'a str,
+    denied: bool,
+    denial_reason: Option<&'a str>,
 }
 
 fn runtime_tool_audit(details: RuntimeToolAudit<'_>) -> String {
@@ -1272,6 +1339,8 @@ fn runtime_tool_audit(details: RuntimeToolAudit<'_>) -> String {
         failed,
         duration_ms,
         status,
+        denied,
+        denial_reason,
     } = details;
     let bounded = |format: &str, value: String| {
         let bytes = value.len();
@@ -1310,6 +1379,8 @@ fn runtime_tool_audit(details: RuntimeToolAudit<'_>) -> String {
         "authoritative": "Nakode native runtime session history",
         "input": bounded("json", serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string())),
         "durationMs": duration_ms,
+        "denied": denied,
+        "denialReason": denial_reason,
     });
     if is_shell {
         if let Some(command) = arguments.get("command") {
@@ -1351,6 +1422,8 @@ async fn send_tool_started(
         failed: false,
         duration_ms: None,
         status: "running",
+        denied: false,
+        denial_reason: None,
     });
     events
         .send(BackendEvent::ItemStarted {
@@ -1404,6 +1477,8 @@ async fn record_tool_result(
                         } else {
                             "succeeded"
                         },
+                        denied: executed.denied,
+                        denial_reason: executed.denial_reason.as_deref(),
                     })
                     .into_boxed_str(),
                 ),
@@ -1430,6 +1505,8 @@ async fn record_tool_result(
         output: executed.output,
         model_output: Some(executed.model_output),
         failed: executed.failed,
+        denied: executed.denied,
+        denial_reason: executed.denial_reason,
         duration_ms: Some(executed.duration_ms),
     });
     Ok(())
@@ -1715,6 +1792,8 @@ fn normalize_tool_history_item(
         title,
         output,
         failed,
+        denied,
+        denial_reason,
         duration_ms,
         ..
     } = item
@@ -1748,6 +1827,8 @@ fn normalize_tool_history_item(
                     failed: *failed,
                     duration_ms: *duration_ms,
                     status: if *failed { "failed" } else { "succeeded" },
+                    denied: *denied,
+                    denial_reason: denial_reason.as_deref(),
                 })
                 .into_boxed_str()
             }),
@@ -2176,12 +2257,12 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         AgentRuntime, ConversationItem, InferenceEvent, InferenceFuture, InferenceOutput,
         InferenceProvider, InferenceRequest, QuestionBroker, RuntimeSession, RuntimeSessionStore,
-        RuntimeToolAudit, ToolCall, normalize_history_item, runtime_tool_audit,
+        RuntimeToolAudit, ToolCall, normalize_history_item, record_tool_result, runtime_tool_audit,
     };
     use crate::backend::{
         BackendEvent, CompactionReason, ItemKind, QuestionOption, QuestionRequest,
@@ -2235,6 +2316,8 @@ mod tests {
                 failed: false,
                 duration_ms: Some(8),
                 status: "succeeded",
+                denied: false,
+                denial_reason: None,
             }))
             .expect("audit json");
         assert_eq!(audit["callId"], "read-7");
@@ -2253,6 +2336,8 @@ mod tests {
                 output: "line one\nline two".to_owned(),
                 model_output: None,
                 failed: false,
+                denied: false,
+                denial_reason: None,
                 duration_ms: Some(8),
             },
         );
@@ -2281,6 +2366,8 @@ mod tests {
                 failed: false,
                 duration_ms: Some(12),
                 status: "succeeded",
+                denied: false,
+                denial_reason: None,
             }))
             .expect("shell audit json");
         assert_eq!(audit["shell"]["command"]["value"], command);
@@ -2518,6 +2605,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn builtin_tool_allowlist_is_authoritative_for_native_inference() {
         let directory = tempfile::tempdir().expect("workspace");
         let provider = Arc::new(ExternalToolProvider {
@@ -2543,6 +2631,104 @@ mod tests {
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["read"]
+        );
+
+        let (events, mut receiver) = mpsc::channel(4);
+        let mut session = RuntimeSession::new("model".to_owned(), String::new());
+        session.id = "restricted-session".to_owned();
+        let denied = runtime
+            .execute_exclusive_tool(
+                &mut session,
+                "turn-1",
+                ToolCall {
+                    id: "bash-call".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command": "echo bypass"}),
+                },
+                &events,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("authorization result");
+        assert!(denied.failed);
+        assert!(denied.denied);
+        record_tool_result(&mut session, denied, "turn-1", &events)
+            .await
+            .expect("denial audit");
+        let BackendEvent::ItemCompleted { item, .. } = receiver.recv().await.expect("denial event")
+        else {
+            panic!("expected completed denial event");
+        };
+        let audit: Value = serde_json::from_str(
+            item.tool_audit_json
+                .as_deref()
+                .expect("authoritative audit"),
+        )
+        .expect("audit json");
+        assert_eq!(audit["name"], "bash");
+        assert_eq!(audit["denied"], true);
+        assert!(
+            audit["denialReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("launch policy"))
+        );
+        let restored = normalize_history_item(
+            "restricted-session",
+            0,
+            session.history.last().expect("persisted denial"),
+        );
+        let restored_audit: Value = serde_json::from_str(
+            restored[0]
+                .item
+                .tool_audit_json
+                .as_deref()
+                .expect("restored authoritative audit"),
+        )
+        .expect("restored audit json");
+        assert_eq!(restored_audit["denied"], true);
+        assert_eq!(restored_audit["denialReason"], audit["denialReason"]);
+
+        let collision = runtime
+            .configure_external_tools(
+                "collision-session",
+                vec![nakode_protocol::ExternalToolDefinition {
+                    name: "read".to_owned(),
+                    description: "custom collision".to_owned(),
+                    input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                }],
+                false,
+                Some(vec!["read".to_owned()]),
+                None,
+                None,
+            )
+            .await
+            .expect_err("custom tools cannot inherit builtin authority");
+        assert!(collision.contains("collides with canonical builtin"));
+
+        runtime
+            .configure_external_tools(
+                "replacement-session",
+                vec![nakode_protocol::ExternalToolDefinition {
+                    name: "read".to_owned(),
+                    description: "replacement read".to_owned(),
+                    input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                }],
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("replacement tools may reuse hidden builtin names");
+        assert!(
+            !runtime
+                .builtin_tool_allowed("replacement-session", "bash")
+                .await
+        );
+        assert!(
+            runtime
+                .is_external_tool("replacement-session", "read")
+                .await
         );
     }
 
@@ -3088,6 +3274,8 @@ mod tests {
                 output: "x".repeat(128 * 1024),
                 model_output: Some("x".repeat(32 * 1024)),
                 failed: false,
+                denied: false,
+                denial_reason: None,
                 name: None,
                 arguments: None,
                 audit_kind: None,
@@ -3284,6 +3472,8 @@ mod tests {
             output: "full".repeat(30_000),
             model_output: Some("bounded".repeat(1_000)),
             failed: false,
+            denied: false,
+            denial_reason: None,
             name: None,
             arguments: None,
             audit_kind: None,

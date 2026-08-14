@@ -663,12 +663,15 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
 }
 
 fn run_policy(run: &SubagentRun) -> (RunPolicyView, Option<String>, bool) {
-    let definition = serde_json::from_str::<AgentDefinition>(&run.observability.policy_json)
-        .unwrap_or_else(|_| AgentDefinition {
-            slug: run.agent.clone(),
-            description: run.observability.archetype_purpose.clone(),
-            ..AgentDefinition::default()
-        });
+    let parsed_definition = serde_json::from_str::<AgentDefinition>(&run.observability.policy_json);
+    let policy_available = parsed_definition
+        .as_ref()
+        .is_ok_and(|_| run.observability.policy_json.trim() != "{}");
+    let definition = parsed_definition.unwrap_or_else(|_| AgentDefinition {
+        slug: run.agent.clone(),
+        description: run.observability.archetype_purpose.clone(),
+        ..AgentDefinition::default()
+    });
     let tool_profile = match definition.tool_profile {
         AgentToolProfile::None => "none",
         AgentToolProfile::ReadOnly => "read_only",
@@ -683,6 +686,7 @@ fn run_policy(run: &SubagentRun) -> (RunPolicyView, Option<String>, bool) {
         .as_deref()
         .map(|value| bounded_policy_text(value, "reasoning_effort", &mut truncated_fields));
     let fast_mode = definition.fast_mode;
+    let effective_canonical_tools = definition.builtin_tool_allowlist();
     let allowed_capabilities = bounded_policy_list(
         definition.allowed_capabilities,
         "allowed_capabilities",
@@ -703,6 +707,22 @@ fn run_policy(run: &SubagentRun) -> (RunPolicyView, Option<String>, bool) {
         "denied_tools",
         &mut truncated_fields,
     );
+    let provider_projection =
+        crate::backend::project_provider_tools(&run.provider, effective_canonical_tools.as_deref());
+    let provider = bounded_policy_text(&run.provider, "provider", &mut truncated_fields);
+    let provider_tools_restricted = policy_available
+        && provider_projection.enforced
+        && provider_projection.allowed_tools.is_some();
+    let provider_allowed_tools = bounded_policy_list(
+        provider_projection.allowed_tools.unwrap_or_default(),
+        "provider_allowed_tools",
+        &mut truncated_fields,
+    );
+    let unsupported_canonical_tools = bounded_policy_list(
+        provider_projection.unsupported_canonical_tools,
+        "unsupported_canonical_tools",
+        &mut truncated_fields,
+    );
     let task_shape =
         bounded_policy_text(&definition.task_shape, "task_shape", &mut truncated_fields);
     let output_contract = bounded_policy_text(
@@ -716,6 +736,11 @@ fn run_policy(run: &SubagentRun) -> (RunPolicyView, Option<String>, bool) {
             denied_capabilities,
             allowed_tools,
             denied_tools,
+            provider,
+            policy_available,
+            provider_tools_restricted,
+            provider_allowed_tools,
+            unsupported_canonical_tools,
             tool_profile,
             task_shape,
             output_contract,
@@ -1880,6 +1905,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn run_metadata_and_outcomes_expose_their_bounded_text_windows() {
         let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
         let body = "r".repeat(MAX_TRANSCRIPT_ENTRY_BODY_BYTES * 2);
@@ -1948,6 +1974,14 @@ mod tests {
         assert_eq!(run.duration_ms, Some(50));
         assert_eq!(run.termination_kind.as_deref(), Some("completed"));
         assert_eq!(run.policy.tool_profile, "read_only");
+        assert_eq!(run.policy.provider, CODEX_PROVIDER);
+        assert!(run.policy.policy_available);
+        assert!(run.policy.provider_tools_restricted);
+        assert!(run.policy.provider_allowed_tools.is_empty());
+        assert_eq!(
+            run.policy.unsupported_canonical_tools.len(),
+            MAX_RUN_POLICY_ITEMS
+        );
         assert_eq!(run.policy.denied_tools, ["write"]);
         assert_eq!(run.policy.allowed_tools.len(), MAX_RUN_POLICY_ITEMS);
         assert_eq!(run.policy.output_contract.len(), MAX_RUN_POLICY_TEXT_BYTES);
@@ -1957,7 +1991,12 @@ mod tests {
         );
         assert_eq!(
             run.policy.truncated_fields,
-            ["reasoning_effort", "allowed_tools", "output_contract"]
+            [
+                "reasoning_effort",
+                "allowed_tools",
+                "unsupported_canonical_tools",
+                "output_contract"
+            ]
         );
         assert_eq!(run.tool_denials.len(), MAX_RUN_TOOL_DENIALS);
         assert_eq!(run.tool_denials_retained_total, 75);

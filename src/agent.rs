@@ -250,6 +250,7 @@ impl AgentDefinition {
         Some(
             configured
                 .into_iter()
+                .filter(|tool| !self.denied_tools.iter().any(|denied| denied == tool))
                 .filter(|tool| {
                     (*tool != NAKODE_AGENT_TOOL_NAME
                         || (self.can_delegate && self.max_delegation_depth > 0))

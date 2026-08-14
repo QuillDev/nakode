@@ -449,6 +449,9 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             owner_session_id,
             external_tools,
             replace_builtin_tools,
+            allowed_builtin_tools,
+            max_turns,
+            timeout_seconds,
         } => {
             if let Some(runtime) = context.runtime
                 && let Err(error) = runtime
@@ -456,9 +459,9 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                         &provider_session_id,
                         external_tools,
                         replace_builtin_tools,
-                        None,
-                        None,
-                        None,
+                        allowed_builtin_tools,
+                        max_turns,
+                        timeout_seconds,
                     )
                     .await
             {
@@ -1270,6 +1273,8 @@ mod tests {
                     output: "full output".to_owned(),
                     model_output: Some("bounded output".to_owned()),
                     failed: false,
+                    denied: false,
+                    denial_reason: None,
                     name: None,
                     arguments: None,
                     audit_kind: None,

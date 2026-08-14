@@ -205,6 +205,9 @@ async fn verify_resume_and_cancellation(
             owner_session_id: None,
             external_tools: Vec::new(),
             replace_builtin_tools: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
         })
         .await?;
     match next_event(backend).await? {
