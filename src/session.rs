@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 pub use crate::backend::{CODEX_PROVIDER, DEVIN_PROVIDER};
 use crate::{
-    backend::{ModelInfo, ModelOptions},
+    backend::{ModelInfo, ModelOptions, TurnOutcome},
     credential::CredentialMetadata,
     domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
     mcp::McpServerRecord,
@@ -40,6 +40,14 @@ struct ProviderCatalogEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedTurnConfiguration {
+    pub id: String,
+    pub model: Option<String>,
+    pub options: ModelOptions,
+    pub outcome: TurnOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
     pub id: String,
     pub provider: String,
@@ -47,6 +55,12 @@ pub struct SessionRecord {
     pub workspace: String,
     pub title: String,
     pub model: Option<String>,
+    /// Authoritative session-local configuration for the next owner turn.
+    pub model_options: ModelOptions,
+    /// Immutable attribution for the latest terminal owner turn.
+    pub last_turn: Option<PersistedTurnConfiguration>,
+    /// Immutable terminal owner turns retained for historical transcript attribution.
+    pub owner_turns: Vec<PersistedTurnConfiguration>,
     /// Unix epoch seconds at initial persistence; converted exactly once at API projection.
     pub created_at: i64,
     /// Unix epoch seconds at the latest persistence touch; converted exactly once at API projection.
@@ -206,12 +220,14 @@ pub trait SessionRepository: Send + Sync {
             workspace,
             title,
             model,
+            &ModelOptions::default(),
         )
     }
     /// Creates a logical session using an identity assigned before provider work begins.
     ///
     /// # Errors
     /// Returns an error when the record cannot be persisted.
+    #[allow(clippy::too_many_arguments)]
     fn create_with_id(
         &self,
         id: &str,
@@ -220,7 +236,22 @@ pub trait SessionRepository: Send + Sync {
         workspace: &str,
         title: &str,
         model: Option<&str>,
+        options: &ModelOptions,
     ) -> Result<SessionRecord, SessionError>;
+    /// Atomically replaces one logical session's primary provider-native resource while retaining
+    /// the previous primary as owned history for restart cleanup and deletion.
+    ///
+    /// # Errors
+    /// Returns an error when the logical session is unknown or persistence cannot be updated.
+    #[allow(clippy::too_many_arguments)]
+    fn transition_primary(
+        &self,
+        id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        model: Option<&str>,
+        options: &ModelOptions,
+    ) -> Result<(), SessionError>;
     /// Marks a session as recently used.
     ///
     /// # Errors
@@ -249,7 +280,21 @@ pub trait SessionRepository: Send + Sync {
     ///
     /// # Errors
     /// Returns an error when persistence cannot be updated.
-    fn update_model(&self, id: &str, model: Option<&str>) -> Result<(), SessionError>;
+    fn update_model(
+        &self,
+        id: &str,
+        model: Option<&str>,
+        options: &ModelOptions,
+    ) -> Result<(), SessionError>;
+    /// Persists immutable attribution for the latest terminal owner turn.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
+    fn update_last_turn(
+        &self,
+        id: &str,
+        turn: &PersistedTurnConfiguration,
+    ) -> Result<(), SessionError>;
     /// Lists cached models for a provider.
     ///
     /// # Errors
@@ -444,6 +489,13 @@ impl SqliteSessionRepository {
                workspace TEXT NOT NULL,
                title TEXT NOT NULL,
                model TEXT,
+               model_reasoning_effort TEXT,
+               model_fast_mode INTEGER NOT NULL DEFAULT 0,
+               last_turn_id TEXT,
+               last_turn_model TEXT,
+               last_turn_reasoning_effort TEXT,
+               last_turn_fast_mode INTEGER NOT NULL DEFAULT 0,
+               last_turn_outcome TEXT,
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL,
                UNIQUE(provider, provider_session_id)
@@ -543,6 +595,22 @@ impl SqliteSessionRepository {
                updated_at INTEGER NOT NULL,
                PRIMARY KEY(provider, session_id)
              );
+             CREATE TABLE IF NOT EXISTS owner_turns (
+               session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+               turn_id TEXT NOT NULL,
+               model TEXT,
+               reasoning_effort TEXT,
+               fast_mode INTEGER NOT NULL DEFAULT 0,
+               outcome INTEGER NOT NULL,
+               PRIMARY KEY(session_id, turn_id)
+             );
+             CREATE INDEX IF NOT EXISTS owner_turns_session ON owner_turns(session_id);
+             CREATE TABLE IF NOT EXISTS session_native_history (
+               parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+               provider TEXT NOT NULL,
+               provider_session_id TEXT NOT NULL,
+               PRIMARY KEY(parent_session_id, provider, provider_session_id)
+             );
              CREATE TABLE IF NOT EXISTS orchestration_runs (
                parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                id TEXT NOT NULL,
@@ -591,6 +659,32 @@ impl SqliteSessionRepository {
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
              );",
         )?;
+        let session_columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut session_migration = String::from("BEGIN IMMEDIATE;\n");
+        for (column, definition) in [
+            ("model_reasoning_effort", "TEXT"),
+            ("model_fast_mode", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_turn_id", "TEXT"),
+            ("last_turn_model", "TEXT"),
+            ("last_turn_reasoning_effort", "TEXT"),
+            ("last_turn_fast_mode", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_turn_outcome", "TEXT"),
+        ] {
+            if !session_columns.iter().any(|existing| existing == column) {
+                writeln!(
+                    session_migration,
+                    "ALTER TABLE sessions ADD COLUMN {column} {definition};"
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        session_migration.push_str("COMMIT;");
+        execute_batch_with_busy_retry(&connection, &session_migration)?;
         let orchestration_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(orchestration_runs)")?;
             statement
@@ -736,6 +830,38 @@ impl SqliteSessionRepository {
     }
 
     fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+        let last_turn_id = row.get::<_, Option<String>>(8)?;
+        let last_turn_outcome = row.get::<_, Option<String>>(12)?;
+        let last_turn = match (last_turn_id, last_turn_outcome.as_deref()) {
+            (Some(id), Some("completed")) => Some(PersistedTurnConfiguration {
+                id,
+                model: row.get(9)?,
+                options: ModelOptions {
+                    reasoning_effort: row.get(10)?,
+                    fast_mode: row.get::<_, i64>(11)? != 0,
+                },
+                outcome: TurnOutcome::Completed,
+            }),
+            (Some(id), Some("interrupted")) => Some(PersistedTurnConfiguration {
+                id,
+                model: row.get(9)?,
+                options: ModelOptions {
+                    reasoning_effort: row.get(10)?,
+                    fast_mode: row.get::<_, i64>(11)? != 0,
+                },
+                outcome: TurnOutcome::Interrupted,
+            }),
+            (Some(id), Some("failed")) => Some(PersistedTurnConfiguration {
+                id,
+                model: row.get(9)?,
+                options: ModelOptions {
+                    reasoning_effort: row.get(10)?,
+                    fast_mode: row.get::<_, i64>(11)? != 0,
+                },
+                outcome: TurnOutcome::Failed,
+            }),
+            _ => None,
+        };
         Ok(SessionRecord {
             id: row.get(0)?,
             provider: row.get(1)?,
@@ -743,11 +869,46 @@ impl SqliteSessionRepository {
             workspace: row.get(3)?,
             title: row.get(4)?,
             model: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
+            model_options: ModelOptions {
+                reasoning_effort: row.get(6)?,
+                fast_mode: row.get::<_, i64>(7)? != 0,
+            },
+            last_turn,
+            owner_turns: Vec::new(),
+            created_at: row.get(13)?,
+            updated_at: row.get(14)?,
             owned_provider_sessions: Vec::new(),
         })
     }
+}
+
+fn load_owner_turns(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<PersistedTurnConfiguration>, SessionError> {
+    let mut statement = connection.prepare(
+        "SELECT turn_id, model, reasoning_effort, fast_mode, outcome
+         FROM owner_turns WHERE session_id = ?1 ORDER BY rowid",
+    )?;
+    statement
+        .query_map([session_id], |row| {
+            let outcome = match row.get::<_, i64>(4)? {
+                1 => TurnOutcome::Completed,
+                2 => TurnOutcome::Interrupted,
+                _ => TurnOutcome::Failed,
+            };
+            Ok(PersistedTurnConfiguration {
+                id: row.get(0)?,
+                model: row.get(1)?,
+                options: ModelOptions {
+                    reasoning_effort: row.get(2)?,
+                    fast_mode: row.get::<_, i64>(3)? != 0,
+                },
+                outcome,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn load_owned_provider_sessions(
@@ -755,11 +916,18 @@ fn load_owned_provider_sessions(
     parent_session_id: &str,
 ) -> Result<Vec<(String, String)>, SessionError> {
     let mut statement = connection.prepare(
-        "SELECT provider, provider_session_id
-         FROM orchestration_runs
-         WHERE parent_session_id = ?1 AND provider_session_id IS NOT NULL
+        "SELECT provider, provider_session_id, ordinal
+         FROM (
+           SELECT provider, provider_session_id, 0 AS ordinal
+           FROM session_native_history
+           WHERE parent_session_id = ?1
+           UNION
+           SELECT provider, provider_session_id, 1 AS ordinal
+           FROM orchestration_runs
+           WHERE parent_session_id = ?1 AND provider_session_id IS NOT NULL
+         )
          GROUP BY provider, provider_session_id
-         ORDER BY MIN(created_at), MIN(id)",
+         ORDER BY MIN(ordinal), provider, provider_session_id",
     )?;
     statement
         .query_map([parent_session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -890,7 +1058,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
@@ -898,6 +1066,7 @@ impl SessionRepository for SqliteSessionRepository {
         let mut records = rows.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         for record in &mut records {
+            record.owner_turns = load_owner_turns(&connection, &record.id)?;
             record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
         }
         Ok(records)
@@ -910,19 +1079,20 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
+                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
                  FROM sessions WHERE id = ?1",
                 [id],
                 Self::row,
             )
             .optional()?;
         if let Some(mut exact) = exact {
+            exact.owner_turns = load_owner_turns(&connection, &exact.id)?;
             exact.owned_provider_sessions = load_owned_provider_sessions(&connection, &exact.id)?;
             return Ok(Some(exact));
         }
         let pattern = format!("{id}%");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
              FROM sessions WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
         )?;
         let matches = statement
@@ -932,6 +1102,7 @@ impl SessionRepository for SqliteSessionRepository {
             [] => Ok(None),
             [record] => {
                 let mut record = record.clone();
+                record.owner_turns = load_owner_turns(&connection, &record.id)?;
                 record.owned_provider_sessions =
                     load_owned_provider_sessions(&connection, &record.id)?;
                 Ok(Some(record))
@@ -948,6 +1119,7 @@ impl SessionRepository for SqliteSessionRepository {
         workspace: &str,
         title: &str,
         model: Option<&str>,
+        options: &ModelOptions,
     ) -> Result<SessionRecord, SessionError> {
         let now = unix_timestamp();
         let title = title.lines().next().unwrap_or("New session").trim();
@@ -961,17 +1133,83 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         connection.execute(
-            "INSERT INTO sessions (id, provider, provider_session_id, workspace, title, model, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-             ON CONFLICT(provider, provider_session_id) DO UPDATE SET updated_at = excluded.updated_at",
-            params![id, provider, provider_session_id, workspace, title, model, now],
+            "INSERT INTO sessions
+             (id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             ON CONFLICT(provider, provider_session_id) DO UPDATE SET
+               model = excluded.model,
+               model_reasoning_effort = excluded.model_reasoning_effort,
+               model_fast_mode = excluded.model_fast_mode,
+               updated_at = excluded.updated_at",
+            params![
+                id,
+                provider,
+                provider_session_id,
+                workspace,
+                title,
+                model,
+                options.reasoning_effort,
+                i64::from(options.fast_mode),
+                now
+            ],
         )?;
         connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, created_at, updated_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
         ).map_err(Into::into)
+    }
+
+    fn transition_primary(
+        &self,
+        id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        model: Option<&str>,
+        options: &ModelOptions,
+    ) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT provider, provider_session_id FROM sessions WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| SessionError::SessionNotFound(id.to_owned()))?;
+        transaction.execute(
+            "DELETE FROM session_native_history
+             WHERE parent_session_id = ?1 AND provider = ?2 AND provider_session_id = ?3",
+            params![id, provider, provider_session_id],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO session_native_history
+             (parent_session_id, provider, provider_session_id)
+             VALUES (?1, ?2, ?3)",
+            params![id, current.0, current.1],
+        )?;
+        transaction.execute(
+            "UPDATE sessions
+             SET provider = ?1, provider_session_id = ?2, model = ?3,
+                 model_reasoning_effort = ?4, model_fast_mode = ?5, updated_at = ?6
+             WHERE id = ?7",
+            params![
+                provider,
+                provider_session_id,
+                model,
+                options.reasoning_effort,
+                i64::from(options.fast_mode),
+                unix_timestamp(),
+                id
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn touch(&self, id: &str) -> Result<(), SessionError> {
@@ -1007,6 +1245,12 @@ impl SessionRepository for SqliteSessionRepository {
             "DELETE FROM native_runtime_sessions WHERE provider = ?1 AND session_id = ?2",
             params![record.provider, record.provider_session_id],
         )?;
+        for (provider, provider_session_id) in &record.owned_provider_sessions {
+            transaction.execute(
+                "DELETE FROM native_runtime_sessions WHERE provider = ?1 AND session_id = ?2",
+                params![provider, provider_session_id],
+            )?;
+        }
         // Then the session itself. `orchestration_runs` and `agent_turns` go with it by cascade, which
         // the connection's `PRAGMA foreign_keys = ON` is what makes true.
         let removed =
@@ -1039,18 +1283,82 @@ impl SessionRepository for SqliteSessionRepository {
         Ok(report)
     }
 
-    fn update_model(&self, id: &str, model: Option<&str>) -> Result<(), SessionError> {
+    fn update_model(
+        &self,
+        id: &str,
+        model: Option<&str>,
+        options: &ModelOptions,
+    ) -> Result<(), SessionError> {
         let connection = self
             .connection
             .lock()
             .expect("session database mutex poisoned");
         let updated = connection.execute(
-            "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
-            params![model, unix_timestamp(), id],
+            "UPDATE sessions
+             SET model = ?1, model_reasoning_effort = ?2, model_fast_mode = ?3, updated_at = ?4
+             WHERE id = ?5",
+            params![
+                model,
+                options.reasoning_effort,
+                i64::from(options.fast_mode),
+                unix_timestamp(),
+                id
+            ],
         )?;
         if updated == 0 {
             return Err(SessionError::SessionNotFound(id.to_owned()));
         }
+        Ok(())
+    }
+
+    fn update_last_turn(
+        &self,
+        id: &str,
+        turn: &PersistedTurnConfiguration,
+    ) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let (outcome, outcome_code) = match turn.outcome {
+            TurnOutcome::Completed => ("completed", 1_i64),
+            TurnOutcome::Interrupted => ("interrupted", 2_i64),
+            TurnOutcome::Failed => ("failed", 3_i64),
+        };
+        let updated = transaction.execute(
+            "UPDATE sessions
+             SET last_turn_id = ?1, last_turn_model = ?2, last_turn_reasoning_effort = ?3,
+                 last_turn_fast_mode = ?4, last_turn_outcome = ?5, updated_at = ?6
+             WHERE id = ?7",
+            params![
+                turn.id,
+                turn.model,
+                turn.options.reasoning_effort,
+                i64::from(turn.options.fast_mode),
+                outcome,
+                unix_timestamp(),
+                id
+            ],
+        )?;
+        if updated == 0 {
+            return Err(SessionError::SessionNotFound(id.to_owned()));
+        }
+        transaction.execute(
+            "INSERT INTO owner_turns
+             (session_id, turn_id, model, reasoning_effort, fast_mode, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id, turn_id) DO NOTHING",
+            params![
+                id,
+                turn.id,
+                turn.model,
+                turn.options.reasoning_effort,
+                i64::from(turn.options.fast_mode),
+                outcome_code
+            ],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1857,6 +2165,9 @@ fn load_subagent_transcript(
             created_at_ms: created_at_ms.and_then(|value| u64::try_from(value).ok()),
             provider_id,
             model_id,
+            owner_turn_id: None,
+            reasoning_effort: None,
+            fast_mode: None,
             tool_audit_json,
         })
     })
@@ -2082,7 +2393,7 @@ mod tests {
                 capabilities: crate::codex::model_capabilities(),
             },
         ];
-        store.update_model(&second.id, Some("model-a"))?;
+        store.update_model(&second.id, Some("model-a"), &ModelOptions::default())?;
         assert_eq!(
             store.find(&second.id)?.and_then(|record| record.model),
             Some("model-a".to_owned())
@@ -2099,6 +2410,88 @@ mod tests {
         assert_eq!(store.list_models(CODEX_PROVIDER)?, preferred);
         store.replace_models(CODEX_PROVIDER, &[])?;
         assert!(store.list_models(CODEX_PROVIDER)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn restores_next_and_last_owner_turn_configuration() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("sessions.db");
+        let store = SqliteSessionRepository::open(&path)?;
+        let session = store.create(
+            CODEX_PROVIDER,
+            "provider-turn-config",
+            "/tmp/project",
+            "Configured prompt",
+            Some("openai-codex/model-a"),
+        )?;
+        let next = ModelOptions {
+            reasoning_effort: Some("high".to_owned()),
+            fast_mode: true,
+        };
+        store.update_model(&session.id, Some("openai-codex/model-b"), &next)?;
+        let last = PersistedTurnConfiguration {
+            id: "turn-immutable".to_owned(),
+            model: Some("openai-codex/model-a".to_owned()),
+            options: ModelOptions {
+                reasoning_effort: Some("medium".to_owned()),
+                fast_mode: false,
+            },
+            outcome: TurnOutcome::Interrupted,
+        };
+        store.update_last_turn(&session.id, &last)?;
+        drop(store);
+
+        let restored = SqliteSessionRepository::open(&path)?
+            .find(&session.id)?
+            .expect("restored session");
+        assert_eq!(restored.model.as_deref(), Some("openai-codex/model-b"));
+        assert_eq!(restored.model_options, next);
+        assert_eq!(restored.last_turn, Some(last.clone()));
+        assert_eq!(restored.owner_turns, vec![last]);
+        Ok(())
+    }
+
+    #[test]
+    fn transitions_primary_provider_without_changing_logical_identity() -> Result<(), SessionError>
+    {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("transition.db");
+        let store = SqliteSessionRepository::open(&path)?;
+        let original = store.create(
+            CODEX_PROVIDER,
+            "codex-primary",
+            "/tmp/project",
+            "Transition me",
+            Some("openai-codex/model-a"),
+        )?;
+        let options = ModelOptions {
+            reasoning_effort: Some("high".to_owned()),
+            fast_mode: false,
+        };
+
+        store.transition_primary(
+            &original.id,
+            DEVIN_PROVIDER,
+            "devin-primary",
+            Some("devin-acp/model-b"),
+            &options,
+        )?;
+        drop(store);
+
+        let restored = SqliteSessionRepository::open(&path)?
+            .find(&original.id)?
+            .expect("same logical session");
+        assert_eq!(restored.id, original.id);
+        assert_eq!(restored.provider, DEVIN_PROVIDER);
+        assert_eq!(restored.provider_session_id, "devin-primary");
+        assert_eq!(restored.model.as_deref(), Some("devin-acp/model-b"));
+        assert_eq!(restored.model_options, options);
+        assert!(
+            restored
+                .owned_provider_sessions
+                .contains(&(CODEX_PROVIDER.to_owned(), "codex-primary".to_owned()))
+        );
         Ok(())
     }
 
@@ -2183,7 +2576,7 @@ mod tests {
             Err(SessionError::SessionNotFound(id)) if id == "missing-session"
         ));
         assert!(matches!(
-            store.update_model("missing-session", Some("model")),
+            store.update_model("missing-session", Some("model"), &ModelOptions::default()),
             Err(SessionError::SessionNotFound(id)) if id == "missing-session"
         ));
         assert!(matches!(
@@ -2240,6 +2633,9 @@ mod tests {
                 created_at_ms: None,
                 provider_id: None,
                 model_id: None,
+                owner_turn_id: None,
+                reasoning_effort: None,
+                fast_mode: None,
                 tool_audit_json: None,
             }],
             observability: SubagentObservability::default(),
@@ -2327,6 +2723,9 @@ mod tests {
                     created_at_ms: Some(900),
                     provider_id: None,
                     model_id: None,
+                    owner_turn_id: None,
+                    reasoning_effort: None,
+                    fast_mode: None,
                     tool_audit_json: None,
                 },
                 TranscriptEntry {
@@ -2339,6 +2738,9 @@ mod tests {
                     created_at_ms: Some(1_100),
                     provider_id: Some(CODEX_PROVIDER.to_owned()),
                     model_id: Some("openai-codex/gpt-5.4".to_owned()),
+                    owner_turn_id: None,
+                    reasoning_effort: None,
+                    fast_mode: None,
                     tool_audit_json: Some(
                         r#"{"version":1,"callId":"call-1","kind":"native"}"#.to_owned(),
                     ),
@@ -2452,6 +2854,9 @@ mod tests {
                 created_at_ms: None,
                 provider_id: None,
                 model_id: None,
+                owner_turn_id: None,
+                reasoning_effort: None,
+                fast_mode: None,
                 tool_audit_json: None,
             }],
             observability: SubagentObservability::default(),

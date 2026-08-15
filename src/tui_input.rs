@@ -1753,6 +1753,7 @@ mod tests {
             id: TurnId::from("turn-1"),
             agent_session_id: AgentSessionId::from("agent-session-1"),
             model_id: None,
+            resolved_model_options: nakode_protocol::ModelOptions::default(),
             status: TurnStatus::Running,
         });
         let mut state = state(&view);
@@ -1776,6 +1777,7 @@ mod tests {
             id: TurnId::from("turn-1"),
             agent_session_id: AgentSessionId::from("agent-session-1"),
             model_id: None,
+            resolved_model_options: nakode_protocol::ModelOptions::default(),
             status: TurnStatus::Running,
         });
         let mut state = state(&view);

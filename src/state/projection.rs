@@ -214,6 +214,7 @@ fn session_view(
     let provider = provider_id(&state.backend_provider);
     let agent_session = agent_session_view(state, &session_id, provider.as_ref());
     let active_turn = turn_view(state, &session_id, agent_session.as_ref());
+    let last_turn = last_turn_view(state, &session_id, agent_session.as_ref());
     let (runs, runs_has_earlier) = run_views(state);
 
     let selected_options = state.selected_model_options();
@@ -242,6 +243,9 @@ fn session_view(
         },
         active_agent_session: agent_session,
         active_turn,
+        last_turn,
+        next_turn_configuration_pending: next_turn_configuration_pending(state),
+        next_turn_transition: next_turn_transition(state),
         context_usage: context_usage_view(state),
         transcript: transcript_page(&state.transcript),
         recoverable_prompt: recoverable_prompt_view(state),
@@ -362,7 +366,51 @@ fn turn_view(
     session_id: &SessionId,
     agent_session: Option<&AgentSessionView>,
 ) -> Option<TurnView> {
-    let turn = state.active_turn.as_ref()?;
+    let agent_session = agent_session?;
+    if let Some(turn) = state.active_turn.as_ref() {
+        return Some(TurnView {
+            id: TurnId::from(scoped_id(
+                "turn",
+                &format!("{}:{}", session_id.as_str(), turn.id),
+            )),
+            agent_session_id: agent_session.id.clone(),
+            model_id: turn.model.clone().map(ModelId::from),
+            resolved_model_options: ProtocolModelOptions {
+                reasoning_effort: turn.options.reasoning_effort.clone(),
+                fast_mode: turn.options.fast_mode,
+            },
+            status: if turn.cancelling {
+                TurnStatus::Cancelling
+            } else {
+                TurnStatus::Running
+            },
+        });
+    }
+    let starting = state
+        .starting_turn
+        .as_ref()
+        .or(state.pending_session_prompt.as_ref())?;
+    Some(TurnView {
+        id: TurnId::from(scoped_id(
+            "turn-starting",
+            &format!("{}:{}", session_id.as_str(), starting.id),
+        )),
+        agent_session_id: agent_session.id.clone(),
+        model_id: starting.resolved_model.clone().map(ModelId::from),
+        resolved_model_options: ProtocolModelOptions {
+            reasoning_effort: starting.options.reasoning_effort.clone(),
+            fast_mode: starting.options.fast_mode,
+        },
+        status: TurnStatus::Starting,
+    })
+}
+
+fn last_turn_view(
+    state: &DomainState,
+    session_id: &SessionId,
+    agent_session: Option<&AgentSessionView>,
+) -> Option<TurnView> {
+    let turn = state.last_turn.as_ref()?;
     let agent_session = agent_session?;
     Some(TurnView {
         id: TurnId::from(scoped_id(
@@ -370,13 +418,64 @@ fn turn_view(
             &format!("{}:{}", session_id.as_str(), turn.id),
         )),
         agent_session_id: agent_session.id.clone(),
-        model_id: turn.model.clone().map(|model| qualify_model(state, &model)),
-        status: if turn.cancelling {
-            TurnStatus::Cancelling
-        } else {
-            TurnStatus::Running
+        model_id: turn.model.clone().map(ModelId::from),
+        resolved_model_options: ProtocolModelOptions {
+            reasoning_effort: turn.options.reasoning_effort.clone(),
+            fast_mode: turn.options.fast_mode,
+        },
+        status: match turn.outcome {
+            crate::backend::TurnOutcome::Completed => TurnStatus::Completed,
+            crate::backend::TurnOutcome::Interrupted => TurnStatus::Interrupted,
+            crate::backend::TurnOutcome::Failed => TurnStatus::Failed,
         },
     })
+}
+
+fn next_turn_configuration_pending(state: &DomainState) -> bool {
+    let current = state.active_turn.as_ref().map_or_else(
+        || {
+            state
+                .starting_turn
+                .as_ref()
+                .or(state.pending_session_prompt.as_ref())
+                .map(|turn| (turn.resolved_model.as_ref(), &turn.options))
+        },
+        |turn| Some((turn.model.as_ref(), &turn.options)),
+    );
+    let Some((model, options)) = current else {
+        return false;
+    };
+    model != state.selected_model.as_ref() || *options != state.selected_model_options()
+}
+
+fn next_turn_transition(state: &DomainState) -> Option<String> {
+    let selected_provider = state
+        .selected_model
+        .as_deref()
+        .and_then(|model| model.split_once('/').map(|(provider, _)| provider));
+    let changes_provider =
+        selected_provider.is_some_and(|provider| provider != state.backend_provider);
+    if next_turn_configuration_pending(state) {
+        return Some(if changes_provider {
+            "Active owner work keeps its captured configuration; the selected configuration starts with the next owner turn in a fresh provider-native session with a continuity handoff."
+                .to_owned()
+        } else {
+            "Active owner work keeps its captured configuration; the selected configuration starts with the next owner turn."
+                .to_owned()
+        });
+    }
+    if state.active_turn.is_none()
+        && state.starting_turn.is_none()
+        && state.pending_session_prompt.is_none()
+    {
+        return Some(if changes_provider && state.provider_session_id.is_some() {
+            "Selected configuration applies to the next owner turn in a fresh provider-native session with a continuity handoff."
+                .to_owned()
+        } else {
+            "Selected configuration applies to the next owner turn.".to_owned()
+        });
+    }
+    None
 }
 
 fn context_usage_view(state: &DomainState) -> Option<ContextUsageView> {
@@ -1341,6 +1440,9 @@ fn transcript_entry_view(
         created_at_ms: entry.created_at_ms,
         provider_id: entry.provider_id.clone(),
         model_id: entry.model_id.clone().map(ModelId::from),
+        owner_turn_id: entry.owner_turn_id.clone().map(TurnId::from),
+        resolved_reasoning_effort: entry.reasoning_effort.clone(),
+        resolved_fast_mode: entry.fast_mode,
         tool_audit_json: include_audit
             .then(|| entry.tool_audit_json.clone())
             .flatten(),
@@ -1610,14 +1712,6 @@ const fn run_status(status: SubagentStatus) -> RunStatus {
         SubagentStatus::Interrupted => RunStatus::Interrupted,
         SubagentStatus::Failed => RunStatus::Failed,
     }
-}
-
-fn qualify_model(state: &DomainState, model: &str) -> ModelId {
-    ModelId::from(if model.contains('/') {
-        model.to_owned()
-    } else {
-        format!("{}/{model}", state.backend_provider)
-    })
 }
 
 fn provider_id(provider: &str) -> Option<ProviderId> {
@@ -1962,6 +2056,9 @@ mod tests {
                     created_at_ms: None,
                     provider_id: None,
                     model_id: None,
+                    owner_turn_id: None,
+                    reasoning_effort: None,
+                    fast_mode: None,
                     tool_audit_json: Some(
                         serde_json::json!({
                             "denied": true,
@@ -2254,6 +2351,9 @@ mod tests {
             created_at_ms: None,
             provider_id: None,
             model_id: None,
+            owner_turn_id: None,
+            resolved_reasoning_effort: None,
+            resolved_fast_mode: None,
             tool_audit_json: None,
         }
     }

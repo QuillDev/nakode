@@ -149,7 +149,16 @@ impl ConnectionState {
 pub struct ActiveTurn {
     pub id: String,
     pub model: Option<String>,
+    pub options: ModelOptions,
     pub cancelling: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LastTurn {
+    pub id: String,
+    pub model: Option<String>,
+    pub options: ModelOptions,
+    pub outcome: TurnOutcome,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +198,8 @@ struct OutgoingPrompt {
     text: String,
     wire_text: String,
     model: Option<String>,
+    resolved_model: Option<String>,
+    options: ModelOptions,
     handoff: Option<HandoffPackage>,
     attachments: Vec<PromptAttachment>,
 }
@@ -906,6 +917,7 @@ pub enum Effect {
         workspace: String,
         title: String,
         model: Option<String>,
+        options: ModelOptions,
     },
     PersistModels {
         provider: String,
@@ -925,6 +937,18 @@ pub enum Effect {
     UpdateSessionModel {
         session_id: String,
         model: Option<String>,
+        options: ModelOptions,
+    },
+    TransitionSessionPrimary {
+        session_id: String,
+        provider: String,
+        provider_session_id: String,
+        model: Option<String>,
+        options: ModelOptions,
+    },
+    UpdateSessionLastTurn {
+        session_id: String,
+        turn: crate::session::PersistedTurnConfiguration,
     },
     TouchSession(String),
     SaveWebConfig(WebConfig),
@@ -983,6 +1007,8 @@ pub struct DomainState {
     pub provider_session_id: Option<String>,
     pub session_id: Option<String>,
     pub active_turn: Option<ActiveTurn>,
+    pub last_turn: Option<LastTurn>,
+    owner_turns: HashMap<String, crate::session::PersistedTurnConfiguration>,
     pub context_usage: Option<ContextUsageState>,
     pub provider_usage: crate::backend::BackendTokenUsage,
     pub context_compaction: Option<ContextCompactionState>,
@@ -1643,6 +1669,8 @@ impl DomainState {
             provider_session_id: None,
             session_id: None,
             active_turn: None,
+            last_turn: None,
+            owner_turns: HashMap::new(),
             context_usage: None,
             provider_usage: crate::backend::BackendTokenUsage::default(),
             context_compaction: None,
@@ -2891,6 +2919,23 @@ impl DomainState {
             return Vec::new();
         }
         self.pending_handoff = None;
+        self.selected_model.clone_from(&session.model);
+        self.session_model_options_override = session
+            .model
+            .clone()
+            .map(|model| (model, session.model_options.clone()));
+        self.last_turn = session.last_turn.as_ref().map(|turn| LastTurn {
+            id: turn.id.clone(),
+            model: turn.model.clone(),
+            options: turn.options.clone(),
+            outcome: turn.outcome,
+        });
+        self.owner_turns = session
+            .owner_turns
+            .iter()
+            .cloned()
+            .map(|turn| (turn.id.clone(), turn))
+            .collect();
         let old_provider_session = self.provider_session_id.clone();
         self.resuming_session = Some(session.clone());
         self.nakode_session_id.clone_from(&session.id);
@@ -3678,6 +3723,7 @@ impl DomainState {
         self.session_model_options_override = None;
         self.selected_model = self.default_model();
         self.active_turn = None;
+        self.last_turn = None;
         self.context_usage = None;
         self.context_compaction = None;
         self.creating_session = None;
@@ -3801,12 +3847,19 @@ impl DomainState {
                 "Cursor models do not expose reasoning-effort selection".to_owned(),
             ));
         }
-        if let Some(effort) = options.reasoning_effort.as_deref()
-            && !matches!(effort, "none" | "low" | "medium" | "high" | "xhigh" | "max")
-        {
-            return Err(DomainCommandError::Invalid(format!(
-                "unknown reasoning effort {effort:?}"
+        let configuration = projection::model_configuration(selected, false);
+        if options.fast_mode && !configuration.fast_mode_configurable {
+            return Err(DomainCommandError::Unsupported(format!(
+                "model {model_id} does not advertise fast-mode selection"
             )));
+        }
+        if let Some(effort) = options.reasoning_effort.as_deref() {
+            let advertised = configuration.reasoning_efforts;
+            if !advertised.iter().any(|candidate| candidate == effort) {
+                return Err(DomainCommandError::Unsupported(format!(
+                    "model {model_id} does not advertise reasoning effort {effort:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -3837,17 +3890,56 @@ impl DomainState {
         effects
     }
 
+    fn transition_idle_provider_selection(
+        &mut self,
+        selected: &ModelInfo,
+    ) -> Result<bool, DomainCommandError> {
+        if selected.provider == self.backend_provider {
+            return Ok(false);
+        }
+        let source_provider = self.backend_provider.clone();
+        let source_name = self.backend_name.clone();
+        let source_model = self.selected_model.clone();
+        let source_session = self.provider_session_id.clone();
+        let source_logical_session = self.session_id.clone();
+        let target_name = self
+            .provider_contexts
+            .get(&selected.provider)
+            .map_or_else(|| selected.provider.clone(), |context| context.name.clone());
+        let handoff = HandoffPackage::from_transcript(
+            source_provider,
+            source_model,
+            source_session,
+            selected.provider.clone(),
+            self.transcript.entries(),
+        );
+        if !self.activate_provider(&selected.provider) {
+            return Err(DomainCommandError::Conflict(
+                "provider could not be activated for this session".to_owned(),
+            ));
+        }
+        self.provider_session_id = None;
+        self.session_id = source_logical_session;
+        self.context_usage = None;
+        self.pending_handoff = handoff;
+        self.sync_active_provider_context();
+        if self.pending_handoff.is_some() {
+            self.transcript.push(
+                EntryKind::System,
+                format!("HANDOFF · {source_name} → {target_name}"),
+                "The next message will continue in a fresh provider-native session.",
+                EntryStatus::Complete,
+            );
+        }
+        Ok(true)
+    }
+
     fn apply_session_model_selection(
         &mut self,
         selected: &ModelInfo,
         options: ModelOptions,
     ) -> Result<Vec<Effect>, DomainCommandError> {
         let provider_changed = selected.provider != self.backend_provider;
-        if provider_changed && self.is_busy() {
-            return Err(DomainCommandError::Conflict(
-                "cannot change provider while session work is active".to_owned(),
-            ));
-        }
         if provider_changed && !self.provider_contexts.contains_key(&selected.provider) {
             return Err(DomainCommandError::NotFound(format!(
                 "provider {}",
@@ -3855,53 +3947,40 @@ impl DomainState {
             )));
         }
 
-        let source_provider = self.backend_provider.clone();
-        let source_name = self.backend_name.clone();
-        let source_model = self.selected_model.clone();
-        let source_session = self.provider_session_id.clone();
-        let target_name = self
-            .provider_contexts
-            .get(&selected.provider)
-            .map_or_else(|| selected.provider.clone(), |context| context.name.clone());
-        let handoff = provider_changed.then(|| {
-            HandoffPackage::from_transcript(
-                source_provider,
-                source_model,
-                source_session,
-                selected.provider.clone(),
-                self.transcript.entries(),
-            )
-        });
-        if !self.activate_provider(&selected.provider) {
-            return Err(DomainCommandError::Conflict(
-                "provider could not be activated for this session".to_owned(),
-            ));
-        }
-        if provider_changed {
-            self.provider_session_id = None;
-            self.session_id = None;
-            self.context_usage = None;
-            self.pending_handoff = handoff.flatten();
-            self.sync_active_provider_context();
-            if self.pending_handoff.is_some() {
-                self.transcript.push(
-                    EntryKind::System,
-                    format!("HANDOFF · {source_name} → {target_name}"),
-                    "The next message will continue in a fresh provider-native session.",
-                    EntryStatus::Complete,
-                );
-            }
-        }
-
         let qualified = selected.qualified_id();
         let display = selected.display_name();
+        if provider_changed && self.is_busy() {
+            self.selected_model = Some(qualified.clone());
+            self.session_model_override = true;
+            self.session_model_options_override = Some((qualified.clone(), options.clone()));
+            self.status_message = format!(
+                "Active owner work keeps its current configuration. {display} starts with the next owner turn in a fresh provider-native session."
+            );
+            return Ok(self
+                .session_id
+                .clone()
+                .map(|session_id| Effect::UpdateSessionModel {
+                    session_id,
+                    model: Some(qualified),
+                    options,
+                })
+                .into_iter()
+                .collect());
+        }
+
+        let provider_changed = self.transition_idle_provider_selection(selected)?;
+
         self.selected_model = Some(qualified.clone());
         self.session_model_override = true;
         self.session_model_options_override = Some((qualified.clone(), options.clone()));
-        self.status_message = if provider_changed && self.pending_handoff.is_some() {
+        self.status_message = if self.active_turn.is_some() || self.starting_turn.is_some() {
+            format!(
+                "Active owner work keeps its current configuration. {display} starts with the next owner turn."
+            )
+        } else if provider_changed && self.pending_handoff.is_some() {
             format!("Selected {display}. The next message includes a continuity handoff.")
         } else {
-            format!("Selected model: {display}.")
+            format!("Selected model: {display}. It applies to the next owner turn.")
         };
 
         let mut effects = Vec::new();
@@ -3916,17 +3995,16 @@ impl DomainState {
                 provider_session_id,
                 model: selected.id.clone(),
             }));
-        } else if let Some(session_id) = self.session_id.clone() {
-            // Native adapters temporarily move a session out of their idle-session map while a turn
-            // or compaction owns it. The selected model is already attached to every future
-            // StartTurn, so persist the logical override now instead of addressing a native session
-            // that cannot accept an out-of-band model mutation until its work completes.
+        }
+        if let Some(session_id) = self.session_id.clone() {
             effects.push(Effect::UpdateSessionModel {
                 session_id,
                 model: Some(qualified),
+                options: options.clone(),
             });
         }
         if model_supports_options(selected)
+            && self.native_session_accepts_model_mutation()
             && let Some(provider_session_id) = self.provider_session_id.clone()
         {
             effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
@@ -3935,6 +4013,58 @@ impl DomainState {
             }));
         }
         Ok(effects)
+    }
+
+    fn prepare_selected_provider_transition(&mut self) -> bool {
+        let Some(target_provider) = self.selected_model.as_deref().and_then(|model| {
+            model
+                .split_once('/')
+                .map(|(provider, _)| provider.to_owned())
+        }) else {
+            return true;
+        };
+        if target_provider == self.backend_provider {
+            return true;
+        }
+
+        let source_provider = self.backend_provider.clone();
+        let source_name = self.backend_name.clone();
+        let source_model = self
+            .last_turn
+            .as_ref()
+            .and_then(|turn| turn.model.clone())
+            .or_else(|| self.selected_model.clone());
+        let source_native_session = self.provider_session_id.clone();
+        let source_logical_session = self.session_id.clone();
+        let target_name = self
+            .provider_contexts
+            .get(&target_provider)
+            .map_or_else(|| target_provider.clone(), |context| context.name.clone());
+        let handoff = HandoffPackage::from_transcript(
+            source_provider,
+            source_model,
+            source_native_session,
+            target_provider.clone(),
+            self.transcript.entries(),
+        );
+        if !self.activate_provider(&target_provider) {
+            return false;
+        }
+
+        self.provider_session_id = None;
+        self.session_id = source_logical_session;
+        self.context_usage = None;
+        self.pending_handoff = handoff;
+        self.sync_active_provider_context();
+        if self.pending_handoff.is_some() {
+            self.transcript.push(
+                EntryKind::System,
+                format!("HANDOFF · {source_name} → {target_name}"),
+                "The next message will continue in a fresh provider-native session.",
+                EntryStatus::Complete,
+            );
+        }
+        true
     }
 
     /// A native session is temporarily owned by its turn/compaction task while work is in flight.
@@ -4583,42 +4713,6 @@ impl DomainState {
             if scope == ModelSelectionScope::Vision {
                 return self.select_vision_model(&selected);
             }
-            let provider_changed = selected.provider != self.backend_provider;
-            let source_provider = self.backend_provider.clone();
-            let source_name = self.backend_name.clone();
-            let source_model = self.selected_model.clone();
-            let source_session = self.provider_session_id.clone();
-            let target_name = self
-                .provider_contexts
-                .get(&selected.provider)
-                .map_or_else(|| selected.provider.clone(), |context| context.name.clone());
-            let handoff = provider_changed.then(|| {
-                HandoffPackage::from_transcript(
-                    source_provider.clone(),
-                    source_model,
-                    source_session,
-                    selected.provider.clone(),
-                    self.transcript.entries(),
-                )
-            });
-            if !self.activate_provider(&selected.provider) {
-                return Vec::new();
-            }
-            if provider_changed {
-                self.provider_session_id = None;
-                self.session_id = None;
-                self.context_usage = None;
-                self.pending_handoff = handoff.flatten();
-                self.sync_active_provider_context();
-                if self.pending_handoff.is_some() {
-                    self.transcript.push(
-                        EntryKind::System,
-                        format!("HANDOFF · {source_name} → {target_name}"),
-                        "The next message will continue in a fresh provider-native session.",
-                        EntryStatus::Complete,
-                    );
-                }
-            }
             let selected_options = if stage == ModelPickerStage::Options {
                 self.client.model_picker.as_ref().map_or_else(
                     || self.model_options_for(&selected),
@@ -4627,75 +4721,22 @@ impl DomainState {
             } else {
                 self.model_options_for(&selected)
             };
-            let active = self.active_turn.is_some();
-            let qualified = selected.qualified_id();
-            let display = selected.display_name();
-            self.selected_model = Some(qualified.clone());
-            self.session_model_override = scope == ModelSelectionScope::Session;
-            self.session_model_options_override = (scope == ModelSelectionScope::Session)
-                .then(|| (qualified.clone(), selected_options.clone()));
-            if scope == ModelSelectionScope::Default {
-                for model in &mut self.models {
-                    if model.provider == selected.provider {
-                        model.is_default = model.id == selected.id;
+            self.finish_model_picker();
+            return match scope {
+                ModelSelectionScope::Default => {
+                    self.apply_default_model_selection(&selected, selected_options)
+                }
+                ModelSelectionScope::Session => {
+                    match self.apply_session_model_selection(&selected, selected_options) {
+                        Ok(effects) => effects,
+                        Err(error) => {
+                            self.status_message = error.to_string();
+                            Vec::new()
+                        }
                     }
                 }
-            }
-            self.status_message = if provider_changed && self.pending_handoff.is_some() {
-                format!("Selected {display}. The next message includes a continuity handoff.")
-            } else if active {
-                format!("Next model: {display}. The active turn is unchanged.")
-            } else if scope == ModelSelectionScope::Default {
-                format!("Default model: {display}.")
-            } else {
-                format!("Selected model: {display}.")
+                ModelSelectionScope::Vision => unreachable!("vision selection returned above"),
             };
-            self.finish_model_picker();
-            let mut effects = Vec::new();
-            if scope == ModelSelectionScope::Default {
-                effects.push(Effect::SetDefaultModel {
-                    provider: selected.provider.clone(),
-                    model: selected.id.clone(),
-                });
-                if model_supports_options(&selected) {
-                    self.install_model_options(
-                        &selected.provider,
-                        &selected.id,
-                        selected_options.clone(),
-                    );
-                    effects.push(Effect::SaveModelOptions {
-                        provider: selected.provider.clone(),
-                        model: selected.id.clone(),
-                        options: selected_options.clone(),
-                    });
-                }
-            }
-            if self
-                .backend_capabilities
-                .session_model_config
-                .is_supported()
-                && self.native_session_accepts_model_mutation()
-                && let Some(session_id) = self.provider_session_id.clone()
-            {
-                effects.push(Effect::Backend(BackendCommand::SetSessionModel {
-                    provider_session_id: session_id,
-                    model: selected.id.clone(),
-                }));
-            } else if let Some(session_id) = self.session_id.clone() {
-                effects.push(Effect::UpdateSessionModel {
-                    session_id,
-                    model: Some(qualified),
-                });
-            }
-            if model_supports_options(&selected)
-                && let Some(provider_session_id) = self.provider_session_id.clone()
-            {
-                effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
-                    provider_session_id,
-                    options: selected_options,
-                }));
-            }
-            return effects;
         }
         Vec::new()
     }
@@ -5712,6 +5753,7 @@ impl DomainState {
             effects.push(Effect::UpdateSessionModel {
                 session_id,
                 model: Some(model),
+                options: self.selected_model_options(),
             });
         }
         effects
@@ -5737,16 +5779,29 @@ impl DomainState {
                 );
             }
         }
-        let Some(prompt) = self.pending_session_prompt.take() else {
+        let Some(mut prompt) = self.pending_session_prompt.take() else {
             return Vec::new();
         };
-        let mut effects = vec![Effect::PersistSession {
-            provider: self.backend_provider.clone(),
-            provider_session_id: provider_session_id.clone(),
-            workspace: self.workspace.clone(),
-            title: prompt.text.clone(),
-            model: self.selected_model.clone(),
-        }];
+        prompt.resolved_model.clone_from(&self.selected_model);
+        prompt.options = self.selected_model_options();
+        let persistence = self.session_id.clone().map_or_else(
+            || Effect::PersistSession {
+                provider: self.backend_provider.clone(),
+                provider_session_id: provider_session_id.clone(),
+                workspace: self.workspace.clone(),
+                title: prompt.text.clone(),
+                model: self.selected_model.clone(),
+                options: prompt.options.clone(),
+            },
+            |session_id| Effect::TransitionSessionPrimary {
+                session_id,
+                provider: self.backend_provider.clone(),
+                provider_session_id: provider_session_id.clone(),
+                model: self.selected_model.clone(),
+                options: prompt.options.clone(),
+            },
+        );
+        let mut effects = vec![persistence];
         if self
             .selected_model
             .as_deref()
@@ -5785,11 +5840,30 @@ impl DomainState {
         self.context_usage = None;
         self.provider_usage = crate::backend::BackendTokenUsage::default();
         self.context_compaction = None;
-        self.session_model_options_override = None;
-        if !model.is_empty() {
-            self.selected_model = Some(self.qualify_active_model(model));
+        if let Some(selected) = session.model.clone() {
+            let selected = self.qualify_active_model(&selected);
+            self.selected_model = Some(selected.clone());
+            self.session_model_options_override = Some((selected, session.model_options.clone()));
             self.session_model_override = true;
+        } else {
+            self.session_model_options_override = None;
+            if !model.is_empty() {
+                self.selected_model = Some(self.qualify_active_model(model));
+                self.session_model_override = true;
+            }
         }
+        self.last_turn = session.last_turn.as_ref().map(|turn| LastTurn {
+            id: turn.id.clone(),
+            model: turn.model.clone(),
+            options: turn.options.clone(),
+            outcome: turn.outcome,
+        });
+        self.owner_turns = session
+            .owner_turns
+            .iter()
+            .cloned()
+            .map(|turn| (turn.id.clone(), turn))
+            .collect();
         self.install_history(history);
         self.install_subagents(Vec::new());
         self.status_message = format!("Resumed session {}.", short_id(&session.id));
@@ -5797,15 +5871,16 @@ impl DomainState {
             Effect::TouchSession(session.id.clone()),
             Effect::LoadSubagents(session.id),
         ];
-        if self
-            .selected_model
-            .as_deref()
-            .and_then(|selected| {
-                self.models
-                    .iter()
-                    .find(|model| model.qualified_id() == selected)
-            })
-            .is_some_and(model_supports_options)
+        if self.selected_model_for_active_provider().is_some()
+            && self
+                .selected_model
+                .as_deref()
+                .and_then(|selected| {
+                    self.models
+                        .iter()
+                        .find(|model| model.qualified_id() == selected)
+                })
+                .is_some_and(model_supports_options)
         {
             effects.push(Effect::Backend(BackendCommand::SetSessionOptions {
                 provider_session_id: provider_session_id_for_options,
@@ -6186,6 +6261,10 @@ impl DomainState {
     }
 
     fn begin_prompt(&mut self, prompt: QueuedPrompt) -> Vec<Effect> {
+        if !self.prepare_selected_provider_transition() {
+            self.queue.push_front(prompt);
+            return Vec::new();
+        }
         let mut wire_text = self
             .skills
             .render_prompt(&prompt.text)
@@ -6196,6 +6275,7 @@ impl DomainState {
             wire_text.push_str("\n\n");
             wire_text.push_str(&self.nakode_current_agent_catalogue());
         }
+        let resolved_options = self.selected_model_options();
         let prompt = OutgoingPrompt {
             id: prompt.id,
             text: prompt.text,
@@ -6206,6 +6286,8 @@ impl DomainState {
                 .is_supported()
                 .then(|| self.selected_model_for_active_provider())
                 .flatten(),
+            resolved_model: self.selected_model.clone(),
+            options: resolved_options,
             handoff: self.pending_handoff.take(),
             attachments: prompt.attachments,
         };
@@ -6222,11 +6304,22 @@ impl DomainState {
             .collect::<Vec<_>>();
         self.transcript.set_labeled_images(user_key.clone(), images);
         self.transcript.upsert(
-            user_key,
+            user_key.clone(),
             EntryKind::User,
             format!("YOU · {}", prompt.id),
             &prompt.text,
             EntryStatus::Complete,
+        );
+        self.transcript.set_origin(
+            &user_key,
+            Some(self.backend_provider.as_str()),
+            prompt.resolved_model.as_deref(),
+        );
+        self.transcript.set_turn_attribution(
+            &user_key,
+            &prompt.id,
+            prompt.options.reasoning_effort.as_deref(),
+            prompt.options.fast_mode,
         );
         self.transcript.set_stream_active(true);
 
@@ -6237,6 +6330,7 @@ impl DomainState {
                 workspace: self.workspace.clone(),
                 title: prompt.text.clone(),
                 model: self.selected_model.clone(),
+                options: prompt.options.clone(),
             });
             let mut effects = self.start_prompt_on_session(prompt, provider_session_id);
             if let Some(persist) = persist {
@@ -6289,7 +6383,7 @@ impl DomainState {
         let starting = self.starting_turn.take();
         let model = starting
             .as_ref()
-            .and_then(|prompt| prompt.model.clone())
+            .and_then(|prompt| prompt.resolved_model.clone())
             .or_else(|| self.selected_model.clone());
         if let Some(started) = &starting
             && self
@@ -6299,12 +6393,35 @@ impl DomainState {
         {
             self.redirect_start = None;
         }
+        let options = starting
+            .as_ref()
+            .map_or_else(ModelOptions::default, |prompt| prompt.options.clone());
         self.active_turn = Some(ActiveTurn {
             id: turn_id,
             model,
+            options,
             cancelling: false,
         });
         self.status_message = format!("{} is working…", self.backend_name);
+    }
+
+    fn record_terminal_owner_turn(&mut self, turn: Option<ActiveTurn>, outcome: TurnOutcome) {
+        let Some(turn) = turn else {
+            return;
+        };
+        let persisted = crate::session::PersistedTurnConfiguration {
+            id: turn.id.clone(),
+            model: turn.model.clone(),
+            options: turn.options.clone(),
+            outcome,
+        };
+        self.owner_turns.insert(persisted.id.clone(), persisted);
+        self.last_turn = Some(LastTurn {
+            id: turn.id,
+            model: turn.model,
+            options: turn.options,
+            outcome,
+        });
     }
 
     fn complete_turn(
@@ -6345,6 +6462,7 @@ impl DomainState {
         self.item_turns
             .retain(|_, item_turn_id| item_turn_id != turn_id);
 
+        let completed_turn = self.active_turn.clone();
         self.active_turn = None;
         self.context_compaction = None;
         self.starting_turn = None;
@@ -6383,12 +6501,22 @@ impl DomainState {
             }
         }
 
-        let mut effects = self
-            .session_id
-            .clone()
-            .map(Effect::TouchSession)
-            .into_iter()
-            .collect::<Vec<_>>();
+        self.record_terminal_owner_turn(completed_turn, outcome);
+
+        let mut effects = Vec::new();
+        if let (Some(session_id), Some(turn)) = (self.session_id.clone(), self.last_turn.clone()) {
+            effects.push(Effect::UpdateSessionLastTurn {
+                session_id,
+                turn: crate::session::PersistedTurnConfiguration {
+                    id: turn.id,
+                    model: turn.model,
+                    options: turn.options,
+                    outcome: turn.outcome,
+                },
+            });
+        } else if let Some(session_id) = self.session_id.clone() {
+            effects.push(Effect::TouchSession(session_id));
+        }
         if outcome == TurnOutcome::Failed && self.pending_redirect.is_some() {
             self.pending_redirect = None;
             self.status_message.push_str(" The selected follow-up remains queued; retry Steer now after the provider recovers.");
@@ -6429,7 +6557,7 @@ impl DomainState {
             if hides_subagent_item(&item) {
                 continue;
             }
-            self.item_turns.insert(item.id.clone(), turn_id);
+            self.item_turns.insert(item.id.clone(), turn_id.clone());
             let item_id = item.id.clone();
             let tool_audit_json = item.tool_audit_json;
             self.transcript.upsert(
@@ -6444,8 +6572,20 @@ impl DomainState {
             self.transcript.set_created_at_ms(&item_id, None);
             self.transcript
                 .set_tool_audit(&item_id, tool_audit_json.map(Into::into));
+            let owner_turn = self.owner_turns.get(&turn_id);
+            let historical_model = owner_turn
+                .and_then(|turn| turn.model.as_deref())
+                .or(model_id.as_deref());
             self.transcript
-                .set_origin(&item_id, provider_id.as_deref(), model_id.as_deref());
+                .set_origin(&item_id, provider_id.as_deref(), historical_model);
+            if let Some(turn) = owner_turn {
+                self.transcript.set_turn_attribution(
+                    &item_id,
+                    &turn.id,
+                    turn.options.reasoning_effort.as_deref(),
+                    turn.options.fast_mode,
+                );
+            }
             self.transcript.set_labeled_images(
                 &item_id,
                 attachments
@@ -6561,6 +6701,12 @@ impl DomainState {
             item_id,
             (!self.backend_provider.is_empty()).then_some(self.backend_provider.as_str()),
             turn.model.as_deref(),
+        );
+        self.transcript.set_turn_attribution(
+            item_id,
+            &turn.id,
+            turn.options.reasoning_effort.as_deref(),
+            turn.options.fast_mode,
         );
     }
 
@@ -8261,8 +8407,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        AgentEditorField, AgentRequest, AppState, ApprovalDecision, Effect, SubagentStatus,
-        model_supports_options, objective_mismatch_handoff, sanitize_client_instructions,
+        AgentEditorField, AgentRequest, AppState, ApprovalDecision, DomainCommandError, Effect,
+        SubagentStatus, model_supports_options, objective_mismatch_handoff,
+        sanitize_client_instructions,
     };
 
     #[test]
@@ -8502,6 +8649,9 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             workspace: state.workspace.clone(),
             title: "Diagram work".to_owned(),
             model: Some("model-a".to_owned()),
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
             created_at: 1,
             updated_at: 2,
             owned_provider_sessions: Vec::new(),
@@ -8543,6 +8693,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: None,
+            options: ModelOptions::default(),
             cancelling: false,
         });
         state.client.editor.set_text("!pwd");
@@ -8598,6 +8749,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "primary-turn".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
 
@@ -8825,6 +8977,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: None,
+            options: ModelOptions::default(),
             cancelling: false,
         });
         state.client.editor.set_text("steer");
@@ -9166,7 +9319,8 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert_eq!(state.queue.len(), 1);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::TouchSession(id), Effect::Backend(_)] if id == "nakode-session-1"
+            [Effect::UpdateSessionLastTurn { session_id, .. }, Effect::Backend(_)]
+                if session_id == "nakode-session-1"
         ));
     }
 
@@ -9177,6 +9331,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         for text in ["first follow-up", "repeat me", "repeat me"] {
@@ -9234,6 +9389,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         for text in ["first", "redirect me", "third"] {
@@ -9307,6 +9463,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         for text in ["first next", "second next"] {
@@ -9352,6 +9509,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         for text in ["ordinary next", "chosen next"] {
@@ -9391,6 +9549,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         for text in ["first", "redirect me", "third"] {
@@ -9434,6 +9593,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         for text in ["first", "selected", "third"] {
@@ -9502,6 +9662,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         state
@@ -9536,6 +9697,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         for text in ["first", "selected", "third"] {
@@ -9584,6 +9746,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         for text in ["first", "second", "third"] {
@@ -9624,6 +9787,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         state
@@ -9685,6 +9849,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
 
@@ -9717,6 +9882,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         state.client.editor.set_text("too late");
@@ -9948,7 +10114,8 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert_eq!(state.status_message, "prompt failed");
         assert!(matches!(
             effects.as_slice(),
-            [Effect::TouchSession(id)] if id == "nakode-session-1"
+            [Effect::UpdateSessionLastTurn { session_id, .. }]
+                if session_id == "nakode-session-1"
         ));
     }
 
@@ -10028,7 +10195,8 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         });
         assert!(matches!(
             effects.as_slice(),
-            [Effect::TouchSession(id), Effect::Backend(_)] if id == "nakode-session-1"
+            [Effect::UpdateSessionLastTurn { session_id, .. }, Effect::Backend(_)]
+                if session_id == "nakode-session-1"
         ));
     }
 
@@ -10081,6 +10249,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         state.client.editor.set_text("focus");
@@ -10320,6 +10489,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("kimi-coding/k3-256k".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         for (item_id, kind, delta) in [
@@ -10349,6 +10519,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
 
@@ -10440,6 +10611,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("claude-agent/opus".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
 
@@ -10550,6 +10722,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         state.handle_backend(BackendEvent::ItemStarted {
@@ -10585,6 +10758,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.active_turn = Some(super::ActiveTurn {
             id: "parent-turn".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         state.handle_backend(BackendEvent::ItemStarted {
@@ -11123,6 +11297,17 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             workspace: "/tmp/project".to_owned(),
             title: "Previous work".to_owned(),
             model: Some("model-a".to_owned()),
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: vec![crate::session::PersistedTurnConfiguration {
+                id: "turn-1".to_owned(),
+                model: Some("openai-codex/model-a".to_owned()),
+                options: ModelOptions {
+                    reasoning_effort: Some("high".to_owned()),
+                    fast_mode: true,
+                },
+                outcome: TurnOutcome::Completed,
+            }],
             created_at: 1,
             updated_at: 2,
             owned_provider_sessions: Vec::new(),
@@ -11160,11 +11345,19 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             ] if touched == &session.id
                 && loaded == &session.id
                 && options.reasoning_effort.is_none()
-                && options.fast_mode
+                && !options.fast_mode
         ));
         assert_eq!(state.session_id.as_deref(), Some(session.id.as_str()));
         assert_eq!(state.provider_session_id.as_deref(), Some("thread-resumed"));
         assert_eq!(state.transcript.entries()[0].body, "hello");
+        let restored_entry = &state.transcript.entries()[0];
+        assert_eq!(restored_entry.owner_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(
+            restored_entry.model_id.as_deref(),
+            Some("openai-codex/model-a")
+        );
+        assert_eq!(restored_entry.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(restored_entry.fast_mode, Some(true));
     }
 
     #[test]
@@ -11218,6 +11411,9 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 created_at_ms: None,
                 provider_id: None,
                 model_id: None,
+                owner_turn_id: None,
+                reasoning_effort: None,
+                fast_mode: None,
                 tool_audit_json: None,
             }],
             observability: SubagentObservability {
@@ -11279,14 +11475,21 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         });
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
-            model: Some("model-a".to_owned()),
+            model: Some("openai-codex/model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         let _ = state.open_model_picker();
         state.picker_move(1);
         let _ = state.picker_select();
-        let _ = state.picker_select();
+        let effects = state.picker_select();
 
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(
+                BackendCommand::SetSessionModel { .. } | BackendCommand::SetSessionOptions { .. }
+            )
+        )));
         assert_eq!(
             state.selected_model.as_deref(),
             Some("openai-codex/model-b")
@@ -11296,7 +11499,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .active_turn
                 .as_ref()
                 .and_then(|turn| turn.model.as_deref()),
-            Some("model-a")
+            Some("openai-codex/model-a")
         );
     }
 
@@ -11489,6 +11692,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn model_changes_during_native_work_are_persisted_for_the_next_turn() {
         for report_turn_started in [false, true] {
             let mut state = ready_state();
@@ -11518,9 +11722,33 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                     _ => None,
                 })
                 .expect("native turn starts");
+            let sent_entry = state
+                .transcript
+                .entries()
+                .iter()
+                .rev()
+                .find(|entry| entry.kind == EntryKind::User)
+                .expect("sent owner entry");
+            assert_eq!(sent_entry.model_id.as_deref(), Some("openai-codex/model-a"));
+            assert_eq!(sent_entry.reasoning_effort.as_deref(), Some("medium"));
+            assert_eq!(sent_entry.fast_mode, Some(false));
             if report_turn_started {
-                state.handle_backend(BackendEvent::TurnStarted { turn_id: client_id });
+                state.handle_backend(BackendEvent::TurnStarted {
+                    turn_id: client_id.clone(),
+                });
             }
+            let unchanged = projection::bootstrap(&state, 1, &[], &[])
+                .active_session
+                .expect("active session before selection");
+            assert!(!unchanged.next_turn_configuration_pending);
+            assert_eq!(
+                unchanged
+                    .active_turn
+                    .and_then(|turn| turn.model_id)
+                    .map(|model| model.to_string())
+                    .as_deref(),
+                Some("openai-codex/model-a")
+            );
 
             let effects = state
                 .select_model_intent(
@@ -11537,24 +11765,435 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
 
             assert!(effects.iter().any(|effect| matches!(
                 effect,
-                Effect::UpdateSessionModel { session_id, model }
+                Effect::UpdateSessionModel { session_id, model, .. }
                     if session_id == &state.nakode_session_id
                         && model.as_deref() == Some("openai-codex/model-b")
             )));
-            assert!(effects.iter().any(|effect| matches!(
-                effect,
-                Effect::Backend(BackendCommand::SetSessionOptions { options, .. })
-                    if options.reasoning_effort.as_deref() == Some("high")
-            )));
             assert!(!effects.iter().any(|effect| matches!(
                 effect,
-                Effect::Backend(BackendCommand::SetSessionModel { .. })
+                Effect::Backend(
+                    BackendCommand::SetSessionOptions { .. }
+                        | BackendCommand::SetSessionModel { .. }
+                )
             )));
             assert_eq!(
                 state.selected_model.as_deref(),
                 Some("openai-codex/model-b")
             );
+            let projected = projection::bootstrap(&state, 2, &[], &[])
+                .active_session
+                .expect("active session");
+            let active = projected
+                .active_turn
+                .expect("starting or running owner turn");
+            assert_eq!(
+                active.model_id.as_ref().map(ToString::to_string).as_deref(),
+                Some("openai-codex/model-a")
+            );
+            assert_eq!(
+                active.resolved_model_options.reasoning_effort.as_deref(),
+                Some("medium")
+            );
+            assert!(projected.next_turn_configuration_pending);
+            assert_eq!(
+                projected.selected_model_options.reasoning_effort.as_deref(),
+                Some("high")
+            );
+
+            let completion = state.handle_backend(BackendEvent::TurnCompleted {
+                turn_id: client_id,
+                outcome: TurnOutcome::Completed,
+                error: None,
+            });
+            assert!(completion.iter().any(|effect| matches!(
+                effect,
+                Effect::UpdateSessionLastTurn { turn, .. }
+                    if turn.model.as_deref() == Some("openai-codex/model-a")
+            )));
+            state.backend_provider = "anthropic".to_owned();
+            let projected = projection::bootstrap(&state, 3, &[], &[])
+                .active_session
+                .expect("active session");
+            assert!(projected.active_turn.is_none());
+            assert!(!projected.next_turn_configuration_pending);
+            let last = projected.last_turn.expect("latest terminal owner turn");
+            assert_eq!(
+                last.model_id.as_ref().map(ToString::to_string).as_deref(),
+                Some("openai-codex/model-a")
+            );
+            assert_eq!(
+                last.resolved_model_options.reasoning_effort.as_deref(),
+                Some("medium")
+            );
+            assert_eq!(last.status, nakode_protocol::TurnStatus::Completed);
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cross_provider_selection_transitions_on_next_turn_without_changing_logical_session() {
+        let mut state = ready_state();
+        state.handle_provider_backend(
+            DEVIN_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: DEVIN_PROVIDER.to_owned(),
+                display_name: "Devin".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities {
+                    model_catalog: CapabilitySupport::Supported,
+                    ..BackendCapabilities::default()
+                },
+            }),
+        );
+        state.handle_provider_backend(
+            DEVIN_PROVIDER,
+            BackendEvent::Models(vec![ModelInfo {
+                provider: DEVIN_PROVIDER.to_owned(),
+                id: "devin-model".to_owned(),
+                is_default: true,
+                capabilities: ModelCapabilities::default(),
+            }]),
+        );
+        state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "codex-native".to_owned(),
+            model: "model-a".to_owned(),
+        });
+        let logical_id = state.nakode_session_id.clone();
+        state.session_id = Some(logical_id.clone());
+        let first = state
+            .submit_prompt("source turn".to_owned(), Vec::new())
+            .expect("source turn starts");
+        let first_id = first
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Backend(BackendCommand::StartTurn { client_id, .. }) => {
+                    Some(client_id.clone())
+                }
+                _ => None,
+            })
+            .expect("source turn id");
+        state.handle_backend(BackendEvent::TurnStarted {
+            turn_id: first_id.clone(),
+        });
+
+        let selection = state
+            .select_model_intent(
+                &nakode_protocol::ModelTarget::Session {
+                    session_id: logical_id.clone().into(),
+                },
+                &nakode_protocol::ModelId::from("devin-acp/devin-model"),
+                &nakode_protocol::ModelOptions::default(),
+            )
+            .expect("cross-provider target is queued");
+        assert!(selection.iter().any(|effect| matches!(
+            effect,
+            Effect::UpdateSessionModel { model, .. }
+                if model.as_deref() == Some("devin-acp/devin-model")
+        )));
+        assert_eq!(state.backend_provider, CODEX_PROVIDER);
+        assert_eq!(state.provider_session_id.as_deref(), Some("codex-native"));
+        let active = projection::bootstrap(&state, 1, &[], &[])
+            .active_session
+            .expect("active session");
+        assert!(active.next_turn_configuration_pending);
+        assert!(
+            active
+                .next_turn_transition
+                .as_deref()
+                .is_some_and(|message| message.contains("fresh provider-native session"))
+        );
+        assert_eq!(
+            active
+                .active_turn
+                .and_then(|turn| turn.model_id)
+                .map(|model| model.to_string())
+                .as_deref(),
+            Some("openai-codex/model-a")
+        );
+
+        state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: first_id,
+            outcome: TurnOutcome::Completed,
+            error: None,
+        });
+        let effects = state
+            .submit_prompt("target turn".to_owned(), Vec::new())
+            .expect("target turn accepted");
+        assert_eq!(state.session_id.as_deref(), Some(logical_id.as_str()));
+        assert_eq!(state.backend_provider, DEVIN_PROVIDER);
+        assert!(state.provider_session_id.is_none());
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Backend(BackendCommand::StartSession { .. })
+            ))
+        );
+        state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::StartSession,
+            code: -32602,
+            message: "target provider unavailable".to_owned(),
+        });
+        assert!(!state.is_busy());
+        assert_eq!(
+            state
+                .recoverable_prompt()
+                .map(|prompt| prompt.text.as_str()),
+            Some("target turn")
+        );
+        assert!(state.pending_handoff.is_some());
+        assert_eq!(state.session_id.as_deref(), Some(logical_id.as_str()));
+        let retry = state
+            .submit_prompt("target retry".to_owned(), Vec::new())
+            .expect("target transition can be retried");
+        assert!(
+            retry.iter().any(|effect| matches!(
+                effect,
+                Effect::Backend(BackendCommand::StartSession { .. })
+            ))
+        );
+
+        let created = state.handle_provider_backend(
+            DEVIN_PROVIDER,
+            BackendEvent::SessionCreated {
+                provider_session_id: "devin-native".to_owned(),
+                model: "devin-model".to_owned(),
+            },
+        );
+        assert!(created.iter().any(|effect| matches!(
+            effect,
+            Effect::TransitionSessionPrimary {
+                session_id,
+                provider,
+                provider_session_id,
+                ..
+            } if session_id == &logical_id
+                && provider == DEVIN_PROVIDER
+                && provider_session_id == "devin-native"
+        )));
+        assert!(
+            created
+                .iter()
+                .any(|effect| matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. })))
+        );
+        assert_eq!(state.session_id.as_deref(), Some(logical_id.as_str()));
+        assert_eq!(
+            state
+                .starting_turn
+                .as_ref()
+                .and_then(|turn| turn.model.as_deref()),
+            Some("devin-model")
+        );
+    }
+
+    #[test]
+    fn restored_source_session_retains_a_persisted_cross_provider_next_turn_intent() {
+        let mut state = ready_state();
+        state.handle_provider_backend(
+            DEVIN_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: DEVIN_PROVIDER.to_owned(),
+                display_name: "Devin".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities {
+                    model_catalog: CapabilitySupport::Supported,
+                    ..BackendCapabilities::default()
+                },
+            }),
+        );
+        state.handle_provider_backend(
+            DEVIN_PROVIDER,
+            BackendEvent::Models(vec![ModelInfo {
+                provider: DEVIN_PROVIDER.to_owned(),
+                id: "devin-model".to_owned(),
+                is_default: true,
+                capabilities: ModelCapabilities::default(),
+            }]),
+        );
+        let session = SessionRecord {
+            id: "logical-restored".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "codex-restored".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            title: "Restored transition".to_owned(),
+            model: Some("devin-acp/devin-model".to_owned()),
+            model_options: ModelOptions::default(),
+            last_turn: Some(crate::session::PersistedTurnConfiguration {
+                id: "source-turn".to_owned(),
+                model: Some("openai-codex/model-a".to_owned()),
+                options: ModelOptions {
+                    reasoning_effort: Some("medium".to_owned()),
+                    fast_mode: false,
+                },
+                outcome: TurnOutcome::Completed,
+            }),
+            owner_turns: vec![crate::session::PersistedTurnConfiguration {
+                id: "source-turn".to_owned(),
+                model: Some("openai-codex/model-a".to_owned()),
+                options: ModelOptions {
+                    reasoning_effort: Some("medium".to_owned()),
+                    fast_mode: false,
+                },
+                outcome: TurnOutcome::Completed,
+            }],
+            created_at: 1,
+            updated_at: 2,
+            owned_provider_sessions: Vec::new(),
+        };
+        state.begin_resume(session.clone());
+        state.handle_backend(BackendEvent::SessionResumed {
+            provider_session_id: "codex-restored".to_owned(),
+            model: "model-a".to_owned(),
+            history: vec![SessionHistoryItem {
+                turn_id: "source-turn".to_owned(),
+                provider_id: Some(CODEX_PROVIDER.to_owned()),
+                model_id: Some("model-a".to_owned()),
+                attachments: Vec::new(),
+                item: NormalizedItem {
+                    id: "source-answer".to_owned(),
+                    kind: ItemKind::Assistant,
+                    title: "ASSISTANT".to_owned(),
+                    body: "Source-provider context.".to_owned(),
+                    status: ItemStatus::Complete,
+                    tool_audit_json: None,
+                },
+            }],
+        });
+        assert_eq!(state.backend_provider, CODEX_PROVIDER);
+        assert_eq!(
+            state.selected_model.as_deref(),
+            Some("devin-acp/devin-model")
+        );
+
+        let effects = state
+            .submit_prompt("continue after restart".to_owned(), Vec::new())
+            .expect("restored transition starts");
+        assert_eq!(state.backend_provider, DEVIN_PROVIDER);
+        assert_eq!(state.session_id.as_deref(), Some(session.id.as_str()));
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Backend(BackendCommand::StartSession { .. })
+            ))
+        );
+        assert!(state.pending_session_prompt.as_ref().is_some_and(|prompt| {
+            prompt.resolved_model.as_deref() == Some("devin-acp/devin-model")
+                && prompt.handoff.is_some()
+        }));
+    }
+
+    #[test]
+    fn session_selection_rejects_effort_not_advertised_by_the_model() {
+        let mut state = ready_state();
+        state.session_id = Some(state.nakode_session_id.clone());
+        let original_model = state.selected_model.clone();
+        let original_options = state.selected_model_options();
+
+        let result = state.select_model_intent(
+            &nakode_protocol::ModelTarget::Session {
+                session_id: state.nakode_session_id.clone().into(),
+            },
+            &nakode_protocol::ModelId::from("openai-codex/model-a"),
+            &nakode_protocol::ModelOptions {
+                reasoning_effort: Some("impossible".to_owned()),
+                fast_mode: false,
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(state.selected_model, original_model);
+        assert_eq!(state.selected_model_options(), original_options);
+    }
+
+    #[test]
+    fn session_selection_rejects_fast_mode_not_advertised_by_the_model() {
+        let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CLAUDE_PROVIDER.to_owned(),
+            id: "claude-opus".to_owned(),
+            is_default: false,
+            capabilities: ModelCapabilities {
+                reasoning_efforts: vec!["low".to_owned(), "high".to_owned()],
+            },
+        });
+        state.session_id = Some(state.nakode_session_id.clone());
+
+        let result = state.select_model_intent(
+            &nakode_protocol::ModelTarget::Session {
+                session_id: state.nakode_session_id.clone().into(),
+            },
+            &nakode_protocol::ModelId::from("claude-agent/claude-opus"),
+            &nakode_protocol::ModelOptions {
+                reasoning_effort: Some("high".to_owned()),
+                fast_mode: true,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(DomainCommandError::Unsupported(message))
+                if message.contains("does not advertise fast-mode")
+        ));
+    }
+
+    #[test]
+    fn queued_follow_up_uses_configuration_selected_while_previous_turn_runs() {
+        let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "model-b".to_owned(),
+            is_default: false,
+            capabilities: crate::codex::model_capabilities(),
+        });
+        state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "thread-1".to_owned(),
+            model: "model-a".to_owned(),
+        });
+        state.session_id = Some(state.nakode_session_id.clone());
+        let first = state
+            .submit_prompt("first".to_owned(), Vec::new())
+            .expect("first turn");
+        let first_id = first
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Backend(BackendCommand::StartTurn { client_id, .. }) => {
+                    Some(client_id.clone())
+                }
+                _ => None,
+            })
+            .expect("first turn id");
+        state.handle_backend(BackendEvent::TurnStarted {
+            turn_id: first_id.clone(),
+        });
+        state.client.editor.set_text("queued");
+        state.submit_editor();
+        assert_eq!(state.queue.len(), 1);
+
+        state
+            .select_model_intent(
+                &nakode_protocol::ModelTarget::Session {
+                    session_id: state.nakode_session_id.clone().into(),
+                },
+                &nakode_protocol::ModelId::from("openai-codex/model-b"),
+                &nakode_protocol::ModelOptions {
+                    reasoning_effort: Some("high".to_owned()),
+                    fast_mode: false,
+                },
+            )
+            .expect("next-turn selection");
+        let effects = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: first_id,
+            outcome: TurnOutcome::Completed,
+            error: None,
+        });
+
+        let next = state.starting_turn.as_ref().expect("queued turn promoted");
+        assert_eq!(next.model.as_deref(), Some("model-b"));
+        assert_eq!(next.options.reasoning_effort.as_deref(), Some("high"));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { model, .. })
+                if model.as_deref() == Some("model-b")
+        )));
     }
 
     #[test]
@@ -12510,6 +13149,7 @@ model = "claude-agent/sonnet"
         state.active_turn = Some(super::ActiveTurn {
             id: "parent-turn".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         let run_id = begin_mocked_subagent(&mut state);
@@ -12631,6 +13271,7 @@ model = "claude-agent/sonnet"
         state.active_turn = Some(super::ActiveTurn {
             id: "parent-turn".to_owned(),
             model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
             cancelling: false,
         });
         let run_id = begin_mocked_subagent(&mut state);

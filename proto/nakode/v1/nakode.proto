@@ -504,7 +504,14 @@ message AgentSession {
   TokenUsage usage = 9;
 }
 enum TurnStatus { TURN_STATUS_UNSPECIFIED = 0; TURN_STATUS_STARTING = 1; TURN_STATUS_RUNNING = 2; TURN_STATUS_CANCELLING = 3; TURN_STATUS_COMPLETED = 4; TURN_STATUS_INTERRUPTED = 5; TURN_STATUS_FAILED = 6; }
-message Turn { string id = 1; string agent_session_id = 2; optional string model_id = 3; TurnStatus status = 4; }
+message Turn {
+  string id = 1;
+  string agent_session_id = 2;
+  optional string model_id = 3;
+  TurnStatus status = 4;
+  // Concrete options captured when this owner turn was accepted. They never follow later selection changes.
+  ModelOptions resolved_model_options = 5;
+}
 message ContextUsage { uint64 estimated_tokens = 1; optional uint64 context_window = 2; bool compacting = 3; }
 message SessionState {
   string id = 1;
@@ -533,6 +540,12 @@ message SessionState {
   // Unix epoch milliseconds from Nakode's persisted logical-session record.
   int64 created_at_ms = 23;
   int64 updated_at_ms = 24;
+  // Most recent terminal owner turn. Delegated child runs are represented only in `runs`.
+  optional Turn last_turn = 25;
+  // True only when the selected next-turn configuration differs from the owner turn in flight.
+  bool next_turn_configuration_pending = 26;
+  // Server-authored transition semantics for the selected next-turn configuration.
+  optional string next_turn_transition = 27;
 }
 message ExternalToolCall { string id = 1; string name = 2; string arguments_json = 3; }
 
@@ -546,6 +559,10 @@ message TranscriptEntry {
   optional string tool_audit_json = 11;
   // Immutable server creation boundary. Absent for imported history without source timing.
   optional uint64 created_at_ms = 12;
+  // Immutable owner-turn attribution. Absent for user/system/delegate or legacy entries.
+  optional string owner_turn_id = 13;
+  optional string resolved_reasoning_effort = 14;
+  optional bool resolved_fast_mode = 15;
 }
 message TranscriptPage { repeated TranscriptEntry entries = 1; bool has_earlier = 2; bool stream_active = 3; string stream_label = 4; }
 message TranscriptBodyWindow { string entry_id = 1; string body = 2; uint64 start_byte = 3; uint64 total_bytes = 4; bool has_earlier = 5; }

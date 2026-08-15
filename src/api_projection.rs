@@ -498,6 +498,9 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
         ),
         active_agent_session: value.active_agent_session.map(agent_session).transpose()?,
         active_turn: value.active_turn.map(turn).transpose()?,
+        last_turn: value.last_turn.map(turn).transpose()?,
+        next_turn_configuration_pending: value.next_turn_configuration_pending,
+        next_turn_transition: value.next_turn_transition,
         context_usage: value.context_usage.map(|usage| view::ContextUsageView {
             estimated_tokens: usage.estimated_tokens,
             context_window: usage.context_window,
@@ -879,6 +882,13 @@ fn turn(value: api::Turn) -> Result<view::TurnView, String> {
         id: view::TurnId::from(value.id),
         agent_session_id: view::AgentSessionId::from(value.agent_session_id),
         model_id: value.model_id.map(view::ModelId::from),
+        resolved_model_options: value.resolved_model_options.map_or_else(
+            view::ModelOptions::default,
+            |options| view::ModelOptions {
+                reasoning_effort: options.reasoning_effort,
+                fast_mode: options.fast_mode,
+            },
+        ),
         status: match api::TurnStatus::try_from(value.status).map_err(invalid_enum)? {
             api::TurnStatus::Starting => view::TurnStatus::Starting,
             api::TurnStatus::Running => view::TurnStatus::Running,
@@ -941,6 +951,9 @@ fn transcript_entry(value: api::TranscriptEntry) -> Result<view::TranscriptEntry
             .collect(),
         provider_id: value.provider_id,
         model_id: value.model_id.map(view::ModelId::from),
+        owner_turn_id: None,
+        resolved_reasoning_effort: None,
+        resolved_fast_mode: None,
         tool_audit_json: value.tool_audit_json,
         created_at_ms: value.created_at_ms,
     })

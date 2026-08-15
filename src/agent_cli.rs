@@ -250,6 +250,9 @@ mod tests {
             artifacts: Vec::new(),
             provider_id: None,
             model_id: None,
+            owner_turn_id: None,
+            resolved_reasoning_effort: None,
+            resolved_fast_mode: None,
             tool_audit_json: None,
             created_at_ms: None,
         }
