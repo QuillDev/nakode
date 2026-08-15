@@ -1026,6 +1026,9 @@ fn install_created_session_view(
                 artifacts: Vec::new(),
                 provider_id: None,
                 model_id: None,
+                owner_turn_id: None,
+                resolved_reasoning_effort: None,
+                resolved_fast_mode: None,
                 tool_audit_json: None,
                 created_at_ms: None,
             });
@@ -1056,6 +1059,7 @@ fn install_started_turn_view(
         id: nakode_protocol::TurnId::from(turn_id),
         agent_session_id: agent.id.clone(),
         model_id: agent.model_id.clone(),
+        resolved_model_options: nakode_protocol::ModelOptions::default(),
         status: nakode_protocol::TurnStatus::Running,
     });
     session.activity = nakode_protocol::SessionActivity::RunningTurn;
@@ -1099,6 +1103,9 @@ fn install_item_view(
         artifacts: Vec::new(),
         provider_id: None,
         model_id: None,
+        owner_turn_id: None,
+        resolved_reasoning_effort: None,
+        resolved_fast_mode: None,
         tool_audit_json: None,
         created_at_ms: None,
     };

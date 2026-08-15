@@ -1642,6 +1642,9 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         selected_model_options: Some(projected_model_options(value.selected_model_options)),
         active_agent_session: value.active_agent_session.map(agent_session),
         active_turn: value.active_turn.map(turn),
+        last_turn: value.last_turn.map(turn),
+        next_turn_configuration_pending: value.next_turn_configuration_pending,
+        next_turn_transition: value.next_turn_transition,
         context_usage: value.context_usage.map(context_usage),
         transcript: Some(transcript(value.transcript)),
         recoverable_prompt: value.recoverable_prompt.map(recoverable_prompt),
@@ -1723,6 +1726,7 @@ fn turn(value: protocol::TurnView) -> api::Turn {
         agent_session_id: value.agent_session_id.to_string(),
         model_id: value.model_id.map(|id| id.to_string()),
         status: status as i32,
+        resolved_model_options: Some(projected_model_options(value.resolved_model_options)),
     }
 }
 
@@ -1778,6 +1782,9 @@ fn transcript_entry(value: protocol::TranscriptEntryView) -> api::TranscriptEntr
         model_id: value.model_id.map(|id| id.to_string()),
         tool_audit_json: value.tool_audit_json,
         created_at_ms: value.created_at_ms,
+        owner_turn_id: value.owner_turn_id.map(|id| id.to_string()),
+        resolved_reasoning_effort: value.resolved_reasoning_effort,
+        resolved_fast_mode: value.resolved_fast_mode,
     }
 }
 

@@ -1905,6 +1905,8 @@ impl EffectExecutor {
             | Effect::PersistSubagent(_)
             | Effect::LoadSubagents(_)
             | Effect::UpdateSessionModel { .. }
+            | Effect::TransitionSessionPrimary { .. }
+            | Effect::UpdateSessionLastTurn { .. }
             | Effect::TouchSession(_)
             | Effect::DeleteSession(_)) => {
                 execute_persistence_effect(state, sessions, persistence_effect);
@@ -2035,6 +2037,7 @@ fn execute_persistence_effect(
             workspace,
             title,
             model,
+            options,
         } => persist_session(
             state,
             sessions,
@@ -2043,6 +2046,7 @@ fn execute_persistence_effect(
             &workspace,
             &title,
             model.as_deref(),
+            &options,
         ),
         Effect::PersistModels { provider, models } => {
             persist_models(state, sessions, &provider, &models);
@@ -2059,8 +2063,30 @@ fn execute_persistence_effect(
         Effect::LoadSubagents(parent_session_id) => {
             load_subagents(state, sessions, &parent_session_id);
         }
-        Effect::UpdateSessionModel { session_id, model } => {
-            update_session_model(state, sessions, &session_id, model.as_deref());
+        Effect::UpdateSessionModel {
+            session_id,
+            model,
+            options,
+        } => {
+            update_session_model(state, sessions, &session_id, model.as_deref(), &options);
+        }
+        Effect::TransitionSessionPrimary {
+            session_id,
+            provider,
+            provider_session_id,
+            model,
+            options,
+        } => transition_session_primary(
+            state,
+            sessions,
+            &session_id,
+            &provider,
+            &provider_session_id,
+            model.as_deref(),
+            &options,
+        ),
+        Effect::UpdateSessionLastTurn { session_id, turn } => {
+            update_session_last_turn(state, sessions, &session_id, &turn);
         }
         Effect::TouchSession(id) => touch_session(state, sessions, &id),
         Effect::DeleteSession(id) => delete_session(state, sessions, &id),
@@ -2068,6 +2094,7 @@ fn execute_persistence_effect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_session(
     state: &mut DomainState,
     sessions: &dyn SessionRepository,
@@ -2076,6 +2103,7 @@ fn persist_session(
     workspace: &str,
     title: &str,
     model: Option<&str>,
+    options: &crate::backend::ModelOptions,
 ) {
     match sessions.create_with_id(
         &state.nakode_session_id,
@@ -2084,6 +2112,7 @@ fn persist_session(
         workspace,
         title,
         model,
+        options,
     ) {
         Ok(record) => state.session_persisted(&record),
         Err(error) => state.session_store_failed(error.to_string()),
@@ -2412,8 +2441,37 @@ fn update_session_model(
     sessions: &dyn SessionRepository,
     id: &str,
     model: Option<&str>,
+    options: &crate::backend::ModelOptions,
 ) {
-    if let Err(error) = sessions.update_model(id, model) {
+    if let Err(error) = sessions.update_model(id, model, options) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transition_session_primary(
+    state: &mut DomainState,
+    sessions: &dyn SessionRepository,
+    id: &str,
+    provider: &str,
+    provider_session_id: &str,
+    model: Option<&str>,
+    options: &crate::backend::ModelOptions,
+) {
+    if let Err(error) =
+        sessions.transition_primary(id, provider, provider_session_id, model, options)
+    {
+        state.session_store_failed(error.to_string());
+    }
+}
+
+fn update_session_last_turn(
+    state: &mut DomainState,
+    sessions: &dyn SessionRepository,
+    id: &str,
+    turn: &crate::session::PersistedTurnConfiguration,
+) {
+    if let Err(error) = sessions.update_last_turn(id, turn) {
         state.session_store_failed(error.to_string());
     }
 }

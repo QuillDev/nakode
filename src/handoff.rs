@@ -150,6 +150,9 @@ mod tests {
             created_at_ms: None,
             provider_id: None,
             model_id: None,
+            owner_turn_id: None,
+            reasoning_effort: None,
+            fast_mode: None,
             tool_audit_json: None,
         }
     }

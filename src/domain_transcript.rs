@@ -43,6 +43,12 @@ pub struct TranscriptEntry {
     pub provider_id: Option<String>,
     /// The canonical provider-qualified model used by that turn.
     pub model_id: Option<String>,
+    /// Provider turn identifier correlating historical entries with immutable owner-turn metadata.
+    pub owner_turn_id: Option<String>,
+    /// Concrete reasoning effort resolved for the owner turn that produced this entry.
+    pub reasoning_effort: Option<String>,
+    /// Concrete fast-mode value resolved for the owner turn that produced this entry.
+    pub fast_mode: Option<bool>,
     /// Versioned, bounded provider-neutral tool audit JSON. Never interpreted as markup.
     pub tool_audit_json: Option<String>,
 }
@@ -229,6 +235,9 @@ impl DomainTranscript {
             created_at_ms: Some(unix_time_ms()),
             provider_id: None,
             model_id: None,
+            owner_turn_id: None,
+            reasoning_effort: None,
+            fast_mode: None,
             tool_audit_json: None,
         });
         self.enforce_limit();
@@ -261,6 +270,9 @@ impl DomainTranscript {
                 created_at_ms: Some(unix_time_ms()),
                 provider_id: None,
                 model_id: None,
+                owner_turn_id: None,
+                reasoning_effort: None,
+                fast_mode: None,
                 tool_audit_json: None,
             });
             self.item_indices.insert(key, index);
@@ -292,6 +304,9 @@ impl DomainTranscript {
                 created_at_ms: Some(unix_time_ms()),
                 provider_id: None,
                 model_id: None,
+                owner_turn_id: None,
+                reasoning_effort: None,
+                fast_mode: None,
                 tool_audit_json: None,
             });
             self.item_indices.insert(key, index);
@@ -313,6 +328,23 @@ impl DomainTranscript {
             }
             if entry.model_id.is_none() {
                 entry.model_id = model_id.map(str::to_owned);
+            }
+        }
+    }
+
+    pub fn set_turn_attribution(
+        &mut self,
+        key: &str,
+        turn_id: &str,
+        reasoning_effort: Option<&str>,
+        fast_mode: bool,
+    ) {
+        if let Some(index) = self.item_indices.get(key).copied() {
+            let entry = &mut self.entries[index];
+            if entry.owner_turn_id.is_none() {
+                entry.owner_turn_id = Some(turn_id.to_owned());
+                entry.reasoning_effort = reasoning_effort.map(str::to_owned);
+                entry.fast_mode = Some(fast_mode);
             }
         }
     }

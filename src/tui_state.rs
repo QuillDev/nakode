@@ -387,6 +387,9 @@ mod tests {
             selected_model_options: nakode_protocol::ModelOptions::default(),
             active_agent_session: None,
             active_turn: None,
+            last_turn: None,
+            next_turn_configuration_pending: false,
+            next_turn_transition: None,
             context_usage: None,
             transcript: TranscriptPage {
                 entries: Vec::new(),

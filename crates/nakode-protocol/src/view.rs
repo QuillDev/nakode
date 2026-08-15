@@ -179,6 +179,9 @@ pub struct TurnView {
     pub id: TurnId,
     pub agent_session_id: AgentSessionId,
     pub model_id: Option<ModelId>,
+    /// Concrete options captured at owner-turn acceptance.
+    #[serde(default)]
+    pub resolved_model_options: ModelOptions,
     pub status: TurnStatus,
 }
 
@@ -234,6 +237,15 @@ pub struct TranscriptEntryView {
     /// Canonical provider-qualified model captured when this turn began.
     #[serde(default)]
     pub model_id: Option<ModelId>,
+    /// Immutable owner turn that produced this entry.
+    #[serde(default)]
+    pub owner_turn_id: Option<TurnId>,
+    /// Concrete reasoning effort resolved when that owner turn began.
+    #[serde(default)]
+    pub resolved_reasoning_effort: Option<String>,
+    /// Concrete fast-mode value resolved when that owner turn began.
+    #[serde(default)]
+    pub resolved_fast_mode: Option<bool>,
     /// Versioned, bounded tool audit JSON. Clients must render it as inert data.
     #[serde(default)]
     pub tool_audit_json: Option<String>,
@@ -697,6 +709,15 @@ pub struct SessionView {
     pub selected_model_options: ModelOptions,
     pub active_agent_session: Option<AgentSessionView>,
     pub active_turn: Option<TurnView>,
+    /// Most recent terminal owner turn. Delegated runs never populate this field.
+    #[serde(default)]
+    pub last_turn: Option<TurnView>,
+    /// Server-owned indication that selected next-turn configuration differs from active work.
+    #[serde(default)]
+    pub next_turn_configuration_pending: bool,
+    /// Server-authored provider/native-session transition semantics for the next turn.
+    #[serde(default)]
+    pub next_turn_transition: Option<String>,
     pub context_usage: Option<ContextUsageView>,
     pub transcript: TranscriptPage,
     #[serde(default)]
@@ -737,6 +758,12 @@ pub struct SessionMetadataView {
     pub selected_model_options: ModelOptions,
     pub active_agent_session: Option<AgentSessionView>,
     pub active_turn: Option<TurnView>,
+    #[serde(default)]
+    pub last_turn: Option<TurnView>,
+    #[serde(default)]
+    pub next_turn_configuration_pending: bool,
+    #[serde(default)]
+    pub next_turn_transition: Option<String>,
     pub context_usage: Option<ContextUsageView>,
     #[serde(default)]
     pub recoverable_prompt: Option<RecoverablePromptView>,
