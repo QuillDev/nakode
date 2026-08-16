@@ -8,17 +8,20 @@ pub(crate) mod runtime;
 
 use std::{
     collections::{HashMap, VecDeque},
+    fmt::Write as _,
     path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use nakode_protocol::{
-    AgentDefinitionInput, AgentSessionId, Command, CommandAccepted, CredentialInput, EntryId,
-    ErrorCode, IdempotencyKey, MAX_ARTIFACT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES, McpGrantPolicy,
-    McpServerInput, McpSessionGrant, ModelTarget, PromptInput, ProviderId, Query, QueryResult,
-    RunId, RunMetadataView, RunTextField, RunView, ServiceCapability, ServiceError, SessionId,
-    SessionMetadataView, SessionView, Snapshot, SoulDocumentView, SubscriptionScope,
-    SubscriptionView, TranscriptEntryStatus, TranscriptEntryView, TranscriptOwner, TranscriptPage,
-    TranscriptWindowView, ViewEvent, WorkspaceId,
+    AgentDefinitionInput, AgentSessionId, BridgeContinuationDisposition, BridgeLifecycle, Command,
+    CommandAccepted, CredentialInput, EntryId, ErrorCode, IdempotencyKey, MAX_ARTIFACT_BYTES,
+    MAX_TRANSCRIPT_DELTA_BYTES, McpGrantPolicy, McpServerInput, McpSessionGrant, ModelTarget,
+    PromptInput, ProviderId, Query, QueryResult, RunId, RunMetadataView, RunTextField, RunView,
+    ServiceCapability, ServiceError, SessionBridgeIntent, SessionId, SessionMetadataView,
+    SessionView, Snapshot, SoulDocumentView, SubscriptionScope, SubscriptionView,
+    TranscriptEntryStatus, TranscriptEntryView, TranscriptOwner, TranscriptPage,
+    TranscriptWindowView, TurnId, ViewEvent, WorkspaceId,
 };
 use nakode_server::{ServerEndpoint, ServerRequest};
 use sha2::{Digest, Sha256};
@@ -28,12 +31,16 @@ use crate::{
     agent::{AgentCatalog, AgentDefinition, AgentFallbackPolicy, AgentOwnership, AgentToolProfile},
     backend::PromptAttachment,
     service::ServiceEngine,
-    session::{ProviderRecord, SessionRecord},
+    session::{
+        BridgeDeliveryRecord, BridgePendingInboundRecord, ProviderRecord, SessionBridgeRecord,
+        SessionRecord,
+    },
     soul::{SoulError, SoulSource, SoulStore},
     state::{DomainCommandError, Effect},
 };
 
 const IDEMPOTENCY_CAPACITY: usize = 1_024;
+const RECENT_INBOUND_CACHE_CAPACITY: usize = 256;
 
 type DomainCommandOutcome = Result<(CommandAccepted, Vec<Effect>), DomainCommandError>;
 type McpArchetypeGrants = HashMap<String, std::collections::HashSet<String>>;
@@ -72,6 +79,15 @@ struct PendingPublication {
     event: ViewEvent,
 }
 
+#[derive(Clone)]
+pub(crate) struct BridgeStateCheckpoint {
+    session_bridges: Vec<SessionBridgeRecord>,
+    command_cache: HashMap<IdempotencyKey, CachedCommand>,
+    command_order: VecDeque<IdempotencyKey>,
+    published_workspace: Option<nakode_protocol::BootstrapView>,
+}
+
+#[derive(Clone)]
 pub struct ServerCore {
     sessions_by_id: HashMap<SessionId, ServiceEngine>,
     default_session: SessionId,
@@ -79,6 +95,7 @@ pub struct ServerCore {
     mcp_servers: Vec<crate::mcp::McpServerRecord>,
     providers: Vec<ProviderRecord>,
     sessions: Vec<SessionRecord>,
+    session_bridges: Vec<SessionBridgeRecord>,
     command_cache: HashMap<IdempotencyKey, CachedCommand>,
     command_order: VecDeque<IdempotencyKey>,
     published_workspace: Option<nakode_protocol::BootstrapView>,
@@ -103,6 +120,7 @@ impl ServerCore {
             mcp_servers: Vec::new(),
             providers,
             sessions,
+            session_bridges: Vec::new(),
             command_cache: HashMap::new(),
             command_order: VecDeque::new(),
             published_workspace: None,
@@ -152,6 +170,46 @@ impl ServerCore {
             .into_iter()
             .find_map(|(session_id, engine)| (session_id == self.default_session).then_some(engine))
             .expect("the default session runtime always exists")
+    }
+
+    pub(crate) fn install_session_bridges(&mut self, bridges: Vec<SessionBridgeRecord>) {
+        self.session_bridges = bridges;
+        self.published_workspace = Some(self.workspace_bootstrap());
+    }
+
+    pub(crate) fn remember_durable_bridge_inbound_event(
+        &mut self,
+        session_id: &SessionId,
+        external_event_id: &str,
+    ) {
+        if let Some(bridge) = self
+            .session_bridges
+            .iter_mut()
+            .find(|bridge| bridge.session_id == session_id.as_str())
+        {
+            remember_inbound_event(bridge, external_event_id);
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn bridge_state_checkpoint(&self) -> BridgeStateCheckpoint {
+        BridgeStateCheckpoint {
+            session_bridges: self.session_bridges.clone(),
+            command_cache: self.command_cache.clone(),
+            command_order: self.command_order.clone(),
+            published_workspace: self.published_workspace.clone(),
+        }
+    }
+
+    pub(crate) fn restore_bridge_state(&mut self, checkpoint: BridgeStateCheckpoint) {
+        self.session_bridges = checkpoint.session_bridges;
+        self.command_cache = checkpoint.command_cache;
+        self.command_order = checkpoint.command_order;
+        self.published_workspace = checkpoint.published_workspace;
+    }
+
+    pub(crate) fn replace_session_bridges(&mut self, bridges: Vec<SessionBridgeRecord>) {
+        self.session_bridges = bridges;
     }
 
     pub(crate) fn install_mcp_servers(&mut self, servers: Vec<crate::mcp::McpServerRecord>) {
@@ -423,18 +481,21 @@ impl ServerCore {
         match command {
             Command::CreateSession {
                 workspace_id,
+                title,
                 model_id,
                 options,
                 tools,
                 initial_instructions,
+                bridge,
                 mcp_grant,
-                ..
             } => self.create_session_command_with_mcp(
                 &workspace_id,
+                title.as_deref(),
                 model_id.as_ref(),
                 &options,
                 tools,
                 initial_instructions.as_deref(),
+                bridge,
                 mcp_grant.as_ref(),
             ),
             Command::OpenSession {
@@ -442,6 +503,86 @@ impl ServerCore {
                 tools,
                 mcp_grant,
             } => self.open_session_command_with_mcp(&session_id, tools, mcp_grant.as_ref()),
+            Command::SetSessionBridgeLifecycle {
+                session_id,
+                lifecycle,
+            } => self.set_session_bridge_lifecycle_command(&session_id, lifecycle),
+            Command::SetWorkspaceBridgeLifecycle {
+                workspace_id,
+                lifecycle,
+            } => self.set_workspace_bridge_lifecycle_command(&workspace_id, lifecycle),
+            Command::BindSessionBridgeThread {
+                session_id,
+                transport,
+                external_parent_id,
+                external_thread_id,
+            } => self.bind_session_bridge_thread_command(
+                &session_id,
+                &transport,
+                &external_parent_id,
+                &external_thread_id,
+            ),
+            Command::ClearSessionBridgeThread {
+                session_id,
+                transport,
+                external_thread_id,
+            } => self.clear_session_bridge_thread_command(
+                &session_id,
+                &transport,
+                &external_thread_id,
+            ),
+            Command::PrepareBridgeDelivery {
+                session_id,
+                turn_id,
+                body_sha256,
+                part_count,
+            } => self.prepare_bridge_delivery_command(
+                &session_id,
+                &turn_id,
+                &body_sha256,
+                part_count,
+            ),
+            Command::CompleteBridgeDeliveryPart {
+                session_id,
+                turn_id,
+                part_index,
+                external_message_id,
+            } => self.complete_bridge_delivery_part_command(
+                &session_id,
+                &turn_id,
+                part_index,
+                &external_message_id,
+            ),
+            Command::FinalizeBridgeDelivery {
+                session_id,
+                turn_id,
+            } => self.finalize_bridge_delivery_command(&session_id, &turn_id),
+            Command::SetBridgeLiveMessage {
+                session_id,
+                turn_id,
+                external_message_id,
+            } => self.set_bridge_live_message_command(
+                &session_id,
+                turn_id.as_ref(),
+                external_message_id.as_deref(),
+            ),
+            Command::ContinueSessionFromBridge {
+                session_id,
+                transport,
+                external_thread_id,
+                external_event_id,
+                source_message_id,
+                prompt,
+                consume_as_busy,
+            } => self.continue_session_from_bridge_command(
+                &session_id,
+                &transport,
+                &external_thread_id,
+                &external_event_id,
+                &source_message_id,
+                prompt,
+                consume_as_busy,
+            ),
             Command::SendPrompt { session_id, prompt } => {
                 let enqueue = self
                     .engine_for(&session_id)
@@ -596,16 +737,30 @@ impl ServerCore {
         options: &nakode_protocol::ModelOptions,
         tools: Option<nakode_protocol::SessionToolConfiguration>,
     ) -> DomainCommandOutcome {
-        self.create_session_command_with_mcp(workspace_id, model_id, options, tools, None, None)
+        self.create_session_command_with_mcp(
+            workspace_id,
+            None,
+            model_id,
+            options,
+            tools,
+            None,
+            None,
+            None,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    // Session creation mirrors the versioned public command. Keeping every typed option explicit
+    // prevents bridge/MCP/default policy from being hidden in a frontend-owned bag of values.
     fn create_session_command_with_mcp(
         &mut self,
         workspace_id: &WorkspaceId,
+        title: Option<&str>,
         model_id: Option<&nakode_protocol::ModelId>,
         options: &nakode_protocol::ModelOptions,
         tools: Option<nakode_protocol::SessionToolConfiguration>,
         initial_instructions: Option<&str>,
+        bridge: Option<SessionBridgeIntent>,
         mcp_grant: Option<&McpSessionGrant>,
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
@@ -644,8 +799,477 @@ impl ServerCore {
                 .state_mut()
                 .configure_mcp_archetype_grants(archetype_grants);
         }
+        if let Some(bridge) = bridge {
+            let display_title = validated_bridge_title(&bridge.display_title, title)?;
+            let record = SessionBridgeRecord {
+                session_id: session_id.to_string(),
+                workspace: engine.state().workspace.clone(),
+                kind: bridge.kind,
+                lifecycle: bridge.lifecycle,
+                display_title,
+                revision: 1,
+                transport: None,
+                external_parent_id: None,
+                external_thread_id: None,
+                last_delivered_turn_id: None,
+                delivery: None,
+                live_turn_id: None,
+                live_external_message_id: None,
+                active_source_message_id: None,
+                recent_inbound_event_ids: Vec::new(),
+                pending_inbound: None,
+                updated_at_ms: unix_timestamp_ms(),
+            };
+            effects.insert(0, Effect::PersistSessionBridge(record.clone()));
+            self.session_bridges.push(record);
+        }
         self.sessions_by_id.insert(session_id.clone(), engine);
         Ok(Self::accepted(Some(session_id.to_string()), effects))
+    }
+
+    fn set_session_bridge_lifecycle_command(
+        &mut self,
+        session_id: &SessionId,
+        lifecycle: BridgeLifecycle,
+    ) -> DomainCommandOutcome {
+        let changed = {
+            let bridge = self.session_bridge_mut(session_id)?;
+            if bridge.lifecycle == lifecycle {
+                false
+            } else {
+                bridge.lifecycle = lifecycle;
+                bump_bridge_revision(bridge);
+                true
+            }
+        };
+        let mut effects = if changed {
+            vec![Effect::PersistSessionBridge(
+                self.session_bridge(session_id)?.clone(),
+            )]
+        } else {
+            Vec::new()
+        };
+        if lifecycle == BridgeLifecycle::Open {
+            effects.extend(self.resume_pending_bridge_prompt(session_id)?);
+        }
+        Ok(Self::accepted(Some(session_id.to_string()), effects))
+    }
+
+    fn set_workspace_bridge_lifecycle_command(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        lifecycle: BridgeLifecycle,
+    ) -> DomainCommandOutcome {
+        self.ensure_workspace(workspace_id)?;
+        let workspace = self.engine().state().workspace.clone();
+        let mut effects = Vec::new();
+        let mut reopened = Vec::new();
+        for bridge in self
+            .session_bridges
+            .iter_mut()
+            .filter(|bridge| bridge.workspace == workspace)
+        {
+            if bridge.lifecycle != lifecycle {
+                bridge.lifecycle = lifecycle;
+                bump_bridge_revision(bridge);
+                effects.push(Effect::PersistSessionBridge(bridge.clone()));
+                if lifecycle == BridgeLifecycle::Open && bridge.pending_inbound.is_some() {
+                    reopened.push(SessionId::from(bridge.session_id.clone()));
+                }
+            }
+        }
+        for session_id in reopened {
+            effects.extend(self.resume_pending_bridge_prompt(&session_id)?);
+        }
+        Ok(Self::accepted(Some(workspace_id.to_string()), effects))
+    }
+
+    fn bind_session_bridge_thread_command(
+        &mut self,
+        session_id: &SessionId,
+        transport: &str,
+        external_parent_id: &str,
+        external_thread_id: &str,
+    ) -> DomainCommandOutcome {
+        validate_external_identity("transport", transport, 32)?;
+        validate_external_identity("external parent id", external_parent_id, 128)?;
+        validate_external_identity("external thread id", external_thread_id, 128)?;
+        if self.session_bridges.iter().any(|candidate| {
+            candidate.session_id != session_id.as_str()
+                && candidate.transport.as_deref() == Some(transport)
+                && candidate.external_thread_id.as_deref() == Some(external_thread_id)
+        }) {
+            return Err(DomainCommandError::Conflict(
+                "external thread is already paired with another session".to_owned(),
+            ));
+        }
+        let bridge = self.session_bridge_mut(session_id)?;
+        match (
+            bridge.transport.as_deref(),
+            bridge.external_parent_id.as_deref(),
+            bridge.external_thread_id.as_deref(),
+        ) {
+            (Some(current_transport), Some(current_parent), Some(current_thread))
+                if current_transport == transport
+                    && current_parent == external_parent_id
+                    && current_thread == external_thread_id =>
+            {
+                return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(DomainCommandError::Conflict(
+                    "session bridge is already paired with a different external thread".to_owned(),
+                ));
+            }
+        }
+        bridge.transport = Some(transport.to_owned());
+        bridge.external_parent_id = Some(external_parent_id.to_owned());
+        bridge.external_thread_id = Some(external_thread_id.to_owned());
+        bump_bridge_revision(bridge);
+        let effect = Effect::PersistSessionBridge(bridge.clone());
+        Ok(Self::accepted(Some(session_id.to_string()), vec![effect]))
+    }
+
+    fn clear_session_bridge_thread_command(
+        &mut self,
+        session_id: &SessionId,
+        transport: &str,
+        external_thread_id: &str,
+    ) -> DomainCommandOutcome {
+        let bridge = self.session_bridge_mut(session_id)?;
+        if bridge.transport.as_deref() != Some(transport)
+            || bridge.external_thread_id.as_deref() != Some(external_thread_id)
+        {
+            return Err(DomainCommandError::Conflict(
+                "external thread no longer matches this session bridge".to_owned(),
+            ));
+        }
+        bridge.transport = None;
+        bridge.external_parent_id = None;
+        bridge.external_thread_id = None;
+        bridge.live_turn_id = None;
+        bridge.live_external_message_id = None;
+        bridge.active_source_message_id = None;
+        if let Some(delivery) = &mut bridge.delivery {
+            delivery.completed_parts = 0;
+            delivery.last_external_message_id = None;
+        }
+        bump_bridge_revision(bridge);
+        let effect = Effect::PersistSessionBridge(bridge.clone());
+        Ok(Self::accepted(Some(session_id.to_string()), vec![effect]))
+    }
+
+    fn prepare_bridge_delivery_command(
+        &mut self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        body_sha256: &str,
+        part_count: u64,
+    ) -> DomainCommandOutcome {
+        validate_delivery_plan(body_sha256, part_count)?;
+        let bridge = self.session_bridge_mut(session_id)?;
+        if bridge.last_delivered_turn_id.as_deref() == Some(turn_id.as_str()) {
+            return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
+        }
+        let delivery = BridgeDeliveryRecord {
+            turn_id: turn_id.to_string(),
+            body_sha256: body_sha256.to_owned(),
+            part_count,
+            completed_parts: 0,
+            last_external_message_id: None,
+        };
+        if let Some(current) = &bridge.delivery {
+            if current.turn_id == delivery.turn_id
+                && current.body_sha256 == delivery.body_sha256
+                && current.part_count == delivery.part_count
+            {
+                return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
+            }
+            return Err(DomainCommandError::Conflict(
+                "another final delivery is already pending for this session".to_owned(),
+            ));
+        }
+        bridge.delivery = Some(delivery);
+        bump_bridge_revision(bridge);
+        let effect = Effect::PersistSessionBridge(bridge.clone());
+        Ok(Self::accepted(Some(session_id.to_string()), vec![effect]))
+    }
+
+    fn complete_bridge_delivery_part_command(
+        &mut self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        part_index: u64,
+        external_message_id: &str,
+    ) -> DomainCommandOutcome {
+        validate_external_identity("external message id", external_message_id, 128)?;
+        let bridge = self.session_bridge_mut(session_id)?;
+        let delivery = bridge.delivery.as_mut().ok_or_else(|| {
+            DomainCommandError::Conflict("no final delivery is pending".to_owned())
+        })?;
+        if delivery.turn_id != turn_id.as_str() {
+            return Err(DomainCommandError::Conflict(
+                "pending final delivery belongs to another turn".to_owned(),
+            ));
+        }
+        if part_index >= delivery.part_count {
+            return Err(DomainCommandError::Invalid(
+                "delivery part index exceeds the prepared part count".to_owned(),
+            ));
+        }
+        if part_index < delivery.completed_parts {
+            // The constant-size checkpoint can authenticate the most recently completed part. This
+            // catches a lost-response retry that somehow resolved the deterministic nonce to a
+            // different Discord message instead of silently accepting a duplicate external send.
+            if part_index.saturating_add(1) == delivery.completed_parts
+                && delivery.last_external_message_id.as_deref() != Some(external_message_id)
+            {
+                return Err(DomainCommandError::Conflict(
+                    "completed delivery part has a different external message identity".to_owned(),
+                ));
+            }
+            return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
+        }
+        if part_index != delivery.completed_parts {
+            return Err(DomainCommandError::Conflict(
+                "delivery parts must be checkpointed in order".to_owned(),
+            ));
+        }
+        delivery.completed_parts = delivery.completed_parts.saturating_add(1);
+        delivery.last_external_message_id = Some(external_message_id.to_owned());
+        bump_bridge_revision(bridge);
+        let effect = Effect::PersistSessionBridge(bridge.clone());
+        Ok(Self::accepted(Some(session_id.to_string()), vec![effect]))
+    }
+
+    fn finalize_bridge_delivery_command(
+        &mut self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> DomainCommandOutcome {
+        let bridge = self.session_bridge_mut(session_id)?;
+        if bridge.last_delivered_turn_id.as_deref() == Some(turn_id.as_str()) {
+            return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
+        }
+        let delivery = bridge.delivery.as_ref().ok_or_else(|| {
+            DomainCommandError::Conflict("no final delivery is pending".to_owned())
+        })?;
+        if delivery.turn_id != turn_id.as_str() {
+            return Err(DomainCommandError::Conflict(
+                "pending final delivery belongs to another turn".to_owned(),
+            ));
+        }
+        if delivery.completed_parts != delivery.part_count {
+            return Err(DomainCommandError::Conflict(
+                "final delivery still has unsent parts".to_owned(),
+            ));
+        }
+        bridge.last_delivered_turn_id = Some(turn_id.to_string());
+        bridge.delivery = None;
+        bridge.live_turn_id = None;
+        bridge.live_external_message_id = None;
+        bridge.active_source_message_id = None;
+        bump_bridge_revision(bridge);
+        let effect = Effect::PersistSessionBridge(bridge.clone());
+        Ok(Self::accepted(Some(session_id.to_string()), vec![effect]))
+    }
+
+    fn set_bridge_live_message_command(
+        &mut self,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        external_message_id: Option<&str>,
+    ) -> DomainCommandOutcome {
+        if turn_id.is_some() != external_message_id.is_some() {
+            return Err(DomainCommandError::Invalid(
+                "live turn and external message identities must be set or cleared together"
+                    .to_owned(),
+            ));
+        }
+        if let Some(message_id) = external_message_id {
+            validate_external_identity("external message id", message_id, 128)?;
+        }
+        let bridge = self.session_bridge_mut(session_id)?;
+        let next_turn = turn_id.map(ToString::to_string);
+        let next_message = external_message_id.map(ToOwned::to_owned);
+        if bridge.live_turn_id == next_turn && bridge.live_external_message_id == next_message {
+            return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
+        }
+        bridge.live_turn_id = next_turn;
+        bridge.live_external_message_id = next_message;
+        bump_bridge_revision(bridge);
+        let effect = Effect::PersistSessionBridge(bridge.clone());
+        Ok(Self::accepted(Some(session_id.to_string()), vec![effect]))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    // These fields are the complete authenticated external-event identity plus the typed prompt;
+    // preserving them as distinct arguments makes accidental route or dedup-key swaps visible.
+    fn continue_session_from_bridge_command(
+        &mut self,
+        session_id: &SessionId,
+        transport: &str,
+        external_thread_id: &str,
+        external_event_id: &str,
+        source_message_id: &str,
+        prompt: PromptInput,
+        consume_as_busy: bool,
+    ) -> DomainCommandOutcome {
+        validate_external_identity("transport", transport, 32)?;
+        validate_external_identity("external thread id", external_thread_id, 128)?;
+        validate_external_identity("external event id", external_event_id, 128)?;
+        validate_external_identity("source message id", source_message_id, 128)?;
+        let bridge = self.session_bridge(session_id)?;
+        if bridge.lifecycle != BridgeLifecycle::Open
+            || bridge.transport.as_deref() != Some(transport)
+            || bridge.external_thread_id.as_deref() != Some(external_thread_id)
+        {
+            return Err(DomainCommandError::Conflict(
+                "message does not belong to an open bound session bridge".to_owned(),
+            ));
+        }
+        if bridge
+            .recent_inbound_event_ids
+            .iter()
+            .any(|event_id| event_id == external_event_id)
+        {
+            return Ok(Self::accepted_bridge_continuation(
+                session_id,
+                BridgeContinuationDisposition::Duplicate,
+                Vec::new(),
+            ));
+        }
+        if consume_as_busy {
+            let bridge = self.session_bridge_mut(session_id)?;
+            remember_inbound_event(bridge, external_event_id);
+            bump_bridge_revision(bridge);
+            let effect = Effect::PersistSessionBridge(bridge.clone());
+            return Ok(Self::accepted_bridge_continuation(
+                session_id,
+                BridgeContinuationDisposition::Busy,
+                vec![effect],
+            ));
+        }
+
+        self.reload_agent_catalogue_for_session(session_id)?;
+        let (text, attachments) = self.convert_prompt(session_id, prompt)?;
+        let client_prompt_id = bridge_prompt_id(external_event_id);
+        let pending = BridgePendingInboundRecord {
+            external_event_id: external_event_id.to_owned(),
+            source_message_id: source_message_id.to_owned(),
+            client_prompt_id: client_prompt_id.clone(),
+            text: text.clone(),
+            attachments: attachments.clone(),
+        };
+        match self
+            .session_engine_mut(session_id)?
+            .state_mut()
+            .submit_prompt_with_id(client_prompt_id, text, attachments)
+        {
+            Ok(mut effects) => {
+                let bridge = self.session_bridge_mut(session_id)?;
+                remember_inbound_event(bridge, external_event_id);
+                bridge.active_source_message_id = Some(source_message_id.to_owned());
+                bridge.pending_inbound = Some(pending);
+                bump_bridge_revision(bridge);
+                effects.insert(0, Effect::PersistSessionBridge(bridge.clone()));
+                Ok(Self::accepted_bridge_continuation(
+                    session_id,
+                    BridgeContinuationDisposition::Accepted,
+                    effects,
+                ))
+            }
+            Err(DomainCommandError::Conflict(_)) => {
+                // A busy/not-ready message is consumed durably rather than queued. Replayed gateway
+                // events can therefore never turn into a later prompt after the active turn ends.
+                let bridge = self.session_bridge_mut(session_id)?;
+                remember_inbound_event(bridge, external_event_id);
+                bump_bridge_revision(bridge);
+                let effect = Effect::PersistSessionBridge(bridge.clone());
+                Ok(Self::accepted_bridge_continuation(
+                    session_id,
+                    BridgeContinuationDisposition::Busy,
+                    vec![effect],
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Replays one durable accepted bridge prompt after restart using its original provider client
+    /// id. Busy/not-ready states leave the inbox item in place for a later backend event.
+    pub(crate) fn resume_pending_bridge_prompt(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        let bridge = self.session_bridge(session_id)?;
+        if bridge.lifecycle != BridgeLifecycle::Open {
+            return Ok(Vec::new());
+        }
+        let Some(pending) = bridge.pending_inbound.clone() else {
+            return Ok(Vec::new());
+        };
+        self.reload_agent_catalogue_for_session(session_id)?;
+        match self
+            .session_engine_mut(session_id)?
+            .state_mut()
+            .submit_prompt_with_id(pending.client_prompt_id, pending.text, pending.attachments)
+        {
+            Ok(effects) => Ok(effects),
+            Err(DomainCommandError::Conflict(_)) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Resolves a provider acceptance to the durable client prompt id. Some provider protocols
+    /// return a new provider turn id even though Nakode supplied a stable client-message id.
+    #[must_use]
+    pub(crate) fn bridge_prompt_acknowledgement_id(
+        &self,
+        session_id: &SessionId,
+        provider_turn_id: &str,
+        accepted: bool,
+    ) -> Option<String> {
+        let pending = self
+            .session_bridge(session_id)
+            .ok()?
+            .pending_inbound
+            .as_ref()?;
+        if pending.client_prompt_id == provider_turn_id
+            || (accepted
+                && self
+                    .sessions_by_id
+                    .get(session_id)
+                    .and_then(|engine| engine.state().starting_prompt_id())
+                    == Some(pending.client_prompt_id.as_str()))
+        {
+            Some(pending.client_prompt_id.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Clears the durable inbox only after a backend acknowledges the stable prompt client id.
+    pub(crate) fn acknowledge_bridge_prompt(
+        &mut self,
+        session_id: &SessionId,
+        client_prompt_id: &str,
+    ) -> Option<Effect> {
+        let bridge = self
+            .session_bridges
+            .iter_mut()
+            .find(|bridge| bridge.session_id == session_id.as_str())?;
+        if bridge
+            .pending_inbound
+            .as_ref()
+            .is_none_or(|pending| pending.client_prompt_id != client_prompt_id)
+        {
+            return None;
+        }
+        bridge.pending_inbound = None;
+        bump_bridge_revision(bridge);
+        Some(Effect::PersistSessionBridge(bridge.clone()))
     }
 
     #[cfg(test)]
@@ -902,6 +1526,16 @@ impl ServerCore {
                 self.replace_default_session()?;
             }
             self.release_session(session_id);
+        }
+        if let Some(bridge) = self
+            .session_bridges
+            .iter_mut()
+            .find(|bridge| bridge.session_id == session_id.as_str())
+            && bridge.lifecycle != BridgeLifecycle::Archived
+        {
+            bridge.lifecycle = BridgeLifecycle::Archived;
+            bump_bridge_revision(bridge);
+            effects.push(Effect::PersistSessionBridge(bridge.clone()));
         }
         effects.push(Effect::DeleteSession(session_id.to_string()));
         Ok(Self::accepted(Some(session_id.to_string()), effects))
@@ -1436,6 +2070,22 @@ impl ServerCore {
             CommandAccepted {
                 resource_id,
                 revision: None,
+                bridge_continuation: None,
+            },
+            effects,
+        )
+    }
+
+    fn accepted_bridge_continuation(
+        session_id: &SessionId,
+        disposition: BridgeContinuationDisposition,
+        effects: Vec<Effect>,
+    ) -> (CommandAccepted, Vec<Effect>) {
+        (
+            CommandAccepted {
+                resource_id: Some(session_id.to_string()),
+                revision: None,
+                bridge_continuation: Some(disposition),
             },
             effects,
         )
@@ -2177,6 +2827,11 @@ impl ServerCore {
                 bootstrap.sessions.push(summary);
             }
         }
+        bootstrap.session_bridges = self
+            .session_bridges
+            .iter()
+            .map(session_bridge_view)
+            .collect();
         bootstrap.active_session = None;
         bootstrap
     }
@@ -2245,6 +2900,26 @@ impl ServerCore {
         } else {
             Err(DomainCommandError::NotFound(session_id.to_string()))
         }
+    }
+
+    fn session_bridge(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<&SessionBridgeRecord, DomainCommandError> {
+        self.session_bridges
+            .iter()
+            .find(|bridge| bridge.session_id == session_id.as_str())
+            .ok_or_else(|| DomainCommandError::NotFound(session_id.to_string()))
+    }
+
+    fn session_bridge_mut(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<&mut SessionBridgeRecord, DomainCommandError> {
+        self.session_bridges
+            .iter_mut()
+            .find(|bridge| bridge.session_id == session_id.as_str())
+            .ok_or_else(|| DomainCommandError::NotFound(session_id.to_string()))
     }
 
     fn session_engine_mut(
@@ -2344,6 +3019,14 @@ impl ServerCore {
     fn command_session(&self, command: &Command) -> Option<SessionId> {
         match command {
             Command::SendPrompt { session_id, .. }
+            | Command::ContinueSessionFromBridge { session_id, .. }
+            | Command::SetSessionBridgeLifecycle { session_id, .. }
+            | Command::BindSessionBridgeThread { session_id, .. }
+            | Command::ClearSessionBridgeThread { session_id, .. }
+            | Command::PrepareBridgeDelivery { session_id, .. }
+            | Command::CompleteBridgeDeliveryPart { session_id, .. }
+            | Command::FinalizeBridgeDelivery { session_id, .. }
+            | Command::SetBridgeLiveMessage { session_id, .. }
             | Command::EnqueuePrompt { session_id, .. }
             | Command::RemoveQueuedPrompt { session_id, .. }
             | Command::SteerQueuedPrompt { session_id, .. }
@@ -2378,6 +3061,7 @@ impl ServerCore {
             }
             Command::CancelRun { run_id } => self.session_for_run(run_id).ok(),
             Command::CreateSession { .. }
+            | Command::SetWorkspaceBridgeLifecycle { .. }
             | Command::SelectModel { .. }
             | Command::SetProviderEnabled { .. }
             | Command::BeginProviderAuthentication { .. }
@@ -2464,6 +3148,130 @@ impl ServerCore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((prompt.text, attachments))
+    }
+}
+
+fn validated_bridge_title(
+    requested: &str,
+    fallback: Option<&str>,
+) -> Result<String, DomainCommandError> {
+    let candidate = if requested.trim().is_empty() {
+        fallback.unwrap_or("Nakode session")
+    } else {
+        requested
+    };
+    let title = candidate.lines().next().unwrap_or_default().trim();
+    if title.chars().any(char::is_control) {
+        return Err(DomainCommandError::Invalid(
+            "bridge display title contains control characters".to_owned(),
+        ));
+    }
+    let title = if title.is_empty() {
+        "Nakode session".to_owned()
+    } else {
+        title.chars().take(100).collect()
+    };
+    Ok(title)
+}
+
+fn validate_external_identity(
+    field: &str,
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<(), DomainCommandError> {
+    if value.is_empty()
+        || value.len() > maximum_bytes
+        || value.chars().any(char::is_control)
+        || value.trim() != value
+    {
+        return Err(DomainCommandError::Invalid(format!(
+            "{field} must be a non-empty normalized value of at most {maximum_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_delivery_plan(body_sha256: &str, part_count: u64) -> Result<(), DomainCommandError> {
+    if body_sha256.len() != 64
+        || !body_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(DomainCommandError::Invalid(
+            "bridge delivery body_sha256 must be 64 lowercase hexadecimal characters".to_owned(),
+        ));
+    }
+    if part_count == 0 {
+        return Err(DomainCommandError::Invalid(
+            "bridge delivery must contain at least one part".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn bridge_prompt_id(external_event_id: &str) -> String {
+    let digest = Sha256::digest(external_event_id.as_bytes());
+    let mut id = String::from("bridge-");
+    for byte in &digest[..16] {
+        write!(&mut id, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    id
+}
+
+fn remember_inbound_event(bridge: &mut SessionBridgeRecord, external_event_id: &str) {
+    if bridge
+        .recent_inbound_event_ids
+        .iter()
+        .any(|existing| existing == external_event_id)
+    {
+        return;
+    }
+    if bridge.recent_inbound_event_ids.len() == RECENT_INBOUND_CACHE_CAPACITY {
+        bridge.recent_inbound_event_ids.remove(0);
+    }
+    bridge
+        .recent_inbound_event_ids
+        .push(external_event_id.to_owned());
+}
+
+fn bump_bridge_revision(bridge: &mut SessionBridgeRecord) {
+    bridge.revision = bridge.revision.saturating_add(1);
+    bridge.updated_at_ms = unix_timestamp_ms();
+}
+
+fn unix_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default()
+}
+
+fn session_bridge_view(bridge: &SessionBridgeRecord) -> nakode_protocol::SessionBridgeView {
+    nakode_protocol::SessionBridgeView {
+        session_id: SessionId::from(bridge.session_id.clone()),
+        workspace_id: crate::state::projection::workspace_id(&bridge.workspace),
+        kind: bridge.kind,
+        lifecycle: bridge.lifecycle,
+        display_title: bridge.display_title.clone(),
+        revision: bridge.revision,
+        transport: bridge.transport.clone(),
+        external_parent_id: bridge.external_parent_id.clone(),
+        external_thread_id: bridge.external_thread_id.clone(),
+        last_delivered_turn_id: bridge.last_delivered_turn_id.clone().map(TurnId::from),
+        delivery: bridge
+            .delivery
+            .as_ref()
+            .map(|delivery| nakode_protocol::BridgeDeliveryView {
+                turn_id: TurnId::from(delivery.turn_id.clone()),
+                body_sha256: delivery.body_sha256.clone(),
+                part_count: delivery.part_count,
+                completed_parts: delivery.completed_parts,
+                last_external_message_id: delivery.last_external_message_id.clone(),
+            }),
+        live_turn_id: bridge.live_turn_id.clone().map(TurnId::from),
+        live_external_message_id: bridge.live_external_message_id.clone(),
+        active_source_message_id: bridge.active_source_message_id.clone(),
     }
 }
 
@@ -2785,7 +3593,13 @@ impl DispatchOutcome {
         }
     }
 
-    fn respond(self) {
+    pub(crate) fn respond_with_error(mut self, error: ServiceError) {
+        if let Some(response) = self.command_response.take() {
+            let _ = response.respond.send(Err(error));
+        }
+    }
+
+    pub(crate) fn respond(self) {
         if let Some(response) = self.command_response {
             let _ = response.respond.send(response.result);
         }
@@ -2958,17 +3772,19 @@ mod tests {
     use std::collections::BTreeSet;
 
     use nakode_protocol::{
-        AgentDefinitionInput, ClientId, Command, ErrorCode, ExternalToolDefinition, IdempotencyKey,
-        MAX_API_MESSAGE_BYTES, MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES,
-        ModelId, ModelOptions, ModelTarget, PromptAttachment as ProtocolPromptAttachment,
-        PromptInput, ProviderAuthenticationView, ProviderId, Query, QueryResult, RunId,
-        RunTextField, ServiceCapabilities, ServiceCapability, SessionId, SessionToolConfiguration,
-        SubscriptionScope, SubscriptionView, TranscriptOwner, ViewEvent, WorkspaceId,
+        AgentDefinitionInput, BridgeContinuationDisposition, BridgeLifecycle, ClientId, Command,
+        ErrorCode, ExternalToolDefinition, IdempotencyKey, MAX_API_MESSAGE_BYTES,
+        MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES, ModelId, ModelOptions,
+        ModelTarget, OrchestratorKind, PromptAttachment as ProtocolPromptAttachment, PromptInput,
+        ProviderAuthenticationView, ProviderId, Query, QueryResult, RunId, RunTextField,
+        ServiceCapabilities, ServiceCapability, SessionBridgeIntent, SessionId,
+        SessionToolConfiguration, SubscriptionScope, SubscriptionView, TranscriptOwner, TurnId,
+        ViewEvent, WorkspaceId,
     };
     use nakode_server::{PublishedEvent, ServerEndpoint, ServerRequest};
     use tokio::sync::broadcast;
 
-    use super::{IDEMPOTENCY_CAPACITY, ServerCore};
+    use super::{IDEMPOTENCY_CAPACITY, ServerCore, unix_timestamp_ms};
     use crate::{
         agent::{AgentCatalog, AgentDefinition},
         backend::{
@@ -2979,7 +3795,10 @@ mod tests {
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         personality::PromptAddenda,
         service::ServiceEngine,
-        session::{ProviderRecord, SessionRecord, SubagentObservability, SubagentRecord},
+        session::{
+            ProviderRecord, SessionBridgeRecord, SessionRecord, SubagentObservability,
+            SubagentRecord,
+        },
         soul::{SoulSource, SoulStore},
         state::{AppState, DomainCommandError},
     };
@@ -3062,6 +3881,422 @@ mod tests {
         workspace_id: &WorkspaceId,
     ) -> super::DomainCommandOutcome {
         core.create_session_command(workspace_id, None, &ModelOptions::default(), None)
+    }
+
+    #[test]
+    fn bridge_intent_is_created_atomically_and_projected_with_the_session() {
+        let (mut core, _) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let (accepted, effects) = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                Some("Dashboard title"),
+                None,
+                &ModelOptions::default(),
+                None,
+                None,
+                Some(SessionBridgeIntent {
+                    kind: OrchestratorKind::Chat,
+                    lifecycle: BridgeLifecycle::Open,
+                    display_title: String::new(),
+                }),
+                None,
+            )
+            .expect("bridged session");
+        let session_id = SessionId::from(accepted.resource_id.expect("session id"));
+        assert!(matches!(
+            effects.first(),
+            Some(crate::state::Effect::PersistSessionBridge(bridge))
+                if bridge.session_id == session_id.as_str()
+                    && bridge.display_title == "Dashboard title"
+        ));
+        let projected = core.workspace_bootstrap();
+        let bridge = projected
+            .session_bridges
+            .iter()
+            .find(|bridge| bridge.session_id == session_id)
+            .expect("bridge projection");
+        assert_eq!(bridge.kind, OrchestratorKind::Chat);
+        assert_eq!(bridge.lifecycle, BridgeLifecycle::Open);
+        assert!(bridge.external_thread_id.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bridge_binding_lifecycle_and_final_delivery_are_idempotent() {
+        let (mut core, _) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let (accepted, _) = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                Some("Agent review"),
+                None,
+                &ModelOptions::default(),
+                None,
+                None,
+                Some(SessionBridgeIntent {
+                    kind: OrchestratorKind::Agent,
+                    lifecycle: BridgeLifecycle::Open,
+                    display_title: "Agent review".to_owned(),
+                }),
+                None,
+            )
+            .expect("bridged session");
+        let session_id = SessionId::from(accepted.resource_id.expect("session id"));
+        let (_, bound) = core
+            .bind_session_bridge_thread_command(&session_id, "discord", "100", "101")
+            .expect("bind");
+        assert_eq!(bound.len(), 1);
+        let (_, duplicate) = core
+            .bind_session_bridge_thread_command(&session_id, "discord", "100", "101")
+            .expect("same binding is idempotent");
+        assert!(duplicate.is_empty());
+        assert!(
+            core.bind_session_bridge_thread_command(&session_id, "discord", "100", "102")
+                .is_err()
+        );
+
+        let turn_id = TurnId::from("turn-1");
+        let body_sha256 = "a".repeat(64);
+        core.prepare_bridge_delivery_command(&session_id, &turn_id, &body_sha256, 2)
+            .expect("prepare");
+        let (_, duplicate_prepare) = core
+            .prepare_bridge_delivery_command(&session_id, &turn_id, &body_sha256, 2)
+            .expect("lost prepare response is idempotent");
+        assert!(duplicate_prepare.is_empty());
+        let prepared = core
+            .session_bridge(&session_id)
+            .expect("bridge")
+            .delivery
+            .as_ref()
+            .expect("prepared delivery");
+        assert_eq!(prepared.completed_parts, 0);
+        assert!(prepared.last_external_message_id.is_none());
+        core.complete_bridge_delivery_part_command(&session_id, &turn_id, 0, "200")
+            .expect("first part");
+        let (_, duplicate_first_part) = core
+            .complete_bridge_delivery_part_command(&session_id, &turn_id, 0, "200")
+            .expect("lost-response retry is idempotent");
+        assert!(duplicate_first_part.is_empty());
+        assert!(
+            core.complete_bridge_delivery_part_command(&session_id, &turn_id, 0, "different")
+                .is_err(),
+            "the last completed part cannot be acknowledged with a different message"
+        );
+        let delivery = core
+            .session_bridge(&session_id)
+            .expect("bridge")
+            .delivery
+            .as_ref()
+            .expect("pending delivery");
+        assert_eq!(delivery.completed_parts, 1);
+        assert_eq!(delivery.last_external_message_id.as_deref(), Some("200"));
+        assert_eq!(delivery.part_count, 2);
+        assert!(
+            core.complete_bridge_delivery_part_command(&session_id, &turn_id, 2, "202")
+                .is_err()
+        );
+        assert!(
+            core.finalize_bridge_delivery_command(&session_id, &turn_id)
+                .is_err()
+        );
+
+        core.clear_session_bridge_thread_command(&session_id, "discord", "101")
+            .expect("clear missing thread binding");
+        let reset = core
+            .session_bridge(&session_id)
+            .expect("bridge")
+            .delivery
+            .as_ref()
+            .expect("delivery remains prepared for replacement thread");
+        assert_eq!(reset.completed_parts, 0);
+        assert!(reset.last_external_message_id.is_none());
+        core.bind_session_bridge_thread_command(&session_id, "discord", "100", "102")
+            .expect("bind replacement thread");
+        core.complete_bridge_delivery_part_command(&session_id, &turn_id, 0, "300")
+            .expect("first part is resent to replacement thread");
+        core.complete_bridge_delivery_part_command(&session_id, &turn_id, 1, "301")
+            .expect("second part");
+        core.finalize_bridge_delivery_command(&session_id, &turn_id)
+            .expect("finalize");
+        let (_, duplicate_finalize) = core
+            .finalize_bridge_delivery_command(&session_id, &turn_id)
+            .expect("finalization is idempotent");
+        assert!(duplicate_finalize.is_empty());
+        let bridge = core.session_bridge(&session_id).expect("bridge");
+        assert_eq!(bridge.last_delivered_turn_id.as_deref(), Some("turn-1"));
+        assert!(bridge.delivery.is_none());
+
+        core.set_session_bridge_lifecycle_command(&session_id, BridgeLifecycle::Archived)
+            .expect("archive");
+        assert_eq!(
+            core.session_bridge(&session_id).expect("bridge").lifecycle,
+            BridgeLifecycle::Archived
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bridge_continuation_rejects_busy_work_without_queueing_and_deduplicates_events() {
+        let (mut core, _) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let (accepted, _) = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                Some("Chat"),
+                None,
+                &ModelOptions::default(),
+                None,
+                None,
+                Some(SessionBridgeIntent {
+                    kind: OrchestratorKind::Chat,
+                    lifecycle: BridgeLifecycle::Open,
+                    display_title: "Chat".to_owned(),
+                }),
+                None,
+            )
+            .expect("bridged session");
+        let session_id = SessionId::from(accepted.resource_id.expect("session id"));
+        core.bind_session_bridge_thread_command(&session_id, "discord", "100", "101")
+            .expect("bind");
+        let prompt = PromptInput {
+            text: "continue".to_owned(),
+            attachments: Vec::new(),
+        };
+        let (overload_result, overload_effects) = core
+            .continue_session_from_bridge_command(
+                &session_id,
+                "discord",
+                "101",
+                "event-overload",
+                "message-overload",
+                PromptInput {
+                    text: String::new(),
+                    attachments: Vec::new(),
+                },
+                true,
+            )
+            .expect("transport overload is durably consumed while ready");
+        assert_eq!(
+            overload_result.bridge_continuation,
+            Some(BridgeContinuationDisposition::Busy)
+        );
+        assert!(matches!(
+            overload_effects.as_slice(),
+            [crate::state::Effect::PersistSessionBridge(_)]
+        ));
+        assert!(
+            !core
+                .engine_for(&session_id)
+                .expect("session")
+                .state()
+                .is_busy()
+        );
+        let (continued, effects) = core
+            .continue_session_from_bridge_command(
+                &session_id,
+                "discord",
+                "101",
+                "event-1",
+                "message-1",
+                prompt.clone(),
+                false,
+            )
+            .expect("idle continuation");
+        assert_eq!(
+            continued.bridge_continuation,
+            Some(BridgeContinuationDisposition::Accepted)
+        );
+        assert!(matches!(
+            effects.first(),
+            Some(crate::state::Effect::PersistSessionBridge(_))
+        ));
+        let (duplicate_result, duplicate) = core
+            .continue_session_from_bridge_command(
+                &session_id,
+                "discord",
+                "101",
+                "event-1",
+                "message-1",
+                prompt.clone(),
+                false,
+            )
+            .expect("duplicate event");
+        assert_eq!(
+            duplicate_result.bridge_continuation,
+            Some(BridgeContinuationDisposition::Duplicate)
+        );
+        assert!(duplicate.is_empty());
+        let (busy_result, busy_effects) = core
+            .continue_session_from_bridge_command(
+                &session_id,
+                "discord",
+                "101",
+                "event-2",
+                "message-2",
+                prompt.clone(),
+                false,
+            )
+            .expect("busy event is durably consumed");
+        assert_eq!(
+            busy_result.bridge_continuation,
+            Some(BridgeContinuationDisposition::Busy)
+        );
+        assert!(matches!(
+            busy_effects.as_slice(),
+            [crate::state::Effect::PersistSessionBridge(_)]
+        ));
+        let session = core.session_view(&session_id).expect("session");
+        assert!(
+            session.queue.is_empty(),
+            "busy bridge input must never queue"
+        );
+        assert_eq!(
+            core.session_bridge(&session_id)
+                .expect("bridge")
+                .recent_inbound_event_ids,
+            ["event-overload", "event-1", "event-2"]
+        );
+        for index in 0..130 {
+            let event_id = format!("later-busy-{index}");
+            let (result, _) = core
+                .continue_session_from_bridge_command(
+                    &session_id,
+                    "discord",
+                    "101",
+                    &event_id,
+                    &format!("later-message-{index}"),
+                    prompt.clone(),
+                    false,
+                )
+                .expect("later busy event");
+            assert_eq!(
+                result.bridge_continuation,
+                Some(BridgeContinuationDisposition::Busy)
+            );
+        }
+        let (old_duplicate, effects) = core
+            .continue_session_from_bridge_command(
+                &session_id,
+                "discord",
+                "101",
+                "event-1",
+                "message-1",
+                prompt,
+                false,
+            )
+            .expect("old event remains consumed");
+        assert_eq!(
+            old_duplicate.bridge_continuation,
+            Some(BridgeContinuationDisposition::Duplicate)
+        );
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn accepted_bridge_continuation_replays_stable_prompt_until_backend_acknowledges_it() {
+        let (mut core, session_id) = ready_codex_server();
+        let workspace = core
+            .engine_for(&session_id)
+            .expect("session")
+            .state()
+            .workspace
+            .clone();
+        core.session_bridges.push(SessionBridgeRecord {
+            session_id: session_id.to_string(),
+            workspace,
+            kind: OrchestratorKind::Chat,
+            lifecycle: BridgeLifecycle::Open,
+            display_title: "Chat".to_owned(),
+            revision: 1,
+            transport: None,
+            external_parent_id: None,
+            external_thread_id: None,
+            last_delivered_turn_id: None,
+            delivery: None,
+            live_turn_id: None,
+            live_external_message_id: None,
+            active_source_message_id: None,
+            recent_inbound_event_ids: Vec::new(),
+            pending_inbound: None,
+            updated_at_ms: unix_timestamp_ms(),
+        });
+        core.bind_session_bridge_thread_command(&session_id, "discord", "100", "101")
+            .expect("bind");
+
+        let (_, initial_effects) = core
+            .continue_session_from_bridge_command(
+                &session_id,
+                "discord",
+                "101",
+                "event-durable",
+                "message-durable",
+                PromptInput {
+                    text: "survive a crash window".to_owned(),
+                    attachments: Vec::new(),
+                },
+                false,
+            )
+            .expect("accepted");
+        let initial_client_id = initial_effects
+            .iter()
+            .find_map(|effect| match effect {
+                crate::state::Effect::Backend(BackendCommand::StartTurn { client_id, .. }) => {
+                    Some(client_id.clone())
+                }
+                _ => None,
+            })
+            .expect("turn start effect");
+        assert_eq!(
+            core.session_bridge(&session_id)
+                .expect("bridge")
+                .pending_inbound
+                .as_ref()
+                .map(|pending| pending.client_prompt_id.as_str()),
+            Some(initial_client_id.as_str())
+        );
+        assert_eq!(
+            core.bridge_prompt_acknowledgement_id(&session_id, "provider-turn-42", true)
+                .as_deref(),
+            Some(initial_client_id.as_str()),
+            "provider acceptance correlates through the stable client prompt id"
+        );
+        assert_eq!(
+            core.bridge_prompt_acknowledgement_id(&session_id, "unrelated-turn", false),
+            None,
+            "an unrelated terminal event must not consume the durable inbox"
+        );
+
+        core.engine_for_mut(&session_id)
+            .expect("session")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::RequestFailed {
+                    operation: BackendOperation::StartTurn,
+                    code: -1,
+                    message: "process stopped before acknowledgement".to_owned(),
+                },
+            );
+        let replay = core
+            .resume_pending_bridge_prompt(&session_id)
+            .expect("durable replay");
+        assert!(replay.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::StartTurn { client_id, .. })
+                if client_id == &initial_client_id
+        )));
+
+        assert!(
+            core.acknowledge_bridge_prompt(&session_id, &initial_client_id)
+                .is_some()
+        );
+        assert!(
+            core.session_bridge(&session_id)
+                .expect("bridge")
+                .pending_inbound
+                .is_none()
+        );
     }
 
     fn shell_command(session_id: &SessionId, command: &str) -> Command {

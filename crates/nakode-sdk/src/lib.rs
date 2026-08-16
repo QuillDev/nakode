@@ -6,6 +6,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Write as _,
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -14,6 +15,7 @@ use std::{
 
 use futures_util::{Stream, StreamExt};
 use nakode_api::v1::{self as api, nakode_service_client::NakodeServiceClient};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
@@ -55,6 +57,9 @@ pub struct NakodeClient {
 macro_rules! typed_mutation {
     ($method:ident, $request:ty) => {
         /// Executes this typed product mutation with an SDK-owned idempotency key.
+        /// A caller-supplied key is preserved; callers repeating a completed SDK invocation must
+        /// supply the same key themselves. Automatic transport retries within one invocation reuse
+        /// the exact request.
         ///
         /// # Errors
         /// Returns a transport or server status error.
@@ -188,6 +193,40 @@ impl NakodeClient {
             .await
     }
 
+    /// Creates a logical session with an atomic external-thread bridge intent.
+    ///
+    /// Frontends use this when the session must never be published without its Chat/Agent
+    /// classification. External transport credentials and thread identities are deliberately not
+    /// accepted here.
+    ///
+    /// # Errors
+    /// Returns a transport, server validation, or missing-identifier error.
+    pub async fn create_session_with_bridge(
+        &self,
+        workspace_id: impl Into<String>,
+        title: Option<String>,
+        bridge: api::SessionBridgeIntent,
+    ) -> Result<String, SdkError> {
+        let result = send_mutation!(
+            self,
+            create_session,
+            api::CreateSessionRequest {
+                mutation: Some(mutation(None)),
+                workspace_id: workspace_id.into(),
+                title,
+                model_id: None,
+                options: None,
+                tools: None,
+                initial_instructions: None,
+                mcp_grant: None,
+                bridge: Some(bridge),
+            }
+        )?;
+        result
+            .resource_id
+            .ok_or(SdkError::MissingState("created session identifier"))
+    }
+
     /// Creates a logical session with an optional provider-qualified initial model and its options.
     /// The selection is validated and committed atomically with creation, before a first prompt can
     /// run. Omitting it inherits Nakode's configured provider/model defaults.
@@ -229,6 +268,7 @@ impl NakodeClient {
                 tools,
                 initial_instructions: None,
                 mcp_grant: None,
+                bridge: None,
             }
         )?;
         result
@@ -262,6 +302,7 @@ impl NakodeClient {
                 tools,
                 mcp_grant: None,
                 initial_instructions,
+                bridge: None,
             }
         )?;
         result
@@ -632,6 +673,49 @@ impl NakodeClient {
     }
 
     typed_mutation!(reload_workspace, api::ReloadWorkspaceRequest);
+    typed_mutation!(
+        set_session_bridge_lifecycle,
+        api::SetSessionBridgeLifecycleRequest
+    );
+    typed_mutation!(
+        set_workspace_bridge_lifecycle,
+        api::SetWorkspaceBridgeLifecycleRequest
+    );
+    typed_mutation!(
+        bind_session_bridge_thread,
+        api::BindSessionBridgeThreadRequest
+    );
+    typed_mutation!(
+        clear_session_bridge_thread,
+        api::ClearSessionBridgeThreadRequest
+    );
+    typed_mutation!(prepare_bridge_delivery, api::PrepareBridgeDeliveryRequest);
+    typed_mutation!(
+        complete_bridge_delivery_part,
+        api::CompleteBridgeDeliveryPartRequest
+    );
+    typed_mutation!(finalize_bridge_delivery, api::FinalizeBridgeDeliveryRequest);
+    typed_mutation!(set_bridge_live_message, api::SetBridgeLiveMessageRequest);
+    /// Atomically attempts an idle-only continuation from an authoritative external thread binding.
+    /// Busy and duplicate events are successful typed dispositions rather than queued work.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn continue_session_from_bridge(
+        &self,
+        mut request: api::ContinueSessionFromBridgeRequest,
+    ) -> Result<api::ContinueSessionFromBridgeResponse, SdkError> {
+        if request.mutation.is_none() {
+            request.mutation = Some(bridge_continuation_mutation(&request));
+        }
+        retry_transport(request, |request| {
+            let mut transport = self.transport.clone();
+            async move { transport.continue_session_from_bridge(request).await }
+        })
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(Into::into)
+    }
     typed_mutation!(save_soul, api::SaveSoulRequest);
     typed_mutation!(remove_queued_prompt, api::RemoveQueuedPromptRequest);
     typed_mutation!(cancel_turn, api::CancelTurnRequest);
@@ -1070,12 +1154,20 @@ impl NakodeClient {
             }
         }
         for entry in &mut transcript.entries {
-            self.hydrate_entry_body(owner_kind, owner_id, entry).await?;
+            self.hydrate_transcript_entry(owner_kind, owner_id, entry)
+                .await?;
         }
         Ok(transcript)
     }
 
-    async fn hydrate_entry_body(
+    /// Hydrates the complete body for one typed transcript entry without hydrating other history.
+    ///
+    /// This supports clients that page old history through bounded storage and process one entry at a
+    /// time rather than constructing an unbounded replacement transcript in memory.
+    ///
+    /// # Errors
+    /// Returns a transport error or an inconsistent-window projection error.
+    pub async fn hydrate_transcript_entry(
         &self,
         owner_kind: api::TranscriptOwnerKind,
         owner_id: &str,
@@ -1120,6 +1212,30 @@ fn configured_transport(channel: Channel) -> NakodeServiceClient<Channel> {
     NakodeServiceClient::new(channel)
         .max_decoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
         .max_encoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
+}
+
+fn bridge_continuation_mutation(
+    request: &api::ContinueSessionFromBridgeRequest,
+) -> api::MutationOptions {
+    let mut digest = Sha256::new();
+    for identity_part in [
+        request.session_id.as_bytes(),
+        request.transport.as_bytes(),
+        request.external_thread_id.as_bytes(),
+        request.external_event_id.as_bytes(),
+    ] {
+        digest.update(identity_part.len().to_be_bytes());
+        digest.update(identity_part);
+    }
+    let digest = digest.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    api::MutationOptions {
+        idempotency_key: format!("bridge-continuation-{encoded}"),
+        expected_revision: None,
+    }
 }
 
 fn mutation(expected_revision: Option<u64>) -> api::MutationOptions {
@@ -1232,11 +1348,57 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use super::retry_transport;
+    use super::{api, bridge_continuation_mutation, retry_transport};
+
+    fn bridge_request(
+        session_id: &str,
+        thread_id: &str,
+        event_id: &str,
+    ) -> api::ContinueSessionFromBridgeRequest {
+        api::ContinueSessionFromBridgeRequest {
+            mutation: None,
+            session_id: session_id.to_owned(),
+            transport: "discord".to_owned(),
+            external_thread_id: thread_id.to_owned(),
+            external_event_id: event_id.to_owned(),
+            source_message_id: event_id.to_owned(),
+            prompt: None,
+            consume_as_busy: false,
+        }
+    }
 
     #[derive(Clone)]
     struct Request {
         idempotency_key: String,
+    }
+
+    #[test]
+    fn bridge_continuation_key_is_stable_across_sdk_invocations() {
+        let request = bridge_request("session-a", "thread-a", "event-a");
+        let first = bridge_continuation_mutation(&request).idempotency_key;
+        let second = bridge_continuation_mutation(&request).idempotency_key;
+        assert_eq!(first, second);
+        assert_ne!(
+            first,
+            bridge_continuation_mutation(&bridge_request("session-a", "thread-a", "event-b"))
+                .idempotency_key
+        );
+        assert_ne!(
+            first,
+            bridge_continuation_mutation(&bridge_request("session-b", "thread-a", "event-a"))
+                .idempotency_key
+        );
+        let mut other_transport = request.clone();
+        other_transport.transport = "other-transport".to_owned();
+        assert_ne!(
+            first,
+            bridge_continuation_mutation(&other_transport).idempotency_key
+        );
+        assert_ne!(
+            first,
+            bridge_continuation_mutation(&bridge_request("session-a", "thread-b", "event-a"))
+                .idempotency_key
+        );
     }
 
     #[test]

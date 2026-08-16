@@ -370,6 +370,7 @@ mod tests {
             },
             sessions: Vec::new(),
             active_session: None,
+            session_bridges: Vec::new(),
         }
     }
 

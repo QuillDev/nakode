@@ -16,7 +16,7 @@ mod view;
 pub use command::{
     AgentDefinitionInput, Command, CredentialInput, ExternalToolDefinition, InteractionResolution,
     ModelOptions, ModelTarget, PromptAttachment, PromptInput, Query, QuestionResponse,
-    RunTextField, SessionToolConfiguration, SettingsPatch, TranscriptOwner,
+    RunTextField, SessionBridgeIntent, SessionToolConfiguration, SettingsPatch, TranscriptOwner,
 };
 pub use diagnostics::{
     DiagnosticsDailyUsage, DiagnosticsReport, DiagnosticsSessionUsage, DiagnosticsToolUsage,
@@ -33,17 +33,18 @@ pub use mcp::{
     McpSessionGrant, McpSessionSurface, McpTemplateView, McpToolView,
 };
 pub use service::{
-    CommandAccepted, Cursor, QueryResult, ServiceCapabilities, ServiceCapability, Snapshot,
-    SoulDocumentView, SubscriptionScope, SubscriptionView,
+    BridgeContinuationDisposition, CommandAccepted, Cursor, QueryResult, ServiceCapabilities,
+    ServiceCapability, Snapshot, SoulDocumentView, SubscriptionScope, SubscriptionView,
 };
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,
-    ConnectionView, ContextUsageView, ExternalToolCallView, InteractionKind, InteractionOptionView,
-    InteractionQuestionView, InteractionStatus, InteractionView, MemorySettingsView,
-    ModelConfigurationView, ModelView, NoticeLevel, NoticeView, OwnedProviderSessionView,
-    ProviderAuthenticationView, ProviderCapabilities, ProviderCapability, ProviderView,
-    QueueItemView, RecoverablePromptView, RunMetadataView, RunOutcome, RunPage, RunPolicyView,
-    RunStatus, RunTextWindow, RunToolDenialView, RunView, SessionActivity, SessionMetadataView,
+    BridgeDeliveryView, BridgeLifecycle, ConnectionView, ContextUsageView, ExternalToolCallView,
+    InteractionKind, InteractionOptionView, InteractionQuestionView, InteractionStatus,
+    InteractionView, MemorySettingsView, ModelConfigurationView, ModelView, NoticeLevel,
+    NoticeView, OrchestratorKind, OwnedProviderSessionView, ProviderAuthenticationView,
+    ProviderCapabilities, ProviderCapability, ProviderView, QueueItemView, RecoverablePromptView,
+    RunMetadataView, RunOutcome, RunPage, RunPolicyView, RunStatus, RunTextWindow,
+    RunToolDenialView, RunView, SessionActivity, SessionBridgeView, SessionMetadataView,
     SessionSummary, SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView,
     TodoPhaseView, TodoStatusView, TokenUsageView, TranscriptBodyWindow, TranscriptEntryKind,
     TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TranscriptWindowView, TurnStatus,

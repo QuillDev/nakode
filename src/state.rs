@@ -909,6 +909,8 @@ pub enum Effect {
     /// Removes a logical session and its persisted history. Routed with the persistence effects.
     DeleteSession(String),
     ReloadConfiguration,
+    /// Persists one complete provider-neutral external-thread bridge replacement.
+    PersistSessionBridge(crate::session::SessionBridgeRecord),
     #[cfg(test)]
     ResolveSession(String),
     PersistSession {
@@ -3130,6 +3132,22 @@ impl DomainState {
         text: String,
         attachments: Vec<PromptAttachment>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.submit_prompt_with_id(Self::next_id("msg"), text, attachments)
+    }
+
+    /// Submits a prompt using a caller-owned stable provider client id. This is reserved for
+    /// durable server inboxes that must replay the same operation identity after a crash.
+    pub(crate) fn submit_prompt_with_id(
+        &mut self,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        if prompt_id.is_empty() || prompt_id.len() > 128 {
+            return Err(DomainCommandError::Invalid(
+                "prompt operation id must contain 1 to 128 bytes".to_owned(),
+            ));
+        }
         self.validate_prompt(&text)?;
         if !self.connection.is_ready() {
             return Err(DomainCommandError::Conflict(
@@ -3155,12 +3173,24 @@ impl DomainState {
             )));
         }
         let prompt = QueuedPrompt {
-            id: Self::next_id("msg"),
+            id: prompt_id,
             text,
             attachments,
         };
         self.recoverable_prompt = None;
         Ok(self.begin_prompt(prompt))
+    }
+
+    /// Returns the caller-owned prompt identity currently awaiting provider acceptance.
+    ///
+    /// This is used by the durable transport inbox to correlate providers whose accepted turn id
+    /// differs from the client message id sent with `StartTurn`.
+    #[must_use]
+    pub(crate) fn starting_prompt_id(&self) -> Option<&str> {
+        self.starting_turn
+            .as_ref()
+            .or(self.pending_session_prompt.as_ref())
+            .map(|prompt| prompt.id.as_str())
     }
 
     /// Adds a complete semantic prompt to the server-owned queue.
