@@ -15,7 +15,8 @@ use std::{
 use tokio::sync::mpsc;
 
 use nakode_protocol::{
-    ErrorCode, Query, QueryResult, ServiceCapabilities, ServiceCapability, ServiceError, Snapshot,
+    Command, ErrorCode, Query, QueryResult, ServiceCapabilities, ServiceCapability, ServiceError,
+    Snapshot,
 };
 use nakode_server::{ServerEndpoint, ServerRequests};
 use thiserror::Error;
@@ -39,7 +40,7 @@ use crate::{
     state::{AgentBrowserStatus, DomainState, Effect, SubagentStatus},
 };
 
-use super::ServerCore;
+use super::{BridgeStateCheckpoint, ServerCore};
 
 #[derive(Debug, Error)]
 pub enum NativeRuntimeError {
@@ -150,6 +151,49 @@ struct McpDiscoveryCompletion {
     result: Result<crate::mcp::DiscoveryResult, crate::mcp::McpError>,
 }
 
+enum BridgeMutationRollback {
+    /// Session creation/deletion, inbound continuation, and lifecycle reopening can also change
+    /// logical session state by resuming a durable bridge inbox item.
+    Full(Box<ServerCore>),
+    /// Binding and delivery commands only change bridge metadata and idempotency state.
+    BridgeOnly(Box<BridgeStateCheckpoint>),
+}
+
+impl BridgeMutationRollback {
+    fn capture(request: &nakode_server::ServerRequest, core: &ServerCore) -> Option<Self> {
+        let nakode_server::ServerRequest::Command { command, .. } = request else {
+            return None;
+        };
+        match command {
+            Command::CreateSession {
+                bridge: Some(_), ..
+            }
+            | Command::ContinueSessionFromBridge { .. }
+            | Command::DeleteSession { .. }
+            | Command::SetSessionBridgeLifecycle { .. }
+            | Command::SetWorkspaceBridgeLifecycle { .. } => {
+                Some(Self::Full(Box::new(core.clone())))
+            }
+            Command::BindSessionBridgeThread { .. }
+            | Command::ClearSessionBridgeThread { .. }
+            | Command::PrepareBridgeDelivery { .. }
+            | Command::CompleteBridgeDeliveryPart { .. }
+            | Command::FinalizeBridgeDelivery { .. }
+            | Command::SetBridgeLiveMessage { .. } => {
+                Some(Self::BridgeOnly(Box::new(core.bridge_state_checkpoint())))
+            }
+            _ => None,
+        }
+    }
+
+    fn restore(self, core: &mut ServerCore) {
+        match self {
+            Self::Full(previous) => *core = *previous,
+            Self::BridgeOnly(checkpoint) => core.restore_bridge_state(*checkpoint),
+        }
+    }
+}
+
 pub(crate) struct NativeServerRuntime {
     core: ServerCore,
     endpoint: ServerEndpoint,
@@ -159,6 +203,7 @@ pub(crate) struct NativeServerRuntime {
     shutdown: mpsc::Receiver<()>,
     quiesce: mpsc::Receiver<QuiesceRequest>,
     accepting_work: bool,
+    pending_bridge_acknowledgements: HashMap<nakode_protocol::SessionId, String>,
     delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
     native_cancellation_tx: mpsc::Sender<u64>,
     native_cancellations: mpsc::Receiver<u64>,
@@ -280,6 +325,18 @@ impl NativeServerRuntime {
             quiesce: quiesce_tx,
         };
         let mut core = ServerCore::new(engine, providers, sessions);
+        let workspace_path = core.engine().state().workspace.clone();
+        match effects
+            .persistence
+            .sessions
+            .list_session_bridges(&workspace_path)
+        {
+            Ok(bridges) => core.install_session_bridges(bridges),
+            Err(error) => core
+                .engine_mut()
+                .state_mut()
+                .session_store_failed(format!("failed to restore orchestrator bridges: {error}")),
+        }
         let workspace =
             crate::state::projection::workspace_id(&core.engine().state().workspace).to_string();
         if let Ok(servers) = effects.persistence.sessions.list_mcp_servers(&workspace) {
@@ -310,6 +367,7 @@ impl NativeServerRuntime {
                 shutdown,
                 quiesce,
                 accepting_work: true,
+                pending_bridge_acknowledgements: HashMap::new(),
                 delegation_requests,
                 native_cancellation_tx,
                 native_cancellations,
@@ -574,6 +632,9 @@ impl NativeServerRuntime {
             .commit_and_publish_session(&self.endpoint, &pending.session_id);
     }
 
+    #[allow(clippy::too_many_lines)]
+    // The request dispatcher keeps fencing, typed routing, persistence rollback, and response
+    // completion in one exhaustive match so a newly added public request cannot bypass a guard.
     async fn handle_request(&mut self, request: nakode_server::ServerRequest) {
         let request = if self.accepting_work {
             request
@@ -640,13 +701,62 @@ impl NativeServerRuntime {
             }
             request => request,
         };
+        let mut inbound_event_to_claim = None;
+        if let Some((session_id, external_event_id)) = bridge_inbound_event_identity(&request) {
+            match self
+                .effects
+                .persistence
+                .sessions
+                .has_session_bridge_inbound_event(session_id.as_str(), &external_event_id)
+            {
+                Ok(true) => self
+                    .core
+                    .remember_durable_bridge_inbound_event(&session_id, &external_event_id),
+                Ok(false) => inbound_event_to_claim = Some((session_id, external_event_id)),
+                Err(_) => {
+                    if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                        let _ = respond.send(Err(ServiceError {
+                            code: ErrorCode::Internal,
+                            message: "the durable inbound replay ledger is unavailable; retry the operation"
+                                .to_owned(),
+                            retryable: true,
+                        }));
+                    }
+                    return;
+                }
+            }
+        }
+        let rollback = BridgeMutationRollback::capture(&request, &self.core);
         let mut outcome = self.core.handle(&self.endpoint, request);
-        let effects = std::mem::take(&mut outcome.effects);
+        let mut effects = std::mem::take(&mut outcome.effects);
         let had_effects = !effects.is_empty();
         let session_id = outcome
             .effect_session
             .clone()
             .unwrap_or_else(|| self.core.default_session_id().clone());
+        if let Err(_error) = persist_bridge_effects(
+            self.effects.persistence.sessions.as_ref(),
+            &mut effects,
+            inbound_event_to_claim.as_ref(),
+        ) {
+            // Discord and the provider must observe bridge work only after its durable authority
+            // checkpoint. Restore both logical-session and idempotency state so a same-process retry
+            // (including the same key) can execute rather than replaying an un-dispatched success.
+            match rollback {
+                Some(rollback) => rollback.restore(&mut self.core),
+                None => {
+                    // A new bridge-producing command must opt into rollback before retries are safe.
+                    self.accepting_work = false;
+                }
+            }
+            outcome.respond_with_error(ServiceError {
+                code: ErrorCode::Internal,
+                message: "the durable orchestrator bridge checkpoint failed; retry the operation"
+                    .to_owned(),
+                retryable: true,
+            });
+            return;
+        }
         self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);
         self.execute_effects(&session_id, effects, EffectOrigin::ClientCommand)
@@ -692,6 +802,9 @@ impl NativeServerRuntime {
             .commit_and_publish_session(&self.endpoint, &session_id);
     }
 
+    #[allow(clippy::too_many_lines)]
+    // Provider-event correlation, durable bridge acknowledgement, and downstream effect ordering
+    // intentionally share this dispatcher so persistence failure can stop every dependent effect.
     async fn handle_backend_event(&mut self, source: BackendSource, event: BackendEvent) {
         if let BackendEvent::ExternalToolRequested(request) = &event
             && request.name.starts_with(nakode_protocol::MCP_TOOL_PREFIX)
@@ -699,6 +812,26 @@ impl NativeServerRuntime {
             self.handle_mcp_tool_request(source, request.clone()).await;
             return;
         }
+        let event_session_id = match &source {
+            BackendSource::ProviderControl(_) => Some(self.core.default_session_id().clone()),
+            BackendSource::Primary { session_id, .. } => Some(session_id.clone()),
+            BackendSource::Subagent(_) => None,
+        };
+        let acknowledged_prompt_id = event_session_id.as_ref().and_then(|session_id| {
+            self.pending_bridge_acknowledgements
+                .get(session_id)
+                .cloned()
+                .or_else(|| match &event {
+                    BackendEvent::TurnAccepted { turn_id } => self
+                        .core
+                        .bridge_prompt_acknowledgement_id(session_id, turn_id, true),
+                    BackendEvent::TurnStarted { turn_id }
+                    | BackendEvent::TurnCompleted { turn_id, .. } => self
+                        .core
+                        .bridge_prompt_acknowledgement_id(session_id, turn_id, false),
+                    _ => None,
+                })
+        });
         let origin = match &source {
             BackendSource::ProviderControl(_) => EffectOrigin::ProviderControl,
             BackendSource::Primary { .. } => EffectOrigin::PrimarySession,
@@ -707,7 +840,7 @@ impl NativeServerRuntime {
         self.effects
             .backends
             .observe_provider_event(&source, &event);
-        let (session_id, effects) = match source {
+        let (session_id, mut effects) = match source {
             BackendSource::ProviderControl(provider) => {
                 let session_id = self.core.default_session_id().clone();
                 let effects = self
@@ -744,6 +877,40 @@ impl NativeServerRuntime {
                 (session_id, effects)
             }
         };
+        let bridge_checkpoint = acknowledged_prompt_id
+            .as_ref()
+            .map(|_| self.core.bridge_state_checkpoint());
+        if let Some(client_prompt_id) = acknowledged_prompt_id.as_deref()
+            && let Some(effect) = self
+                .core
+                .acknowledge_bridge_prompt(&session_id, client_prompt_id)
+        {
+            effects.insert(0, effect);
+        }
+        let bridge_checkpoint_deferred = if persist_bridge_effects(
+            self.effects.persistence.sessions.as_ref(),
+            &mut effects,
+            None,
+        )
+        .is_err()
+        {
+            if let Some(checkpoint) = bridge_checkpoint {
+                self.core.restore_bridge_state(checkpoint);
+            }
+            if let Some(client_prompt_id) = acknowledged_prompt_id {
+                self.pending_bridge_acknowledgements
+                    .insert(session_id.clone(), client_prompt_id);
+            }
+            // Keep the inbox item pending and retain its in-process acknowledgement correlation. A
+            // later provider event or restart retries the same stable client turn identity.
+            eprintln!("nakode bridge: inbound acknowledgement checkpoint deferred");
+            true
+        } else {
+            if acknowledged_prompt_id.is_some() {
+                self.pending_bridge_acknowledgements.remove(&session_id);
+            }
+            false
+        };
         let had_effects = !effects.is_empty();
         self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);
@@ -754,6 +921,25 @@ impl NativeServerRuntime {
         }
         if had_effects {
             self.refresh_catalogs();
+        }
+        if !bridge_checkpoint_deferred {
+            match self.core.resume_pending_bridge_prompt(&session_id) {
+                Ok(pending_effects) if !pending_effects.is_empty() => {
+                    self.register_effect_owners(&session_id, &pending_effects);
+                    if let Some(engine) = self.core.engine_for_mut(&session_id) {
+                        self.effects
+                            .execute(
+                                &session_id,
+                                engine.state_mut(),
+                                pending_effects,
+                                EffectOrigin::PrimarySession,
+                            )
+                            .await;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => eprintln!("nakode bridge: durable inbound replay deferred"),
+            }
         }
         self.core
             .commit_and_publish_session(&self.endpoint, &session_id);
@@ -1210,6 +1396,19 @@ impl NativeServerRuntime {
             .effects
             .persistence
             .sessions
+            .list_session_bridges(&workspace)
+        {
+            Ok(bridges) => self.core.replace_session_bridges(bridges),
+            Err(error) => self
+                .core
+                .engine_mut()
+                .state_mut()
+                .session_store_failed(error.to_string()),
+        }
+        match self
+            .effects
+            .persistence
+            .sessions
             .list_recent(&workspace, 100)
         {
             Ok(sessions) => self.core.replace_session_records(sessions),
@@ -1255,6 +1454,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::ArchetypeManagement,
             ServiceCapability::SoulManagement,
             ServiceCapability::McpManagement,
+            ServiceCapability::OrchestratorThreadBridge,
         ]
         .into_iter()
         .collect(),
@@ -1899,6 +2099,7 @@ impl EffectExecutor {
             #[cfg(test)]
             Effect::ResolveSession(id) => resolve_session(state, sessions, pending, &id),
             persistence_effect @ (Effect::PersistSession { .. }
+            | Effect::PersistSessionBridge(_)
             | Effect::PersistModels { .. }
             | Effect::SetDefaultModel { .. }
             | Effect::SaveModelOptions { .. }
@@ -2025,6 +2226,58 @@ fn save_agent_effect(
     save_agent_definition(state, definition, previous_slug);
 }
 
+fn bridge_inbound_event_identity(
+    request: &nakode_server::ServerRequest,
+) -> Option<(nakode_protocol::SessionId, String)> {
+    let nakode_server::ServerRequest::Command {
+        command:
+            Command::ContinueSessionFromBridge {
+                session_id,
+                external_event_id,
+                ..
+            },
+        ..
+    } = request
+    else {
+        return None;
+    };
+    Some((session_id.clone(), external_event_id.clone()))
+}
+
+fn persist_bridge_effects(
+    sessions: &dyn SessionRepository,
+    effects: &mut Vec<Effect>,
+    inbound_event_to_claim: Option<&(nakode_protocol::SessionId, String)>,
+) -> Result<(), SessionError> {
+    let mut bridges = Vec::new();
+    let mut remaining = Vec::with_capacity(effects.len());
+    for effect in effects.drain(..) {
+        match effect {
+            Effect::PersistSessionBridge(bridge) => bridges.push(bridge),
+            effect => remaining.push(effect),
+        }
+    }
+    let result = if bridges.is_empty() {
+        Ok(())
+    } else if let Some((session_id, external_event_id)) = inbound_event_to_claim {
+        sessions.save_session_bridges_with_inbound_event(
+            &bridges,
+            session_id.as_str(),
+            external_event_id,
+        )
+    } else {
+        sessions.save_session_bridges(&bridges)
+    };
+    if let Err(error) = result {
+        // The runtime fences this command before provider work or success acknowledgement. Retain
+        // non-bridge effects only for diagnostic ownership; they must not be executed by the caller.
+        *effects = remaining;
+        return Err(error);
+    }
+    *effects = remaining;
+    Ok(())
+}
+
 fn execute_persistence_effect(
     state: &mut DomainState,
     sessions: &dyn SessionRepository,
@@ -2089,6 +2342,11 @@ fn execute_persistence_effect(
             update_session_last_turn(state, sessions, &session_id, &turn);
         }
         Effect::TouchSession(id) => touch_session(state, sessions, &id),
+        Effect::PersistSessionBridge(bridge) => {
+            if let Err(error) = sessions.save_session_bridge(&bridge) {
+                state.session_store_failed(error.to_string());
+            }
+        }
         Effect::DeleteSession(id) => delete_session(state, sessions, &id),
         _ => unreachable!("only persistence effects are routed here"),
     }
@@ -2803,7 +3061,8 @@ mod tests {
     };
 
     use nakode_protocol::{
-        ClientId, Command, CredentialInput, ErrorCode, IdempotencyKey, McpGrantPolicy, Query,
+        BridgeContinuationDisposition, BridgeLifecycle, ClientId, Command, CredentialInput,
+        ErrorCode, IdempotencyKey, McpGrantPolicy, OrchestratorKind, PromptInput, Query,
         QueryResult, ServiceCapability, SessionId,
     };
     use tokio::sync::mpsc;
@@ -2814,12 +3073,16 @@ mod tests {
         native_service_capabilities, provider_enablement_changes, save_provider_credential,
     };
     use crate::{
-        backend::{BackendCommand, BackendEvent, BackendHandle, BackendIdentity, CODEX_PROVIDER},
+        backend::{
+            BackendCapabilities, BackendCommand, BackendEvent, BackendHandle, BackendIdentity,
+            CODEX_PROVIDER, ModelInfo,
+        },
         config::{Config, OpenAiReasoningEffort},
         credential::{CredentialStore, SqliteCredentialStore},
         service::ServiceEngine,
         session::{
-            SessionRepository, SqliteSessionRepository, SubagentObservability, SubagentRecord,
+            BridgePendingInboundRecord, SessionBridgeRecord, SessionRepository,
+            SqliteSessionRepository, SubagentObservability, SubagentRecord,
         },
         state::{DomainState, Effect, SubagentStatus},
     };
@@ -3306,6 +3569,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bridge_restore_failure_is_visible_in_authoritative_status() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let breaker =
+            rusqlite::Connection::open(&persistence.database).expect("breaker connection");
+        breaker
+            .execute(
+                "INSERT INTO session_bridges
+                 (session_id, workspace, kind, lifecycle, display_title, revision, updated_at_ms)
+                 VALUES ('invalid-bridge', ?1, 'invalid-kind', 'open', 'Invalid', 1, 1)",
+                [workspace.path().to_string_lossy().as_ref()],
+            )
+            .expect("invalid persisted bridge");
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+
+        let (runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+
+        assert!(
+            runtime
+                .core
+                .engine()
+                .state()
+                .status_message
+                .contains("failed to restore orchestrator bridges")
+        );
+        runtime.effects.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn abandoned_quiescence_does_not_leave_runtime_fenced() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (persistence, _credentials) = test_persistence(workspace.path());
@@ -3369,6 +3674,7 @@ mod tests {
                     options: nakode_protocol::ModelOptions::default(),
                     tools: None,
                     initial_instructions: None,
+                    bridge: None,
                     mcp_grant: None,
                 },
             )
@@ -3379,6 +3685,419 @@ mod tests {
 
         handle.shutdown().await;
         runtime.await.expect("runtime task");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn failed_bridge_checkpoint_rolls_back_same_process_for_same_and_new_keys() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let database = workspace.path().join("sessions.sqlite3");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let sessions = Arc::clone(&persistence.sessions);
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        sessions
+            .save_session_bridge(&SessionBridgeRecord {
+                session_id: session_id.to_string(),
+                workspace: state.workspace.clone(),
+                kind: OrchestratorKind::Chat,
+                lifecycle: BridgeLifecycle::Open,
+                display_title: "Rollback test".to_owned(),
+                revision: 1,
+                transport: None,
+                external_parent_id: None,
+                external_thread_id: None,
+                last_delivered_turn_id: None,
+                delivery: None,
+                live_turn_id: None,
+                live_external_message_id: None,
+                active_source_message_id: None,
+                recent_inbound_event_ids: Vec::new(),
+                pending_inbound: None,
+                updated_at_ms: 1,
+            })
+            .expect("initial bridge");
+        let breaker = rusqlite::Connection::open(&database).expect("breaker connection");
+        breaker
+            .execute_batch(
+                "CREATE TRIGGER fail_bridge_checkpoint \
+                 BEFORE UPDATE ON session_bridges \
+                 BEGIN SELECT RAISE(ABORT, 'forced bridge failure'); END;",
+            )
+            .expect("failure trigger");
+
+        let (runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+        let key = IdempotencyKey::from("bridge-checkpoint-retry");
+        let command = Command::SetSessionBridgeLifecycle {
+            session_id: session_id.clone(),
+            lifecycle: BridgeLifecycle::Archived,
+        };
+        let first = endpoint
+            .execute_command(
+                ClientId::from("bridge-checkpoint-test"),
+                key.clone(),
+                None,
+                false,
+                command.clone(),
+            )
+            .await
+            .expect_err("trigger rejects durable checkpoint");
+        assert_eq!(first.code, ErrorCode::Internal);
+        assert!(first.retryable);
+        let second = endpoint
+            .execute_command(
+                ClientId::from("bridge-checkpoint-test"),
+                IdempotencyKey::from("bridge-checkpoint-new-key"),
+                None,
+                false,
+                command.clone(),
+            )
+            .await
+            .expect_err("a new-key retry reaches the checkpoint instead of a process fence");
+        assert_eq!(second.code, ErrorCode::Internal);
+        assert!(second.retryable);
+        assert_eq!(
+            sessions
+                .list_session_bridges(&workspace.path().to_string_lossy())
+                .expect("stored bridge")[0]
+                .lifecycle,
+            BridgeLifecycle::Open
+        );
+
+        breaker
+            .execute_batch("DROP TRIGGER fail_bridge_checkpoint;")
+            .expect("drop failure trigger");
+        endpoint
+            .execute_command(
+                ClientId::from("bridge-checkpoint-test"),
+                key,
+                None,
+                false,
+                command,
+            )
+            .await
+            .expect("same-key retry executes after rollback");
+        assert_eq!(
+            sessions
+                .list_session_bridges(&workspace.path().to_string_lossy())
+                .expect("stored bridge")[0]
+                .lifecycle,
+            BridgeLifecycle::Archived
+        );
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn failed_bridge_acknowledgement_checkpoint_is_retried_on_a_later_provider_event() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let database = workspace.path().join("sessions.sqlite3");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let sessions = Arc::clone(&persistence.sessions);
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        state.handle_backend(BackendEvent::Ready(BackendIdentity {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            version: None,
+            capabilities: BackendCapabilities::default(),
+        }));
+        state.handle_backend(BackendEvent::Models(vec![ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "model".to_owned(),
+            is_default: true,
+            capabilities: crate::codex::model_capabilities(),
+        }]));
+        state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "provider-session".to_owned(),
+            model: "model".to_owned(),
+        });
+        state
+            .submit_prompt_with_id(
+                "bridge-stable-prompt".to_owned(),
+                "continue".to_owned(),
+                Vec::new(),
+            )
+            .expect("stable prompt starts");
+        sessions
+            .save_session_bridge(&SessionBridgeRecord {
+                session_id: session_id.to_string(),
+                workspace: state.workspace.clone(),
+                kind: OrchestratorKind::Chat,
+                lifecycle: BridgeLifecycle::Open,
+                display_title: "Acknowledgement retry".to_owned(),
+                revision: 1,
+                transport: Some("discord".to_owned()),
+                external_parent_id: Some("100".to_owned()),
+                external_thread_id: Some("101".to_owned()),
+                last_delivered_turn_id: None,
+                delivery: None,
+                live_turn_id: None,
+                live_external_message_id: None,
+                active_source_message_id: Some("message-1".to_owned()),
+                recent_inbound_event_ids: Vec::new(),
+                pending_inbound: Some(BridgePendingInboundRecord {
+                    external_event_id: "event-1".to_owned(),
+                    source_message_id: "message-1".to_owned(),
+                    client_prompt_id: "bridge-stable-prompt".to_owned(),
+                    text: "continue".to_owned(),
+                    attachments: Vec::new(),
+                }),
+                updated_at_ms: 1,
+            })
+            .expect("initial bridge");
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let breaker = rusqlite::Connection::open(&database).expect("breaker connection");
+        breaker
+            .execute_batch(
+                "CREATE TRIGGER fail_bridge_acknowledgement \
+                 BEFORE UPDATE ON session_bridges \
+                 BEGIN SELECT RAISE(ABORT, 'forced acknowledgement failure'); END;",
+            )
+            .expect("failure trigger");
+
+        runtime
+            .handle_backend_event(
+                BackendSource::Primary {
+                    session_id: session_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                },
+                BackendEvent::TurnAccepted {
+                    turn_id: "provider-generated-turn".to_owned(),
+                },
+            )
+            .await;
+        assert_eq!(
+            runtime.pending_bridge_acknowledgements.get(&session_id),
+            Some(&"bridge-stable-prompt".to_owned())
+        );
+        assert!(
+            runtime
+                .core
+                .session_bridge(&session_id)
+                .expect("runtime bridge")
+                .pending_inbound
+                .is_some()
+        );
+        assert!(
+            sessions
+                .list_session_bridges(&workspace.path().to_string_lossy())
+                .expect("stored bridge")[0]
+                .pending_inbound
+                .is_some()
+        );
+
+        breaker
+            .execute_batch("DROP TRIGGER fail_bridge_acknowledgement;")
+            .expect("drop failure trigger");
+        runtime
+            .handle_backend_event(
+                BackendSource::Primary {
+                    session_id: session_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                },
+                BackendEvent::TurnStarted {
+                    turn_id: "provider-generated-turn".to_owned(),
+                },
+            )
+            .await;
+        assert!(
+            !runtime
+                .pending_bridge_acknowledgements
+                .contains_key(&session_id)
+        );
+        assert!(
+            runtime
+                .core
+                .session_bridge(&session_id)
+                .expect("runtime bridge")
+                .pending_inbound
+                .is_none()
+        );
+        assert!(
+            sessions
+                .list_session_bridges(&workspace.path().to_string_lossy())
+                .expect("stored bridge")[0]
+                .pending_inbound
+                .is_none()
+        );
+        runtime.effects.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn normalized_inbound_ledger_deduplicates_after_restart_without_cross_route_acceptance() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let restarted_persistence = persistence.clone();
+        let sessions = Arc::clone(&persistence.sessions);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let restarted_state = state.clone();
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        sessions
+            .save_session_bridge(&SessionBridgeRecord {
+                session_id: session_id.to_string(),
+                workspace: state.workspace.clone(),
+                kind: OrchestratorKind::Chat,
+                lifecycle: BridgeLifecycle::Open,
+                display_title: "Inbound ledger".to_owned(),
+                revision: 1,
+                transport: Some("discord".to_owned()),
+                external_parent_id: Some("100".to_owned()),
+                external_thread_id: Some("101".to_owned()),
+                last_delivered_turn_id: None,
+                delivery: None,
+                live_turn_id: None,
+                live_external_message_id: None,
+                active_source_message_id: None,
+                recent_inbound_event_ids: Vec::new(),
+                pending_inbound: None,
+                updated_at_ms: 1,
+            })
+            .expect("initial bridge");
+
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let (runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+        let first = endpoint
+            .execute_command(
+                ClientId::from("bridge-ledger-test"),
+                IdempotencyKey::from("bridge-ledger-first"),
+                None,
+                false,
+                Command::ContinueSessionFromBridge {
+                    session_id: session_id.clone(),
+                    transport: "discord".to_owned(),
+                    external_thread_id: "101".to_owned(),
+                    external_event_id: "event-1".to_owned(),
+                    source_message_id: "message-1".to_owned(),
+                    prompt: PromptInput {
+                        text: String::new(),
+                        attachments: Vec::new(),
+                    },
+                    consume_as_busy: true,
+                },
+            )
+            .await
+            .expect("first event is consumed as busy");
+        assert_eq!(
+            first.bridge_continuation,
+            Some(BridgeContinuationDisposition::Busy)
+        );
+        assert!(
+            sessions
+                .has_session_bridge_inbound_event(session_id.as_str(), "event-1")
+                .expect("ledger query")
+        );
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
+
+        let effects = EffectExecutor::new(
+            empty_registry(workspace.path()).await,
+            restarted_persistence,
+        );
+        let (restarted, restarted_handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(restarted_state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = restarted_handle.endpoint().clone();
+        let restarted = tokio::spawn(restarted.run());
+        let wrong_route = endpoint
+            .execute_command(
+                ClientId::from("bridge-ledger-test"),
+                IdempotencyKey::from("bridge-ledger-wrong-route"),
+                None,
+                false,
+                Command::ContinueSessionFromBridge {
+                    session_id: session_id.clone(),
+                    transport: "discord".to_owned(),
+                    external_thread_id: "999".to_owned(),
+                    external_event_id: "event-1".to_owned(),
+                    source_message_id: "message-1".to_owned(),
+                    prompt: PromptInput {
+                        text: "must not run".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                    consume_as_busy: false,
+                },
+            )
+            .await
+            .expect_err("durable identity never bypasses exact route authorization");
+        assert_eq!(wrong_route.code, ErrorCode::Conflict);
+        let duplicate = endpoint
+            .execute_command(
+                ClientId::from("bridge-ledger-test"),
+                IdempotencyKey::from("bridge-ledger-duplicate"),
+                None,
+                false,
+                Command::ContinueSessionFromBridge {
+                    session_id: session_id.clone(),
+                    transport: "discord".to_owned(),
+                    external_thread_id: "101".to_owned(),
+                    external_event_id: "event-1".to_owned(),
+                    source_message_id: "message-1".to_owned(),
+                    prompt: PromptInput {
+                        text: "must not run".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                    consume_as_busy: false,
+                },
+            )
+            .await
+            .expect("replayed event is typed duplicate");
+        assert_eq!(
+            duplicate.bridge_continuation,
+            Some(BridgeContinuationDisposition::Duplicate)
+        );
+
+        restarted_handle.shutdown().await;
+        restarted.await.expect("restarted runtime task");
     }
 
     async fn assert_start_session_routed(

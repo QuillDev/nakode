@@ -29,6 +29,15 @@ service NakodeService {
 
   rpc CreateSession(CreateSessionRequest) returns (MutationResult);
   rpc OpenSession(OpenSessionRequest) returns (MutationResult);
+  rpc SetSessionBridgeLifecycle(SetSessionBridgeLifecycleRequest) returns (MutationResult);
+  rpc SetWorkspaceBridgeLifecycle(SetWorkspaceBridgeLifecycleRequest) returns (MutationResult);
+  rpc BindSessionBridgeThread(BindSessionBridgeThreadRequest) returns (MutationResult);
+  rpc ClearSessionBridgeThread(ClearSessionBridgeThreadRequest) returns (MutationResult);
+  rpc PrepareBridgeDelivery(PrepareBridgeDeliveryRequest) returns (MutationResult);
+  rpc CompleteBridgeDeliveryPart(CompleteBridgeDeliveryPartRequest) returns (MutationResult);
+  rpc FinalizeBridgeDelivery(FinalizeBridgeDeliveryRequest) returns (MutationResult);
+  rpc SetBridgeLiveMessage(SetBridgeLiveMessageRequest) returns (MutationResult);
+  rpc ContinueSessionFromBridge(ContinueSessionFromBridgeRequest) returns (ContinueSessionFromBridgeResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (MutationResult);
   rpc GetSession(GetSessionRequest) returns (SessionSnapshot);
@@ -143,10 +152,97 @@ message CreateSessionRequest {
   // Bounded client context merged into Nakode-owned provider system instructions.
   // Omission preserves legacy session creation behavior. Requires `InitialSessionInstructions`.
   optional string initial_instructions = 8;
+  // Optional provider-neutral Chat/Agent external-thread projection intent.
+  optional SessionBridgeIntent bridge = 9;
 }
 // Supplying tools installs them before a closed session begins provider restoration. An already
 // attached session accepts only the identical table, making client reattachment idempotent without
 // permitting late reconfiguration.
+message SessionBridgeIntent {
+  OrchestratorKind kind = 1;
+  BridgeLifecycle lifecycle = 2;
+  string display_title = 3;
+}
+enum OrchestratorKind {
+  ORCHESTRATOR_KIND_UNSPECIFIED = 0;
+  ORCHESTRATOR_KIND_CHAT = 1;
+  ORCHESTRATOR_KIND_AGENT = 2;
+}
+enum BridgeLifecycle {
+  BRIDGE_LIFECYCLE_UNSPECIFIED = 0;
+  BRIDGE_LIFECYCLE_OPEN = 1;
+  BRIDGE_LIFECYCLE_ARCHIVED = 2;
+}
+message SetSessionBridgeLifecycleRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  BridgeLifecycle lifecycle = 3;
+}
+message SetWorkspaceBridgeLifecycleRequest {
+  MutationOptions mutation = 1;
+  string workspace_id = 2;
+  BridgeLifecycle lifecycle = 3;
+}
+message BindSessionBridgeThreadRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string transport = 3;
+  string external_parent_id = 4;
+  string external_thread_id = 5;
+}
+message ClearSessionBridgeThreadRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string transport = 3;
+  string external_thread_id = 4;
+}
+message PrepareBridgeDeliveryRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string turn_id = 3;
+  string body_sha256 = 4;
+  uint64 part_count = 5;
+}
+message CompleteBridgeDeliveryPartRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string turn_id = 3;
+  uint64 part_index = 4;
+  string external_message_id = 5;
+}
+message FinalizeBridgeDeliveryRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string turn_id = 3;
+}
+message SetBridgeLiveMessageRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  optional string turn_id = 3;
+  optional string external_message_id = 4;
+}
+enum BridgeContinuationDisposition {
+  BRIDGE_CONTINUATION_DISPOSITION_UNSPECIFIED = 0;
+  BRIDGE_CONTINUATION_DISPOSITION_ACCEPTED = 1;
+  BRIDGE_CONTINUATION_DISPOSITION_DUPLICATE = 2;
+  BRIDGE_CONTINUATION_DISPOSITION_BUSY = 3;
+}
+message ContinueSessionFromBridgeResponse {
+  MutationResult mutation = 1;
+  BridgeContinuationDisposition disposition = 2;
+}
+message ContinueSessionFromBridgeRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string transport = 3;
+  string external_thread_id = 4;
+  string external_event_id = 5;
+  string source_message_id = 6;
+  PromptInput prompt = 7;
+  // Consume an authorized event as Busy without starting or queueing work. Used only for bounded
+  // transport backpressure; duplicate retries retain the Busy disposition.
+  bool consume_as_busy = 8;
+}
 message OpenSessionRequest {
   MutationOptions mutation = 1;
   string session_id = 2;
@@ -402,6 +498,33 @@ message WorkspaceState {
   Settings settings = 7;
   repeated SessionSummary sessions = 8;
   optional SessionState active_session = 9;
+  repeated SessionBridge session_bridges = 10;
+}
+
+message BridgeDelivery {
+  string turn_id = 1;
+  string body_sha256 = 2;
+  uint64 part_count = 3;
+  uint64 completed_parts = 4;
+  optional string last_external_message_id = 5;
+}
+message SessionBridge {
+  string session_id = 1;
+  string workspace_id = 2;
+  OrchestratorKind kind = 3;
+  BridgeLifecycle lifecycle = 4;
+  string display_title = 5;
+  // Monotonic bridge-local projection revision. This is distinct from
+  // MutationOptions.expected_revision, which targets the owning session engine revision.
+  uint64 revision = 6;
+  optional string transport = 7;
+  optional string external_parent_id = 8;
+  optional string external_thread_id = 9;
+  optional string last_delivered_turn_id = 10;
+  optional BridgeDelivery delivery = 11;
+  optional string live_turn_id = 12;
+  optional string live_external_message_id = 13;
+  optional string active_source_message_id = 14;
 }
 
 message ProviderCapabilities { repeated ProviderCapability supported = 1; }

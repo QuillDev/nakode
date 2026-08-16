@@ -271,21 +271,17 @@ impl ServiceAction {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum DiscordAction {
-    /// Interactively configure the Discord bot and its first channel binding.
+    /// Interactively configure the Discord bot and orchestrator parent channels.
     Setup {
-        /// Discord channel snowflake. If omitted, setup prompts for it.
+        /// Chat Orchestrator parent-channel snowflake. If omitted, setup prompts for it.
         #[arg(long)]
-        channel_id: Option<String>,
-        /// Optional Discord guild snowflake for the channel binding.
+        chat_channel_id: Option<String>,
+        /// Agent Orchestrator parent-channel snowflake. If omitted, setup prompts for it.
         #[arg(long)]
-        guild_id: Option<String>,
-        /// Optional Nakode session id for legacy direct channel routing. Blank makes the channel
-        /// mention-driven, creating a new session and thread for each bot mention.
+        agent_channel_id: Option<String>,
+        /// The sole Discord user snowflake authorized to continue bridged sessions.
         #[arg(long)]
-        session_id: Option<String>,
-        /// Comma-separated Discord user snowflakes allowed to use the bot.
-        #[arg(long)]
-        allowed_users: Option<String>,
+        primary_user_id: Option<String>,
     },
     /// Show Discord configuration without revealing the bot token.
     Status {
@@ -303,25 +299,6 @@ pub enum DiscordAction {
     Stop,
     /// Restart Discord in the running workspace service.
     Restart,
-    /// Add or replace a parent-channel binding.
-    Bind {
-        /// Discord channel snowflake.
-        #[arg(long)]
-        channel_id: String,
-        /// Optional Discord guild snowflake.
-        #[arg(long)]
-        guild_id: Option<String>,
-        /// Optional Nakode session id for legacy direct channel routing. Blank makes the channel
-        /// mention-driven, creating a new session and thread for each bot mention.
-        #[arg(long)]
-        session_id: Option<String>,
-    },
-    /// Remove a parent-channel binding.
-    Unbind {
-        /// Discord channel snowflake.
-        #[arg(long)]
-        channel_id: String,
-    },
 }
 
 #[derive(Debug, Error)]
@@ -898,12 +875,12 @@ mod tests {
             "service",
             "discord",
             "setup",
-            "--channel-id",
+            "--chat-channel-id",
             "123",
-            "--guild-id",
+            "--agent-channel-id",
             "456",
-            "--allowed-users",
-            "789,790",
+            "--primary-user-id",
+            "789",
         ])
         .expect("Discord setup command");
         assert!(matches!(
@@ -911,13 +888,12 @@ mod tests {
             Some(NakodeCommand::Service {
                 action: ServiceAction::Discord {
                     action: DiscordAction::Setup {
-                        channel_id: Some(channel_id),
-                        guild_id: Some(guild_id),
-                        allowed_users: Some(allowed_users),
-                        ..
+                        chat_channel_id: Some(chat_channel_id),
+                        agent_channel_id: Some(agent_channel_id),
+                        primary_user_id: Some(primary_user_id),
                     }
                 }
-            }) if channel_id == "123" && guild_id == "456" && allowed_users == "789,790"
+            }) if chat_channel_id == "123" && agent_channel_id == "456" && primary_user_id == "789"
         ));
 
         let start = Config::try_parse_from(["nakode", "service", "discord", "start"])

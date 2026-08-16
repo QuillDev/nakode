@@ -12,6 +12,7 @@ use crate::{
 };
 
 /// Canonical state and revision for one server-managed logical session.
+#[derive(Clone)]
 pub struct ServiceEngine {
     state: DomainState,
     revision: u64,

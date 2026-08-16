@@ -35,6 +35,8 @@ pub enum ServiceCapability {
     SoulManagement,
     /// Nakode owns MCP configuration, credentials, discovery, grants, invocation, and audit.
     McpManagement,
+    /// Typed Chat/Agent external-thread intent, lifecycle, binding, and delivery checkpoints.
+    OrchestratorThreadBridge,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -80,10 +82,24 @@ pub struct SoulDocumentView {
     pub digest: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeContinuationDisposition {
+    /// The event atomically started the next provider-neutral user turn.
+    Accepted,
+    /// This external event was already handled and did not mutate the session again.
+    Duplicate,
+    /// The event was durably rejected because the session was not ready for a new turn.
+    Busy,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CommandAccepted {
     pub resource_id: Option<String>,
     pub revision: Option<u64>,
+    /// Present only for `ContinueSessionFromBridge`; retained in idempotency replay results.
+    #[serde(default)]
+    pub bridge_continuation: Option<BridgeContinuationDisposition>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

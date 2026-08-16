@@ -35,11 +35,11 @@ impl GrpcService {
             .max_encoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
     }
 
-    async fn mutate(
+    async fn execute_mutation(
         &self,
         options: Option<api::MutationOptions>,
         command: protocol::Command,
-    ) -> Result<tonic::Response<api::MutationResult>, tonic::Status> {
+    ) -> Result<protocol::CommandAccepted, tonic::Status> {
         let options =
             options.ok_or_else(|| tonic::Status::invalid_argument("mutation is required"))?;
         if options.idempotency_key.is_empty() {
@@ -47,8 +47,7 @@ impl GrpcService {
                 "mutation.idempotency_key is required",
             ));
         }
-        let result = self
-            .endpoint
+        self.endpoint
             .execute_command(
                 self.client_id.clone(),
                 protocol::IdempotencyKey::new(options.idempotency_key),
@@ -57,7 +56,15 @@ impl GrpcService {
                 command,
             )
             .await
-            .map_err(status)?;
+            .map_err(status)
+    }
+
+    async fn mutate(
+        &self,
+        options: Option<api::MutationOptions>,
+        command: protocol::Command,
+    ) -> Result<tonic::Response<api::MutationResult>, tonic::Status> {
+        let result = self.execute_mutation(options, command).await?;
         Ok(tonic::Response::new(api::MutationResult {
             resource_id: result.resource_id,
             revision: result.revision,
@@ -162,6 +169,40 @@ fn session_tools(
             .collect(),
         replace_builtin_tools: value.replace_builtin_tools,
     })
+}
+
+fn bridge_lifecycle(value: i32) -> Result<protocol::BridgeLifecycle, tonic::Status> {
+    match api::BridgeLifecycle::try_from(value).unwrap_or(api::BridgeLifecycle::Unspecified) {
+        api::BridgeLifecycle::Open => Ok(protocol::BridgeLifecycle::Open),
+        api::BridgeLifecycle::Archived => Ok(protocol::BridgeLifecycle::Archived),
+        api::BridgeLifecycle::Unspecified => Err(tonic::Status::invalid_argument(
+            "bridge lifecycle is required",
+        )),
+    }
+}
+
+fn orchestrator_kind(value: i32) -> Result<protocol::OrchestratorKind, tonic::Status> {
+    match api::OrchestratorKind::try_from(value).unwrap_or(api::OrchestratorKind::Unspecified) {
+        api::OrchestratorKind::Chat => Ok(protocol::OrchestratorKind::Chat),
+        api::OrchestratorKind::Agent => Ok(protocol::OrchestratorKind::Agent),
+        api::OrchestratorKind::Unspecified => Err(tonic::Status::invalid_argument(
+            "orchestrator kind is required",
+        )),
+    }
+}
+
+fn bridge_intent(
+    value: Option<api::SessionBridgeIntent>,
+) -> Result<Option<protocol::SessionBridgeIntent>, tonic::Status> {
+    value
+        .map(|value| {
+            Ok(protocol::SessionBridgeIntent {
+                kind: orchestrator_kind(value.kind)?,
+                lifecycle: bridge_lifecycle(value.lifecycle)?,
+                display_title: value.display_title,
+            })
+        })
+        .transpose()
 }
 
 fn mcp_grant(
@@ -563,6 +604,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             options: model_options(input.options),
             tools: session_tools(input.tools),
             initial_instructions: input.initial_instructions,
+            bridge: bridge_intent(input.bridge)?,
             mcp_grant: mcp_grant(input.mcp_grant)?,
         }
     );
@@ -576,6 +618,134 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             mcp_grant: mcp_grant(input.mcp_grant)?,
         }
     );
+
+    command_rpc!(
+        set_session_bridge_lifecycle,
+        api::SetSessionBridgeLifecycleRequest,
+        input,
+        protocol::Command::SetSessionBridgeLifecycle {
+            session_id: protocol::SessionId::from(input.session_id),
+            lifecycle: bridge_lifecycle(input.lifecycle)?,
+        }
+    );
+    command_rpc!(
+        set_workspace_bridge_lifecycle,
+        api::SetWorkspaceBridgeLifecycleRequest,
+        input,
+        protocol::Command::SetWorkspaceBridgeLifecycle {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            lifecycle: bridge_lifecycle(input.lifecycle)?,
+        }
+    );
+    command_rpc!(
+        bind_session_bridge_thread,
+        api::BindSessionBridgeThreadRequest,
+        input,
+        protocol::Command::BindSessionBridgeThread {
+            session_id: protocol::SessionId::from(input.session_id),
+            transport: input.transport,
+            external_parent_id: input.external_parent_id,
+            external_thread_id: input.external_thread_id,
+        }
+    );
+    command_rpc!(
+        clear_session_bridge_thread,
+        api::ClearSessionBridgeThreadRequest,
+        input,
+        protocol::Command::ClearSessionBridgeThread {
+            session_id: protocol::SessionId::from(input.session_id),
+            transport: input.transport,
+            external_thread_id: input.external_thread_id,
+        }
+    );
+    command_rpc!(
+        prepare_bridge_delivery,
+        api::PrepareBridgeDeliveryRequest,
+        input,
+        protocol::Command::PrepareBridgeDelivery {
+            session_id: protocol::SessionId::from(input.session_id),
+            turn_id: protocol::TurnId::from(input.turn_id),
+            body_sha256: input.body_sha256,
+            part_count: input.part_count,
+        }
+    );
+    command_rpc!(
+        complete_bridge_delivery_part,
+        api::CompleteBridgeDeliveryPartRequest,
+        input,
+        protocol::Command::CompleteBridgeDeliveryPart {
+            session_id: protocol::SessionId::from(input.session_id),
+            turn_id: protocol::TurnId::from(input.turn_id),
+            part_index: input.part_index,
+            external_message_id: input.external_message_id,
+        }
+    );
+    command_rpc!(
+        finalize_bridge_delivery,
+        api::FinalizeBridgeDeliveryRequest,
+        input,
+        protocol::Command::FinalizeBridgeDelivery {
+            session_id: protocol::SessionId::from(input.session_id),
+            turn_id: protocol::TurnId::from(input.turn_id),
+        }
+    );
+    command_rpc!(
+        set_bridge_live_message,
+        api::SetBridgeLiveMessageRequest,
+        input,
+        protocol::Command::SetBridgeLiveMessage {
+            session_id: protocol::SessionId::from(input.session_id),
+            turn_id: input.turn_id.map(protocol::TurnId::from),
+            external_message_id: input.external_message_id,
+        }
+    );
+    async fn continue_session_from_bridge(
+        &self,
+        request: tonic::Request<api::ContinueSessionFromBridgeRequest>,
+    ) -> Result<tonic::Response<api::ContinueSessionFromBridgeResponse>, tonic::Status> {
+        let mut input = request.into_inner();
+        let options = input.mutation.take();
+        let prompt = prompt(input.prompt)?;
+        let result = self
+            .execute_mutation(
+                options,
+                protocol::Command::ContinueSessionFromBridge {
+                    session_id: protocol::SessionId::from(input.session_id),
+                    transport: input.transport,
+                    external_thread_id: input.external_thread_id,
+                    external_event_id: input.external_event_id,
+                    source_message_id: input.source_message_id,
+                    prompt,
+                    consume_as_busy: input.consume_as_busy,
+                },
+            )
+            .await?;
+        let disposition = match result.bridge_continuation {
+            Some(protocol::BridgeContinuationDisposition::Accepted) => {
+                api::BridgeContinuationDisposition::Accepted
+            }
+            Some(protocol::BridgeContinuationDisposition::Duplicate) => {
+                api::BridgeContinuationDisposition::Duplicate
+            }
+            Some(protocol::BridgeContinuationDisposition::Busy) => {
+                api::BridgeContinuationDisposition::Busy
+            }
+            None => {
+                return Err(tonic::Status::internal(
+                    "bridge continuation result omitted its disposition",
+                ));
+            }
+        };
+        Ok(tonic::Response::new(
+            api::ContinueSessionFromBridgeResponse {
+                mutation: Some(api::MutationResult {
+                    resource_id: result.resource_id,
+                    revision: result.revision,
+                }),
+                disposition: disposition as i32,
+            },
+        ))
+    }
 
     async fn list_sessions(
         &self,
@@ -1401,6 +1571,42 @@ pub(crate) fn workspace(value: protocol::BootstrapView) -> api::WorkspaceState {
         settings: Some(settings(value.settings)),
         sessions: value.sessions.into_iter().map(session_summary).collect(),
         active_session: value.active_session.map(session),
+        session_bridges: value
+            .session_bridges
+            .into_iter()
+            .map(session_bridge)
+            .collect(),
+    }
+}
+
+fn session_bridge(value: protocol::SessionBridgeView) -> api::SessionBridge {
+    api::SessionBridge {
+        session_id: value.session_id.to_string(),
+        workspace_id: value.workspace_id.to_string(),
+        kind: match value.kind {
+            protocol::OrchestratorKind::Chat => api::OrchestratorKind::Chat as i32,
+            protocol::OrchestratorKind::Agent => api::OrchestratorKind::Agent as i32,
+        },
+        lifecycle: match value.lifecycle {
+            protocol::BridgeLifecycle::Open => api::BridgeLifecycle::Open as i32,
+            protocol::BridgeLifecycle::Archived => api::BridgeLifecycle::Archived as i32,
+        },
+        display_title: value.display_title,
+        revision: value.revision,
+        transport: value.transport,
+        external_parent_id: value.external_parent_id,
+        external_thread_id: value.external_thread_id,
+        last_delivered_turn_id: value.last_delivered_turn_id.map(|id| id.to_string()),
+        delivery: value.delivery.map(|delivery| api::BridgeDelivery {
+            turn_id: delivery.turn_id.to_string(),
+            body_sha256: delivery.body_sha256,
+            part_count: delivery.part_count,
+            completed_parts: delivery.completed_parts,
+            last_external_message_id: delivery.last_external_message_id,
+        }),
+        live_turn_id: value.live_turn_id.map(|id| id.to_string()),
+        live_external_message_id: value.live_external_message_id,
+        active_source_message_id: value.active_source_message_id,
     }
 }
 

@@ -475,6 +475,48 @@ pub(crate) fn workspace(value: api::WorkspaceState) -> Result<view::BootstrapVie
         settings: settings(required(value.settings, "workspace settings")?)?,
         sessions: value.sessions.into_iter().map(session_summary).collect(),
         active_session: value.active_session.map(session).transpose()?,
+        session_bridges: value
+            .session_bridges
+            .into_iter()
+            .map(session_bridge)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn session_bridge(value: api::SessionBridge) -> Result<view::SessionBridgeView, String> {
+    Ok(view::SessionBridgeView {
+        session_id: view::SessionId::from(value.session_id),
+        workspace_id: view::WorkspaceId::from(value.workspace_id),
+        kind: match api::OrchestratorKind::try_from(value.kind).map_err(invalid_enum)? {
+            api::OrchestratorKind::Chat => view::OrchestratorKind::Chat,
+            api::OrchestratorKind::Agent => view::OrchestratorKind::Agent,
+            api::OrchestratorKind::Unspecified => {
+                return Err("unspecified orchestrator kind".to_owned());
+            }
+        },
+        lifecycle: match api::BridgeLifecycle::try_from(value.lifecycle).map_err(invalid_enum)? {
+            api::BridgeLifecycle::Open => view::BridgeLifecycle::Open,
+            api::BridgeLifecycle::Archived => view::BridgeLifecycle::Archived,
+            api::BridgeLifecycle::Unspecified => {
+                return Err("unspecified bridge lifecycle".to_owned());
+            }
+        },
+        display_title: value.display_title,
+        revision: value.revision,
+        transport: value.transport,
+        external_parent_id: value.external_parent_id,
+        external_thread_id: value.external_thread_id,
+        last_delivered_turn_id: value.last_delivered_turn_id.map(view::TurnId::from),
+        delivery: value.delivery.map(|delivery| view::BridgeDeliveryView {
+            turn_id: view::TurnId::from(delivery.turn_id),
+            body_sha256: delivery.body_sha256,
+            part_count: delivery.part_count,
+            completed_parts: delivery.completed_parts,
+            last_external_message_id: delivery.last_external_message_id,
+        }),
+        live_turn_id: value.live_turn_id.map(view::TurnId::from),
+        live_external_message_id: value.live_external_message_id,
+        active_source_message_id: value.active_source_message_id,
     })
 }
 

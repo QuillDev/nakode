@@ -81,6 +81,7 @@ pub fn bootstrap(
     BootstrapView {
         workspace_id: workspace_id.clone(),
         workspace_path: state.workspace.clone(),
+        session_bridges: Vec::new(),
         providers: providers
             .iter()
             .map(|provider| provider_view(state, provider))

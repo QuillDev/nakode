@@ -134,50 +134,32 @@ service is discovered or started.
 The TUI uses this exact public SDK path. It is an example frontend, not a
 privileged application runtime.
 
-## Discord frontend
+## Discord orchestrator threads (optional)
 
-The optional Discord adapter is configured through the transport command group:
+Discord is a native Nakode transport. Nakode—not a frontend—owns the bot token, gateway client,
+logical-session/thread mappings, inbound authorization and deduplication, delivery checkpoints, and
+archive state. Frontends such as FStack only attach a typed `SessionBridgeIntent` while creating a
+session and issue typed open/archive lifecycle commands when the corresponding dashboard object is
+opened or closed. They must not read Nakode persistence or call Discord directly.
 
-```text
-nakode transport discord setup
+Configure the transport through the secret-safe CLI:
+
+```bash
+nakode transport discord setup \
+  --chat-channel-id <CHAT_PARENT_SNOWFLAKE> \
+  --agent-channel-id <AGENT_PARENT_SNOWFLAKE> \
+  --primary-user-id <PRIMARY_USER_SNOWFLAKE>
 nakode transport discord status
-nakode transport discord start
-nakode transport discord stop
-nakode transport discord restart
-nakode transport discord enable
-nakode transport discord disable
-nakode transport discord bind --channel-id <channel> [--guild-id <guild>] [--session-id <session>]
-nakode transport discord unbind --channel-id <channel>
 ```
 
-`setup` is interactive and reads the bot token without echoing it. The token is
-stored in a private per-workspace file; the TOML configuration stores only the
-enabled flag, authorized Discord user and guild IDs, configured parent-channel
-entry points, and persisted Discord-thread/session mappings. A configured
-parent channel is mention-driven when its optional legacy session ID is empty:
-a real `@nako` mention creates a new Nakode session and a Discord thread, and
-subsequent authorized messages in that thread route to the same session. A
-legacy binding with an explicit session ID continues to accept direct channel
-prompts. An enabled configuration requires an explicit allow-list of users and
-at least one parent-channel binding. The adapter accepts text prompts and
-bounded HTTPS image attachments, sends them through `NakodeClient::send_prompt`,
-and renders bounded `watch_hydrated_session` replacement snapshots. `!nakode`
-commands expose cancellation and text-based interaction resolution for the MVP.
-The bot needs message-content access and permission to send messages and create
-public threads in each configured parent channel.
+`setup` reads the credential privately without echo; status never prints it. The public IDs and private token are installation-level, while ingress/recovery state remains isolated by canonical workspace. Configuration is optional and an unconfigured transport does not affect normal sessions. Each bridged Chat or Agent session gets one lazily-created thread under its configured parent channel. Nakode persists the stable pairing,
+reuses it after restart, archives/unarchives it from lifecycle intent, projects user-visible live and
+final transcript output, and accepts a continuation only from the configured user while the logical
+session is authoritatively idle.
 
-The native service owns the transport supervisor, but transports have
-independent runtime lifecycles. `start`, `stop`, and `restart` control Discord
-without stopping or restarting the native runtime. `enable` and `disable`
-change automatic startup policy and also apply the corresponding live action
-when the workspace service is already running. `setup` applies its configuration
-immediately; `bind` and `unbind` reload Discord only when it is currently
-running.
-`status` reports both persisted configuration and live runtime state. The
-current endpoint is a private per-workspace Unix socket; this integration is
-therefore a same-host frontend. Remote Discord hosting requires authenticated
-TCP/TLS transport plus server-side authorization and must not be enabled by
-exposing the private socket.
+See [`discord-orchestrator-threads.md`](discord-orchestrator-threads.md) for intents, permissions,
+reaction semantics, retries, limits, failure behavior, and the current deterministic-only live-test
+status.
 
 ## Adding a product capability
 

@@ -3,9 +3,17 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentSessionId, ArtifactId, EntryId, InteractionId, McpGrantPolicy, McpServerInput,
-    McpSessionGrant, ModelId, PromptId, ProviderId, RunId, SessionId, TurnId, WorkspaceId,
+    AgentSessionId, ArtifactId, BridgeLifecycle, EntryId, InteractionId, McpGrantPolicy,
+    McpServerInput, McpSessionGrant, ModelId, OrchestratorKind, PromptId, ProviderId, RunId,
+    SessionId, TurnId, WorkspaceId,
 };
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionBridgeIntent {
+    pub kind: OrchestratorKind,
+    pub lifecycle: BridgeLifecycle,
+    pub display_title: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PromptInput {
@@ -243,6 +251,9 @@ pub enum Command {
         /// Optional client-owned context merged into provider system instructions for this session.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         initial_instructions: Option<String>,
+        /// Optional external-thread projection intent owned by the creating frontend.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bridge: Option<SessionBridgeIntent>,
         /// Explicit, deny-by-default Nakode MCP server grants for this session.
         #[serde(default)]
         mcp_grant: Option<McpSessionGrant>,
@@ -254,6 +265,67 @@ pub enum Command {
         /// Explicit MCP grant used only when restoring a closed session.
         #[serde(default)]
         mcp_grant: Option<McpSessionGrant>,
+    },
+    /// Sets one session's desired external-thread lifecycle. Idempotent when already in that state.
+    SetSessionBridgeLifecycle {
+        session_id: SessionId,
+        lifecycle: BridgeLifecycle,
+    },
+    /// Sets every persisted bridge in a workspace to one desired lifecycle.
+    SetWorkspaceBridgeLifecycle {
+        workspace_id: WorkspaceId,
+        lifecycle: BridgeLifecycle,
+    },
+    /// Claims a stable external thread for one unbound bridge.
+    BindSessionBridgeThread {
+        session_id: SessionId,
+        transport: String,
+        external_parent_id: String,
+        external_thread_id: String,
+    },
+    /// Clears a missing/deleted external thread without changing bridge intent.
+    ClearSessionBridgeThread {
+        session_id: SessionId,
+        transport: String,
+        external_thread_id: String,
+    },
+    /// Atomically establishes the durable checkpoint for one final answer before network delivery.
+    PrepareBridgeDelivery {
+        session_id: SessionId,
+        turn_id: TurnId,
+        body_sha256: String,
+        part_count: u64,
+    },
+    /// Marks one prepared delivery part as accepted by the external transport.
+    CompleteBridgeDeliveryPart {
+        session_id: SessionId,
+        turn_id: TurnId,
+        part_index: u64,
+        external_message_id: String,
+    },
+    /// Marks a fully delivered turn final and clears its constant-size progress checkpoint.
+    FinalizeBridgeDelivery {
+        session_id: SessionId,
+        turn_id: TurnId,
+    },
+    /// Records or clears the transport's one non-final/live status message.
+    SetBridgeLiveMessage {
+        session_id: SessionId,
+        turn_id: Option<TurnId>,
+        external_message_id: Option<String>,
+    },
+    /// Atomically verifies an open binding, rejects busy sessions instead of queueing, records the
+    /// gateway event for replay suppression, and starts the next user turn.
+    ContinueSessionFromBridge {
+        session_id: SessionId,
+        transport: String,
+        external_thread_id: String,
+        external_event_id: String,
+        source_message_id: String,
+        prompt: PromptInput,
+        /// Durably consumes this authorized event as busy without ever starting a turn. Transports
+        /// use this when their bounded ingress is saturated.
+        consume_as_busy: bool,
     },
     /// Sends a prompt using server-owned queue-versus-start policy.
     SendPrompt {
@@ -507,6 +579,7 @@ mod tests {
             },
             tools: None,
             initial_instructions: None,
+            bridge: None,
             mcp_grant: None,
         };
         assert_eq!(

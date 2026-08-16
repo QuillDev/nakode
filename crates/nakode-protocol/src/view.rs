@@ -110,6 +110,54 @@ pub struct ProviderView {
     pub authentication: Option<ProviderAuthenticationView>,
 }
 
+/// Product surface that owns the user-facing projection of one logical session.
+///
+/// This is intentionally transport-neutral: Discord, Slack, or another thread transport may map
+/// the same Chat/Agent distinction to different destinations.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorKind {
+    Chat,
+    Agent,
+}
+
+/// Desired lifecycle of an external thread paired with a logical session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeLifecycle {
+    Open,
+    Archived,
+}
+
+/// Crash-recoverable, constant-size delivery checkpoint for one final assistant answer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BridgeDeliveryView {
+    pub turn_id: TurnId,
+    pub body_sha256: String,
+    pub part_count: u64,
+    pub completed_parts: u64,
+    pub last_external_message_id: Option<String>,
+}
+
+/// Authoritative provider-neutral pairing intent and adapter-owned external identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionBridgeView {
+    pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
+    pub kind: OrchestratorKind,
+    pub lifecycle: BridgeLifecycle,
+    pub display_title: String,
+    pub revision: u64,
+    pub transport: Option<String>,
+    pub external_parent_id: Option<String>,
+    pub external_thread_id: Option<String>,
+    pub last_delivered_turn_id: Option<TurnId>,
+    pub delivery: Option<BridgeDeliveryView>,
+    pub live_turn_id: Option<TurnId>,
+    pub live_external_message_id: Option<String>,
+    pub active_source_message_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionSummary {
     pub id: SessionId,
@@ -774,6 +822,9 @@ pub struct SessionMetadataView {
 pub struct BootstrapView {
     pub workspace_id: WorkspaceId,
     pub workspace_path: String,
+    /// Durable external-thread bridge records, including archived and currently unbound intents.
+    #[serde(default)]
+    pub session_bridges: Vec<SessionBridgeView>,
     pub providers: Vec<ProviderView>,
     pub models: Vec<ModelView>,
     pub agents: Vec<AgentDefinitionView>,

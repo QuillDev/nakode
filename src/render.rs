@@ -2270,6 +2270,7 @@ mod tests {
             },
             sessions: Vec::new(),
             active_session: Some(session()),
+            session_bridges: Vec::new(),
         }
     }
 
