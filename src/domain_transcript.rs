@@ -49,6 +49,8 @@ pub struct TranscriptEntry {
     pub reasoning_effort: Option<String>,
     /// Concrete fast-mode value resolved for the owner turn that produced this entry.
     pub fast_mode: Option<bool>,
+    /// External transport that originated this user turn. Absent for dashboard/SDK input.
+    pub source_transport: Option<String>,
     /// Versioned, bounded provider-neutral tool audit JSON. Never interpreted as markup.
     pub tool_audit_json: Option<String>,
 }
@@ -238,6 +240,7 @@ impl DomainTranscript {
             owner_turn_id: None,
             reasoning_effort: None,
             fast_mode: None,
+            source_transport: None,
             tool_audit_json: None,
         });
         self.enforce_limit();
@@ -273,6 +276,7 @@ impl DomainTranscript {
                 owner_turn_id: None,
                 reasoning_effort: None,
                 fast_mode: None,
+                source_transport: None,
                 tool_audit_json: None,
             });
             self.item_indices.insert(key, index);
@@ -307,6 +311,7 @@ impl DomainTranscript {
                 owner_turn_id: None,
                 reasoning_effort: None,
                 fast_mode: None,
+                source_transport: None,
                 tool_audit_json: None,
             });
             self.item_indices.insert(key, index);
@@ -332,6 +337,19 @@ impl DomainTranscript {
         }
     }
 
+    pub fn set_model_options(
+        &mut self,
+        key: &str,
+        reasoning_effort: Option<&str>,
+        fast_mode: bool,
+    ) {
+        if let Some(index) = self.item_indices.get(key).copied() {
+            let entry = &mut self.entries[index];
+            entry.reasoning_effort = reasoning_effort.map(str::to_owned);
+            entry.fast_mode = Some(fast_mode);
+        }
+    }
+
     pub fn set_turn_attribution(
         &mut self,
         key: &str,
@@ -347,6 +365,36 @@ impl DomainTranscript {
                 entry.fast_mode = Some(fast_mode);
             }
         }
+    }
+
+    pub fn set_source_transport(&mut self, key: &str, source_transport: Option<&str>) {
+        if let Some(index) = self.item_indices.get(key).copied() {
+            let entry = &mut self.entries[index];
+            if entry.source_transport.is_none() {
+                entry.source_transport = source_transport.map(str::to_owned);
+            }
+        }
+    }
+
+    pub fn set_source_transport_for_user_turn(&mut self, turn_id: &str, source_transport: &str) {
+        for entry in &mut self.entries {
+            if entry.kind == EntryKind::User
+                && entry.owner_turn_id.as_deref() == Some(turn_id)
+                && entry.source_transport.is_none()
+            {
+                entry.source_transport = Some(source_transport.to_owned());
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn user_source_transport_for_turn(&self, turn_id: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.kind == EntryKind::User && entry.owner_turn_id.as_deref() == Some(turn_id)
+            })
+            .and_then(|entry| entry.source_transport.as_deref())
     }
 
     pub fn set_tool_audit(&mut self, key: &str, audit_json: Option<String>) {

@@ -27,6 +27,13 @@ service NakodeService {
   rpc ClearMcpServerCredential(ClearMcpServerCredentialRequest) returns (MutationResult);
   rpc SetMcpServerGrants(SetMcpServerGrantsRequest) returns (MutationResult);
 
+  // Installation-level Discord configuration and the transport state of this workspace service.
+  // The bot token is write-only and is never projected by a response.
+  rpc GetDiscordIntegration(GetDiscordIntegrationRequest) returns (DiscordIntegration);
+  rpc SaveDiscordIntegration(SaveDiscordIntegrationRequest) returns (DiscordIntegration);
+  rpc SetDiscordIntegrationEnabled(SetDiscordIntegrationEnabledRequest) returns (DiscordIntegration);
+  rpc RestartDiscordIntegration(RestartDiscordIntegrationRequest) returns (DiscordIntegration);
+
   rpc CreateSession(CreateSessionRequest) returns (MutationResult);
   rpc OpenSession(OpenSessionRequest) returns (MutationResult);
   rpc SetSessionBridgeLifecycle(SetSessionBridgeLifecycleRequest) returns (MutationResult);
@@ -202,6 +209,9 @@ message PrepareBridgeDeliveryRequest {
   string turn_id = 3;
   string body_sha256 = 4;
   uint64 part_count = 5;
+  BridgeProjectionKind projection_kind = 6;
+  // Compare-and-set predecessor. An absent value means this must be the first projected item.
+  optional BridgeProjection expected_last_projected = 7;
 }
 message CompleteBridgeDeliveryPartRequest {
   MutationOptions mutation = 1;
@@ -209,17 +219,21 @@ message CompleteBridgeDeliveryPartRequest {
   string turn_id = 3;
   uint64 part_index = 4;
   string external_message_id = 5;
+  BridgeProjectionKind projection_kind = 6;
 }
 message FinalizeBridgeDeliveryRequest {
   MutationOptions mutation = 1;
   string session_id = 2;
   string turn_id = 3;
+  BridgeProjectionKind projection_kind = 4;
 }
 message SetBridgeLiveMessageRequest {
   MutationOptions mutation = 1;
   string session_id = 2;
   optional string turn_id = 3;
   optional string external_message_id = 4;
+  // Clears terminal inbound reaction ownership only when this durable message still owns it.
+  optional string clear_active_source_message_id = 5;
 }
 enum BridgeContinuationDisposition {
   BRIDGE_CONTINUATION_DISPOSITION_UNSPECIFIED = 0;
@@ -230,6 +244,11 @@ enum BridgeContinuationDisposition {
 message ContinueSessionFromBridgeResponse {
   MutationResult mutation = 1;
   BridgeContinuationDisposition disposition = 2;
+  // Original Accepted/Busy result when disposition is Duplicate. Absent only for identity-only
+  // legacy ledger rows whose original status cannot be reconstructed safely.
+  optional BridgeContinuationDisposition replayed_disposition = 3;
+  // True only while the replayed Accepted source message still owns progress/final reactions.
+  optional bool replayed_source_active = 4;
 }
 message ContinueSessionFromBridgeRequest {
   MutationOptions mutation = 1;
@@ -409,6 +428,40 @@ message SetMcpServerCredentialRequest { MutationOptions mutation = 1; string wor
 message ClearMcpServerCredentialRequest { MutationOptions mutation = 1; string workspace_id = 2; string server_id = 3; }
 message SetMcpServerGrantsRequest { MutationOptions mutation = 1; string workspace_id = 2; string server_id = 3; McpGrantPolicy grants = 4; }
 
+// Redacted installation configuration plus the Discord transport state for the workspace service
+// answering this request. Runtime errors are sanitized and never contain credentials, payloads, or
+// raw network metadata.
+message DiscordIntegration {
+  enum RuntimeState {
+    RUNTIME_STATE_UNSPECIFIED = 0;
+    RUNTIME_STATE_DISABLED = 1;
+    RUNTIME_STATE_STOPPED = 2;
+    RUNTIME_STATE_RUNNING = 3;
+    RUNTIME_STATE_FAILED = 4;
+  }
+  bool enabled = 1;
+  bool configuration_complete = 2;
+  bool token_configured = 3;
+  optional string chat_channel_id = 4;
+  optional string agent_channel_id = 5;
+  optional string primary_user_id = 6;
+  RuntimeState runtime_state = 7;
+  optional string runtime_error = 8;
+}
+message GetDiscordIntegrationRequest {}
+message SaveDiscordIntegrationRequest {
+  MutationOptions mutation = 1;
+  reserved 2;
+  string chat_channel_id = 3;
+  string agent_channel_id = 4;
+  string primary_user_id = 5;
+  // Omission preserves the credential already owned by Nakode. An explicitly present blank value is
+  // invalid. This field is never echoed by any response.
+  optional string bot_token = 6;
+}
+message SetDiscordIntegrationEnabledRequest { MutationOptions mutation = 1; bool enabled = 2; }
+message RestartDiscordIntegrationRequest { MutationOptions mutation = 1; }
+
 message ModelOptions { optional string reasoning_effort = 1; bool fast_mode = 2; }
 message ModelTarget {
   oneof target {
@@ -501,12 +554,23 @@ message WorkspaceState {
   repeated SessionBridge session_bridges = 10;
 }
 
+enum BridgeProjectionKind {
+  BRIDGE_PROJECTION_KIND_UNSPECIFIED = 0;
+  BRIDGE_PROJECTION_KIND_USER = 1;
+  BRIDGE_PROJECTION_KIND_ASSISTANT = 2;
+}
+message BridgeProjection {
+  BridgeProjectionKind kind = 1;
+  string turn_id = 2;
+}
 message BridgeDelivery {
   string turn_id = 1;
   string body_sha256 = 2;
   uint64 part_count = 3;
   uint64 completed_parts = 4;
   optional string last_external_message_id = 5;
+  BridgeProjectionKind projection_kind = 6;
+  optional BridgeProjection previous_projection = 7;
 }
 message SessionBridge {
   string session_id = 1;
@@ -520,11 +584,13 @@ message SessionBridge {
   optional string transport = 7;
   optional string external_parent_id = 8;
   optional string external_thread_id = 9;
-  optional string last_delivered_turn_id = 10;
+  reserved 10;
   optional BridgeDelivery delivery = 11;
   optional string live_turn_id = 12;
   optional string live_external_message_id = 13;
   optional string active_source_message_id = 14;
+  // Last user or assistant transcript item durably projected to the bound transport.
+  optional BridgeProjection last_projected = 15;
 }
 
 message ProviderCapabilities { repeated ProviderCapability supported = 1; }
@@ -686,6 +752,8 @@ message TranscriptEntry {
   optional string owner_turn_id = 13;
   optional string resolved_reasoning_effort = 14;
   optional bool resolved_fast_mode = 15;
+  // External transport that originated this user turn. Absent for dashboard/SDK-origin input.
+  optional string source_transport = 16;
 }
 message TranscriptPage { repeated TranscriptEntry entries = 1; bool has_earlier = 2; bool stream_active = 3; string stream_label = 4; }
 message TranscriptBodyWindow { string entry_id = 1; string body = 2; uint64 start_byte = 3; uint64 total_bytes = 4; bool has_earlier = 5; }

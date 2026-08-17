@@ -14,14 +14,14 @@ use std::{
 };
 
 use nakode_protocol::{
-    AgentDefinitionInput, AgentSessionId, BridgeContinuationDisposition, BridgeLifecycle, Command,
-    CommandAccepted, CredentialInput, EntryId, ErrorCode, IdempotencyKey, MAX_ARTIFACT_BYTES,
-    MAX_TRANSCRIPT_DELTA_BYTES, McpGrantPolicy, McpServerInput, McpSessionGrant, ModelTarget,
-    PromptInput, ProviderId, Query, QueryResult, RunId, RunMetadataView, RunTextField, RunView,
-    ServiceCapability, ServiceError, SessionBridgeIntent, SessionId, SessionMetadataView,
-    SessionView, Snapshot, SoulDocumentView, SubscriptionScope, SubscriptionView,
-    TranscriptEntryStatus, TranscriptEntryView, TranscriptOwner, TranscriptPage,
-    TranscriptWindowView, TurnId, ViewEvent, WorkspaceId,
+    AgentDefinitionInput, AgentSessionId, BridgeContinuationDisposition, BridgeLifecycle,
+    BridgeProjectionKind, BridgeProjectionView, Command, CommandAccepted, CredentialInput, EntryId,
+    ErrorCode, IdempotencyKey, MAX_ARTIFACT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES, McpGrantPolicy,
+    McpServerInput, McpSessionGrant, ModelTarget, PromptInput, ProviderId, Query, QueryResult,
+    RunId, RunMetadataView, RunTextField, RunView, ServiceCapability, ServiceError,
+    SessionBridgeIntent, SessionId, SessionMetadataView, SessionView, Snapshot, SoulDocumentView,
+    SubscriptionScope, SubscriptionView, TranscriptEntryStatus, TranscriptEntryView,
+    TranscriptOwner, TranscriptPage, TranscriptWindowView, TurnId, ViewEvent, WorkspaceId,
 };
 use nakode_server::{ServerEndpoint, ServerRequest};
 use sha2::{Digest, Sha256};
@@ -32,8 +32,8 @@ use crate::{
     backend::PromptAttachment,
     service::ServiceEngine,
     session::{
-        BridgeDeliveryRecord, BridgePendingInboundRecord, ProviderRecord, SessionBridgeRecord,
-        SessionRecord,
+        BridgeDeliveryRecord, BridgeInboundTurnOriginRecord, BridgePendingInboundRecord,
+        BridgeProjectionRecord, ProviderRecord, SessionBridgeRecord, SessionRecord,
     },
     soul::{SoulError, SoulSource, SoulStore},
     state::{DomainCommandError, Effect},
@@ -82,6 +82,7 @@ struct PendingPublication {
 #[derive(Clone)]
 pub(crate) struct BridgeStateCheckpoint {
     session_bridges: Vec<SessionBridgeRecord>,
+    inbound_event_dispositions: HashMap<(SessionId, String), BridgeContinuationDisposition>,
     command_cache: HashMap<IdempotencyKey, CachedCommand>,
     command_order: VecDeque<IdempotencyKey>,
     published_workspace: Option<nakode_protocol::BootstrapView>,
@@ -96,6 +97,7 @@ pub struct ServerCore {
     providers: Vec<ProviderRecord>,
     sessions: Vec<SessionRecord>,
     session_bridges: Vec<SessionBridgeRecord>,
+    inbound_event_dispositions: HashMap<(SessionId, String), BridgeContinuationDisposition>,
     command_cache: HashMap<IdempotencyKey, CachedCommand>,
     command_order: VecDeque<IdempotencyKey>,
     published_workspace: Option<nakode_protocol::BootstrapView>,
@@ -121,6 +123,7 @@ impl ServerCore {
             providers,
             sessions,
             session_bridges: Vec::new(),
+            inbound_event_dispositions: HashMap::new(),
             command_cache: HashMap::new(),
             command_order: VecDeque::new(),
             published_workspace: None,
@@ -181,20 +184,37 @@ impl ServerCore {
         &mut self,
         session_id: &SessionId,
         external_event_id: &str,
+        disposition: BridgeContinuationDisposition,
     ) {
-        if let Some(bridge) = self
+        self.remember_bridge_inbound_event(session_id, external_event_id, disposition);
+    }
+
+    fn remember_bridge_inbound_event(
+        &mut self,
+        session_id: &SessionId,
+        external_event_id: &str,
+        disposition: BridgeContinuationDisposition,
+    ) {
+        let evicted = self
             .session_bridges
             .iter_mut()
             .find(|bridge| bridge.session_id == session_id.as_str())
-        {
-            remember_inbound_event(bridge, external_event_id);
+            .and_then(|bridge| remember_inbound_event(bridge, external_event_id));
+        if let Some(evicted) = evicted {
+            self.inbound_event_dispositions
+                .remove(&(session_id.clone(), evicted));
         }
+        self.inbound_event_dispositions.insert(
+            (session_id.clone(), external_event_id.to_owned()),
+            disposition,
+        );
     }
 
     #[must_use]
     pub(crate) fn bridge_state_checkpoint(&self) -> BridgeStateCheckpoint {
         BridgeStateCheckpoint {
             session_bridges: self.session_bridges.clone(),
+            inbound_event_dispositions: self.inbound_event_dispositions.clone(),
             command_cache: self.command_cache.clone(),
             command_order: self.command_order.clone(),
             published_workspace: self.published_workspace.clone(),
@@ -203,6 +223,7 @@ impl ServerCore {
 
     pub(crate) fn restore_bridge_state(&mut self, checkpoint: BridgeStateCheckpoint) {
         self.session_bridges = checkpoint.session_bridges;
+        self.inbound_event_dispositions = checkpoint.inbound_event_dispositions;
         self.command_cache = checkpoint.command_cache;
         self.command_order = checkpoint.command_order;
         self.published_workspace = checkpoint.published_workspace;
@@ -533,38 +554,47 @@ impl ServerCore {
             ),
             Command::PrepareBridgeDelivery {
                 session_id,
+                projection_kind,
                 turn_id,
+                expected_last_projected,
                 body_sha256,
                 part_count,
             } => self.prepare_bridge_delivery_command(
                 &session_id,
+                projection_kind,
                 &turn_id,
+                expected_last_projected.as_ref(),
                 &body_sha256,
                 part_count,
             ),
             Command::CompleteBridgeDeliveryPart {
                 session_id,
+                projection_kind,
                 turn_id,
                 part_index,
                 external_message_id,
             } => self.complete_bridge_delivery_part_command(
                 &session_id,
+                projection_kind,
                 &turn_id,
                 part_index,
                 &external_message_id,
             ),
             Command::FinalizeBridgeDelivery {
                 session_id,
+                projection_kind,
                 turn_id,
-            } => self.finalize_bridge_delivery_command(&session_id, &turn_id),
+            } => self.finalize_bridge_delivery_command(&session_id, projection_kind, &turn_id),
             Command::SetBridgeLiveMessage {
                 session_id,
                 turn_id,
                 external_message_id,
+                clear_active_source_message_id,
             } => self.set_bridge_live_message_command(
                 &session_id,
                 turn_id.as_ref(),
                 external_message_id.as_deref(),
+                clear_active_source_message_id.as_deref(),
             ),
             Command::ContinueSessionFromBridge {
                 session_id,
@@ -811,13 +841,14 @@ impl ServerCore {
                 transport: None,
                 external_parent_id: None,
                 external_thread_id: None,
-                last_delivered_turn_id: None,
+                last_projected: None,
                 delivery: None,
                 live_turn_id: None,
                 live_external_message_id: None,
                 active_source_message_id: None,
                 recent_inbound_event_ids: Vec::new(),
                 pending_inbound: None,
+                inbound_turn_origins: Vec::new(),
                 updated_at_ms: unix_timestamp_ms(),
             };
             effects.insert(0, Effect::PersistSessionBridge(record.clone()));
@@ -963,31 +994,62 @@ impl ServerCore {
     fn prepare_bridge_delivery_command(
         &mut self,
         session_id: &SessionId,
+        projection_kind: BridgeProjectionKind,
         turn_id: &TurnId,
+        expected_last_projected: Option<&BridgeProjectionView>,
         body_sha256: &str,
         part_count: u64,
     ) -> DomainCommandOutcome {
         validate_delivery_plan(body_sha256, part_count)?;
+        let target = BridgeProjectionRecord {
+            kind: projection_kind,
+            turn_id: turn_id.to_string(),
+        };
+        let expected = expected_last_projected.map(|projection| BridgeProjectionRecord {
+            kind: projection.kind,
+            turn_id: projection.turn_id.to_string(),
+        });
         let bridge = self.session_bridge_mut(session_id)?;
-        if bridge.last_delivered_turn_id.as_deref() == Some(turn_id.as_str()) {
+        if bridge.last_projected.as_ref() == Some(&target) {
             return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
         }
+        let zero_part_suppression_allowed = part_count == 0
+            && projection_kind == BridgeProjectionKind::User
+            && bridge.inbound_turn_origins.iter().any(|origin| {
+                origin.turn_id == turn_id.as_str()
+                    && origin.transport == bridge.transport.as_deref().unwrap_or_default()
+            });
+        if part_count == 0 && !zero_part_suppression_allowed {
+            return Err(DomainCommandError::Invalid(
+                "zero-part projection requires trusted inbound user provenance".to_owned(),
+            ));
+        }
         let delivery = BridgeDeliveryRecord {
+            projection_kind,
             turn_id: turn_id.to_string(),
+            previous_projection: expected.clone(),
             body_sha256: body_sha256.to_owned(),
             part_count,
             completed_parts: 0,
             last_external_message_id: None,
         };
         if let Some(current) = &bridge.delivery {
-            if current.turn_id == delivery.turn_id
+            if current.projection_kind == delivery.projection_kind
+                && current.turn_id == delivery.turn_id
+                && current.previous_projection == delivery.previous_projection
                 && current.body_sha256 == delivery.body_sha256
                 && current.part_count == delivery.part_count
             {
                 return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
             }
             return Err(DomainCommandError::Conflict(
-                "another final delivery is already pending for this session".to_owned(),
+                "another transcript delivery is already pending for this session".to_owned(),
+            ));
+        }
+        if bridge.last_projected != expected {
+            return Err(DomainCommandError::Conflict(
+                "bridge transcript projection cursor advanced; refresh before delivering"
+                    .to_owned(),
             ));
         }
         bridge.delivery = Some(delivery);
@@ -999,6 +1061,7 @@ impl ServerCore {
     fn complete_bridge_delivery_part_command(
         &mut self,
         session_id: &SessionId,
+        projection_kind: BridgeProjectionKind,
         turn_id: &TurnId,
         part_index: u64,
         external_message_id: &str,
@@ -1006,11 +1069,11 @@ impl ServerCore {
         validate_external_identity("external message id", external_message_id, 128)?;
         let bridge = self.session_bridge_mut(session_id)?;
         let delivery = bridge.delivery.as_mut().ok_or_else(|| {
-            DomainCommandError::Conflict("no final delivery is pending".to_owned())
+            DomainCommandError::Conflict("no transcript delivery is pending".to_owned())
         })?;
-        if delivery.turn_id != turn_id.as_str() {
+        if delivery.projection_kind != projection_kind || delivery.turn_id != turn_id.as_str() {
             return Err(DomainCommandError::Conflict(
-                "pending final delivery belongs to another turn".to_owned(),
+                "pending transcript delivery belongs to another projection".to_owned(),
             ));
         }
         if part_index >= delivery.part_count {
@@ -1046,30 +1109,50 @@ impl ServerCore {
     fn finalize_bridge_delivery_command(
         &mut self,
         session_id: &SessionId,
+        projection_kind: BridgeProjectionKind,
         turn_id: &TurnId,
     ) -> DomainCommandOutcome {
+        let target = BridgeProjectionRecord {
+            kind: projection_kind,
+            turn_id: turn_id.to_string(),
+        };
         let bridge = self.session_bridge_mut(session_id)?;
-        if bridge.last_delivered_turn_id.as_deref() == Some(turn_id.as_str()) {
+        if bridge.last_projected.as_ref() == Some(&target) {
             return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
         }
         let delivery = bridge.delivery.as_ref().ok_or_else(|| {
-            DomainCommandError::Conflict("no final delivery is pending".to_owned())
+            DomainCommandError::Conflict("no transcript delivery is pending".to_owned())
         })?;
-        if delivery.turn_id != turn_id.as_str() {
+        if delivery.projection_kind != projection_kind || delivery.turn_id != turn_id.as_str() {
             return Err(DomainCommandError::Conflict(
-                "pending final delivery belongs to another turn".to_owned(),
+                "pending transcript delivery belongs to another projection".to_owned(),
+            ));
+        }
+        if bridge.last_projected != delivery.previous_projection {
+            return Err(DomainCommandError::Conflict(
+                "bridge transcript projection cursor changed during delivery".to_owned(),
             ));
         }
         if delivery.completed_parts != delivery.part_count {
             return Err(DomainCommandError::Conflict(
-                "final delivery still has unsent parts".to_owned(),
+                "transcript delivery still has unsent parts".to_owned(),
             ));
         }
-        bridge.last_delivered_turn_id = Some(turn_id.to_string());
+        bridge.last_projected = Some(target);
         bridge.delivery = None;
-        bridge.live_turn_id = None;
-        bridge.live_external_message_id = None;
-        bridge.active_source_message_id = None;
+        if matches!(
+            projection_kind,
+            BridgeProjectionKind::User | BridgeProjectionKind::Assistant
+        ) {
+            bridge
+                .inbound_turn_origins
+                .retain(|origin| origin.turn_id != turn_id.as_str());
+        }
+        if projection_kind == BridgeProjectionKind::Assistant {
+            bridge.live_turn_id = None;
+            bridge.live_external_message_id = None;
+            bridge.active_source_message_id = None;
+        }
         bump_bridge_revision(bridge);
         let effect = Effect::PersistSessionBridge(bridge.clone());
         Ok(Self::accepted(Some(session_id.to_string()), vec![effect]))
@@ -1080,6 +1163,7 @@ impl ServerCore {
         session_id: &SessionId,
         turn_id: Option<&TurnId>,
         external_message_id: Option<&str>,
+        clear_active_source_message_id: Option<&str>,
     ) -> DomainCommandOutcome {
         if turn_id.is_some() != external_message_id.is_some() {
             return Err(DomainCommandError::Invalid(
@@ -1090,22 +1174,45 @@ impl ServerCore {
         if let Some(message_id) = external_message_id {
             validate_external_identity("external message id", message_id, 128)?;
         }
+        if let Some(message_id) = clear_active_source_message_id {
+            validate_external_identity("active source message id", message_id, 128)?;
+        }
         let bridge = self.session_bridge_mut(session_id)?;
+        if let Some(expected) = clear_active_source_message_id
+            && bridge
+                .active_source_message_id
+                .as_deref()
+                .is_some_and(|current| current != expected)
+        {
+            return Err(DomainCommandError::Conflict(
+                "bridge source-message owner changed before terminal cleanup".to_owned(),
+            ));
+        }
         let next_turn = turn_id.map(ToString::to_string);
         let next_message = external_message_id.map(ToOwned::to_owned);
-        if bridge.live_turn_id == next_turn && bridge.live_external_message_id == next_message {
+        let clear_source = clear_active_source_message_id.is_some()
+            && bridge.active_source_message_id.as_deref() == clear_active_source_message_id;
+        if bridge.live_turn_id == next_turn
+            && bridge.live_external_message_id == next_message
+            && !clear_source
+        {
             return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
         }
         bridge.live_turn_id = next_turn;
         bridge.live_external_message_id = next_message;
+        if clear_source {
+            bridge.active_source_message_id = None;
+        }
         bump_bridge_revision(bridge);
         let effect = Effect::PersistSessionBridge(bridge.clone());
         Ok(Self::accepted(Some(session_id.to_string()), vec![effect]))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     // These fields are the complete authenticated external-event identity plus the typed prompt;
-    // preserving them as distinct arguments makes accidental route or dedup-key swaps visible.
+    // preserving them as distinct arguments makes accidental route or dedup-key swaps visible. The
+    // route check, replay disposition, readiness decision, and durable checkpoint stay together so
+    // no accepted or busy branch can bypass the same atomic command boundary.
     fn continue_session_from_bridge_command(
         &mut self,
         session_id: &SessionId,
@@ -1134,15 +1241,36 @@ impl ServerCore {
             .iter()
             .any(|event_id| event_id == external_event_id)
         {
-            return Ok(Self::accepted_bridge_continuation(
+            let replayed = self
+                .inbound_event_dispositions
+                .get(&(session_id.clone(), external_event_id.to_owned()))
+                .copied()
+                .filter(|disposition| {
+                    matches!(
+                        disposition,
+                        BridgeContinuationDisposition::Accepted
+                            | BridgeContinuationDisposition::Busy
+                    )
+                });
+            let replayed_source_active = (replayed
+                == Some(BridgeContinuationDisposition::Accepted))
+            .then(|| bridge.active_source_message_id.as_deref() == Some(source_message_id));
+            let (mut accepted, effects) = Self::accepted_bridge_continuation(
                 session_id,
                 BridgeContinuationDisposition::Duplicate,
                 Vec::new(),
-            ));
+            );
+            accepted.replayed_bridge_continuation = replayed;
+            accepted.replayed_bridge_source_active = replayed_source_active;
+            return Ok((accepted, effects));
         }
         if consume_as_busy {
+            self.remember_bridge_inbound_event(
+                session_id,
+                external_event_id,
+                BridgeContinuationDisposition::Busy,
+            );
             let bridge = self.session_bridge_mut(session_id)?;
-            remember_inbound_event(bridge, external_event_id);
             bump_bridge_revision(bridge);
             let effect = Effect::PersistSessionBridge(bridge.clone());
             return Ok(Self::accepted_bridge_continuation(
@@ -1165,11 +1293,19 @@ impl ServerCore {
         match self
             .session_engine_mut(session_id)?
             .state_mut()
-            .submit_prompt_with_id(client_prompt_id, text, attachments)
-        {
+            .submit_prompt_with_id_and_source(
+                client_prompt_id,
+                text,
+                attachments,
+                Some(transport.to_owned()),
+            ) {
             Ok(mut effects) => {
+                self.remember_bridge_inbound_event(
+                    session_id,
+                    external_event_id,
+                    BridgeContinuationDisposition::Accepted,
+                );
                 let bridge = self.session_bridge_mut(session_id)?;
-                remember_inbound_event(bridge, external_event_id);
                 bridge.active_source_message_id = Some(source_message_id.to_owned());
                 bridge.pending_inbound = Some(pending);
                 bump_bridge_revision(bridge);
@@ -1183,8 +1319,12 @@ impl ServerCore {
             Err(DomainCommandError::Conflict(_)) => {
                 // A busy/not-ready message is consumed durably rather than queued. Replayed gateway
                 // events can therefore never turn into a later prompt after the active turn ends.
+                self.remember_bridge_inbound_event(
+                    session_id,
+                    external_event_id,
+                    BridgeContinuationDisposition::Busy,
+                );
                 let bridge = self.session_bridge_mut(session_id)?;
-                remember_inbound_event(bridge, external_event_id);
                 bump_bridge_revision(bridge);
                 let effect = Effect::PersistSessionBridge(bridge.clone());
                 Ok(Self::accepted_bridge_continuation(
@@ -1203,19 +1343,26 @@ impl ServerCore {
         &mut self,
         session_id: &SessionId,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        let bridge = self.session_bridge(session_id)?;
-        if bridge.lifecycle != BridgeLifecycle::Open {
-            return Ok(Vec::new());
-        }
-        let Some(pending) = bridge.pending_inbound.clone() else {
-            return Ok(Vec::new());
+        let (pending, source_transport) = {
+            let bridge = self.session_bridge(session_id)?;
+            if bridge.lifecycle != BridgeLifecycle::Open {
+                return Ok(Vec::new());
+            }
+            let Some(pending) = bridge.pending_inbound.clone() else {
+                return Ok(Vec::new());
+            };
+            (pending, bridge.transport.clone())
         };
         self.reload_agent_catalogue_for_session(session_id)?;
         match self
             .session_engine_mut(session_id)?
             .state_mut()
-            .submit_prompt_with_id(pending.client_prompt_id, pending.text, pending.attachments)
-        {
+            .submit_prompt_with_id_and_source(
+                pending.client_prompt_id,
+                pending.text,
+                pending.attachments,
+                source_transport,
+            ) {
             Ok(effects) => Ok(effects),
             Err(DomainCommandError::Conflict(_)) => Ok(Vec::new()),
             Err(error) => Err(error),
@@ -1248,6 +1395,67 @@ impl ServerCore {
         } else {
             None
         }
+    }
+
+    pub(crate) fn reapply_bridge_turn_origins(&mut self, session_id: &SessionId) {
+        let origins = self
+            .session_bridges
+            .iter()
+            .find(|bridge| bridge.session_id == session_id.as_str())
+            .map(|bridge| bridge.inbound_turn_origins.clone())
+            .unwrap_or_default();
+        if let Some(engine) = self.sessions_by_id.get_mut(session_id) {
+            for origin in origins {
+                engine
+                    .state_mut()
+                    .set_user_source_transport_for_turn(&origin.turn_id, &origin.transport);
+            }
+        }
+    }
+
+    /// Persists trusted source provenance once the provider assigns the logical turn identity.
+    /// The transcript is the source of truth during the live process; this cursor-pruned bridge
+    /// record restores the association after history rebuilds. A non-transport turn also clears
+    /// stale inbound reaction ownership left by a failed prior transport turn.
+    pub(crate) fn record_bridge_turn_origin(
+        &mut self,
+        session_id: &SessionId,
+        provider_turn_id: &str,
+    ) -> Option<Effect> {
+        let source_transport = self
+            .sessions_by_id
+            .get(session_id)?
+            .state()
+            .user_source_transport_for_turn(provider_turn_id)
+            .map(ToOwned::to_owned);
+        let bridge = self
+            .session_bridges
+            .iter_mut()
+            .find(|bridge| bridge.session_id == session_id.as_str())?;
+        let mut changed = false;
+        if let Some(source_transport) = source_transport.as_deref()
+            && !bridge.inbound_turn_origins.iter().any(|origin| {
+                origin.turn_id == provider_turn_id && origin.transport == source_transport
+            })
+        {
+            bridge
+                .inbound_turn_origins
+                .push(BridgeInboundTurnOriginRecord {
+                    turn_id: provider_turn_id.to_owned(),
+                    transport: source_transport.to_owned(),
+                });
+            changed = true;
+        }
+        if source_transport.as_deref() != bridge.transport.as_deref()
+            && bridge.active_source_message_id.take().is_some()
+        {
+            changed = true;
+        }
+        if !changed {
+            return None;
+        }
+        bump_bridge_revision(bridge);
+        Some(Effect::PersistSessionBridge(bridge.clone()))
     }
 
     /// Clears the durable inbox only after a backend acknowledges the stable prompt client id.
@@ -2069,6 +2277,8 @@ impl ServerCore {
                 resource_id,
                 revision: None,
                 bridge_continuation: None,
+                replayed_bridge_continuation: None,
+                replayed_bridge_source_active: None,
             },
             effects,
         )
@@ -2084,6 +2294,8 @@ impl ServerCore {
                 resource_id: Some(session_id.to_string()),
                 revision: None,
                 bridge_continuation: Some(disposition),
+                replayed_bridge_continuation: None,
+                replayed_bridge_source_active: None,
             },
             effects,
         )
@@ -3189,7 +3401,7 @@ fn validate_external_identity(
     Ok(())
 }
 
-fn validate_delivery_plan(body_sha256: &str, part_count: u64) -> Result<(), DomainCommandError> {
+fn validate_delivery_plan(body_sha256: &str, _part_count: u64) -> Result<(), DomainCommandError> {
     if body_sha256.len() != 64
         || !body_sha256
             .bytes()
@@ -3197,11 +3409,6 @@ fn validate_delivery_plan(body_sha256: &str, part_count: u64) -> Result<(), Doma
     {
         return Err(DomainCommandError::Invalid(
             "bridge delivery body_sha256 must be 64 lowercase hexadecimal characters".to_owned(),
-        ));
-    }
-    if part_count == 0 {
-        return Err(DomainCommandError::Invalid(
-            "bridge delivery must contain at least one part".to_owned(),
         ));
     }
     Ok(())
@@ -3216,20 +3423,23 @@ fn bridge_prompt_id(external_event_id: &str) -> String {
     id
 }
 
-fn remember_inbound_event(bridge: &mut SessionBridgeRecord, external_event_id: &str) {
+fn remember_inbound_event(
+    bridge: &mut SessionBridgeRecord,
+    external_event_id: &str,
+) -> Option<String> {
     if bridge
         .recent_inbound_event_ids
         .iter()
         .any(|existing| existing == external_event_id)
     {
-        return;
+        return None;
     }
-    if bridge.recent_inbound_event_ids.len() == RECENT_INBOUND_CACHE_CAPACITY {
-        bridge.recent_inbound_event_ids.remove(0);
-    }
+    let evicted = (bridge.recent_inbound_event_ids.len() == RECENT_INBOUND_CACHE_CAPACITY)
+        .then(|| bridge.recent_inbound_event_ids.remove(0));
     bridge
         .recent_inbound_event_ids
         .push(external_event_id.to_owned());
+    evicted
 }
 
 fn bump_bridge_revision(bridge: &mut SessionBridgeRecord) {
@@ -3256,12 +3466,19 @@ fn session_bridge_view(bridge: &SessionBridgeRecord) -> nakode_protocol::Session
         transport: bridge.transport.clone(),
         external_parent_id: bridge.external_parent_id.clone(),
         external_thread_id: bridge.external_thread_id.clone(),
-        last_delivered_turn_id: bridge.last_delivered_turn_id.clone().map(TurnId::from),
+        last_projected: bridge.last_projected.as_ref().map(bridge_projection_view),
         delivery: bridge
             .delivery
             .as_ref()
             .map(|delivery| nakode_protocol::BridgeDeliveryView {
-                turn_id: TurnId::from(delivery.turn_id.clone()),
+                projection: BridgeProjectionView {
+                    kind: delivery.projection_kind,
+                    turn_id: TurnId::from(delivery.turn_id.clone()),
+                },
+                previous_projection: delivery
+                    .previous_projection
+                    .as_ref()
+                    .map(bridge_projection_view),
                 body_sha256: delivery.body_sha256.clone(),
                 part_count: delivery.part_count,
                 completed_parts: delivery.completed_parts,
@@ -3270,6 +3487,13 @@ fn session_bridge_view(bridge: &SessionBridgeRecord) -> nakode_protocol::Session
         live_turn_id: bridge.live_turn_id.clone().map(TurnId::from),
         live_external_message_id: bridge.live_external_message_id.clone(),
         active_source_message_id: bridge.active_source_message_id.clone(),
+    }
+}
+
+fn bridge_projection_view(projection: &BridgeProjectionRecord) -> BridgeProjectionView {
+    BridgeProjectionView {
+        kind: projection.kind,
+        turn_id: TurnId::from(projection.turn_id.clone()),
     }
 }
 
@@ -3591,6 +3815,15 @@ impl DispatchOutcome {
         }
     }
 
+    pub(crate) fn bridge_continuation(&self) -> Option<BridgeContinuationDisposition> {
+        self.command_response
+            .as_ref()?
+            .result
+            .as_ref()
+            .ok()?
+            .bridge_continuation
+    }
+
     pub(crate) fn respond_with_error(mut self, error: ServiceError) {
         if let Some(response) = self.command_response.take() {
             let _ = response.respond.send(Err(error));
@@ -3770,14 +4003,14 @@ mod tests {
     use std::collections::BTreeSet;
 
     use nakode_protocol::{
-        AgentDefinitionInput, BridgeContinuationDisposition, BridgeLifecycle, ClientId, Command,
-        ErrorCode, ExternalToolDefinition, IdempotencyKey, MAX_API_MESSAGE_BYTES,
-        MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES, ModelId, ModelOptions,
-        ModelTarget, OrchestratorKind, PromptAttachment as ProtocolPromptAttachment, PromptInput,
-        ProviderAuthenticationView, ProviderId, Query, QueryResult, RunId, RunTextField,
-        ServiceCapabilities, ServiceCapability, SessionBridgeIntent, SessionId,
-        SessionToolConfiguration, SubscriptionScope, SubscriptionView, TranscriptOwner, TurnId,
-        ViewEvent, WorkspaceId,
+        AgentDefinitionInput, BridgeContinuationDisposition, BridgeLifecycle, BridgeProjectionKind,
+        BridgeProjectionView, ClientId, Command, ErrorCode, ExternalToolDefinition, IdempotencyKey,
+        MAX_API_MESSAGE_BYTES, MAX_ARTIFACT_BYTES, MAX_RUN_TEXT_BYTES, MAX_TRANSCRIPT_DELTA_BYTES,
+        ModelId, ModelOptions, ModelTarget, OrchestratorKind,
+        PromptAttachment as ProtocolPromptAttachment, PromptInput, ProviderAuthenticationView,
+        ProviderId, Query, QueryResult, RunId, RunTextField, ServiceCapabilities,
+        ServiceCapability, SessionBridgeIntent, SessionId, SessionToolConfiguration,
+        SubscriptionScope, SubscriptionView, TranscriptOwner, TurnId, ViewEvent, WorkspaceId,
     };
     use nakode_server::{PublishedEvent, ServerEndpoint, ServerRequest};
     use tokio::sync::broadcast;
@@ -3794,8 +4027,8 @@ mod tests {
         personality::PromptAddenda,
         service::ServiceEngine,
         session::{
-            ProviderRecord, SessionBridgeRecord, SessionRecord, SubagentObservability,
-            SubagentRecord,
+            BridgeInboundTurnOriginRecord, BridgeProjectionRecord, ProviderRecord,
+            SessionBridgeRecord, SessionRecord, SubagentObservability, SubagentRecord,
         },
         soul::{SoulSource, SoulStore},
         state::{AppState, DomainCommandError},
@@ -3953,13 +4186,55 @@ mod tests {
             core.bind_session_bridge_thread_command(&session_id, "discord", "100", "102")
                 .is_err()
         );
+        let (other, _) = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                Some("Other chat"),
+                None,
+                &ModelOptions::default(),
+                None,
+                None,
+                Some(SessionBridgeIntent {
+                    kind: OrchestratorKind::Chat,
+                    lifecycle: BridgeLifecycle::Open,
+                    display_title: "Other chat".to_owned(),
+                }),
+                None,
+            )
+            .expect("second bridged session");
+        let other_session_id = SessionId::from(other.resource_id.expect("other session id"));
+        assert!(
+            core.bind_session_bridge_thread_command(&other_session_id, "discord", "100", "101",)
+                .is_err(),
+            "one external thread cannot be cross-wired to concurrent logical sessions"
+        );
+        assert!(
+            core.session_bridge(&other_session_id)
+                .expect("other bridge")
+                .external_thread_id
+                .is_none()
+        );
 
         let turn_id = TurnId::from("turn-1");
         let body_sha256 = "a".repeat(64);
-        core.prepare_bridge_delivery_command(&session_id, &turn_id, &body_sha256, 2)
-            .expect("prepare");
+        core.prepare_bridge_delivery_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &turn_id,
+            None,
+            &body_sha256,
+            2,
+        )
+        .expect("prepare");
         let (_, duplicate_prepare) = core
-            .prepare_bridge_delivery_command(&session_id, &turn_id, &body_sha256, 2)
+            .prepare_bridge_delivery_command(
+                &session_id,
+                BridgeProjectionKind::Assistant,
+                &turn_id,
+                None,
+                &body_sha256,
+                2,
+            )
             .expect("lost prepare response is idempotent");
         assert!(duplicate_prepare.is_empty());
         let prepared = core
@@ -3970,15 +4245,33 @@ mod tests {
             .expect("prepared delivery");
         assert_eq!(prepared.completed_parts, 0);
         assert!(prepared.last_external_message_id.is_none());
-        core.complete_bridge_delivery_part_command(&session_id, &turn_id, 0, "200")
-            .expect("first part");
+        core.complete_bridge_delivery_part_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &turn_id,
+            0,
+            "200",
+        )
+        .expect("first part");
         let (_, duplicate_first_part) = core
-            .complete_bridge_delivery_part_command(&session_id, &turn_id, 0, "200")
+            .complete_bridge_delivery_part_command(
+                &session_id,
+                BridgeProjectionKind::Assistant,
+                &turn_id,
+                0,
+                "200",
+            )
             .expect("lost-response retry is idempotent");
         assert!(duplicate_first_part.is_empty());
         assert!(
-            core.complete_bridge_delivery_part_command(&session_id, &turn_id, 0, "different")
-                .is_err(),
+            core.complete_bridge_delivery_part_command(
+                &session_id,
+                BridgeProjectionKind::Assistant,
+                &turn_id,
+                0,
+                "different"
+            )
+            .is_err(),
             "the last completed part cannot be acknowledged with a different message"
         );
         let delivery = core
@@ -3991,12 +4284,22 @@ mod tests {
         assert_eq!(delivery.last_external_message_id.as_deref(), Some("200"));
         assert_eq!(delivery.part_count, 2);
         assert!(
-            core.complete_bridge_delivery_part_command(&session_id, &turn_id, 2, "202")
-                .is_err()
+            core.complete_bridge_delivery_part_command(
+                &session_id,
+                BridgeProjectionKind::Assistant,
+                &turn_id,
+                2,
+                "202"
+            )
+            .is_err()
         );
         assert!(
-            core.finalize_bridge_delivery_command(&session_id, &turn_id)
-                .is_err()
+            core.finalize_bridge_delivery_command(
+                &session_id,
+                BridgeProjectionKind::Assistant,
+                &turn_id,
+            )
+            .is_err()
         );
 
         core.clear_session_bridge_thread_command(&session_id, "discord", "101")
@@ -4011,18 +4314,44 @@ mod tests {
         assert!(reset.last_external_message_id.is_none());
         core.bind_session_bridge_thread_command(&session_id, "discord", "100", "102")
             .expect("bind replacement thread");
-        core.complete_bridge_delivery_part_command(&session_id, &turn_id, 0, "300")
-            .expect("first part is resent to replacement thread");
-        core.complete_bridge_delivery_part_command(&session_id, &turn_id, 1, "301")
-            .expect("second part");
-        core.finalize_bridge_delivery_command(&session_id, &turn_id)
-            .expect("finalize");
+        core.complete_bridge_delivery_part_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &turn_id,
+            0,
+            "300",
+        )
+        .expect("first part is resent to replacement thread");
+        core.complete_bridge_delivery_part_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &turn_id,
+            1,
+            "301",
+        )
+        .expect("second part");
+        core.finalize_bridge_delivery_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &turn_id,
+        )
+        .expect("finalize");
         let (_, duplicate_finalize) = core
-            .finalize_bridge_delivery_command(&session_id, &turn_id)
+            .finalize_bridge_delivery_command(
+                &session_id,
+                BridgeProjectionKind::Assistant,
+                &turn_id,
+            )
             .expect("finalization is idempotent");
         assert!(duplicate_finalize.is_empty());
         let bridge = core.session_bridge(&session_id).expect("bridge");
-        assert_eq!(bridge.last_delivered_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(
+            bridge.last_projected.as_ref(),
+            Some(&BridgeProjectionRecord {
+                kind: BridgeProjectionKind::Assistant,
+                turn_id: "turn-1".to_owned(),
+            })
+        );
         assert!(bridge.delivery.is_none());
 
         core.set_session_bridge_lifecycle_command(&session_id, BridgeLifecycle::Archived)
@@ -4030,6 +4359,113 @@ mod tests {
         assert_eq!(
             core.session_bridge(&session_id).expect("bridge").lifecycle,
             BridgeLifecycle::Archived
+        );
+    }
+
+    #[test]
+    fn bridge_projection_cursor_enforces_user_before_assistant_and_rejects_stale_workers() {
+        let (mut core, _) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let (accepted, _) = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                Some("Ordered projection"),
+                None,
+                &ModelOptions::default(),
+                None,
+                None,
+                Some(SessionBridgeIntent {
+                    kind: OrchestratorKind::Chat,
+                    lifecycle: BridgeLifecycle::Open,
+                    display_title: "Ordered projection".to_owned(),
+                }),
+                None,
+            )
+            .expect("bridged session");
+        let session_id = SessionId::from(accepted.resource_id.expect("session id"));
+        let turn_id = TurnId::from("turn-ordered");
+        let body_sha256 = "b".repeat(64);
+
+        core.prepare_bridge_delivery_command(
+            &session_id,
+            BridgeProjectionKind::User,
+            &turn_id,
+            None,
+            &body_sha256,
+            1,
+        )
+        .expect("prepare user");
+        core.complete_bridge_delivery_part_command(
+            &session_id,
+            BridgeProjectionKind::User,
+            &turn_id,
+            0,
+            "user-message",
+        )
+        .expect("checkpoint user");
+        core.finalize_bridge_delivery_command(&session_id, BridgeProjectionKind::User, &turn_id)
+            .expect("finalize user");
+
+        assert!(
+            core.prepare_bridge_delivery_command(
+                &session_id,
+                BridgeProjectionKind::Assistant,
+                &turn_id,
+                None,
+                &body_sha256,
+                1,
+            )
+            .is_err(),
+            "a stale worker cannot prepare against the pre-user cursor"
+        );
+        let user_cursor = BridgeProjectionView {
+            kind: BridgeProjectionKind::User,
+            turn_id: turn_id.clone(),
+        };
+        core.prepare_bridge_delivery_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &turn_id,
+            Some(&user_cursor),
+            &body_sha256,
+            1,
+        )
+        .expect("prepare assistant after user");
+        core.complete_bridge_delivery_part_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &turn_id,
+            0,
+            "assistant-message",
+        )
+        .expect("checkpoint assistant");
+        core.finalize_bridge_delivery_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &turn_id,
+        )
+        .expect("finalize assistant");
+
+        assert!(
+            core.prepare_bridge_delivery_command(
+                &session_id,
+                BridgeProjectionKind::User,
+                &TurnId::from("later-turn"),
+                Some(&user_cursor),
+                &body_sha256,
+                1,
+            )
+            .is_err(),
+            "a stale predecessor cannot regress the assistant cursor"
+        );
+        assert_eq!(
+            core.session_bridge(&session_id)
+                .expect("bridge")
+                .last_projected,
+            Some(BridgeProjectionRecord {
+                kind: BridgeProjectionKind::Assistant,
+                turn_id: turn_id.to_string(),
+            })
         );
     }
 
@@ -4124,6 +4560,11 @@ mod tests {
             duplicate_result.bridge_continuation,
             Some(BridgeContinuationDisposition::Duplicate)
         );
+        assert_eq!(
+            duplicate_result.replayed_bridge_continuation,
+            Some(BridgeContinuationDisposition::Accepted)
+        );
+        assert_eq!(duplicate_result.replayed_bridge_source_active, Some(true));
         assert!(duplicate.is_empty());
         let (busy_result, busy_effects) = core
             .continue_session_from_bridge_command(
@@ -4144,6 +4585,27 @@ mod tests {
             busy_effects.as_slice(),
             [crate::state::Effect::PersistSessionBridge(_)]
         ));
+        let (busy_duplicate, duplicate_effects) = core
+            .continue_session_from_bridge_command(
+                &session_id,
+                "discord",
+                "101",
+                "event-2",
+                "message-2",
+                prompt.clone(),
+                false,
+            )
+            .expect("busy duplicate event");
+        assert_eq!(
+            busy_duplicate.bridge_continuation,
+            Some(BridgeContinuationDisposition::Duplicate)
+        );
+        assert_eq!(
+            busy_duplicate.replayed_bridge_continuation,
+            Some(BridgeContinuationDisposition::Busy)
+        );
+        assert_eq!(busy_duplicate.replayed_bridge_source_active, None);
+        assert!(duplicate_effects.is_empty());
         let session = core.session_view(&session_id).expect("session");
         assert!(
             session.queue.is_empty(),
@@ -4192,6 +4654,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn accepted_bridge_continuation_replays_stable_prompt_until_backend_acknowledges_it() {
         let (mut core, session_id) = ready_codex_server();
         let workspace = core
@@ -4210,13 +4673,14 @@ mod tests {
             transport: None,
             external_parent_id: None,
             external_thread_id: None,
-            last_delivered_turn_id: None,
+            last_projected: None,
             delivery: None,
             live_turn_id: None,
             live_external_message_id: None,
             active_source_message_id: None,
             recent_inbound_event_ids: Vec::new(),
             pending_inbound: None,
+            inbound_turn_origins: Vec::new(),
             updated_at_ms: unix_timestamp_ms(),
         });
         core.bind_session_bridge_thread_command(&session_id, "discord", "100", "101")
@@ -4285,6 +4749,111 @@ mod tests {
                 if client_id == &initial_client_id
         )));
 
+        core.engine_for_mut(&session_id)
+            .expect("session")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnStarted {
+                    turn_id: "provider-turn-42".to_owned(),
+                },
+            );
+        assert!(
+            core.record_bridge_turn_origin(&session_id, "provider-turn-42")
+                .is_some(),
+            "provider turn provenance is durably checkpointed"
+        );
+        let transcript = core.session_view(&session_id).expect("session").transcript;
+        let user = transcript
+            .entries
+            .iter()
+            .find(|entry| entry.kind == nakode_protocol::TranscriptEntryKind::User)
+            .expect("bridge user entry");
+        assert_eq!(
+            user.owner_turn_id.as_ref().map(TurnId::as_str),
+            Some("provider-turn-42")
+        );
+        assert_eq!(user.source_transport.as_deref(), Some("discord"));
+        assert_eq!(
+            core.session_bridge(&session_id)
+                .expect("bridge")
+                .inbound_turn_origins,
+            [BridgeInboundTurnOriginRecord {
+                turn_id: "provider-turn-42".to_owned(),
+                transport: "discord".to_owned(),
+            }]
+        );
+
+        let provider_turn = TurnId::from("provider-turn-42");
+        let empty_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        core.prepare_bridge_delivery_command(
+            &session_id,
+            BridgeProjectionKind::User,
+            &provider_turn,
+            None,
+            empty_sha256,
+            0,
+        )
+        .expect("trusted Discord user is suppressed with a zero-message checkpoint");
+        core.finalize_bridge_delivery_command(
+            &session_id,
+            BridgeProjectionKind::User,
+            &provider_turn,
+        )
+        .expect("advance suppressed user cursor");
+        assert!(
+            core.session_bridge(&session_id)
+                .expect("bridge")
+                .inbound_turn_origins
+                .is_empty(),
+            "provenance is pruned only after the typed cursor passes its user projection"
+        );
+        let (_, duplicate_suppression) = core
+            .prepare_bridge_delivery_command(
+                &session_id,
+                BridgeProjectionKind::User,
+                &provider_turn,
+                None,
+                empty_sha256,
+                0,
+            )
+            .expect("lost suppression response is idempotent after provenance pruning");
+        assert!(duplicate_suppression.is_empty());
+        let user_cursor = BridgeProjectionView {
+            kind: BridgeProjectionKind::User,
+            turn_id: provider_turn.clone(),
+        };
+        core.prepare_bridge_delivery_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &provider_turn,
+            Some(&user_cursor),
+            empty_sha256,
+            1,
+        )
+        .expect("assistant follows the suppressed user cursor");
+        core.complete_bridge_delivery_part_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &provider_turn,
+            0,
+            "assistant-message",
+        )
+        .expect("assistant checkpoint");
+        core.finalize_bridge_delivery_command(
+            &session_id,
+            BridgeProjectionKind::Assistant,
+            &provider_turn,
+        )
+        .expect("assistant finalization");
+        assert!(
+            core.session_bridge(&session_id)
+                .expect("bridge")
+                .inbound_turn_origins
+                .is_empty(),
+            "assistant finalization keeps already-pruned provenance empty"
+        );
+
         assert!(
             core.acknowledge_bridge_prompt(&session_id, &initial_client_id)
                 .is_some()
@@ -4295,6 +4864,42 @@ mod tests {
                 .pending_inbound
                 .is_none()
         );
+
+        {
+            let bridge = core.session_bridge_mut(&session_id).expect("bridge");
+            bridge.active_source_message_id = Some("stale-discord-source".to_owned());
+        }
+        assert!(
+            core.record_bridge_turn_origin(&session_id, "dashboard-origin-turn")
+                .is_some(),
+            "a source-neutral provider turn clears stale Discord reaction ownership"
+        );
+        assert!(
+            core.session_bridge(&session_id)
+                .expect("bridge")
+                .active_source_message_id
+                .is_none()
+        );
+
+        {
+            let bridge = core.session_bridge_mut(&session_id).expect("bridge");
+            bridge.active_source_message_id = Some("failed-source".to_owned());
+            bridge.live_turn_id = Some("failed-turn".to_owned());
+            bridge.live_external_message_id = Some("failed-live".to_owned());
+        }
+        assert!(
+            core.set_bridge_live_message_command(&session_id, None, None, Some("newer-source"),)
+                .is_err(),
+            "terminal cleanup cannot clear a newer source-message owner"
+        );
+        core.set_bridge_live_message_command(&session_id, None, None, Some("failed-source"))
+            .expect("compare-and-clear failed terminal state");
+        let bridge = core.session_bridge(&session_id).expect("bridge");
+        assert!(bridge.active_source_message_id.is_none());
+        assert!(bridge.live_turn_id.is_none());
+        assert!(bridge.live_external_message_id.is_none());
+        core.set_bridge_live_message_command(&session_id, None, None, Some("failed-source"))
+            .expect("lost terminal cleanup response is idempotent");
     }
 
     fn shell_command(session_id: &SessionId, command: &str) -> Command {
@@ -5591,6 +6196,7 @@ first_message = "Starting review"
                 owner_turn_id: None,
                 reasoning_effort: None,
                 fast_mode: None,
+                source_transport: None,
                 tool_audit_json: None,
             }],
             observability: SubagentObservability::default(),
@@ -5648,6 +6254,7 @@ first_message = "Starting review"
                     owner_turn_id: None,
                     reasoning_effort: None,
                     fast_mode: None,
+                    source_transport: None,
                     tool_audit_json: None,
                 })
                 .collect(),
@@ -5880,6 +6487,7 @@ first_message = "Starting review"
                 owner_turn_id: None,
                 reasoning_effort: None,
                 fast_mode: None,
+                source_transport: None,
                 tool_audit_json: None,
             }],
             observability: SubagentObservability::default(),

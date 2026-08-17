@@ -3,7 +3,7 @@
 //! Conversion lives here so provider/runtime protocol types never leak into
 //! the public generated contract. The adapter never owns domain state.
 
-use std::pin::Pin;
+use std::{pin::Pin, sync::Arc};
 
 use futures_util::Stream;
 use nakode_api::v1 as api;
@@ -12,11 +12,35 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{PublishedEvent, ServerEndpoint};
 
+/// Root-owned Discord management mutation injected into the dependency-neutral gRPC facade.
+/// Credential debug output remains redacted through [`protocol::CredentialInput`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiscordManagementMutation {
+    Save(protocol::DiscordIntegrationInput),
+    SetEnabled(bool),
+    Restart,
+}
+
+/// Dependency-inverted authority for installation configuration and the current service's Discord
+/// transport. The root application implements this because it owns private credential storage and
+/// transport supervision; `nakode-server` never depends on either implementation.
+#[tonic::async_trait]
+pub trait DiscordManagement: Send + Sync {
+    async fn get(&self) -> Result<protocol::DiscordIntegrationView, protocol::ServiceError>;
+
+    async fn mutate(
+        &self,
+        idempotency_key: protocol::IdempotencyKey,
+        mutation: DiscordManagementMutation,
+    ) -> Result<protocol::DiscordIntegrationView, protocol::ServiceError>;
+}
+
 /// Public gRPC facade over one authoritative [`ServerEndpoint`].
 #[derive(Clone)]
 pub struct GrpcService {
     endpoint: ServerEndpoint,
     client_id: protocol::ClientId,
+    discord_management: Option<Arc<dyn DiscordManagement>>,
 }
 
 impl GrpcService {
@@ -25,7 +49,15 @@ impl GrpcService {
         Self {
             endpoint,
             client_id: protocol::ClientId::new(format!("grpc-{}", uuid::Uuid::now_v7())),
+            discord_management: None,
         }
+    }
+
+    /// Installs the root-owned Discord configuration and transport authority.
+    #[must_use]
+    pub fn with_discord_management(mut self, management: Arc<dyn DiscordManagement>) -> Self {
+        self.discord_management = Some(management);
+        self
     }
 
     #[must_use]
@@ -90,6 +122,30 @@ impl GrpcService {
             .await
             .map_err(status)
     }
+
+    fn discord_management(&self) -> Result<Arc<dyn DiscordManagement>, tonic::Status> {
+        self.discord_management.clone().ok_or_else(|| {
+            tonic::Status::unimplemented("Discord management is unavailable in this service")
+        })
+    }
+
+    fn discord_mutation_key(
+        options: Option<api::MutationOptions>,
+    ) -> Result<protocol::IdempotencyKey, tonic::Status> {
+        let options =
+            options.ok_or_else(|| tonic::Status::invalid_argument("mutation is required"))?;
+        if options.idempotency_key.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "mutation.idempotency_key is required",
+            ));
+        }
+        if options.expected_revision.is_some() {
+            return Err(tonic::Status::invalid_argument(
+                "Discord management mutations do not accept expected_revision",
+            ));
+        }
+        Ok(protocol::IdempotencyKey::new(options.idempotency_key))
+    }
 }
 
 type ApiStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
@@ -107,6 +163,32 @@ fn status(error: protocol::ServiceError) -> tonic::Status {
         protocol::ErrorCode::Internal => tonic::Code::Internal,
     };
     tonic::Status::new(code, error.message)
+}
+
+fn discord_integration(value: protocol::DiscordIntegrationView) -> api::DiscordIntegration {
+    let runtime_state = match value.runtime_state {
+        protocol::DiscordRuntimeState::Disabled => api::discord_integration::RuntimeState::Disabled,
+        protocol::DiscordRuntimeState::Stopped => api::discord_integration::RuntimeState::Stopped,
+        protocol::DiscordRuntimeState::Running => api::discord_integration::RuntimeState::Running,
+        protocol::DiscordRuntimeState::Failed => api::discord_integration::RuntimeState::Failed,
+    };
+    api::DiscordIntegration {
+        enabled: value.enabled,
+        configuration_complete: value.configuration_complete,
+        token_configured: value.token_configured,
+        chat_channel_id: value.chat_channel_id,
+        agent_channel_id: value.agent_channel_id,
+        primary_user_id: value.primary_user_id,
+        runtime_state: runtime_state.into(),
+        runtime_error: value.runtime_error,
+    }
+}
+
+fn advertise_capability(
+    value: protocol::ServiceCapability,
+    discord_management_available: bool,
+) -> bool {
+    value != protocol::ServiceCapability::DiscordManagement || discord_management_available
 }
 
 fn prompt(value: Option<api::PromptInput>) -> Result<protocol::PromptInput, tonic::Status> {
@@ -593,6 +675,64 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
 
+    async fn get_discord_integration(
+        &self,
+        _request: tonic::Request<api::GetDiscordIntegrationRequest>,
+    ) -> Result<tonic::Response<api::DiscordIntegration>, tonic::Status> {
+        let value = self.discord_management()?.get().await.map_err(status)?;
+        Ok(tonic::Response::new(discord_integration(value)))
+    }
+
+    async fn save_discord_integration(
+        &self,
+        request: tonic::Request<api::SaveDiscordIntegrationRequest>,
+    ) -> Result<tonic::Response<api::DiscordIntegration>, tonic::Status> {
+        let input = request.into_inner();
+        let key = Self::discord_mutation_key(input.mutation)?;
+        let value = self
+            .discord_management()?
+            .mutate(
+                key,
+                DiscordManagementMutation::Save(protocol::DiscordIntegrationInput {
+                    chat_channel_id: input.chat_channel_id,
+                    agent_channel_id: input.agent_channel_id,
+                    primary_user_id: input.primary_user_id,
+                    bot_token: input.bot_token.map(protocol::CredentialInput),
+                }),
+            )
+            .await
+            .map_err(status)?;
+        Ok(tonic::Response::new(discord_integration(value)))
+    }
+
+    async fn set_discord_integration_enabled(
+        &self,
+        request: tonic::Request<api::SetDiscordIntegrationEnabledRequest>,
+    ) -> Result<tonic::Response<api::DiscordIntegration>, tonic::Status> {
+        let input = request.into_inner();
+        let key = Self::discord_mutation_key(input.mutation)?;
+        let value = self
+            .discord_management()?
+            .mutate(key, DiscordManagementMutation::SetEnabled(input.enabled))
+            .await
+            .map_err(status)?;
+        Ok(tonic::Response::new(discord_integration(value)))
+    }
+
+    async fn restart_discord_integration(
+        &self,
+        request: tonic::Request<api::RestartDiscordIntegrationRequest>,
+    ) -> Result<tonic::Response<api::DiscordIntegration>, tonic::Status> {
+        let input = request.into_inner();
+        let key = Self::discord_mutation_key(input.mutation)?;
+        let value = self
+            .discord_management()?
+            .mutate(key, DiscordManagementMutation::Restart)
+            .await
+            .map_err(status)?;
+        Ok(tonic::Response::new(discord_integration(value)))
+    }
+
     command_rpc!(
         create_session,
         api::CreateSessionRequest,
@@ -658,36 +798,49 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             external_thread_id: input.external_thread_id,
         }
     );
-    command_rpc!(
+    try_command_rpc!(
         prepare_bridge_delivery,
         api::PrepareBridgeDeliveryRequest,
         input,
-        protocol::Command::PrepareBridgeDelivery {
-            session_id: protocol::SessionId::from(input.session_id),
-            turn_id: protocol::TurnId::from(input.turn_id),
-            body_sha256: input.body_sha256,
-            part_count: input.part_count,
-        }
+        (|| -> Result<protocol::Command, tonic::Status> {
+            Ok(protocol::Command::PrepareBridgeDelivery {
+                session_id: protocol::SessionId::from(input.session_id),
+                projection_kind: bridge_projection_kind(input.projection_kind)?,
+                turn_id: protocol::TurnId::from(input.turn_id),
+                expected_last_projected: input
+                    .expected_last_projected
+                    .map(bridge_projection)
+                    .transpose()?,
+                body_sha256: input.body_sha256,
+                part_count: input.part_count,
+            })
+        })()
     );
-    command_rpc!(
+    try_command_rpc!(
         complete_bridge_delivery_part,
         api::CompleteBridgeDeliveryPartRequest,
         input,
-        protocol::Command::CompleteBridgeDeliveryPart {
-            session_id: protocol::SessionId::from(input.session_id),
-            turn_id: protocol::TurnId::from(input.turn_id),
-            part_index: input.part_index,
-            external_message_id: input.external_message_id,
-        }
+        bridge_projection_kind(input.projection_kind).map(|projection_kind| {
+            protocol::Command::CompleteBridgeDeliveryPart {
+                session_id: protocol::SessionId::from(input.session_id),
+                projection_kind,
+                turn_id: protocol::TurnId::from(input.turn_id),
+                part_index: input.part_index,
+                external_message_id: input.external_message_id,
+            }
+        })
     );
-    command_rpc!(
+    try_command_rpc!(
         finalize_bridge_delivery,
         api::FinalizeBridgeDeliveryRequest,
         input,
-        protocol::Command::FinalizeBridgeDelivery {
-            session_id: protocol::SessionId::from(input.session_id),
-            turn_id: protocol::TurnId::from(input.turn_id),
-        }
+        bridge_projection_kind(input.projection_kind).map(|projection_kind| {
+            protocol::Command::FinalizeBridgeDelivery {
+                session_id: protocol::SessionId::from(input.session_id),
+                projection_kind,
+                turn_id: protocol::TurnId::from(input.turn_id),
+            }
+        })
     );
     command_rpc!(
         set_bridge_live_message,
@@ -697,6 +850,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             session_id: protocol::SessionId::from(input.session_id),
             turn_id: input.turn_id.map(protocol::TurnId::from),
             external_message_id: input.external_message_id,
+            clear_active_source_message_id: input.clear_active_source_message_id,
         }
     );
     async fn continue_session_from_bridge(
@@ -720,22 +874,27 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 },
             )
             .await?;
-        let disposition = match result.bridge_continuation {
-            Some(protocol::BridgeContinuationDisposition::Accepted) => {
+        let wire_disposition = |disposition| match disposition {
+            protocol::BridgeContinuationDisposition::Accepted => {
                 api::BridgeContinuationDisposition::Accepted
             }
-            Some(protocol::BridgeContinuationDisposition::Duplicate) => {
+            protocol::BridgeContinuationDisposition::Duplicate => {
                 api::BridgeContinuationDisposition::Duplicate
             }
-            Some(protocol::BridgeContinuationDisposition::Busy) => {
+            protocol::BridgeContinuationDisposition::Busy => {
                 api::BridgeContinuationDisposition::Busy
             }
-            None => {
-                return Err(tonic::Status::internal(
-                    "bridge continuation result omitted its disposition",
-                ));
-            }
         };
+        let disposition = result
+            .bridge_continuation
+            .map(wire_disposition)
+            .ok_or_else(|| {
+                tonic::Status::internal("bridge continuation result omitted its disposition")
+            })?;
+        let replayed_disposition = result
+            .replayed_bridge_continuation
+            .map(wire_disposition)
+            .map(|disposition| disposition as i32);
         Ok(tonic::Response::new(
             api::ContinueSessionFromBridgeResponse {
                 mutation: Some(api::MutationResult {
@@ -743,6 +902,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                     revision: result.revision,
                 }),
                 disposition: disposition as i32,
+                replayed_disposition,
+                replayed_source_active: result.replayed_bridge_source_active,
             },
         ))
     }
@@ -1310,6 +1471,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .capabilities()
                 .supported
                 .iter()
+                .filter(|value| advertise_capability(**value, self.discord_management.is_some()))
                 .map(|value| format!("{value:?}"))
                 .collect(),
         }))
@@ -1596,9 +1758,14 @@ fn session_bridge(value: protocol::SessionBridgeView) -> api::SessionBridge {
         transport: value.transport,
         external_parent_id: value.external_parent_id,
         external_thread_id: value.external_thread_id,
-        last_delivered_turn_id: value.last_delivered_turn_id.map(|id| id.to_string()),
+        last_projected: value.last_projected.as_ref().map(api_bridge_projection),
         delivery: value.delivery.map(|delivery| api::BridgeDelivery {
-            turn_id: delivery.turn_id.to_string(),
+            projection_kind: api_bridge_projection_kind(delivery.projection.kind),
+            turn_id: delivery.projection.turn_id.to_string(),
+            previous_projection: delivery
+                .previous_projection
+                .as_ref()
+                .map(api_bridge_projection),
             body_sha256: delivery.body_sha256,
             part_count: delivery.part_count,
             completed_parts: delivery.completed_parts,
@@ -1607,6 +1774,39 @@ fn session_bridge(value: protocol::SessionBridgeView) -> api::SessionBridge {
         live_turn_id: value.live_turn_id.map(|id| id.to_string()),
         live_external_message_id: value.live_external_message_id,
         active_source_message_id: value.active_source_message_id,
+    }
+}
+
+fn bridge_projection_kind(value: i32) -> Result<protocol::BridgeProjectionKind, tonic::Status> {
+    match api::BridgeProjectionKind::try_from(value) {
+        Ok(api::BridgeProjectionKind::User) => Ok(protocol::BridgeProjectionKind::User),
+        Ok(api::BridgeProjectionKind::Assistant) => Ok(protocol::BridgeProjectionKind::Assistant),
+        Ok(api::BridgeProjectionKind::Unspecified) | Err(_) => Err(
+            tonic::Status::invalid_argument("bridge projection kind must be user or assistant"),
+        ),
+    }
+}
+
+fn bridge_projection(
+    value: api::BridgeProjection,
+) -> Result<protocol::BridgeProjectionView, tonic::Status> {
+    Ok(protocol::BridgeProjectionView {
+        kind: bridge_projection_kind(value.kind)?,
+        turn_id: protocol::TurnId::from(value.turn_id),
+    })
+}
+
+fn api_bridge_projection_kind(value: protocol::BridgeProjectionKind) -> i32 {
+    match value {
+        protocol::BridgeProjectionKind::User => api::BridgeProjectionKind::User as i32,
+        protocol::BridgeProjectionKind::Assistant => api::BridgeProjectionKind::Assistant as i32,
+    }
+}
+
+fn api_bridge_projection(value: &protocol::BridgeProjectionView) -> api::BridgeProjection {
+    api::BridgeProjection {
+        kind: api_bridge_projection_kind(value.kind),
+        turn_id: value.turn_id.to_string(),
     }
 }
 
@@ -1986,6 +2186,7 @@ fn transcript_entry(value: protocol::TranscriptEntryView) -> api::TranscriptEntr
             .collect(),
         provider_id: value.provider_id,
         model_id: value.model_id.map(|id| id.to_string()),
+        source_transport: value.source_transport,
         tool_audit_json: value.tool_audit_json,
         created_at_ms: value.created_at_ms,
         owner_turn_id: value.owner_turn_id.map(|id| id.to_string()),
@@ -2321,6 +2522,49 @@ fn diagnostics_totals(value: &protocol::DiagnosticsUsageTotals) -> api::Diagnost
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discord_management_capability_is_advertised_only_when_injected() {
+        assert!(!advertise_capability(
+            protocol::ServiceCapability::DiscordManagement,
+            false,
+        ));
+        assert!(advertise_capability(
+            protocol::ServiceCapability::DiscordManagement,
+            true,
+        ));
+        assert!(advertise_capability(
+            protocol::ServiceCapability::OrchestratorThreadBridge,
+            false,
+        ));
+    }
+
+    #[test]
+    fn discord_mutations_require_an_idempotency_key_without_a_revision() {
+        let missing = GrpcService::discord_mutation_key(None).expect_err("missing options");
+        assert_eq!(missing.code(), tonic::Code::InvalidArgument);
+
+        let blank = GrpcService::discord_mutation_key(Some(api::MutationOptions {
+            idempotency_key: String::new(),
+            expected_revision: None,
+        }))
+        .expect_err("blank idempotency key");
+        assert_eq!(blank.code(), tonic::Code::InvalidArgument);
+
+        let revision = GrpcService::discord_mutation_key(Some(api::MutationOptions {
+            idempotency_key: "discord-save".to_owned(),
+            expected_revision: Some(4),
+        }))
+        .expect_err("installation state has no workspace revision");
+        assert_eq!(revision.code(), tonic::Code::InvalidArgument);
+
+        let key = GrpcService::discord_mutation_key(Some(api::MutationOptions {
+            idempotency_key: "discord-save".to_owned(),
+            expected_revision: None,
+        }))
+        .expect("valid key");
+        assert_eq!(key.as_str(), "discord-save");
+    }
 
     #[test]
     fn queue_redirect_reservation_projects_to_grpc() {

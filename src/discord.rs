@@ -15,17 +15,15 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use directories::ProjectDirs;
 use futures_util::{StreamExt, TryStreamExt, future::BoxFuture, future::FutureExt};
-use nakode_sdk::{HydratedSession, NakodeClient, SdkError, v1 as api};
+use nakode_sdk::{HydratedSession, NakodeClient, SdkError, Watch, v1 as api};
 use reqwest::Client as HttpClient;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serenity::{
     all::{
@@ -38,12 +36,30 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
-use crate::{
-    config::{Config, DiscordAction},
-    control_service::{
-        ServicePaths, TransportAction, TransportController, TransportStatus, TransportSupervisor,
-    },
+#[cfg(test)]
+use crate::control_service::TransportSupervisor;
+use crate::control_service::{TransportController, TransportStatus};
+
+mod config;
+
+mod ingress;
+
+mod projection;
+
+use projection::{
+    ProjectionItem, ProjectionKind, RecoverySpool, completed_projections,
+    projection_clears_stale_source, projection_from_entry, same_projection,
 };
+
+use ingress::IngressSpool;
+#[cfg(test)]
+use ingress::prune_ingress_tombstones;
+
+use config::validate_snowflake;
+pub use config::{DiscordConfig, DiscordConfigStore, run_command};
+#[cfg(test)]
+use config::{DiscordManagementService, DiscordManagementState};
+pub(crate) use config::{management_service, transport_supervisor};
 
 const CONFIG_VERSION: u32 = 2;
 const MAX_TOKEN_BYTES: usize = 8 * 1024;
@@ -54,12 +70,25 @@ const DISCORD_CHUNK_SIZE: usize = DISCORD_MESSAGE_LIMIT - 100;
 const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(500);
 const RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const BRIDGE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+const DISCORD_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const GATEWAY_IDENTIFY_INTERVAL: Duration = Duration::from_secs(5);
+const GATEWAY_IDENTIFY_POLL: Duration = Duration::from_millis(100);
+const CHILD_JOIN_GRACE: Duration = Duration::from_secs(1);
 const MAX_INBOUND_INFLIGHT: usize = 16;
+// When an overloaded gateway event arrives before this workspace can prove thread ownership, keep
+// only a second bounded tier of stripped route metadata. The owning workspace can then return Busy
+// without a non-owning same-token gateway reacting in somebody else's thread.
+const MAX_PENDING_ROUTE_REJECTIONS: usize = 16;
 const MAX_ACTIVE_MULTIPART_ASSEMBLIES: usize = 32;
 const MAX_ACTIVE_MULTIPART_ASSEMBLIES_PER_SESSION: usize = 1;
+const MAX_MULTIPART_PARTS: u32 = 256;
+const MAX_MULTIPART_BYTES: usize = 512 * 1024;
 const MAX_NONCE_SEARCH_PAGES: usize = 64;
+const MAX_INGRESS_TOMBSTONES: usize = 16 * 1_024;
+const INGRESS_TOMBSTONE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const MULTIPART_TTL: Duration = Duration::from_secs(30 * 60);
 const TRANSPORT_NAME: &str = "discord";
+const MAX_MANAGEMENT_REPLAYS: usize = 128;
 const REACTION_ACCEPTED: &str = "🔄";
 const REACTION_LIVE: &str = "🟡";
 const REACTION_COMPLETED: &str = "✅";
@@ -67,108 +96,36 @@ const REACTION_FAILED: &str = "⚠️";
 const REACTION_BUSY: &str = "❌";
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-fn default_config_version() -> u32 {
-    CONFIG_VERSION
+fn cached_thread_route_is_current(
+    config: &DiscordConfig,
+    bridges: &HashMap<String, api::SessionBridge>,
+    thread_id: u64,
+    session_id: &str,
+) -> bool {
+    bridges
+        .get(session_id)
+        .and_then(|bridge| valid_open_thread_route(config, bridge))
+        .is_some_and(|(current_thread_id, current_session_id)| {
+            current_thread_id == thread_id && current_session_id == session_id
+        })
 }
 
-/// Persisted system configuration for the Discord orchestrator bridge.
-///
-/// The bot token is intentionally absent and remains in the private token file managed by
-/// [`DiscordConfigStore`]. Thread/session mappings are authoritative Nakode state and are never
-/// duplicated in this file.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct DiscordConfig {
-    #[serde(default = "default_config_version")]
-    pub version: u32,
-    pub enabled: bool,
-    pub chat_channel_id: Option<String>,
-    pub agent_channel_id: Option<String>,
-    pub primary_user_id: Option<String>,
-}
-
-impl Default for DiscordConfig {
-    fn default() -> Self {
-        Self {
-            version: CONFIG_VERSION,
-            enabled: false,
-            chat_channel_id: None,
-            agent_channel_id: None,
-            primary_user_id: None,
-        }
+fn valid_open_thread_route(
+    config: &DiscordConfig,
+    bridge: &api::SessionBridge,
+) -> Option<(u64, String)> {
+    if bridge.lifecycle != api::BridgeLifecycle::Open as i32
+        || bridge.transport.as_deref() != Some(TRANSPORT_NAME)
+    {
+        return None;
     }
-}
-
-impl DiscordConfig {
-    /// Validates persisted configuration without contacting Discord or the Nakode server.
-    pub fn validate(&self) -> Result<(), DiscordError> {
-        if self.version != CONFIG_VERSION {
-            return Err(DiscordError::InvalidConfig(format!(
-                "unsupported Discord configuration version {}; rerun `nakode transport discord setup`",
-                self.version
-            )));
-        }
-        for (field, value) in [
-            ("chat_channel_id", self.chat_channel_id.as_deref()),
-            ("agent_channel_id", self.agent_channel_id.as_deref()),
-            ("primary_user_id", self.primary_user_id.as_deref()),
-        ] {
-            if let Some(value) = value {
-                validate_snowflake(field, value)?;
-            }
-        }
-        if self.enabled {
-            let chat = self.chat_channel_id.as_deref().ok_or_else(|| {
-                DiscordError::InvalidConfig(
-                    "chat_channel_id is required when Discord is enabled".to_owned(),
-                )
-            })?;
-            let agent = self.agent_channel_id.as_deref().ok_or_else(|| {
-                DiscordError::InvalidConfig(
-                    "agent_channel_id is required when Discord is enabled".to_owned(),
-                )
-            })?;
-            if self.primary_user_id.is_none() {
-                return Err(DiscordError::InvalidConfig(
-                    "primary_user_id is required when Discord is enabled".to_owned(),
-                ));
-            }
-            if chat == agent {
-                return Err(DiscordError::InvalidConfig(
-                    "Chat and Agent orchestrators require different parent channels".to_owned(),
-                ));
-            }
-        }
-        Ok(())
+    let kind = api::OrchestratorKind::try_from(bridge.kind).ok()?;
+    let expected_parent = config.parent_channel(kind)?.get().to_string();
+    if bridge.external_parent_id.as_deref() != Some(expected_parent.as_str()) {
+        return None;
     }
-
-    fn parent_channel(&self, kind: api::OrchestratorKind) -> Option<ChannelId> {
-        let value = match kind {
-            api::OrchestratorKind::Chat => self.chat_channel_id.as_deref(),
-            api::OrchestratorKind::Agent => self.agent_channel_id.as_deref(),
-            api::OrchestratorKind::Unspecified => None,
-        }?;
-        value.parse::<u64>().ok().map(ChannelId::new)
-    }
-
-    fn is_primary_user(&self, user_id: UserId) -> bool {
-        self.primary_user_id
-            .as_deref()
-            .is_some_and(|configured| configured == user_id.get().to_string())
-    }
-}
-
-fn validate_snowflake(field: &str, value: &str) -> Result<u64, DiscordError> {
-    let value = value.trim();
-    let parsed = value.parse::<u64>().map_err(|_| DiscordError::InvalidId {
-        field: field.to_owned(),
-    })?;
-    if parsed == 0 {
-        return Err(DiscordError::InvalidId {
-            field: field.to_owned(),
-        });
-    }
-    Ok(parsed)
+    let thread_id = bridge.external_thread_id.as_deref()?.parse::<u64>().ok()?;
+    Some((thread_id, bridge.session_id.clone()))
 }
 
 /// Errors returned by Discord configuration and runtime operations.
@@ -206,139 +163,32 @@ pub enum DiscordError {
         "combined Discord prompt attachments exceed the {MAX_TOTAL_ATTACHMENT_BYTES} byte limit"
     )]
     CombinedAttachmentsTooLarge,
+    #[error("Discord multipart prompt exceeds the {MAX_MULTIPART_PARTS}-part limit")]
+    MultipartTooManyParts,
+    #[error("Discord multipart prompt exceeds the {MAX_MULTIPART_BYTES}-byte limit")]
+    MultipartTooLarge,
     #[error("Discord attachment {name:?} is not a supported HTTPS image")]
     UnsupportedAttachment { name: String },
     #[error("Discord durable ingress store failed")]
     IngressStore(#[source] rusqlite::Error),
+    #[error("Discord durable ingress worker stopped")]
+    IngressWorker,
     #[error("Discord durable ingress payload is invalid")]
     IngressPayload(#[source] serde_json::Error),
     #[error("Discord delivery cursor is outside the bounded hydrated transcript")]
     DeliveryCursorUnavailable,
+    #[error("Discord transcript projection cursor changed concurrently")]
+    ProjectionCursorConflict,
+    #[error("Nakode bridge RPC exceeded its bounded deadline")]
+    BridgeRpcTimeout,
+    #[error("Discord gateway shutdown exceeded its bounded deadline")]
+    GatewayShutdownTimeout,
     #[error("the workspace service is not running; run `nakode start` first")]
     ServiceNotRunning,
     #[error("Discord transport control failed: {0}")]
     Control(#[from] crate::control_service::ControlError),
     #[error("Discord setup input failed: {0}")]
     SetupInput(#[source] io::Error),
-}
-
-/// Private system configuration plus workspace-scoped transport state.
-/// Credentials and channel/user snowflakes are installation-level. Durable ingress/recovery files
-/// remain workspace-hashed so independent Nakode authorities never consume each other's work.
-#[derive(Clone, Debug)]
-pub struct DiscordConfigStore {
-    configuration_directory: PathBuf,
-    directory: PathBuf,
-}
-
-impl DiscordConfigStore {
-    /// Opens the private store associated with one canonical workspace.
-    pub fn for_workspace(workspace: &Path) -> Result<Self, DiscordError> {
-        let root = if let Some(configured) = std::env::var_os("NAKODE_DISCORD_DIR") {
-            PathBuf::from(configured)
-        } else {
-            ProjectDirs::from("dev", "nakode", "Nakode")
-                .map(|project| project.data_local_dir().join("discord"))
-                .ok_or(DiscordError::MissingDataDirectory)?
-        };
-        Self::from_root(workspace, &root)
-    }
-
-    fn from_root(workspace: &Path, root: &Path) -> Result<Self, DiscordError> {
-        let workspace = workspace
-            .canonicalize()
-            .map_err(|source| io_error(workspace, source))?;
-        let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
-        let mut key = String::with_capacity(32);
-        for byte in &digest[..16] {
-            key.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
-            key.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
-        }
-        prepare_private_directory(root)?;
-        let workspace_root = root.join("workspaces");
-        prepare_private_directory(&workspace_root)?;
-        let directory = workspace_root.join(key);
-        prepare_private_directory(&directory)?;
-        Ok(Self {
-            configuration_directory: root.to_path_buf(),
-            directory,
-        })
-    }
-
-    #[must_use]
-    pub fn config_path(&self) -> PathBuf {
-        self.configuration_directory.join("discord.toml")
-    }
-
-    #[must_use]
-    pub fn token_path(&self) -> PathBuf {
-        self.configuration_directory.join("discord.token")
-    }
-
-    /// Loads the public configuration. Missing configuration is equivalent to
-    /// the disabled default.
-    pub fn load(&self) -> Result<DiscordConfig, DiscordError> {
-        let path = self.config_path();
-        if !path.exists() {
-            return Ok(DiscordConfig::default());
-        }
-        let source = std::fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
-        let config: DiscordConfig = toml::from_str(&source)?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    /// Atomically saves public configuration without the token.
-    pub fn save(&self, config: &DiscordConfig) -> Result<(), DiscordError> {
-        config.validate()?;
-        let encoded = toml::to_string_pretty(config)?;
-        atomic_write(&self.config_path(), format!("{encoded}\n").as_bytes())
-    }
-
-    /// Returns the token without ever including it in a debug representation
-    /// or status response.
-    pub fn read_token(&self) -> Result<String, DiscordError> {
-        let path = self.token_path();
-        if !path.exists() {
-            return Err(DiscordError::MissingToken);
-        }
-        let source = std::fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
-        if source.len() > MAX_TOKEN_BYTES {
-            return Err(DiscordError::TokenTooLarge);
-        }
-        let token = source.trim().to_owned();
-        if token.is_empty() {
-            return Err(DiscordError::MissingToken);
-        }
-        Ok(token)
-    }
-
-    #[must_use]
-    pub fn token_configured(&self) -> bool {
-        self.token_path().is_file()
-    }
-
-    /// Replaces the token using a private, atomically renamed file.
-    pub fn save_token(&self, token: &str) -> Result<(), DiscordError> {
-        let token = token.trim();
-        if token.is_empty() {
-            return Err(DiscordError::MissingToken);
-        }
-        if token.len() > MAX_TOKEN_BYTES {
-            return Err(DiscordError::TokenTooLarge);
-        }
-        atomic_write(&self.token_path(), format!("{token}\n").as_bytes())
-    }
-
-    /// Removes the token while retaining non-secret configuration.
-    pub fn delete_token(&self) -> Result<(), DiscordError> {
-        let path = self.token_path();
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(io_error(&path, source)),
-        }
-    }
 }
 
 fn io_error(path: &Path, source: io::Error) -> DiscordError {
@@ -379,299 +229,6 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), DiscordError> {
     Ok(())
 }
 
-/// Handles a `nakode transport discord ...` command.
-pub async fn run_command(config: &Config, action: DiscordAction) -> Result<(), DiscordError> {
-    let store = DiscordConfigStore::for_workspace(&config.workspace)?;
-    let paths = crate::control_service::ServicePaths::of(config)?;
-    match action {
-        DiscordAction::Setup {
-            chat_channel_id,
-            agent_channel_id,
-            primary_user_id,
-        } => {
-            setup(&store, chat_channel_id, agent_channel_id, primary_user_id)?;
-            start_or_reload(&paths, "Discord configuration applied").await?;
-        }
-        DiscordAction::Status { json } => status(&store, &paths, json).await?,
-        DiscordAction::Enable => {
-            set_enabled(&store, true)?;
-            report_live_action(&paths, TransportAction::Start, "Discord frontend started").await?;
-        }
-        DiscordAction::Disable => {
-            set_enabled(&store, false)?;
-            report_live_action(&paths, TransportAction::Stop, "Discord frontend stopped").await?;
-        }
-        DiscordAction::Start => {
-            report_required_action(&paths, TransportAction::Start, "Discord frontend started")
-                .await?;
-        }
-        DiscordAction::Stop => {
-            report_required_action(&paths, TransportAction::Stop, "Discord frontend stopped")
-                .await?;
-        }
-        DiscordAction::Restart => {
-            report_required_action(
-                &paths,
-                TransportAction::Restart,
-                "Discord frontend restarted",
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-fn setup(
-    store: &DiscordConfigStore,
-    chat_channel_id: Option<String>,
-    agent_channel_id: Option<String>,
-    primary_user_id: Option<String>,
-) -> Result<(), DiscordError> {
-    let existing = store.load()?;
-    let token = rpassword::prompt_password("Discord bot token (input hidden): ")
-        .map_err(DiscordError::SetupInput)?;
-    let chat_channel_id = match chat_channel_id {
-        Some(channel_id) => channel_id,
-        None => prompt_line(
-            "Chat Orchestrator parent-channel ID",
-            existing.chat_channel_id.as_deref().unwrap_or_default(),
-            true,
-        )?,
-    };
-    let agent_channel_id = match agent_channel_id {
-        Some(channel_id) => channel_id,
-        None => prompt_line(
-            "Agent Orchestrator parent-channel ID",
-            existing.agent_channel_id.as_deref().unwrap_or_default(),
-            true,
-        )?,
-    };
-    let primary_user_id = match primary_user_id {
-        Some(user_id) => user_id,
-        None => prompt_line(
-            "Primary Discord user ID",
-            existing.primary_user_id.as_deref().unwrap_or_default(),
-            true,
-        )?,
-    };
-
-    let next = DiscordConfig {
-        version: CONFIG_VERSION,
-        enabled: true,
-        chat_channel_id: Some(chat_channel_id.trim().to_owned()),
-        agent_channel_id: Some(agent_channel_id.trim().to_owned()),
-        primary_user_id: Some(primary_user_id.trim().to_owned()),
-    };
-    next.validate()?;
-    store.save_token(&token)?;
-    store.save(&next)?;
-    println!("Discord orchestrator bridge configured and enabled for automatic service startup.");
-    Ok(())
-}
-
-async fn report_required_action(
-    paths: &ServicePaths,
-    action: TransportAction,
-    message: &str,
-) -> Result<(), DiscordError> {
-    let status = match crate::control_service::transport_action(paths, "discord", action).await {
-        Ok(status) => status,
-        Err(error) if service_unavailable(&error) => return Err(DiscordError::ServiceNotRunning),
-        Err(error) => return Err(error.into()),
-    };
-    println!(
-        "{message}; native service remains running (transport running: {}).",
-        status.running
-    );
-    Ok(())
-}
-
-async fn report_live_action(
-    paths: &ServicePaths,
-    action: TransportAction,
-    message: &str,
-) -> Result<(), DiscordError> {
-    match crate::control_service::transport_action(paths, "discord", action).await {
-        Ok(status) => {
-            println!("{message} (transport running: {}).", status.running);
-            Ok(())
-        }
-        Err(error) if service_unavailable(&error) => {
-            println!(
-                "Configuration saved. The workspace service is not running, so no live Discord transport was changed."
-            );
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn service_unavailable(error: &crate::control_service::ControlError) -> bool {
-    matches!(
-        error,
-        crate::control_service::ControlError::Io { source, .. }
-            if matches!(
-                source.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            )
-    )
-}
-
-async fn status(
-    store: &DiscordConfigStore,
-    paths: &ServicePaths,
-    json: bool,
-) -> Result<(), DiscordError> {
-    let config = store.load()?;
-    let token_configured = store.token_configured();
-    let runtime =
-        match crate::control_service::transport_action(paths, "discord", TransportAction::Status)
-            .await
-        {
-            Ok(status) => Some(status),
-            Err(error) if service_unavailable(&error) => None,
-            Err(error) => return Err(error.into()),
-        };
-    if json {
-        #[derive(Serialize)]
-        struct Status<'a> {
-            enabled: bool,
-            token_configured: bool,
-            chat_channel_id: Option<&'a str>,
-            agent_channel_id: Option<&'a str>,
-            primary_user_id: Option<&'a str>,
-            config_path: String,
-            runtime: Option<&'a TransportStatus>,
-        }
-        let status = Status {
-            enabled: config.enabled,
-            token_configured,
-            chat_channel_id: config.chat_channel_id.as_deref(),
-            agent_channel_id: config.agent_channel_id.as_deref(),
-            primary_user_id: config.primary_user_id.as_deref(),
-            config_path: store.config_path().display().to_string(),
-            runtime: runtime.as_ref(),
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&status).expect("status is serializable")
-        );
-    } else {
-        println!("Discord enabled: {}", config.enabled);
-        println!("Discord token configured: {token_configured}");
-        match &runtime {
-            Some(status) => println!(
-                "Discord runtime: {}",
-                if status.running { "running" } else { "stopped" }
-            ),
-            None => println!("Discord runtime: workspace service not running"),
-        }
-        println!(
-            "Chat Orchestrator channel: {}",
-            config
-                .chat_channel_id
-                .as_deref()
-                .unwrap_or("not configured")
-        );
-        println!(
-            "Agent Orchestrator channel: {}",
-            config
-                .agent_channel_id
-                .as_deref()
-                .unwrap_or("not configured")
-        );
-        println!(
-            "Primary Discord user: {}",
-            config
-                .primary_user_id
-                .as_deref()
-                .unwrap_or("not configured")
-        );
-        println!("Configuration: {}", store.config_path().display());
-    }
-    Ok(())
-}
-
-async fn start_or_reload(paths: &ServicePaths, message: &str) -> Result<(), DiscordError> {
-    match crate::control_service::transport_action(paths, "discord", TransportAction::Status).await
-    {
-        Ok(status) => {
-            let action = if status.running {
-                TransportAction::Restart
-            } else {
-                TransportAction::Start
-            };
-            let status = crate::control_service::transport_action(paths, "discord", action).await?;
-            println!("{message} (transport running: {}).", status.running);
-            Ok(())
-        }
-        Err(error) if service_unavailable(&error) => {
-            println!(
-                "Configuration saved. The workspace service is not running; start it and run `nakode transport discord start` to activate Discord."
-            );
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn set_enabled(store: &DiscordConfigStore, enabled: bool) -> Result<(), DiscordError> {
-    let mut config = store.load()?;
-    config.enabled = enabled;
-    config.validate()?;
-    if enabled {
-        let _ = store.read_token()?;
-    }
-    store.save(&config)?;
-    println!(
-        "Discord frontend {} for automatic service startup.",
-        if enabled { "enabled" } else { "disabled" }
-    );
-    Ok(())
-}
-
-fn prompt_line(prompt: &str, default: &str, required: bool) -> Result<String, DiscordError> {
-    loop {
-        if default.is_empty() {
-            print!("{prompt}: ");
-        } else {
-            print!("{prompt} [{default}]: ");
-        }
-        io::stdout().flush().map_err(DiscordError::SetupInput)?;
-        let mut line = String::new();
-        io::stdin()
-            .read_line(&mut line)
-            .map_err(DiscordError::SetupInput)?;
-        let value = line.trim();
-        let value = if value.is_empty() { default } else { value };
-        if !required || !value.is_empty() {
-            return Ok(value.to_owned());
-        }
-        println!("A value is required.");
-    }
-}
-
-/// Creates the workspace's registered frontend transports.
-///
-/// The supervisor is deliberately generic: future transports can implement
-/// [`TransportController`] and register alongside Discord without changing the
-/// native service lifecycle.
-pub(crate) fn transport_supervisor(workspace: &Path, endpoint: PathBuf) -> TransportSupervisor {
-    match DiscordTransport::new(workspace, endpoint) {
-        Ok(transport) => TransportSupervisor::new([(
-            "discord".to_owned(),
-            Arc::new(transport) as Arc<dyn TransportController>,
-        )]),
-        Err(error) => {
-            eprintln!(
-                "nakode discord: could not open configuration ({})",
-                sanitized_bridge_error(&error)
-            );
-            TransportSupervisor::default()
-        }
-    }
-}
-
 struct DiscordTransport {
     workspace: PathBuf,
     endpoint: PathBuf,
@@ -699,7 +256,7 @@ impl DiscordTransport {
         })
     }
 
-    async fn start_inner(&self, only_if_enabled: bool) -> Result<TransportStatus, DiscordError> {
+    async fn start_inner(&self, _only_if_enabled: bool) -> Result<TransportStatus, DiscordError> {
         let config = self.store.load()?;
         {
             let runtime = self.runtime.lock().await;
@@ -711,10 +268,6 @@ impl DiscordTransport {
                 return Ok(status_for(&config, &runtime));
             }
         }
-        if only_if_enabled && !config.enabled {
-            return Ok(self.status_for_config(&config).await);
-        }
-        let token = self.store.read_token()?;
         let mut runtime = self.runtime.lock().await;
         if runtime
             .task
@@ -734,26 +287,28 @@ impl DiscordTransport {
         let store = self.store.clone();
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
         let task_config = config.clone();
-        let task =
-            tokio::spawn(async move {
-                let error =
-                    match run_gateway(task_config, token, workspace, endpoint, store, shutdown_rx)
-                        .await
-                    {
-                        Ok(()) => None,
-                        Err(error) => {
-                            let sanitized = sanitized_bridge_error(&error).to_owned();
-                            eprintln!("nakode discord: {sanitized}");
-                            Some(sanitized)
-                        }
-                    };
-                let mut runtime = task_runtime.lock().await;
-                if runtime.generation == generation {
-                    runtime.task = None;
-                    runtime.shutdown = None;
-                    runtime.error = error;
-                }
-            });
+        let task = tokio::spawn(async move {
+            // Every workspace service owns only its authoritative workspace projection and ingress
+            // state. Discord gateway events fan out to each bot session; this runtime admits only
+            // exact typed thread mappings owned by this workspace.
+            let error =
+                match run_managed_gateway(task_config, workspace, endpoint, store, shutdown_rx)
+                    .await
+                {
+                    Ok(()) => None,
+                    Err(error) => {
+                        let sanitized = sanitized_bridge_error(&error).to_owned();
+                        eprintln!("nakode discord: {sanitized}");
+                        Some(sanitized)
+                    }
+                };
+            let mut runtime = task_runtime.lock().await;
+            if runtime.generation == generation {
+                runtime.task = None;
+                runtime.shutdown = None;
+                runtime.error = error;
+            }
+        });
         runtime.task = Some(task);
         runtime.shutdown = Some(shutdown);
         Ok(status_for(&config, &runtime))
@@ -821,10 +376,11 @@ fn status_for(config: &DiscordConfig, runtime: &DiscordRuntime) -> TransportStat
     TransportStatus {
         name: "discord".to_owned(),
         enabled: config.enabled,
-        running: runtime
-            .task
-            .as_ref()
-            .is_some_and(|task| !task.is_finished()),
+        running: config.enabled
+            && runtime
+                .task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished()),
         error: runtime.error.clone(),
     }
 }
@@ -904,6 +460,10 @@ trait DiscordApi: Send + Sync {
         thread_id: ChannelId,
         archived: bool,
     ) -> Result<(), serenity::Error>;
+    async fn parent_channel_id(
+        &self,
+        thread_id: ChannelId,
+    ) -> Result<Option<ChannelId>, serenity::Error>;
     async fn messages_page(
         &self,
         channel_id: ChannelId,
@@ -935,6 +495,14 @@ struct SerenityDiscordApi {
     http: Arc<serenity::http::Http>,
 }
 
+async fn discord_http<T>(
+    operation: impl std::future::Future<Output = Result<T, serenity::Error>>,
+) -> Result<T, serenity::Error> {
+    tokio::time::timeout(DISCORD_HTTP_TIMEOUT, operation)
+        .await
+        .map_err(|_| serenity::Error::Other("discord HTTP operation timed out"))?
+}
+
 #[async_trait]
 impl DiscordApi for SerenityDiscordApi {
     async fn send_message(
@@ -951,7 +519,7 @@ impl DiscordApi for SerenityDiscordApi {
                 .nonce(serenity::all::Nonce::String(nonce.to_owned()))
                 .enforce_nonce(true);
         }
-        let message = channel_id.send_message(&self.http, request).await?;
+        let message = discord_http(channel_id.send_message(&self.http, request)).await?;
         Ok(external_message(&message))
     }
 
@@ -961,15 +529,16 @@ impl DiscordApi for SerenityDiscordApi {
         message_id: MessageId,
         content: &str,
     ) -> Result<(), serenity::Error> {
-        channel_id
-            .edit_message(
+        discord_http(
+            channel_id.edit_message(
                 &self.http,
                 message_id,
                 EditMessage::new()
                     .content(content)
                     .allowed_mentions(disabled_mentions()),
-            )
-            .await?;
+            ),
+        )
+        .await?;
         Ok(())
     }
 
@@ -979,10 +548,13 @@ impl DiscordApi for SerenityDiscordApi {
         starter_message_id: MessageId,
         title: &str,
     ) -> Result<ChannelId, serenity::Error> {
-        Ok(parent_channel_id
-            .create_thread_from_message(&self.http, starter_message_id, CreateThread::new(title))
-            .await?
-            .id)
+        Ok(discord_http(parent_channel_id.create_thread_from_message(
+            &self.http,
+            starter_message_id,
+            CreateThread::new(title),
+        ))
+        .await?
+        .id)
     }
 
     async fn set_thread_archived(
@@ -990,13 +562,24 @@ impl DiscordApi for SerenityDiscordApi {
         thread_id: ChannelId,
         archived: bool,
     ) -> Result<(), serenity::Error> {
-        thread_id
-            .edit_thread(
-                &self.http,
-                serenity::all::EditThread::new().archived(archived),
-            )
-            .await?;
+        discord_http(thread_id.edit_thread(
+            &self.http,
+            serenity::all::EditThread::new().archived(archived),
+        ))
+        .await?;
         Ok(())
+    }
+
+    async fn parent_channel_id(
+        &self,
+        thread_id: ChannelId,
+    ) -> Result<Option<ChannelId>, serenity::Error> {
+        Ok(
+            match discord_http(thread_id.to_channel(&self.http)).await? {
+                serenity::all::Channel::Guild(channel) => channel.parent_id,
+                _ => None,
+            },
+        )
     }
 
     async fn messages_page(
@@ -1008,8 +591,7 @@ impl DiscordApi for SerenityDiscordApi {
         if let Some(before) = before {
             request = request.before(before);
         }
-        Ok(channel_id
-            .messages(&self.http, request)
+        Ok(discord_http(channel_id.messages(&self.http, request))
             .await?
             .iter()
             .map(external_message)
@@ -1022,13 +604,12 @@ impl DiscordApi for SerenityDiscordApi {
         message_id: MessageId,
         emoji: &str,
     ) -> Result<(), serenity::Error> {
-        channel_id
-            .create_reaction(
-                &self.http,
-                message_id,
-                serenity::all::ReactionType::Unicode(emoji.to_owned()),
-            )
-            .await
+        discord_http(channel_id.create_reaction(
+            &self.http,
+            message_id,
+            serenity::all::ReactionType::Unicode(emoji.to_owned()),
+        ))
+        .await
     }
 
     async fn remove_own_reaction(
@@ -1037,14 +618,13 @@ impl DiscordApi for SerenityDiscordApi {
         message_id: MessageId,
         emoji: &str,
     ) -> Result<(), serenity::Error> {
-        channel_id
-            .delete_reaction(
-                &self.http,
-                message_id,
-                None,
-                serenity::all::ReactionType::Unicode(emoji.to_owned()),
-            )
-            .await
+        discord_http(channel_id.delete_reaction(
+            &self.http,
+            message_id,
+            None,
+            serenity::all::ReactionType::Unicode(emoji.to_owned()),
+        ))
+        .await
     }
 }
 
@@ -1072,6 +652,7 @@ struct MultipartGroup {
     session_id: String,
     total: u32,
     received: HashMap<u32, (String, String)>,
+    received_bytes: usize,
     updated: Instant,
 }
 
@@ -1155,6 +736,7 @@ impl MultipartAssembler {
             session_id: session_id.to_owned(),
             total: part.total,
             received: HashMap::new(),
+            received_bytes: 0,
             updated: Instant::now(),
         });
         if group.total != part.total {
@@ -1171,6 +753,10 @@ impl MultipartAssembler {
                 ));
             }
         } else {
+            let received_bytes = group.received_bytes.saturating_add(part.body.len());
+            if received_bytes > MAX_MULTIPART_BYTES {
+                return Err(DiscordError::MultipartTooLarge);
+            }
             atomic_write(
                 &group.directory.join(format!("{:010}.part", part.index)),
                 part.body.as_bytes(),
@@ -1178,13 +764,14 @@ impl MultipartAssembler {
             group
                 .received
                 .insert(part.index, (body_hash, message_id.get().to_string()));
+            group.received_bytes = received_bytes;
         }
         group.updated = Instant::now();
         if group.received.len() != usize::try_from(group.total).unwrap_or(usize::MAX) {
             return Ok(MultipartOutcome::Waiting);
         }
 
-        let mut text = String::new();
+        let mut text = String::with_capacity(group.received_bytes);
         let mut event_material = format!("{session_id}:{}:{}", part.group, group.total);
         for index in 1..=group.total {
             let source = std::fs::read_to_string(group.directory.join(format!("{index:010}.part")))
@@ -1249,12 +836,24 @@ fn parse_multipart(value: &str) -> Option<Result<MultipartPart<'_>, DiscordError
         .parse::<u32>()
         .ok()
         .zip(total.parse::<u32>().ok())
-        .filter(|(index, total)| *index > 0 && *total > 0 && index <= total);
+        .filter(|(index, total)| {
+            *index > 0 && *total > 0 && index <= total && *total <= MAX_MULTIPART_PARTS
+        });
     Some(parsed.map_or_else(
         || {
-            Err(DiscordError::InvalidConfig(
-                "multipart part numbers must be positive and no greater than the total".to_owned(),
-            ))
+            Err(
+                if total
+                    .parse::<u32>()
+                    .is_ok_and(|total| total > MAX_MULTIPART_PARTS)
+                {
+                    DiscordError::MultipartTooManyParts
+                } else {
+                    DiscordError::InvalidConfig(
+                        "multipart part numbers must be positive and no greater than the total"
+                            .to_owned(),
+                    )
+                },
+            )
         },
         |(index, total)| {
             Ok(MultipartPart {
@@ -1289,16 +888,22 @@ struct IngressRecord {
     attachments: Vec<IngressAttachment>,
     multipart_group: Option<String>,
     forced_busy: bool,
+    /// The durable ingress tombstone already owns this capacity rejection; no replay row exists.
+    #[serde(default)]
+    local_terminal: bool,
+    #[serde(default)]
+    route_pending: bool,
 }
 
 impl IngressRecord {
-    fn from_message(session_id: String, message: &Message, forced_busy: bool) -> Self {
+    fn from_message(session_id: Option<String>, message: &Message, forced_busy: bool) -> Self {
         let multipart_group = parse_multipart(&message.content)
             .and_then(Result::ok)
             .map(|part| part.group.to_owned());
+        let route_pending = session_id.is_none();
         Self {
             version: INGRESS_SCHEMA_VERSION,
-            session_id,
+            session_id: session_id.unwrap_or_default(),
             thread_id: message.channel_id.get().to_string(),
             message_id: message.id.get().to_string(),
             author_id: message.author.id.get().to_string(),
@@ -1316,6 +921,8 @@ impl IngressRecord {
                 .collect(),
             multipart_group,
             forced_busy,
+            local_terminal: false,
+            route_pending,
         }
     }
 }
@@ -1333,264 +940,6 @@ fn unix_time_ms_i64() -> i64 {
     i64::try_from(unix_time_ms()).unwrap_or(i64::MAX)
 }
 
-struct IngressSpool {
-    connection: std::sync::Mutex<Connection>,
-}
-
-impl IngressSpool {
-    fn open(path: &Path) -> Result<Self, DiscordError> {
-        if let Some(parent) = path.parent() {
-            prepare_private_directory(parent)?;
-        }
-        let connection = Connection::open(path).map_err(DiscordError::IngressStore)?;
-        connection
-            .busy_timeout(Duration::from_secs(5))
-            .map_err(DiscordError::IngressStore)?;
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = FULL;
-                 CREATE TABLE IF NOT EXISTS discord_ingress (
-                   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                   external_event_id TEXT NOT NULL UNIQUE,
-                   session_id TEXT NOT NULL,
-                   multipart_group TEXT,
-                   payload_json BLOB NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS discord_ingress_tombstones (
-                   external_event_id TEXT PRIMARY KEY,
-                   recorded_at_ms INTEGER NOT NULL
-                 );",
-            )
-            .map_err(DiscordError::IngressStore)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|source| io_error(path, source))?;
-        }
-        Ok(Self {
-            connection: std::sync::Mutex::new(connection),
-        })
-    }
-
-    /// Durably admits a gateway event. `None` means this identity already reached a terminal local
-    /// or authoritative disposition and must not be reconsidered after a reconnect or reopen.
-    fn enqueue(&self, proposed: &IngressRecord) -> Result<Option<IngressRecord>, DiscordError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // An immediate transaction serializes admission across Nakode processes before either the
-        // per-session ordering check or overload decision is observed. The unique event key then
-        // makes the first complete durable decision authoritative for duplicate gateway delivery.
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(DiscordError::IngressStore)?;
-        let tombstoned = transaction
-            .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM discord_ingress_tombstones WHERE external_event_id = ?1
-                 )",
-                [&proposed.message_id],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(DiscordError::IngressStore)?;
-        if tombstoned {
-            transaction.commit().map_err(DiscordError::IngressStore)?;
-            return Ok(None);
-        }
-        if let Some(payload) = transaction
-            .query_row(
-                "SELECT payload_json FROM discord_ingress WHERE external_event_id = ?1",
-                [&proposed.message_id],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .map_err(DiscordError::IngressStore)?
-        {
-            transaction.commit().map_err(DiscordError::IngressStore)?;
-            return serde_json::from_slice(&payload)
-                .map(Some)
-                .map_err(DiscordError::IngressPayload);
-        }
-
-        let mut record = proposed.clone();
-        let same_session_pending = transaction
-            .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM discord_ingress
-                   WHERE session_id = ?1
-                     AND (?2 IS NULL OR multipart_group IS NULL OR multipart_group != ?2)
-                 )",
-                params![record.session_id, record.multipart_group],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(DiscordError::IngressStore)?;
-        let pending_count = transaction
-            .query_row("SELECT COUNT(*) FROM discord_ingress", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map_err(DiscordError::IngressStore)?;
-        if same_session_pending
-            || (record.multipart_group.is_none()
-                && pending_count >= i64::try_from(MAX_INBOUND_INFLIGHT).unwrap_or(i64::MAX))
-        {
-            record.forced_busy = true;
-        }
-        if record.forced_busy {
-            // Busy records only need durable identity and route metadata. Do not retain prompt text,
-            // expiring attachment URLs, or grouping for work that is guaranteed never to execute.
-            record.content.clear();
-            record.attachments.clear();
-            record.multipart_group = None;
-        }
-        let payload = serde_json::to_vec(&record).map_err(DiscordError::IngressPayload)?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO discord_ingress
-                 (external_event_id, session_id, multipart_group, payload_json)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    record.message_id,
-                    record.session_id,
-                    record.multipart_group,
-                    payload
-                ],
-            )
-            .map_err(DiscordError::IngressStore)?;
-        let authoritative = transaction
-            .query_row(
-                "SELECT payload_json FROM discord_ingress WHERE external_event_id = ?1",
-                [&record.message_id],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .map_err(DiscordError::IngressStore)?;
-        transaction.commit().map_err(DiscordError::IngressStore)?;
-        serde_json::from_slice(&authoritative)
-            .map(Some)
-            .map_err(DiscordError::IngressPayload)
-    }
-
-    fn next_after(&self, sequence: i64) -> Result<Option<(i64, IngressRecord)>, DiscordError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let row = connection
-            .query_row(
-                "SELECT sequence, payload_json FROM discord_ingress
-                 WHERE sequence > ?1 ORDER BY sequence LIMIT 1",
-                [sequence],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()
-            .map_err(DiscordError::IngressStore)?;
-        row.map(|(sequence, payload)| {
-            serde_json::from_slice(&payload)
-                .map(|record| (sequence, record))
-                .map_err(DiscordError::IngressPayload)
-        })
-        .transpose()
-    }
-
-    fn remove_event(&self, external_event_id: &str) -> Result<(), DiscordError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection
-            .transaction()
-            .map_err(DiscordError::IngressStore)?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO discord_ingress_tombstones
-                 (external_event_id, recorded_at_ms)
-                 SELECT external_event_id, ?2 FROM discord_ingress WHERE external_event_id = ?1",
-                params![external_event_id, unix_time_ms_i64()],
-            )
-            .map_err(DiscordError::IngressStore)?;
-        transaction
-            .execute(
-                "DELETE FROM discord_ingress WHERE external_event_id = ?1",
-                [external_event_id],
-            )
-            .map_err(DiscordError::IngressStore)?;
-        transaction.commit().map_err(DiscordError::IngressStore)
-    }
-
-    fn remove_multipart_group(&self, session_id: &str, group: &str) -> Result<(), DiscordError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection
-            .transaction()
-            .map_err(DiscordError::IngressStore)?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO discord_ingress_tombstones
-                 (external_event_id, recorded_at_ms)
-                 SELECT external_event_id, ?3 FROM discord_ingress
-                 WHERE session_id = ?1 AND multipart_group = ?2",
-                params![session_id, group, unix_time_ms_i64()],
-            )
-            .map_err(DiscordError::IngressStore)?;
-        transaction
-            .execute(
-                "DELETE FROM discord_ingress WHERE session_id = ?1 AND multipart_group = ?2",
-                params![session_id, group],
-            )
-            .map_err(DiscordError::IngressStore)?;
-        transaction.commit().map_err(DiscordError::IngressStore)
-    }
-
-    /// Quarantines one corrupt payload without retaining user content or allowing its event
-    /// identity to become a future prompt after a reconnect.
-    fn discard_next_after(&self, sequence: i64) -> Result<(), DiscordError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection
-            .transaction()
-            .map_err(DiscordError::IngressStore)?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO discord_ingress_tombstones
-                 (external_event_id, recorded_at_ms)
-                 SELECT external_event_id, ?2 FROM discord_ingress
-                 WHERE sequence = (
-                   SELECT MIN(sequence) FROM discord_ingress WHERE sequence > ?1
-                 )",
-                params![sequence, unix_time_ms_i64()],
-            )
-            .map_err(DiscordError::IngressStore)?;
-        transaction
-            .execute(
-                "DELETE FROM discord_ingress WHERE sequence = (
-                   SELECT MIN(sequence) FROM discord_ingress WHERE sequence > ?1
-                 )",
-                [sequence],
-            )
-            .map_err(DiscordError::IngressStore)?;
-        transaction.commit().map_err(DiscordError::IngressStore)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> Result<u64, DiscordError> {
-        let count = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query_row("SELECT COUNT(*) FROM discord_ingress", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map_err(DiscordError::IngressStore)?;
-        Ok(u64::try_from(count).unwrap_or_default())
-    }
-}
-
 struct BotState {
     client: NakodeClient,
     workspace_id: String,
@@ -1600,12 +949,13 @@ struct BotState {
     bridges: tokio::sync::RwLock<HashMap<String, api::SessionBridge>>,
     thread_routes: tokio::sync::RwLock<HashMap<u64, String>>,
     workers: tokio::sync::Mutex<HashMap<String, JoinHandle<()>>>,
+    child_tasks: Arc<TrackedChildTasks>,
     thread_creation: tokio::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     reconciler: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     ingress_replayer: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     ingress_inflight: tokio::sync::Mutex<HashSet<String>>,
     ingress_notify: tokio::sync::Notify,
-    ingress: IngressSpool,
+    ingress: Arc<IngressSpool>,
     bot_user_id: std::sync::OnceLock<UserId>,
     inbound_slots: tokio::sync::Semaphore,
     multipart: MultipartAssembler,
@@ -1613,31 +963,176 @@ struct BotState {
     shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
-impl BotState {
-    async fn stop_tasks(&self) {
-        if let Some(handle) = self.reconciler.lock().await.take() {
+#[derive(Default)]
+struct TrackedChildTasks {
+    handles: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+impl TrackedChildTasks {
+    fn track(&self, handle: &JoinHandle<()>) {
+        let mut handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.retain(|handle| !handle.is_finished());
+        handles.push(handle.abort_handle());
+    }
+
+    fn abort_all(&self) {
+        for handle in self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
             handle.abort();
-            let _ = handle.await;
+        }
+    }
+}
+
+async fn finish_child_tasks(handles: Vec<JoinHandle<()>>, cooperative_grace: Option<Duration>) {
+    let deadline = cooperative_grace.map(|grace| tokio::time::Instant::now() + grace);
+    for mut handle in handles {
+        if let Some(deadline) = deadline
+            && tokio::time::timeout_at(deadline, &mut handle).await.is_ok()
+        {
+            continue;
+        }
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+impl BotState {
+    fn track_child(&self, handle: &JoinHandle<()>) {
+        self.child_tasks.track(handle);
+    }
+
+    async fn stop_tasks(&self) {
+        let mut handles = Vec::new();
+        if let Some(handle) = self.reconciler.lock().await.take() {
+            handles.push(handle);
         }
         if let Some(handle) = self.ingress_replayer.lock().await.take() {
-            handle.abort();
-            let _ = handle.await;
+            handles.push(handle);
         }
-        let handles = self
-            .workers
-            .lock()
-            .await
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect::<Vec<_>>();
-        for handle in handles {
-            handle.abort();
-            let _ = handle.await;
-        }
+        handles.extend(self.workers.lock().await.drain().map(|(_, handle)| handle));
+        // A configured shutdown signal gives children one shared bounded window to observe their
+        // cancellation receiver and join normally. Initialization/error exits abort immediately.
+        let cooperative_grace = (*self.shutdown.borrow()).then_some(CHILD_JOIN_GRACE);
+        finish_child_tasks(handles, cooperative_grace).await;
     }
 
     async fn current_bridge(&self, session_id: &str) -> Option<api::SessionBridge> {
         self.bridges.read().await.get(session_id).cloned()
+    }
+
+    async fn resolve_thread_route(
+        &self,
+        thread_id: ChannelId,
+    ) -> Result<Option<String>, DiscordError> {
+        if let Some(session_id) = self
+            .thread_routes
+            .read()
+            .await
+            .get(&thread_id.get())
+            .cloned()
+        {
+            let still_valid = {
+                let bridges = self.bridges.read().await;
+                cached_thread_route_is_current(&self.config, &bridges, thread_id.get(), &session_id)
+            };
+            if still_valid {
+                return Ok(Some(session_id));
+            }
+            self.thread_routes.write().await.remove(&thread_id.get());
+        }
+        let workspace = tokio::time::timeout(
+            BRIDGE_RPC_TIMEOUT,
+            self.client.get_workspace(self.workspace_path.clone(), None),
+        )
+        .await
+        .map_err(|_| DiscordError::BridgeRpcTimeout)??;
+        let latest = workspace
+            .session_bridges
+            .into_iter()
+            .map(|bridge| (bridge.session_id.clone(), bridge))
+            .collect::<HashMap<_, _>>();
+        let routes = latest
+            .values()
+            .filter_map(|bridge| valid_open_thread_route(&self.config, bridge))
+            .collect::<HashMap<_, _>>();
+        let resolved = routes.get(&thread_id.get()).cloned();
+        *self.bridges.write().await = latest;
+        *self.thread_routes.write().await = routes;
+        Ok(resolved)
+    }
+
+    async fn ingress_enqueue(
+        &self,
+        proposed: IngressRecord,
+    ) -> Result<Option<IngressRecord>, DiscordError> {
+        ingress_io(Arc::clone(&self.ingress), move |ingress| {
+            ingress.enqueue(&proposed)
+        })
+        .await
+    }
+
+    async fn ingress_next_after(
+        &self,
+        sequence: i64,
+    ) -> Result<Option<(i64, IngressRecord)>, DiscordError> {
+        ingress_io(Arc::clone(&self.ingress), move |ingress| {
+            ingress.next_after(sequence)
+        })
+        .await
+    }
+
+    async fn ingress_bind_route(
+        &self,
+        external_event_id: String,
+        session_id: String,
+        forced_busy: bool,
+    ) -> Result<Option<IngressRecord>, DiscordError> {
+        ingress_io(Arc::clone(&self.ingress), move |ingress| {
+            ingress.bind_route(&external_event_id, &session_id, forced_busy)
+        })
+        .await
+    }
+
+    async fn ingress_force_busy(
+        &self,
+        external_event_id: String,
+    ) -> Result<Option<IngressRecord>, DiscordError> {
+        ingress_io(Arc::clone(&self.ingress), move |ingress| {
+            ingress.force_busy(&external_event_id)
+        })
+        .await
+    }
+
+    async fn ingress_remove_event(&self, external_event_id: String) -> Result<(), DiscordError> {
+        ingress_io(Arc::clone(&self.ingress), move |ingress| {
+            ingress.remove_event(&external_event_id)
+        })
+        .await
+    }
+
+    async fn ingress_remove_multipart_group(
+        &self,
+        session_id: String,
+        group: String,
+    ) -> Result<(), DiscordError> {
+        ingress_io(Arc::clone(&self.ingress), move |ingress| {
+            ingress.remove_multipart_group(&session_id, &group)
+        })
+        .await
+    }
+
+    async fn ingress_discard_next_after(&self, sequence: i64) -> Result<(), DiscordError> {
+        ingress_io(Arc::clone(&self.ingress), move |ingress| {
+            ingress.discard_next_after(sequence)
+        })
+        .await
     }
 
     async fn thread_creation_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1652,8 +1147,304 @@ impl BotState {
     }
 }
 
+async fn bridge_rpc<T>(
+    operation: impl std::future::Future<Output = Result<T, SdkError>>,
+) -> Result<T, DiscordError> {
+    tokio::time::timeout(BRIDGE_RPC_TIMEOUT, operation)
+        .await
+        .map_err(|_| DiscordError::BridgeRpcTimeout)?
+        .map_err(DiscordError::Sdk)
+}
+
+async fn ingress_io<T>(
+    ingress: Arc<IngressSpool>,
+    operation: impl FnOnce(&IngressSpool) -> Result<T, DiscordError> + Send + 'static,
+) -> Result<T, DiscordError>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || operation(&ingress))
+        .await
+        .map_err(|_| DiscordError::IngressWorker)?
+}
+
+struct ChildAbortGuard {
+    tasks: Arc<TrackedChildTasks>,
+}
+
+impl Drop for ChildAbortGuard {
+    fn drop(&mut self) {
+        // `DiscordTransport::stop_inner` may abort the top-level gateway after its bounded grace
+        // period. Abort handles are synchronous, so no separately spawned worker can outlive that
+        // forced parent cancellation even when it is stalled in an RPC.
+        self.tasks.abort_all();
+    }
+}
+
 struct Handler {
     state: Arc<BotState>,
+    gateway_ready: tokio::sync::watch::Sender<bool>,
+}
+
+enum ManagedGatewayEvent {
+    Gateway(Result<(), DiscordError>),
+    Configuration(Result<bool, DiscordError>),
+}
+
+async fn next_managed_gateway_event<G, C>(
+    gateway: std::pin::Pin<&mut G>,
+    configuration_changed: std::pin::Pin<&mut C>,
+) -> ManagedGatewayEvent
+where
+    G: std::future::Future<Output = Result<(), DiscordError>> + ?Sized,
+    C: std::future::Future<Output = Result<bool, DiscordError>> + ?Sized,
+{
+    tokio::select! {
+        // A simultaneous config/token mutation supersedes an obsolete gateway completion. This
+        // deterministic priority prevents a replacement request from being lost as a terminal exit.
+        biased;
+        changed = configuration_changed => ManagedGatewayEvent::Configuration(changed),
+        result = gateway => ManagedGatewayEvent::Gateway(result),
+    }
+}
+
+async fn await_managed_gateway_shutdown<G>(
+    gateway: std::pin::Pin<&mut G>,
+    deadline: Duration,
+) -> Result<(), DiscordError>
+where
+    G: std::future::Future<Output = Result<(), DiscordError>> + ?Sized,
+{
+    tokio::time::timeout(deadline, gateway)
+        .await
+        .map_err(|_| DiscordError::GatewayShutdownTimeout)?
+}
+
+async fn run_managed_gateway(
+    mut config: DiscordConfig,
+    workspace: PathBuf,
+    endpoint: PathBuf,
+    store: DiscordConfigStore,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), DiscordError> {
+    loop {
+        if !config.enabled {
+            if !wait_for_runtime_configuration_change(&store, &config, None, shutdown.clone())
+                .await?
+            {
+                return Ok(());
+            }
+            config = store.load()?;
+            continue;
+        }
+
+        let change = {
+            let token = store.read_token()?;
+            let (runtime_shutdown_tx, runtime_shutdown_rx) = tokio::sync::watch::channel(false);
+            let gateway = run_gateway(
+                config.clone(),
+                token.clone(),
+                workspace.clone(),
+                endpoint.clone(),
+                store.clone(),
+                runtime_shutdown_rx,
+            );
+            tokio::pin!(gateway);
+            let configuration_changed = wait_for_runtime_configuration_change(
+                &store,
+                &config,
+                Some(token.as_str()),
+                shutdown.clone(),
+            );
+            tokio::pin!(configuration_changed);
+            let change =
+                match next_managed_gateway_event(gateway.as_mut(), configuration_changed.as_mut())
+                    .await
+                {
+                    ManagedGatewayEvent::Gateway(result) => return result,
+                    ManagedGatewayEvent::Configuration(changed) => changed,
+                };
+            // Never drop a running gateway future as a restart mechanism. Signal its structured
+            // shutdown path, await shard shutdown plus tracked child joins, and only then replace it.
+            let _ = runtime_shutdown_tx.send(true);
+            await_managed_gateway_shutdown(gateway.as_mut(), Duration::from_secs(5)).await?;
+            change
+        };
+        if !change? {
+            return Ok(());
+        }
+        config = store.load()?;
+    }
+}
+
+async fn wait_for_runtime_configuration_change(
+    store: &DiscordConfigStore,
+    current_config: &DiscordConfig,
+    current_token: Option<&str>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, DiscordError> {
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first interval tick is immediate; this closes the save/restart race around gateway
+    // construction without logging or projecting credential material.
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(false);
+                }
+            }
+            _ = interval.tick() => {
+                let latest = store.load()?;
+                if latest != *current_config {
+                    return Ok(true);
+                }
+                if let Some(token) = current_token
+                    && store.read_token()? != token
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+}
+
+fn discord_session_start_wait(
+    remaining: u64,
+    reset_after_ms: u64,
+    total: u64,
+    max_concurrency: u64,
+) -> Result<Option<Duration>, DiscordError> {
+    if max_concurrency == 0 {
+        return Err(DiscordError::InvalidConfig(
+            "Discord reported an invalid zero gateway identify concurrency".to_owned(),
+        ));
+    }
+    if remaining > 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        Duration::from_millis(reset_after_ms.max(1_000))
+            .saturating_add(retry_delay(0, total ^ max_concurrency)),
+    ))
+}
+
+async fn await_discord_session_start_budget(
+    client: &serenity::Client,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, DiscordError> {
+    loop {
+        if *shutdown.borrow() {
+            return Ok(false);
+        }
+        let gateway = tokio::time::timeout(BRIDGE_RPC_TIMEOUT, client.http.get_bot_gateway())
+            .await
+            .map_err(|_| DiscordError::BridgeRpcTimeout)?
+            .map_err(DiscordError::Gateway)?;
+        let limit = gateway.session_start_limit;
+        let Some(wait) = discord_session_start_wait(
+            limit.remaining,
+            limit.reset_after,
+            limit.total,
+            limit.max_concurrency,
+        )?
+        else {
+            return Ok(true);
+        };
+
+        // Do not consume an exhausted identify budget. Discord supplies the reset duration; add a
+        // stable jitter so installations sharing a token do not all retry at once.
+        eprintln!(
+            "nakode discord: gateway session-start budget exhausted; identify deferred until Discord's reset window"
+        );
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(false),
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+struct GatewayIdentifyLease {
+    lock: std::fs::File,
+    timestamp_path: PathBuf,
+}
+
+impl Drop for GatewayIdentifyLease {
+    fn drop(&mut self) {
+        // Refresh while still holding the lock so the next process waits from the actual
+        // Identify/Ready boundary (or this failed attempt), not merely from preflight admission.
+        let _ = atomic_write(&self.timestamp_path, unix_time_ms().to_string().as_bytes());
+        let _ = fs2::FileExt::unlock(&self.lock);
+    }
+}
+
+async fn acquire_gateway_identify_lease(
+    store: &DiscordConfigStore,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<GatewayIdentifyLease>, DiscordError> {
+    let lock_path = store.configuration_directory.join("gateway-identify.lock");
+    let timestamp_path = store
+        .configuration_directory
+        .join("gateway-identify-last-ms");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| io_error(&lock_path, source))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| io_error(&lock_path, source))?;
+    }
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => break,
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        let _ = changed;
+                        return Ok(None);
+                    }
+                    () = tokio::time::sleep(GATEWAY_IDENTIFY_POLL) => {}
+                }
+                if *shutdown.borrow() {
+                    return Ok(None);
+                }
+            }
+            Err(source) => return Err(io_error(&lock_path, source)),
+        }
+    }
+
+    let last_identify_ms = match std::fs::read_to_string(&timestamp_path) {
+        Ok(value) => value.trim().parse::<u64>().map_err(|_| {
+            DiscordError::InvalidConfig("invalid gateway identify checkpoint".to_owned())
+        })?,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => 0,
+        Err(source) => return Err(io_error(&timestamp_path, source)),
+    };
+    let elapsed_ms = unix_time_ms().saturating_sub(last_identify_ms);
+    let interval_ms = u64::try_from(GATEWAY_IDENTIFY_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+    let remaining = Duration::from_millis(interval_ms.saturating_sub(elapsed_ms));
+    if !remaining.is_zero() {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Ok(None);
+            }
+            () = tokio::time::sleep(remaining) => {}
+        }
+        if *shutdown.borrow() {
+            return Ok(None);
+        }
+    }
+    atomic_write(&timestamp_path, unix_time_ms().to_string().as_bytes())?;
+    Ok(Some(GatewayIdentifyLease {
+        lock,
+        timestamp_path,
+    }))
 }
 
 async fn run_gateway(
@@ -1667,7 +1458,7 @@ async fn run_gateway(
     let Some(client) = connect_api(endpoint, &mut shutdown).await? else {
         return Ok(());
     };
-    let server_info = client.get_server_info().await?;
+    let server_info = bridge_rpc(client.get_server_info()).await?;
     if !server_info
         .capabilities
         .iter()
@@ -1678,13 +1469,22 @@ async fn run_gateway(
         ));
     }
     let workspace_path = workspace.to_string_lossy().into_owned();
-    let workspace_state = client.get_workspace(workspace_path, None).await?;
+    let workspace_state = bridge_rpc(client.get_workspace(workspace_path, None)).await?;
     let initial_bridges = workspace_state
         .session_bridges
         .into_iter()
         .map(|bridge| (bridge.session_id.clone(), bridge))
+        .collect::<HashMap<_, _>>();
+    // Prehydrate inbound routes before the gateway can dispatch its first Message event. Ready
+    // reconciliation remains authoritative for later changes, but startup never has an empty-map
+    // window for already-bound open threads.
+    let initial_routes = initial_bridges
+        .values()
+        .filter_map(|bridge| valid_open_thread_route(&config, bridge))
         .collect();
     let http_client = HttpClient::builder()
+        .connect_timeout(BRIDGE_RPC_TIMEOUT)
+        .timeout(DISCORD_HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 || !is_approved_discord_cdn_url(attempt.url()) {
                 attempt.stop()
@@ -1706,20 +1506,26 @@ async fn run_gateway(
         http_client,
         config,
         bridges: tokio::sync::RwLock::new(initial_bridges),
-        thread_routes: tokio::sync::RwLock::new(HashMap::new()),
+        thread_routes: tokio::sync::RwLock::new(initial_routes),
         workers: tokio::sync::Mutex::new(HashMap::new()),
+        child_tasks: Arc::new(TrackedChildTasks::default()),
         thread_creation: tokio::sync::Mutex::new(HashMap::new()),
         reconciler: tokio::sync::Mutex::new(None),
         ingress_replayer: tokio::sync::Mutex::new(None),
         ingress_inflight: tokio::sync::Mutex::new(HashSet::new()),
         ingress_notify: tokio::sync::Notify::new(),
-        ingress: IngressSpool::open(&store.directory.join("discord-ingress.sqlite"))?,
+        ingress: Arc::new(IngressSpool::open(
+            &store.directory.join("discord-ingress.sqlite"),
+        )?),
         bot_user_id: std::sync::OnceLock::new(),
         inbound_slots: tokio::sync::Semaphore::new(MAX_INBOUND_INFLIGHT),
         multipart: MultipartAssembler::new(store.directory.join("assemblies"))?,
         recovery_root,
         shutdown,
     });
+    let _child_abort_guard = ChildAbortGuard {
+        tasks: Arc::clone(&state.child_tasks),
+    };
     let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
     let mut gateway_shutdown = state.shutdown.clone();
     let mut reconnect_attempt = 0;
@@ -1729,8 +1535,10 @@ async fn run_gateway(
             state.stop_tasks().await;
             return Ok(());
         }
+        let (gateway_ready, mut gateway_ready_rx) = tokio::sync::watch::channel(false);
         let handler = Handler {
             state: Arc::clone(&state),
+            gateway_ready,
         };
         let mut discord = match serenity::Client::builder(token.clone(), intents)
             .event_handler(handler)
@@ -1754,13 +1562,41 @@ async fn run_gateway(
             }
         };
         let shard_manager = Arc::clone(&discord.shard_manager);
-        let gateway_result = tokio::select! {
-            result = discord.start() => Some(result),
-            _ = gateway_shutdown.changed() => {
-                shard_manager.shutdown_all().await;
-                None
+        let Some(identify_lease) =
+            acquire_gateway_identify_lease(&store, &mut gateway_shutdown).await?
+        else {
+            state.stop_tasks().await;
+            return Ok(());
+        };
+        if !await_discord_session_start_budget(&discord, &mut gateway_shutdown).await? {
+            state.stop_tasks().await;
+            return Ok(());
+        }
+        let mut gateway = Box::pin(discord.start());
+        let mut identify_lease = Some(identify_lease);
+        let mut ready_signal_open = true;
+        let gateway_result = loop {
+            tokio::select! {
+                result = &mut gateway => break Some(result),
+                _ = gateway_shutdown.changed() => {
+                    shard_manager.shutdown_all().await;
+                    break None;
+                }
+                changed = gateway_ready_rx.changed(), if identify_lease.is_some() && ready_signal_open => {
+                    if changed.is_ok() && *gateway_ready_rx.borrow() {
+                        // Keep the installation-wide process lock through Serenity's actual
+                        // Identify/Ready boundary. A checkpoint alone leaves a scheduling window
+                        // where a delayed first process can identify after a later contender.
+                        identify_lease.take();
+                    } else if changed.is_err() {
+                        // Without an authoritative Ready signal, conservatively retain the lease
+                        // until this gateway future terminates rather than admitting a contender.
+                        ready_signal_open = false;
+                    }
+                }
             }
         };
+        drop(identify_lease);
         state.stop_tasks().await;
         let Some(gateway_result) = gateway_result else {
             return Ok(());
@@ -1791,9 +1627,109 @@ async fn start_ingress_replayer(discord: Arc<dyn DiscordApi>, state: Arc<BotStat
         let _ = finished.await;
     }
     let task_state = Arc::clone(&state);
-    *slot = Some(tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         replay_ingress_loop(discord, task_state).await;
-    }));
+    });
+    state.track_child(&handle);
+    *slot = Some(handle);
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PendingRouteResolution {
+    Routed(String),
+    Terminal,
+    Deferred,
+}
+
+#[async_trait]
+trait PendingRouteAuthority: Send + Sync {
+    fn discord_config(&self) -> &DiscordConfig;
+    async fn resolve_authoritative_thread_route(
+        &self,
+        thread_id: ChannelId,
+    ) -> Result<Option<String>, DiscordError>;
+    async fn authoritative_bridge(&self, session_id: &str) -> Option<api::SessionBridge>;
+}
+
+#[async_trait]
+impl PendingRouteAuthority for BotState {
+    fn discord_config(&self) -> &DiscordConfig {
+        &self.config
+    }
+
+    async fn resolve_authoritative_thread_route(
+        &self,
+        thread_id: ChannelId,
+    ) -> Result<Option<String>, DiscordError> {
+        BotState::resolve_thread_route(self, thread_id).await
+    }
+
+    async fn authoritative_bridge(&self, session_id: &str) -> Option<api::SessionBridge> {
+        BotState::current_bridge(self, session_id).await
+    }
+}
+
+async fn resolve_pending_route(
+    discord: &dyn DiscordApi,
+    authority: &dyn PendingRouteAuthority,
+    record: &IngressRecord,
+) -> PendingRouteResolution {
+    let Ok(thread_snowflake) = record.thread_id.parse::<u64>() else {
+        return PendingRouteResolution::Terminal;
+    };
+    let thread_id = ChannelId::new(thread_snowflake);
+    let parent = match tokio::time::timeout(
+        BRIDGE_RPC_TIMEOUT,
+        discord.parent_channel_id(thread_id),
+    )
+    .await
+    {
+        Ok(Ok(Some(parent))) => parent,
+        Ok(Ok(None)) => return PendingRouteResolution::Terminal,
+        Ok(Err(error)) if is_not_found(&error) => return PendingRouteResolution::Terminal,
+        Ok(Err(error)) => {
+            eprintln!(
+                "nakode discord: pending route parent lookup deferred ({})",
+                sanitized_bridge_error(&DiscordError::Gateway(error))
+            );
+            return PendingRouteResolution::Deferred;
+        }
+        Err(_) => return PendingRouteResolution::Deferred,
+    };
+    let parent_is_configured = [
+        authority.discord_config().chat_channel_id.as_deref(),
+        authority.discord_config().agent_channel_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|configured| configured == parent.get().to_string());
+    if !parent_is_configured {
+        return PendingRouteResolution::Terminal;
+    }
+
+    let session_id = match authority
+        .resolve_authoritative_thread_route(thread_id)
+        .await
+    {
+        Ok(Some(session_id)) => session_id,
+        Ok(None) => return PendingRouteResolution::Terminal,
+        Err(error) => {
+            eprintln!(
+                "nakode discord: pending authoritative route lookup deferred ({})",
+                sanitized_bridge_error(&error)
+            );
+            return PendingRouteResolution::Deferred;
+        }
+    };
+    let Some(bridge) = authority.authoritative_bridge(&session_id).await else {
+        return PendingRouteResolution::Deferred;
+    };
+    if valid_open_thread_route(authority.discord_config(), &bridge)
+        != Some((thread_snowflake, session_id.clone()))
+    {
+        return PendingRouteResolution::Terminal;
+    }
+    PendingRouteResolution::Routed(session_id)
 }
 
 async fn replay_ingress_loop(discord: Arc<dyn DiscordApi>, state: Arc<BotState>) {
@@ -1803,23 +1739,65 @@ async fn replay_ingress_loop(discord: Arc<dyn DiscordApi>, state: Arc<BotState>)
         if *shutdown.borrow() {
             return;
         }
-        match state.ingress.next_after(sequence) {
-            Ok(Some((next_sequence, record))) => {
+        match state.ingress_next_after(sequence).await {
+            Ok(Some((next_sequence, mut record))) => {
                 sequence = next_sequence;
+                let mut permit = None;
+                if record.route_pending {
+                    let session_id =
+                        match resolve_pending_route(&*discord, state.as_ref(), &record).await {
+                            PendingRouteResolution::Routed(session_id) => session_id,
+                            PendingRouteResolution::Terminal => {
+                                if let Err(error) =
+                                    state.ingress_remove_event(record.message_id.clone()).await
+                                {
+                                    eprintln!(
+                                        "nakode discord: rejected route cleanup deferred ({})",
+                                        sanitized_bridge_error(&error)
+                                    );
+                                }
+                                continue;
+                            }
+                            PendingRouteResolution::Deferred => continue,
+                        };
+                    permit = state.inbound_slots.try_acquire().ok();
+                    record = match state
+                        .ingress_bind_route(record.message_id.clone(), session_id, permit.is_none())
+                        .await
+                    {
+                        Ok(Some(record)) => record,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            eprintln!(
+                                "nakode discord: pending route checkpoint deferred ({})",
+                                sanitized_bridge_error(&error)
+                            );
+                            continue;
+                        }
+                    };
+                }
+                if record.forced_busy {
+                    permit = None;
+                }
+                if !record.forced_busy && permit.is_none() {
+                    permit = state.inbound_slots.try_acquire().ok();
+                    if permit.is_none() {
+                        record = match state.ingress_force_busy(record.message_id.clone()).await {
+                            Ok(Some(record)) => record,
+                            Ok(None) => continue,
+                            Err(error) => {
+                                eprintln!(
+                                    "nakode discord: busy ingress checkpoint deferred ({})",
+                                    sanitized_bridge_error(&error)
+                                );
+                                continue;
+                            }
+                        };
+                    }
+                }
                 if !claim_ingress(&state, &record.message_id).await {
                     continue;
                 }
-                let permit = if record.forced_busy {
-                    None
-                } else {
-                    Some(tokio::select! {
-                        _ = shutdown.changed() => return,
-                        permit = state.inbound_slots.acquire() => match permit {
-                            Ok(permit) => permit,
-                            Err(_) => return,
-                        },
-                    })
-                };
                 let outcome = process_ingress_record(&*discord, &state, &record).await;
                 drop(permit);
                 settle_ingress(&state, &record, outcome).await;
@@ -1844,7 +1822,7 @@ async fn replay_ingress_loop(discord: Arc<dyn DiscordApi>, state: Arc<BotState>)
                     sanitized_bridge_error(&error)
                 );
                 if corrupt_payload {
-                    if let Err(discard_error) = state.ingress.discard_next_after(sequence) {
+                    if let Err(discard_error) = state.ingress_discard_next_after(sequence).await {
                         eprintln!(
                             "nakode discord: corrupt ingress quarantine deferred ({})",
                             sanitized_bridge_error(&discard_error)
@@ -1874,12 +1852,14 @@ async fn claim_ingress(state: &BotState, message_id: &str) -> bool {
 
 async fn settle_ingress(state: &BotState, record: &IngressRecord, outcome: IngressProcessOutcome) {
     let result = match outcome {
-        IngressProcessOutcome::Terminal => state.ingress.remove_event(&record.message_id),
+        IngressProcessOutcome::Terminal => {
+            state.ingress_remove_event(record.message_id.clone()).await
+        }
         IngressProcessOutcome::TerminalMultipart(group) => {
             state.multipart.finish(&record.session_id, &group).await;
             state
-                .ingress
-                .remove_multipart_group(&record.session_id, &group)
+                .ingress_remove_multipart_group(record.session_id.clone(), group)
+                .await
         }
         IngressProcessOutcome::Deferred | IngressProcessOutcome::WaitingMultipart => Ok(()),
     };
@@ -1901,9 +1881,11 @@ async fn start_reconciler(discord: Arc<dyn DiscordApi>, state: Arc<BotState>) {
         let _ = finished.await;
     }
     let task_state = Arc::clone(&state);
-    *slot = Some(tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         reconcile_loop(discord, task_state).await;
-    }));
+    });
+    state.track_child(&handle);
+    *slot = Some(handle);
 }
 
 async fn reconcile_loop(discord: Arc<dyn DiscordApi>, state: Arc<BotState>) {
@@ -1929,7 +1911,6 @@ async fn reconcile_loop(discord: Arc<dyn DiscordApi>, state: Arc<BotState>) {
                             return;
                         }
                         watch_attempt = watch_attempt.saturating_add(1);
-                        updates = state.client.watch_workspace(state.workspace_id.clone());
                         continue;
                     }
                     None => {
@@ -2049,7 +2030,7 @@ async fn reconcile_bridge(
             match set_archived_with_retry(&*discord, thread_id, true).await {
                 Ok(()) => {}
                 Err(error) if is_not_found(&error) => {
-                    clear_thread_binding(&state.client, bridge, thread_id).await?;
+                    clear_thread_binding(&state, bridge, thread_id).await?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -2063,7 +2044,7 @@ async fn reconcile_bridge(
     if let Some(thread_id) = mapped_thread {
         if mapped_parent != Some(expected_parent) {
             let _ = set_archived_with_retry(&*discord, thread_id, true).await;
-            clear_thread_binding(&state.client, bridge, thread_id).await?;
+            clear_thread_binding(&state, bridge, thread_id).await?;
             state.thread_routes.write().await.remove(&thread_id.get());
             stop_worker(&state, &bridge.session_id).await;
             return Ok(());
@@ -2074,7 +2055,7 @@ async fn reconcile_bridge(
                 start_worker(discord, state, bridge.session_id.clone()).await;
             }
             Err(error) if is_not_found(&error) => {
-                clear_thread_binding(&state.client, bridge, thread_id).await?;
+                clear_thread_binding(&state, bridge, thread_id).await?;
                 state.thread_routes.write().await.remove(&thread_id.get());
                 stop_worker(&state, &bridge.session_id).await;
             }
@@ -2106,23 +2087,25 @@ async fn reconcile_bridge(
     }
 
     let thread_id = create_or_recover_thread(&*discord, expected_parent, bridge).await?;
-    let binding = state
-        .client
-        .bind_session_bridge_thread(api::BindSessionBridgeThreadRequest {
+    let binding = bridge_rpc(state.client.bind_session_bridge_thread(
+        api::BindSessionBridgeThreadRequest {
             mutation: None,
             session_id: bridge.session_id.clone(),
             transport: TRANSPORT_NAME.to_owned(),
             external_parent_id: expected_parent.get().to_string(),
             external_thread_id: thread_id.get().to_string(),
-        })
-        .await;
+        },
+    ))
+    .await;
     if let Err(error) = binding {
         // A separately reconnecting gateway/process may have won after our preflight. Adopt only the
         // authoritative Nakode binding and archive the unclaimed Discord thread best-effort.
-        if let Ok(workspace) = state
-            .client
-            .get_workspace(state.workspace_path.clone(), None)
-            .await
+        if let Ok(workspace) = bridge_rpc(
+            state
+                .client
+                .get_workspace(state.workspace_path.clone(), None),
+        )
+        .await
             && let Some(authoritative) = workspace
                 .session_bridges
                 .into_iter()
@@ -2148,7 +2131,7 @@ async fn reconcile_bridge(
             }
             return Ok(());
         }
-        return Err(error.into());
+        return Err(error);
     }
     let mut bound = bridge.clone();
     bound.transport = Some(TRANSPORT_NAME.to_owned());
@@ -2172,19 +2155,52 @@ async fn register_open_thread(state: &BotState, bridge: &api::SessionBridge, thr
         .insert(thread_id.get(), bridge.session_id.clone());
 }
 
+fn clear_local_thread_binding(
+    bridge: &mut api::SessionBridge,
+    thread_id: ChannelId,
+    expected_revision: u64,
+) -> bool {
+    if bridge.revision != expected_revision
+        || bridge.transport.as_deref() != Some(TRANSPORT_NAME)
+        || bridge.external_thread_id.as_deref() != Some(&thread_id.get().to_string())
+    {
+        return false;
+    }
+    bridge.transport = None;
+    bridge.external_parent_id = None;
+    bridge.external_thread_id = None;
+    bridge.live_turn_id = None;
+    bridge.live_external_message_id = None;
+    bridge.active_source_message_id = None;
+    if let Some(delivery) = &mut bridge.delivery {
+        delivery.completed_parts = 0;
+        delivery.last_external_message_id = None;
+    }
+    bridge.revision = bridge.revision.saturating_add(1);
+    true
+}
+
 async fn clear_thread_binding(
-    client: &NakodeClient,
+    state: &BotState,
     bridge: &api::SessionBridge,
     thread_id: ChannelId,
 ) -> Result<(), DiscordError> {
-    client
-        .clear_session_bridge_thread(api::ClearSessionBridgeThreadRequest {
-            mutation: None,
-            session_id: bridge.session_id.clone(),
-            transport: TRANSPORT_NAME.to_owned(),
-            external_thread_id: thread_id.get().to_string(),
-        })
-        .await?;
+    bridge_rpc(
+        state
+            .client
+            .clear_session_bridge_thread(api::ClearSessionBridgeThreadRequest {
+                mutation: None,
+                session_id: bridge.session_id.clone(),
+                transport: TRANSPORT_NAME.to_owned(),
+                external_thread_id: thread_id.get().to_string(),
+            }),
+    )
+    .await?;
+    // The RPC compare-clears the authoritative thread. Only mirror that clear into the cache when
+    // no newer snapshot (including a same-thread rebind) arrived while the RPC was in flight.
+    if let Some(current) = state.bridges.write().await.get_mut(&bridge.session_id) {
+        clear_local_thread_binding(current, thread_id, bridge.revision);
+    }
     Ok(())
 }
 
@@ -2193,7 +2209,7 @@ async fn create_or_recover_thread(
     parent_channel_id: ChannelId,
     bridge: &api::SessionBridge,
 ) -> Result<ChannelId, DiscordError> {
-    let nonce = starter_nonce(&bridge.session_id);
+    let nonce = starter_nonce(parent_channel_id, &bridge.session_id);
     let starter_text = format!(
         "{} **{}**",
         orchestrator_label(bridge.kind),
@@ -2291,18 +2307,39 @@ async fn start_worker(discord: Arc<dyn DiscordApi>, state: Arc<BotState>, sessio
     }
     let key = session_id.clone();
     let worker_state = Arc::clone(&state);
-    workers.insert(
-        key.clone(),
-        tokio::spawn(async move {
-            watch_session_bridge(discord, worker_state, session_id).await;
-        }),
-    );
+    let handle = tokio::spawn(async move {
+        watch_session_bridge(discord, worker_state, session_id).await;
+    });
+    state.track_child(&handle);
+    workers.insert(key, handle);
 }
 
 async fn stop_worker(state: &BotState, session_id: &str) {
     if let Some(handle) = state.workers.lock().await.remove(session_id) {
         handle.abort();
         let _ = handle.await;
+    }
+}
+
+enum ReadyUpdateDrain {
+    Open,
+    Interrupted(SdkError),
+    Ended,
+}
+
+/// Coalesces only updates that are already buffered. Awaiting `try_next()` here would wait for a
+/// future snapshot and permanently postpone projection whenever the watch remains healthy but idle.
+fn drain_ready_hydrated_updates(
+    updates: &mut Watch<HydratedSession>,
+    hydrated: &mut HydratedSession,
+) -> ReadyUpdateDrain {
+    loop {
+        match updates.next().now_or_never() {
+            None => return ReadyUpdateDrain::Open,
+            Some(Some(Ok(next))) => *hydrated = next,
+            Some(Some(Err(error))) => return ReadyUpdateDrain::Interrupted(error),
+            Some(None) => return ReadyUpdateDrain::Ended,
+        }
     }
 }
 
@@ -2315,7 +2352,7 @@ async fn watch_session_bridge(
         .client
         .watch_hydrated_session(session_id.clone(), 1_024);
     let mut shutdown = state.shutdown.clone();
-    let mut terminal_reactions = HashSet::new();
+    let mut terminal_reaction = None;
     let mut watch_attempt = 0;
     let retry_identity = stable_retry_identity(&session_id);
     loop {
@@ -2338,9 +2375,8 @@ async fn watch_session_bridge(
                     return;
                 }
                 watch_attempt = watch_attempt.saturating_add(1);
-                updates = state
-                    .client
-                    .watch_hydrated_session(session_id.clone(), 1_024);
+                // `watch_hydrated_session` reconnects internally. Keep consuming this stream rather
+                // than spawning a second listener and orphaning the first reconnect loop.
                 continue;
             }
             None => {
@@ -2358,9 +2394,7 @@ async fn watch_session_bridge(
             _ = shutdown.changed() => return,
             () = tokio::time::sleep(SNAPSHOT_DEBOUNCE) => {}
         }
-        while let Ok(Some(next)) = updates.try_next().await {
-            hydrated = next;
-        }
+        let ready_drain = drain_ready_hydrated_updates(&mut updates, &mut hydrated);
         let Some(bridge) = state.current_bridge(&session_id).await else {
             return;
         };
@@ -2382,7 +2416,7 @@ async fn watch_session_bridge(
             thread_id,
             &bridge,
             &hydrated,
-            &mut terminal_reactions,
+            &mut terminal_reaction,
         )
         .await
         {
@@ -2391,7 +2425,33 @@ async fn watch_session_bridge(
                 short_identity(&session_id),
                 sanitized_bridge_error(&error)
             );
-            tokio::time::sleep(RECONCILE_RETRY_DELAY).await;
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                () = tokio::time::sleep(RECONCILE_RETRY_DELAY) => {}
+            }
+        }
+        match ready_drain {
+            ReadyUpdateDrain::Open => {}
+            ReadyUpdateDrain::Interrupted(error) => {
+                eprintln!(
+                    "nakode discord: session bridge watch reconnecting for {} ({})",
+                    short_identity(&session_id),
+                    sanitized_sdk_error(&error)
+                );
+                if !wait_for_reconnect(&mut shutdown, watch_attempt, retry_identity).await {
+                    return;
+                }
+                watch_attempt = watch_attempt.saturating_add(1);
+            }
+            ReadyUpdateDrain::Ended => {
+                if !wait_for_reconnect(&mut shutdown, watch_attempt, retry_identity).await {
+                    return;
+                }
+                watch_attempt = watch_attempt.saturating_add(1);
+                updates = state
+                    .client
+                    .watch_hydrated_session(session_id.clone(), 1_024);
+            }
         }
     }
 }
@@ -2402,55 +2462,80 @@ async fn project_session_update(
     thread_id: ChannelId,
     bridge: &api::SessionBridge,
     hydrated: &HydratedSession,
-    terminal_reactions: &mut HashSet<String>,
+    terminal_reaction: &mut Option<String>,
 ) -> Result<(), DiscordError> {
-    if let Some(turn) = &hydrated.state.active_turn
-        && let Some(body) = assistant_body_for_turn(hydrated, &turn.id, false)
-    {
-        project_live(discord, state, thread_id, bridge, &turn.id, &body).await?;
-    }
-
-    let mut cursor = bridge.last_delivered_turn_id.as_deref();
-    let answers = completed_answers(hydrated);
+    let active_turn_id = hydrated
+        .state
+        .active_turn
+        .as_ref()
+        .map(|turn| turn.id.as_str());
+    let active_owner_turn_id = hydrated
+        .state
+        .active_turn
+        .as_ref()
+        .map(|turn| turn.id.as_str());
+    let entries = hydrated
+        .state
+        .transcript
+        .as_ref()
+        .map(|transcript| transcript.entries.as_slice())
+        .unwrap_or_default();
+    let projections = completed_projections(entries, active_turn_id);
     let transcript_has_earlier = hydrated
         .state
         .transcript
         .as_ref()
         .is_some_and(|transcript| transcript.has_earlier);
-    let mut recovered = false;
-    let start = match cursor {
-        None => 0,
-        Some(turn_id) => match answers.iter().position(|answer| answer.turn_id == turn_id) {
-            Some(index) => index + 1,
-            None if transcript_has_earlier => {
-                recover_answers_after_cursor(
-                    discord,
-                    state,
-                    thread_id,
-                    bridge,
-                    turn_id,
-                    hydrated
-                        .state
-                        .active_turn
-                        .as_ref()
-                        .map(|turn| turn.id.as_str()),
-                )
-                .await?;
-                recovered = true;
-                0
-            }
-            None if answers.is_empty() => 0,
-            None => return Err(DiscordError::DeliveryCursorUnavailable),
-        },
-    };
-    if !recovered {
-        for answer in answers.iter().skip(start) {
-            if cursor == Some(answer.turn_id.as_str()) {
-                continue;
-            }
-            deliver_final(discord, state, thread_id, bridge, answer).await?;
-            cursor = Some(&answer.turn_id);
+    let mut cursor = bridge.last_projected.clone();
+    let cursor_position = cursor
+        .as_ref()
+        .and_then(|projected| projections.iter().position(|item| item.matches(projected)));
+    let needs_recovery = transcript_has_earlier
+        && match cursor.as_ref() {
+            None => !projections.is_empty() || active_turn_id.is_some(),
+            Some(_) => cursor_position.is_none(),
+        };
+    if needs_recovery {
+        recover_projections_after_cursor(
+            discord,
+            state,
+            thread_id,
+            bridge,
+            cursor.as_ref(),
+            active_turn_id,
+            active_owner_turn_id,
+        )
+        .await?;
+    } else {
+        let start = cursor_position.map_or(0, |index| index + 1);
+        if cursor.is_some() && cursor_position.is_none() && !projections.is_empty() {
+            return Err(DiscordError::DeliveryCursorUnavailable);
         }
+        for projection in projections.iter().skip(start) {
+            deliver_projection(
+                discord,
+                state,
+                thread_id,
+                bridge,
+                projection,
+                cursor.as_ref(),
+                active_owner_turn_id,
+            )
+            .await?;
+            cursor = Some(projection.cursor());
+        }
+    }
+
+    // Every completed user projection—including a durable zero-message cursor advance for a
+    // Discord-origin prompt—is finalized before any live assistant preview.
+    if let Some(turn) = &hydrated.state.active_turn
+        && let Some(body) = assistant_body_for_turn(hydrated, &turn.id, false)
+    {
+        let current_bridge = state
+            .current_bridge(&bridge.session_id)
+            .await
+            .unwrap_or_else(|| bridge.clone());
+        project_live(discord, state, thread_id, &current_bridge, &turn.id, &body).await?;
     }
 
     if let Some(turn) = &hydrated.state.last_turn
@@ -2458,231 +2543,101 @@ async fn project_session_update(
             api::TurnStatus::try_from(turn.status),
             Ok(api::TurnStatus::Failed | api::TurnStatus::Interrupted)
         )
-        && terminal_reactions.insert(turn.id.clone())
+        && terminal_reaction.as_deref() != Some(turn.id.as_str())
     {
-        react_source(discord, thread_id, bridge, REACTION_FAILED).await?;
-        if let Some(message_id) = bridge
-            .live_external_message_id
-            .as_deref()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(MessageId::new)
-        {
-            discord
-                .react(thread_id, message_id, REACTION_FAILED)
-                .await?;
-        }
-        set_live_message(state, bridge, None, None).await?;
+        let current_bridge = state
+            .current_bridge(&bridge.session_id)
+            .await
+            .unwrap_or_else(|| bridge.clone());
+        project_terminal_failure(discord, state, thread_id, &current_bridge).await?;
+        *terminal_reaction = Some(turn.id.clone());
     }
     Ok(())
 }
 
-#[derive(Deserialize, Serialize)]
-struct RecoveryEntry {
-    id: String,
-    turn_id: String,
-    body: String,
-    body_start_byte: u64,
-    body_total_bytes: u64,
-}
-
-struct RecoverySpool {
-    directory: PathBuf,
-    entries: usize,
-}
-
-impl RecoverySpool {
-    fn new(root: &Path, session_id: &str) -> Result<Self, DiscordError> {
-        prepare_private_directory(root)?;
-        let directory = root.join(&hex_digest(session_id.as_bytes())[..32]);
-        if directory.exists() {
-            std::fs::remove_dir_all(&directory).map_err(|source| io_error(&directory, source))?;
-        }
-        prepare_private_directory(&directory)?;
-        Ok(Self {
-            directory,
-            entries: 0,
-        })
-    }
-
-    fn push(&mut self, entry: &api::TranscriptEntry, turn_id: &str) -> Result<(), DiscordError> {
-        let marker = self
-            .directory
-            .join(format!("turn-{}", hex_digest(turn_id.as_bytes())));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker)
-        {
-            Ok(_) => {}
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
-            Err(source) => return Err(io_error(&marker, source)),
-        }
-        let stored = RecoveryEntry {
-            id: entry.id.clone(),
-            turn_id: turn_id.to_owned(),
-            body: entry.body.clone(),
-            body_start_byte: entry.body_start_byte,
-            body_total_bytes: entry.body_total_bytes,
-        };
-        let encoded = serde_json::to_vec(&stored).map_err(|_| {
-            DiscordError::InvalidConfig("could not spool transcript recovery metadata".to_owned())
-        })?;
-        let path = self
-            .directory
-            .join(format!("entry-{:020}.json", self.entries));
-        atomic_write(&path, &encoded)?;
-        self.entries = self.entries.saturating_add(1);
-        Ok(())
-    }
-
-    fn oldest_first(&self) -> impl Iterator<Item = Result<RecoveryEntry, DiscordError>> + '_ {
-        (0..self.entries).rev().map(|index| {
-            let path = self.directory.join(format!("entry-{index:020}.json"));
-            let encoded = std::fs::read(&path).map_err(|source| io_error(&path, source))?;
-            serde_json::from_slice(&encoded).map_err(|_| {
-                DiscordError::InvalidConfig(
-                    "invalid private transcript recovery metadata".to_owned(),
-                )
-            })
-        })
-    }
-}
-
-impl Drop for RecoverySpool {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.directory);
-    }
-}
-
-struct CompletedAnswer {
-    turn_id: String,
-    body: String,
-}
-
-fn completed_answers(hydrated: &HydratedSession) -> Vec<CompletedAnswer> {
-    let active_turn = hydrated
-        .state
-        .active_turn
-        .as_ref()
-        .map(|turn| turn.id.as_str());
-    let mut answers = Vec::<CompletedAnswer>::new();
-    let Some(transcript) = &hydrated.state.transcript else {
-        return answers;
-    };
-    for entry in &transcript.entries {
-        if entry.kind != api::TranscriptEntryKind::Assistant as i32
-            || entry.status != api::TranscriptEntryStatus::Complete as i32
-        {
-            continue;
-        }
-        let Some(turn_id) = entry.owner_turn_id.as_deref() else {
-            continue;
-        };
-        if active_turn == Some(turn_id) {
-            continue;
-        }
-        if let Some(existing) = answers.iter_mut().find(|answer| answer.turn_id == turn_id) {
-            existing.body.clone_from(&entry.body);
-        } else {
-            answers.push(CompletedAnswer {
-                turn_id: turn_id.to_owned(),
-                body: entry.body.clone(),
-            });
-        }
-    }
-    if answers.is_empty()
-        && let Some(turn) = &hydrated.state.last_turn
-        && turn.status == api::TurnStatus::Completed as i32
-        && let Some(entry) = transcript
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| entry.kind == api::TranscriptEntryKind::Assistant as i32)
-    {
-        answers.push(CompletedAnswer {
-            turn_id: turn.id.clone(),
-            body: entry.body.clone(),
-        });
-    }
-    answers
-}
-
-async fn recover_answers_after_cursor(
+async fn recover_projections_after_cursor(
     discord: &dyn DiscordApi,
     state: &BotState,
     thread_id: ChannelId,
     bridge: &api::SessionBridge,
-    cursor: &str,
+    cursor: Option<&api::BridgeProjection>,
     active_turn: Option<&str>,
+    active_owner_turn: Option<&str>,
 ) -> Result<(), DiscordError> {
     let mut spool = RecoverySpool::new(&state.recovery_root, &bridge.session_id)?;
     let mut before_entry_id = None;
     let mut found_cursor = false;
     loop {
-        let page = state
-            .client
-            .get_transcript_page(api::GetTranscriptPageRequest {
-                owner_kind: api::TranscriptOwnerKind::Session as i32,
-                owner_id: bridge.session_id.clone(),
-                before_entry_id: before_entry_id.clone(),
-                limit: 256,
-            })
-            .await?;
+        let page = bridge_rpc(
+            state
+                .client
+                .get_transcript_page(api::GetTranscriptPageRequest {
+                    owner_kind: api::TranscriptOwnerKind::Session as i32,
+                    owner_id: bridge.session_id.clone(),
+                    before_entry_id: before_entry_id.clone(),
+                    limit: 256,
+                }),
+        )
+        .await?;
+        // Transcript pages are chronological (oldest to newest). Walk from the page's oldest ID,
+        // but spool newest to oldest so one final reverse spans every fetched page correctly.
         let next_before = page.entries.first().map(|entry| entry.id.clone());
         for entry in page.entries.iter().rev() {
-            if entry.kind != api::TranscriptEntryKind::Assistant as i32
-                || entry.status != api::TranscriptEntryStatus::Complete as i32
-            {
-                continue;
-            }
-            let Some(turn_id) = entry.owner_turn_id.as_deref() else {
+            let Some(projection) = projection_from_entry(entry, active_turn) else {
                 continue;
             };
-            if turn_id == cursor {
+            if cursor.is_some_and(|cursor| projection.matches(cursor)) {
                 found_cursor = true;
                 break;
             }
-            if active_turn != Some(turn_id) {
-                spool.push(entry, turn_id)?;
-            }
+            spool.push(entry)?;
         }
         if found_cursor {
             break;
         }
         if !page.has_earlier || page.entries.is_empty() || next_before == before_entry_id {
-            return Err(DiscordError::DeliveryCursorUnavailable);
+            if cursor.is_some() && !found_cursor {
+                return Err(DiscordError::DeliveryCursorUnavailable);
+            }
+            break;
         }
         before_entry_id = next_before;
     }
 
+    let mut expected = cursor.cloned();
     for stored in spool.oldest_first() {
         let stored = stored?;
         let mut entry = api::TranscriptEntry {
             id: stored.id,
+            kind: stored.kind,
+            status: api::TranscriptEntryStatus::Complete as i32,
+            owner_turn_id: Some(stored.turn_id),
+            source_transport: stored.source_transport,
             body: stored.body,
             body_start_byte: stored.body_start_byte,
             body_total_bytes: stored.body_total_bytes,
             ..api::TranscriptEntry::default()
         };
-        state
-            .client
-            .hydrate_transcript_entry(
-                api::TranscriptOwnerKind::Session,
-                &bridge.session_id,
-                &mut entry,
-            )
-            .await?;
-        deliver_final(
+        bridge_rpc(state.client.hydrate_transcript_entry(
+            api::TranscriptOwnerKind::Session,
+            &bridge.session_id,
+            &mut entry,
+        ))
+        .await?;
+        let Some(projection) = projection_from_entry(&entry, active_turn) else {
+            continue;
+        };
+        deliver_projection(
             discord,
             state,
             thread_id,
             bridge,
-            &CompletedAnswer {
-                turn_id: stored.turn_id,
-                body: entry.body,
-            },
+            &projection,
+            expected.as_ref(),
+            active_owner_turn,
         )
         .await?;
+        expected = Some(projection.cursor());
     }
     Ok(())
 }
@@ -2759,7 +2714,7 @@ async fn create_or_recover_live_message(
     turn_id: &str,
     preview: &str,
 ) -> Result<MessageId, DiscordError> {
-    let nonce = live_nonce(&bridge.session_id, turn_id);
+    let nonce = live_nonce(thread_id, &bridge.session_id, turn_id);
     if let Some(message) = find_message_by_nonce(discord, thread_id, &nonce).await? {
         match discord.edit_message(thread_id, message.id, preview).await {
             Ok(()) => return Ok(message.id),
@@ -2773,21 +2728,74 @@ async fn create_or_recover_live_message(
         .id)
 }
 
+async fn project_terminal_failure(
+    discord: &dyn DiscordApi,
+    state: &BotState,
+    thread_id: ChannelId,
+    bridge: &api::SessionBridge,
+) -> Result<(), DiscordError> {
+    react_source(discord, thread_id, bridge, REACTION_FAILED).await?;
+    if let Some(message_id) = bridge
+        .live_external_message_id
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(MessageId::new)
+    {
+        discord
+            .react(thread_id, message_id, REACTION_FAILED)
+            .await?;
+    }
+    clear_terminal_bridge_state(state, bridge, bridge.active_source_message_id.as_deref()).await
+}
+
+async fn clear_terminal_bridge_state(
+    state: &BotState,
+    bridge: &api::SessionBridge,
+    expected_active_source_message_id: Option<&str>,
+) -> Result<(), DiscordError> {
+    bridge_rpc(
+        state
+            .client
+            .set_bridge_live_message(api::SetBridgeLiveMessageRequest {
+                mutation: None,
+                session_id: bridge.session_id.clone(),
+                turn_id: None,
+                external_message_id: None,
+                clear_active_source_message_id: expected_active_source_message_id
+                    .map(str::to_owned),
+            }),
+    )
+    .await?;
+    if let Some(current) = state.bridges.write().await.get_mut(&bridge.session_id) {
+        current.live_turn_id = None;
+        current.live_external_message_id = None;
+        if expected_active_source_message_id.is_some()
+            && current.active_source_message_id.as_deref() == expected_active_source_message_id
+        {
+            current.active_source_message_id = None;
+        }
+    }
+    Ok(())
+}
+
 async fn set_live_message(
     state: &BotState,
     bridge: &api::SessionBridge,
     turn_id: Option<String>,
     external_message_id: Option<String>,
 ) -> Result<(), DiscordError> {
-    state
-        .client
-        .set_bridge_live_message(api::SetBridgeLiveMessageRequest {
-            mutation: None,
-            session_id: bridge.session_id.clone(),
-            turn_id: turn_id.clone(),
-            external_message_id: external_message_id.clone(),
-        })
-        .await?;
+    bridge_rpc(
+        state
+            .client
+            .set_bridge_live_message(api::SetBridgeLiveMessageRequest {
+                mutation: None,
+                session_id: bridge.session_id.clone(),
+                turn_id: turn_id.clone(),
+                external_message_id: external_message_id.clone(),
+                clear_active_source_message_id: None,
+            }),
+    )
+    .await?;
     if let Some(current) = state.bridges.write().await.get_mut(&bridge.session_id) {
         current.live_turn_id = turn_id;
         current.live_external_message_id = external_message_id;
@@ -2795,70 +2803,120 @@ async fn set_live_message(
     Ok(())
 }
 
-async fn deliver_final(
+async fn deliver_projection(
     discord: &dyn DiscordApi,
     state: &BotState,
     thread_id: ChannelId,
     projected_bridge: &api::SessionBridge,
-    answer: &CompletedAnswer,
+    projection: &ProjectionItem,
+    expected_previous: Option<&api::BridgeProjection>,
+    active_owner_turn: Option<&str>,
 ) -> Result<(), DiscordError> {
     let current_bridge = state
         .current_bridge(&projected_bridge.session_id)
         .await
         .unwrap_or_else(|| projected_bridge.clone());
     let bridge = &current_bridge;
-    if bridge.last_delivered_turn_id.as_deref() == Some(answer.turn_id.as_str()) {
+    let target = projection.cursor();
+    if same_projection(bridge.last_projected.as_ref(), Some(&target)) {
         return Ok(());
     }
-    let safe_body = visible_discord_content(&answer.body);
+    if !same_projection(bridge.last_projected.as_ref(), expected_previous) {
+        return Err(DiscordError::ProjectionCursorConflict);
+    }
+    if projection_clears_stale_source(
+        projection,
+        active_owner_turn,
+        bridge.active_source_message_id.as_deref(),
+    ) && let Some(source_message_id) = bridge.active_source_message_id.as_deref()
+    {
+        // Only the actively-running source-neutral owner turn may clear stale reaction ownership.
+        // Historical recovery and the accepted-before-provider-start window must not sever a newer
+        // Discord continuation from its source message.
+        clear_terminal_bridge_state(state, bridge, Some(source_message_id)).await?;
+    }
+    let safe_body = if projection.suppressed {
+        String::new()
+    } else {
+        visible_discord_content(&projection.body)
+    };
     let body_sha256 = hex_digest(safe_body.as_bytes());
-    // Count with the same streaming chunker used below, without retaining all chunk text or
+    // A trusted Discord-origin user prompt advances the authoritative typed cursor with zero
+    // message parts. The server validates that suppression against durable turn provenance.
+    // Other projections use the same streaming chunker below without retaining all chunk text or
     // per-part metadata in memory or in the authoritative projection.
-    let part_count = u64::try_from(DiscordChunks::new(&safe_body).count()).map_err(|_| {
-        DiscordError::InvalidConfig("final answer has too many Discord chunks".to_owned())
-    })?;
+    let part_count = if projection.suppressed {
+        0
+    } else {
+        u64::try_from(DiscordChunks::new(&safe_body).count()).map_err(|_| {
+            DiscordError::InvalidConfig(
+                "transcript projection has too many Discord chunks".to_owned(),
+            )
+        })?
+    };
 
     let pending = bridge.delivery.as_ref().filter(|delivery| {
-        delivery.turn_id == answer.turn_id
+        delivery.projection_kind == projection.kind.api_value()
+            && delivery.turn_id == projection.turn_id
+            && same_projection(delivery.previous_projection.as_ref(), expected_previous)
             && delivery.body_sha256 == body_sha256
             && delivery.part_count == part_count
     });
     if bridge.delivery.is_some() && pending.is_none() {
-        return Err(DiscordError::InvalidConfig(
-            "a different final delivery is already pending".to_owned(),
-        ));
+        return Err(DiscordError::ProjectionCursorConflict);
     }
     if pending.is_none() {
-        state
-            .client
-            .prepare_bridge_delivery(api::PrepareBridgeDeliveryRequest {
-                mutation: None,
-                session_id: bridge.session_id.clone(),
-                turn_id: answer.turn_id.clone(),
-                body_sha256: body_sha256.clone(),
-                part_count,
-            })
-            .await?;
+        bridge_rpc(
+            state
+                .client
+                .prepare_bridge_delivery(api::PrepareBridgeDeliveryRequest {
+                    mutation: None,
+                    session_id: bridge.session_id.clone(),
+                    turn_id: projection.turn_id.clone(),
+                    body_sha256: body_sha256.clone(),
+                    part_count,
+                    projection_kind: projection.kind.api_value(),
+                    expected_last_projected: expected_previous.cloned(),
+                }),
+        )
+        .await?;
     }
     let completed_parts = pending.map_or(0, |delivery| delivery.completed_parts);
     if completed_parts > part_count {
         return Err(DiscordError::InvalidConfig(
-            "invalid final delivery progress".to_owned(),
+            "invalid transcript delivery progress".to_owned(),
         ));
     }
 
-    for (index, chunk) in DiscordChunks::new(&safe_body).enumerate() {
+    let mut chunks = DiscordChunks::new(&safe_body);
+    let projected_chunks = std::iter::from_fn(|| {
+        if projection.suppressed {
+            None
+        } else {
+            chunks.next()
+        }
+    });
+    for (index, chunk) in projected_chunks.enumerate() {
         let part_index = u64::try_from(index).map_err(|_| {
-            DiscordError::InvalidConfig("final answer has too many Discord chunks".to_owned())
+            DiscordError::InvalidConfig(
+                "transcript projection has too many Discord chunks".to_owned(),
+            )
         })?;
         if part_index < completed_parts {
             continue;
         }
-        let nonce = final_nonce(&bridge.session_id, &answer.turn_id, index);
-        let message_id = if index == 0
-            && bridge.live_turn_id.as_deref() == Some(answer.turn_id.as_str())
-            && bridge.live_external_message_id.is_some()
-        {
+        let nonce = projection_nonce(
+            thread_id,
+            &bridge.session_id,
+            projection.kind,
+            &projection.turn_id,
+            index,
+        );
+        let can_reuse_live = projection.kind == ProjectionKind::Assistant
+            && index == 0
+            && bridge.live_turn_id.as_deref() == Some(projection.turn_id.as_str())
+            && bridge.live_external_message_id.is_some();
+        let message_id = if can_reuse_live {
             let live_message_id = bridge
                 .live_external_message_id
                 .as_deref()
@@ -2882,43 +2940,57 @@ async fn deliver_final(
             send_or_recover_final_part(discord, thread_id, &nonce, &chunk).await?
         };
         // Reactions precede the durable part checkpoint. If a Discord mutation or the checkpoint
-        // response fails, the deterministic nonce makes the whole part safe to retry.
-        if let Err(error) = discord
-            .remove_own_reaction(thread_id, message_id, REACTION_LIVE)
-            .await
-            && !is_not_found(&error)
-        {
-            return Err(error.into());
+        // response fails, the deterministic kind-aware nonce makes the whole part safe to retry.
+        if projection.kind == ProjectionKind::Assistant {
+            if let Err(error) = discord
+                .remove_own_reaction(thread_id, message_id, REACTION_LIVE)
+                .await
+                && !is_not_found(&error)
+            {
+                return Err(error.into());
+            }
+            discord
+                .react(thread_id, message_id, REACTION_COMPLETED)
+                .await?;
+        } else {
+            discord
+                .react(thread_id, message_id, REACTION_ACCEPTED)
+                .await?;
         }
-        discord
-            .react(thread_id, message_id, REACTION_COMPLETED)
-            .await?;
-        state
-            .client
-            .complete_bridge_delivery_part(api::CompleteBridgeDeliveryPartRequest {
+        bridge_rpc(state.client.complete_bridge_delivery_part(
+            api::CompleteBridgeDeliveryPartRequest {
                 mutation: None,
                 session_id: bridge.session_id.clone(),
-                turn_id: answer.turn_id.clone(),
+                turn_id: projection.turn_id.clone(),
                 part_index,
                 external_message_id: message_id.get().to_string(),
-            })
-            .await?;
-    }
-    react_source(discord, thread_id, bridge, REACTION_COMPLETED).await?;
-    state
-        .client
-        .finalize_bridge_delivery(api::FinalizeBridgeDeliveryRequest {
-            mutation: None,
-            session_id: bridge.session_id.clone(),
-            turn_id: answer.turn_id.clone(),
-        })
+                projection_kind: projection.kind.api_value(),
+            },
+        ))
         .await?;
+    }
+    if projection.kind == ProjectionKind::Assistant {
+        react_source(discord, thread_id, bridge, REACTION_COMPLETED).await?;
+    }
+    bridge_rpc(
+        state
+            .client
+            .finalize_bridge_delivery(api::FinalizeBridgeDeliveryRequest {
+                mutation: None,
+                session_id: bridge.session_id.clone(),
+                turn_id: projection.turn_id.clone(),
+                projection_kind: projection.kind.api_value(),
+            }),
+    )
+    .await?;
     if let Some(current) = state.bridges.write().await.get_mut(&bridge.session_id) {
-        current.last_delivered_turn_id = Some(answer.turn_id.clone());
+        current.last_projected = Some(target);
         current.delivery = None;
-        current.live_turn_id = None;
-        current.live_external_message_id = None;
-        current.active_source_message_id = None;
+        if projection.kind == ProjectionKind::Assistant {
+            current.live_turn_id = None;
+            current.live_external_message_id = None;
+            current.active_source_message_id = None;
+        }
     }
     Ok(())
 }
@@ -2956,16 +3028,18 @@ async fn react_source(
     else {
         return Ok(());
     };
-    discord
-        .remove_own_reaction(thread_id, message_id, REACTION_ACCEPTED)
-        .await?;
-    discord.react(thread_id, message_id, reaction).await?;
-    Ok(())
+    feedback_step(
+        discord
+            .remove_own_reaction(thread_id, message_id, REACTION_ACCEPTED)
+            .await,
+    )?;
+    feedback_step(discord.react(thread_id, message_id, reaction).await)
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
+        let _ = self.gateway_ready.send(true);
         let _ = self.state.bot_user_id.set(ready.user.id);
         let discord: Arc<dyn DiscordApi> = Arc::new(SerenityDiscordApi {
             http: Arc::clone(&ctx.http),
@@ -2981,60 +3055,90 @@ impl EventHandler for Handler {
         {
             return;
         }
-        let session_id = self
+        let cached_session = self
             .state
             .thread_routes
             .read()
             .await
             .get(&message.channel_id.get())
             .cloned();
-        let Some(session_id) = session_id else {
-            return;
+        let session_id = if let Some(session_id) = cached_session {
+            let valid = self
+                .state
+                .current_bridge(&session_id)
+                .await
+                .is_some_and(|bridge| {
+                    valid_open_thread_route(&self.state.config, &bridge)
+                        == Some((message.channel_id.get(), session_id.clone()))
+                });
+            valid.then_some(session_id)
+        } else {
+            None
         };
-        let Some(bridge) = self.state.current_bridge(&session_id).await else {
-            return;
-        };
-        if bridge.lifecycle != api::BridgeLifecycle::Open as i32
-            || bridge.transport.as_deref() != Some(TRANSPORT_NAME)
-            || bridge.external_thread_id.as_deref() != Some(&message.channel_id.get().to_string())
-        {
-            return;
-        }
         let discord = SerenityDiscordApi {
             http: Arc::clone(&ctx.http),
         };
-        let slot = self.state.inbound_slots.try_acquire().ok();
-        let proposed = IngressRecord::from_message(session_id, &message, slot.is_none());
-        let record = match self.state.ingress.enqueue(&proposed) {
+        let route_resolved = session_id.is_some();
+        let slot = session_id
+            .as_ref()
+            .and_then(|_| self.state.inbound_slots.try_acquire().ok());
+        let proposed =
+            IngressRecord::from_message(session_id, &message, route_resolved && slot.is_none());
+        let record = match self.state.ingress_enqueue(proposed).await {
             Ok(Some(record)) => record,
             Ok(None) => return,
             Err(error) => {
-                let _ = discord
-                    .react(message.channel_id, message.id, REACTION_FAILED)
-                    .await;
+                let _ = tokio::time::timeout(
+                    BRIDGE_RPC_TIMEOUT,
+                    discord.react(message.channel_id, message.id, REACTION_FAILED),
+                )
+                .await;
                 eprintln!(
-                    "nakode discord: durable ingress checkpoint failed for session {} ({})",
-                    short_identity(&bridge.session_id),
+                    "nakode discord: durable ingress checkpoint failed ({})",
                     sanitized_bridge_error(&error)
                 );
                 return;
             }
         };
-        if record.forced_busy || slot.is_none() {
-            mark_message_busy(&discord, message.channel_id, message.id).await;
+        if record.local_terminal {
+            drop(slot);
+            if record.route_pending {
+                eprintln!(
+                    "nakode discord: unresolved inbound event dropped at the bounded ownership-check limit"
+                );
+            } else {
+                let _ = tokio::time::timeout(
+                    BRIDGE_RPC_TIMEOUT,
+                    mark_message_busy(&discord, message.channel_id, message.id),
+                )
+                .await;
+            }
+            return;
+        }
+        if record.route_pending {
+            drop(slot);
             self.state.ingress_notify.notify_one();
             return;
         }
-        if !claim_ingress(&self.state, &record.message_id).await {
-            return;
+        if record.forced_busy || slot.is_none() {
+            let _ = tokio::time::timeout(
+                BRIDGE_RPC_TIMEOUT,
+                mark_message_busy(&discord, message.channel_id, message.id),
+            )
+            .await;
+        } else {
+            // The durable record and exact cached route exist before optimistic feedback. Nakode's
+            // atomic readiness check may still replace this with Busy, but attachment downloads and
+            // replay scheduling never delay the documented continuing state.
+            let _ = tokio::time::timeout(
+                BRIDGE_RPC_TIMEOUT,
+                discord.react(message.channel_id, message.id, REACTION_ACCEPTED),
+            )
+            .await;
         }
-        let outcome = process_ingress_record(&discord, &self.state, &record).await;
-        settle_ingress(&self.state, &record, outcome).await;
-        self.state
-            .ingress_inflight
-            .lock()
-            .await
-            .remove(&record.message_id);
+        drop(slot);
+        // The tracked replayer is the sole owner of continuation RPCs and attachment work. Event
+        // callbacks only durably admit, apply an immediate busy reaction, and wake that worker.
         self.state.ingress_notify.notify_one();
     }
 }
@@ -3117,34 +3221,44 @@ async fn consume_record_as_busy(
         {
             let channel_id = record.thread_id.parse::<u64>().ok().map(ChannelId::new);
             let message_id = record.message_id.parse::<u64>().ok().map(MessageId::new);
-            if let (Some(channel_id), Some(message_id)) = (channel_id, message_id) {
-                let _ = discord
-                    .remove_own_reaction(channel_id, message_id, REACTION_FAILED)
-                    .await;
-                let _ = discord
-                    .react(channel_id, message_id, terminal_reaction)
-                    .await;
-                if terminal_reaction == REACTION_BUSY {
-                    let nonce = busy_nonce(message_id);
-                    let _ = discord
-                        .send_message(
-                            channel_id,
-                            "❌ This session is busy or closed. Wait for the active turn to finish, then send a new message.",
-                            Some(&nonce),
-                        )
-                        .await;
-                } else if terminal_reaction == REACTION_FAILED {
-                    let nonce = failed_nonce(message_id);
-                    let _ = discord
-                        .send_message(
-                            channel_id,
-                            "⚠️ This message could not be accepted safely. Check its multipart syntax or attachments, then send a new message.",
-                            Some(&nonce),
-                        )
-                        .await;
+            let feedback = if let (Some(channel_id), Some(message_id)) = (channel_id, message_id) {
+                let disposition =
+                    api::BridgeContinuationDisposition::try_from(response.disposition)
+                        .unwrap_or(api::BridgeContinuationDisposition::Unspecified);
+                if disposition == api::BridgeContinuationDisposition::Duplicate {
+                    match response
+                        .replayed_disposition
+                        .and_then(|value| api::BridgeContinuationDisposition::try_from(value).ok())
+                    {
+                        Some(api::BridgeContinuationDisposition::Accepted) => {
+                            match response.replayed_source_active {
+                                Some(true) => {
+                                    mark_message_accepted(discord, channel_id, message_id).await
+                                }
+                                Some(false) => {
+                                    remove_accepted_feedback(discord, channel_id, message_id).await
+                                }
+                                None => mark_message_failed(discord, channel_id, message_id).await,
+                            }
+                        }
+                        Some(api::BridgeContinuationDisposition::Busy) => {
+                            if terminal_reaction == REACTION_BUSY {
+                                mark_message_busy(discord, channel_id, message_id).await
+                            } else {
+                                mark_message_failed(discord, channel_id, message_id).await
+                            }
+                        }
+                        _ => mark_message_failed(discord, channel_id, message_id).await,
+                    }
+                } else if terminal_reaction == REACTION_BUSY {
+                    mark_message_busy(discord, channel_id, message_id).await
+                } else {
+                    mark_message_failed(discord, channel_id, message_id).await
                 }
-            }
-            IngressProcessOutcome::Terminal
+            } else {
+                Ok(())
+            };
+            terminal_feedback_outcome(feedback, &bridge.session_id)
         }
         Ok(Err(error)) => {
             eprintln!(
@@ -3177,6 +3291,16 @@ async fn handle_prompt_record(
     bridge: &api::SessionBridge,
     record: &IngressRecord,
 ) -> IngressProcessOutcome {
+    if let (Some(channel_id), Some(message_id)) = (
+        record.thread_id.parse::<u64>().ok().map(ChannelId::new),
+        record.message_id.parse::<u64>().ok().map(MessageId::new),
+    ) {
+        let _ = tokio::time::timeout(
+            BRIDGE_RPC_TIMEOUT,
+            discord.react(channel_id, message_id, REACTION_ACCEPTED),
+        )
+        .await;
+    }
     let prompt = match prompt_from_record(state, record).await {
         Ok(prompt) => prompt,
         Err(error) => {
@@ -3238,6 +3362,7 @@ async fn handle_multipart_record(
     let Some(message_id) = message_id else {
         return IngressProcessOutcome::Terminal;
     };
+    let multipart_group = part.group.to_owned();
     match state
         .multipart
         .accept(&bridge.session_id, message_id, part)
@@ -3252,12 +3377,12 @@ async fn handle_multipart_record(
             IngressProcessOutcome::WaitingMultipart
         }
         Ok(MultipartOutcome::Duplicate) => {
-            if let Some(channel_id) = channel_id {
-                let _ = discord
-                    .react(channel_id, message_id, REACTION_ACCEPTED)
-                    .await;
-            }
-            IngressProcessOutcome::Terminal
+            let feedback = if let Some(channel_id) = channel_id {
+                mark_message_accepted(discord, channel_id, message_id).await
+            } else {
+                Ok(())
+            };
+            terminal_feedback_outcome(feedback, &bridge.session_id)
         }
         Ok(MultipartOutcome::Complete {
             group,
@@ -3292,7 +3417,17 @@ async fn handle_multipart_record(
                 short_identity(&bridge.session_id),
                 sanitized_bridge_error(&error)
             );
-            consume_record_as_busy(discord, state, bridge, record, REACTION_FAILED).await
+            let outcome =
+                consume_record_as_busy(discord, state, bridge, record, REACTION_FAILED).await;
+            if matches!(outcome, IngressProcessOutcome::Terminal) {
+                state
+                    .multipart
+                    .finish(&bridge.session_id, &multipart_group)
+                    .await;
+                IngressProcessOutcome::TerminalMultipart(multipart_group)
+            } else {
+                outcome
+            }
         }
     }
 }
@@ -3331,12 +3466,7 @@ async fn submit_bridge_record(
     };
     // Feedback follows the durable local ingress checkpoint and precedes the serialized Nakode
     // claim. A readiness race replaces this optimistic reaction with the documented busy state.
-    let _ = discord
-        .remove_own_reaction(channel_id, reaction_message_id, REACTION_FAILED)
-        .await;
-    let _ = discord
-        .react(channel_id, reaction_message_id, REACTION_ACCEPTED)
-        .await;
+    let accepted_feedback = mark_message_accepted(discord, channel_id, reaction_message_id).await;
     let response = tokio::time::timeout(
         BRIDGE_RPC_TIMEOUT,
         state.client.continue_session_from_bridge(request),
@@ -3351,26 +3481,60 @@ async fn submit_bridge_record(
                     if let Some(current) = state.bridges.write().await.get_mut(&bridge.session_id) {
                         current.active_source_message_id = Some(accepted_source_message_id);
                     }
-                    IngressProcessOutcome::Terminal
+                    terminal_feedback_outcome(accepted_feedback, &bridge.session_id)
                 }
                 api::BridgeContinuationDisposition::Duplicate => {
-                    let still_active = state
-                        .current_bridge(&bridge.session_id)
-                        .await
-                        .and_then(|current| current.active_source_message_id)
-                        .as_deref()
-                        == Some(accepted_source_message_id.as_str());
-                    if !still_active {
-                        let _ = discord
-                            .remove_own_reaction(channel_id, reaction_message_id, REACTION_ACCEPTED)
-                            .await;
+                    let replayed = response
+                        .replayed_disposition
+                        .and_then(|value| api::BridgeContinuationDisposition::try_from(value).ok())
+                        .unwrap_or(api::BridgeContinuationDisposition::Unspecified);
+                    match replayed {
+                        api::BridgeContinuationDisposition::Accepted => {
+                            match response.replayed_source_active {
+                                Some(true) => {
+                                    if let Some(current) =
+                                        state.bridges.write().await.get_mut(&bridge.session_id)
+                                    {
+                                        current.active_source_message_id =
+                                            Some(accepted_source_message_id.clone());
+                                    }
+                                    terminal_feedback_outcome(accepted_feedback, &bridge.session_id)
+                                }
+                                Some(false) => terminal_feedback_outcome(
+                                    remove_accepted_feedback(
+                                        discord,
+                                        channel_id,
+                                        reaction_message_id,
+                                    )
+                                    .await,
+                                    &bridge.session_id,
+                                ),
+                                None => terminal_feedback_outcome(
+                                    mark_message_failed(discord, channel_id, reaction_message_id)
+                                        .await,
+                                    &bridge.session_id,
+                                ),
+                            }
+                        }
+                        api::BridgeContinuationDisposition::Busy => terminal_feedback_outcome(
+                            mark_message_busy(discord, channel_id, reaction_message_id).await,
+                            &bridge.session_id,
+                        ),
+                        api::BridgeContinuationDisposition::Unspecified
+                        | api::BridgeContinuationDisposition::Duplicate => {
+                            // Legacy identity-only rows cannot safely reconstruct Accepted versus
+                            // Busy. Terminate visibly instead of retrying forever or guessing.
+                            terminal_feedback_outcome(
+                                mark_message_failed(discord, channel_id, reaction_message_id).await,
+                                &bridge.session_id,
+                            )
+                        }
                     }
-                    IngressProcessOutcome::Terminal
                 }
-                api::BridgeContinuationDisposition::Busy => {
-                    mark_message_busy(discord, channel_id, reaction_message_id).await;
-                    IngressProcessOutcome::Terminal
-                }
+                api::BridgeContinuationDisposition::Busy => terminal_feedback_outcome(
+                    mark_message_busy(discord, channel_id, reaction_message_id).await,
+                    &bridge.session_id,
+                ),
                 api::BridgeContinuationDisposition::Unspecified => {
                     mark_ingress_deferred(discord, channel_id, reaction_message_id).await;
                     IngressProcessOutcome::Deferred
@@ -3397,6 +3561,82 @@ async fn submit_bridge_record(
     }
 }
 
+fn feedback_step(result: Result<(), serenity::Error>) -> Result<(), DiscordError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_not_found(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn remove_accepted_feedback(
+    discord: &dyn DiscordApi,
+    channel_id: ChannelId,
+    message_id: MessageId,
+) -> Result<(), DiscordError> {
+    feedback_step(
+        discord
+            .remove_own_reaction(channel_id, message_id, REACTION_ACCEPTED)
+            .await,
+    )
+}
+
+fn terminal_feedback_outcome(
+    feedback: Result<(), DiscordError>,
+    session_id: &str,
+) -> IngressProcessOutcome {
+    match feedback {
+        Ok(()) => IngressProcessOutcome::Terminal,
+        Err(error) => {
+            eprintln!(
+                "nakode discord: terminal inbound feedback deferred for session {} ({})",
+                short_identity(session_id),
+                sanitized_bridge_error(&error)
+            );
+            IngressProcessOutcome::Deferred
+        }
+    }
+}
+
+async fn mark_message_accepted(
+    discord: &dyn DiscordApi,
+    channel_id: ChannelId,
+    message_id: MessageId,
+) -> Result<(), DiscordError> {
+    feedback_step(
+        discord
+            .remove_own_reaction(channel_id, message_id, REACTION_FAILED)
+            .await,
+    )?;
+    feedback_step(
+        discord
+            .react(channel_id, message_id, REACTION_ACCEPTED)
+            .await,
+    )
+}
+
+async fn mark_message_failed(
+    discord: &dyn DiscordApi,
+    channel_id: ChannelId,
+    message_id: MessageId,
+) -> Result<(), DiscordError> {
+    feedback_step(
+        discord
+            .remove_own_reaction(channel_id, message_id, REACTION_ACCEPTED)
+            .await,
+    )?;
+    feedback_step(discord.react(channel_id, message_id, REACTION_FAILED).await)?;
+    let nonce = failed_nonce(message_id);
+    send_or_recover_final_part(
+        discord,
+        channel_id,
+        &nonce,
+        "⚠️ This message could not be accepted safely. Check that the session is ready, then send a new message.",
+    )
+    .await
+    .map(|_| ())
+}
+
 async fn mark_ingress_deferred(
     discord: &dyn DiscordApi,
     channel_id: ChannelId,
@@ -3408,19 +3648,26 @@ async fn mark_ingress_deferred(
     let _ = discord.react(channel_id, message_id, REACTION_FAILED).await;
 }
 
-async fn mark_message_busy(discord: &dyn DiscordApi, channel_id: ChannelId, message_id: MessageId) {
-    let _ = discord
-        .remove_own_reaction(channel_id, message_id, REACTION_ACCEPTED)
-        .await;
-    let _ = discord.react(channel_id, message_id, REACTION_BUSY).await;
+async fn mark_message_busy(
+    discord: &dyn DiscordApi,
+    channel_id: ChannelId,
+    message_id: MessageId,
+) -> Result<(), DiscordError> {
+    feedback_step(
+        discord
+            .remove_own_reaction(channel_id, message_id, REACTION_ACCEPTED)
+            .await,
+    )?;
+    feedback_step(discord.react(channel_id, message_id, REACTION_BUSY).await)?;
     let nonce = busy_nonce(message_id);
-    let _ = discord
-        .send_message(
-            channel_id,
-            "❌ This session is busy or closed. Wait for the active turn to finish, then send a new message.",
-            Some(&nonce),
-        )
-        .await;
+    send_or_recover_final_part(
+        discord,
+        channel_id,
+        &nonce,
+        "❌ This session is busy or closed. Wait for the active turn to finish, then send a new message.",
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn prompt_from_record(
@@ -3508,21 +3755,48 @@ fn thread_title(kind: i32, display_title: &str) -> String {
     }
 }
 
-fn starter_nonce(session_id: &str) -> String {
-    format!("nk-s-{}", &hex_digest(session_id.as_bytes())[..20])
-}
-
-fn live_nonce(session_id: &str, turn_id: &str) -> String {
+fn starter_nonce(parent_channel_id: ChannelId, session_id: &str) -> String {
     format!(
-        "nk-l-{}",
-        &hex_digest(format!("{session_id}:{turn_id}").as_bytes())[..20]
+        "nk-s-{}",
+        &hex_digest(format!("{}:{session_id}", parent_channel_id.get()).as_bytes())[..20]
     )
 }
 
-fn final_nonce(session_id: &str, turn_id: &str, index: usize) -> String {
+fn live_nonce(thread_id: ChannelId, session_id: &str, turn_id: &str) -> String {
     format!(
-        "nk-f-{}",
-        &hex_digest(format!("{session_id}:{turn_id}:{index}").as_bytes())[..20]
+        "nk-l-{}",
+        &hex_digest(format!("{}:{session_id}:{turn_id}", thread_id.get()).as_bytes())[..20]
+    )
+}
+
+fn projection_nonce(
+    thread_id: ChannelId,
+    session_id: &str,
+    kind: ProjectionKind,
+    turn_id: &str,
+    index: usize,
+) -> String {
+    format!(
+        "nk-p-{}",
+        &hex_digest(
+            format!(
+                "{}:{session_id}:{}:{turn_id}:{index}",
+                thread_id.get(),
+                kind.nonce_label()
+            )
+            .as_bytes()
+        )[..20]
+    )
+}
+
+#[cfg(test)]
+fn final_nonce(thread_id: ChannelId, session_id: &str, turn_id: &str, index: usize) -> String {
+    projection_nonce(
+        thread_id,
+        session_id,
+        ProjectionKind::Assistant,
+        turn_id,
+        index,
     )
 }
 
@@ -3600,6 +3874,8 @@ fn sanitized_bridge_error(error: &DiscordError) -> &'static str {
         DiscordError::Http(_) => "attachment request failed",
         DiscordError::AttachmentTooLarge { .. } => "attachment too large",
         DiscordError::CombinedAttachmentsTooLarge => "combined attachments too large",
+        DiscordError::MultipartTooManyParts => "multipart prompt has too many parts",
+        DiscordError::MultipartTooLarge => "multipart prompt too large",
         DiscordError::UnsupportedAttachment { .. } => "unsupported attachment",
         DiscordError::InvalidConfig(_) | DiscordError::InvalidId { .. } => "invalid bridge state",
         _ => "bridge operation failed",
@@ -3819,1062 +4095,4 @@ async fn download_image(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Barrier, Mutex},
-        time::Duration,
-    };
-
-    use serenity::all::{ChannelId, MessageId, UserId};
-
-    use super::{
-        CONFIG_VERSION, DiscordApi, DiscordConfig, DiscordConfigStore, DiscordError,
-        ExternalMessage, IngressAttachment, IngressRecord, IngressSpool,
-        MAX_ACTIVE_MULTIPART_ASSEMBLIES_PER_SESSION, MultipartAssembler, MultipartOutcome,
-        RecoverySpool, busy_nonce, connect_api, create_or_recover_thread, failed_nonce,
-        final_nonce, find_message_by_nonce, is_approved_discord_cdn_url, parse_multipart,
-        reconciliation_snapshot, sanitize_mentions, send_or_recover_final_part,
-        split_discord_content, starter_nonce, thread_title, validate_snowflake,
-        visible_discord_content,
-    };
-    use nakode_sdk::v1 as api;
-
-    fn enabled_config() -> DiscordConfig {
-        DiscordConfig {
-            version: CONFIG_VERSION,
-            enabled: true,
-            chat_channel_id: Some("43".to_owned()),
-            agent_channel_id: Some("44".to_owned()),
-            primary_user_id: Some("42".to_owned()),
-        }
-    }
-
-    fn bridge() -> api::SessionBridge {
-        api::SessionBridge {
-            session_id: "session-1".to_owned(),
-            workspace_id: "workspace-1".to_owned(),
-            kind: api::OrchestratorKind::Chat as i32,
-            lifecycle: api::BridgeLifecycle::Open as i32,
-            display_title: "Investigate Unicode 🦀".to_owned(),
-            revision: 1,
-            transport: None,
-            external_parent_id: None,
-            external_thread_id: None,
-            last_delivered_turn_id: None,
-            delivery: None,
-            live_turn_id: None,
-            live_external_message_id: None,
-            active_source_message_id: None,
-        }
-    }
-
-    fn ingress_record(
-        session_id: &str,
-        message_id: &str,
-        multipart_group: Option<&str>,
-        forced_busy: bool,
-    ) -> IngressRecord {
-        IngressRecord {
-            version: super::INGRESS_SCHEMA_VERSION,
-            session_id: session_id.to_owned(),
-            thread_id: "92".to_owned(),
-            message_id: message_id.to_owned(),
-            author_id: "42".to_owned(),
-            received_at_ms: super::unix_time_ms(),
-            content: multipart_group.map_or_else(
-                || "continue".to_owned(),
-                |group| format!("!nakode multipart {group} 1/2\npart"),
-            ),
-            attachments: Vec::new(),
-            multipart_group: multipart_group.map(str::to_owned),
-            forced_busy,
-        }
-    }
-
-    #[test]
-    fn periodic_reconciliation_preserves_optimistic_state_until_a_watch_update() {
-        let mut optimistic = bridge();
-        optimistic.live_turn_id = Some("turn-1".to_owned());
-        optimistic.live_external_message_id = Some("200".to_owned());
-        let mut bridges = HashMap::from([(optimistic.session_id.clone(), optimistic)]);
-
-        let periodic = reconciliation_snapshot(&mut bridges, None);
-        assert_eq!(periodic[0].live_turn_id.as_deref(), Some("turn-1"));
-        assert_eq!(
-            bridges["session-1"].live_external_message_id.as_deref(),
-            Some("200")
-        );
-
-        let mut authoritative = bridge();
-        authoritative.revision = 2;
-        let watched = reconciliation_snapshot(&mut bridges, Some(vec![authoritative]));
-        assert!(watched[0].live_turn_id.is_none());
-        assert_eq!(bridges["session-1"].revision, 2);
-    }
-
-    #[tokio::test]
-    async fn initial_api_connect_stops_cooperatively() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let endpoint = directory.path().join("missing-nakode.sock");
-        let (shutdown_sender, mut shutdown) = tokio::sync::watch::channel(false);
-        let connection = tokio::spawn(async move { connect_api(endpoint, &mut shutdown).await });
-
-        tokio::task::yield_now().await;
-        shutdown_sender.send(true).expect("request shutdown");
-        let result = tokio::time::timeout(Duration::from_secs(1), connection)
-            .await
-            .expect("connection loop stops before the transport abort deadline")
-            .expect("connection task")
-            .expect("cooperative shutdown is not an error");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn durable_ingress_preserves_forced_busy_and_same_session_order_across_restart() {
-        let directory = tempfile::tempdir().expect("ingress root");
-        let path = directory.path().join("ingress.sqlite");
-        {
-            let spool = IngressSpool::open(&path).expect("open ingress");
-            let first = spool
-                .enqueue(&ingress_record("session-1", "100", None, false))
-                .expect("first event")
-                .expect("first event is pending");
-            assert!(!first.forced_busy);
-            let duplicate = spool
-                .enqueue(&ingress_record("session-1", "100", None, true))
-                .expect("duplicate event")
-                .expect("duplicate remains pending");
-            assert!(!duplicate.forced_busy, "the first durable decision wins");
-            let later = spool
-                .enqueue(&ingress_record("session-1", "101", None, false))
-                .expect("later same-session event")
-                .expect("later event is pending");
-            assert!(
-                later.forced_busy,
-                "a later turn cannot overtake an unresolved one"
-            );
-            let concurrent = spool
-                .enqueue(&ingress_record("session-2", "102", None, false))
-                .expect("concurrent session event")
-                .expect("concurrent event is pending");
-            assert!(!concurrent.forced_busy);
-
-            let mut overloaded = ingress_record("session-3", "103", Some("private"), true);
-            overloaded.attachments.push(IngressAttachment {
-                filename: "secret.png".to_owned(),
-                url: "https://cdn.discordapp.com/attachments/secret".to_owned(),
-                content_type: Some("image/png".to_owned()),
-                size: 6,
-            });
-            let overloaded = spool
-                .enqueue(&overloaded)
-                .expect("overloaded multipart event")
-                .expect("overloaded event is durably consumed");
-            assert!(overloaded.forced_busy);
-            assert!(overloaded.content.is_empty());
-            assert!(overloaded.attachments.is_empty());
-            assert!(overloaded.multipart_group.is_none());
-        }
-
-        let restored = IngressSpool::open(&path).expect("restore ingress");
-        let restored_busy = restored
-            .enqueue(&ingress_record("session-1", "101", None, false))
-            .expect("replay pending busy identity")
-            .expect("pending identity remains present");
-        assert!(
-            restored_busy.forced_busy,
-            "the durable admission decision wins"
-        );
-        assert!(restored_busy.content.is_empty());
-        let (_, first) = restored
-            .next_after(0)
-            .expect("read ingress")
-            .expect("first ingress");
-        assert_eq!(first.message_id, "100");
-        let (_, later) = restored
-            .next_after(1)
-            .expect("read later ingress")
-            .expect("later ingress");
-        assert_eq!(later.message_id, "101");
-        assert!(later.forced_busy);
-        assert!(later.content.is_empty());
-        assert!(later.attachments.is_empty());
-
-        restored.remove_event("100").expect("settle first event");
-        assert!(
-            restored
-                .enqueue(&ingress_record("session-1", "100", None, false))
-                .expect("replay settled identity")
-                .is_none(),
-            "a locally terminal event cannot become a prompt after reopen"
-        );
-        drop(restored);
-        let reopened = IngressSpool::open(&path).expect("reopen ingress");
-        assert!(
-            reopened
-                .enqueue(&ingress_record("session-1", "100", None, false))
-                .expect("replay tombstone after restart")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn independent_ingress_connections_serialize_same_session_admission() {
-        let directory = tempfile::tempdir().expect("ingress root");
-        let path = directory.path().join("ingress.sqlite");
-        let first_spool = Arc::new(IngressSpool::open(&path).expect("first connection"));
-        let second_spool = Arc::new(IngressSpool::open(&path).expect("second connection"));
-        let barrier = Arc::new(Barrier::new(3));
-
-        let first = {
-            let spool = Arc::clone(&first_spool);
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                spool
-                    .enqueue(&ingress_record("session-race", "race-1", None, false))
-                    .expect("first admission")
-                    .expect("first remains pending")
-            })
-        };
-        let second = {
-            let spool = Arc::clone(&second_spool);
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                spool
-                    .enqueue(&ingress_record("session-race", "race-2", None, false))
-                    .expect("second admission")
-                    .expect("second remains pending")
-            })
-        };
-        barrier.wait();
-
-        let records = [
-            first.join().expect("first thread"),
-            second.join().expect("second thread"),
-        ];
-        assert_eq!(
-            records.iter().filter(|record| !record.forced_busy).count(),
-            1,
-            "only one same-session event may remain executable across connections"
-        );
-        let rejected = records
-            .iter()
-            .find(|record| record.forced_busy)
-            .expect("one event is durably busy");
-        assert!(rejected.content.is_empty());
-        assert!(rejected.attachments.is_empty());
-    }
-
-    #[test]
-    fn corrupt_ingress_is_quarantined_without_blocking_later_sessions() {
-        let directory = tempfile::tempdir().expect("ingress root");
-        let spool =
-            IngressSpool::open(&directory.path().join("ingress.sqlite")).expect("open ingress");
-        spool
-            .enqueue(&ingress_record("session-1", "300", None, false))
-            .expect("first enqueue")
-            .expect("first pending");
-        spool
-            .enqueue(&ingress_record("session-2", "301", None, false))
-            .expect("second enqueue")
-            .expect("second pending");
-        spool
-            .connection
-            .lock()
-            .expect("ingress connection")
-            .execute(
-                "UPDATE discord_ingress SET payload_json = x'00' WHERE external_event_id = '300'",
-                [],
-            )
-            .expect("corrupt payload");
-
-        assert!(matches!(
-            spool.next_after(0),
-            Err(DiscordError::IngressPayload(_))
-        ));
-        spool
-            .discard_next_after(0)
-            .expect("quarantine corrupt payload");
-        let (_, next) = spool
-            .next_after(0)
-            .expect("read after quarantine")
-            .expect("later event remains");
-        assert_eq!(next.message_id, "301");
-        assert!(
-            spool
-                .enqueue(&ingress_record("session-1", "300", None, false))
-                .expect("replay corrupt identity")
-                .is_none(),
-            "quarantined identities fail closed"
-        );
-    }
-
-    #[test]
-    fn durable_ingress_cleans_a_completed_multipart_group_as_one_turn() {
-        let directory = tempfile::tempdir().expect("ingress root");
-        let path = directory.path().join("ingress.sqlite");
-        let spool = IngressSpool::open(&path).expect("open ingress");
-        for message_id in ["200", "201"] {
-            let record = spool
-                .enqueue(&ingress_record(
-                    "session-1",
-                    message_id,
-                    Some("long-turn"),
-                    false,
-                ))
-                .expect("multipart event")
-                .expect("multipart event is pending");
-            assert!(
-                !record.forced_busy,
-                "parts in one explicit group remain assemblable"
-            );
-        }
-        spool
-            .enqueue(&ingress_record("session-2", "202", None, true))
-            .expect("other event")
-            .expect("other event is pending");
-        spool
-            .remove_multipart_group("session-1", "long-turn")
-            .expect("remove group");
-        assert_eq!(spool.len().expect("ingress count"), 1);
-        drop(spool);
-        let restored = IngressSpool::open(&path).expect("restore ingress");
-        for message_id in ["200", "201"] {
-            assert!(
-                restored
-                    .enqueue(&ingress_record(
-                        "session-1",
-                        message_id,
-                        Some("long-turn"),
-                        false,
-                    ))
-                    .expect("replay completed multipart")
-                    .is_none(),
-                "every grouped part identity remains terminal after restart"
-            );
-        }
-    }
-
-    #[test]
-    fn cursor_recovery_spools_unbounded_history_in_oldest_first_order() {
-        let directory = tempfile::tempdir().expect("recovery root");
-        let mut spool = RecoverySpool::new(directory.path(), "session-1").expect("spool");
-        for (id, turn) in [
-            ("entry-3", "turn-3"),
-            ("entry-2", "turn-2"),
-            ("entry-1", "turn-1"),
-        ] {
-            spool
-                .push(
-                    &api::TranscriptEntry {
-                        id: id.to_owned(),
-                        body: format!("body for {turn}"),
-                        body_total_bytes: u64::try_from(format!("body for {turn}").len())
-                            .expect("body size"),
-                        ..api::TranscriptEntry::default()
-                    },
-                    turn,
-                )
-                .expect("spool entry");
-        }
-        // A later duplicate projection for the same turn does not create another delivery.
-        spool
-            .push(
-                &api::TranscriptEntry {
-                    id: "entry-2-duplicate".to_owned(),
-                    ..api::TranscriptEntry::default()
-                },
-                "turn-2",
-            )
-            .expect("duplicate turn");
-        let turns = spool
-            .oldest_first()
-            .map(|entry| entry.expect("stored entry").turn_id)
-            .collect::<Vec<_>>();
-        assert_eq!(turns, ["turn-1", "turn-2", "turn-3"]);
-    }
-
-    #[test]
-    fn disabled_default_is_valid_without_ids_or_token() {
-        let config = DiscordConfig::default();
-        assert_eq!(config.version, CONFIG_VERSION);
-        assert!(!config.enabled);
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn enabled_config_requires_distinct_parents_and_one_primary_user() {
-        let mut config = DiscordConfig {
-            enabled: true,
-            ..DiscordConfig::default()
-        };
-        assert!(config.validate().is_err());
-        config.chat_channel_id = Some("43".to_owned());
-        config.agent_channel_id = Some("43".to_owned());
-        config.primary_user_id = Some("42".to_owned());
-        assert!(config.validate().is_err());
-        config.agent_channel_id = Some("44".to_owned());
-        assert!(config.validate().is_ok());
-        config.primary_user_id = Some("not-a-snowflake".to_owned());
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn authorization_and_parent_selection_use_only_stable_snowflakes() {
-        let config = enabled_config();
-        assert!(config.is_primary_user(UserId::new(42)));
-        assert!(!config.is_primary_user(UserId::new(99)));
-        assert_eq!(
-            config.parent_channel(api::OrchestratorKind::Chat),
-            Some(ChannelId::new(43))
-        );
-        assert_eq!(
-            config.parent_channel(api::OrchestratorKind::Agent),
-            Some(ChannelId::new(44))
-        );
-    }
-
-    #[test]
-    fn config_store_never_serializes_the_token() {
-        let directory = tempfile::tempdir().expect("workspace");
-        let store =
-            DiscordConfigStore::from_root(directory.path(), &directory.path().join("discord-data"))
-                .expect("store");
-        let config = enabled_config();
-        store.save(&config).expect("save config");
-        store.save_token("secret-token").expect("save token");
-        assert_eq!(store.load().expect("load config"), config);
-        assert_eq!(store.read_token().expect("read token"), "secret-token");
-        let source = std::fs::read_to_string(store.config_path()).expect("config source");
-        assert!(!source.contains("secret-token"));
-        assert!(!format!("{config:?}").contains("secret-token"));
-        let invalid = validate_snowflake("chat_channel_id", "accidentally-pasted-secret")
-            .expect_err("invalid snowflake");
-        assert!(!invalid.to_string().contains("accidentally-pasted-secret"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(store.token_path())
-                    .expect("token metadata")
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-    }
-
-    #[test]
-    fn system_configuration_is_shared_while_transport_state_is_workspace_scoped() {
-        let directory = tempfile::tempdir().expect("root");
-        let first_workspace = directory.path().join("workspace-a");
-        let second_workspace = directory.path().join("workspace-b");
-        std::fs::create_dir_all(&first_workspace).expect("first workspace");
-        std::fs::create_dir_all(&second_workspace).expect("second workspace");
-        let data = directory.path().join("discord-data");
-        let first = DiscordConfigStore::from_root(&first_workspace, &data).expect("first store");
-        let second = DiscordConfigStore::from_root(&second_workspace, &data).expect("second store");
-
-        first.save(&enabled_config()).expect("save shared config");
-        first
-            .save_token("shared-secret")
-            .expect("save shared token");
-        assert_eq!(second.load().expect("load shared config"), enabled_config());
-        assert_eq!(
-            second.read_token().expect("read shared token"),
-            "shared-secret"
-        );
-        assert_eq!(first.config_path(), second.config_path());
-        assert_eq!(first.token_path(), second.token_path());
-        assert_ne!(first.directory, second.directory);
-    }
-
-    #[test]
-    fn malformed_or_legacy_config_errors_never_echo_possible_secret_values() {
-        let directory = tempfile::tempdir().expect("workspace");
-        let store =
-            DiscordConfigStore::from_root(directory.path(), &directory.path().join("discord-data"))
-                .expect("store");
-        std::fs::write(
-            store.config_path(),
-            "version = 1\nenabled = true\nbot_token = \"must-never-escape\"\n",
-        )
-        .expect("legacy config");
-        let error = store.load().expect_err("legacy config must not activate");
-        assert_eq!(error.to_string(), "invalid Discord configuration TOML");
-        assert!(!error.to_string().contains("must-never-escape"));
-    }
-
-    #[test]
-    fn discord_chunks_preserve_unicode_and_order_without_truncation() {
-        let body = format!("{}\n{}", "🦀".repeat(1_500), "終".repeat(1_500));
-        let chunks = split_discord_content(&body);
-        assert!(chunks.len() >= 2);
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.encode_utf16().count() <= 1_900)
-        );
-        assert_eq!(chunks.concat(), body);
-    }
-
-    #[tokio::test]
-    async fn explicit_multipart_prompts_assemble_in_part_order_without_combining_groups() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let assembler =
-            MultipartAssembler::new(directory.path().join("assemblies")).expect("assembler");
-        let second = parse_multipart("!nakode multipart long-turn 2/3\n世界")
-            .expect("multipart")
-            .expect("valid");
-        assert!(matches!(
-            assembler
-                .accept("session-1", MessageId::new(12), second)
-                .await
-                .expect("second"),
-            MultipartOutcome::Waiting
-        ));
-        let first = parse_multipart("!nakode multipart long-turn 1/3\nHello ")
-            .expect("multipart")
-            .expect("valid");
-        assert!(matches!(
-            assembler
-                .accept("session-1", MessageId::new(11), first)
-                .await
-                .expect("first"),
-            MultipartOutcome::Waiting
-        ));
-        let third = parse_multipart("!nakode multipart long-turn 3/3\n!")
-            .expect("multipart")
-            .expect("valid");
-        let complete = assembler
-            .accept("session-1", MessageId::new(13), third)
-            .await
-            .expect("third");
-        match complete {
-            MultipartOutcome::Complete {
-                group,
-                text,
-                source_message_id,
-                ..
-            } => {
-                assert_eq!(group, "long-turn");
-                assert_eq!(text, "Hello 世界!");
-                assert_eq!(source_message_id, "13");
-                assembler.finish("session-1", &group).await;
-            }
-            MultipartOutcome::Waiting | MultipartOutcome::Duplicate => {
-                panic!("expected complete prompt")
-            }
-        }
-        let replay = parse_multipart("!nakode multipart long-turn 3/3\n!")
-            .expect("multipart")
-            .expect("valid");
-        assert!(matches!(
-            assembler
-                .accept("session-1", MessageId::new(13), replay)
-                .await
-                .expect("replay"),
-            MultipartOutcome::Duplicate
-        ));
-        let other = parse_multipart("!nakode multipart another-turn 1/2\nSeparate")
-            .expect("multipart")
-            .expect("valid");
-        assert!(matches!(
-            assembler
-                .accept("session-1", MessageId::new(21), other)
-                .await
-                .expect("other group"),
-            MultipartOutcome::Waiting
-        ));
-    }
-
-    #[tokio::test]
-    async fn multipart_state_rebuilds_from_durable_record_contents_after_restart() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let root = directory.path().join("assemblies");
-        let before_restart = MultipartAssembler::new(root.clone()).expect("first assembler");
-        let first = parse_multipart("!nakode multipart restartable 1/2\nHello ")
-            .expect("multipart")
-            .expect("valid");
-        assert!(matches!(
-            before_restart
-                .accept("session-1", MessageId::new(31), first)
-                .await
-                .expect("first"),
-            MultipartOutcome::Waiting
-        ));
-        drop(before_restart);
-
-        // Startup intentionally clears the derived assembly files. Replaying the durable ingress
-        // payloads reconstructs them, so an expiring Discord source message is not needed again.
-        let after_restart = MultipartAssembler::new(root).expect("restarted assembler");
-        let replayed_first = parse_multipart("!nakode multipart restartable 1/2\nHello ")
-            .expect("multipart")
-            .expect("valid");
-        assert!(matches!(
-            after_restart
-                .accept("session-1", MessageId::new(31), replayed_first)
-                .await
-                .expect("replayed first"),
-            MultipartOutcome::Waiting
-        ));
-        let second = parse_multipart("!nakode multipart restartable 2/2\nworld")
-            .expect("multipart")
-            .expect("valid");
-        assert!(matches!(
-            after_restart
-                .accept("session-1", MessageId::new(32), second)
-                .await
-                .expect("second"),
-            MultipartOutcome::Complete { text, .. } if text == "Hello world"
-        ));
-    }
-
-    #[tokio::test]
-    async fn multipart_admission_allows_only_one_group_per_session_without_starving_others() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let assembler =
-            MultipartAssembler::new(directory.path().join("assemblies")).expect("assembler");
-        for index in 0..MAX_ACTIVE_MULTIPART_ASSEMBLIES_PER_SESSION {
-            let content = format!("!nakode multipart group-{index} 1/2\npart");
-            let part = parse_multipart(&content)
-                .expect("multipart")
-                .expect("valid");
-            assert!(matches!(
-                assembler
-                    .accept(
-                        "saturated-session",
-                        MessageId::new(100 + u64::try_from(index).expect("message id")),
-                        part,
-                    )
-                    .await
-                    .expect("within cap"),
-                MultipartOutcome::Waiting
-            ));
-        }
-        let extra = parse_multipart("!nakode multipart one-too-many 1/2\npart")
-            .expect("multipart")
-            .expect("valid");
-        assert!(
-            assembler
-                .accept("saturated-session", MessageId::new(200), extra)
-                .await
-                .is_err()
-        );
-        let other = parse_multipart("!nakode multipart independent 1/2\npart")
-            .expect("multipart")
-            .expect("valid");
-        assert!(matches!(
-            assembler
-                .accept("other-session", MessageId::new(201), other)
-                .await
-                .expect("other session remains admissible"),
-            MultipartOutcome::Waiting
-        ));
-    }
-
-    #[test]
-    fn multipart_prompts_require_an_explicit_bounded_group_header() {
-        assert!(parse_multipart("ordinary message").is_none());
-        assert!(
-            parse_multipart("!nakode multipart ../bad 1/2\ntext")
-                .expect("recognized")
-                .is_err()
-        );
-        assert!(
-            parse_multipart("!nakode multipart okay 0/2\ntext")
-                .expect("recognized")
-                .is_err()
-        );
-        assert!(
-            parse_multipart("!nakode multipart okay 3/2\ntext")
-                .expect("recognized")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn discord_chunks_close_and_reopen_markdown_code_fences() {
-        let body = format!("```rust\n{}\n```\nDone 🦀", "let value = 1;\n".repeat(300));
-        let chunks = split_discord_content(&body);
-        assert!(chunks.len() >= 2);
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.encode_utf16().count() <= 1_900)
-        );
-        assert!(chunks[0].ends_with("\n```"));
-        assert!(chunks[1].starts_with("```rust\n"));
-        assert!(
-            chunks
-                .last()
-                .is_some_and(|chunk| chunk.ends_with("Done 🦀"))
-        );
-    }
-
-    #[test]
-    fn discord_chunks_respect_utf16_and_do_not_split_fence_markers() {
-        let boundary = "😀".repeat(945);
-        let body = format!("{boundary}```typescript\n{}\n```尾", "x".repeat(4_000));
-        let chunks = split_discord_content(&body);
-        assert!(chunks.len() >= 3);
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.encode_utf16().count() <= 1_900)
-        );
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| { !chunk.ends_with('`') || chunk.ends_with("```") })
-        );
-        assert!(chunks.last().is_some_and(|chunk| chunk.ends_with('尾')));
-    }
-
-    #[test]
-    fn deterministic_discord_nonces_fit_the_platform_contract() {
-        let starter = starter_nonce("session-1");
-        let first = final_nonce("session-1", "turn-1", 0);
-        let retry = final_nonce("session-1", "turn-1", 0);
-        let second = final_nonce("session-1", "turn-1", 1);
-        let busy = busy_nonce(MessageId::new(42));
-        let failed = failed_nonce(MessageId::new(42));
-        assert!(starter.len() <= 25);
-        assert!(first.len() <= 25);
-        assert!(busy.len() <= 25);
-        assert!(failed.len() <= 25);
-        assert_ne!(busy, failed);
-        assert_eq!(first, retry);
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn attachment_hosts_and_redirect_targets_are_restricted_to_discord_cdns() {
-        for approved in [
-            "https://cdn.discordapp.com/attachments/1/2/image.png",
-            "https://media.discordapp.net/attachments/1/2/image.png",
-        ] {
-            assert!(is_approved_discord_cdn_url(
-                &reqwest::Url::parse(approved).expect("approved URL")
-            ));
-        }
-        for rejected in [
-            "http://cdn.discordapp.com/attachments/1/2/image.png",
-            "https://evil.discordapp.com/attachments/1/2/image.png",
-            "https://example.com/image.png",
-        ] {
-            assert!(!is_approved_discord_cdn_url(
-                &reqwest::Url::parse(rejected).expect("rejected URL")
-            ));
-        }
-    }
-
-    #[test]
-    fn mentions_are_neutralized_without_changing_other_markdown() {
-        assert_eq!(
-            sanitize_mentions("**ok** @everyone and @here"),
-            "**ok** @\u{200b}everyone and @\u{200b}here"
-        );
-        assert_eq!(visible_discord_content(" \n\t"), "…");
-    }
-
-    #[test]
-    fn thread_titles_are_readable_bounded_and_kind_specific() {
-        let chat = thread_title(api::OrchestratorKind::Chat as i32, &"x".repeat(500));
-        let agent = thread_title(api::OrchestratorKind::Agent as i32, "Review auth");
-        assert!(chat.chars().count() <= 100);
-        assert!(chat.contains("Chat"));
-        assert!(agent.contains("Agent"));
-    }
-
-    #[derive(Default)]
-    struct FakeDiscord {
-        messages: Mutex<Vec<ExternalMessage>>,
-        sends: Mutex<Vec<(u64, String, Option<String>)>>,
-        creates: Mutex<Vec<(u64, u64, String)>>,
-        archives: Mutex<Vec<(u64, bool)>>,
-        edits: Mutex<Vec<(u64, u64, String)>>,
-        fail_next_send_after_record: Mutex<bool>,
-        next_message: Mutex<u64>,
-        next_thread: Mutex<u64>,
-    }
-
-    impl FakeDiscord {
-        fn with_message(message: ExternalMessage) -> Self {
-            Self {
-                messages: Mutex::new(vec![message]),
-                next_message: Mutex::new(100),
-                next_thread: Mutex::new(200),
-                ..Self::default()
-            }
-        }
-    }
-
-    #[serenity::async_trait]
-    impl DiscordApi for FakeDiscord {
-        async fn send_message(
-            &self,
-            channel_id: ChannelId,
-            content: &str,
-            nonce: Option<&str>,
-        ) -> Result<ExternalMessage, serenity::Error> {
-            if let Some(nonce) = nonce
-                && let Some(existing) = self
-                    .messages
-                    .lock()
-                    .expect("messages")
-                    .iter()
-                    .find(|message| message.nonce.as_deref() == Some(nonce))
-                    .cloned()
-            {
-                return Ok(existing);
-            }
-            self.sends.lock().expect("sends").push((
-                channel_id.get(),
-                content.to_owned(),
-                nonce.map(str::to_owned),
-            ));
-            let mut next = self.next_message.lock().expect("message id");
-            *next += 1;
-            let message = ExternalMessage {
-                id: MessageId::new(*next),
-                nonce: nonce.map(str::to_owned),
-                thread_id: None,
-            };
-            self.messages
-                .lock()
-                .expect("messages")
-                .push(message.clone());
-            if std::mem::take(
-                &mut *self
-                    .fail_next_send_after_record
-                    .lock()
-                    .expect("send failure"),
-            ) {
-                return Err(serenity::Error::Other("simulated lost send response"));
-            }
-            Ok(message)
-        }
-
-        async fn edit_message(
-            &self,
-            channel_id: ChannelId,
-            message_id: MessageId,
-            content: &str,
-        ) -> Result<(), serenity::Error> {
-            self.edits.lock().expect("edits").push((
-                channel_id.get(),
-                message_id.get(),
-                content.to_owned(),
-            ));
-            Ok(())
-        }
-
-        async fn create_thread(
-            &self,
-            parent_channel_id: ChannelId,
-            starter_message_id: MessageId,
-            title: &str,
-        ) -> Result<ChannelId, serenity::Error> {
-            if let Some(thread_id) = self
-                .messages
-                .lock()
-                .expect("messages")
-                .iter()
-                .find(|message| message.id == starter_message_id)
-                .and_then(|message| message.thread_id)
-            {
-                return Ok(thread_id);
-            }
-            self.creates.lock().expect("creates").push((
-                parent_channel_id.get(),
-                starter_message_id.get(),
-                title.to_owned(),
-            ));
-            let mut next = self.next_thread.lock().expect("thread id");
-            *next += 1;
-            let thread_id = ChannelId::new(*next);
-            if let Some(message) = self
-                .messages
-                .lock()
-                .expect("messages")
-                .iter_mut()
-                .find(|message| message.id == starter_message_id)
-            {
-                message.thread_id = Some(thread_id);
-            }
-            Ok(thread_id)
-        }
-
-        async fn set_thread_archived(
-            &self,
-            thread_id: ChannelId,
-            archived: bool,
-        ) -> Result<(), serenity::Error> {
-            self.archives
-                .lock()
-                .expect("archives")
-                .push((thread_id.get(), archived));
-            Ok(())
-        }
-
-        async fn messages_page(
-            &self,
-            _channel_id: ChannelId,
-            before: Option<MessageId>,
-        ) -> Result<Vec<ExternalMessage>, serenity::Error> {
-            Ok(self
-                .messages
-                .lock()
-                .expect("messages")
-                .iter()
-                .filter(|message| before.is_none_or(|before| message.id < before))
-                .rev()
-                .take(100)
-                .cloned()
-                .collect())
-        }
-
-        async fn react(
-            &self,
-            _channel_id: ChannelId,
-            _message_id: MessageId,
-            _emoji: &str,
-        ) -> Result<(), serenity::Error> {
-            Ok(())
-        }
-
-        async fn remove_own_reaction(
-            &self,
-            _channel_id: ChannelId,
-            _message_id: MessageId,
-            _emoji: &str,
-        ) -> Result<(), serenity::Error> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn lazy_thread_creation_recovers_existing_starter_mapping() {
-        let bridge = bridge();
-        let nonce = starter_nonce(&bridge.session_id);
-        let fake = FakeDiscord::with_message(ExternalMessage {
-            id: MessageId::new(91),
-            nonce: Some(nonce),
-            thread_id: Some(ChannelId::new(92)),
-        });
-        let thread = create_or_recover_thread(&fake, ChannelId::new(43), &bridge)
-            .await
-            .expect("recover thread");
-        assert_eq!(thread, ChannelId::new(92));
-        assert!(fake.sends.lock().expect("sends").is_empty());
-        assert!(fake.creates.lock().expect("creates").is_empty());
-    }
-
-    #[tokio::test]
-    async fn lazy_thread_creation_uses_one_nonce_starter_and_one_thread() {
-        let fake = Arc::new(FakeDiscord {
-            next_message: Mutex::new(100),
-            next_thread: Mutex::new(200),
-            ..FakeDiscord::default()
-        });
-        let bridge = bridge();
-        let thread = create_or_recover_thread(&*fake, ChannelId::new(43), &bridge)
-            .await
-            .expect("create thread");
-        assert_eq!(thread, ChannelId::new(201));
-        let sends = fake.sends.lock().expect("sends");
-        assert_eq!(sends.len(), 1);
-        assert_eq!(
-            sends[0].2.as_deref(),
-            Some(starter_nonce(&bridge.session_id).as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_lazy_creation_adopts_one_nonce_starter_and_thread() {
-        let fake = Arc::new(FakeDiscord {
-            next_message: Mutex::new(100),
-            next_thread: Mutex::new(200),
-            ..FakeDiscord::default()
-        });
-        let bridge = bridge();
-        let first = create_or_recover_thread(&*fake, ChannelId::new(43), &bridge);
-        let second = create_or_recover_thread(&*fake, ChannelId::new(43), &bridge);
-        let (first, second) = tokio::join!(first, second);
-        assert_eq!(first.expect("first"), ChannelId::new(201));
-        assert_eq!(second.expect("second"), ChannelId::new(201));
-        assert_eq!(fake.sends.lock().expect("sends").len(), 1);
-        assert_eq!(fake.creates.lock().expect("creates").len(), 1);
-    }
-
-    #[tokio::test]
-    async fn final_part_recovers_a_send_that_succeeded_before_its_response_was_lost() {
-        let fake = FakeDiscord {
-            fail_next_send_after_record: Mutex::new(true),
-            next_message: Mutex::new(100),
-            ..FakeDiscord::default()
-        };
-        let nonce = final_nonce("session-1", "turn-1", 0);
-        let first =
-            send_or_recover_final_part(&fake, ChannelId::new(92), &nonce, "the final answer").await;
-        assert!(first.is_err(), "the simulated response is lost");
-        assert_eq!(fake.sends.lock().expect("sends").len(), 1);
-
-        let recovered =
-            send_or_recover_final_part(&fake, ChannelId::new(92), &nonce, "the final answer")
-                .await
-                .expect("recover accepted send by nonce");
-        assert_eq!(recovered, MessageId::new(101));
-        assert_eq!(fake.sends.lock().expect("sends").len(), 1);
-        assert_eq!(
-            fake.edits.lock().expect("edits").as_slice(),
-            &[(92, 101, "the final answer".to_owned())]
-        );
-    }
-
-    #[tokio::test]
-    async fn nonce_recovery_fails_closed_after_bounded_history_search() {
-        let nonce = final_nonce("session-1", "outside-window", 0);
-        let messages = (1..=6_401)
-            .map(|id| ExternalMessage {
-                id: MessageId::new(id),
-                nonce: (id == 1).then(|| nonce.clone()),
-                thread_id: None,
-            })
-            .collect();
-        let fake = FakeDiscord {
-            messages: Mutex::new(messages),
-            ..FakeDiscord::default()
-        };
-        let error = find_message_by_nonce(&fake, ChannelId::new(92), &nonce)
-            .await
-            .expect_err("search cap must fail closed before a duplicate send");
-        assert!(error.to_string().contains("bounded nonce history"));
-    }
-
-    #[tokio::test]
-    async fn nonce_recovery_pages_to_thread_origin_without_buffering_history() {
-        let nonce = final_nonce("session-1", "old-turn", 0);
-        let messages = (1..=1_205)
-            .map(|id| ExternalMessage {
-                id: MessageId::new(id),
-                nonce: (id == 1).then(|| nonce.clone()),
-                thread_id: None,
-            })
-            .collect();
-        let fake = FakeDiscord {
-            messages: Mutex::new(messages),
-            ..FakeDiscord::default()
-        };
-        let found = find_message_by_nonce(&fake, ChannelId::new(92), &nonce)
-            .await
-            .expect("history search")
-            .expect("old nonce");
-        assert_eq!(found.id, MessageId::new(1));
-    }
-}
+mod tests;

@@ -40,6 +40,43 @@ pub enum SdkError {
 
 pub type Watch<T> = Pin<Box<dyn Stream<Item = Result<T, SdkError>> + Send + 'static>>;
 
+/// Receiver-backed watch whose reconnecting producer is cancelled with the consumer. Without this
+/// ownership edge, dropping a frontend watch could leave its gRPC stream and reconnect loop alive
+/// until the server happened to emit another item.
+struct ManagedWatch<T> {
+    receiver: ReceiverStream<Result<T, SdkError>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl<T> Unpin for ManagedWatch<T> {}
+
+impl<T> Stream for ManagedWatch<T> {
+    type Item = Result<T, SdkError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(context)
+    }
+}
+
+impl<T> Drop for ManagedWatch<T> {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn managed_watch<T: Send + 'static>(
+    receiver: tokio::sync::mpsc::Receiver<Result<T, SdkError>>,
+    task: tokio::task::JoinHandle<()>,
+) -> Watch<T> {
+    Box::pin(ManagedWatch {
+        receiver: ReceiverStream::new(receiver),
+        task,
+    })
+}
+
 /// A fully materialized session suitable for direct rendering.
 #[derive(Clone, Debug)]
 pub struct HydratedSession {
@@ -67,6 +104,28 @@ macro_rules! typed_mutation {
             &self,
             mut request: $request,
         ) -> Result<api::MutationResult, SdkError> {
+            if request.mutation.is_none() {
+                request.mutation = Some(mutation(None));
+            }
+            retry_transport(request, |request| {
+                let mut transport = self.transport.clone();
+                async move { transport.$method(request).await }
+            })
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(Into::into)
+        }
+    };
+}
+
+macro_rules! typed_response_mutation {
+    ($method:ident, $request:ty, $response:ty) => {
+        /// Executes this typed product mutation with an SDK-owned idempotency key and returns the
+        /// resulting redacted management view.
+        ///
+        /// # Errors
+        /// Returns a transport or server status error.
+        pub async fn $method(&self, mut request: $request) -> Result<$response, SdkError> {
             if request.mutation.is_none() {
                 request.mutation = Some(mutation(None));
             }
@@ -746,6 +805,21 @@ impl NakodeClient {
         api::ClearMcpServerCredentialRequest
     );
     typed_mutation!(set_mcp_server_grants, api::SetMcpServerGrantsRequest);
+    typed_response_mutation!(
+        save_discord_integration,
+        api::SaveDiscordIntegrationRequest,
+        api::DiscordIntegration
+    );
+    typed_response_mutation!(
+        set_discord_integration_enabled,
+        api::SetDiscordIntegrationEnabledRequest,
+        api::DiscordIntegration
+    );
+    typed_response_mutation!(
+        restart_discord_integration,
+        api::RestartDiscordIntegrationRequest,
+        api::DiscordIntegration
+    );
     typed_mutation!(save_agent, api::SaveAgentRequest);
     typed_mutation!(delete_agent, api::DeleteAgentRequest);
     typed_mutation!(delete_session, api::DeleteSessionRequest);
@@ -851,6 +925,20 @@ impl NakodeClient {
             .into_inner())
     }
 
+    /// Returns redacted installation Discord configuration and this workspace service's runtime
+    /// transport state. The bot token is represented only by `token_configured`.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn get_discord_integration(&self) -> Result<api::DiscordIntegration, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .get_discord_integration(api::GetDiscordIntegrationRequest {})
+            .await?
+            .into_inner())
+    }
+
     /// Returns API version and capability metadata.
     ///
     /// # Errors
@@ -868,7 +956,7 @@ impl NakodeClient {
         let client = self.clone();
         let workspace_id = workspace_id.into();
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut after = None;
             let mut reconnect_reported = false;
             loop {
@@ -918,14 +1006,14 @@ impl NakodeClient {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
         });
-        Box::pin(ReceiverStream::new(receiver))
+        managed_watch(receiver, task)
     }
 
     pub fn watch_session(&self, session_id: impl Into<String>) -> Watch<api::SessionState> {
         let client = self.clone();
         let session_id = session_id.into();
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut after = None;
             let mut reconnect_reported = false;
             loop {
@@ -975,7 +1063,7 @@ impl NakodeClient {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
         });
-        Box::pin(ReceiverStream::new(receiver))
+        managed_watch(receiver, task)
     }
 
     /// Watches a fully hydrated authoritative session. Each item replaces the
@@ -989,7 +1077,7 @@ impl NakodeClient {
         let client = self.clone();
         let mut source = self.watch_session(session_id);
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             while let Some(update) = source.next().await {
                 let hydrated = match update {
                     Ok(state) => client.hydrate_session(state, limit).await,
@@ -1000,14 +1088,14 @@ impl NakodeClient {
                 }
             }
         });
-        Box::pin(ReceiverStream::new(receiver))
+        managed_watch(receiver, task)
     }
 
     pub fn watch_run(&self, run_id: impl Into<String>) -> Watch<api::RunState> {
         let client = self.clone();
         let run_id = run_id.into();
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut after = None;
             let mut reconnect_reported = false;
             loop {
@@ -1057,7 +1145,7 @@ impl NakodeClient {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
         });
-        Box::pin(ReceiverStream::new(receiver))
+        managed_watch(receiver, task)
     }
 
     async fn hydrate_session(
@@ -1348,7 +1436,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use super::{api, bridge_continuation_mutation, retry_transport};
+    use super::{SdkError, api, bridge_continuation_mutation, managed_watch, retry_transport};
 
     fn bridge_request(
         session_id: &str,
@@ -1370,6 +1458,39 @@ mod tests {
     #[derive(Clone)]
     struct Request {
         idempotency_key: String,
+    }
+
+    #[tokio::test]
+    async fn dropping_a_watch_cancels_its_reconnecting_producer() {
+        struct DropSignal(Arc<AtomicUsize>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<Result<api::WorkspaceState, SdkError>>(1);
+        let _sender = sender;
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let task_dropped = Arc::clone(&dropped);
+        let task = tokio::spawn(async move {
+            let _signal = DropSignal(task_dropped);
+            let _ = started_sender.send(());
+            futures_util::future::pending::<()>().await;
+        });
+        let watch = managed_watch(receiver, task);
+        started_receiver.await.expect("producer started");
+        drop(watch);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while dropped.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer is cancelled with the consumer");
     }
 
     #[test]

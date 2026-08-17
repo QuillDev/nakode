@@ -1444,6 +1444,7 @@ fn transcript_entry_view(
         owner_turn_id: entry.owner_turn_id.clone().map(TurnId::from),
         resolved_reasoning_effort: entry.reasoning_effort.clone(),
         resolved_fast_mode: entry.fast_mode,
+        source_transport: entry.source_transport.clone(),
         tool_audit_json: include_audit
             .then(|| entry.tool_audit_json.clone())
             .flatten(),
@@ -2060,6 +2061,7 @@ mod tests {
                     owner_turn_id: None,
                     reasoning_effort: None,
                     fast_mode: None,
+                    source_transport: None,
                     tool_audit_json: Some(
                         serde_json::json!({
                             "denied": true,
@@ -2355,6 +2357,7 @@ mod tests {
             owner_turn_id: None,
             resolved_reasoning_effort: None,
             resolved_fast_mode: None,
+            source_transport: None,
             tool_audit_json: None,
         }
     }

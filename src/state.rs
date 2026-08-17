@@ -181,6 +181,7 @@ pub struct QueuedPrompt {
     pub id: String,
     pub text: String,
     pub attachments: Vec<PromptAttachment>,
+    source_transport: Option<String>,
 }
 
 /// A prompt that the server definitively failed to start and can offer to any
@@ -202,6 +203,7 @@ struct OutgoingPrompt {
     options: ModelOptions,
     handoff: Option<HandoffPackage>,
     attachments: Vec<PromptAttachment>,
+    source_transport: Option<String>,
 }
 
 impl OutgoingPrompt {
@@ -3143,6 +3145,18 @@ impl DomainState {
         text: String,
         attachments: Vec<PromptAttachment>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.submit_prompt_with_id_and_source(prompt_id, text, attachments, None)
+    }
+
+    /// Submits one transport-origin prompt while retaining its immutable source for transcript
+    /// projection and same-transport echo suppression.
+    pub(crate) fn submit_prompt_with_id_and_source(
+        &mut self,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+        source_transport: Option<String>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
         if prompt_id.is_empty() || prompt_id.len() > 128 {
             return Err(DomainCommandError::Invalid(
                 "prompt operation id must contain 1 to 128 bytes".to_owned(),
@@ -3176,6 +3190,7 @@ impl DomainState {
             id: prompt_id,
             text,
             attachments,
+            source_transport,
         };
         self.recoverable_prompt = None;
         Ok(self.begin_prompt(prompt))
@@ -3212,6 +3227,7 @@ impl DomainState {
             id,
             text,
             attachments,
+            source_transport: None,
         });
         self.status_message = format!("Queued message {}.", self.queue.len());
         Ok(Vec::new())
@@ -6285,6 +6301,7 @@ impl DomainState {
             id: Self::next_id("msg"),
             text,
             attachments,
+            source_transport: None,
         };
         self.client.editor.clear();
         prompt
@@ -6320,6 +6337,7 @@ impl DomainState {
             options: resolved_options,
             handoff: self.pending_handoff.take(),
             attachments: prompt.attachments,
+            source_transport: prompt.source_transport,
         };
         let user_key = format!("user:{}", prompt.id);
         let images = prompt
@@ -6345,12 +6363,13 @@ impl DomainState {
             Some(self.backend_provider.as_str()),
             prompt.resolved_model.as_deref(),
         );
-        self.transcript.set_turn_attribution(
+        self.transcript.set_model_options(
             &user_key,
-            &prompt.id,
             prompt.options.reasoning_effort.as_deref(),
             prompt.options.fast_mode,
         );
+        self.transcript
+            .set_source_transport(&user_key, prompt.source_transport.as_deref());
         self.transcript.set_stream_active(true);
 
         if let Some(provider_session_id) = self.provider_session_id.clone() {
@@ -6426,6 +6445,15 @@ impl DomainState {
         let options = starting
             .as_ref()
             .map_or_else(ModelOptions::default, |prompt| prompt.options.clone());
+        if let Some(started) = &starting {
+            let user_key = format!("user:{}", started.id);
+            self.transcript.set_turn_attribution(
+                &user_key,
+                &turn_id,
+                started.options.reasoning_effort.as_deref(),
+                started.options.fast_mode,
+            );
+        }
         self.active_turn = Some(ActiveTurn {
             id: turn_id,
             model,
@@ -6634,6 +6662,19 @@ impl DomainState {
                 EntryStatus::Complete,
             );
         }
+    }
+
+    pub(crate) fn user_source_transport_for_turn(&self, turn_id: &str) -> Option<&str> {
+        self.transcript.user_source_transport_for_turn(turn_id)
+    }
+
+    pub(crate) fn set_user_source_transport_for_turn(
+        &mut self,
+        turn_id: &str,
+        source_transport: &str,
+    ) {
+        self.transcript
+            .set_source_transport_for_user_turn(turn_id, source_transport);
     }
 
     fn observe_item(&mut self, turn_id: &str, item: NormalizedItem, completed: bool) {
@@ -11444,6 +11485,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 owner_turn_id: None,
                 reasoning_effort: None,
                 fast_mode: None,
+                source_transport: None,
                 tool_audit_json: None,
             }],
             observability: SubagentObservability {

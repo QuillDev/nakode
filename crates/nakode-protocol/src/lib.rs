@@ -7,6 +7,7 @@
 mod base64_bytes;
 mod command;
 mod diagnostics;
+mod discord;
 mod error;
 mod ids;
 mod mcp;
@@ -22,6 +23,7 @@ pub use diagnostics::{
     DiagnosticsDailyUsage, DiagnosticsReport, DiagnosticsSessionUsage, DiagnosticsToolUsage,
     DiagnosticsUsageTotals,
 };
+pub use discord::{DiscordIntegrationInput, DiscordIntegrationView, DiscordRuntimeState};
 pub use error::{ErrorCode, ServiceError};
 pub use ids::{
     AgentSessionId, ArtifactId, ClientId, EntryId, IdempotencyKey, InteractionId, ModelId,
@@ -38,17 +40,18 @@ pub use service::{
 };
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,
-    BridgeDeliveryView, BridgeLifecycle, ConnectionView, ContextUsageView, ExternalToolCallView,
-    InteractionKind, InteractionOptionView, InteractionQuestionView, InteractionStatus,
-    InteractionView, MemorySettingsView, ModelConfigurationView, ModelView, NoticeLevel,
-    NoticeView, OrchestratorKind, OwnedProviderSessionView, ProviderAuthenticationView,
-    ProviderCapabilities, ProviderCapability, ProviderView, QueueItemView, RecoverablePromptView,
-    RunMetadataView, RunOutcome, RunPage, RunPolicyView, RunStatus, RunTextWindow,
-    RunToolDenialView, RunView, SessionActivity, SessionBridgeView, SessionMetadataView,
-    SessionSummary, SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView,
-    TodoPhaseView, TodoStatusView, TokenUsageView, TranscriptBodyWindow, TranscriptEntryKind,
-    TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TranscriptWindowView, TurnStatus,
-    TurnView, ViewEvent, VisionSettingsView, WebSettingsView,
+    BridgeDeliveryView, BridgeLifecycle, BridgeProjectionKind, BridgeProjectionView,
+    ConnectionView, ContextUsageView, ExternalToolCallView, InteractionKind, InteractionOptionView,
+    InteractionQuestionView, InteractionStatus, InteractionView, MemorySettingsView,
+    ModelConfigurationView, ModelView, NoticeLevel, NoticeView, OrchestratorKind,
+    OwnedProviderSessionView, ProviderAuthenticationView, ProviderCapabilities, ProviderCapability,
+    ProviderView, QueueItemView, RecoverablePromptView, RunMetadataView, RunOutcome, RunPage,
+    RunPolicyView, RunStatus, RunTextWindow, RunToolDenialView, RunView, SessionActivity,
+    SessionBridgeView, SessionMetadataView, SessionSummary, SessionView, SettingsView, SkillView,
+    TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TokenUsageView,
+    TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView,
+    TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionSettingsView,
+    WebSettingsView,
 };
 
 /// Maximum encoded Protobuf request or response accepted by Nakode's API.

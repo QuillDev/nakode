@@ -37,6 +37,8 @@ pub enum ServiceCapability {
     McpManagement,
     /// Typed Chat/Agent external-thread intent, lifecycle, binding, and delivery checkpoints.
     OrchestratorThreadBridge,
+    /// Redacted Discord configuration/status plus write-only credential and transport controls.
+    DiscordManagement,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -100,6 +102,13 @@ pub struct CommandAccepted {
     /// Present only for `ContinueSessionFromBridge`; retained in idempotency replay results.
     #[serde(default)]
     pub bridge_continuation: Option<BridgeContinuationDisposition>,
+    /// Original Accepted/Busy result when `bridge_continuation` is Duplicate. This lets a transport
+    /// restore the same reaction after a lost response without inferring from mutable turn state.
+    #[serde(default)]
+    pub replayed_bridge_continuation: Option<BridgeContinuationDisposition>,
+    /// Whether the replayed Accepted message still owns live/final reaction routing.
+    #[serde(default)]
+    pub replayed_bridge_source_active: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
