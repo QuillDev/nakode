@@ -129,10 +129,26 @@ pub enum BridgeLifecycle {
     Archived,
 }
 
-/// Crash-recoverable, constant-size delivery checkpoint for one final assistant answer.
+/// User-visible transcript role projected through an external session bridge.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeProjectionKind {
+    User,
+    Assistant,
+}
+
+/// Stable position in one bridge's ordered user/assistant transcript projection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BridgeProjectionView {
+    pub kind: BridgeProjectionKind,
+    pub turn_id: TurnId,
+}
+
+/// Crash-recoverable, constant-size delivery checkpoint for one transcript projection.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BridgeDeliveryView {
-    pub turn_id: TurnId,
+    pub projection: BridgeProjectionView,
+    pub previous_projection: Option<BridgeProjectionView>,
     pub body_sha256: String,
     pub part_count: u64,
     pub completed_parts: u64,
@@ -151,7 +167,7 @@ pub struct SessionBridgeView {
     pub transport: Option<String>,
     pub external_parent_id: Option<String>,
     pub external_thread_id: Option<String>,
-    pub last_delivered_turn_id: Option<TurnId>,
+    pub last_projected: Option<BridgeProjectionView>,
     pub delivery: Option<BridgeDeliveryView>,
     pub live_turn_id: Option<TurnId>,
     pub live_external_message_id: Option<String>,
@@ -294,6 +310,9 @@ pub struct TranscriptEntryView {
     /// Concrete fast-mode value resolved when that owner turn began.
     #[serde(default)]
     pub resolved_fast_mode: Option<bool>,
+    /// External transport that originated this user turn. Absent for dashboard/SDK-origin input.
+    #[serde(default)]
+    pub source_transport: Option<String>,
     /// Versioned, bounded tool audit JSON. Clients must render it as inert data.
     #[serde(default)]
     pub tool_audit_json: Option<String>,
@@ -1095,8 +1114,12 @@ mod tests {
             body_total_bytes: 100,
             status: TranscriptEntryStatus::Running,
             artifacts: Vec::new(),
+            created_at_ms: None,
             provider_id: Some("openai-codex".to_owned()),
             model_id: Some(ModelId::from("openai-codex/gpt-5.4")),
+            owner_turn_id: None,
+            resolved_reasoning_effort: None,
+            resolved_fast_mode: None,
             tool_audit_json: None,
         };
         let value = serde_json::to_value(entry).expect("serialize transcript entry");

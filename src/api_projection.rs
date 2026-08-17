@@ -506,18 +506,47 @@ fn session_bridge(value: api::SessionBridge) -> Result<view::SessionBridgeView, 
         transport: value.transport,
         external_parent_id: value.external_parent_id,
         external_thread_id: value.external_thread_id,
-        last_delivered_turn_id: value.last_delivered_turn_id.map(view::TurnId::from),
-        delivery: value.delivery.map(|delivery| view::BridgeDeliveryView {
-            turn_id: view::TurnId::from(delivery.turn_id),
-            body_sha256: delivery.body_sha256,
-            part_count: delivery.part_count,
-            completed_parts: delivery.completed_parts,
-            last_external_message_id: delivery.last_external_message_id,
-        }),
+        last_projected: value.last_projected.map(bridge_projection).transpose()?,
+        delivery: value
+            .delivery
+            .map(|delivery| -> Result<view::BridgeDeliveryView, String> {
+                Ok(view::BridgeDeliveryView {
+                    projection: view::BridgeProjectionView {
+                        kind: bridge_projection_kind(delivery.projection_kind)?,
+                        turn_id: view::TurnId::from(delivery.turn_id),
+                    },
+                    previous_projection: delivery
+                        .previous_projection
+                        .map(bridge_projection)
+                        .transpose()?,
+                    body_sha256: delivery.body_sha256,
+                    part_count: delivery.part_count,
+                    completed_parts: delivery.completed_parts,
+                    last_external_message_id: delivery.last_external_message_id,
+                })
+            })
+            .transpose()?,
         live_turn_id: value.live_turn_id.map(view::TurnId::from),
         live_external_message_id: value.live_external_message_id,
         active_source_message_id: value.active_source_message_id,
     })
+}
+
+fn bridge_projection(value: api::BridgeProjection) -> Result<view::BridgeProjectionView, String> {
+    Ok(view::BridgeProjectionView {
+        kind: bridge_projection_kind(value.kind)?,
+        turn_id: view::TurnId::from(value.turn_id),
+    })
+}
+
+fn bridge_projection_kind(value: i32) -> Result<view::BridgeProjectionKind, String> {
+    match api::BridgeProjectionKind::try_from(value).map_err(invalid_enum)? {
+        api::BridgeProjectionKind::User => Ok(view::BridgeProjectionKind::User),
+        api::BridgeProjectionKind::Assistant => Ok(view::BridgeProjectionKind::Assistant),
+        api::BridgeProjectionKind::Unspecified => {
+            Err("unspecified bridge projection kind".to_owned())
+        }
+    }
 }
 
 pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, String> {
@@ -996,6 +1025,7 @@ fn transcript_entry(value: api::TranscriptEntry) -> Result<view::TranscriptEntry
         owner_turn_id: None,
         resolved_reasoning_effort: None,
         resolved_fast_mode: None,
+        source_transport: value.source_transport,
         tool_audit_json: value.tool_audit_json,
         created_at_ms: value.created_at_ms,
     })

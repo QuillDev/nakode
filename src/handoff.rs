@@ -153,6 +153,7 @@ mod tests {
             owner_turn_id: None,
             reasoning_effort: None,
             fast_mode: None,
+            source_transport: None,
             tool_audit_json: None,
         }
     }

@@ -3,9 +3,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentSessionId, ArtifactId, BridgeLifecycle, EntryId, InteractionId, McpGrantPolicy,
-    McpServerInput, McpSessionGrant, ModelId, OrchestratorKind, PromptId, ProviderId, RunId,
-    SessionId, TurnId, WorkspaceId,
+    AgentSessionId, ArtifactId, BridgeLifecycle, BridgeProjectionKind, BridgeProjectionView,
+    EntryId, InteractionId, McpGrantPolicy, McpServerInput, McpSessionGrant, ModelId,
+    OrchestratorKind, PromptId, ProviderId, RunId, SessionId, TurnId, WorkspaceId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -255,7 +255,7 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bridge: Option<SessionBridgeIntent>,
         /// Explicit, deny-by-default Nakode MCP server grants for this session.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         mcp_grant: Option<McpSessionGrant>,
     },
     OpenSession {
@@ -289,30 +289,36 @@ pub enum Command {
         transport: String,
         external_thread_id: String,
     },
-    /// Atomically establishes the durable checkpoint for one final answer before network delivery.
+    /// Atomically establishes a compare-and-set checkpoint before external transcript delivery.
     PrepareBridgeDelivery {
         session_id: SessionId,
+        projection_kind: BridgeProjectionKind,
         turn_id: TurnId,
+        expected_last_projected: Option<BridgeProjectionView>,
         body_sha256: String,
         part_count: u64,
     },
     /// Marks one prepared delivery part as accepted by the external transport.
     CompleteBridgeDeliveryPart {
         session_id: SessionId,
+        projection_kind: BridgeProjectionKind,
         turn_id: TurnId,
         part_index: u64,
         external_message_id: String,
     },
-    /// Marks a fully delivered turn final and clears its constant-size progress checkpoint.
+    /// Advances the ordered bridge cursor and clears its constant-size progress checkpoint.
     FinalizeBridgeDelivery {
         session_id: SessionId,
+        projection_kind: BridgeProjectionKind,
         turn_id: TurnId,
     },
-    /// Records or clears the transport's one non-final/live status message.
+    /// Records or clears the transport's one non-final/live status message. A terminal worker may
+    /// also compare-and-clear the inbound source-message reaction owner without racing a newer turn.
     SetBridgeLiveMessage {
         session_id: SessionId,
         turn_id: Option<TurnId>,
         external_message_id: Option<String>,
+        clear_active_source_message_id: Option<String>,
     },
     /// Atomically verifies an open binding, rejects busy sessions instead of queueing, records the
     /// gateway event for replay suppression, and starts the next user turn.

@@ -25,6 +25,7 @@ use crate::{
 
 const PROVIDER_CATALOG_PATH: &str = "config/providers.toml";
 const PROVIDER_CATALOG: &str = include_str!("../config/providers.toml");
+const MAX_BRIDGE_REPLAY_EVENTS_PER_SESSION: usize = 4 * 1_024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,12 +71,32 @@ pub struct SessionRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BridgeDeliveryRecord {
+pub struct BridgeProjectionRecord {
+    pub kind: nakode_protocol::BridgeProjectionKind,
     pub turn_id: String,
+}
+
+fn default_bridge_projection_kind() -> nakode_protocol::BridgeProjectionKind {
+    nakode_protocol::BridgeProjectionKind::Assistant
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BridgeDeliveryRecord {
+    #[serde(default = "default_bridge_projection_kind")]
+    pub projection_kind: nakode_protocol::BridgeProjectionKind,
+    pub turn_id: String,
+    #[serde(default)]
+    pub previous_projection: Option<BridgeProjectionRecord>,
     pub body_sha256: String,
     pub part_count: u64,
     pub completed_parts: u64,
     pub last_external_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BridgeInboundTurnOriginRecord {
+    pub turn_id: String,
+    pub transport: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -103,7 +124,7 @@ pub struct SessionBridgeRecord {
     pub transport: Option<String>,
     pub external_parent_id: Option<String>,
     pub external_thread_id: Option<String>,
-    pub last_delivered_turn_id: Option<String>,
+    pub last_projected: Option<BridgeProjectionRecord>,
     pub delivery: Option<BridgeDeliveryRecord>,
     pub live_turn_id: Option<String>,
     pub live_external_message_id: Option<String>,
@@ -111,6 +132,8 @@ pub struct SessionBridgeRecord {
     pub recent_inbound_event_ids: Vec<String>,
     /// Durable at-least-once inbox item, cleared only after the backend acknowledges this client id.
     pub pending_inbound: Option<BridgePendingInboundRecord>,
+    /// Durable source provenance keyed by provider turn identity for resume-time user history.
+    pub inbound_turn_origins: Vec<BridgeInboundTurnOriginRecord>,
     pub updated_at_ms: i64,
 }
 
@@ -274,19 +297,22 @@ pub trait SessionRepository: Send + Sync {
         bridges: &[SessionBridgeRecord],
         _session_id: &str,
         _external_event_id: &str,
+        _disposition: nakode_protocol::BridgeContinuationDisposition,
     ) -> Result<(), SessionError> {
         self.save_session_bridges(bridges)
     }
-    /// Checks the durable, never-expiring inbound replay ledger without hydrating it into memory.
+    /// Looks up the durable, never-expiring inbound replay result without hydrating the ledger.
+    /// `None` means the external identity has never been claimed; `Duplicate` represents an older
+    /// identity-only row whose original Accepted/Busy status is unavailable.
     ///
     /// # Errors
-    /// Returns an error when the replay ledger cannot be queried.
-    fn has_session_bridge_inbound_event(
+    /// Returns an error when the replay ledger cannot be queried or decoded.
+    fn find_session_bridge_inbound_event(
         &self,
         _session_id: &str,
         _external_event_id: &str,
-    ) -> Result<bool, SessionError> {
-        Ok(false)
+    ) -> Result<Option<nakode_protocol::BridgeContinuationDisposition>, SessionError> {
+        Ok(None)
     }
     /// Lists the most recently used sessions in a workspace.
     ///
@@ -614,11 +640,13 @@ impl SqliteSessionRepository {
                external_parent_id TEXT,
                external_thread_id TEXT,
                last_delivered_turn_id TEXT,
+               last_delivered_kind TEXT NOT NULL DEFAULT 'assistant',
                delivery_json TEXT,
                live_turn_id TEXT,
                live_external_message_id TEXT,
                active_source_message_id TEXT,
                pending_inbound_json TEXT,
+               inbound_turn_origins_json TEXT NOT NULL DEFAULT '[]',
                updated_at_ms INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS session_bridges_workspace
@@ -629,9 +657,12 @@ impl SqliteSessionRepository {
              CREATE TABLE IF NOT EXISTS session_bridge_inbound_events (
                session_id TEXT NOT NULL,
                external_event_id TEXT NOT NULL,
+               disposition TEXT NOT NULL DEFAULT 'duplicate',
                recorded_at_ms INTEGER NOT NULL,
                PRIMARY KEY(session_id, external_event_id)
              );
+             CREATE INDEX IF NOT EXISTS session_bridge_inbound_events_recorded
+               ON session_bridge_inbound_events(session_id, recorded_at_ms DESC);
              CREATE TABLE IF NOT EXISTS provider_models (
                provider TEXT NOT NULL,
                model_id TEXT NOT NULL,
@@ -803,6 +834,47 @@ impl SqliteSessionRepository {
                 &connection,
                 "BEGIN IMMEDIATE;
                  ALTER TABLE session_bridges ADD COLUMN pending_inbound_json TEXT;
+                 COMMIT;",
+            )?;
+        }
+        if !bridge_columns
+            .iter()
+            .any(|column| column == "last_delivered_kind")
+        {
+            execute_batch_with_busy_retry(
+                &connection,
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE session_bridges ADD COLUMN last_delivered_kind TEXT NOT NULL DEFAULT 'assistant';
+                 COMMIT;",
+            )?;
+        }
+        if !bridge_columns
+            .iter()
+            .any(|column| column == "inbound_turn_origins_json")
+        {
+            execute_batch_with_busy_retry(
+                &connection,
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE session_bridges ADD COLUMN inbound_turn_origins_json TEXT NOT NULL DEFAULT '[]';
+                 COMMIT;",
+            )?;
+        }
+        let inbound_event_columns = {
+            let mut statement =
+                connection.prepare("PRAGMA table_info(session_bridge_inbound_events)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !inbound_event_columns
+            .iter()
+            .any(|column| column == "disposition")
+        {
+            execute_batch_with_busy_retry(
+                &connection,
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE session_bridge_inbound_events
+                   ADD COLUMN disposition TEXT NOT NULL DEFAULT 'duplicate';
                  COMMIT;",
             )?;
         }
@@ -1039,7 +1111,16 @@ impl SqliteSessionRepository {
                 },
             )
         })?;
-        let delivery_json = row.get::<_, Option<String>>(10)?;
+        let last_projected_turn_id = row.get::<_, Option<String>>(9)?;
+        let last_projected_kind = row.get::<_, String>(10)?;
+        let last_projected = last_projected_turn_id
+            .map(|turn_id| {
+                bridge_projection_kind_from_database(&last_projected_kind)
+                    .map(|kind| BridgeProjectionRecord { kind, turn_id })
+            })
+            .transpose()
+            .map_err(|error| stored_bridge_conversion_error(10, error))?;
+        let delivery_json = row.get::<_, Option<String>>(11)?;
         let delivery = delivery_json
             .map(|value| {
                 serde_json::from_str(&value).map_err(|source| SessionError::InvalidStoredJson {
@@ -1048,8 +1129,8 @@ impl SqliteSessionRepository {
                 })
             })
             .transpose()
-            .map_err(|error| stored_bridge_conversion_error(10, error))?;
-        let pending_json = row.get::<_, Option<String>>(14)?;
+            .map_err(|error| stored_bridge_conversion_error(11, error))?;
+        let pending_json = row.get::<_, Option<String>>(15)?;
         let pending_inbound = pending_json
             .map(|value| {
                 serde_json::from_str(&value).map_err(|source| SessionError::InvalidStoredJson {
@@ -1058,7 +1139,14 @@ impl SqliteSessionRepository {
                 })
             })
             .transpose()
-            .map_err(|error| stored_bridge_conversion_error(14, error))?;
+            .map_err(|error| stored_bridge_conversion_error(15, error))?;
+        let inbound_turn_origins_json = row.get::<_, String>(16)?;
+        let inbound_turn_origins = serde_json::from_str(&inbound_turn_origins_json)
+            .map_err(|source| SessionError::InvalidStoredJson {
+                field: "session_bridges.inbound_turn_origins_json",
+                source,
+            })
+            .map_err(|error| stored_bridge_conversion_error(16, error))?;
         Ok(SessionBridgeRecord {
             session_id: row.get(0)?,
             workspace: row.get(1)?,
@@ -1069,14 +1157,15 @@ impl SqliteSessionRepository {
             transport: row.get(6)?,
             external_parent_id: row.get(7)?,
             external_thread_id: row.get(8)?,
-            last_delivered_turn_id: row.get(9)?,
+            last_projected,
             delivery,
-            live_turn_id: row.get(11)?,
-            live_external_message_id: row.get(12)?,
-            active_source_message_id: row.get(13)?,
+            live_turn_id: row.get(12)?,
+            live_external_message_id: row.get(13)?,
+            active_source_message_id: row.get(14)?,
             recent_inbound_event_ids: Vec::new(),
             pending_inbound,
-            updated_at_ms: row.get(15)?,
+            inbound_turn_origins,
+            updated_at_ms: row.get(17)?,
         })
     }
 
@@ -1155,6 +1244,25 @@ fn save_session_bridge_on(
             field: "session_bridges.pending_inbound_json",
             source,
         })?;
+    let inbound_turn_origins_json =
+        serde_json::to_string(&bridge.inbound_turn_origins).map_err(|source| {
+            SessionError::InvalidStoredJson {
+                field: "session_bridges.inbound_turn_origins_json",
+                source,
+            }
+        })?;
+    let (last_projected_turn_id, last_projected_kind) = bridge.last_projected.as_ref().map_or(
+        (
+            None,
+            bridge_projection_kind_database_value(nakode_protocol::BridgeProjectionKind::Assistant),
+        ),
+        |projection| {
+            (
+                Some(projection.turn_id.as_str()),
+                bridge_projection_kind_database_value(projection.kind),
+            )
+        },
+    );
     let revision =
         i64::try_from(bridge.revision).map_err(|_| SessionError::InvalidStoredValue {
             field: "session_bridges.revision",
@@ -1163,10 +1271,10 @@ fn save_session_bridge_on(
     connection.execute(
         "INSERT INTO session_bridges
          (session_id, workspace, kind, lifecycle, display_title, revision, transport,
-          external_parent_id, external_thread_id, last_delivered_turn_id, delivery_json,
-          live_turn_id, live_external_message_id, active_source_message_id,
-          pending_inbound_json, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+          external_parent_id, external_thread_id, last_delivered_turn_id, last_delivered_kind,
+          delivery_json, live_turn_id, live_external_message_id, active_source_message_id,
+          pending_inbound_json, inbound_turn_origins_json, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(session_id) DO UPDATE SET
            workspace = excluded.workspace,
            kind = excluded.kind,
@@ -1177,11 +1285,13 @@ fn save_session_bridge_on(
            external_parent_id = excluded.external_parent_id,
            external_thread_id = excluded.external_thread_id,
            last_delivered_turn_id = excluded.last_delivered_turn_id,
+           last_delivered_kind = excluded.last_delivered_kind,
            delivery_json = excluded.delivery_json,
            live_turn_id = excluded.live_turn_id,
            live_external_message_id = excluded.live_external_message_id,
            active_source_message_id = excluded.active_source_message_id,
            pending_inbound_json = excluded.pending_inbound_json,
+           inbound_turn_origins_json = excluded.inbound_turn_origins_json,
            updated_at_ms = excluded.updated_at_ms",
         params![
             bridge.session_id,
@@ -1193,12 +1303,14 @@ fn save_session_bridge_on(
             bridge.transport,
             bridge.external_parent_id,
             bridge.external_thread_id,
-            bridge.last_delivered_turn_id,
+            last_projected_turn_id,
+            last_projected_kind,
             delivery_json,
             bridge.live_turn_id,
             bridge.live_external_message_id,
             bridge.active_source_message_id,
             pending_json,
+            inbound_turn_origins_json,
             bridge.updated_at_ms,
         ],
     )?;
@@ -1229,6 +1341,28 @@ fn orchestrator_kind_from_database(
     }
 }
 
+fn bridge_projection_kind_database_value(
+    kind: nakode_protocol::BridgeProjectionKind,
+) -> &'static str {
+    match kind {
+        nakode_protocol::BridgeProjectionKind::User => "user",
+        nakode_protocol::BridgeProjectionKind::Assistant => "assistant",
+    }
+}
+
+fn bridge_projection_kind_from_database(
+    value: &str,
+) -> Result<nakode_protocol::BridgeProjectionKind, SessionError> {
+    match value {
+        "user" => Ok(nakode_protocol::BridgeProjectionKind::User),
+        "assistant" => Ok(nakode_protocol::BridgeProjectionKind::Assistant),
+        _ => Err(SessionError::InvalidStoredValue {
+            field: "session_bridges.last_delivered_kind",
+            value: value.to_owned(),
+        }),
+    }
+}
+
 fn bridge_lifecycle_database_value(lifecycle: nakode_protocol::BridgeLifecycle) -> &'static str {
     match lifecycle {
         nakode_protocol::BridgeLifecycle::Open => "open",
@@ -1244,6 +1378,30 @@ fn bridge_lifecycle_from_database(
         "archived" => Ok(nakode_protocol::BridgeLifecycle::Archived),
         _ => Err(SessionError::InvalidStoredValue {
             field: "session_bridges.lifecycle",
+            value: value.to_owned(),
+        }),
+    }
+}
+
+fn bridge_continuation_disposition_value(
+    disposition: nakode_protocol::BridgeContinuationDisposition,
+) -> &'static str {
+    match disposition {
+        nakode_protocol::BridgeContinuationDisposition::Accepted => "accepted",
+        nakode_protocol::BridgeContinuationDisposition::Duplicate => "duplicate",
+        nakode_protocol::BridgeContinuationDisposition::Busy => "busy",
+    }
+}
+
+fn parse_bridge_continuation_disposition(
+    value: &str,
+) -> Result<nakode_protocol::BridgeContinuationDisposition, SessionError> {
+    match value {
+        "accepted" => Ok(nakode_protocol::BridgeContinuationDisposition::Accepted),
+        "duplicate" => Ok(nakode_protocol::BridgeContinuationDisposition::Duplicate),
+        "busy" => Ok(nakode_protocol::BridgeContinuationDisposition::Busy),
+        _ => Err(SessionError::InvalidStoredValue {
+            field: "session_bridge_inbound_events.disposition",
             value: value.to_owned(),
         }),
     }
@@ -1425,9 +1583,10 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT session_id, workspace, kind, lifecycle, display_title, revision, transport,
-                    external_parent_id, external_thread_id, last_delivered_turn_id, delivery_json,
-                    live_turn_id, live_external_message_id, active_source_message_id,
-                    pending_inbound_json, updated_at_ms
+                    external_parent_id, external_thread_id, last_delivered_turn_id,
+                    last_delivered_kind, delivery_json, live_turn_id, live_external_message_id,
+                    active_source_message_id, pending_inbound_json, inbound_turn_origins_json,
+                    updated_at_ms
              FROM session_bridges WHERE workspace = ?1 ORDER BY updated_at_ms, session_id",
         )?;
         statement
@@ -1468,6 +1627,7 @@ impl SessionRepository for SqliteSessionRepository {
         bridges: &[SessionBridgeRecord],
         session_id: &str,
         external_event_id: &str,
+        disposition: nakode_protocol::BridgeContinuationDisposition,
     ) -> Result<(), SessionError> {
         if !bridges.iter().any(|bridge| bridge.session_id == session_id) {
             return Err(SessionError::InvalidStoredValue {
@@ -1475,6 +1635,11 @@ impl SessionRepository for SqliteSessionRepository {
                 value: session_id.to_owned(),
             });
         }
+        let protected_pending_event = bridges
+            .iter()
+            .find(|bridge| bridge.session_id == session_id)
+            .and_then(|bridge| bridge.pending_inbound.as_ref())
+            .map(|pending| pending.external_event_id.as_str());
         let mut connection = self
             .connection
             .lock()
@@ -1487,36 +1652,57 @@ impl SessionRepository for SqliteSessionRepository {
         // roll back before dispatch and retry into the durable Duplicate path.
         transaction.execute(
             "INSERT INTO session_bridge_inbound_events
-             (session_id, external_event_id, recorded_at_ms) VALUES (?1, ?2, ?3)",
+             (session_id, external_event_id, disposition, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 session_id,
                 external_event_id,
+                bridge_continuation_disposition_value(disposition),
                 unix_timestamp().saturating_mul(1000)
+            ],
+        )?;
+        // Discord only replays a bounded recent gateway window. Retain a generous per-session
+        // durable replay ledger, plus any currently unacknowledged accepted prompt, instead of
+        // allowing an old long-lived conversation to grow this table forever.
+        transaction.execute(
+            "DELETE FROM session_bridge_inbound_events
+             WHERE rowid IN (
+               SELECT rowid FROM session_bridge_inbound_events
+               WHERE session_id = ?1
+                 AND (?2 IS NULL OR external_event_id != ?2)
+               ORDER BY recorded_at_ms DESC, rowid DESC
+               LIMIT -1 OFFSET ?3
+             )",
+            params![
+                session_id,
+                protected_pending_event,
+                i64::try_from(MAX_BRIDGE_REPLAY_EVENTS_PER_SESSION).unwrap_or(i64::MAX)
             ],
         )?;
         transaction.commit()?;
         Ok(())
     }
 
-    fn has_session_bridge_inbound_event(
+    fn find_session_bridge_inbound_event(
         &self,
         session_id: &str,
         external_event_id: &str,
-    ) -> Result<bool, SessionError> {
+    ) -> Result<Option<nakode_protocol::BridgeContinuationDisposition>, SessionError> {
         let connection = self
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        connection
+        let value = connection
             .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM session_bridge_inbound_events
-                   WHERE session_id = ?1 AND external_event_id = ?2
-                 )",
+                "SELECT disposition FROM session_bridge_inbound_events
+                 WHERE session_id = ?1 AND external_event_id = ?2",
                 params![session_id, external_event_id],
-                |row| row.get::<_, i64>(0).map(|value| value != 0),
+                |row| row.get::<_, String>(0),
             )
-            .map_err(Into::into)
+            .optional()?;
+        value
+            .map(|value| parse_bridge_continuation_disposition(&value))
+            .transpose()
     }
 
     fn list_recent(
@@ -1722,6 +1908,12 @@ impl SessionRepository for SqliteSessionRepository {
                 params![provider, provider_session_id],
             )?;
         }
+        // This normalized replay ledger predates a foreign key so remove its session-owned rows
+        // explicitly; otherwise individual session deletion leaves permanent idempotency orphans.
+        transaction.execute(
+            "DELETE FROM session_bridge_inbound_events WHERE session_id = ?1",
+            [&record.id],
+        )?;
         // Then the session itself. `orchestration_runs` and `agent_turns` go with it by cascade, which
         // the connection's `PRAGMA foreign_keys = ON` is what makes true.
         let removed =
@@ -2641,6 +2833,7 @@ fn load_subagent_transcript(
             owner_turn_id: None,
             reasoning_effort: None,
             fast_mode: None,
+            source_transport: None,
             tool_audit_json,
         })
     })
@@ -2828,6 +3021,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn bridge_schema_migrates_pending_inbox_and_installs_normalized_replay_ledger()
     -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -2852,16 +3046,25 @@ mod tests {
                recent_inbound_event_ids_json TEXT NOT NULL DEFAULT '[]',
                updated_at_ms INTEGER NOT NULL
              );
+             CREATE TABLE session_bridge_inbound_events (
+               session_id TEXT NOT NULL,
+               external_event_id TEXT NOT NULL,
+               recorded_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(session_id, external_event_id)
+             );
+             INSERT INTO session_bridge_inbound_events
+               (session_id, external_event_id, recorded_at_ms)
+             VALUES ('legacy-session', 'event-c', 122);
              INSERT INTO session_bridges
                (session_id, workspace, kind, lifecycle, display_title, revision,
-                recent_inbound_event_ids_json, updated_at_ms)
+                last_delivered_turn_id, recent_inbound_event_ids_json, updated_at_ms)
              VALUES
                ('legacy-session', '/tmp/project', 'chat', 'open', 'Legacy bridge', 1,
-                '["event-a","event-b","event-a"]', 123);"#,
+                'legacy-turn', '["event-a","event-b","event-a"]', 123);"#,
         )?;
         drop(legacy);
 
-        let _store = SqliteSessionRepository::open(&database)?;
+        let store = SqliteSessionRepository::open(&database)?;
         let migrated = Connection::open(&database)?;
         let bridge_columns = {
             let mut statement = migrated.prepare("PRAGMA table_info(session_bridges)")?;
@@ -2885,16 +3088,22 @@ mod tests {
         assert_eq!(ledger_exists, 1);
         let migrated_events = {
             let mut statement = migrated.prepare(
-                "SELECT external_event_id FROM session_bridge_inbound_events
+                "SELECT external_event_id, disposition FROM session_bridge_inbound_events
                  WHERE session_id = 'legacy-session' ORDER BY external_event_id",
             )?;
             statement
-                .query_map([], |row| row.get::<_, String>(0))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?
         };
         assert_eq!(
             migrated_events,
-            vec!["event-a".to_owned(), "event-b".to_owned()]
+            vec![
+                ("event-a".to_owned(), "duplicate".to_owned()),
+                ("event-b".to_owned(), "duplicate".to_owned()),
+                ("event-c".to_owned(), "duplicate".to_owned()),
+            ]
         );
         let legacy_json = migrated.query_row(
             "SELECT recent_inbound_event_ids_json FROM session_bridges
@@ -2903,11 +3112,25 @@ mod tests {
             |row| row.get::<_, String>(0),
         )?;
         assert_eq!(legacy_json, "[]");
+        let bridge = store
+            .list_session_bridges("/tmp/project")?
+            .pop()
+            .expect("migrated bridge");
+        assert_eq!(
+            bridge.last_projected,
+            Some(BridgeProjectionRecord {
+                kind: nakode_protocol::BridgeProjectionKind::Assistant,
+                turn_id: "legacy-turn".to_owned(),
+            }),
+            "legacy turn-only cursors migrate as assistant projections"
+        );
+        assert!(bridge.inbound_turn_origins.is_empty());
         Ok(())
     }
 
     #[test]
-    fn bridge_state_round_trips_survives_session_delete_and_is_removed_by_full_purge()
+    #[allow(clippy::too_many_lines)]
+    fn bridge_state_survives_session_delete_while_replay_rows_are_removed()
     -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
@@ -2928,9 +3151,17 @@ mod tests {
             transport: Some("discord".to_owned()),
             external_parent_id: Some("100".to_owned()),
             external_thread_id: Some("101".to_owned()),
-            last_delivered_turn_id: Some("turn-0".to_owned()),
+            last_projected: Some(BridgeProjectionRecord {
+                kind: nakode_protocol::BridgeProjectionKind::Assistant,
+                turn_id: "turn-0".to_owned(),
+            }),
             delivery: Some(BridgeDeliveryRecord {
+                projection_kind: nakode_protocol::BridgeProjectionKind::User,
                 turn_id: "turn-1".to_owned(),
+                previous_projection: Some(BridgeProjectionRecord {
+                    kind: nakode_protocol::BridgeProjectionKind::Assistant,
+                    turn_id: "turn-0".to_owned(),
+                }),
                 body_sha256: "a".repeat(64),
                 part_count: 2,
                 completed_parts: 1,
@@ -2947,6 +3178,10 @@ mod tests {
                 text: "continue after restart".to_owned(),
                 attachments: Vec::new(),
             }),
+            inbound_turn_origins: vec![BridgeInboundTurnOriginRecord {
+                turn_id: "turn-2".to_owned(),
+                transport: "discord".to_owned(),
+            }],
             updated_at_ms: 123,
         };
         store.save_session_bridges_with_inbound_event(
@@ -2956,11 +3191,13 @@ mod tests {
             }],
             &session.id,
             "event-1",
+            nakode_protocol::BridgeContinuationDisposition::Accepted,
         )?;
         store.save_session_bridges_with_inbound_event(
             std::slice::from_ref(&bridge),
             &session.id,
             "event-2",
+            nakode_protocol::BridgeContinuationDisposition::Busy,
         )?;
         let mut persisted_bridge = bridge.clone();
         persisted_bridge.recent_inbound_event_ids.clear();
@@ -2968,14 +3205,21 @@ mod tests {
             store.list_session_bridges("/tmp/project")?,
             vec![persisted_bridge.clone()]
         );
-        assert!(store.has_session_bridge_inbound_event(&session.id, "event-1")?);
-        assert!(store.has_session_bridge_inbound_event(&session.id, "event-2")?);
+        assert_eq!(
+            store.find_session_bridge_inbound_event(&session.id, "event-1")?,
+            Some(nakode_protocol::BridgeContinuationDisposition::Accepted)
+        );
+        assert_eq!(
+            store.find_session_bridge_inbound_event(&session.id, "event-2")?,
+            Some(nakode_protocol::BridgeContinuationDisposition::Busy)
+        );
         assert!(
             store
                 .save_session_bridges_with_inbound_event(
                     std::slice::from_ref(&bridge),
                     &session.id,
                     "event-2",
+                    nakode_protocol::BridgeContinuationDisposition::Busy,
                 )
                 .is_err(),
             "a concurrent/replayed durable claim must fail closed"
@@ -2988,9 +3232,110 @@ mod tests {
             "single-session deletion preserves the thread identity for archival"
         );
 
+        assert_eq!(
+            store.find_session_bridge_inbound_event(&session.id, "event-1")?,
+            None,
+            "session deletion removes its normalized replay ledger rows"
+        );
+
         store.purge_all()?;
         assert!(store.list_session_bridges("/tmp/project")?.is_empty());
-        assert!(!store.has_session_bridge_inbound_event(&session.id, "event-1")?);
+        assert_eq!(
+            store.find_session_bridge_inbound_event(&session.id, "event-1")?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_replay_ledger_is_bounded_but_preserves_the_pending_prompt() -> Result<(), SessionError>
+    {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let session = store.create(
+            CODEX_PROVIDER,
+            "provider-ledger",
+            "/tmp/project",
+            "Ledger",
+            None,
+        )?;
+        let bridge = SessionBridgeRecord {
+            session_id: session.id.clone(),
+            workspace: "/tmp/project".to_owned(),
+            kind: nakode_protocol::OrchestratorKind::Chat,
+            lifecycle: nakode_protocol::BridgeLifecycle::Open,
+            display_title: "Ledger bridge".to_owned(),
+            revision: 1,
+            transport: Some("discord".to_owned()),
+            external_parent_id: Some("100".to_owned()),
+            external_thread_id: Some("101".to_owned()),
+            last_projected: None,
+            delivery: None,
+            live_turn_id: None,
+            live_external_message_id: None,
+            active_source_message_id: Some("protected".to_owned()),
+            recent_inbound_event_ids: Vec::new(),
+            pending_inbound: Some(BridgePendingInboundRecord {
+                external_event_id: "protected".to_owned(),
+                source_message_id: "protected".to_owned(),
+                client_prompt_id: "bridge-protected".to_owned(),
+                text: "still awaiting backend acknowledgement".to_owned(),
+                attachments: Vec::new(),
+            }),
+            inbound_turn_origins: Vec::new(),
+            updated_at_ms: 1,
+        };
+        store.save_session_bridges_with_inbound_event(
+            std::slice::from_ref(&bridge),
+            &session.id,
+            "protected",
+            nakode_protocol::BridgeContinuationDisposition::Accepted,
+        )?;
+        {
+            let mut connection = store
+                .connection
+                .lock()
+                .expect("session database mutex poisoned");
+            let transaction = connection.transaction()?;
+            for index in 0..MAX_BRIDGE_REPLAY_EVENTS_PER_SESSION + 3 {
+                transaction.execute(
+                    "INSERT INTO session_bridge_inbound_events
+                     (session_id, external_event_id, disposition, recorded_at_ms)
+                     VALUES (?1, ?2, 'busy', ?3)",
+                    params![
+                        session.id,
+                        format!("event-{index}"),
+                        i64::try_from(index).expect("bounded ledger index")
+                    ],
+                )?;
+            }
+            transaction.commit()?;
+        }
+        store.save_session_bridges_with_inbound_event(
+            std::slice::from_ref(&bridge),
+            &session.id,
+            "newest",
+            nakode_protocol::BridgeContinuationDisposition::Busy,
+        )?;
+
+        let connection = store
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let count = connection.query_row(
+            "SELECT COUNT(*) FROM session_bridge_inbound_events WHERE session_id = ?1",
+            [&session.id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(
+            usize::try_from(count).expect("non-negative replay count"),
+            MAX_BRIDGE_REPLAY_EVENTS_PER_SESSION + 1
+        );
+        drop(connection);
+        assert_eq!(
+            store.find_session_bridge_inbound_event(&session.id, "protected")?,
+            Some(nakode_protocol::BridgeContinuationDisposition::Accepted)
+        );
         Ok(())
     }
 
@@ -3009,13 +3354,14 @@ mod tests {
             transport: Some("discord".to_owned()),
             external_parent_id: Some("100".to_owned()),
             external_thread_id: Some("101".to_owned()),
-            last_delivered_turn_id: None,
+            last_projected: None,
             delivery: None,
             live_turn_id: None,
             live_external_message_id: None,
             active_source_message_id: None,
             recent_inbound_event_ids: Vec::new(),
             pending_inbound: None,
+            inbound_turn_origins: Vec::new(),
             updated_at_ms: 1,
         };
         let second = SessionBridgeRecord {
@@ -3311,6 +3657,7 @@ mod tests {
                 owner_turn_id: None,
                 reasoning_effort: None,
                 fast_mode: None,
+                source_transport: None,
                 tool_audit_json: None,
             }],
             observability: SubagentObservability::default(),
@@ -3401,6 +3748,7 @@ mod tests {
                     owner_turn_id: None,
                     reasoning_effort: None,
                     fast_mode: None,
+                    source_transport: None,
                     tool_audit_json: None,
                 },
                 TranscriptEntry {
@@ -3416,6 +3764,7 @@ mod tests {
                     owner_turn_id: None,
                     reasoning_effort: None,
                     fast_mode: None,
+                    source_transport: None,
                     tool_audit_json: Some(
                         r#"{"version":1,"callId":"call-1","kind":"native"}"#.to_owned(),
                     ),
@@ -3532,6 +3881,7 @@ mod tests {
                 owner_turn_id: None,
                 reasoning_effort: None,
                 fast_mode: None,
+                source_transport: None,
                 tool_audit_json: None,
             }],
             observability: SubagentObservability::default(),

@@ -15,8 +15,8 @@ use std::{
 use tokio::sync::mpsc;
 
 use nakode_protocol::{
-    Command, ErrorCode, Query, QueryResult, ServiceCapabilities, ServiceCapability, ServiceError,
-    Snapshot,
+    BridgeContinuationDisposition, Command, ErrorCode, Query, QueryResult, ServiceCapabilities,
+    ServiceCapability, ServiceError, Snapshot,
 };
 use nakode_server::{ServerEndpoint, ServerRequests};
 use thiserror::Error;
@@ -707,12 +707,14 @@ impl NativeServerRuntime {
                 .effects
                 .persistence
                 .sessions
-                .has_session_bridge_inbound_event(session_id.as_str(), &external_event_id)
+                .find_session_bridge_inbound_event(session_id.as_str(), &external_event_id)
             {
-                Ok(true) => self
-                    .core
-                    .remember_durable_bridge_inbound_event(&session_id, &external_event_id),
-                Ok(false) => inbound_event_to_claim = Some((session_id, external_event_id)),
+                Ok(Some(disposition)) => self.core.remember_durable_bridge_inbound_event(
+                    &session_id,
+                    &external_event_id,
+                    disposition,
+                ),
+                Ok(None) => inbound_event_to_claim = Some((session_id, external_event_id)),
                 Err(_) => {
                     if let nakode_server::ServerRequest::Command { respond, .. } = request {
                         let _ = respond.send(Err(ServiceError {
@@ -728,6 +730,11 @@ impl NativeServerRuntime {
         }
         let rollback = BridgeMutationRollback::capture(&request, &self.core);
         let mut outcome = self.core.handle(&self.endpoint, request);
+        let replay_disposition = outcome.bridge_continuation();
+        let inbound_event_to_claim =
+            inbound_event_to_claim.and_then(|(session_id, external_event_id)| {
+                replay_disposition.map(|disposition| (session_id, external_event_id, disposition))
+            });
         let mut effects = std::mem::take(&mut outcome.effects);
         let had_effects = !effects.is_empty();
         let session_id = outcome
@@ -817,18 +824,23 @@ impl NativeServerRuntime {
             BackendSource::Primary { session_id, .. } => Some(session_id.clone()),
             BackendSource::Subagent(_) => None,
         };
+        let history_was_rebuilt = matches!(&event, BackendEvent::SessionResumed { .. });
+        let bridge_origin_turn_id = event_session_id.as_ref().and_then(|_| match &event {
+            BackendEvent::TurnAccepted { turn_id }
+            | BackendEvent::TurnStarted { turn_id }
+            | BackendEvent::TurnCompleted { turn_id, .. } => Some(turn_id.clone()),
+            _ => None,
+        });
         let acknowledged_prompt_id = event_session_id.as_ref().and_then(|session_id| {
             self.pending_bridge_acknowledgements
                 .get(session_id)
                 .cloned()
                 .or_else(|| match &event {
-                    BackendEvent::TurnAccepted { turn_id } => self
-                        .core
-                        .bridge_prompt_acknowledgement_id(session_id, turn_id, true),
-                    BackendEvent::TurnStarted { turn_id }
+                    BackendEvent::TurnAccepted { turn_id }
+                    | BackendEvent::TurnStarted { turn_id }
                     | BackendEvent::TurnCompleted { turn_id, .. } => self
                         .core
-                        .bridge_prompt_acknowledgement_id(session_id, turn_id, false),
+                        .bridge_prompt_acknowledgement_id(session_id, turn_id, true),
                     _ => None,
                 })
         });
@@ -877,15 +889,23 @@ impl NativeServerRuntime {
                 (session_id, effects)
             }
         };
-        let bridge_checkpoint = acknowledged_prompt_id
-            .as_ref()
-            .map(|_| self.core.bridge_state_checkpoint());
+        if history_was_rebuilt {
+            self.core.reapply_bridge_turn_origins(&session_id);
+        }
+        let bridge_checkpoint = (acknowledged_prompt_id.is_some()
+            || bridge_origin_turn_id.is_some())
+        .then(|| self.core.bridge_state_checkpoint());
+        if let Some(turn_id) = bridge_origin_turn_id.as_deref()
+            && let Some(effect) = self.core.record_bridge_turn_origin(&session_id, turn_id)
+        {
+            effects.push(effect);
+        }
         if let Some(client_prompt_id) = acknowledged_prompt_id.as_deref()
             && let Some(effect) = self
                 .core
                 .acknowledge_bridge_prompt(&session_id, client_prompt_id)
         {
-            effects.insert(0, effect);
+            effects.push(effect);
         }
         let bridge_checkpoint_deferred = if persist_bridge_effects(
             self.effects.persistence.sessions.as_ref(),
@@ -1455,6 +1475,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::SoulManagement,
             ServiceCapability::McpManagement,
             ServiceCapability::OrchestratorThreadBridge,
+            ServiceCapability::DiscordManagement,
         ]
         .into_iter()
         .collect(),
@@ -2247,7 +2268,11 @@ fn bridge_inbound_event_identity(
 fn persist_bridge_effects(
     sessions: &dyn SessionRepository,
     effects: &mut Vec<Effect>,
-    inbound_event_to_claim: Option<&(nakode_protocol::SessionId, String)>,
+    inbound_event_to_claim: Option<&(
+        nakode_protocol::SessionId,
+        String,
+        BridgeContinuationDisposition,
+    )>,
 ) -> Result<(), SessionError> {
     let mut bridges = Vec::new();
     let mut remaining = Vec::with_capacity(effects.len());
@@ -2259,11 +2284,12 @@ fn persist_bridge_effects(
     }
     let result = if bridges.is_empty() {
         Ok(())
-    } else if let Some((session_id, external_event_id)) = inbound_event_to_claim {
+    } else if let Some((session_id, external_event_id, disposition)) = inbound_event_to_claim {
         sessions.save_session_bridges_with_inbound_event(
             &bridges,
             session_id.as_str(),
             external_event_id,
+            *disposition,
         )
     } else {
         sessions.save_session_bridges(&bridges)
@@ -3081,8 +3107,8 @@ mod tests {
         credential::{CredentialStore, SqliteCredentialStore},
         service::ServiceEngine,
         session::{
-            BridgePendingInboundRecord, SessionBridgeRecord, SessionRepository,
-            SqliteSessionRepository, SubagentObservability, SubagentRecord,
+            BridgeInboundTurnOriginRecord, BridgePendingInboundRecord, SessionBridgeRecord,
+            SessionRepository, SqliteSessionRepository, SubagentObservability, SubagentRecord,
         },
         state::{DomainState, Effect, SubagentStatus},
     };
@@ -3714,13 +3740,14 @@ mod tests {
                 transport: None,
                 external_parent_id: None,
                 external_thread_id: None,
-                last_delivered_turn_id: None,
+                last_projected: None,
                 delivery: None,
                 live_turn_id: None,
                 live_external_message_id: None,
                 active_source_message_id: None,
                 recent_inbound_event_ids: Vec::new(),
                 pending_inbound: None,
+                inbound_turn_origins: Vec::new(),
                 updated_at_ms: 1,
             })
             .expect("initial bridge");
@@ -3806,7 +3833,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn failed_bridge_acknowledgement_checkpoint_is_retried_on_a_later_provider_event() {
+    async fn failed_bridge_origin_and_acknowledgement_checkpoint_retries_on_terminal_event() {
         let workspace = tempfile::tempdir().expect("workspace");
         let database = workspace.path().join("sessions.sqlite3");
         let (persistence, _credentials) = test_persistence(workspace.path());
@@ -3836,10 +3863,11 @@ mod tests {
             model: "model".to_owned(),
         });
         state
-            .submit_prompt_with_id(
+            .submit_prompt_with_id_and_source(
                 "bridge-stable-prompt".to_owned(),
                 "continue".to_owned(),
                 Vec::new(),
+                Some("discord".to_owned()),
             )
             .expect("stable prompt starts");
         sessions
@@ -3853,7 +3881,7 @@ mod tests {
                 transport: Some("discord".to_owned()),
                 external_parent_id: Some("100".to_owned()),
                 external_thread_id: Some("101".to_owned()),
-                last_delivered_turn_id: None,
+                last_projected: None,
                 delivery: None,
                 live_turn_id: None,
                 live_external_message_id: None,
@@ -3866,6 +3894,7 @@ mod tests {
                     text: "continue".to_owned(),
                     attachments: Vec::new(),
                 }),
+                inbound_turn_origins: Vec::new(),
                 updated_at_ms: 1,
             })
             .expect("initial bridge");
@@ -3892,7 +3921,7 @@ mod tests {
                     session_id: session_id.clone(),
                     provider: CODEX_PROVIDER.to_owned(),
                 },
-                BackendEvent::TurnAccepted {
+                BackendEvent::TurnStarted {
                     turn_id: "provider-generated-turn".to_owned(),
                 },
             )
@@ -3926,8 +3955,10 @@ mod tests {
                     session_id: session_id.clone(),
                     provider: CODEX_PROVIDER.to_owned(),
                 },
-                BackendEvent::TurnStarted {
+                BackendEvent::TurnCompleted {
                     turn_id: "provider-generated-turn".to_owned(),
+                    outcome: crate::backend::TurnOutcome::Completed,
+                    error: None,
                 },
             )
             .await;
@@ -3944,12 +3975,17 @@ mod tests {
                 .pending_inbound
                 .is_none()
         );
-        assert!(
-            sessions
-                .list_session_bridges(&workspace.path().to_string_lossy())
-                .expect("stored bridge")[0]
-                .pending_inbound
-                .is_none()
+        let stored_bridge = &sessions
+            .list_session_bridges(&workspace.path().to_string_lossy())
+            .expect("stored bridge")[0];
+        assert!(stored_bridge.pending_inbound.is_none());
+        assert_eq!(
+            stored_bridge.inbound_turn_origins,
+            [BridgeInboundTurnOriginRecord {
+                turn_id: "provider-generated-turn".to_owned(),
+                transport: "discord".to_owned(),
+            }],
+            "terminal retry persists source provenance and acknowledgement as one final bridge state"
         );
         runtime.effects.shutdown().await;
     }
@@ -3981,13 +4017,14 @@ mod tests {
                 transport: Some("discord".to_owned()),
                 external_parent_id: Some("100".to_owned()),
                 external_thread_id: Some("101".to_owned()),
-                last_delivered_turn_id: None,
+                last_projected: None,
                 delivery: None,
                 live_turn_id: None,
                 live_external_message_id: None,
                 active_source_message_id: None,
                 recent_inbound_event_ids: Vec::new(),
                 pending_inbound: None,
+                inbound_turn_origins: Vec::new(),
                 updated_at_ms: 1,
             })
             .expect("initial bridge");
@@ -4027,10 +4064,11 @@ mod tests {
             first.bridge_continuation,
             Some(BridgeContinuationDisposition::Busy)
         );
-        assert!(
+        assert_eq!(
             sessions
-                .has_session_bridge_inbound_event(session_id.as_str(), "event-1")
-                .expect("ledger query")
+                .find_session_bridge_inbound_event(session_id.as_str(), "event-1")
+                .expect("ledger query"),
+            Some(BridgeContinuationDisposition::Busy)
         );
         handle.shutdown().await;
         runtime.await.expect("runtime task");
@@ -4094,6 +4132,11 @@ mod tests {
         assert_eq!(
             duplicate.bridge_continuation,
             Some(BridgeContinuationDisposition::Duplicate)
+        );
+        assert_eq!(
+            duplicate.replayed_bridge_continuation,
+            Some(BridgeContinuationDisposition::Busy),
+            "a lost response restores the exact durable Busy reaction after restart"
         );
 
         restarted_handle.shutdown().await;
