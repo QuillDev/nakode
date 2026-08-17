@@ -1311,11 +1311,9 @@ impl ServerCore {
                             tools.replace_builtin_tools,
                         )?;
                 }
-                if mcp_grant.is_some() {
-                    return Err(DomainCommandError::Invalid(
-                        "an attached session cannot change its MCP grant".to_owned(),
-                    ));
-                }
+                // Opening an attached session is a reattachment, not a reconfiguration. The
+                // runtime already owns its installed MCP tools, so a caller's current grant must
+                // not make an otherwise valid reattach fail or mutate the active session.
                 return Ok(Self::accepted(Some(loaded.to_string()), Vec::new()));
             }
             [_, ..] => {
@@ -4471,6 +4469,26 @@ mod tests {
             )
             .expect_err("different table must fail closed");
         assert!(error.to_string().contains("different tool table"));
+    }
+
+    #[test]
+    fn attached_session_ignores_a_new_mcp_grant() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let (created, _) = core
+            .create_session_command(&workspace_id, None, &ModelOptions::default(), None)
+            .expect("coding session");
+        let session_id = SessionId::from(created.resource_id.expect("logical session id"));
+        let changed_grant = nakode_protocol::McpSessionGrant {
+            surface: Some(nakode_protocol::McpSessionSurface::CodingAgent),
+            server_ids: vec!["not-installed-on-this-session".to_owned()],
+        };
+
+        let (_, effects) = core
+            .open_session_command_with_mcp(&session_id, None, Some(&changed_grant))
+            .expect("attached sessions retain their installed MCP configuration");
+
+        assert!(effects.is_empty());
     }
 
     #[test]
