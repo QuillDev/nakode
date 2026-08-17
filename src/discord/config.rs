@@ -23,8 +23,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     CONFIG_VERSION, DiscordError, DiscordTransport, HEX_DIGITS, MAX_MANAGEMENT_REPLAYS,
-    MAX_TOKEN_BYTES, TRANSPORT_NAME, atomic_write, io_error, prepare_private_directory,
-    sanitized_bridge_error,
+    MAX_TOKEN_BYTES, RUNTIME_ERROR_INVALID_INTENTS, RUNTIME_ERROR_INVALID_TOKEN,
+    RUNTIME_ERROR_MESSAGE_CONTENT_INTENT, TRANSPORT_NAME, atomic_write, io_error,
+    prepare_private_directory, sanitized_bridge_error,
 };
 use crate::{
     config::{Config, DiscordAction},
@@ -933,6 +934,18 @@ fn management_error(error: DiscordError, operation: &'static str) -> ServiceErro
     }
 }
 
+const GENERIC_RUNTIME_ERROR: &str =
+    "Discord transport is unavailable; check the sanitized Nakode service logs";
+
+fn public_runtime_error(error: &str) -> String {
+    match error {
+        RUNTIME_ERROR_INVALID_TOKEN
+        | RUNTIME_ERROR_MESSAGE_CONTENT_INTENT
+        | RUNTIME_ERROR_INVALID_INTENTS => error.to_owned(),
+        _ => GENERIC_RUNTIME_ERROR.to_owned(),
+    }
+}
+
 fn discord_management_view(
     config: &DiscordConfig,
     token_configured: bool,
@@ -941,9 +954,13 @@ fn discord_management_view(
     let configuration_complete = config.chat_channel_id.is_some()
         && config.agent_channel_id.is_some()
         && config.primary_user_id.is_some();
-    let (running, failed) = match transport {
-        Ok(status) => (status.running, status.error.is_some()),
-        Err(_) => (false, true),
+    let (running, failed, runtime_error) = match transport {
+        Ok(status) => match (status.running, status.error.as_deref()) {
+            (true, _) => (true, false, None),
+            (false, Some(error)) => (false, true, Some(public_runtime_error(error))),
+            (false, None) => (false, false, None),
+        },
+        Err(_) => (false, true, Some(GENERIC_RUNTIME_ERROR.to_owned())),
     };
     let runtime_state = if running {
         DiscordRuntimeState::Running
@@ -954,9 +971,6 @@ fn discord_management_view(
     } else {
         DiscordRuntimeState::Disabled
     };
-    let runtime_error = failed.then(|| {
-        "Discord transport is unavailable; check the sanitized Nakode service logs".to_owned()
-    });
     DiscordIntegrationView {
         enabled: config.enabled,
         configuration_complete,

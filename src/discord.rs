@@ -88,6 +88,10 @@ const MAX_INGRESS_TOMBSTONES: usize = 16 * 1_024;
 const INGRESS_TOMBSTONE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const MULTIPART_TTL: Duration = Duration::from_secs(30 * 60);
 const TRANSPORT_NAME: &str = "discord";
+const RUNTIME_ERROR_INVALID_TOKEN: &str =
+    "The Discord bot token is missing or was rejected. Replace the token, then restart the bridge.";
+const RUNTIME_ERROR_MESSAGE_CONTENT_INTENT: &str = "Discord rejected the Message Content intent. Enable Message Content Intent in the Discord Developer Portal, then restart the bridge.";
+const RUNTIME_ERROR_INVALID_INTENTS: &str = "Discord rejected Nakode's gateway intents. Upgrade Nakode or check the operator guide, then restart the bridge.";
 const MAX_MANAGEMENT_REPLAYS: usize = 128;
 const REACTION_ACCEPTED: &str = "🔄";
 const REACTION_LIVE: &str = "🟡";
@@ -1546,7 +1550,11 @@ async fn run_gateway(
         {
             Ok(discord) => discord,
             Err(error) => {
+                let terminal = is_terminal_gateway_error(&error);
                 let error = DiscordError::Gateway(error);
+                if terminal {
+                    return Err(error);
+                }
                 eprintln!(
                     "nakode discord: gateway reconnecting ({})",
                     sanitized_bridge_error(&error)
@@ -1602,7 +1610,11 @@ async fn run_gateway(
             return Ok(());
         };
         if let Err(error) = gateway_result {
+            let terminal = is_terminal_gateway_error(&error);
             let error = DiscordError::Gateway(error);
+            if terminal {
+                return Err(error);
+            }
             eprintln!(
                 "nakode discord: gateway reconnecting ({})",
                 sanitized_bridge_error(&error)
@@ -3866,11 +3878,45 @@ fn sanitized_sdk_error(error: &SdkError) -> &'static str {
     }
 }
 
+fn terminal_http_gateway_error(status: Option<serenity::http::StatusCode>) -> Option<&'static str> {
+    (status == Some(serenity::http::StatusCode::UNAUTHORIZED))
+        .then_some(RUNTIME_ERROR_INVALID_TOKEN)
+}
+
+fn terminal_gateway_error(error: &serenity::Error) -> Option<&'static str> {
+    match error {
+        serenity::Error::Gateway(serenity::gateway::GatewayError::InvalidAuthentication) => {
+            Some(RUNTIME_ERROR_INVALID_TOKEN)
+        }
+        serenity::Error::Gateway(serenity::gateway::GatewayError::DisallowedGatewayIntents) => {
+            Some(RUNTIME_ERROR_MESSAGE_CONTENT_INTENT)
+        }
+        serenity::Error::Gateway(serenity::gateway::GatewayError::InvalidGatewayIntents) => {
+            Some(RUNTIME_ERROR_INVALID_INTENTS)
+        }
+        serenity::Error::Http(error) => terminal_http_gateway_error(error.status_code()),
+        _ => None,
+    }
+}
+
+fn is_terminal_gateway_error(error: &serenity::Error) -> bool {
+    terminal_gateway_error(error).is_some()
+}
+
+fn sanitized_gateway_error(error: &serenity::Error) -> &'static str {
+    if let Some(message) = terminal_gateway_error(error) {
+        message
+    } else if is_not_found(error) {
+        "Discord resource missing"
+    } else {
+        "Discord request failed"
+    }
+}
+
 fn sanitized_bridge_error(error: &DiscordError) -> &'static str {
     match error {
         DiscordError::Sdk(error) => sanitized_sdk_error(error),
-        DiscordError::Gateway(error) if is_not_found(error) => "Discord resource missing",
-        DiscordError::Gateway(_) => "Discord request failed",
+        DiscordError::Gateway(error) => sanitized_gateway_error(error),
         DiscordError::Http(_) => "attachment request failed",
         DiscordError::AttachmentTooLarge { .. } => "attachment too large",
         DiscordError::CombinedAttachmentsTooLarge => "combined attachments too large",
@@ -3878,6 +3924,7 @@ fn sanitized_bridge_error(error: &DiscordError) -> &'static str {
         DiscordError::MultipartTooLarge => "multipart prompt too large",
         DiscordError::UnsupportedAttachment { .. } => "unsupported attachment",
         DiscordError::InvalidConfig(_) | DiscordError::InvalidId { .. } => "invalid bridge state",
+        DiscordError::MissingToken | DiscordError::TokenTooLarge => RUNTIME_ERROR_INVALID_TOKEN,
         _ => "bridge operation failed",
     }
 }

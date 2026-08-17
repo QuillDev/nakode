@@ -13,7 +13,10 @@ use nakode_protocol::{
     CredentialInput, DiscordIntegrationInput, DiscordRuntimeState, ErrorCode, IdempotencyKey,
 };
 use nakode_server::grpc::{DiscordManagement, DiscordManagementMutation};
-use serenity::all::{ChannelId, MessageId, UserId};
+use serenity::{
+    all::{ChannelId, MessageId, UserId},
+    gateway::GatewayError,
+};
 
 use super::{
     CONFIG_VERSION, ChildAbortGuard, DiscordApi, DiscordConfig, DiscordConfigStore, DiscordError,
@@ -21,16 +24,18 @@ use super::{
     ExternalMessage, IngressAttachment, IngressProcessOutcome, IngressRecord, IngressSpool,
     MAX_ACTIVE_MULTIPART_ASSEMBLIES_PER_SESSION, ManagedGatewayEvent, MultipartAssembler,
     MultipartOutcome, PendingRouteAuthority, PendingRouteResolution, ProjectionKind, REACTION_BUSY,
-    ReadyUpdateDrain, RecoverySpool, TrackedChildTasks, TransportController, TransportStatus,
-    TransportSupervisor, acquire_gateway_identify_lease, await_managed_gateway_shutdown,
-    busy_nonce, cached_thread_route_is_current, clear_local_thread_binding, completed_projections,
-    connect_api, create_or_recover_thread, discord_session_start_wait,
-    drain_ready_hydrated_updates, failed_nonce, final_nonce, find_message_by_nonce,
-    finish_child_tasks, ingress_io, is_approved_discord_cdn_url, mark_message_busy,
-    next_managed_gateway_event, parse_multipart, projection_clears_stale_source, projection_nonce,
-    reconciliation_snapshot, resolve_pending_route, sanitize_mentions, send_or_recover_final_part,
-    split_discord_content, starter_nonce, terminal_feedback_outcome, thread_title,
-    valid_open_thread_route, validate_snowflake, visible_discord_content,
+    RUNTIME_ERROR_INVALID_INTENTS, RUNTIME_ERROR_INVALID_TOKEN,
+    RUNTIME_ERROR_MESSAGE_CONTENT_INTENT, ReadyUpdateDrain, RecoverySpool, TrackedChildTasks,
+    TransportController, TransportStatus, TransportSupervisor, acquire_gateway_identify_lease,
+    await_managed_gateway_shutdown, busy_nonce, cached_thread_route_is_current,
+    clear_local_thread_binding, completed_projections, connect_api, create_or_recover_thread,
+    discord_session_start_wait, drain_ready_hydrated_updates, failed_nonce, final_nonce,
+    find_message_by_nonce, finish_child_tasks, ingress_io, is_approved_discord_cdn_url,
+    is_terminal_gateway_error, mark_message_busy, next_managed_gateway_event, parse_multipart,
+    projection_clears_stale_source, projection_nonce, reconciliation_snapshot,
+    resolve_pending_route, sanitize_mentions, sanitized_bridge_error, send_or_recover_final_part,
+    split_discord_content, starter_nonce, terminal_feedback_outcome, terminal_http_gateway_error,
+    thread_title, valid_open_thread_route, validate_snowflake, visible_discord_content,
     wait_for_runtime_configuration_change,
 };
 use nakode_sdk::{HydratedSession, Watch, v1 as api};
@@ -196,6 +201,43 @@ impl TransportController for FailingRestartTransport {
     }
 }
 
+struct StatusFailureTransport {
+    error: &'static str,
+}
+
+impl StatusFailureTransport {
+    fn failed_status(&self) -> TransportStatus {
+        TransportStatus {
+            name: "discord".to_owned(),
+            enabled: true,
+            running: false,
+            error: Some(self.error.to_owned()),
+        }
+    }
+}
+
+impl TransportController for StatusFailureTransport {
+    fn autostart(&self) -> futures_util::future::BoxFuture<'_, Result<TransportStatus, String>> {
+        async move { Ok(self.failed_status()) }.boxed()
+    }
+
+    fn start(&self) -> futures_util::future::BoxFuture<'_, Result<TransportStatus, String>> {
+        async move { Ok(self.failed_status()) }.boxed()
+    }
+
+    fn stop(&self) -> futures_util::future::BoxFuture<'_, Result<TransportStatus, String>> {
+        async move { Ok(self.failed_status()) }.boxed()
+    }
+
+    fn restart(&self) -> futures_util::future::BoxFuture<'_, Result<TransportStatus, String>> {
+        async move { Ok(self.failed_status()) }.boxed()
+    }
+
+    fn status(&self) -> futures_util::future::BoxFuture<'_, Result<TransportStatus, String>> {
+        async move { Ok(self.failed_status()) }.boxed()
+    }
+}
+
 fn management_input(token: Option<&str>) -> DiscordIntegrationInput {
     DiscordIntegrationInput {
         chat_channel_id: "43".to_owned(),
@@ -330,6 +372,57 @@ fn discord_gateway_identify_budget_honors_remaining_reset_and_concurrency() {
     assert!(wait >= Duration::from_secs(60));
     assert!(wait < Duration::from_secs(61));
     assert!(discord_session_start_wait(1, 1, 1, 0).is_err());
+}
+
+#[test]
+fn terminal_gateway_configuration_errors_fail_with_actionable_sanitized_status() {
+    for (gateway_error, expected) in [
+        (
+            GatewayError::InvalidAuthentication,
+            RUNTIME_ERROR_INVALID_TOKEN,
+        ),
+        (
+            GatewayError::InvalidGatewayIntents,
+            RUNTIME_ERROR_INVALID_INTENTS,
+        ),
+        (
+            GatewayError::DisallowedGatewayIntents,
+            RUNTIME_ERROR_MESSAGE_CONTENT_INTENT,
+        ),
+    ] {
+        let error = serenity::Error::Gateway(gateway_error);
+        assert!(is_terminal_gateway_error(&error));
+        assert_eq!(
+            sanitized_bridge_error(&DiscordError::Gateway(error)),
+            expected
+        );
+    }
+
+    assert_eq!(
+        sanitized_bridge_error(&DiscordError::MissingToken),
+        RUNTIME_ERROR_INVALID_TOKEN
+    );
+    assert_eq!(
+        sanitized_bridge_error(&DiscordError::TokenTooLarge),
+        RUNTIME_ERROR_INVALID_TOKEN
+    );
+
+    assert_eq!(
+        terminal_http_gateway_error(Some(serenity::http::StatusCode::UNAUTHORIZED)),
+        Some(RUNTIME_ERROR_INVALID_TOKEN)
+    );
+    assert_eq!(
+        terminal_http_gateway_error(Some(serenity::http::StatusCode::FORBIDDEN)),
+        None
+    );
+    assert_eq!(terminal_http_gateway_error(None), None);
+
+    let retryable = serenity::Error::Gateway(GatewayError::HeartbeatFailed);
+    assert!(!is_terminal_gateway_error(&retryable));
+    assert_eq!(
+        sanitized_bridge_error(&DiscordError::Gateway(retryable)),
+        "Discord request failed"
+    );
 }
 
 #[test]
@@ -1778,6 +1871,51 @@ async fn management_storage_failures_are_sanitized_retryable_and_not_replayed() 
         unavailable.message,
         "Discord configuration storage is unavailable"
     );
+}
+
+#[tokio::test]
+async fn management_exposes_only_allowlisted_actionable_gateway_failures() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let store =
+        DiscordConfigStore::from_root(directory.path(), &directory.path().join("discord-data"))
+            .expect("store");
+    store
+        .save(&enabled_config())
+        .expect("enabled configuration");
+    store
+        .save_token("must-remain-write-only")
+        .expect("private token");
+
+    for (transport_error, expected) in [
+        (
+            RUNTIME_ERROR_MESSAGE_CONTENT_INTENT,
+            RUNTIME_ERROR_MESSAGE_CONTENT_INTENT,
+        ),
+        (RUNTIME_ERROR_INVALID_TOKEN, RUNTIME_ERROR_INVALID_TOKEN),
+        (RUNTIME_ERROR_INVALID_INTENTS, RUNTIME_ERROR_INVALID_INTENTS),
+        (
+            "raw Discord gateway metadata must not escape",
+            "Discord transport is unavailable; check the sanitized Nakode service logs",
+        ),
+    ] {
+        let transport = Arc::new(StatusFailureTransport {
+            error: transport_error,
+        });
+        let manager = DiscordManagementService {
+            store: Ok(store.clone()),
+            transports: TransportSupervisor::new([(
+                "discord".to_owned(),
+                transport as Arc<dyn TransportController>,
+            )]),
+            operation: Arc::new(tokio::sync::Mutex::new(DiscordManagementState::default())),
+        };
+        let view = manager.get().await.expect("redacted failed status");
+        assert_eq!(view.runtime_state, DiscordRuntimeState::Failed);
+        assert_eq!(view.runtime_error.as_deref(), Some(expected));
+        let debug = format!("{view:?}");
+        assert!(!debug.contains("must-remain-write-only"));
+        assert!(!debug.contains("raw Discord gateway metadata"));
+    }
 }
 
 #[tokio::test]
