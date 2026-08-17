@@ -1180,21 +1180,38 @@ async fn ensure_api_service(
     Err(ControlError::ServiceStartup(api_path.display().to_string()))
 }
 
+const FRONTEND_API_VERSION: &str = "nakode.v1";
+
 fn runtime_matches_cli(record: Option<&ServiceRuntimeRecord>, cli: &ExecutableIdentity) -> bool {
     record
         .and_then(|record| record.executable.as_ref())
         .is_some_and(|running| running.same_build(cli))
 }
 
+fn server_is_api_compatible(server: Option<&ServerReport>) -> bool {
+    // Additive features are negotiated through capabilities. A wire-incompatible service must
+    // publish a different API version rather than forcing a restart solely for build identity.
+    server.is_some_and(|server| server.api_version == FRONTEND_API_VERSION)
+}
+
+fn service_can_be_reused(
+    record: Option<&ServiceRuntimeRecord>,
+    cli: &ExecutableIdentity,
+    server: Option<&ServerReport>,
+) -> bool {
+    runtime_matches_cli(record, cli) || server_is_api_compatible(server)
+}
+
 /// Returns a compatible live endpoint or starts/activates the workspace server.
 ///
-/// Endpoint discovery is serialized per workspace and compares immutable executable content, not
-/// semver or the mutable path string. A live old service is replaced at most once, and the
-/// replacement is verified before its descriptor is returned.
+/// Endpoint discovery is serialized per workspace. A responsive API-compatible service is reused
+/// even when its executable differs from the invoking CLI, preserving server-owned live work
+/// across installs. A live incompatible service is replaced at most once, and the replacement is
+/// verified before its descriptor is returned.
 ///
 /// # Errors
-/// Returns when identity cannot be established, live work makes replacement unsafe, or a bounded
-/// start/restart cannot produce the invoking executable's identity.
+/// Returns when compatibility cannot be established, live work makes replacement unsafe, or a
+/// bounded start/restart cannot produce a ready compatible service.
 pub async fn frontend_api_endpoint_report(
     executable: &Path,
     config: &Config,
@@ -1222,12 +1239,13 @@ pub async fn frontend_api_endpoint_report(
         .is_some()
     {
         let old_record = read_runtime_record(paths.runtime());
-        if runtime_matches_cli(old_record.as_ref(), &cli) {
+        let old_server = server_report(paths.api()).await;
+        if service_can_be_reused(old_record.as_ref(), &cli, old_server.as_ref()) {
             return verified_frontend_endpoint(
                 &paths,
                 cli,
                 EndpointActivation::Reused,
-                "reusing current service",
+                "reusing compatible service",
             )
             .await;
         }
@@ -1374,15 +1392,16 @@ async fn verified_frontend_endpoint(
             "the ready service did not publish service.json",
         ))
     })?;
-    let matches = runtime_matches_cli(Some(&service), &cli);
+    let server = server_report(paths.api()).await;
+    let matches = service_can_be_reused(Some(&service), &cli, server.as_ref());
     if !matches {
         return Err(ControlError::StaleServiceActivation(activation_diagnostic(
             paths,
             &cli,
             Some(&service),
-            None,
+            server,
             action,
-            "the ready service executable identity does not match the invoking CLI",
+            "the ready service is neither the invoking CLI build nor API-compatible",
         )));
     }
     Ok(FrontendEndpoint {
@@ -1390,7 +1409,7 @@ async fn verified_frontend_endpoint(
         lifecycle_socket: paths.lifecycle().to_path_buf(),
         cli,
         service,
-        server: server_report(paths.api()).await,
+        server,
         activation,
     })
 }
@@ -2165,8 +2184,9 @@ mod tests {
         activation_lock_owner_is_abandoned, bind_service_listener, detach_service_process,
         ensure_service_at, exchange, executable_identity, expect_ok, frontend_api_endpoint_at,
         ping_at, quiescence_refusal, refresh_stale_service, run_lifecycle_listener,
-        runtime_matches_cli, service_arguments, service_command, service_configuration_fingerprint,
-        service_running_at, session_has_live_work, shutdown_all_services_in, workspace_from_log,
+        runtime_matches_cli, server_is_api_compatible, service_arguments, service_can_be_reused,
+        service_command, service_configuration_fingerprint, service_running_at,
+        session_has_live_work, shutdown_all_services_in, workspace_from_log,
         workspace_runtime_directory_in,
     };
     use crate::config::{Config, OpenAiReasoningEffort};
@@ -2204,6 +2224,40 @@ mod tests {
         assert!(!runtime_matches_cli(Some(&same_version_old_build), &cli));
         assert!(!runtime_matches_cli(Some(&old_record), &cli));
         assert!(!runtime_matches_cli(None, &cli));
+    }
+
+    #[test]
+    fn api_compatible_service_is_reused_across_executable_identity_drift() {
+        let cli = identity("/installed/nakode", "new-hash", 200);
+        let old_build = ServiceRuntimeRecord {
+            pid: 42,
+            started_at_unix_ms: 10,
+            version: "0.3.0".to_owned(),
+            workspace: None,
+            executable: Some(identity("/installed/nakode", "old-hash", 190)),
+        };
+        let compatible = super::ServerReport {
+            server_version: "0.3.0".to_owned(),
+            api_version: "nakode.v1".to_owned(),
+            capabilities: vec!["Subscriptions".to_owned()],
+        };
+        let incompatible = super::ServerReport {
+            api_version: "nakode.v2".to_owned(),
+            ..compatible.clone()
+        };
+
+        assert!(server_is_api_compatible(Some(&compatible)));
+        assert!(service_can_be_reused(
+            Some(&old_build),
+            &cli,
+            Some(&compatible)
+        ));
+        assert!(!service_can_be_reused(
+            Some(&old_build),
+            &cli,
+            Some(&incompatible)
+        ));
+        assert!(!service_can_be_reused(Some(&old_build), &cli, None));
     }
 
     #[test]
