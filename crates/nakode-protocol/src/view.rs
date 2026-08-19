@@ -800,6 +800,10 @@ pub struct SessionView {
     pub interactions: Vec<InteractionView>,
     pub todos: Vec<TodoPhaseView>,
     pub runs: Vec<RunView>,
+    /// All delegated runs owned by this logical session before the bounded `runs` projection.
+    /// Includes both direct runs and recursively delegated descendants.
+    #[serde(default)]
+    pub runs_total: Option<u64>,
     #[serde(default)]
     pub runs_has_earlier: bool,
     pub notices: Vec<NoticeView>,

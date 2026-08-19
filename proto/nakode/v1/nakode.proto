@@ -742,6 +742,10 @@ message SessionState {
   bool next_turn_configuration_pending = 26;
   // Server-authored transition semantics for the selected next-turn configuration.
   optional string next_turn_transition = 27;
+  // All delegated runs owned by this logical session before the bounded `runs` projection.
+  // Includes direct runs and recursively delegated descendants. Presence distinguishes a real zero
+  // from an older server that predates this field.
+  optional uint64 runs_total = 28;
 }
 message ExternalToolCall { string id = 1; string name = 2; string arguments_json = 3; }
 

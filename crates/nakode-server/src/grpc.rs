@@ -2079,6 +2079,7 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         interactions: value.interactions.into_iter().map(interaction).collect(),
         todos: value.todos.into_iter().map(todo_phase).collect(),
         runs: value.runs.into_iter().map(run).collect(),
+        runs_total: value.runs_total,
         runs_has_earlier: value.runs_has_earlier,
         notices: value.notices.into_iter().map(notice).collect(),
         external_tool_calls: value

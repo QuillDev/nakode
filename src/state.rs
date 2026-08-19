@@ -2422,7 +2422,15 @@ impl DomainState {
         };
     }
 
-    pub fn install_subagents(&mut self, records: Vec<SubagentRecord>) {
+    pub fn install_subagents(&mut self, mut records: Vec<SubagentRecord>) {
+        // This is the authoritative run boundary for both restoration and embedded/paged projection:
+        // oldest first by immutable start time, with stable run identity breaking timestamp ties.
+        records.sort_by(|left, right| {
+            left.observability
+                .started_at_ms
+                .cmp(&right.observability.started_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         self.subagents.clear();
         self.subagent_executions.clear();
         self.subagent_chats.clear();
@@ -7128,7 +7136,17 @@ impl DomainState {
                 ..SubagentObservability::default()
             },
         };
-        self.subagents.push(run.clone());
+        let insertion = self
+            .subagents
+            .binary_search_by(|existing| {
+                existing
+                    .observability
+                    .started_at_ms
+                    .cmp(&run.observability.started_at_ms)
+                    .then_with(|| existing.id.cmp(&run.id))
+            })
+            .unwrap_or_else(|index| index);
+        self.subagents.insert(insertion, run.clone());
         self.sync_inline_subagent(&run);
         let mut transcript = DomainTranscript::new(self.transcript_limit);
         transcript.set_stream_label(definition.slug.clone());
@@ -13051,6 +13069,42 @@ model = "claude-agent/sonnet"
 
         assert_eq!(state.subagents.len(), super::MAX_CONCURRENT_SUBAGENTS);
         assert!(state.has_running_subagents());
+        let ordered_ids = state
+            .subagents
+            .iter()
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        let mut expected_ids = ordered_ids.clone();
+        expected_ids.sort_by(|left, right| {
+            let left = state
+                .subagents
+                .iter()
+                .find(|run| &run.id == left)
+                .expect("live run");
+            let right = state
+                .subagents
+                .iter()
+                .find(|run| &run.id == right)
+                .expect("live run");
+            left.observability
+                .started_at_ms
+                .cmp(&right.observability.started_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        assert_eq!(ordered_ids, expected_ids);
+        let session = projection::bootstrap(&state, 7, &[], &[])
+            .active_session
+            .expect("live session projection");
+        assert_eq!(session.runs_total, Some(4));
+        assert_eq!(
+            session
+                .runs
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            ordered_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(!session.runs_has_earlier);
         let rejected = state.invoke_agent(&AgentRequest {
             id: 99,
             agent: "explorer".to_owned(),

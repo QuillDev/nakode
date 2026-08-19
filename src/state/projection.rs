@@ -252,6 +252,7 @@ fn session_view(
         interactions: interactions(state, revision),
         todos: todo_views(state),
         runs,
+        runs_total: Some(u64::try_from(state.subagents.len()).unwrap_or(u64::MAX)),
         runs_has_earlier,
         notices: notice_views(state, revision),
         external_tool_calls: state
@@ -2039,36 +2040,79 @@ mod tests {
         );
     }
 
+    fn subagent_records(parent_session_id: &str, count: usize) -> Vec<SubagentRecord> {
+        (0..count)
+            .rev()
+            .map(|index| SubagentRecord {
+                parent_session_id: parent_session_id.to_owned(),
+                id: format!("run-{index:03}"),
+                agent: "reviewer".to_owned(),
+                provider: CODEX_PROVIDER.to_owned(),
+                model: None,
+                provider_session_id: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                objective: format!("Review {index}"),
+                status: SubagentStatus::Completed,
+                latest_activity: "Completed".to_owned(),
+                transcript: Vec::new(),
+                observability: SubagentObservability {
+                    // Exercise the session-wide recursive semantics: descendants count and compete
+                    // at the same latest-64 boundary as direct runs.
+                    parent_run_id: (index % 2 == 1).then(|| format!("run-{:03}", index - 1)),
+                    ..SubagentObservability::default()
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn session_run_window_and_authoritative_total_are_independent_at_every_cap_boundary() {
+        for count in [0, 7, MAX_SESSION_RUNS, MAX_SESSION_RUNS + 17] {
+            let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+            let parent_session_id = state.nakode_session_id.clone();
+            state.install_subagents(subagent_records(&parent_session_id, count));
+
+            let session = bootstrap(&state, 2, &[], &[])
+                .active_session
+                .expect("active session");
+            assert_eq!(
+                session.runs_total,
+                Some(u64::try_from(count).expect("test count"))
+            );
+            assert_eq!(session.runs.len(), count.min(MAX_SESSION_RUNS));
+            assert_eq!(session.runs_has_earlier, count > MAX_SESSION_RUNS);
+
+            let first_retained = count.saturating_sub(MAX_SESSION_RUNS);
+            assert_eq!(
+                session.runs.first().map(|run| run.id.as_str()),
+                (count > 0)
+                    .then(|| format!("run-{first_retained:03}"))
+                    .as_deref()
+            );
+            assert_eq!(
+                session.runs.last().map(|run| run.id.as_str()),
+                count
+                    .checked_sub(1)
+                    .map(|index| format!("run-{index:03}"))
+                    .as_deref()
+            );
+        }
+    }
+
     #[test]
     fn omitted_runs_are_discoverable_through_complete_cursor_pagination() {
         let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
         let parent_session_id = state.nakode_session_id.clone();
-        state.install_subagents(
-            (0..150)
-                .map(|index| SubagentRecord {
-                    parent_session_id: parent_session_id.clone(),
-                    id: format!("run-{index:03}"),
-                    agent: "reviewer".to_owned(),
-                    provider: CODEX_PROVIDER.to_owned(),
-                    model: None,
-                    provider_session_id: None,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cached_input_tokens: 0,
-                    cache_write_tokens: 0,
-                    objective: format!("Review {index}"),
-                    status: SubagentStatus::Completed,
-                    latest_activity: "Completed".to_owned(),
-                    transcript: Vec::new(),
-                    observability: SubagentObservability::default(),
-                })
-                .collect(),
-        );
+        state.install_subagents(subagent_records(&parent_session_id, 150));
 
         let session = bootstrap(&state, 2, &[], &[])
             .active_session
             .expect("active session");
         assert_eq!(session.runs.len(), MAX_SESSION_RUNS);
+        assert_eq!(session.runs_total, Some(150));
         assert!(session.runs_has_earlier);
 
         let mut before = None;

@@ -2396,6 +2396,7 @@ mod tests {
             interactions: Vec::new(),
             todos: Vec::new(),
             runs: Vec::new(),
+            runs_total: Some(0),
             runs_has_earlier: false,
             notices: Vec::new(),
             external_tool_calls: Vec::new(),

@@ -637,6 +637,7 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
             .map(todo_phase)
             .collect::<Result<_, _>>()?,
         runs: value.runs.into_iter().map(run).collect::<Result<_, _>>()?,
+        runs_total: value.runs_total,
         runs_has_earlier: value.runs_has_earlier,
         notices: value
             .notices

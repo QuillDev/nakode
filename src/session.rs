@@ -2566,7 +2566,7 @@ impl SessionRepository for SqliteSessionRepository {
                     termination_kind, termination_detail, objective_mismatch_handoff
              FROM orchestration_runs
              WHERE parent_session_id = ?1
-             ORDER BY created_at, id",
+             ORDER BY started_at_ms, id",
         )?;
         let rows = statement.query_map([parent_session_id], |row| {
             Ok((
