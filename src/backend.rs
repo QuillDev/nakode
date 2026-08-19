@@ -836,6 +836,8 @@ mod tests {
             "bash".to_owned(),
             "ask".to_owned(),
             crate::tools::NAKODE_AGENT_TOOL_NAME.to_owned(),
+            "memory_search".to_owned(),
+            "memory_store".to_owned(),
             "ls".to_owned(),
             "Bash".to_owned(),
             "mcp__nakode_external__bash".to_owned(),
@@ -859,7 +861,13 @@ mod tests {
         );
         assert_eq!(
             claude.unsupported_canonical_tools,
-            vec!["ls", "Bash", "mcp__nakode_external__bash"]
+            vec![
+                "memory_search",
+                "memory_store",
+                "ls",
+                "Bash",
+                "mcp__nakode_external__bash",
+            ]
         );
 
         for provider in [CODEX_PROVIDER, DEVIN_PROVIDER, KIMI_PROVIDER, GLM_PROVIDER] {
@@ -867,10 +875,20 @@ mod tests {
             assert_eq!(
                 projection.allowed_tools,
                 Some(
-                    vec!["read", "grep", "find", "bash", "ask", "nakode_agent", "ls"]
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect()
+                    vec![
+                        "read",
+                        "grep",
+                        "find",
+                        "bash",
+                        "ask",
+                        "nakode_agent",
+                        "memory_search",
+                        "memory_store",
+                        "ls",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
                 ),
                 "{provider} uses exact canonical identities"
             );

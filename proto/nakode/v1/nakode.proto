@@ -143,6 +143,9 @@ message WorkspaceSnapshot { Cursor cursor = 1; WorkspaceState state = 2; }
 message SessionToolConfiguration {
   repeated ExternalToolDefinition tools = 1;
   bool replace_builtin_tools = 2;
+  // Non-empty canonical Nakode builtin names allowed for this session.
+  // Omission keeps the runtime default; use replace_builtin_tools to deny every builtin.
+  repeated string allowed_builtin_tools = 3;
 }
 
 // A fresh session may carry its provider-qualified model, options, and client-owned tool surface in

@@ -826,11 +826,11 @@ impl ServerCore {
             )?);
         }
         if let Some(tools) = tools {
-            effects.extend(
-                engine
-                    .state_mut()
-                    .configure_external_tools(tools.tools, tools.replace_builtin_tools)?,
-            );
+            effects.extend(engine.state_mut().configure_session_tools(
+                tools.tools,
+                tools.replace_builtin_tools,
+                tools.allowed_builtin_tools,
+            )?);
         }
         if let Some(grant) = mcp_grant {
             let (mcp_tools, archetype_grants) = self.mcp_tools_for_grant(grant)?;
@@ -1527,6 +1527,7 @@ impl ServerCore {
                         .configure_or_validate_external_tools(
                             &tools.tools,
                             tools.replace_builtin_tools,
+                            tools.allowed_builtin_tools.as_deref(),
                         )?;
                 }
                 // Opening an attached session is a reattachment, not a reconfiguration. The
@@ -1562,9 +1563,22 @@ impl ServerCore {
         // clone before installing client-owned tools; restoration begins only after validation.
         let _discarded_template_effects = engine.state_mut().create_logical_session()?;
         if let Some(tools) = tools {
-            engine
-                .state_mut()
-                .configure_external_tools(tools.tools, tools.replace_builtin_tools)?;
+            if let Some(allowed) = tools.allowed_builtin_tools.as_deref() {
+                let projection =
+                    crate::backend::project_provider_tools(&session.provider, Some(allowed));
+                if !projection.unsupported_canonical_tools.is_empty() {
+                    return Err(DomainCommandError::Invalid(format!(
+                        "provider {} cannot project allowed builtin tools: {}",
+                        session.provider,
+                        projection.unsupported_canonical_tools.join(", ")
+                    )));
+                }
+            }
+            engine.state_mut().configure_session_tools(
+                tools.tools,
+                tools.replace_builtin_tools,
+                tools.allowed_builtin_tools,
+            )?;
         }
         if let Some(grant) = mcp_grant {
             let (mcp_tools, archetype_grants) = self.mcp_tools_for_grant(grant)?;
@@ -4063,8 +4077,8 @@ mod tests {
         agent::{AgentCatalog, AgentDefinition},
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendIdentity, BackendOperation,
-            CODEX_PROVIDER, CapabilitySupport, ModelCapabilities, ModelInfo, PromptImage,
-            TurnOutcome,
+            CLAUDE_PROVIDER, CODEX_PROVIDER, CapabilitySupport, ModelCapabilities, ModelInfo,
+            PromptImage, TurnOutcome,
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         personality::PromptAddenda,
@@ -4085,6 +4099,7 @@ mod tests {
                 input_schema_json: r#"{"type":"object","properties":{}}"#.to_owned(),
             }],
             replace_builtin_tools,
+            allowed_builtin_tools: None,
         }
     }
 
@@ -5055,6 +5070,66 @@ mod tests {
     }
 
     #[test]
+    fn fresh_session_builtin_allowlist_is_carried_to_provider_start() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let tools = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(vec!["read".to_owned(), "grep".to_owned()]),
+        };
+        let (created, _) = core
+            .create_session_command(&workspace_id, None, &ModelOptions::default(), Some(tools))
+            .expect("builtin allowlist without external tools");
+        let (_, effects) = core
+            .try_execute_command(Command::SendPrompt {
+                session_id: SessionId::from(created.resource_id.expect("session id")),
+                prompt: PromptInput {
+                    text: "inspect".to_owned(),
+                    attachments: Vec::new(),
+                },
+            })
+            .expect("first prompt");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::StartSession {
+                allowed_builtin_tools: Some(allowed),
+                ..
+            }) if allowed == &["read".to_owned(), "grep".to_owned()]
+        )));
+    }
+
+    #[test]
+    fn attached_session_tool_validation_includes_builtin_allowlist() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let configured = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(vec!["read".to_owned()]),
+        };
+        let (created, _) = core
+            .create_session_command(
+                &workspace_id,
+                None,
+                &ModelOptions::default(),
+                Some(configured.clone()),
+            )
+            .expect("create");
+        let id = SessionId::from(created.resource_id.expect("session id"));
+        assert!(
+            core.open_session_command(
+                &id,
+                Some(SessionToolConfiguration {
+                    allowed_builtin_tools: Some(vec!["grep".to_owned()]),
+                    ..configured
+                })
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn persisted_session_tools_are_installed_before_provider_resume() {
         let (mut core, _) = ready_external_tools_server();
         let restored_id = SessionId::from("restored-tools-session");
@@ -5072,7 +5147,9 @@ mod tests {
             updated_at: 12,
             owned_provider_sessions: Vec::new(),
         }]);
-        let tools = dashboard_tools("DashboardRead", true);
+        let mut tools = dashboard_tools("DashboardRead", false);
+        tools.allowed_builtin_tools =
+            Some(vec!["memory_search".to_owned(), "memory_store".to_owned()]);
 
         let (_, effects) = core
             .open_session_command(&restored_id, Some(tools.clone()))
@@ -5083,12 +5160,49 @@ mod tests {
                 crate::state::Effect::Backend(BackendCommand::ResumeSession {
                     provider_session_id,
                     external_tools,
-                    replace_builtin_tools: true,
+                    replace_builtin_tools: false,
+                    allowed_builtin_tools: Some(allowed),
                     ..
-                }) if provider_session_id == "thread-restored" && external_tools == &tools.tools
+                }) if provider_session_id == "thread-restored"
+                    && external_tools == &tools.tools
+                    && allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
             )),
             "{effects:#?}"
         );
+    }
+
+    #[test]
+    fn persisted_session_rejects_builtin_tools_the_provider_cannot_expose() {
+        let (mut core, _) = ready_external_tools_server();
+        let restored_id = SessionId::from("restored-claude-session");
+        core.replace_session_records(vec![SessionRecord {
+            id: restored_id.to_string(),
+            provider: CLAUDE_PROVIDER.to_owned(),
+            provider_session_id: "claude-thread".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            title: "Historical Claude session".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            owned_provider_sessions: Vec::new(),
+        }]);
+        let tools = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(vec![
+                "memory_search".to_owned(),
+                "memory_store".to_owned(),
+            ]),
+        };
+
+        let error = core
+            .open_session_command(&restored_id, Some(tools))
+            .expect_err("Claude cannot claim canonical memory support");
+        assert!(error.to_string().contains("memory_search"));
+        assert!(error.to_string().contains("memory_store"));
     }
 
     #[test]
@@ -5148,6 +5262,7 @@ mod tests {
         let invalid = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: true,
+            allowed_builtin_tools: None,
         };
         core.create_session_command(
             &workspace_id,

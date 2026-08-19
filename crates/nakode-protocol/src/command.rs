@@ -168,6 +168,9 @@ pub struct ExternalToolDefinition {
 pub struct SessionToolConfiguration {
     pub tools: Vec<ExternalToolDefinition>,
     pub replace_builtin_tools: bool,
+    /// Non-empty canonical Nakode builtin names allowed for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_builtin_tools: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

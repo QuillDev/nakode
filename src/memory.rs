@@ -495,7 +495,19 @@ impl MemoryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryBackend, MemoryConfig, MemoryScope, memory_data_directory};
+    use super::{MemoryBackend, MemoryConfig, MemoryScope, memory_data_directory, project_bank};
+
+    #[test]
+    fn project_memory_banks_are_stable_and_workspace_isolated() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir_all(&first).expect("first workspace");
+        std::fs::create_dir_all(&second).expect("second workspace");
+
+        assert_eq!(project_bank(&first), project_bank(&first));
+        assert_ne!(project_bank(&first), project_bank(&second));
+    }
 
     #[test]
     fn disabled_memory_is_not_configured() {

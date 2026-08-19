@@ -250,6 +250,8 @@ fn session_tools(
             })
             .collect(),
         replace_builtin_tools: value.replace_builtin_tools,
+        allowed_builtin_tools: (!value.allowed_builtin_tools.is_empty())
+            .then_some(value.allowed_builtin_tools),
     })
 }
 

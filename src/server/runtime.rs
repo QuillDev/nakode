@@ -1472,6 +1472,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::ArtifactTransfer,
             ServiceCapability::ExternalTools,
             ServiceCapability::InitialSessionTools,
+            ServiceCapability::BuiltinToolAllowlists,
             ServiceCapability::InitialSessionModel,
             ServiceCapability::InitialSessionInstructions,
             ServiceCapability::SessionDeletion,

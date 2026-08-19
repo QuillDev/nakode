@@ -1037,6 +1037,7 @@ pub struct DomainState {
     mcp_tools: Vec<nakode_protocol::ExternalToolDefinition>,
     mcp_archetype_grants: HashMap<String, HashSet<String>>,
     replace_builtin_tools: bool,
+    allowed_builtin_tools: Option<Vec<String>>,
     pub todo_phases: Vec<TodoPhase>,
     pub status_message: String,
     pub diagnostic_count: usize,
@@ -1702,6 +1703,7 @@ impl DomainState {
             mcp_tools: Vec::new(),
             mcp_archetype_grants: HashMap::new(),
             replace_builtin_tools: false,
+            allowed_builtin_tools: None,
             todo_phases: Vec::new(),
             status_message: format!("Connecting to {backend_name}…"),
             diagnostic_count: 0,
@@ -2970,7 +2972,7 @@ impl DomainState {
             owner_session_id: Some(self.nakode_session_id.clone()),
             external_tools: self.provider_external_tools(),
             replace_builtin_tools: self.replace_builtin_tools,
-            allowed_builtin_tools: None,
+            allowed_builtin_tools: self.allowed_builtin_tools.clone(),
             max_turns: None,
             timeout_seconds: None,
         }));
@@ -5195,7 +5197,31 @@ impl DomainState {
                 "session tools must be configured before the first prompt".to_owned(),
             ));
         }
-        self.validate_and_install_external_tools(tools, replace_builtin_tools)
+        self.configure_session_tools(tools, replace_builtin_tools, None)
+    }
+
+    /// Configures the complete client-owned and canonical builtin session tool boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after provider startup, for invalid external definitions, contradictory
+    /// replacement/allowlist policy, unknown canonical names, or unsupported provider projection.
+    pub fn configure_session_tools(
+        &mut self,
+        tools: Vec<nakode_protocol::ExternalToolDefinition>,
+        replace_builtin_tools: bool,
+        allowed_builtin_tools: Option<Vec<String>>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        if self.is_busy() || self.provider_session_id.is_some() {
+            return Err(DomainCommandError::Invalid(
+                "session tools must be configured before the first prompt".to_owned(),
+            ));
+        }
+        self.validate_and_install_external_tools(
+            tools,
+            replace_builtin_tools,
+            allowed_builtin_tools,
+        )
     }
 
     /// Verifies that an already-loaded session has the exact requested tool boundary.
@@ -5207,8 +5233,12 @@ impl DomainState {
         &mut self,
         tools: &[nakode_protocol::ExternalToolDefinition],
         replace_builtin_tools: bool,
+        allowed_builtin_tools: Option<&[String]>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        if self.external_tools == tools && self.replace_builtin_tools == replace_builtin_tools {
+        if self.external_tools == tools
+            && self.replace_builtin_tools == replace_builtin_tools
+            && self.allowed_builtin_tools.as_deref() == allowed_builtin_tools
+        {
             return Ok(Vec::new());
         }
         Err(DomainCommandError::Invalid(
@@ -5220,13 +5250,46 @@ impl DomainState {
         &mut self,
         tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
+        allowed_builtin_tools: Option<Vec<String>>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        if tools.is_empty() {
+        if tools.is_empty() && allowed_builtin_tools.is_none() {
             return Err(DomainCommandError::Invalid(
                 "at least one external tool is required".to_owned(),
             ));
         }
         let mut names = HashSet::new();
+        if let Some(allowed) = &allowed_builtin_tools {
+            if allowed.is_empty() {
+                return Err(DomainCommandError::Invalid(
+                    "allowed builtin tools must be non-empty; replace builtins to deny all"
+                        .to_owned(),
+                ));
+            }
+            if replace_builtin_tools {
+                return Err(DomainCommandError::Invalid(
+                    "allowed builtin tools cannot be combined with builtin replacement".to_owned(),
+                ));
+            }
+            let mut canonical_names = HashSet::new();
+            for name in allowed {
+                if !crate::agent::CANONICAL_AGENT_TOOLS.contains(&name.as_str())
+                    || !canonical_names.insert(name.as_str())
+                {
+                    return Err(DomainCommandError::Invalid(
+                        "allowed builtin tool names must be canonical and unique".to_owned(),
+                    ));
+                }
+            }
+            let projection =
+                crate::backend::project_provider_tools(&self.backend_provider, Some(allowed));
+            if !projection.unsupported_canonical_tools.is_empty() {
+                return Err(DomainCommandError::Invalid(format!(
+                    "provider {} cannot project allowed builtin tools: {}",
+                    self.backend_name,
+                    projection.unsupported_canonical_tools.join(", ")
+                )));
+            }
+        }
         for tool in &tools {
             if tool.name.trim().is_empty() || !names.insert(tool.name.as_str()) {
                 return Err(DomainCommandError::Invalid(
@@ -5252,6 +5315,7 @@ impl DomainState {
         }
         self.external_tools = tools;
         self.replace_builtin_tools = replace_builtin_tools;
+        self.allowed_builtin_tools = allowed_builtin_tools;
         Ok(Vec::new())
     }
 
@@ -6410,7 +6474,7 @@ impl DomainState {
                 parent_run_id: None,
                 external_tools: self.provider_external_tools(),
                 replace_builtin_tools: self.replace_builtin_tools,
-                allowed_builtin_tools: None,
+                allowed_builtin_tools: self.allowed_builtin_tools.clone(),
                 max_turns: None,
                 timeout_seconds: None,
             })]

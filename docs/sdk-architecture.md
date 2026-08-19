@@ -43,6 +43,11 @@ The full schema also exposes provider authentication, settings, agents,
 history paging, shell execution, cancellation, and workspace reload so an
 alternative frontend can provide every current capability.
 
+`SessionToolConfiguration` may carry a non-empty canonical built-in allowlist. The server validates
+names, provider projection, and runtime availability before provider work; clients must require the
+advertised `BuiltinToolAllowlists` capability before depending on this field. Omission keeps the
+runtime default, while `replace_builtin_tools` removes every built-in.
+
 ## Ownership
 
 The server owns canonical workspace/session/run state, persistence, provider
