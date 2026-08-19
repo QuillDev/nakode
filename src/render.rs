@@ -1507,6 +1507,10 @@ fn render_provider_details(
     let Some(provider) = picker.providers.get(picker.selected) else {
         return;
     };
+    if let Some(model_picker) = &picker.model_picker {
+        render_provider_model_picker(frame, area, provider, model_picker);
+        return;
+    }
     let enabled = if provider.enabled {
         "enabled"
     } else {
@@ -1542,6 +1546,7 @@ fn render_provider_details(
             ),
         ]),
     ];
+    append_provider_filter(&mut lines, provider);
     append_provider_capabilities(&mut lines, state, provider);
     let mut api_key_input_line = None;
     let authentication_url_line = if let Some(authentication) = &picker.authentication {
@@ -1579,6 +1584,99 @@ fn render_provider_details(
         provider_dashboard_url(provider),
     );
     register_api_key_input(output, popup, api_key_input_line);
+}
+
+fn append_provider_filter(lines: &mut Vec<Line<'_>>, provider: &nakode_protocol::ProviderView) {
+    lines.push(Line::from(vec![
+        Span::styled("Model filter ", Style::default().fg(MUTED)),
+        Span::styled(
+            if provider.model_filter_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            Style::default().fg(if provider.model_filter_enabled {
+                SUCCESS
+            } else {
+                MUTED
+            }),
+        ),
+        Span::styled(
+            format!(
+                " ({} selected, {} candidates)",
+                provider.selected_model_ids.len(),
+                provider.model_candidates.len()
+            ),
+            Style::default().fg(TEXT),
+        ),
+    ]));
+    let has_stale_selection = provider.model_filter_enabled
+        && provider.selected_model_ids.iter().any(|id| {
+            !provider
+                .model_candidates
+                .iter()
+                .any(|model| &model.id == id)
+        });
+    if has_stale_selection {
+        lines.push(Line::styled(
+            "  Includes stale selected model IDs",
+            Style::default().fg(WARNING),
+        ));
+    }
+}
+
+fn render_provider_model_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    provider: &nakode_protocol::ProviderView,
+    picker: &crate::tui_state::ProviderModelPicker,
+) {
+    let popup = centered(area, 76, 28);
+    frame.render_widget(Clear, popup);
+    let filter = picker.filter.to_ascii_lowercase();
+    let models = picker
+        .candidates
+        .iter()
+        .filter(|model| {
+            filter.is_empty()
+                || model.id.to_string().to_ascii_lowercase().contains(&filter)
+                || model.display_name.to_ascii_lowercase().contains(&filter)
+        })
+        .collect::<Vec<_>>();
+    let mut lines = vec![
+        Line::from(format!("Filter: {}", picker.filter)),
+        Line::default(),
+    ];
+    let start = picker.selected.saturating_sub(19);
+    for (index, model) in models.iter().enumerate().skip(start).take(20) {
+        let cursor = if index == picker.selected { "›" } else { " " };
+        let checked = if picker.checked.contains(&model.id) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        lines.push(Line::from(format!(
+            "{cursor}{checked} {}",
+            model.display_name
+        )));
+    }
+    if models.is_empty() {
+        lines.push(Line::styled(
+            "No matching models",
+            Style::default().fg(WARNING),
+        ));
+    }
+    lines.push(Line::styled(
+        "Space select · type search · Enter apply · Esc back",
+        Style::default().fg(MUTED),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines).block(overlay_block(
+            format!(" {} model filter ", provider.display_name),
+            ACCENT,
+        )),
+        popup,
+    );
 }
 
 fn append_provider_capabilities(
@@ -1634,7 +1732,7 @@ fn append_provider_actions(lines: &mut Vec<Line<'_>>, has_credential: bool) {
     }
     lines.push(Line::styled(
         if has_credential {
-            "Enter or Space enable/disable · Esc providers"
+            "f enable/disable model filter · m edit selected models · Enter or Space enable/disable · Esc providers"
         } else {
             "Enter or Space set up credentials · Esc providers"
         },
@@ -2352,6 +2450,9 @@ mod tests {
             },
             capabilities: ProviderCapabilities::default(),
             authentication: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
+            model_candidates: Vec::new(),
         }
     }
 

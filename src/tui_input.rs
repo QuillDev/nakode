@@ -860,6 +860,15 @@ fn handle_provider_picker_key(
     bootstrap: &BootstrapView,
     key: KeyEvent,
 ) -> InputOutcome {
+    let model_picker_open = state
+        .client
+        .provider_picker
+        .as_ref()
+        .and_then(|p| p.model_picker.as_ref())
+        .is_some();
+    if model_picker_open {
+        return handle_provider_model_picker_key(state, bootstrap, key);
+    }
     let showing_details = state
         .client
         .provider_picker
@@ -909,6 +918,10 @@ fn handle_provider_picker_key(
                 };
             }
         }
+        Some(ControlAction::Toggle) if showing_details && !api_key_input => {
+            return toggle_provider_filter(state, bootstrap);
+        }
+        Some(ControlAction::Open) if showing_details => state.open_provider_model_picker(),
         Some(ControlAction::Toggle) => return toggle_provider(state, bootstrap),
         Some(ControlAction::Focus) => {
             state.focus_provider_api_key();
@@ -930,6 +943,83 @@ fn handle_provider_picker_key(
     InputOutcome::default()
 }
 
+fn handle_provider_model_picker_key(
+    state: &mut TuiState,
+    bootstrap: &BootstrapView,
+    key: KeyEvent,
+) -> InputOutcome {
+    match controls::resolve(ControlContext::ProviderModelPicker, key) {
+        Some(ControlAction::Close) => state.close_provider_model_picker(),
+        Some(ControlAction::Previous) => state.provider_model_picker_move(-1),
+        Some(ControlAction::Next) => state.provider_model_picker_move(1),
+        Some(ControlAction::Toggle) => state.provider_model_picker_toggle(),
+        Some(ControlAction::Select) => {
+            let Some(provider) = selected_provider(state, bootstrap).cloned() else {
+                return InputOutcome::default();
+            };
+            let Some(picker) = state
+                .client
+                .provider_picker
+                .as_ref()
+                .and_then(|p| p.model_picker.as_ref())
+            else {
+                return InputOutcome::default();
+            };
+            let selected_model_ids = picker.checked.iter().cloned().collect();
+            state.close_provider_model_picker();
+            return InputOutcome {
+                commands: vec![CommandIntent::new(Command::SetProviderModelFilter {
+                    provider_id: provider.id,
+                    enabled: true,
+                    selected_model_ids,
+                })],
+                ..InputOutcome::default()
+            };
+        }
+        Some(ControlAction::Backspace) => {
+            if let Some(picker) = state
+                .client
+                .provider_picker
+                .as_mut()
+                .and_then(|p| p.model_picker.as_mut())
+            {
+                picker.filter.pop();
+                picker.selected = 0;
+            }
+        }
+        None => {
+            if let KeyCode::Char(c) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && let Some(picker) = state
+                    .client
+                    .provider_picker
+                    .as_mut()
+                    .and_then(|p| p.model_picker.as_mut())
+            {
+                picker.filter.push(c);
+                picker.selected = 0;
+            }
+        }
+        _ => {}
+    }
+    InputOutcome::default()
+}
+
+fn toggle_provider_filter(state: &mut TuiState, bootstrap: &BootstrapView) -> InputOutcome {
+    let Some(provider) = selected_provider(state, bootstrap).cloned() else {
+        return InputOutcome::default();
+    };
+    InputOutcome {
+        commands: vec![CommandIntent::new(Command::SetProviderModelFilter {
+            provider_id: provider.id,
+            enabled: !provider.model_filter_enabled,
+            selected_model_ids: provider.selected_model_ids,
+        })],
+        ..InputOutcome::default()
+    }
+}
 fn selected_provider<'a>(
     state: &TuiState,
     bootstrap: &'a BootstrapView,

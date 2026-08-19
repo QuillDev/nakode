@@ -89,20 +89,18 @@ pub fn bootstrap(
         models: state
             .models
             .iter()
-            .map(|model| {
-                let qualified = model.qualified_id();
-                let options = state.model_options_for_qualified(&qualified);
-                ModelView {
-                    id: ModelId::from(qualified),
-                    provider_id: ProviderId::from(model.provider.clone()),
-                    model_slug: model.id.clone(),
-                    display_name: model.display_name(),
-                    is_default: model.is_default,
-                    reasoning_effort: options.reasoning_effort,
-                    fast_mode: options.fast_mode,
-                    configuration: model_configuration(model, state.vision_config.is_enabled()),
-                }
+            .filter(|model| {
+                providers
+                    .iter()
+                    .find(|p| p.provider == model.provider)
+                    .is_none_or(|p| {
+                        !p.model_filter_enabled
+                            || p.selected_model_ids
+                                .iter()
+                                .any(|id| id == &model.qualified_id())
+                    })
             })
+            .map(|model| model_view(state, model))
             .collect(),
         agents: state
             .agents
@@ -1063,6 +1061,21 @@ fn notice_views(state: &DomainState, revision: u64) -> Vec<NoticeView> {
         .collect()
 }
 
+fn model_view(state: &DomainState, model: &ModelInfo) -> ModelView {
+    let qualified = model.qualified_id();
+    let options = state.model_options_for_qualified(&qualified);
+    ModelView {
+        id: ModelId::from(qualified),
+        provider_id: ProviderId::from(model.provider.clone()),
+        model_slug: model.id.clone(),
+        display_name: model.display_name(),
+        is_default: model.is_default,
+        reasoning_effort: options.reasoning_effort,
+        fast_mode: options.fast_mode,
+        configuration: model_configuration(model, state.vision_config.is_enabled()),
+    }
+}
+
 fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView {
     let connection = state.provider_connection(&provider.provider).map_or_else(
         || {
@@ -1101,6 +1114,19 @@ fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView
             .provider_capabilities(&provider.provider)
             .map_or_else(ProviderCapabilities::default, capabilities_view),
         authentication,
+        model_filter_enabled: provider.model_filter_enabled,
+        selected_model_ids: provider
+            .selected_model_ids
+            .iter()
+            .cloned()
+            .map(ModelId::from)
+            .collect(),
+        model_candidates: state
+            .models
+            .iter()
+            .filter(|model| model.provider == provider.provider)
+            .map(|model| model_view(state, model))
+            .collect(),
     }
 }
 
@@ -1750,7 +1776,7 @@ mod tests {
             CapabilitySupport, ModelInfo, PromptImage,
         },
         domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
-        session::{SubagentObservability, SubagentRecord},
+        session::{ProviderRecord, SubagentObservability, SubagentRecord},
         state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
     };
 
@@ -1819,6 +1845,58 @@ mod tests {
         assert_eq!(
             model_configuration(&model("other-provider", "model"), false),
             nakode_protocol::ModelConfigurationView::default()
+        );
+    }
+
+    #[test]
+    fn provider_filters_only_the_ordinary_catalogue_and_preserves_candidates_and_stale_ids() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        state.models = vec![
+            model(CODEX_PROVIDER, "visible"),
+            model(CODEX_PROVIDER, "hidden"),
+            model(CLAUDE_PROVIDER, "all-models"),
+        ];
+        let providers = vec![
+            ProviderRecord {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                enabled: true,
+                credential: None,
+                model_filter_enabled: true,
+                selected_model_ids: vec![
+                    format!("{CODEX_PROVIDER}/visible"),
+                    format!("{CODEX_PROVIDER}/stale"),
+                ],
+            },
+            ProviderRecord {
+                provider: CLAUDE_PROVIDER.to_owned(),
+                display_name: "Claude".to_owned(),
+                enabled: true,
+                credential: None,
+                model_filter_enabled: false,
+                selected_model_ids: Vec::new(),
+            },
+        ];
+
+        let view = bootstrap(&state, 1, &providers, &[]);
+        assert_eq!(
+            view.models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["openai-codex/visible", "claude-agent/all-models"]
+        );
+        let codex = view
+            .providers
+            .iter()
+            .find(|provider| provider.id.as_str() == CODEX_PROVIDER)
+            .expect("Codex provider");
+        assert_eq!(codex.model_candidates.len(), 2);
+        assert!(
+            codex
+                .selected_model_ids
+                .iter()
+                .any(|id| id.as_str() == "openai-codex/stale")
         );
     }
 

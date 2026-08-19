@@ -78,6 +78,7 @@ mod tests {
             "SubmitExternalToolResult",
             "RunShell",
             "SelectModel",
+            "SetProviderModelFilter",
             "SetProviderEnabled",
             "BeginProviderAuthentication",
             "SetProviderCredential",

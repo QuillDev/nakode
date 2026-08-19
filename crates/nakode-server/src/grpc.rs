@@ -1164,6 +1164,20 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
     command_rpc!(
+        set_provider_model_filter,
+        api::SetProviderModelFilterRequest,
+        input,
+        protocol::Command::SetProviderModelFilter {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            enabled: input.enabled,
+            selected_model_ids: input
+                .selected_model_ids
+                .into_iter()
+                .map(protocol::ModelId::from)
+                .collect()
+        }
+    );
+    command_rpc!(
         begin_provider_authentication,
         api::BeginProviderAuthenticationRequest,
         input,
@@ -1820,6 +1834,13 @@ fn provider(value: protocol::ProviderView) -> api::Provider {
         connection: Some(connection(value.connection)),
         capabilities: Some(capabilities(value.capabilities)),
         authentication: value.authentication.map(authentication),
+        model_filter_enabled: value.model_filter_enabled,
+        selected_model_ids: value
+            .selected_model_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+        model_candidates: value.model_candidates.into_iter().map(model).collect(),
     }
 }
 

@@ -408,6 +408,11 @@ pub enum Command {
         provider_id: ProviderId,
         enabled: bool,
     },
+    SetProviderModelFilter {
+        provider_id: ProviderId,
+        enabled: bool,
+        selected_model_ids: Vec<ModelId>,
+    },
     BeginProviderAuthentication {
         provider_id: ProviderId,
     },

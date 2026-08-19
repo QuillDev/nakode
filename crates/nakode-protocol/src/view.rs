@@ -108,6 +108,13 @@ pub struct ProviderView {
     pub connection: ConnectionView,
     pub capabilities: ProviderCapabilities,
     pub authentication: Option<ProviderAuthenticationView>,
+    #[serde(default)]
+    pub model_filter_enabled: bool,
+    #[serde(default)]
+    pub selected_model_ids: Vec<ModelId>,
+    /// Full discovered catalogue used by settings; BootstrapView.models may be filtered.
+    #[serde(default)]
+    pub model_candidates: Vec<ModelView>,
 }
 
 /// Product surface that owns the user-facing projection of one logical session.

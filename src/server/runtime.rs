@@ -737,6 +737,9 @@ impl NativeServerRuntime {
             });
         let mut effects = std::mem::take(&mut outcome.effects);
         let had_effects = !effects.is_empty();
+        let updates_provider_model_filter = effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SetProviderModelFilter { .. }));
         let session_id = outcome
             .effect_session
             .clone()
@@ -768,6 +771,9 @@ impl NativeServerRuntime {
         self.register_effect_owners(&session_id, &effects);
         self.execute_effects(&session_id, effects, EffectOrigin::ClientCommand)
             .await;
+        if updates_provider_model_filter {
+            self.synchronize_shared_providers().await;
+        }
         self.refresh_mcp_servers();
         if had_effects {
             self.refresh_catalogs();
@@ -2081,6 +2087,17 @@ impl EffectExecutor {
             }
             #[cfg(test)]
             Effect::ListSessions | Effect::ListProviders | Effect::OpenUrl(_) | Effect::Quit => {}
+            Effect::SetProviderModelFilter {
+                provider,
+                enabled,
+                selected_model_ids,
+            } => {
+                if let Err(error) =
+                    sessions.set_provider_model_filter(&provider, enabled, &selected_model_ids)
+                {
+                    state.session_store_failed(error.to_string());
+                }
+            }
             Effect::SetProviderEnabled { provider, enabled } => {
                 self.set_provider_enabled(state, &provider, enabled).await;
             }
@@ -3123,6 +3140,8 @@ mod tests {
                 kind: "api-key".to_owned(),
                 updated_at: 1,
             }),
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }
     }
 

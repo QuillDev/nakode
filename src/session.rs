@@ -151,6 +151,8 @@ pub struct ProviderRecord {
     pub display_name: String,
     pub enabled: bool,
     pub credential: Option<CredentialMetadata>,
+    pub model_filter_enabled: bool,
+    pub selected_model_ids: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -485,6 +487,16 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when persistence cannot be updated.
     fn set_provider_enabled(&self, provider: &str, enabled: bool) -> Result<(), SessionError>;
+    /// Updates one provider's discoverability filter without changing model authorization.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
+    fn set_provider_model_filter(
+        &self,
+        provider: &str,
+        enabled: bool,
+        selected_model_ids: &[String],
+    ) -> Result<(), SessionError>;
     /// Saves the current durable projection of a sub-agent run and its transcript.
     ///
     /// # Errors
@@ -687,6 +699,11 @@ impl SqliteSessionRepository {
                display_name TEXT NOT NULL,
                enabled INTEGER NOT NULL,
                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS provider_model_filters (
+               provider TEXT PRIMARY KEY REFERENCES providers(provider) ON DELETE CASCADE,
+               enabled INTEGER NOT NULL DEFAULT 0,
+               selected_model_ids TEXT NOT NULL DEFAULT '[]'
              );
              CREATE TABLE IF NOT EXISTS provider_credentials (
                provider TEXT PRIMARY KEY REFERENCES providers(provider) ON DELETE CASCADE,
@@ -2365,15 +2382,19 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT p.provider, p.display_name, p.enabled,
-                    c.credential_kind, c.updated_at
+                    c.credential_kind, c.updated_at,
+                    COALESCE(f.enabled, 0), COALESCE(f.selected_model_ids, '[]')
              FROM providers p
              LEFT JOIN provider_credentials c ON c.provider = p.provider
+             LEFT JOIN provider_model_filters f ON f.provider = p.provider
              ORDER BY p.display_name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
             let provider = row.get::<_, String>(0)?;
             let credential_kind = row.get::<_, Option<String>>(3)?;
             let credential_updated_at = row.get::<_, Option<i64>>(4)?;
+            let selected_model_ids =
+                serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default();
             Ok(ProviderRecord {
                 provider: provider.clone(),
                 display_name: row.get(1)?,
@@ -2385,6 +2406,8 @@ impl SessionRepository for SqliteSessionRepository {
                         kind,
                         updated_at,
                     }),
+                model_filter_enabled: row.get::<_, i64>(5)? != 0,
+                selected_model_ids,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2398,6 +2421,28 @@ impl SessionRepository for SqliteSessionRepository {
         let updated = connection.execute(
             "UPDATE providers SET enabled = ?1, updated_at = ?2 WHERE provider = ?3",
             params![i64::from(enabled), unix_timestamp(), provider],
+        )?;
+        if updated == 0 {
+            return Err(SessionError::ProviderNotFound(provider.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn set_provider_model_filter(
+        &self,
+        provider: &str,
+        enabled: bool,
+        selected_model_ids: &[String],
+    ) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let updated = connection.execute(
+            "INSERT INTO provider_model_filters (provider, enabled, selected_model_ids)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(provider) DO UPDATE SET enabled = excluded.enabled, selected_model_ids = excluded.selected_model_ids",
+            params![provider, i64::from(enabled), serde_json::to_string(selected_model_ids).expect("model ids serialize")],
         )?;
         if updated == 0 {
             return Err(SessionError::ProviderNotFound(provider.to_owned()));
@@ -3584,6 +3629,46 @@ mod tests {
             .find(|provider| provider.provider == DEVIN_PROVIDER)
             .expect("Devin provider");
         assert!(!devin.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn persists_independent_provider_model_filters() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("providers.db"))?;
+        let codex = store
+            .list_providers()?
+            .into_iter()
+            .find(|provider| provider.provider == CODEX_PROVIDER)
+            .expect("Codex provider");
+        assert!(!codex.model_filter_enabled);
+        assert!(codex.selected_model_ids.is_empty());
+
+        store.set_provider_model_filter(
+            CODEX_PROVIDER,
+            true,
+            &[
+                "openai-codex/stale-model".to_owned(),
+                "openai-codex/model-a".to_owned(),
+            ],
+        )?;
+        store.set_provider_model_filter(DEVIN_PROVIDER, true, &[])?;
+        let providers = store.list_providers()?;
+        let codex = providers
+            .iter()
+            .find(|provider| provider.provider == CODEX_PROVIDER)
+            .expect("Codex provider");
+        assert!(codex.model_filter_enabled);
+        assert_eq!(
+            codex.selected_model_ids,
+            ["openai-codex/stale-model", "openai-codex/model-a"]
+        );
+        let devin = providers
+            .iter()
+            .find(|provider| provider.provider == DEVIN_PROVIDER)
+            .expect("Devin provider");
+        assert!(devin.model_filter_enabled);
+        assert!(devin.selected_model_ids.is_empty());
         Ok(())
     }
 

@@ -67,6 +67,7 @@ service NakodeService {
 
   rpc SelectModel(SelectModelRequest) returns (MutationResult);
   rpc SetProviderEnabled(SetProviderEnabledRequest) returns (MutationResult);
+  rpc SetProviderModelFilter(SetProviderModelFilterRequest) returns (MutationResult);
   rpc BeginProviderAuthentication(BeginProviderAuthenticationRequest) returns (MutationResult);
   rpc SetProviderCredential(SetProviderCredentialRequest) returns (MutationResult);
   rpc ClearProviderCredential(ClearProviderCredentialRequest) returns (MutationResult);
@@ -473,6 +474,7 @@ message ModelTarget {
 }
 message SelectModelRequest { MutationOptions mutation = 1; ModelTarget target = 2; string model_id = 3; ModelOptions options = 4; }
 message SetProviderEnabledRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; }
+message SetProviderModelFilterRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; repeated string selected_model_ids = 4; }
 message BeginProviderAuthenticationRequest { MutationOptions mutation = 1; string provider_id = 2; }
 message SetProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; string kind = 3; string credential = 4; }
 message ClearProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; }
@@ -612,7 +614,7 @@ enum ProviderCapability {
 enum ConnectionState { CONNECTION_STATE_UNSPECIFIED = 0; CONNECTION_STATE_DISABLED = 1; CONNECTION_STATE_STARTING = 2; CONNECTION_STATE_READY = 3; CONNECTION_STATE_FAILED = 4; CONNECTION_STATE_DISCONNECTED = 5; }
 message Connection { ConnectionState state = 1; optional string message = 2; }
 message ProviderAuthentication { enum Kind { KIND_UNSPECIFIED = 0; KIND_STARTING = 1; KIND_API_KEY_REQUIRED = 2; KIND_CHALLENGE = 3; } Kind kind = 1; optional string dashboard_url = 2; optional string credential_kind = 3; optional string verification_url = 4; optional string user_code = 5; }
-message Provider { string id = 1; string display_name = 2; bool enabled = 3; bool credential_configured = 4; optional string credential_kind = 5; Connection connection = 6; ProviderCapabilities capabilities = 7; optional ProviderAuthentication authentication = 8; }
+message Provider { string id = 1; string display_name = 2; bool enabled = 3; bool credential_configured = 4; optional string credential_kind = 5; Connection connection = 6; ProviderCapabilities capabilities = 7; optional ProviderAuthentication authentication = 8; bool model_filter_enabled = 9; repeated string selected_model_ids = 10; repeated Model model_candidates = 11; }
 message ModelConfiguration { repeated string reasoning_efforts = 1; bool fast_mode_configurable = 2; bool vision_eligible = 3; bool accepts_image_input = 4; }
 message Model { string id = 1; string provider_id = 2; string model_slug = 3; string display_name = 4; bool is_default = 5; optional string reasoning_effort = 6; bool fast_mode = 7; ModelConfiguration configuration = 8; }
 message AgentDefinition {

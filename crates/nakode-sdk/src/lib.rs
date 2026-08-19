@@ -781,6 +781,10 @@ impl NakodeClient {
     typed_mutation!(compact_context, api::CompactContextRequest);
     typed_mutation!(run_shell, api::RunShellRequest);
     typed_mutation!(select_model, api::SelectModelRequest);
+    typed_mutation!(
+        set_provider_model_filter,
+        api::SetProviderModelFilterRequest
+    );
     typed_mutation!(set_provider_enabled, api::SetProviderEnabledRequest);
     typed_mutation!(
         begin_provider_authentication,

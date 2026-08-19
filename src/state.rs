@@ -867,6 +867,11 @@ pub enum Effect {
     ListSessions,
     #[cfg(test)]
     ListProviders,
+    SetProviderModelFilter {
+        provider: String,
+        enabled: bool,
+        selected_model_ids: Vec<String>,
+    },
     SetProviderEnabled {
         provider: String,
         enabled: bool,
@@ -13391,6 +13396,8 @@ model = "claude-agent/sonnet"
                 kind: "chatgpt_device_code".to_owned(),
                 updated_at: 1,
             }),
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
 
         state.open_provider_details();
@@ -13425,6 +13432,8 @@ model = "claude-agent/sonnet"
             display_name: "Cursor".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
         state.open_provider_details();
 
@@ -13454,6 +13463,8 @@ model = "claude-agent/sonnet"
             display_name: "Kimi For Coding".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
         state.open_provider_details();
 
@@ -13480,6 +13491,8 @@ model = "claude-agent/sonnet"
             display_name: "GLM Coding Plan (z.ai)".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
         state.open_provider_details();
 
@@ -13506,6 +13519,8 @@ model = "claude-agent/sonnet"
             display_name: "Cursor".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
         state.open_provider_details();
         let _ = state.toggle_provider();
@@ -13531,6 +13546,8 @@ model = "claude-agent/sonnet"
             display_name: "Codex".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
         state.open_provider_details();
 

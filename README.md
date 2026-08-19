@@ -105,7 +105,10 @@ Nakode currently supports:
 
 Providers are disabled on a fresh installation. Start Nakode, open
 `/providers`, and sign in to the providers you want to use. Press `F2` to browse
-and select from their available models.
+and select from their available models. Provider details can independently enable a model filter and
+select exact provider/model IDs from a searchable, scrollable catalogue. Filtering defaults off.
+When enabled it changes ordinary model discovery only: exact persisted or explicitly requested IDs
+remain addressable, and stale selected IDs remain visible rather than being substituted.
 
 Nakode does not require the separate Codex, Devin, Kimi, or z.ai applications. Claude
 uses the official Claude Agent SDK and the login managed by an installed Claude Code

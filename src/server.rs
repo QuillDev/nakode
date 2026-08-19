@@ -684,6 +684,11 @@ impl ServerCore {
                 session_id,
                 command,
             } => self.run_shell_command(&session_id, command),
+            Command::SetProviderModelFilter {
+                provider_id,
+                enabled,
+                selected_model_ids,
+            } => self.set_provider_model_filter_command(&provider_id, enabled, selected_model_ids),
             Command::SetProviderEnabled {
                 provider_id,
                 enabled,
@@ -2047,6 +2052,38 @@ impl ServerCore {
         self.mcp_server(server_id).map(|_| ())
     }
 
+    fn set_provider_model_filter_command(
+        &self,
+        provider_id: &ProviderId,
+        enabled: bool,
+        selected_model_ids: Vec<nakode_protocol::ModelId>,
+    ) -> DomainCommandOutcome {
+        self.ensure_provider(provider_id)?;
+        let prefix = format!("{provider_id}/");
+        let mut selected_model_ids = selected_model_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        if let Some(id) = selected_model_ids
+            .iter()
+            .find(|id| !id.starts_with(&prefix) || id.len() == prefix.len())
+        {
+            return Err(DomainCommandError::Invalid(format!(
+                "model filter entry {id:?} must be an exact {provider_id}/model ID"
+            )));
+        }
+        selected_model_ids.sort();
+        selected_model_ids.dedup();
+        Ok(Self::accepted(
+            Some(provider_id.to_string()),
+            vec![Effect::SetProviderModelFilter {
+                provider: provider_id.to_string(),
+                enabled,
+                selected_model_ids,
+            }],
+        ))
+    }
+
     fn set_provider_enabled_command(
         &self,
         provider_id: &ProviderId,
@@ -3273,6 +3310,7 @@ impl ServerCore {
             Command::CreateSession { .. }
             | Command::SetWorkspaceBridgeLifecycle { .. }
             | Command::SelectModel { .. }
+            | Command::SetProviderModelFilter { .. }
             | Command::SetProviderEnabled { .. }
             | Command::BeginProviderAuthentication { .. }
             | Command::SetProviderCredential { .. }
@@ -5403,6 +5441,8 @@ mod tests {
             display_name: "Codex".to_owned(),
             enabled: true,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         };
         let mut core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
 
@@ -5437,6 +5477,8 @@ mod tests {
             display_name: "Codex".to_owned(),
             enabled: true,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         };
         let core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
 
@@ -5458,6 +5500,8 @@ mod tests {
             display_name: "Codex".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         };
         let core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
 

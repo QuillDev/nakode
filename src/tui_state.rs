@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use nakode_protocol::{
     AgentBrowserView, AgentDefinitionInput, AgentDefinitionView, ArtifactView, BootstrapView,
@@ -525,6 +525,15 @@ pub struct ProviderPicker {
     pub loading: bool,
     pub showing_details: bool,
     pub authentication: Option<ProviderAuthentication>,
+    pub model_picker: Option<ProviderModelPicker>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderModelPicker {
+    pub candidates: Vec<ModelView>,
+    pub filter: String,
+    pub selected: usize,
+    pub checked: HashSet<ModelId>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1438,6 +1447,26 @@ impl TuiState {
                 .unwrap_or_default()
                 .min(picker.providers.len().saturating_sub(1));
             picker.loading = false;
+            if let Some(model_picker) = &mut picker.model_picker {
+                let selected_id = model_picker
+                    .candidates
+                    .get(model_picker.selected)
+                    .map(|model| model.id.clone());
+                model_picker.candidates = picker
+                    .providers
+                    .get(picker.selected)
+                    .map(|provider| provider.model_candidates.clone())
+                    .unwrap_or_default();
+                model_picker.selected = selected_id
+                    .and_then(|id| {
+                        model_picker
+                            .candidates
+                            .iter()
+                            .position(|model| model.id == id)
+                    })
+                    .unwrap_or_default()
+                    .min(model_picker.candidates.len().saturating_sub(1));
+            }
             if !matches!(
                 picker.authentication,
                 Some(ProviderAuthentication::ApiKeyInput {
@@ -1956,6 +1985,7 @@ impl TuiState {
                 .first()
                 .and_then(|provider| provider.authentication.as_ref())
                 .map(frontend_picker_authentication),
+            model_picker: None,
         });
     }
 
@@ -1972,6 +2002,93 @@ impl TuiState {
             .get(picker.selected)
             .and_then(|provider| provider.authentication.as_ref())
             .map(frontend_picker_authentication);
+    }
+
+    pub fn open_provider_model_picker(&mut self) {
+        let Some(picker) = &mut self.client.provider_picker else {
+            return;
+        };
+        let Some(provider) = picker.providers.get(picker.selected) else {
+            return;
+        };
+        picker.model_picker = Some(ProviderModelPicker {
+            candidates: provider.model_candidates.clone(),
+            filter: String::new(),
+            selected: 0,
+            checked: provider.selected_model_ids.iter().cloned().collect(),
+        });
+    }
+
+    pub fn provider_model_picker_move(&mut self, delta: isize) {
+        let Some(model_picker) = self
+            .client
+            .provider_picker
+            .as_mut()
+            .and_then(|p| p.model_picker.as_mut())
+        else {
+            return;
+        };
+        let filter = model_picker.filter.to_ascii_lowercase();
+        let count = model_picker
+            .candidates
+            .iter()
+            .filter(|m| {
+                m.id.to_string().to_ascii_lowercase().contains(&filter)
+                    || m.display_name.to_ascii_lowercase().contains(&filter)
+            })
+            .count();
+        if count > 0 {
+            model_picker.selected = offset_index(model_picker.selected, count, delta);
+        }
+    }
+
+    #[must_use]
+    pub fn provider_model_picker_candidates(&self) -> Vec<&ModelView> {
+        let Some(picker) = self
+            .client
+            .provider_picker
+            .as_ref()
+            .and_then(|p| p.model_picker.as_ref())
+        else {
+            return Vec::new();
+        };
+        let filter = picker.filter.to_ascii_lowercase();
+        picker
+            .candidates
+            .iter()
+            .filter(|m| {
+                filter.is_empty()
+                    || m.id.to_string().to_ascii_lowercase().contains(&filter)
+                    || m.display_name.to_ascii_lowercase().contains(&filter)
+            })
+            .collect()
+    }
+
+    pub fn provider_model_picker_toggle(&mut self) {
+        let candidates = self
+            .provider_model_picker_candidates()
+            .into_iter()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>();
+        let Some(picker) = self
+            .client
+            .provider_picker
+            .as_mut()
+            .and_then(|p| p.model_picker.as_mut())
+        else {
+            return;
+        };
+        if let Some(id) = candidates.get(picker.selected)
+            && !picker.checked.insert(id.clone())
+        {
+            picker.checked.remove(id);
+        }
+    }
+
+    pub fn close_provider_model_picker(&mut self) {
+        if let Some(picker) = &mut self.client.provider_picker {
+            picker.model_picker = None;
+        }
     }
 
     pub fn open_provider_details(&mut self) {
