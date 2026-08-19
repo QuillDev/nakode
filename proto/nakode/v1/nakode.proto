@@ -49,6 +49,9 @@ service NakodeService {
   rpc DeleteSession(DeleteSessionRequest) returns (MutationResult);
   rpc GetSession(GetSessionRequest) returns (SessionSnapshot);
   rpc WatchSession(WatchSessionRequest) returns (stream SessionSnapshot);
+  // Appends one owner prompt and evaluates start-versus-queue against authoritative state when the
+  // command executes. expected_revision does not fence this operation; idempotency_key distinguishes
+  // deliberate repeated sends from a retry of one logical send.
   rpc SendPrompt(SendPromptRequest) returns (MutationResult);
   rpc EnqueuePrompt(EnqueuePromptRequest) returns (MutationResult);
   rpc RemoveQueuedPrompt(RemoveQueuedPromptRequest) returns (MutationResult);
@@ -94,6 +97,8 @@ service NakodeService {
 message MutationOptions {
   // SDK-generated and stable across a retry of one logical operation.
   string idempotency_key = 1;
+  // For revision-fenced commands, a mismatch rejects the mutation. SendPrompt is append-only owner
+  // intent and ignores this field so incidental turn progress cannot reject a safe queue append.
   // When omitted, the command is evaluated against authoritative state current at execution time.
   optional uint64 expected_revision = 2;
 }

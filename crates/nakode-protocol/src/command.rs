@@ -334,6 +334,10 @@ pub enum Command {
         consume_as_busy: bool,
     },
     /// Sends a prompt using server-owned queue-versus-start policy.
+    ///
+    /// This append-only owner intent is evaluated against authoritative lifecycle state at execution
+    /// time. A transport-provided expected revision does not fence it; its idempotency key provides
+    /// exactly-once retry semantics instead.
     SendPrompt {
         session_id: SessionId,
         prompt: PromptInput,

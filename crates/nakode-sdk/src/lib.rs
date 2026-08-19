@@ -457,6 +457,11 @@ impl NakodeClient {
 
     /// Sends work using the server-owned start-versus-queue policy.
     ///
+    /// `SendPrompt` is append-only owner intent. The server evaluates session lifecycle at execution
+    /// time and does not use `expected_revision` as a fence; the argument remains for source and wire
+    /// compatibility with clients that already supplied an observed revision. The SDK-generated
+    /// idempotency key is stable across automatic transport retries of this invocation.
+    ///
     /// # Errors
     /// Returns a transport or server status error.
     pub async fn send_prompt(

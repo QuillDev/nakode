@@ -442,19 +442,24 @@ impl ServerCore {
             .as_ref()
             .and_then(|session_id| self.engine_for(session_id))
             .map_or_else(|| self.engine().revision(), ServiceEngine::revision);
-        let (mut result, effects) =
-            if expected_revision.is_some_and(|revision| revision != command_revision) {
-                (
-                    Err(service_error(
-                        ErrorCode::Conflict,
-                        "the expected revision is stale",
-                        true,
-                    )),
-                    Vec::new(),
-                )
-            } else {
-                self.execute_command(command)
-            };
+        // Prompt submission is append-only owner intent. Its idempotency key, not a snapshot fence,
+        // distinguishes a retry from another deliberate send; lifecycle and queue placement are
+        // therefore evaluated against authoritative state when this command executes.
+        let revision_fenced = !matches!(&command, Command::SendPrompt { .. });
+        let (mut result, effects) = if revision_fenced
+            && expected_revision.is_some_and(|revision| revision != command_revision)
+        {
+            (
+                Err(service_error(
+                    ErrorCode::Conflict,
+                    "the expected revision is stale",
+                    true,
+                )),
+                Vec::new(),
+            )
+        } else {
+            self.execute_command(command)
+        };
         let effect_session = effect_session.or_else(|| {
             result
                 .as_ref()
@@ -5366,6 +5371,291 @@ mod tests {
                 .selected_model,
             None
         );
+    }
+
+    fn assert_queued_turn_starts(
+        core: &mut ServerCore,
+        session_id: &SessionId,
+        completed_turn: &str,
+        next_turn: &str,
+        expected_prompt: &str,
+        expected_id: &str,
+    ) {
+        let effects = core
+            .engine_for_mut(session_id)
+            .expect("session engine")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnCompleted {
+                    turn_id: completed_turn.to_owned(),
+                    outcome: crate::backend::TurnOutcome::Completed,
+                    error: None,
+                },
+            );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    crate::state::Effect::Backend(BackendCommand::StartTurn { .. })
+                ))
+                .count(),
+            1,
+            "each terminal turn starts exactly one successor"
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::StartTurn { client_id, prompt, .. })
+                if client_id == expected_id && prompt.starts_with(expected_prompt)
+        )));
+        core.engine_for_mut(session_id)
+            .expect("session engine")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnAccepted {
+                    turn_id: next_turn.to_owned(),
+                },
+            );
+    }
+
+    fn busy_server_with_stale_revision(turn_id: &str) -> (ServerCore, SessionId, u64) {
+        let (mut core, session_id) = ready_codex_server();
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnStarted {
+                    turn_id: turn_id.to_owned(),
+                },
+            );
+        let observed_revision = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .note_state_change();
+        (core, session_id, observed_revision)
+    }
+
+    #[test]
+    fn stale_prompt_send_queues_once_in_command_order() {
+        let (mut core, session_id, observed_revision) =
+            busy_server_with_stale_revision("active-turn");
+
+        let repeated = Command::SendPrompt {
+            session_id: session_id.clone(),
+            prompt: PromptInput {
+                text: "repeat me".to_owned(),
+                attachments: Vec::new(),
+            },
+        };
+        let first_key = IdempotencyKey::from("window-a-repeat");
+        let (first, effects, _, changed) = core.execute_idempotent(
+            first_key.clone(),
+            Some(observed_revision),
+            false,
+            repeated.clone(),
+        );
+        first.expect("stale prompt append is accepted");
+        assert!(
+            effects.is_empty(),
+            "a busy send queues without interrupting"
+        );
+        assert!(changed);
+
+        let (retry, retry_effects, retry_session, retry_changed) =
+            core.execute_idempotent(first_key, Some(observed_revision), false, repeated.clone());
+        retry.expect("an ambiguous transport retry replays acceptance");
+        assert!(retry_effects.is_empty());
+        assert_eq!(retry_session, None);
+        assert!(!retry_changed, "a replay must not append a second copy");
+
+        core.execute_idempotent(
+            IdempotencyKey::from("window-b-repeat"),
+            Some(observed_revision),
+            false,
+            repeated,
+        )
+        .0
+        .expect("a distinct concurrent send remains distinct");
+        core.execute_idempotent(
+            IdempotencyKey::from("window-c-next"),
+            Some(observed_revision),
+            false,
+            Command::SendPrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "after repeats".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        )
+        .0
+        .expect("later concurrent send is accepted");
+
+        let queued = &core.session_view(&session_id).expect("session view").queue;
+        assert_eq!(
+            queued
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            ["repeat me", "repeat me", "after repeats"],
+            "distinct sends preserve duplicates and serialized arrival order"
+        );
+        let queued_ids = queued
+            .iter()
+            .map(|prompt| prompt.id.clone())
+            .collect::<Vec<_>>();
+
+        for (completed_turn, next_turn, expected_prompt, expected_id) in [
+            ("active-turn", "queued-turn-1", "repeat me", &queued_ids[0]),
+            (
+                "queued-turn-1",
+                "queued-turn-2",
+                "repeat me",
+                &queued_ids[1],
+            ),
+            (
+                "queued-turn-2",
+                "queued-turn-3",
+                "after repeats",
+                &queued_ids[2],
+            ),
+        ] {
+            assert_queued_turn_starts(
+                &mut core,
+                &session_id,
+                completed_turn,
+                next_turn,
+                expected_prompt,
+                expected_id.as_str(),
+            );
+        }
+        assert!(
+            core.session_view(&session_id)
+                .expect("session view")
+                .queue
+                .is_empty(),
+            "every accepted follow-up leaves the authoritative queue exactly once"
+        );
+    }
+
+    #[test]
+    fn stale_prompt_send_does_not_weaken_other_revision_fences() {
+        let (mut core, session_id) = ready_codex_server();
+        let observed_revision = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .note_state_change();
+
+        let (result, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("stale-unsafe-mutation"),
+            Some(observed_revision),
+            false,
+            shell_command(&session_id, "pwd"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code == ErrorCode::Conflict
+                    && error.message == "the expected revision is stale"
+        ));
+        assert!(effects.is_empty());
+        assert!(!changed);
+    }
+
+    #[test]
+    fn stale_prompt_send_uses_authoritative_state_when_the_active_turn_becomes_terminal() {
+        let (mut core, session_id) = ready_codex_server();
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnStarted {
+                    turn_id: "terminal-race-turn".to_owned(),
+                },
+            );
+        let observed_revision = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnCompleted {
+                    turn_id: "terminal-race-turn".to_owned(),
+                    outcome: crate::backend::TurnOutcome::Interrupted,
+                    error: None,
+                },
+            );
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .note_state_change();
+
+        let (result, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("send-after-terminal-race"),
+            Some(observed_revision),
+            false,
+            Command::SendPrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "run against current state".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        result.expect("terminal progress does not stale owner intent");
+        assert!(changed);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::state::Effect::Backend(BackendCommand::StartTurn { prompt, .. })
+                    if prompt.starts_with("run against current state")
+            )),
+            "execution-time idle send did not start a turn: {effects:?}"
+        );
+        assert!(
+            core.session_view(&session_id)
+                .expect("session view")
+                .queue
+                .is_empty(),
+            "an idle-at-execution send starts instead of being stranded in the queue"
+        );
+    }
+
+    #[test]
+    fn stale_prompt_send_still_refuses_a_closed_session() {
+        let (mut core, _) = ready_codex_server();
+        let closed_session = SessionId::from("closed-session");
+
+        let (result, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("send-to-closed-session"),
+            Some(1),
+            false,
+            Command::SendPrompt {
+                session_id: closed_session,
+                prompt: PromptInput {
+                    text: "do not drop me".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        assert!(matches!(result, Err(error) if error.code == ErrorCode::NotFound));
+        assert!(effects.is_empty());
+        assert!(!changed);
     }
 
     #[test]
