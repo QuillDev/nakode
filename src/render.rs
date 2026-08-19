@@ -977,7 +977,7 @@ fn settings_memory_lines(settings: &SettingsState) -> Vec<Line<'static>> {
         lines.push(settings_row(
             "Data directory",
             if settings.memory.data_directory.is_empty() {
-                "Mnemosyne default"
+                "Nakode home"
             } else {
                 &settings.memory.data_directory
             },

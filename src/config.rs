@@ -457,7 +457,7 @@ impl Config {
     }
 }
 
-fn nakode_home() -> Result<PathBuf, ConfigError> {
+pub(crate) fn nakode_home() -> Result<PathBuf, ConfigError> {
     if let Some(home) = std::env::var_os("NAKODE_HOME") {
         return Ok(PathBuf::from(home));
     }

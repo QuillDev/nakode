@@ -373,9 +373,12 @@ uv tool install 'mnemosyne-memory[mcp]'
 
 Then open `/settings` → **Add-ons** → **Memory**, select **Mnemosyne**, confirm
 the executable, and choose the Mnemosyne bank used for global user memory.
-Semantic embeddings remain optional and can be installed with
-`mnemosyne-memory[mcp,embeddings]`. Nakode supervises local MCP processes and
-stores memories in Mnemosyne's SQLite data directory.
+By default Nakode stores Mnemosyne banks under Nakode home (`NAKODE_HOME`,
+defaulting to `~/.nakode`), instead of inheriting Mnemosyne's application-wide
+default directory. Set **Data directory** explicitly to override this location.
+Semantic embeddings remain optional and can be installed with `mnemosyne-memory[mcp,embeddings]`.
+Nakode supervises local MCP processes and stores memories in Mnemosyne's SQLite
+data directory.
 
 Nakode manages a deterministic project bank for each workspace; project-bank names
 are internal and are not user settings. Every `memory_store` call must explicitly

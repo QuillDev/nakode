@@ -118,6 +118,14 @@ pub fn project_bank(workspace: &Path) -> String {
     format!("nakode-{name}-{hash:016x}")
 }
 
+fn memory_data_directory(configured: &str) -> Option<std::path::PathBuf> {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return Some(configured.into());
+    }
+    crate::config::nakode_home().ok()
+}
+
 fn valid_bank_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().count() <= 64
@@ -304,8 +312,8 @@ impl McpProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        if !config.data_directory.trim().is_empty() {
-            command.env("MNEMOSYNE_DATA_DIR", config.data_directory.trim());
+        if let Some(data_directory) = memory_data_directory(&config.data_directory) {
+            command.env("MNEMOSYNE_DATA_DIR", data_directory);
         }
         let mut child = command.spawn().map_err(MemoryError::Spawn)?;
         let stdin = child
@@ -487,11 +495,33 @@ impl MemoryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryBackend, MemoryConfig, MemoryScope};
+    use super::{MemoryBackend, MemoryConfig, MemoryScope, memory_data_directory};
 
     #[test]
     fn disabled_memory_is_not_configured() {
         assert!(!MemoryConfig::default().configured());
+    }
+
+    #[test]
+    fn explicit_memory_data_directory_is_preserved() {
+        assert_eq!(
+            memory_data_directory(" /tmp/nakode-memory "),
+            Some(std::path::PathBuf::from("/tmp/nakode-memory"))
+        );
+    }
+
+    #[test]
+    fn default_memory_data_directory_is_under_nakode_home() {
+        let directory = memory_data_directory("").expect("home directory");
+        let configured_home = std::env::var_os("NAKODE_HOME").map(std::path::PathBuf::from);
+        if let Some(configured_home) = configured_home {
+            assert_eq!(directory, configured_home);
+        } else {
+            assert_eq!(
+                directory.file_name().and_then(|name| name.to_str()),
+                Some(".nakode")
+            );
+        }
     }
 
     #[cfg(unix)]
