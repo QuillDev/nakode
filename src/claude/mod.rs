@@ -287,14 +287,11 @@ async fn run_supervisor(
     mut commands: mpsc::Receiver<BackendCommand>,
     events: mpsc::Sender<BackendEvent>,
 ) {
-    let _ = events
-        .send(BackendEvent::Ready(BackendIdentity {
-            provider: CLAUDE_PROVIDER.to_owned(),
-            display_name: "Claude".to_owned(),
-            version: Some(SDK_VERSION.to_owned()),
-            capabilities: capabilities(),
-        }))
-        .await;
+    let mut attachment = None;
+    let mut session_options = None;
+    let mut recovery_ready_event = None;
+    let mut deferred_command = None;
+    let _ = events.send(BackendEvent::Ready(claude_identity())).await;
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -303,20 +300,129 @@ async fn run_supervisor(
                     if let Some(bridge) = bridge.as_mut() { let _ = send(bridge, json!({"method":"shutdown"})).await; }
                     break;
                 }
+                remember_session_state(&command, &mut attachment, &mut session_options);
+                if should_recover_bridge(authenticated, bridge.is_some(), &command) {
+                    match spawn_bridge(&config.workspace).await {
+                        Ok(restarted) => bridge = Some(restarted),
+                        Err(error) => {
+                            bridge_recovery_failed(&events, operation_for(&command), error).await;
+                            continue;
+                        }
+                    }
+                    if !is_attachment_command(&command) {
+                        recovery_ready_event = reattach_session(
+                            attachment.clone(),
+                            &config,
+                            authenticated,
+                            &mut bridge,
+                            &events,
+                        )
+                        .await;
+                        if recovery_ready_event.is_some() {
+                            deferred_command = Some(command);
+                            continue;
+                        }
+                    }
+                }
                 handle_command(command, &config, authenticated, bridge.as_mut(), &events).await;
             }
             message = async { bridge.as_mut().expect("guarded").messages.recv().await }, if bridge.is_some() => {
                 let Some(message) = message else {
                     let _ = events.send(BackendEvent::Disconnected { reason: "Claude SDK bridge exited".to_owned() }).await;
-                    bridge = None;
+                    if let Some(stopped) = bridge.take() {
+                        stopped.task.abort();
+                    }
+                    if authenticated {
+                        match spawn_bridge(&config.workspace).await {
+                            Ok(restarted) => {
+                                bridge = Some(restarted);
+                                recovery_ready_event = reattach_session(
+                                    attachment.clone(),
+                                    &config,
+                                    authenticated,
+                                    &mut bridge,
+                                    &events,
+                                )
+                                .await;
+                                if recovery_ready_event.is_none() {
+                                    let _ = events.send(BackendEvent::Ready(claude_identity())).await;
+                                }
+                            }
+                            Err(error) => {
+                                bridge_recovery_failed(&events, BackendOperation::Reload, error)
+                                    .await;
+                            }
+                        }
+                    }
                     continue;
                 };
+                let event_name = message.get("event").and_then(Value::as_str);
+                if event_name == Some("session_created")
+                    && let Some(command) = attachment.take()
+                {
+                    attachment = Some(resume_after_create(command, &message));
+                }
                 handle_bridge_message(&message, &events).await;
+                if recovery_ready_event == event_name {
+                    replay_after_reattach(
+                        session_options.clone(),
+                        deferred_command.take(),
+                        &config,
+                        authenticated,
+                        &mut bridge,
+                        &events,
+                    )
+                    .await;
+                    recovery_ready_event = None;
+                    let _ = events.send(BackendEvent::Ready(claude_identity())).await;
+                }
             }
         }
     }
     if let Some(bridge) = bridge {
         bridge.task.abort();
+    }
+}
+
+async fn bridge_recovery_failed(
+    events: &mpsc::Sender<BackendEvent>,
+    operation: BackendOperation,
+    error: BackendError,
+) {
+    request_failed(
+        events,
+        operation,
+        format!("Claude SDK bridge recovery failed: {error}"),
+    )
+    .await;
+}
+
+async fn reattach_session(
+    attachment: Option<BackendCommand>,
+    config: &BackendConfig,
+    authenticated: bool,
+    bridge: &mut Option<Bridge>,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Option<&'static str> {
+    let command = attachment?;
+    let recovery_event = recovery_event_for(&command);
+    handle_command(command, config, authenticated, bridge.as_mut(), events).await;
+    recovery_event
+}
+
+async fn replay_after_reattach(
+    session_options: Option<BackendCommand>,
+    deferred_command: Option<BackendCommand>,
+    config: &BackendConfig,
+    authenticated: bool,
+    bridge: &mut Option<Bridge>,
+    events: &mpsc::Sender<BackendEvent>,
+) {
+    if let Some(command) = session_options {
+        handle_command(command, config, authenticated, bridge.as_mut(), events).await;
+    }
+    if let Some(command) = deferred_command {
+        handle_command(command, config, authenticated, bridge.as_mut(), events).await;
     }
 }
 
@@ -875,6 +981,88 @@ fn display_value(value: &Value) -> String {
     )
 }
 
+fn claude_identity() -> BackendIdentity {
+    BackendIdentity {
+        provider: CLAUDE_PROVIDER.to_owned(),
+        display_name: "Claude".to_owned(),
+        version: Some(SDK_VERSION.to_owned()),
+        capabilities: capabilities(),
+    }
+}
+
+fn resume_after_create(command: BackendCommand, message: &Value) -> BackendCommand {
+    match command {
+        BackendCommand::StartSession {
+            owner_session_id,
+            external_tools,
+            replace_builtin_tools,
+            allowed_builtin_tools,
+            max_turns,
+            timeout_seconds,
+            ..
+        } => BackendCommand::ResumeSession {
+            provider_session_id: string(message, "sessionId"),
+            owner_session_id,
+            external_tools,
+            replace_builtin_tools,
+            allowed_builtin_tools,
+            max_turns,
+            timeout_seconds,
+        },
+        command => command,
+    }
+}
+
+fn remember_session_state(
+    command: &BackendCommand,
+    attachment: &mut Option<BackendCommand>,
+    session_options: &mut Option<BackendCommand>,
+) {
+    if is_attachment_command(command) {
+        *attachment = Some(command.clone());
+    } else if matches!(command, BackendCommand::SetSessionOptions { .. }) {
+        *session_options = Some(command.clone());
+    } else if matches!(command, BackendCommand::UnsubscribeSession { .. }) {
+        *attachment = None;
+        *session_options = None;
+    }
+}
+
+fn is_attachment_command(command: &BackendCommand) -> bool {
+    matches!(
+        command,
+        BackendCommand::StartSession { .. } | BackendCommand::ResumeSession { .. }
+    )
+}
+
+fn recovery_event_for(command: &BackendCommand) -> Option<&'static str> {
+    match command {
+        BackendCommand::StartSession { .. } => Some("session_created"),
+        BackendCommand::ResumeSession { .. } => Some("session_resumed"),
+        _ => None,
+    }
+}
+
+fn should_recover_bridge(
+    authenticated: bool,
+    bridge_available: bool,
+    command: &BackendCommand,
+) -> bool {
+    authenticated && !bridge_available && command_needs_bridge(command)
+}
+
+fn command_needs_bridge(command: &BackendCommand) -> bool {
+    !matches!(
+        command,
+        BackendCommand::BeginAuthentication
+            | BackendCommand::Shutdown
+            | BackendCommand::SetSessionModel { .. }
+            | BackendCommand::CompactSession { .. }
+            | BackendCommand::SteerTurn { .. }
+            | BackendCommand::ResolveQuestion { .. }
+    )
+}
+
 fn operation_for(command: &BackendCommand) -> BackendOperation {
     match command {
         BackendCommand::StartSession { .. } => BackendOperation::StartSession,
@@ -1419,6 +1607,93 @@ assert.equal(streamMessageIds.size, 0);
             panic!("expected item delta");
         };
         assert_eq!(item_id, "turn-1:claude");
+    }
+
+    #[test]
+    fn authenticated_retry_and_reload_commands_restart_a_lost_bridge() {
+        let retry = BackendCommand::StartTurn {
+            provider_session_id: "session".to_owned(),
+            client_id: "turn".to_owned(),
+            prompt: "retry".to_owned(),
+            attachments: Vec::new(),
+            model: None,
+        };
+        let reload = BackendCommand::Reload {
+            provider_session_id: Some("session".to_owned()),
+        };
+
+        assert!(should_recover_bridge(true, false, &retry));
+        assert!(should_recover_bridge(true, false, &reload));
+        assert!(!should_recover_bridge(false, false, &retry));
+        assert!(!should_recover_bridge(true, true, &retry));
+        assert!(!should_recover_bridge(
+            true,
+            false,
+            &BackendCommand::BeginAuthentication
+        ));
+        assert!(!should_recover_bridge(
+            true,
+            false,
+            &BackendCommand::Shutdown
+        ));
+    }
+
+    #[test]
+    fn created_sessions_cache_a_resumable_bridge_attachment() {
+        let command = BackendCommand::StartSession {
+            model: Some("opus".to_owned()),
+            instructions: Some("briefing".to_owned()),
+            owner_session_id: Some("owner".to_owned()),
+            parent_run_id: None,
+            external_tools: Vec::new(),
+            replace_builtin_tools: true,
+            allowed_builtin_tools: Some(vec!["Read".to_owned()]),
+            max_turns: Some(4),
+            timeout_seconds: Some(30),
+        };
+
+        assert_eq!(recovery_event_for(&command), Some("session_created"));
+        let resumed = resume_after_create(
+            command,
+            &json!({"event":"session_created","sessionId":"claude-session"}),
+        );
+        assert_eq!(recovery_event_for(&resumed), Some("session_resumed"));
+        let BackendCommand::ResumeSession {
+            provider_session_id,
+            owner_session_id,
+            allowed_builtin_tools,
+            max_turns,
+            timeout_seconds,
+            ..
+        } = resumed
+        else {
+            panic!("created session should become a resumable attachment");
+        };
+        assert_eq!(provider_session_id, "claude-session");
+        assert_eq!(owner_session_id.as_deref(), Some("owner"));
+        assert_eq!(allowed_builtin_tools, Some(vec!["Read".to_owned()]));
+        assert_eq!(max_turns, Some(4));
+        assert_eq!(timeout_seconds, Some(30));
+    }
+
+    #[test]
+    fn bridge_recovery_failure_is_reported_for_the_original_operation() {
+        assert_eq!(
+            operation_for(&BackendCommand::Reload {
+                provider_session_id: Some("session".to_owned()),
+            }),
+            BackendOperation::Reload
+        );
+        assert_eq!(
+            operation_for(&BackendCommand::StartTurn {
+                provider_session_id: "session".to_owned(),
+                client_id: "turn".to_owned(),
+                prompt: "retry".to_owned(),
+                attachments: Vec::new(),
+                model: None,
+            }),
+            BackendOperation::StartTurn
+        );
     }
 
     #[test]
