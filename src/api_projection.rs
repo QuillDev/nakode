@@ -587,6 +587,7 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
         id: view::SessionId::from(value.id),
         revision: value.revision,
         workspace_id: view::WorkspaceId::from(value.workspace_id),
+        working_directory: value.working_directory,
         title: value.title,
         status_message: value.status_message,
         diagnostic_count: value.diagnostic_count,
@@ -934,6 +935,7 @@ fn session_summary(value: api::SessionSummary) -> view::SessionSummary {
     view::SessionSummary {
         id: view::SessionId::from(value.id),
         workspace_id: view::WorkspaceId::from(value.workspace_id),
+        working_directory: value.working_directory,
         title: value.title,
         active_provider_id: value.active_provider_id.map(view::ProviderId::from),
         active_model_id: value.active_model_id.map(view::ModelId::from),

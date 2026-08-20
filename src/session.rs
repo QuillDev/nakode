@@ -53,7 +53,10 @@ pub struct SessionRecord {
     pub id: String,
     pub provider: String,
     pub provider_session_id: String,
+    /// Logical workspace/service ownership path.
     pub workspace: String,
+    /// Canonical filesystem/provider process root. Legacy rows inherit `workspace`.
+    pub working_directory: String,
     pub title: String,
     pub model: Option<String>,
     /// Authoritative session-local configuration for the next owner turn.
@@ -347,6 +350,7 @@ pub trait SessionRepository: Send + Sync {
             provider,
             provider_session_id,
             workspace,
+            workspace,
             title,
             model,
             &ModelOptions::default(),
@@ -363,6 +367,7 @@ pub trait SessionRepository: Send + Sync {
         provider: &str,
         provider_session_id: &str,
         workspace: &str,
+        working_directory: &str,
         title: &str,
         model: Option<&str>,
         options: &ModelOptions,
@@ -626,6 +631,7 @@ impl SqliteSessionRepository {
                provider TEXT NOT NULL,
                provider_session_id TEXT NOT NULL,
                workspace TEXT NOT NULL,
+               working_directory TEXT,
                title TEXT NOT NULL,
                model TEXT,
                model_reasoning_effort TEXT,
@@ -956,6 +962,7 @@ impl SqliteSessionRepository {
             ("last_turn_reasoning_effort", "TEXT"),
             ("last_turn_fast_mode", "INTEGER NOT NULL DEFAULT 0"),
             ("last_turn_outcome", "TEXT"),
+            ("working_directory", "TEXT"),
         ] {
             if !session_columns.iter().any(|existing| existing == column) {
                 writeln!(
@@ -1224,6 +1231,7 @@ impl SqliteSessionRepository {
             provider: row.get(1)?,
             provider_session_id: row.get(2)?,
             workspace: row.get(3)?,
+            working_directory: row.get(15)?,
             title: row.get(4)?,
             model: row.get(5)?,
             model_options: ModelOptions {
@@ -1732,7 +1740,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
@@ -1753,7 +1761,7 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
+                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
                  FROM sessions WHERE id = ?1",
                 [id],
                 Self::row,
@@ -1766,7 +1774,7 @@ impl SessionRepository for SqliteSessionRepository {
         }
         let pattern = format!("{id}%");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
              FROM sessions WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
         )?;
         let matches = statement
@@ -1791,6 +1799,7 @@ impl SessionRepository for SqliteSessionRepository {
         provider: &str,
         provider_session_id: &str,
         workspace: &str,
+        working_directory: &str,
         title: &str,
         model: Option<&str>,
         options: &ModelOptions,
@@ -1808,8 +1817,8 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         connection.execute(
             "INSERT INTO sessions
-             (id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             (id, provider, provider_session_id, workspace, working_directory, title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
              ON CONFLICT(provider, provider_session_id) DO UPDATE SET
                model = excluded.model,
                model_reasoning_effort = excluded.model_reasoning_effort,
@@ -1820,6 +1829,7 @@ impl SessionRepository for SqliteSessionRepository {
                 provider,
                 provider_session_id,
                 workspace,
+                working_directory,
                 title,
                 model,
                 options.reasoning_effort,
@@ -1828,7 +1838,7 @@ impl SessionRepository for SqliteSessionRepository {
             ],
         )?;
         connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -3062,6 +3072,47 @@ mod tests {
         };
         store.save_memory_config(&configured)?;
         assert_eq!(store.load_memory_config()?, configured);
+        Ok(())
+    }
+
+    #[test]
+    fn session_cwd_persists_and_legacy_null_rows_inherit_workspace() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let created = store.create_with_id(
+            "logical-session",
+            CODEX_PROVIDER,
+            "provider-session",
+            "/logical/workspace",
+            "/explicit/repository",
+            "Session",
+            None,
+            &ModelOptions::default(),
+        )?;
+        assert_eq!(created.working_directory, "/explicit/repository");
+        assert_eq!(
+            store
+                .find("logical-session")?
+                .expect("persisted session")
+                .working_directory,
+            "/explicit/repository"
+        );
+
+        store
+            .connection
+            .lock()
+            .expect("session database mutex poisoned")
+            .execute(
+                "UPDATE sessions SET working_directory = NULL WHERE id = ?1",
+                ["logical-session"],
+            )?;
+        assert_eq!(
+            store
+                .find("logical-session")?
+                .expect("legacy session")
+                .working_directory,
+            "/logical/workspace"
+        );
         Ok(())
     }
 

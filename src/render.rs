@@ -2377,6 +2377,7 @@ mod tests {
             id: SessionId::from("session"),
             revision: 1,
             workspace_id: WorkspaceId::from("workspace"),
+            working_directory: "/tmp/project".to_owned(),
             title: "Session".to_owned(),
             status_message: String::new(),
             diagnostic_count: 0,
