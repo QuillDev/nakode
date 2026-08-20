@@ -252,6 +252,38 @@ impl NakodeClient {
             .await
     }
 
+    /// Creates a logical session rooted at an explicit filesystem/provider working directory.
+    /// The logical workspace remains the owner and service partition.
+    ///
+    /// # Errors
+    /// Returns a transport, server validation, or missing-identifier error.
+    pub async fn create_session_in_directory(
+        &self,
+        workspace_id: impl Into<String>,
+        title: Option<String>,
+        working_directory: impl Into<String>,
+    ) -> Result<String, SdkError> {
+        let result = send_mutation!(
+            self,
+            create_session,
+            api::CreateSessionRequest {
+                mutation: Some(mutation(None)),
+                workspace_id: workspace_id.into(),
+                title,
+                model_id: None,
+                options: None,
+                tools: None,
+                initial_instructions: None,
+                mcp_grant: None,
+                bridge: None,
+                working_directory: Some(working_directory.into()),
+            }
+        )?;
+        result
+            .resource_id
+            .ok_or(SdkError::MissingState("created session identifier"))
+    }
+
     /// Creates a logical session with an atomic external-thread bridge intent.
     ///
     /// Frontends use this when the session must never be published without its Chat/Agent
@@ -279,6 +311,7 @@ impl NakodeClient {
                 initial_instructions: None,
                 mcp_grant: None,
                 bridge: Some(bridge),
+                working_directory: None,
             }
         )?;
         result
@@ -328,6 +361,7 @@ impl NakodeClient {
                 initial_instructions: None,
                 mcp_grant: None,
                 bridge: None,
+                working_directory: None,
             }
         )?;
         result
@@ -362,6 +396,7 @@ impl NakodeClient {
                 mcp_grant: None,
                 initial_instructions,
                 bridge: None,
+                working_directory: None,
             }
         )?;
         result
@@ -456,6 +491,11 @@ impl NakodeClient {
     }
 
     /// Sends work using the server-owned start-versus-queue policy.
+    ///
+    /// `SendPrompt` is append-only owner intent. The server evaluates session lifecycle at execution
+    /// time and does not use `expected_revision` as a fence; the argument remains for source and wire
+    /// compatibility with clients that already supplied an observed revision. The SDK-generated
+    /// idempotency key is stable across automatic transport retries of this invocation.
     ///
     /// # Errors
     /// Returns a transport or server status error.
@@ -781,6 +821,10 @@ impl NakodeClient {
     typed_mutation!(compact_context, api::CompactContextRequest);
     typed_mutation!(run_shell, api::RunShellRequest);
     typed_mutation!(select_model, api::SelectModelRequest);
+    typed_mutation!(
+        set_provider_model_filter,
+        api::SetProviderModelFilterRequest
+    );
     typed_mutation!(set_provider_enabled, api::SetProviderEnabledRequest);
     typed_mutation!(
         begin_provider_authentication,

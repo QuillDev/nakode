@@ -887,6 +887,9 @@ fn install_ready_view(
         connection: nakode_protocol::ConnectionView::Ready,
         capabilities: capabilities.clone(),
         authentication: None,
+        model_filter_enabled: false,
+        selected_model_ids: Vec::new(),
+        model_candidates: Vec::new(),
     };
     if let Some(existing) = view
         .providers
@@ -949,7 +952,7 @@ fn fixture_protocol_capabilities(
 
 fn install_model_views(view: &mut nakode_protocol::BootstrapView, models: Vec<FixtureModel>) {
     let provider_id = selected_provider_id(view);
-    view.models = models
+    let projected = models
         .into_iter()
         .map(|model| {
             let id = if model.id.contains('/') {
@@ -968,7 +971,15 @@ fn install_model_views(view: &mut nakode_protocol::BootstrapView, models: Vec<Fi
                 configuration: model.configuration,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    view.models.clone_from(&projected);
+    for provider in &mut view.providers {
+        provider.model_candidates = projected
+            .iter()
+            .filter(|model| model.provider_id == provider.id)
+            .cloned()
+            .collect();
+    }
 }
 
 fn install_created_session_view(
@@ -1436,6 +1447,7 @@ const fn command_name(command: &crate::api_projection::TuiAction) -> &'static st
         TuiAction::DeleteAgent { .. } => "delete_agent",
         TuiAction::UpdateSettings { .. } => "update_settings",
         TuiAction::CheckAgentBrowser { .. } => "check_agent_browser",
+        TuiAction::SetProviderModelFilter { .. } => "set_provider_model_filter",
         TuiAction::ReloadWorkspace { .. } => "reload_workspace",
     }
 }
@@ -1513,6 +1525,24 @@ mod tests {
         assert!(error.to_string().contains("line 1"));
         assert!(error.to_string().contains("modal is"));
         assert!(!output.is_empty(), "failure should retain its observation");
+    }
+
+    #[test]
+    fn committed_provider_model_filter_scenario_passes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut output = Vec::new();
+        run_script(
+            io::Cursor::new(include_str!(
+                "../tests/tui_scenarios/provider_model_filter.jsonl"
+            )),
+            &mut output,
+            &options(workspace.path()),
+        )
+        .expect("provider model filter scenario");
+        assert_eq!(
+            String::from_utf8(output).expect("JSONL").lines().count(),
+            14
+        );
     }
 
     #[test]

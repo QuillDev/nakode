@@ -30,6 +30,7 @@ use tokio::sync::oneshot;
 use crate::{
     agent::{AgentCatalog, AgentDefinition, AgentFallbackPolicy, AgentOwnership, AgentToolProfile},
     backend::PromptAttachment,
+    memory::MemoryConfig,
     service::ServiceEngine,
     session::{
         BridgeDeliveryRecord, BridgeInboundTurnOriginRecord, BridgePendingInboundRecord,
@@ -442,19 +443,24 @@ impl ServerCore {
             .as_ref()
             .and_then(|session_id| self.engine_for(session_id))
             .map_or_else(|| self.engine().revision(), ServiceEngine::revision);
-        let (mut result, effects) =
-            if expected_revision.is_some_and(|revision| revision != command_revision) {
-                (
-                    Err(service_error(
-                        ErrorCode::Conflict,
-                        "the expected revision is stale",
-                        true,
-                    )),
-                    Vec::new(),
-                )
-            } else {
-                self.execute_command(command)
-            };
+        // Prompt submission is append-only owner intent. Its idempotency key, not a snapshot fence,
+        // distinguishes a retry from another deliberate send; lifecycle and queue placement are
+        // therefore evaluated against authoritative state when this command executes.
+        let revision_fenced = !matches!(&command, Command::SendPrompt { .. });
+        let (mut result, effects) = if revision_fenced
+            && expected_revision.is_some_and(|revision| revision != command_revision)
+        {
+            (
+                Err(service_error(
+                    ErrorCode::Conflict,
+                    "the expected revision is stale",
+                    true,
+                )),
+                Vec::new(),
+            )
+        } else {
+            self.execute_command(command)
+        };
         let effect_session = effect_session.or_else(|| {
             result
                 .as_ref()
@@ -502,6 +508,7 @@ impl ServerCore {
         match command {
             Command::CreateSession {
                 workspace_id,
+                working_directory,
                 title,
                 model_id,
                 options,
@@ -511,6 +518,7 @@ impl ServerCore {
                 mcp_grant,
             } => self.create_session_command_with_mcp(
                 &workspace_id,
+                working_directory.as_deref(),
                 title.as_deref(),
                 model_id.as_ref(),
                 &options,
@@ -684,6 +692,11 @@ impl ServerCore {
                 session_id,
                 command,
             } => self.run_shell_command(&session_id, command),
+            Command::SetProviderModelFilter {
+                provider_id,
+                enabled,
+                selected_model_ids,
+            } => self.set_provider_model_filter_command(&provider_id, enabled, selected_model_ids),
             Command::SetProviderEnabled {
                 provider_id,
                 enabled,
@@ -770,6 +783,7 @@ impl ServerCore {
         self.create_session_command_with_mcp(
             workspace_id,
             None,
+            None,
             model_id,
             options,
             tools,
@@ -785,6 +799,7 @@ impl ServerCore {
     fn create_session_command_with_mcp(
         &mut self,
         workspace_id: &WorkspaceId,
+        working_directory: Option<&str>,
         title: Option<&str>,
         model_id: Option<&nakode_protocol::ModelId>,
         options: &nakode_protocol::ModelOptions,
@@ -794,6 +809,8 @@ impl ServerCore {
         mcp_grant: Option<&McpSessionGrant>,
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
+        let working_directory =
+            canonical_working_directory(working_directory, &self.session_template.workspace)?;
         if model_id.is_none() && (options.reasoning_effort.is_some() || options.fast_mode) {
             return Err(DomainCommandError::Invalid(
                 "initial model options require model_id".to_owned(),
@@ -801,6 +818,7 @@ impl ServerCore {
         }
         self.refresh_session_template_addenda()?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
+        engine.state_mut().set_working_directory(working_directory);
         engine
             .state_mut()
             .set_initial_client_instructions(initial_instructions)?;
@@ -816,11 +834,12 @@ impl ServerCore {
             )?);
         }
         if let Some(tools) = tools {
-            effects.extend(
-                engine
-                    .state_mut()
-                    .configure_external_tools(tools.tools, tools.replace_builtin_tools)?,
-            );
+            let tools = engine.state().omit_disabled_memory_tools(tools);
+            effects.extend(engine.state_mut().configure_session_tools(
+                tools.tools,
+                tools.replace_builtin_tools,
+                tools.allowed_builtin_tools,
+            )?);
         }
         if let Some(grant) = mcp_grant {
             let (mcp_tools, archetype_grants) = self.mcp_tools_for_grant(grant)?;
@@ -1503,6 +1522,11 @@ impl ServerCore {
             .collect::<Vec<_>>();
         match loaded.as_slice() {
             [loaded] => {
+                let (loaded_workspace, loaded_working_directory) = {
+                    let state = self.session_engine_mut(loaded)?.state();
+                    (state.workspace.clone(), state.working_directory.clone())
+                };
+                canonical_working_directory(Some(&loaded_working_directory), &loaded_workspace)?;
                 if *loaded == self.default_session
                     && !self
                         .sessions
@@ -1512,11 +1536,16 @@ impl ServerCore {
                     return Err(DomainCommandError::NotFound(session_id.to_string()));
                 }
                 if let Some(tools) = tools {
+                    let tools = self
+                        .session_engine_mut(loaded)?
+                        .state()
+                        .omit_disabled_memory_tools(tools);
                     self.session_engine_mut(loaded)?
                         .state_mut()
                         .configure_or_validate_external_tools(
                             &tools.tools,
                             tools.replace_builtin_tools,
+                            tools.allowed_builtin_tools.as_deref(),
                         )?;
                 }
                 // Opening an attached session is a reattachment, not a reconfiguration. The
@@ -1546,15 +1575,32 @@ impl ServerCore {
                 )));
             }
         };
+        let working_directory =
+            canonical_working_directory(Some(&session.working_directory), &session.workspace)?;
         self.refresh_session_template_addenda()?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
+        engine.state_mut().set_working_directory(working_directory);
         // The workspace template may still carry the bootstrap provider/session identity. Reset that
         // clone before installing client-owned tools; restoration begins only after validation.
         let _discarded_template_effects = engine.state_mut().create_logical_session()?;
         if let Some(tools) = tools {
-            engine
-                .state_mut()
-                .configure_external_tools(tools.tools, tools.replace_builtin_tools)?;
+            let tools = engine.state().omit_disabled_memory_tools(tools);
+            if let Some(allowed) = tools.allowed_builtin_tools.as_deref() {
+                let projection =
+                    crate::backend::project_provider_tools(&session.provider, Some(allowed));
+                if !projection.unsupported_canonical_tools.is_empty() {
+                    return Err(DomainCommandError::Invalid(format!(
+                        "provider {} cannot project allowed builtin tools: {}",
+                        session.provider,
+                        projection.unsupported_canonical_tools.join(", ")
+                    )));
+                }
+            }
+            engine.state_mut().configure_session_tools(
+                tools.tools,
+                tools.replace_builtin_tools,
+                tools.allowed_builtin_tools,
+            )?;
         }
         if let Some(grant) = mcp_grant {
             let (mcp_tools, archetype_grants) = self.mcp_tools_for_grant(grant)?;
@@ -2047,6 +2093,38 @@ impl ServerCore {
         self.mcp_server(server_id).map(|_| ())
     }
 
+    fn set_provider_model_filter_command(
+        &self,
+        provider_id: &ProviderId,
+        enabled: bool,
+        selected_model_ids: Vec<nakode_protocol::ModelId>,
+    ) -> DomainCommandOutcome {
+        self.ensure_provider(provider_id)?;
+        let prefix = format!("{provider_id}/");
+        let mut selected_model_ids = selected_model_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        if let Some(id) = selected_model_ids
+            .iter()
+            .find(|id| !id.starts_with(&prefix) || id.len() == prefix.len())
+        {
+            return Err(DomainCommandError::Invalid(format!(
+                "model filter entry {id:?} must be an exact {provider_id}/model ID"
+            )));
+        }
+        selected_model_ids.sort();
+        selected_model_ids.dedup();
+        Ok(Self::accepted(
+            Some(provider_id.to_string()),
+            vec![Effect::SetProviderModelFilter {
+                provider: provider_id.to_string(),
+                enabled,
+                selected_model_ids,
+            }],
+        ))
+    }
+
     fn set_provider_enabled_command(
         &self,
         provider_id: &ProviderId,
@@ -2316,6 +2394,13 @@ impl ServerCore {
             .state_mut()
             .install_agents(agents);
         Ok(())
+    }
+
+    pub(crate) fn install_memory_config(&mut self, config: &MemoryConfig) {
+        self.session_template.install_memory_config(config.clone());
+        for engine in self.sessions_by_id.values_mut() {
+            engine.state_mut().install_memory_config(config.clone());
+        }
     }
 
     fn reload_global_agent_catalogue(&mut self) -> Result<(), ServiceError> {
@@ -3023,6 +3108,7 @@ impl ServerCore {
             let summary = nakode_protocol::SessionSummary {
                 id: session.id,
                 workspace_id: session.workspace_id,
+                working_directory: session.working_directory,
                 title: session.title,
                 active_provider_id: session.selected_provider_id,
                 active_model_id: session.selected_model_id,
@@ -3273,6 +3359,7 @@ impl ServerCore {
             Command::CreateSession { .. }
             | Command::SetWorkspaceBridgeLifecycle { .. }
             | Command::SelectModel { .. }
+            | Command::SetProviderModelFilter { .. }
             | Command::SetProviderEnabled { .. }
             | Command::BeginProviderAuthentication { .. }
             | Command::SetProviderCredential { .. }
@@ -3359,6 +3446,34 @@ impl ServerCore {
             .collect::<Result<Vec<_>, _>>()?;
         Ok((prompt.text, attachments))
     }
+}
+
+fn canonical_working_directory(
+    requested: Option<&str>,
+    workspace: &str,
+) -> Result<String, DomainCommandError> {
+    let path = match requested {
+        None => Path::new(workspace),
+        Some(value) if value.trim().is_empty() => {
+            return Err(DomainCommandError::Invalid(
+                "working_directory must not be empty when supplied".to_owned(),
+            ));
+        }
+        Some(value) => Path::new(value),
+    };
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        DomainCommandError::Invalid(format!(
+            "working_directory {} is unavailable: {error}",
+            path.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(DomainCommandError::Invalid(format!(
+            "working_directory {} is not a directory",
+            canonical.display()
+        )));
+    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 fn validated_bridge_title(
@@ -4020,10 +4135,11 @@ mod tests {
         agent::{AgentCatalog, AgentDefinition},
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendIdentity, BackendOperation,
-            CODEX_PROVIDER, CapabilitySupport, ModelCapabilities, ModelInfo, PromptImage,
-            TurnOutcome,
+            CLAUDE_PROVIDER, CODEX_PROVIDER, CapabilitySupport, ModelCapabilities, ModelInfo,
+            PromptImage, TurnOutcome,
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
+        memory::{MemoryBackend, MemoryConfig},
         personality::PromptAddenda,
         service::ServiceEngine,
         session::{
@@ -4042,6 +4158,7 @@ mod tests {
                 input_schema_json: r#"{"type":"object","properties":{}}"#.to_owned(),
             }],
             replace_builtin_tools,
+            allowed_builtin_tools: None,
         }
     }
 
@@ -4063,9 +4180,14 @@ mod tests {
         events
     }
 
+    fn project_workspace() -> &'static str {
+        std::fs::create_dir_all("/tmp/project").expect("test workspace");
+        "/tmp/project"
+    }
+
     fn ready_codex_server() -> (ServerCore, SessionId) {
         let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+            AppState::new_for_backend(project_workspace(), None, 100, CODEX_PROVIDER, "Codex");
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
@@ -4085,7 +4207,7 @@ mod tests {
 
     fn ready_external_tools_server() -> (ServerCore, SessionId) {
         let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+            AppState::new_for_backend(project_workspace(), None, 100, CODEX_PROVIDER, "Codex");
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
@@ -4115,12 +4237,133 @@ mod tests {
     }
 
     #[test]
+    fn rootless_and_explicit_sessions_share_logical_workspace_but_keep_distinct_cwds() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let explicit = tempfile::tempdir().expect("explicit cwd");
+        let explicit_canonical = explicit.path().canonicalize().expect("canonical cwd");
+
+        let (rootless, _) = core
+            .create_session_command(&workspace_id, None, &ModelOptions::default(), None)
+            .expect("rootless session");
+        let (rooted, _) = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                Some(explicit.path().to_str().expect("utf8 path")),
+                None,
+                None,
+                &ModelOptions::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("explicitly rooted session");
+        let rootless_id = SessionId::from(rootless.resource_id.expect("rootless id"));
+        let rooted_id = SessionId::from(rooted.resource_id.expect("rooted id"));
+
+        assert_eq!(
+            core.engine_for(&rootless_id)
+                .expect("rootless engine")
+                .state()
+                .working_directory,
+            std::fs::canonicalize(project_workspace())
+                .expect("canonical workspace")
+                .to_string_lossy()
+        );
+        assert_eq!(
+            core.engine_for(&rooted_id)
+                .expect("rooted engine")
+                .state()
+                .working_directory,
+            explicit_canonical.to_string_lossy()
+        );
+        let projected = core.workspace_bootstrap();
+        let rooted_summary = projected
+            .sessions
+            .iter()
+            .find(|session| session.id == rooted_id)
+            .expect("rooted summary");
+        assert_eq!(rooted_summary.workspace_id, workspace_id);
+        assert_eq!(
+            rooted_summary.working_directory,
+            explicit_canonical.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn session_creation_rejects_missing_and_non_directory_cwds() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let directory = tempfile::tempdir().expect("cwd fixture");
+        let file = directory.path().join("file");
+        std::fs::write(&file, "not a directory").expect("write fixture");
+        for invalid in [directory.path().join("missing"), file] {
+            let result = core.create_session_command_with_mcp(
+                &workspace_id,
+                Some(invalid.to_str().expect("utf8 path")),
+                None,
+                None,
+                &ModelOptions::default(),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                result.is_err(),
+                "accepted invalid cwd {}",
+                invalid.display()
+            );
+        }
+    }
+
+    #[test]
+    fn open_restores_persisted_cwd_and_fails_after_it_is_deleted() {
+        let (mut core, _) = ready_external_tools_server();
+        let directory = tempfile::tempdir().expect("persisted cwd");
+        let canonical = directory.path().canonicalize().expect("canonical cwd");
+        let restored_id = SessionId::from("restored-cwd-session");
+        core.replace_session_records(vec![SessionRecord {
+            id: restored_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-restored-cwd".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            working_directory: canonical.to_string_lossy().into_owned(),
+            title: "Restored cwd".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            owned_provider_sessions: Vec::new(),
+        }]);
+
+        core.open_session_command(&restored_id, None)
+            .expect("persisted cwd restores");
+        assert_eq!(
+            core.engine_for(&restored_id)
+                .expect("restored engine")
+                .state()
+                .working_directory,
+            canonical.to_string_lossy()
+        );
+        drop(directory);
+        let error = core
+            .open_session_command(&restored_id, None)
+            .expect_err("deleted cwd must not fall back to workspace");
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[test]
     fn bridge_intent_is_created_atomically_and_projected_with_the_session() {
         let (mut core, _) = ready_codex_server();
         let workspace_id = core.workspace_bootstrap().workspace_id;
         let (accepted, effects) = core
             .create_session_command_with_mcp(
                 &workspace_id,
+                None,
                 Some("Dashboard title"),
                 None,
                 &ModelOptions::default(),
@@ -4160,6 +4403,7 @@ mod tests {
         let (accepted, _) = core
             .create_session_command_with_mcp(
                 &workspace_id,
+                None,
                 Some("Agent review"),
                 None,
                 &ModelOptions::default(),
@@ -4189,6 +4433,7 @@ mod tests {
         let (other, _) = core
             .create_session_command_with_mcp(
                 &workspace_id,
+                None,
                 Some("Other chat"),
                 None,
                 &ModelOptions::default(),
@@ -4363,12 +4608,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn bridge_projection_cursor_enforces_user_before_assistant_and_rejects_stale_workers() {
         let (mut core, _) = ready_codex_server();
         let workspace_id = core.workspace_bootstrap().workspace_id;
         let (accepted, _) = core
             .create_session_command_with_mcp(
                 &workspace_id,
+                None,
                 Some("Ordered projection"),
                 None,
                 &ModelOptions::default(),
@@ -4477,6 +4724,7 @@ mod tests {
         let (accepted, _) = core
             .create_session_command_with_mcp(
                 &workspace_id,
+                None,
                 Some("Chat"),
                 None,
                 &ModelOptions::default(),
@@ -5012,7 +5260,148 @@ mod tests {
     }
 
     #[test]
-    fn persisted_session_tools_are_installed_before_provider_resume() {
+    fn fresh_session_builtin_allowlist_is_carried_to_provider_start() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let tools = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(vec!["read".to_owned(), "grep".to_owned()]),
+        };
+        let (created, _) = core
+            .create_session_command(&workspace_id, None, &ModelOptions::default(), Some(tools))
+            .expect("builtin allowlist without external tools");
+        let (_, effects) = core
+            .try_execute_command(Command::SendPrompt {
+                session_id: SessionId::from(created.resource_id.expect("session id")),
+                prompt: PromptInput {
+                    text: "inspect".to_owned(),
+                    attachments: Vec::new(),
+                },
+            })
+            .expect("first prompt");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::StartSession {
+                allowed_builtin_tools: Some(allowed),
+                ..
+            }) if allowed == &["read".to_owned(), "grep".to_owned()]
+        )));
+    }
+
+    #[test]
+    fn disabled_memory_only_allowlist_becomes_an_explicit_empty_replacement() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let tools = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(vec![
+                "memory_search".to_owned(),
+                "memory_store".to_owned(),
+            ]),
+        };
+        let (created, _) = core
+            .create_session_command(&workspace_id, None, &ModelOptions::default(), Some(tools))
+            .expect("disabled memory is a supported empty boundary");
+        let (_, effects) = core
+            .try_execute_command(Command::SendPrompt {
+                session_id: SessionId::from(created.resource_id.expect("session id")),
+                prompt: PromptInput {
+                    text: "inspect".to_owned(),
+                    attachments: Vec::new(),
+                },
+            })
+            .expect("first prompt");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::StartSession {
+                external_tools,
+                replace_builtin_tools: true,
+                allowed_builtin_tools: None,
+                ..
+            }) if external_tools.is_empty()
+        )));
+    }
+
+    #[test]
+    fn attached_session_tool_validation_includes_builtin_allowlist() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let configured = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(vec!["read".to_owned()]),
+        };
+        let (created, _) = core
+            .create_session_command(
+                &workspace_id,
+                None,
+                &ModelOptions::default(),
+                Some(configured.clone()),
+            )
+            .expect("create");
+        let id = SessionId::from(created.resource_id.expect("session id"));
+        assert!(
+            core.open_session_command(
+                &id,
+                Some(SessionToolConfiguration {
+                    allowed_builtin_tools: Some(vec!["grep".to_owned()]),
+                    ..configured
+                })
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn memory_configuration_updates_the_template_and_every_loaded_session() {
+        let (mut core, loaded_id) = ready_external_tools_server();
+        core.install_memory_config(&MemoryConfig {
+            backend: MemoryBackend::Mnemosyne,
+            executable: "/definitely/missing/mnemosyne".to_owned(),
+            global_bank: "configured-memory".to_owned(),
+            data_directory: String::new(),
+        });
+        let requested = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(vec!["memory_search".to_owned()]),
+        };
+        assert_eq!(
+            core.engine_for(&loaded_id)
+                .expect("loaded session")
+                .state()
+                .omit_disabled_memory_tools(requested.clone())
+                .allowed_builtin_tools,
+            requested.allowed_builtin_tools
+        );
+
+        core.install_memory_config(&MemoryConfig::default());
+        let normalized = core
+            .engine_for(&loaded_id)
+            .expect("loaded session")
+            .state()
+            .omit_disabled_memory_tools(requested);
+        assert!(normalized.allowed_builtin_tools.is_none());
+        assert!(normalized.replace_builtin_tools);
+
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        core.create_session_command(
+            &workspace_id,
+            None,
+            &ModelOptions::default(),
+            Some(SessionToolConfiguration {
+                tools: Vec::new(),
+                replace_builtin_tools: false,
+                allowed_builtin_tools: Some(vec!["memory_store".to_owned()]),
+            }),
+        )
+        .expect("new session inherits disabled memory from template");
+    }
+
+    #[test]
+    fn disabled_memory_tools_are_omitted_before_persisted_session_resume() {
         let (mut core, _) = ready_external_tools_server();
         let restored_id = SessionId::from("restored-tools-session");
         core.replace_session_records(vec![SessionRecord {
@@ -5020,6 +5409,7 @@ mod tests {
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-restored".to_owned(),
             workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
             title: "Old dashboard prompt".to_owned(),
             model: None,
             model_options: crate::backend::ModelOptions::default(),
@@ -5029,7 +5419,9 @@ mod tests {
             updated_at: 12,
             owned_provider_sessions: Vec::new(),
         }]);
-        let tools = dashboard_tools("DashboardRead", true);
+        let mut tools = dashboard_tools("DashboardRead", false);
+        tools.allowed_builtin_tools =
+            Some(vec!["memory_search".to_owned(), "memory_store".to_owned()]);
 
         let (_, effects) = core
             .open_session_command(&restored_id, Some(tools.clone()))
@@ -5041,11 +5433,100 @@ mod tests {
                     provider_session_id,
                     external_tools,
                     replace_builtin_tools: true,
+                    allowed_builtin_tools: None,
                     ..
-                }) if provider_session_id == "thread-restored" && external_tools == &tools.tools
+                }) if provider_session_id == "thread-restored"
+                    && external_tools == &tools.tools
             )),
             "{effects:#?}"
         );
+    }
+
+    #[test]
+    fn configured_but_unavailable_memory_remains_in_the_requested_tool_boundary() {
+        let (mut core, _) = ready_external_tools_server();
+        core.install_memory_config(&MemoryConfig {
+            backend: MemoryBackend::Mnemosyne,
+            executable: "/definitely/missing/mnemosyne".to_owned(),
+            global_bank: "configured-memory".to_owned(),
+            data_directory: String::new(),
+        });
+        let restored_id = SessionId::from("restored-unavailable-memory");
+        core.replace_session_records(vec![SessionRecord {
+            id: restored_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-unavailable-memory".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
+            title: "Memory backend unavailable".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            owned_provider_sessions: Vec::new(),
+        }]);
+        let tools = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(vec![
+                "memory_search".to_owned(),
+                "memory_store".to_owned(),
+            ]),
+        };
+
+        let (_, effects) = core
+            .open_session_command(&restored_id, Some(tools))
+            .expect("configured memory remains requested for runtime validation");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::ResumeSession {
+                allowed_builtin_tools: Some(allowed),
+                ..
+            }) if allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
+        )));
+    }
+
+    #[test]
+    fn persisted_session_rejects_builtin_tools_the_provider_cannot_expose() {
+        let (mut core, _) = ready_external_tools_server();
+        core.install_memory_config(&MemoryConfig {
+            backend: MemoryBackend::Mnemosyne,
+            executable: "/definitely/missing/mnemosyne".to_owned(),
+            global_bank: "configured-memory".to_owned(),
+            data_directory: String::new(),
+        });
+        let restored_id = SessionId::from("restored-claude-session");
+        core.replace_session_records(vec![SessionRecord {
+            id: restored_id.to_string(),
+            provider: CLAUDE_PROVIDER.to_owned(),
+            provider_session_id: "claude-thread".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
+            title: "Historical Claude session".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            owned_provider_sessions: Vec::new(),
+        }]);
+        let tools = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(vec![
+                "memory_search".to_owned(),
+                "memory_store".to_owned(),
+            ]),
+        };
+
+        let error = core
+            .open_session_command(&restored_id, Some(tools))
+            .expect_err("Claude cannot claim canonical memory support");
+        assert!(error.to_string().contains("memory_search"));
+        assert!(error.to_string().contains("memory_store"));
     }
 
     #[test]
@@ -5104,7 +5585,8 @@ mod tests {
         let session_count = core.sessions_by_id.len();
         let invalid = SessionToolConfiguration {
             tools: Vec::new(),
-            replace_builtin_tools: true,
+            replace_builtin_tools: false,
+            allowed_builtin_tools: None,
         };
         core.create_session_command(
             &workspace_id,
@@ -5120,6 +5602,7 @@ mod tests {
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-old".to_owned(),
             workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
             title: "Old".to_owned(),
             model: None,
             model_options: crate::backend::ModelOptions::default(),
@@ -5147,6 +5630,7 @@ mod tests {
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-1".to_owned(),
             workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
             title: "Direct terminal session".to_owned(),
             model: None,
             model_options: crate::backend::ModelOptions::default(),
@@ -5175,7 +5659,7 @@ mod tests {
     #[test]
     fn creating_a_session_applies_the_requested_model_atomically() {
         let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+            AppState::new_for_backend(project_workspace(), None, 100, CODEX_PROVIDER, "Codex");
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
@@ -5330,6 +5814,291 @@ mod tests {
         );
     }
 
+    fn assert_queued_turn_starts(
+        core: &mut ServerCore,
+        session_id: &SessionId,
+        completed_turn: &str,
+        next_turn: &str,
+        expected_prompt: &str,
+        expected_id: &str,
+    ) {
+        let effects = core
+            .engine_for_mut(session_id)
+            .expect("session engine")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnCompleted {
+                    turn_id: completed_turn.to_owned(),
+                    outcome: crate::backend::TurnOutcome::Completed,
+                    error: None,
+                },
+            );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    crate::state::Effect::Backend(BackendCommand::StartTurn { .. })
+                ))
+                .count(),
+            1,
+            "each terminal turn starts exactly one successor"
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::StartTurn { client_id, prompt, .. })
+                if client_id == expected_id && prompt.starts_with(expected_prompt)
+        )));
+        core.engine_for_mut(session_id)
+            .expect("session engine")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnAccepted {
+                    turn_id: next_turn.to_owned(),
+                },
+            );
+    }
+
+    fn busy_server_with_stale_revision(turn_id: &str) -> (ServerCore, SessionId, u64) {
+        let (mut core, session_id) = ready_codex_server();
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnStarted {
+                    turn_id: turn_id.to_owned(),
+                },
+            );
+        let observed_revision = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .note_state_change();
+        (core, session_id, observed_revision)
+    }
+
+    #[test]
+    fn stale_prompt_send_queues_once_in_command_order() {
+        let (mut core, session_id, observed_revision) =
+            busy_server_with_stale_revision("active-turn");
+
+        let repeated = Command::SendPrompt {
+            session_id: session_id.clone(),
+            prompt: PromptInput {
+                text: "repeat me".to_owned(),
+                attachments: Vec::new(),
+            },
+        };
+        let first_key = IdempotencyKey::from("window-a-repeat");
+        let (first, effects, _, changed) = core.execute_idempotent(
+            first_key.clone(),
+            Some(observed_revision),
+            false,
+            repeated.clone(),
+        );
+        first.expect("stale prompt append is accepted");
+        assert!(
+            effects.is_empty(),
+            "a busy send queues without interrupting"
+        );
+        assert!(changed);
+
+        let (retry, retry_effects, retry_session, retry_changed) =
+            core.execute_idempotent(first_key, Some(observed_revision), false, repeated.clone());
+        retry.expect("an ambiguous transport retry replays acceptance");
+        assert!(retry_effects.is_empty());
+        assert_eq!(retry_session, None);
+        assert!(!retry_changed, "a replay must not append a second copy");
+
+        core.execute_idempotent(
+            IdempotencyKey::from("window-b-repeat"),
+            Some(observed_revision),
+            false,
+            repeated,
+        )
+        .0
+        .expect("a distinct concurrent send remains distinct");
+        core.execute_idempotent(
+            IdempotencyKey::from("window-c-next"),
+            Some(observed_revision),
+            false,
+            Command::SendPrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "after repeats".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        )
+        .0
+        .expect("later concurrent send is accepted");
+
+        let queued = &core.session_view(&session_id).expect("session view").queue;
+        assert_eq!(
+            queued
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            ["repeat me", "repeat me", "after repeats"],
+            "distinct sends preserve duplicates and serialized arrival order"
+        );
+        let queued_ids = queued
+            .iter()
+            .map(|prompt| prompt.id.clone())
+            .collect::<Vec<_>>();
+
+        for (completed_turn, next_turn, expected_prompt, expected_id) in [
+            ("active-turn", "queued-turn-1", "repeat me", &queued_ids[0]),
+            (
+                "queued-turn-1",
+                "queued-turn-2",
+                "repeat me",
+                &queued_ids[1],
+            ),
+            (
+                "queued-turn-2",
+                "queued-turn-3",
+                "after repeats",
+                &queued_ids[2],
+            ),
+        ] {
+            assert_queued_turn_starts(
+                &mut core,
+                &session_id,
+                completed_turn,
+                next_turn,
+                expected_prompt,
+                expected_id.as_str(),
+            );
+        }
+        assert!(
+            core.session_view(&session_id)
+                .expect("session view")
+                .queue
+                .is_empty(),
+            "every accepted follow-up leaves the authoritative queue exactly once"
+        );
+    }
+
+    #[test]
+    fn stale_prompt_send_does_not_weaken_other_revision_fences() {
+        let (mut core, session_id) = ready_codex_server();
+        let observed_revision = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .note_state_change();
+
+        let (result, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("stale-unsafe-mutation"),
+            Some(observed_revision),
+            false,
+            shell_command(&session_id, "pwd"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.code == ErrorCode::Conflict
+                    && error.message == "the expected revision is stale"
+        ));
+        assert!(effects.is_empty());
+        assert!(!changed);
+    }
+
+    #[test]
+    fn stale_prompt_send_uses_authoritative_state_when_the_active_turn_becomes_terminal() {
+        let (mut core, session_id) = ready_codex_server();
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnStarted {
+                    turn_id: "terminal-race-turn".to_owned(),
+                },
+            );
+        let observed_revision = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnCompleted {
+                    turn_id: "terminal-race-turn".to_owned(),
+                    outcome: crate::backend::TurnOutcome::Interrupted,
+                    error: None,
+                },
+            );
+        core.engine_for_mut(&session_id)
+            .expect("session engine")
+            .note_state_change();
+
+        let (result, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("send-after-terminal-race"),
+            Some(observed_revision),
+            false,
+            Command::SendPrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "run against current state".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        result.expect("terminal progress does not stale owner intent");
+        assert!(changed);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::state::Effect::Backend(BackendCommand::StartTurn { prompt, .. })
+                    if prompt.starts_with("run against current state")
+            )),
+            "execution-time idle send did not start a turn: {effects:?}"
+        );
+        assert!(
+            core.session_view(&session_id)
+                .expect("session view")
+                .queue
+                .is_empty(),
+            "an idle-at-execution send starts instead of being stranded in the queue"
+        );
+    }
+
+    #[test]
+    fn stale_prompt_send_still_refuses_a_closed_session() {
+        let (mut core, _) = ready_codex_server();
+        let closed_session = SessionId::from("closed-session");
+
+        let (result, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("send-to-closed-session"),
+            Some(1),
+            false,
+            Command::SendPrompt {
+                session_id: closed_session,
+                prompt: PromptInput {
+                    text: "do not drop me".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        assert!(matches!(result, Err(error) if error.code == ErrorCode::NotFound));
+        assert!(effects.is_empty());
+        assert!(!changed);
+    }
+
     #[test]
     fn replay_only_command_returns_the_cached_result_without_effects() {
         let (mut core, session_id) = ready_codex_server();
@@ -5403,6 +6172,8 @@ mod tests {
             display_name: "Codex".to_owned(),
             enabled: true,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         };
         let mut core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
 
@@ -5437,6 +6208,8 @@ mod tests {
             display_name: "Codex".to_owned(),
             enabled: true,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         };
         let core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
 
@@ -5458,6 +6231,8 @@ mod tests {
             display_name: "Codex".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         };
         let core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
 
@@ -6537,7 +7312,7 @@ first_message = "Starting review"
     #[test]
     fn logical_session_selects_a_model_before_a_native_session_exists() {
         let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+            AppState::new_for_backend(project_workspace(), None, 100, CODEX_PROVIDER, "Codex");
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
@@ -6628,7 +7403,7 @@ first_message = "Starting review"
     #[test]
     fn provider_default_selection_does_not_override_the_current_session() {
         let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+            AppState::new_for_backend(project_workspace(), None, 100, CODEX_PROVIDER, "Codex");
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
@@ -6938,6 +7713,7 @@ first_message = "Starting review"
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "stale-thread".to_owned(),
             workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
             title: "New session".to_owned(),
             model: None,
             model_options: crate::backend::ModelOptions::default(),
@@ -7077,7 +7853,7 @@ first_message = "Starting review"
     #[test]
     fn cancelling_session_work_uses_one_server_owned_policy_command() {
         let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+            AppState::new_for_backend(project_workspace(), None, 100, CODEX_PROVIDER, "Codex");
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
@@ -7138,7 +7914,7 @@ first_message = "Starting review"
     #[test]
     fn current_session_cancellation_overrides_intervening_revision_progress() {
         let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+            AppState::new_for_backend(project_workspace(), None, 100, CODEX_PROVIDER, "Codex");
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
@@ -7213,7 +7989,7 @@ first_message = "Starting review"
     #[test]
     fn current_session_cancellation_targets_a_successor_current_at_execution() {
         let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+            AppState::new_for_backend(project_workspace(), None, 100, CODEX_PROVIDER, "Codex");
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
@@ -7281,7 +8057,7 @@ first_message = "Starting review"
     #[test]
     fn cancelling_session_work_interrupts_manual_context_compaction() {
         let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+            AppState::new_for_backend(project_workspace(), None, 100, CODEX_PROVIDER, "Codex");
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
@@ -7392,7 +8168,7 @@ first_message = "Starting review"
     #[test]
     fn same_provider_work_is_accepted_for_independent_sessions() {
         let mut state =
-            AppState::new_for_backend("/tmp/project", None, 100, CODEX_PROVIDER, "Codex");
+            AppState::new_for_backend(project_workspace(), None, 100, CODEX_PROVIDER, "Codex");
         state.handle_provider_backend(
             CODEX_PROVIDER,
             BackendEvent::Ready(BackendIdentity {

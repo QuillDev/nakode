@@ -1,0 +1,15 @@
+# Provider model filtering is configured through the same public commands as external clients.
+{"action":"service","event":{"type":"ready","display_name":"Codex","capabilities":["model_catalog"]}}
+{"action":"service","event":{"type":"models","models":[{"id":"model-a","is_default":true},{"id":"model-b","is_default":false}]}}
+{"action":"type","text":"/providers"}
+{"action":"key","key":"enter"}
+{"action":"assert","modal":"providers","screen_contains":["Codex","enabled"]}
+{"action":"key","key":"enter"}
+{"action":"assert","modal":"providers","screen_contains":["Model filter disabled","2 candidates","f enable/disable model filter","m edit selected models"]}
+{"action":"type","text":"f"}
+{"action":"assert","commands_include":["set_provider_model_filter"]}
+{"action":"type","text":"m"}
+{"action":"assert","modal":"providers","screen_contains":["Codex model filter","[ ] Model","type search","Enter apply"]}
+{"action":"key","key":"space"}
+{"action":"key","key":"enter"}
+{"action":"assert","commands_include":["set_provider_model_filter"]}

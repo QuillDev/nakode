@@ -867,6 +867,11 @@ pub enum Effect {
     ListSessions,
     #[cfg(test)]
     ListProviders,
+    SetProviderModelFilter {
+        provider: String,
+        enabled: bool,
+        selected_model_ids: Vec<String>,
+    },
     SetProviderEnabled {
         provider: String,
         enabled: bool,
@@ -919,6 +924,7 @@ pub enum Effect {
         provider: String,
         provider_session_id: String,
         workspace: String,
+        working_directory: String,
         title: String,
         model: Option<String>,
         options: ModelOptions,
@@ -1002,7 +1008,10 @@ pub struct DomainState {
     #[cfg(test)]
     pub client: ClientPresentationState,
     pub connection: ConnectionState,
+    /// Logical workspace/service ownership path.
     pub workspace: String,
+    /// Filesystem and provider process root for this logical session.
+    pub working_directory: String,
     pub backend_provider: String,
     pub backend_name: String,
     pub backend_capabilities: BackendCapabilities,
@@ -1032,6 +1041,7 @@ pub struct DomainState {
     mcp_tools: Vec<nakode_protocol::ExternalToolDefinition>,
     mcp_archetype_grants: HashMap<String, HashSet<String>>,
     replace_builtin_tools: bool,
+    allowed_builtin_tools: Option<Vec<String>>,
     pub todo_phases: Vec<TodoPhase>,
     pub status_message: String,
     pub diagnostic_count: usize,
@@ -1646,6 +1656,7 @@ impl DomainState {
         backend_name: impl Into<String>,
     ) -> Self {
         let backend_name = backend_name.into();
+        let workspace = workspace.into();
         let transcript = DomainTranscript::new(scrollback);
         let provider = provider.into();
         let mut provider_contexts = HashMap::new();
@@ -1664,7 +1675,8 @@ impl DomainState {
             #[cfg(test)]
             client: ClientPresentationState::default(),
             connection: ConnectionState::Starting,
-            workspace: workspace.into(),
+            working_directory: workspace.clone(),
+            workspace,
             backend_provider: provider,
             backend_name: backend_name.clone(),
             backend_capabilities: BackendCapabilities::default(),
@@ -1697,6 +1709,7 @@ impl DomainState {
             mcp_tools: Vec::new(),
             mcp_archetype_grants: HashMap::new(),
             replace_builtin_tools: false,
+            allowed_builtin_tools: None,
             todo_phases: Vec::new(),
             status_message: format!("Connecting to {backend_name}…"),
             diagnostic_count: 0,
@@ -2417,7 +2430,15 @@ impl DomainState {
         };
     }
 
-    pub fn install_subagents(&mut self, records: Vec<SubagentRecord>) {
+    pub fn install_subagents(&mut self, mut records: Vec<SubagentRecord>) {
+        // This is the authoritative run boundary for both restoration and embedded/paged projection:
+        // oldest first by immutable start time, with stable run identity breaking timestamp ties.
+        records.sort_by(|left, right| {
+            left.observability
+                .started_at_ms
+                .cmp(&right.observability.started_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         self.subagents.clear();
         self.subagent_executions.clear();
         self.subagent_chats.clear();
@@ -2923,6 +2944,8 @@ impl DomainState {
             return Vec::new();
         }
         self.pending_handoff = None;
+        self.working_directory
+            .clone_from(&session.working_directory);
         self.selected_model.clone_from(&session.model);
         self.session_model_options_override = session
             .model
@@ -2957,7 +2980,7 @@ impl DomainState {
             owner_session_id: Some(self.nakode_session_id.clone()),
             external_tools: self.provider_external_tools(),
             replace_builtin_tools: self.replace_builtin_tools,
-            allowed_builtin_tools: None,
+            allowed_builtin_tools: self.allowed_builtin_tools.clone(),
             max_turns: None,
             timeout_seconds: None,
         }));
@@ -5182,7 +5205,31 @@ impl DomainState {
                 "session tools must be configured before the first prompt".to_owned(),
             ));
         }
-        self.validate_and_install_external_tools(tools, replace_builtin_tools)
+        self.configure_session_tools(tools, replace_builtin_tools, None)
+    }
+
+    /// Configures the complete client-owned and canonical builtin session tool boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after provider startup, for invalid external definitions, contradictory
+    /// replacement/allowlist policy, unknown canonical names, or unsupported provider projection.
+    pub fn configure_session_tools(
+        &mut self,
+        tools: Vec<nakode_protocol::ExternalToolDefinition>,
+        replace_builtin_tools: bool,
+        allowed_builtin_tools: Option<Vec<String>>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        if self.is_busy() || self.provider_session_id.is_some() {
+            return Err(DomainCommandError::Invalid(
+                "session tools must be configured before the first prompt".to_owned(),
+            ));
+        }
+        self.validate_and_install_external_tools(
+            tools,
+            replace_builtin_tools,
+            allowed_builtin_tools,
+        )
     }
 
     /// Verifies that an already-loaded session has the exact requested tool boundary.
@@ -5194,8 +5241,12 @@ impl DomainState {
         &mut self,
         tools: &[nakode_protocol::ExternalToolDefinition],
         replace_builtin_tools: bool,
+        allowed_builtin_tools: Option<&[String]>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        if self.external_tools == tools && self.replace_builtin_tools == replace_builtin_tools {
+        if self.external_tools == tools
+            && self.replace_builtin_tools == replace_builtin_tools
+            && self.allowed_builtin_tools.as_deref() == allowed_builtin_tools
+        {
             return Ok(Vec::new());
         }
         Err(DomainCommandError::Invalid(
@@ -5207,13 +5258,47 @@ impl DomainState {
         &mut self,
         tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
+        allowed_builtin_tools: Option<Vec<String>>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        if tools.is_empty() {
+        if tools.is_empty() && allowed_builtin_tools.is_none() && !replace_builtin_tools {
             return Err(DomainCommandError::Invalid(
-                "at least one external tool is required".to_owned(),
+                "at least one external tool, builtin allowlist, or explicit empty replacement is required"
+                    .to_owned(),
             ));
         }
         let mut names = HashSet::new();
+        if let Some(allowed) = &allowed_builtin_tools {
+            if allowed.is_empty() {
+                return Err(DomainCommandError::Invalid(
+                    "allowed builtin tools must be non-empty; replace builtins to deny all"
+                        .to_owned(),
+                ));
+            }
+            if replace_builtin_tools {
+                return Err(DomainCommandError::Invalid(
+                    "allowed builtin tools cannot be combined with builtin replacement".to_owned(),
+                ));
+            }
+            let mut canonical_names = HashSet::new();
+            for name in allowed {
+                if !crate::agent::CANONICAL_AGENT_TOOLS.contains(&name.as_str())
+                    || !canonical_names.insert(name.as_str())
+                {
+                    return Err(DomainCommandError::Invalid(
+                        "allowed builtin tool names must be canonical and unique".to_owned(),
+                    ));
+                }
+            }
+            let projection =
+                crate::backend::project_provider_tools(&self.backend_provider, Some(allowed));
+            if !projection.unsupported_canonical_tools.is_empty() {
+                return Err(DomainCommandError::Invalid(format!(
+                    "provider {} cannot project allowed builtin tools: {}",
+                    self.backend_name,
+                    projection.unsupported_canonical_tools.join(", ")
+                )));
+            }
+        }
         for tool in &tools {
             if tool.name.trim().is_empty() || !names.insert(tool.name.as_str()) {
                 return Err(DomainCommandError::Invalid(
@@ -5239,6 +5324,7 @@ impl DomainState {
         }
         self.external_tools = tools;
         self.replace_builtin_tools = replace_builtin_tools;
+        self.allowed_builtin_tools = allowed_builtin_tools;
         Ok(Vec::new())
     }
 
@@ -5835,6 +5921,7 @@ impl DomainState {
                 provider: self.backend_provider.clone(),
                 provider_session_id: provider_session_id.clone(),
                 workspace: self.workspace.clone(),
+                working_directory: self.working_directory.clone(),
                 title: prompt.text.clone(),
                 model: self.selected_model.clone(),
                 options: prompt.options.clone(),
@@ -6377,6 +6464,7 @@ impl DomainState {
                 provider: self.backend_provider.clone(),
                 provider_session_id: provider_session_id.clone(),
                 workspace: self.workspace.clone(),
+                working_directory: self.working_directory.clone(),
                 title: prompt.text.clone(),
                 model: self.selected_model.clone(),
                 options: prompt.options.clone(),
@@ -6397,7 +6485,7 @@ impl DomainState {
                 parent_run_id: None,
                 external_tools: self.provider_external_tools(),
                 replace_builtin_tools: self.replace_builtin_tools,
-                allowed_builtin_tools: None,
+                allowed_builtin_tools: self.allowed_builtin_tools.clone(),
                 max_turns: None,
                 timeout_seconds: None,
             })]
@@ -7123,7 +7211,17 @@ impl DomainState {
                 ..SubagentObservability::default()
             },
         };
-        self.subagents.push(run.clone());
+        let insertion = self
+            .subagents
+            .binary_search_by(|existing| {
+                existing
+                    .observability
+                    .started_at_ms
+                    .cmp(&run.observability.started_at_ms)
+                    .then_with(|| existing.id.cmp(&run.id))
+            })
+            .unwrap_or_else(|index| index);
+        self.subagents.insert(insertion, run.clone());
         self.sync_inline_subagent(&run);
         let mut transcript = DomainTranscript::new(self.transcript_limit);
         transcript.set_stream_label(definition.slug.clone());
@@ -7293,6 +7391,34 @@ impl DomainState {
         };
         self.prompt_addenda
             .apply(&base, self.selected_model.as_deref())
+    }
+
+    /// Sets the already canonicalized filesystem/provider root before a fresh session is published.
+    pub fn set_working_directory(&mut self, working_directory: String) {
+        self.working_directory = working_directory;
+    }
+
+    /// Omits memory tools only when memory is explicitly configured off.
+    ///
+    /// Configured but unavailable backends remain requested so genuine installation, locking, or
+    /// transient failures continue to fail closed at the runtime boundary.
+    #[must_use]
+    pub fn omit_disabled_memory_tools(
+        &self,
+        mut tools: nakode_protocol::SessionToolConfiguration,
+    ) -> nakode_protocol::SessionToolConfiguration {
+        if self.memory_config.backend != MemoryBackend::Disabled {
+            return tools;
+        }
+        let Some(allowed) = tools.allowed_builtin_tools.as_mut() else {
+            return tools;
+        };
+        allowed.retain(|name| !matches!(name.as_str(), "memory_search" | "memory_store"));
+        if allowed.is_empty() {
+            tools.allowed_builtin_tools = None;
+            tools.replace_builtin_tools = true;
+        }
+        tools
     }
 
     /// Installs bounded client-owned provider instructions before the first provider session starts.
@@ -8718,6 +8844,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-with-mcp".to_owned(),
             workspace: state.workspace.clone(),
+            working_directory: state.workspace.clone(),
             title: "Diagram work".to_owned(),
             model: Some("model-a".to_owned()),
             model_options: crate::backend::ModelOptions::default(),
@@ -11366,6 +11493,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-resumed".to_owned(),
             workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
             title: "Previous work".to_owned(),
             model: Some("model-a".to_owned()),
             model_options: crate::backend::ModelOptions::default(),
@@ -12086,6 +12214,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "codex-restored".to_owned(),
             workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
             title: "Restored transition".to_owned(),
             model: Some("devin-acp/devin-model".to_owned()),
             model_options: ModelOptions::default(),
@@ -13046,6 +13175,42 @@ model = "claude-agent/sonnet"
 
         assert_eq!(state.subagents.len(), super::MAX_CONCURRENT_SUBAGENTS);
         assert!(state.has_running_subagents());
+        let ordered_ids = state
+            .subagents
+            .iter()
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        let mut expected_ids = ordered_ids.clone();
+        expected_ids.sort_by(|left, right| {
+            let left = state
+                .subagents
+                .iter()
+                .find(|run| &run.id == left)
+                .expect("live run");
+            let right = state
+                .subagents
+                .iter()
+                .find(|run| &run.id == right)
+                .expect("live run");
+            left.observability
+                .started_at_ms
+                .cmp(&right.observability.started_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        assert_eq!(ordered_ids, expected_ids);
+        let session = projection::bootstrap(&state, 7, &[], &[])
+            .active_session
+            .expect("live session projection");
+        assert_eq!(session.runs_total, Some(4));
+        assert_eq!(
+            session
+                .runs
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            ordered_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(!session.runs_has_earlier);
         let rejected = state.invoke_agent(&AgentRequest {
             id: 99,
             agent: "explorer".to_owned(),
@@ -13391,6 +13556,8 @@ model = "claude-agent/sonnet"
                 kind: "chatgpt_device_code".to_owned(),
                 updated_at: 1,
             }),
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
 
         state.open_provider_details();
@@ -13425,6 +13592,8 @@ model = "claude-agent/sonnet"
             display_name: "Cursor".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
         state.open_provider_details();
 
@@ -13454,6 +13623,8 @@ model = "claude-agent/sonnet"
             display_name: "Kimi For Coding".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
         state.open_provider_details();
 
@@ -13480,6 +13651,8 @@ model = "claude-agent/sonnet"
             display_name: "GLM Coding Plan (z.ai)".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
         state.open_provider_details();
 
@@ -13506,6 +13679,8 @@ model = "claude-agent/sonnet"
             display_name: "Cursor".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
         state.open_provider_details();
         let _ = state.toggle_provider();
@@ -13531,6 +13706,8 @@ model = "claude-agent/sonnet"
             display_name: "Codex".to_owned(),
             enabled: false,
             credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
         }]);
         state.open_provider_details();
 

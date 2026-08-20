@@ -53,7 +53,10 @@ pub struct SessionRecord {
     pub id: String,
     pub provider: String,
     pub provider_session_id: String,
+    /// Logical workspace/service ownership path.
     pub workspace: String,
+    /// Canonical filesystem/provider process root. Legacy rows inherit `workspace`.
+    pub working_directory: String,
     pub title: String,
     pub model: Option<String>,
     /// Authoritative session-local configuration for the next owner turn.
@@ -151,6 +154,8 @@ pub struct ProviderRecord {
     pub display_name: String,
     pub enabled: bool,
     pub credential: Option<CredentialMetadata>,
+    pub model_filter_enabled: bool,
+    pub selected_model_ids: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -345,6 +350,7 @@ pub trait SessionRepository: Send + Sync {
             provider,
             provider_session_id,
             workspace,
+            workspace,
             title,
             model,
             &ModelOptions::default(),
@@ -361,6 +367,7 @@ pub trait SessionRepository: Send + Sync {
         provider: &str,
         provider_session_id: &str,
         workspace: &str,
+        working_directory: &str,
         title: &str,
         model: Option<&str>,
         options: &ModelOptions,
@@ -485,6 +492,16 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when persistence cannot be updated.
     fn set_provider_enabled(&self, provider: &str, enabled: bool) -> Result<(), SessionError>;
+    /// Updates one provider's discoverability filter without changing model authorization.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
+    fn set_provider_model_filter(
+        &self,
+        provider: &str,
+        enabled: bool,
+        selected_model_ids: &[String],
+    ) -> Result<(), SessionError>;
     /// Saves the current durable projection of a sub-agent run and its transcript.
     ///
     /// # Errors
@@ -614,6 +631,7 @@ impl SqliteSessionRepository {
                provider TEXT NOT NULL,
                provider_session_id TEXT NOT NULL,
                workspace TEXT NOT NULL,
+               working_directory TEXT,
                title TEXT NOT NULL,
                model TEXT,
                model_reasoning_effort TEXT,
@@ -687,6 +705,11 @@ impl SqliteSessionRepository {
                display_name TEXT NOT NULL,
                enabled INTEGER NOT NULL,
                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS provider_model_filters (
+               provider TEXT PRIMARY KEY REFERENCES providers(provider) ON DELETE CASCADE,
+               enabled INTEGER NOT NULL DEFAULT 0,
+               selected_model_ids TEXT NOT NULL DEFAULT '[]'
              );
              CREATE TABLE IF NOT EXISTS provider_credentials (
                provider TEXT PRIMARY KEY REFERENCES providers(provider) ON DELETE CASCADE,
@@ -939,6 +962,7 @@ impl SqliteSessionRepository {
             ("last_turn_reasoning_effort", "TEXT"),
             ("last_turn_fast_mode", "INTEGER NOT NULL DEFAULT 0"),
             ("last_turn_outcome", "TEXT"),
+            ("working_directory", "TEXT"),
         ] {
             if !session_columns.iter().any(|existing| existing == column) {
                 writeln!(
@@ -1207,6 +1231,7 @@ impl SqliteSessionRepository {
             provider: row.get(1)?,
             provider_session_id: row.get(2)?,
             workspace: row.get(3)?,
+            working_directory: row.get(15)?,
             title: row.get(4)?,
             model: row.get(5)?,
             model_options: ModelOptions {
@@ -1715,7 +1740,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
@@ -1736,7 +1761,7 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
+                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
                  FROM sessions WHERE id = ?1",
                 [id],
                 Self::row,
@@ -1749,7 +1774,7 @@ impl SessionRepository for SqliteSessionRepository {
         }
         let pattern = format!("{id}%");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
              FROM sessions WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
         )?;
         let matches = statement
@@ -1774,6 +1799,7 @@ impl SessionRepository for SqliteSessionRepository {
         provider: &str,
         provider_session_id: &str,
         workspace: &str,
+        working_directory: &str,
         title: &str,
         model: Option<&str>,
         options: &ModelOptions,
@@ -1791,8 +1817,8 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         connection.execute(
             "INSERT INTO sessions
-             (id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             (id, provider, provider_session_id, workspace, working_directory, title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
              ON CONFLICT(provider, provider_session_id) DO UPDATE SET
                model = excluded.model,
                model_reasoning_effort = excluded.model_reasoning_effort,
@@ -1803,6 +1829,7 @@ impl SessionRepository for SqliteSessionRepository {
                 provider,
                 provider_session_id,
                 workspace,
+                working_directory,
                 title,
                 model,
                 options.reasoning_effort,
@@ -1811,7 +1838,7 @@ impl SessionRepository for SqliteSessionRepository {
             ],
         )?;
         connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -2365,15 +2392,19 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT p.provider, p.display_name, p.enabled,
-                    c.credential_kind, c.updated_at
+                    c.credential_kind, c.updated_at,
+                    COALESCE(f.enabled, 0), COALESCE(f.selected_model_ids, '[]')
              FROM providers p
              LEFT JOIN provider_credentials c ON c.provider = p.provider
+             LEFT JOIN provider_model_filters f ON f.provider = p.provider
              ORDER BY p.display_name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
             let provider = row.get::<_, String>(0)?;
             let credential_kind = row.get::<_, Option<String>>(3)?;
             let credential_updated_at = row.get::<_, Option<i64>>(4)?;
+            let selected_model_ids =
+                serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default();
             Ok(ProviderRecord {
                 provider: provider.clone(),
                 display_name: row.get(1)?,
@@ -2385,6 +2416,8 @@ impl SessionRepository for SqliteSessionRepository {
                         kind,
                         updated_at,
                     }),
+                model_filter_enabled: row.get::<_, i64>(5)? != 0,
+                selected_model_ids,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2398,6 +2431,28 @@ impl SessionRepository for SqliteSessionRepository {
         let updated = connection.execute(
             "UPDATE providers SET enabled = ?1, updated_at = ?2 WHERE provider = ?3",
             params![i64::from(enabled), unix_timestamp(), provider],
+        )?;
+        if updated == 0 {
+            return Err(SessionError::ProviderNotFound(provider.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn set_provider_model_filter(
+        &self,
+        provider: &str,
+        enabled: bool,
+        selected_model_ids: &[String],
+    ) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let updated = connection.execute(
+            "INSERT INTO provider_model_filters (provider, enabled, selected_model_ids)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(provider) DO UPDATE SET enabled = excluded.enabled, selected_model_ids = excluded.selected_model_ids",
+            params![provider, i64::from(enabled), serde_json::to_string(selected_model_ids).expect("model ids serialize")],
         )?;
         if updated == 0 {
             return Err(SessionError::ProviderNotFound(provider.to_owned()));
@@ -2521,7 +2576,7 @@ impl SessionRepository for SqliteSessionRepository {
                     termination_kind, termination_detail, objective_mismatch_handoff
              FROM orchestration_runs
              WHERE parent_session_id = ?1
-             ORDER BY created_at, id",
+             ORDER BY started_at_ms, id",
         )?;
         let rows = statement.query_map([parent_session_id], |row| {
             Ok((
@@ -3017,6 +3072,47 @@ mod tests {
         };
         store.save_memory_config(&configured)?;
         assert_eq!(store.load_memory_config()?, configured);
+        Ok(())
+    }
+
+    #[test]
+    fn session_cwd_persists_and_legacy_null_rows_inherit_workspace() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let created = store.create_with_id(
+            "logical-session",
+            CODEX_PROVIDER,
+            "provider-session",
+            "/logical/workspace",
+            "/explicit/repository",
+            "Session",
+            None,
+            &ModelOptions::default(),
+        )?;
+        assert_eq!(created.working_directory, "/explicit/repository");
+        assert_eq!(
+            store
+                .find("logical-session")?
+                .expect("persisted session")
+                .working_directory,
+            "/explicit/repository"
+        );
+
+        store
+            .connection
+            .lock()
+            .expect("session database mutex poisoned")
+            .execute(
+                "UPDATE sessions SET working_directory = NULL WHERE id = ?1",
+                ["logical-session"],
+            )?;
+        assert_eq!(
+            store
+                .find("logical-session")?
+                .expect("legacy session")
+                .working_directory,
+            "/logical/workspace"
+        );
         Ok(())
     }
 
@@ -3584,6 +3680,46 @@ mod tests {
             .find(|provider| provider.provider == DEVIN_PROVIDER)
             .expect("Devin provider");
         assert!(!devin.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn persists_independent_provider_model_filters() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("providers.db"))?;
+        let codex = store
+            .list_providers()?
+            .into_iter()
+            .find(|provider| provider.provider == CODEX_PROVIDER)
+            .expect("Codex provider");
+        assert!(!codex.model_filter_enabled);
+        assert!(codex.selected_model_ids.is_empty());
+
+        store.set_provider_model_filter(
+            CODEX_PROVIDER,
+            true,
+            &[
+                "openai-codex/stale-model".to_owned(),
+                "openai-codex/model-a".to_owned(),
+            ],
+        )?;
+        store.set_provider_model_filter(DEVIN_PROVIDER, true, &[])?;
+        let providers = store.list_providers()?;
+        let codex = providers
+            .iter()
+            .find(|provider| provider.provider == CODEX_PROVIDER)
+            .expect("Codex provider");
+        assert!(codex.model_filter_enabled);
+        assert_eq!(
+            codex.selected_model_ids,
+            ["openai-codex/stale-model", "openai-codex/model-a"]
+        );
+        let devin = providers
+            .iter()
+            .find(|provider| provider.provider == DEVIN_PROVIDER)
+            .expect("Devin provider");
+        assert!(devin.model_filter_enabled);
+        assert!(devin.selected_model_ids.is_empty());
         Ok(())
     }
 

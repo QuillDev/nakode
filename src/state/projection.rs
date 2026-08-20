@@ -67,6 +67,7 @@ pub fn bootstrap(
             SessionSummary {
                 id: SessionId::from(state.nakode_session_id.clone()),
                 workspace_id: workspace_id.clone(),
+                working_directory: state.working_directory.clone(),
                 title: active_session.title.clone(),
                 active_provider_id: provider_id(&state.backend_provider),
                 active_model_id: state.selected_model.clone().map(ModelId::from),
@@ -89,20 +90,18 @@ pub fn bootstrap(
         models: state
             .models
             .iter()
-            .map(|model| {
-                let qualified = model.qualified_id();
-                let options = state.model_options_for_qualified(&qualified);
-                ModelView {
-                    id: ModelId::from(qualified),
-                    provider_id: ProviderId::from(model.provider.clone()),
-                    model_slug: model.id.clone(),
-                    display_name: model.display_name(),
-                    is_default: model.is_default,
-                    reasoning_effort: options.reasoning_effort,
-                    fast_mode: options.fast_mode,
-                    configuration: model_configuration(model, state.vision_config.is_enabled()),
-                }
+            .filter(|model| {
+                providers
+                    .iter()
+                    .find(|p| p.provider == model.provider)
+                    .is_none_or(|p| {
+                        !p.model_filter_enabled
+                            || p.selected_model_ids
+                                .iter()
+                                .any(|id| id == &model.qualified_id())
+                    })
             })
+            .map(|model| model_view(state, model))
             .collect(),
         agents: state
             .agents
@@ -232,6 +231,7 @@ fn session_view(
         id: session_id.clone(),
         revision,
         workspace_id: workspace_id.clone(),
+        working_directory: state.working_directory.clone(),
         title: session_title(state, sessions),
         status_message: state.status_message.clone(),
         diagnostic_count: u64::try_from(state.diagnostic_count).unwrap_or(u64::MAX),
@@ -254,6 +254,7 @@ fn session_view(
         interactions: interactions(state, revision),
         todos: todo_views(state),
         runs,
+        runs_total: Some(u64::try_from(state.subagents.len()).unwrap_or(u64::MAX)),
         runs_has_earlier,
         notices: notice_views(state, revision),
         external_tool_calls: state
@@ -1063,6 +1064,21 @@ fn notice_views(state: &DomainState, revision: u64) -> Vec<NoticeView> {
         .collect()
 }
 
+fn model_view(state: &DomainState, model: &ModelInfo) -> ModelView {
+    let qualified = model.qualified_id();
+    let options = state.model_options_for_qualified(&qualified);
+    ModelView {
+        id: ModelId::from(qualified),
+        provider_id: ProviderId::from(model.provider.clone()),
+        model_slug: model.id.clone(),
+        display_name: model.display_name(),
+        is_default: model.is_default,
+        reasoning_effort: options.reasoning_effort,
+        fast_mode: options.fast_mode,
+        configuration: model_configuration(model, state.vision_config.is_enabled()),
+    }
+}
+
 fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView {
     let connection = state.provider_connection(&provider.provider).map_or_else(
         || {
@@ -1101,6 +1117,19 @@ fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView
             .provider_capabilities(&provider.provider)
             .map_or_else(ProviderCapabilities::default, capabilities_view),
         authentication,
+        model_filter_enabled: provider.model_filter_enabled,
+        selected_model_ids: provider
+            .selected_model_ids
+            .iter()
+            .cloned()
+            .map(ModelId::from)
+            .collect(),
+        model_candidates: state
+            .models
+            .iter()
+            .filter(|model| model.provider == provider.provider)
+            .map(|model| model_view(state, model))
+            .collect(),
     }
 }
 
@@ -1531,6 +1560,7 @@ fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> Sessi
     SessionSummary {
         id: SessionId::from(session.id.clone()),
         workspace_id: workspace_id.clone(),
+        working_directory: session.working_directory.clone(),
         title: session.title.clone(),
         active_provider_id: provider_id(&session.provider),
         active_model_id: session.model.clone().map(ModelId::from),
@@ -1750,7 +1780,7 @@ mod tests {
             CapabilitySupport, ModelInfo, PromptImage,
         },
         domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
-        session::{SubagentObservability, SubagentRecord},
+        session::{ProviderRecord, SubagentObservability, SubagentRecord},
         state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
     };
 
@@ -1819,6 +1849,58 @@ mod tests {
         assert_eq!(
             model_configuration(&model("other-provider", "model"), false),
             nakode_protocol::ModelConfigurationView::default()
+        );
+    }
+
+    #[test]
+    fn provider_filters_only_the_ordinary_catalogue_and_preserves_candidates_and_stale_ids() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        state.models = vec![
+            model(CODEX_PROVIDER, "visible"),
+            model(CODEX_PROVIDER, "hidden"),
+            model(CLAUDE_PROVIDER, "all-models"),
+        ];
+        let providers = vec![
+            ProviderRecord {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                enabled: true,
+                credential: None,
+                model_filter_enabled: true,
+                selected_model_ids: vec![
+                    format!("{CODEX_PROVIDER}/visible"),
+                    format!("{CODEX_PROVIDER}/stale"),
+                ],
+            },
+            ProviderRecord {
+                provider: CLAUDE_PROVIDER.to_owned(),
+                display_name: "Claude".to_owned(),
+                enabled: true,
+                credential: None,
+                model_filter_enabled: false,
+                selected_model_ids: Vec::new(),
+            },
+        ];
+
+        let view = bootstrap(&state, 1, &providers, &[]);
+        assert_eq!(
+            view.models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["openai-codex/visible", "claude-agent/all-models"]
+        );
+        let codex = view
+            .providers
+            .iter()
+            .find(|provider| provider.id.as_str() == CODEX_PROVIDER)
+            .expect("Codex provider");
+        assert_eq!(codex.model_candidates.len(), 2);
+        assert!(
+            codex
+                .selected_model_ids
+                .iter()
+                .any(|id| id.as_str() == "openai-codex/stale")
         );
     }
 
@@ -1961,36 +2043,79 @@ mod tests {
         );
     }
 
+    fn subagent_records(parent_session_id: &str, count: usize) -> Vec<SubagentRecord> {
+        (0..count)
+            .rev()
+            .map(|index| SubagentRecord {
+                parent_session_id: parent_session_id.to_owned(),
+                id: format!("run-{index:03}"),
+                agent: "reviewer".to_owned(),
+                provider: CODEX_PROVIDER.to_owned(),
+                model: None,
+                provider_session_id: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                objective: format!("Review {index}"),
+                status: SubagentStatus::Completed,
+                latest_activity: "Completed".to_owned(),
+                transcript: Vec::new(),
+                observability: SubagentObservability {
+                    // Exercise the session-wide recursive semantics: descendants count and compete
+                    // at the same latest-64 boundary as direct runs.
+                    parent_run_id: (index % 2 == 1).then(|| format!("run-{:03}", index - 1)),
+                    ..SubagentObservability::default()
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn session_run_window_and_authoritative_total_are_independent_at_every_cap_boundary() {
+        for count in [0, 7, MAX_SESSION_RUNS, MAX_SESSION_RUNS + 17] {
+            let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+            let parent_session_id = state.nakode_session_id.clone();
+            state.install_subagents(subagent_records(&parent_session_id, count));
+
+            let session = bootstrap(&state, 2, &[], &[])
+                .active_session
+                .expect("active session");
+            assert_eq!(
+                session.runs_total,
+                Some(u64::try_from(count).expect("test count"))
+            );
+            assert_eq!(session.runs.len(), count.min(MAX_SESSION_RUNS));
+            assert_eq!(session.runs_has_earlier, count > MAX_SESSION_RUNS);
+
+            let first_retained = count.saturating_sub(MAX_SESSION_RUNS);
+            assert_eq!(
+                session.runs.first().map(|run| run.id.as_str()),
+                (count > 0)
+                    .then(|| format!("run-{first_retained:03}"))
+                    .as_deref()
+            );
+            assert_eq!(
+                session.runs.last().map(|run| run.id.as_str()),
+                count
+                    .checked_sub(1)
+                    .map(|index| format!("run-{index:03}"))
+                    .as_deref()
+            );
+        }
+    }
+
     #[test]
     fn omitted_runs_are_discoverable_through_complete_cursor_pagination() {
         let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
         let parent_session_id = state.nakode_session_id.clone();
-        state.install_subagents(
-            (0..150)
-                .map(|index| SubagentRecord {
-                    parent_session_id: parent_session_id.clone(),
-                    id: format!("run-{index:03}"),
-                    agent: "reviewer".to_owned(),
-                    provider: CODEX_PROVIDER.to_owned(),
-                    model: None,
-                    provider_session_id: None,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cached_input_tokens: 0,
-                    cache_write_tokens: 0,
-                    objective: format!("Review {index}"),
-                    status: SubagentStatus::Completed,
-                    latest_activity: "Completed".to_owned(),
-                    transcript: Vec::new(),
-                    observability: SubagentObservability::default(),
-                })
-                .collect(),
-        );
+        state.install_subagents(subagent_records(&parent_session_id, 150));
 
         let session = bootstrap(&state, 2, &[], &[])
             .active_session
             .expect("active session");
         assert_eq!(session.runs.len(), MAX_SESSION_RUNS);
+        assert_eq!(session.runs_total, Some(150));
         assert!(session.runs_has_earlier);
 
         let mut before = None;

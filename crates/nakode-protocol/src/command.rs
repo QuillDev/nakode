@@ -168,6 +168,9 @@ pub struct ExternalToolDefinition {
 pub struct SessionToolConfiguration {
     pub tools: Vec<ExternalToolDefinition>,
     pub replace_builtin_tools: bool,
+    /// Non-empty canonical Nakode builtin names allowed for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_builtin_tools: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -242,6 +245,9 @@ pub enum SettingsPatch {
 pub enum Command {
     CreateSession {
         workspace_id: WorkspaceId,
+        /// Canonical filesystem/provider root. `None` inherits the logical workspace path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_directory: Option<String>,
         title: Option<String>,
         /// A provider-qualified initial selection. `None` inherits the workspace/provider default.
         model_id: Option<ModelId>,
@@ -334,6 +340,10 @@ pub enum Command {
         consume_as_busy: bool,
     },
     /// Sends a prompt using server-owned queue-versus-start policy.
+    ///
+    /// This append-only owner intent is evaluated against authoritative lifecycle state at execution
+    /// time. A transport-provided expected revision does not fence it; its idempotency key provides
+    /// exactly-once retry semantics instead.
     SendPrompt {
         session_id: SessionId,
         prompt: PromptInput,
@@ -407,6 +417,11 @@ pub enum Command {
     SetProviderEnabled {
         provider_id: ProviderId,
         enabled: bool,
+    },
+    SetProviderModelFilter {
+        provider_id: ProviderId,
+        enabled: bool,
+        selected_model_ids: Vec<ModelId>,
     },
     BeginProviderAuthentication {
         provider_id: ProviderId,
@@ -577,6 +592,7 @@ mod tests {
         let session_id = SessionId::from("session-1");
         let creation = Command::CreateSession {
             workspace_id: WorkspaceId::from("workspace-1"),
+            working_directory: Some("/repo/project".to_owned()),
             title: Some("Dashboard assistant".to_owned()),
             model_id: Some(ModelId::from("anthropic/claude-opus-5")),
             options: ModelOptions {

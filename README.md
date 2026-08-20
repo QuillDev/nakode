@@ -105,7 +105,10 @@ Nakode currently supports:
 
 Providers are disabled on a fresh installation. Start Nakode, open
 `/providers`, and sign in to the providers you want to use. Press `F2` to browse
-and select from their available models.
+and select from their available models. Provider details can independently enable a model filter and
+select exact provider/model IDs from a searchable, scrollable catalogue. Filtering defaults off.
+When enabled it changes ordinary model discovery only: exact persisted or explicitly requested IDs
+remain addressable, and stale selected IDs remain visible rather than being substituted.
 
 Nakode does not require the separate Codex, Devin, Kimi, or z.ai applications. Claude
 uses the official Claude Agent SDK and the login managed by an installed Claude Code
@@ -125,11 +128,19 @@ model.
 
 ## Installation
 
-Nakode requires Git and Rust 1.88 or newer. Install it with this command:
+Nakode requires Git and Rust 1.88 or newer. Source is hosted on Cursor Origin.
+Sign in with the Origin CLI before cloning or running `nakode update`:
+
+```sh
+curl -fsSL https://downloads.cursor.com/origin/install.sh | sh
+origin auth login
+```
+
+Then install Nakode with this command:
 
 ```sh
 mkdir -p "$HOME/.nakode" && \
-  git clone https://github.com/QuillDev/nakode.git "$HOME/.nakode/src" && \
+  git clone https://origin.cursor.com/fragile-inc/nakode.git "$HOME/.nakode/src" && \
   "$HOME/.nakode/src/install.sh"
 ```
 
@@ -145,8 +156,10 @@ Update the checkout, rebuild Nakode, and replace the installed executable with:
 nakode update
 ```
 
-`nakode update` runs `git pull --ff-only` in `~/.nakode/src` and then runs that
-checkout's `install.sh`. `nakode --update` is supported as a convenience alias.
+`nakode update` retargets a GitHub or legacy Origin `/git/` remote to
+`https://origin.cursor.com/fragile-inc/nakode.git` when needed, then runs
+`git pull --ff-only` in `~/.nakode/src` and that checkout's `install.sh`.
+`nakode --update` is supported as a convenience alias.
 
 For local development in another checkout, `./install.sh --debug` reuses the
 development build for much faster iteration, at the cost of a larger and less
@@ -360,9 +373,12 @@ uv tool install 'mnemosyne-memory[mcp]'
 
 Then open `/settings` → **Add-ons** → **Memory**, select **Mnemosyne**, confirm
 the executable, and choose the Mnemosyne bank used for global user memory.
-Semantic embeddings remain optional and can be installed with
-`mnemosyne-memory[mcp,embeddings]`. Nakode supervises local MCP processes and
-stores memories in Mnemosyne's SQLite data directory.
+By default Nakode stores Mnemosyne banks under Nakode home (`NAKODE_HOME`,
+defaulting to `~/.nakode`), instead of inheriting Mnemosyne's application-wide
+default directory. Set **Data directory** explicitly to override this location.
+Semantic embeddings remain optional and can be installed with `mnemosyne-memory[mcp,embeddings]`.
+Nakode supervises local MCP processes and stores memories in Mnemosyne's SQLite
+data directory.
 
 Nakode manages a deterministic project bank for each workspace; project-bank names
 are internal and are not user settings. Every `memory_store` call must explicitly

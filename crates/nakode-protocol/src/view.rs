@@ -108,6 +108,13 @@ pub struct ProviderView {
     pub connection: ConnectionView,
     pub capabilities: ProviderCapabilities,
     pub authentication: Option<ProviderAuthenticationView>,
+    #[serde(default)]
+    pub model_filter_enabled: bool,
+    #[serde(default)]
+    pub selected_model_ids: Vec<ModelId>,
+    /// Full discovered catalogue used by settings; BootstrapView.models may be filtered.
+    #[serde(default)]
+    pub model_candidates: Vec<ModelView>,
 }
 
 /// Product surface that owns the user-facing projection of one logical session.
@@ -179,6 +186,9 @@ pub struct SessionSummary {
     pub id: SessionId,
     pub workspace_id: WorkspaceId,
     pub title: String,
+    /// Canonical filesystem/provider process root, independent from logical workspace ownership.
+    #[serde(default)]
+    pub working_directory: String,
     pub active_provider_id: Option<ProviderId>,
     pub active_model_id: Option<ModelId>,
     pub updated_at_ms: i64,
@@ -765,6 +775,9 @@ pub struct SessionView {
     pub id: SessionId,
     pub revision: u64,
     pub workspace_id: WorkspaceId,
+    /// Canonical filesystem/provider process root, independent from logical workspace ownership.
+    #[serde(default)]
+    pub working_directory: String,
     pub title: String,
     pub status_message: String,
     pub diagnostic_count: u64,
@@ -793,6 +806,10 @@ pub struct SessionView {
     pub interactions: Vec<InteractionView>,
     pub todos: Vec<TodoPhaseView>,
     pub runs: Vec<RunView>,
+    /// All delegated runs owned by this logical session before the bounded `runs` projection.
+    /// Includes both direct runs and recursively delegated descendants.
+    #[serde(default)]
+    pub runs_total: Option<u64>,
     #[serde(default)]
     pub runs_has_earlier: bool,
     pub notices: Vec<NoticeView>,

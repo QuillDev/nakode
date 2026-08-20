@@ -49,6 +49,9 @@ service NakodeService {
   rpc DeleteSession(DeleteSessionRequest) returns (MutationResult);
   rpc GetSession(GetSessionRequest) returns (SessionSnapshot);
   rpc WatchSession(WatchSessionRequest) returns (stream SessionSnapshot);
+  // Appends one owner prompt and evaluates start-versus-queue against authoritative state when the
+  // command executes. expected_revision does not fence this operation; idempotency_key distinguishes
+  // deliberate repeated sends from a retry of one logical send.
   rpc SendPrompt(SendPromptRequest) returns (MutationResult);
   rpc EnqueuePrompt(EnqueuePromptRequest) returns (MutationResult);
   rpc RemoveQueuedPrompt(RemoveQueuedPromptRequest) returns (MutationResult);
@@ -67,6 +70,7 @@ service NakodeService {
 
   rpc SelectModel(SelectModelRequest) returns (MutationResult);
   rpc SetProviderEnabled(SetProviderEnabledRequest) returns (MutationResult);
+  rpc SetProviderModelFilter(SetProviderModelFilterRequest) returns (MutationResult);
   rpc BeginProviderAuthentication(BeginProviderAuthenticationRequest) returns (MutationResult);
   rpc SetProviderCredential(SetProviderCredentialRequest) returns (MutationResult);
   rpc ClearProviderCredential(ClearProviderCredentialRequest) returns (MutationResult);
@@ -93,6 +97,8 @@ service NakodeService {
 message MutationOptions {
   // SDK-generated and stable across a retry of one logical operation.
   string idempotency_key = 1;
+  // For revision-fenced commands, a mismatch rejects the mutation. SendPrompt is append-only owner
+  // intent and ignores this field so incidental turn progress cannot reject a safe queue append.
   // When omitted, the command is evaluated against authoritative state current at execution time.
   optional uint64 expected_revision = 2;
 }
@@ -137,6 +143,9 @@ message WorkspaceSnapshot { Cursor cursor = 1; WorkspaceState state = 2; }
 message SessionToolConfiguration {
   repeated ExternalToolDefinition tools = 1;
   bool replace_builtin_tools = 2;
+  // Non-empty canonical Nakode builtin names allowed for this session.
+  // Omission keeps the runtime default; use replace_builtin_tools to deny every builtin.
+  repeated string allowed_builtin_tools = 3;
 }
 
 // A fresh session may carry its provider-qualified model, options, and client-owned tool surface in
@@ -161,6 +170,9 @@ message CreateSessionRequest {
   optional string initial_instructions = 8;
   // Optional provider-neutral Chat/Agent external-thread projection intent.
   optional SessionBridgeIntent bridge = 9;
+  // Filesystem/provider process root for this session. Omission inherits the logical workspace path.
+  // The server canonicalizes and persists this directory before publishing the session.
+  optional string working_directory = 10;
 }
 // Supplying tools installs them before a closed session begins provider restoration. An already
 // attached session accepts only the identical table, making client reattachment idempotent without
@@ -473,6 +485,7 @@ message ModelTarget {
 }
 message SelectModelRequest { MutationOptions mutation = 1; ModelTarget target = 2; string model_id = 3; ModelOptions options = 4; }
 message SetProviderEnabledRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; }
+message SetProviderModelFilterRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; repeated string selected_model_ids = 4; }
 message BeginProviderAuthenticationRequest { MutationOptions mutation = 1; string provider_id = 2; }
 message SetProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; string kind = 3; string credential = 4; }
 message ClearProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; }
@@ -612,7 +625,7 @@ enum ProviderCapability {
 enum ConnectionState { CONNECTION_STATE_UNSPECIFIED = 0; CONNECTION_STATE_DISABLED = 1; CONNECTION_STATE_STARTING = 2; CONNECTION_STATE_READY = 3; CONNECTION_STATE_FAILED = 4; CONNECTION_STATE_DISCONNECTED = 5; }
 message Connection { ConnectionState state = 1; optional string message = 2; }
 message ProviderAuthentication { enum Kind { KIND_UNSPECIFIED = 0; KIND_STARTING = 1; KIND_API_KEY_REQUIRED = 2; KIND_CHALLENGE = 3; } Kind kind = 1; optional string dashboard_url = 2; optional string credential_kind = 3; optional string verification_url = 4; optional string user_code = 5; }
-message Provider { string id = 1; string display_name = 2; bool enabled = 3; bool credential_configured = 4; optional string credential_kind = 5; Connection connection = 6; ProviderCapabilities capabilities = 7; optional ProviderAuthentication authentication = 8; }
+message Provider { string id = 1; string display_name = 2; bool enabled = 3; bool credential_configured = 4; optional string credential_kind = 5; Connection connection = 6; ProviderCapabilities capabilities = 7; optional ProviderAuthentication authentication = 8; bool model_filter_enabled = 9; repeated string selected_model_ids = 10; repeated Model model_candidates = 11; }
 message ModelConfiguration { repeated string reasoning_efforts = 1; bool fast_mode_configurable = 2; bool vision_eligible = 3; bool accepts_image_input = 4; }
 message Model { string id = 1; string provider_id = 2; string model_slug = 3; string display_name = 4; bool is_default = 5; optional string reasoning_effort = 6; bool fast_mode = 7; ModelConfiguration configuration = 8; }
 message AgentDefinition {
@@ -676,6 +689,8 @@ message SessionSummary {
   bool running = 8;
   // Unix epoch milliseconds. The immutable logical-session creation boundary.
   int64 created_at_ms = 9;
+  // Canonical filesystem/provider process root, independent from logical workspace ownership.
+  string working_directory = 10;
 }
 enum SessionActivity { SESSION_ACTIVITY_UNSPECIFIED = 0; SESSION_ACTIVITY_IDLE = 1; SESSION_ACTIVITY_CREATING_AGENT_SESSION = 2; SESSION_ACTIVITY_STARTING_TURN = 3; SESSION_ACTIVITY_RUNNING_TURN = 4; SESSION_ACTIVITY_COMPACTING_CONTEXT = 5; SESSION_ACTIVITY_RUNNING_DELEGATES = 6; SESSION_ACTIVITY_RUNNING_SHELL = 7; }
 message TokenUsage { uint64 input_tokens = 1; uint64 output_tokens = 2; uint64 cached_input_tokens = 3; uint64 cache_write_tokens = 4; }
@@ -735,6 +750,12 @@ message SessionState {
   bool next_turn_configuration_pending = 26;
   // Server-authored transition semantics for the selected next-turn configuration.
   optional string next_turn_transition = 27;
+  // All delegated runs owned by this logical session before the bounded `runs` projection.
+  // Includes direct runs and recursively delegated descendants. Presence distinguishes a real zero
+  // from an older server that predates this field.
+  optional uint64 runs_total = 28;
+  // Canonical filesystem/provider process root, independent from logical workspace ownership.
+  string working_directory = 29;
 }
 message ExternalToolCall { string id = 1; string name = 2; string arguments_json = 3; }
 

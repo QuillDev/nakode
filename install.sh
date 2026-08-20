@@ -4,8 +4,12 @@ set -eu
 script_directory="$(CDPATH= cd -P "$(dirname "$0")" && pwd -P)"
 invocation_directory="$(pwd -P)"
 
+# Canonical managed-source remote. GitHub and legacy Origin /git/ remotes are
+# rewritten to this so `nakode update` can pull after the move to Origin.
+canonical_source_remote='https://origin.cursor.com/fragile-inc/nakode.git'
+
 usage() {
-  cat <<'EOF'
+  cat <<EOF
 Usage: ./install.sh [--debug] [--system | --prefix PATH]
 
 Build and install the Nakode executable. Rerun the same command after updating
@@ -19,8 +23,83 @@ Options:
   --prefix PATH  Install to PATH/bin without using sudo.
   -h, --help     Show this help.
 
-The default prefix is $HOME/.local, or $PREFIX when that variable is set.
+The default prefix is \$HOME/.local, or \$PREFIX when that variable is set.
+
+Clone and update from Cursor Origin:
+  $canonical_source_remote
+Sign in first with the Origin CLI (\`origin auth login\`) so git can reach it.
 EOF
+}
+
+strip_url_credentials() {
+  url=$1
+  case "$url" in
+    *://*@*)
+      scheme=${url%%://*}
+      rest=${url#*://}
+      userinfo=${rest%%@*}
+      hostpath=${rest#*@}
+      case "$userinfo" in
+        */*)
+          printf '%s\n' "$url"
+          ;;
+        *)
+          printf '%s\n' "$scheme://$hostpath"
+          ;;
+      esac
+      ;;
+    *)
+      printf '%s\n' "$url"
+      ;;
+  esac
+}
+
+is_managed_upstream_url() {
+  cleaned=$(strip_url_credentials "$1")
+  cleaned=${cleaned%/}
+  cleaned=${cleaned%.git}
+  case "$cleaned" in
+    https://github.com/QuillDev/nakode | \
+      http://github.com/QuillDev/nakode | \
+      git@github.com:QuillDev/nakode | \
+      ssh://git@github.com/QuillDev/nakode | \
+      ssh://github.com/QuillDev/nakode | \
+      https://origin.cursor.com/git/fragile-inc/nakode | \
+      http://origin.cursor.com/git/fragile-inc/nakode | \
+      https://origin.cursor.com/fragile-inc/nakode | \
+      http://origin.cursor.com/fragile-inc/nakode | \
+      git@origin.cursor.com:fragile-inc/nakode | \
+      git@origin.cursor.com:git/fragile-inc/nakode | \
+      ssh://git@origin.cursor.com/fragile-inc/nakode | \
+      ssh://git@origin.cursor.com/git/fragile-inc/nakode | \
+      ssh://origin.cursor.com/fragile-inc/nakode | \
+      ssh://origin.cursor.com/git/fragile-inc/nakode)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+normalize_managed_source_remote() {
+  if ! command -v git >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! git -C "$script_directory" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+
+  current_remote="$(git -C "$script_directory" config --get remote.origin.url 2>/dev/null || true)"
+  if [ -z "$current_remote" ] || [ "$current_remote" = "$canonical_source_remote" ]; then
+    return 0
+  fi
+  if ! is_managed_upstream_url "$current_remote"; then
+    return 0
+  fi
+
+  printf '%s\n' "Retargeting the source remote to $canonical_source_remote"
+  git -C "$script_directory" remote set-url origin "$canonical_source_remote"
 }
 
 system_install=false
@@ -115,6 +194,7 @@ if [ -d "$destination" ]; then
 fi
 
 cd "$script_directory"
+normalize_managed_source_remote
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
   CARGO_TARGET_DIR="$script_directory/target"
   export CARGO_TARGET_DIR

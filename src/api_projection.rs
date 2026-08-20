@@ -63,6 +63,11 @@ pub(crate) enum TuiAction {
         provider_id: view::ProviderId,
         enabled: bool,
     },
+    SetProviderModelFilter {
+        provider_id: view::ProviderId,
+        enabled: bool,
+        selected_model_ids: Vec<view::ModelId>,
+    },
     BeginProviderAuthentication {
         provider_id: view::ProviderId,
     },
@@ -224,6 +229,9 @@ async fn execute_management_command(
                 })
                 .await
         }
+        action @ TuiAction::SetProviderModelFilter { .. } => {
+            execute_provider_model_filter(client, action).await
+        }
         TuiAction::BeginProviderAuthentication { provider_id } => {
             client
                 .begin_provider_authentication(api::BeginProviderAuthenticationRequest {
@@ -256,6 +264,31 @@ async fn execute_management_command(
         }
         other => execute_catalog_command(client, other).await,
     }
+}
+
+async fn execute_provider_model_filter(
+    client: &nakode_sdk::NakodeClient,
+    action: TuiAction,
+) -> Result<api::MutationResult, nakode_sdk::SdkError> {
+    let TuiAction::SetProviderModelFilter {
+        provider_id,
+        enabled,
+        selected_model_ids,
+    } = action
+    else {
+        unreachable!("called only for provider model filters")
+    };
+    client
+        .set_provider_model_filter(api::SetProviderModelFilterRequest {
+            mutation: None,
+            provider_id: provider_id.to_string(),
+            enabled,
+            selected_model_ids: selected_model_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+        })
+        .await
 }
 
 async fn execute_catalog_command(
@@ -554,6 +587,7 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
         id: view::SessionId::from(value.id),
         revision: value.revision,
         workspace_id: view::WorkspaceId::from(value.workspace_id),
+        working_directory: value.working_directory,
         title: value.title,
         status_message: value.status_message,
         diagnostic_count: value.diagnostic_count,
@@ -604,6 +638,7 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
             .map(todo_phase)
             .collect::<Result<_, _>>()?,
         runs: value.runs.into_iter().map(run).collect::<Result<_, _>>()?,
+        runs_total: value.runs_total,
         runs_has_earlier: value.runs_has_earlier,
         notices: value
             .notices
@@ -712,6 +747,13 @@ fn provider(value: api::Provider) -> Result<view::ProviderView, String> {
         connection: connection(required(value.connection, "provider connection")?)?,
         capabilities: capabilities(value.capabilities.unwrap_or_default())?,
         authentication: value.authentication.map(authentication).transpose()?,
+        model_filter_enabled: value.model_filter_enabled,
+        selected_model_ids: value
+            .selected_model_ids
+            .into_iter()
+            .map(view::ModelId::from)
+            .collect(),
+        model_candidates: value.model_candidates.into_iter().map(model).collect(),
     })
 }
 
@@ -893,6 +935,7 @@ fn session_summary(value: api::SessionSummary) -> view::SessionSummary {
     view::SessionSummary {
         id: view::SessionId::from(value.id),
         workspace_id: view::WorkspaceId::from(value.workspace_id),
+        working_directory: value.working_directory,
         title: value.title,
         active_provider_id: value.active_provider_id.map(view::ProviderId::from),
         active_model_id: value.active_model_id.map(view::ModelId::from),

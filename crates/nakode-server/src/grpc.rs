@@ -250,6 +250,8 @@ fn session_tools(
             })
             .collect(),
         replace_builtin_tools: value.replace_builtin_tools,
+        allowed_builtin_tools: (!value.allowed_builtin_tools.is_empty())
+            .then_some(value.allowed_builtin_tools),
     })
 }
 
@@ -739,6 +741,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         input,
         protocol::Command::CreateSession {
             workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            working_directory: input.working_directory,
             title: input.title,
             model_id: input.model_id.map(protocol::ModelId::from),
             options: model_options(input.options),
@@ -1161,6 +1164,20 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         protocol::Command::SetProviderEnabled {
             provider_id: protocol::ProviderId::from(input.provider_id),
             enabled: input.enabled
+        }
+    );
+    command_rpc!(
+        set_provider_model_filter,
+        api::SetProviderModelFilterRequest,
+        input,
+        protocol::Command::SetProviderModelFilter {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            enabled: input.enabled,
+            selected_model_ids: input
+                .selected_model_ids
+                .into_iter()
+                .map(protocol::ModelId::from)
+                .collect()
         }
     );
     command_rpc!(
@@ -1820,6 +1837,13 @@ fn provider(value: protocol::ProviderView) -> api::Provider {
         connection: Some(connection(value.connection)),
         capabilities: Some(capabilities(value.capabilities)),
         authentication: value.authentication.map(authentication),
+        model_filter_enabled: value.model_filter_enabled,
+        selected_model_ids: value
+            .selected_model_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+        model_candidates: value.model_candidates.into_iter().map(model).collect(),
     }
 }
 
@@ -2018,6 +2042,7 @@ pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSu
         id: value.id.to_string(),
         workspace_id: value.workspace_id.to_string(),
         title: value.title,
+        working_directory: value.working_directory,
         active_provider_id: value.active_provider_id.map(|id| id.to_string()),
         active_model_id: value.active_model_id.map(|id| id.to_string()),
         updated_at_ms: value.updated_at_ms,
@@ -2039,6 +2064,7 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         id: value.id.to_string(),
         revision: value.revision,
         workspace_id: value.workspace_id.to_string(),
+        working_directory: value.working_directory,
         title: value.title,
         status_message: value.status_message,
         diagnostic_count: value.diagnostic_count,
@@ -2058,6 +2084,7 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         interactions: value.interactions.into_iter().map(interaction).collect(),
         todos: value.todos.into_iter().map(todo_phase).collect(),
         runs: value.runs.into_iter().map(run).collect(),
+        runs_total: value.runs_total,
         runs_has_earlier: value.runs_has_earlier,
         notices: value.notices.into_iter().map(notice).collect(),
         external_tool_calls: value
