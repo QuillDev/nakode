@@ -536,7 +536,14 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::ResolveExternalTool { id, output, failed } => {
             if let Some(runtime) = context.runtime {
                 runtime
-                    .resolve_external_tool(&id, crate::tools::ToolResult { output, failed })
+                    .resolve_external_tool(
+                        &id,
+                        crate::tools::ToolResult {
+                            output,
+                            failed,
+                            invocation_identity: None,
+                        },
+                    )
                     .await;
             }
         }

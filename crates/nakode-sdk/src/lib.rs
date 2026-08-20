@@ -976,6 +976,35 @@ impl NakodeClient {
             .into_inner())
     }
 
+    /// Returns local invocation consent and aggregate usage, including current zero-use items.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn get_invocation_summary(&self) -> Result<api::InvocationSummary, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .get_invocation_summary(api::GetInvocationSummaryRequest {})
+            .await?
+            .into_inner())
+    }
+
+    /// Returns bounded server-bucketed invocation history.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn get_invocation_timeline(
+        &self,
+        request: api::GetInvocationTimelineRequest,
+    ) -> Result<api::InvocationTimeline, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .get_invocation_timeline(request)
+            .await?
+            .into_inner())
+    }
+
     /// Returns Nakode's redacted, workspace-scoped MCP management snapshot.
     ///
     /// # Errors

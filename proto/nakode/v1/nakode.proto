@@ -91,6 +91,10 @@ service NakodeService {
   rpc GetRunTextWindow(GetRunTextWindowRequest) returns (RunTextWindow);
   rpc GetArtifact(GetArtifactRequest) returns (Artifact);
   rpc GetDiagnostics(GetDiagnosticsRequest) returns (DiagnosticsReport);
+  // Local-only owner-opted capability invocation usage. Summary joins current catalogue entries;
+  // timeline is server-bucketed and bounded, never an unbounded raw event stream.
+  rpc GetInvocationSummary(GetInvocationSummaryRequest) returns (InvocationSummary);
+  rpc GetInvocationTimeline(GetInvocationTimelineRequest) returns (InvocationTimeline);
   rpc GetServerInfo(google.protobuf.Empty) returns (ServerInfo);
 }
 
@@ -533,12 +537,14 @@ message WebSettingsPatch { string backend = 1; optional string credential = 2; }
 message MemorySettingsPatch { string backend = 1; optional string executable = 2; optional string global_bank = 3; optional string data_directory = 4; }
 message VisionSettingsPatch { optional string model_id = 1; bool clear_model = 2; }
 message TerminalImagesSettingsPatch { string mode = 1; }
+message InvocationTelemetrySettingsPatch { bool enabled = 1; }
 message SettingsPatch {
   oneof patch {
     WebSettingsPatch web = 1;
     MemorySettingsPatch memory = 2;
     VisionSettingsPatch vision = 3;
     TerminalImagesSettingsPatch terminal_images = 4;
+    InvocationTelemetrySettingsPatch invocation_telemetry = 5;
   }
 }
 message UpdateSettingsRequest { MutationOptions mutation = 1; SettingsPatch patch = 2; }
@@ -558,6 +564,12 @@ enum RunTextField { RUN_TEXT_FIELD_UNSPECIFIED = 0; RUN_TEXT_FIELD_OBJECTIVE = 1
 message GetRunTextWindowRequest { string run_id = 1; RunTextField field = 2; optional uint64 before_byte = 3; uint32 limit_bytes = 4; }
 message GetArtifactRequest { string artifact_id = 1; }
 message GetDiagnosticsRequest { uint32 days = 1; uint32 session_limit = 2; optional string provider_id = 3; }
+message GetInvocationSummaryRequest {}
+message GetInvocationTimelineRequest {
+  uint64 start_at_ms = 1;
+  uint64 end_at_ms = 2;
+  uint64 bucket_width_ms = 3;
+}
 
 message WorkspaceState {
   string workspace_id = 1;
@@ -676,7 +688,13 @@ message AgentBrowser { enum State { STATE_UNSPECIFIED = 0; STATE_CHECKING = 1; S
 message MemorySettings { string backend = 1; string executable = 2; string global_bank = 3; string data_directory = 4; bool configured = 5; bool available = 6; }
 message VisionSettings { optional string model_id = 1; }
 enum TerminalImageMode { TERMINAL_IMAGE_MODE_UNSPECIFIED = 0; TERMINAL_IMAGE_MODE_AUTO = 1; TERMINAL_IMAGE_MODE_ON = 2; TERMINAL_IMAGE_MODE_OFF = 3; }
-message Settings { WebSettings web = 1; MemorySettings memory = 2; VisionSettings vision = 3; TerminalImageMode terminal_images = 4; }
+message Settings {
+  WebSettings web = 1;
+  MemorySettings memory = 2;
+  VisionSettings vision = 3;
+  TerminalImageMode terminal_images = 4;
+  bool invocation_telemetry_enabled = 5;
+}
 
 message OwnedProviderSession { string provider_id = 1; string native_session_id = 2; }
 message SessionSummary {
@@ -877,3 +895,26 @@ message DiagnosticsDailyUsage { string date_utc = 1; string provider_id = 2; Dia
 message DiagnosticsToolUsage { string provider_id = 1; string tool = 2; uint64 calls = 3; uint64 failures = 4; uint64 full_output_bytes = 5; uint64 model_output_bytes = 6; uint64 duration_ms = 7; }
 message DiagnosticsSessionUsage { string session_id = 1; string provider_id = 2; string model = 3; uint64 latest_activity_ms = 4; DiagnosticsUsageTotals totals = 5; }
 message DiagnosticsReport { uint64 generated_at_ms = 1; uint32 period_days = 2; optional string provider_filter = 3; uint64 sessions_scanned = 4; uint64 sessions_with_activity = 5; DiagnosticsUsageTotals totals = 6; repeated DiagnosticsDailyUsage daily = 7; repeated DiagnosticsToolUsage tools = 8; repeated DiagnosticsSessionUsage sessions = 9; repeated string notes = 10; }
+
+enum InvocationKind {
+  INVOCATION_KIND_UNSPECIFIED = 0;
+  INVOCATION_KIND_ARCHETYPE = 1;
+  INVOCATION_KIND_SKILL = 2;
+}
+message InvocationUsage {
+  InvocationKind kind = 1;
+  string identity = 2;
+  string display_label = 3;
+  bool currently_installed = 4;
+  uint64 invocation_count = 5;
+  optional uint64 first_used_at_ms = 6;
+  optional uint64 last_used_at_ms = 7;
+}
+message InvocationSummary { bool enabled = 1; repeated InvocationUsage items = 2; }
+message InvocationBucket { uint64 start_at_ms = 1; uint64 archetype_count = 2; uint64 skill_count = 3; }
+message InvocationTimeline {
+  uint64 start_at_ms = 1;
+  uint64 end_at_ms = 2;
+  uint64 bucket_width_ms = 3;
+  repeated InvocationBucket buckets = 4;
+}

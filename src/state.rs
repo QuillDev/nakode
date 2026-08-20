@@ -973,6 +973,8 @@ pub enum Effect {
     SaveMemoryConfig(MemoryConfig),
     SaveVisionConfig(crate::vision::VisionConfig),
     SaveTerminalImageMode(TerminalImageMode),
+    SaveInvocationTelemetryEnabled(bool),
+    RecordInvocation(crate::session::InvocationRecord),
     CheckAgentBrowser,
     #[cfg(test)]
     Quit,
@@ -1012,6 +1014,8 @@ pub struct ClientPresentationState {
 }
 
 #[derive(Clone, Debug)]
+// Independent lifecycle and consent facts are protocol state, not one interchangeable flag set.
+#[allow(clippy::struct_excessive_bools)]
 pub struct DomainState {
     #[cfg(test)]
     pub client: ClientPresentationState,
@@ -1085,6 +1089,7 @@ pub struct DomainState {
     memory_config: MemoryConfig,
     vision_config: crate::vision::VisionConfig,
     terminal_image_mode: TerminalImageMode,
+    invocation_telemetry_enabled: bool,
     agent_browser_status: AgentBrowserStatus,
 }
 
@@ -1178,6 +1183,7 @@ impl DomainState {
         self.memory_config.clone_from(&source.memory_config);
         self.vision_config.clone_from(&source.vision_config);
         self.terminal_image_mode = source.terminal_image_mode;
+        self.invocation_telemetry_enabled = source.invocation_telemetry_enabled;
         self.agent_browser_status
             .clone_from(&source.agent_browser_status);
     }
@@ -1203,6 +1209,37 @@ impl DomainState {
 
     pub fn install_terminal_image_mode(&mut self, mode: TerminalImageMode) {
         self.terminal_image_mode = mode;
+    }
+
+    pub fn install_invocation_telemetry_enabled(&mut self, enabled: bool) {
+        self.invocation_telemetry_enabled = enabled;
+    }
+
+    #[must_use]
+    pub const fn invocation_telemetry_enabled(&self) -> bool {
+        self.invocation_telemetry_enabled
+    }
+
+    #[must_use]
+    pub fn invocation_catalogue(&self) -> Vec<(nakode_protocol::InvocationKind, String, String)> {
+        self.agents
+            .definitions()
+            .iter()
+            .map(|agent| {
+                (
+                    nakode_protocol::InvocationKind::Archetype,
+                    agent.stable_id().to_owned(),
+                    agent.slug.clone(),
+                )
+            })
+            .chain(self.skills.definitions().iter().map(|skill| {
+                (
+                    nakode_protocol::InvocationKind::Skill,
+                    skill.stable_id().to_owned(),
+                    skill.name.clone(),
+                )
+            }))
+            .collect()
     }
 
     #[must_use]
@@ -1751,6 +1788,7 @@ impl DomainState {
             memory_config: MemoryConfig::default(),
             vision_config: crate::vision::VisionConfig::default(),
             terminal_image_mode: TerminalImageMode::default(),
+            invocation_telemetry_enabled: false,
             agent_browser_status: AgentBrowserStatus::Unavailable,
         }
     }
@@ -4239,6 +4277,9 @@ impl DomainState {
                 };
                 Ok(vec![Effect::SaveTerminalImageMode(mode)])
             }
+            nakode_protocol::SettingsPatch::InvocationTelemetry { enabled } => {
+                Ok(vec![Effect::SaveInvocationTelemetryEnabled(*enabled)])
+            }
         }
     }
 
@@ -5681,7 +5722,8 @@ impl DomainState {
             | BackendEvent::ContextCompactionStarted { .. }
             | BackendEvent::ContextCompactionCompleted { .. }
             | BackendEvent::ContextCompactionFailed { .. }
-            | BackendEvent::SessionUnsubscribed => {}
+            | BackendEvent::SessionUnsubscribed
+            | BackendEvent::SkillInvoked { .. } => {}
             BackendEvent::SessionObserved {
                 provider_session_id,
             } => self.observe_session(provider_session_id),
@@ -7254,6 +7296,9 @@ impl DomainState {
                 reasoning_summaries: ReasoningSummaryTracker::default(),
             },
         );
+        let invocation_identity = definition.stable_id().to_owned();
+        let invocation_label = definition.slug.clone();
+        let invocation_at_ms = run.observability.started_at_ms;
         self.subagent_executions.insert(
             run_id.clone(),
             SubagentExecution {
@@ -7270,10 +7315,19 @@ impl DomainState {
             },
         );
         self.status_message = format!("Spawned subagent {agent_slug} as {run_id}.");
-        let mut effects = vec![Effect::SpawnSubagent {
-            run_id: run_id.clone(),
-            provider,
-        }];
+        let mut effects = vec![
+            Effect::SpawnSubagent {
+                run_id: run_id.clone(),
+                provider,
+            },
+            Effect::RecordInvocation(crate::session::InvocationRecord {
+                invocation_key: format!("archetype:{run_id}"),
+                kind: nakode_protocol::InvocationKind::Archetype,
+                identity: invocation_identity,
+                display_label: invocation_label,
+                occurred_at_ms: invocation_at_ms,
+            }),
+        ];
         if let Some(effect) = self.persist_subagent_effect(&run_id) {
             effects.push(effect);
         }
@@ -7604,6 +7658,7 @@ impl DomainState {
             | BackendEvent::ContextCompactionFailed { .. }
             | BackendEvent::TurnDiff { .. }
             | BackendEvent::TurnPlan { .. }
+            | BackendEvent::SkillInvoked { .. }
             | BackendEvent::ExternalToolRequested(_)
             | BackendEvent::ApprovalResolved { .. }
             | BackendEvent::SteerAccepted { .. }
@@ -8753,6 +8808,18 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         )
         .expect("agent definition");
         AgentCatalog::load(directory.path()).expect("agent catalog")
+    }
+
+    fn spawned_subagent(effects: &[Effect]) -> (&str, &str) {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SpawnSubagent {
+                    run_id, provider, ..
+                } => Some((run_id.as_str(), provider.as_str())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected subagent launch, got {effects:?}"))
     }
 
     fn ready_state() -> AppState {
@@ -12673,11 +12740,9 @@ fast_mode = true
             agent: "cursor-explorer".to_owned(),
             task: "Map auth".to_owned(),
         });
-        let [Effect::SpawnSubagent { run_id, provider }] = effects.as_slice() else {
-            panic!("expected Cursor subagent launch");
-        };
+        let (run_id, provider) = spawned_subagent(&effects);
         assert_eq!(provider, CURSOR_PROVIDER);
-        let run_id = run_id.clone();
+        let run_id = run_id.to_owned();
 
         let effects = state.handle_subagent_backend(
             &run_id,
@@ -12910,10 +12975,8 @@ tool_profile = "none"
             agent: "restricted".to_owned(),
             task: "Inspect nothing".to_owned(),
         });
-        let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
-            panic!("expected a subagent launch");
-        };
-        let run_id = run_id.clone();
+        let (run_id, _) = spawned_subagent(&effects);
+        let run_id = run_id.to_owned();
 
         let effects = state.handle_subagent_backend(
             &run_id,
@@ -12952,10 +13015,8 @@ tool_profile = "none"
             agent: slug.to_owned(),
             task: "Map auth".to_owned(),
         });
-        let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
-            panic!("expected a subagent launch, got {effects:?}");
-        };
-        let run_id = run_id.clone();
+        let (run_id, _) = spawned_subagent(&effects);
+        let run_id = run_id.to_owned();
         state.handle_subagent_backend(
             &run_id,
             BackendEvent::Ready(BackendIdentity {
@@ -12990,9 +13051,7 @@ tool_profile = "none"
             agent: "explorer".to_owned(),
             task: "Map auth".to_owned(),
         });
-        let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
-            panic!("expected a subagent launch");
-        };
+        let (run_id, _) = spawned_subagent(&effects);
 
         let effects = state.handle_subagent_backend(
             run_id,
@@ -13027,7 +13086,11 @@ tool_profile = "none"
         let (run_id, launch) = state
             .delegate_agent_attributed_for_request("explorer", "Inspect native routing", None, 77)
             .expect("native delegation");
-        assert!(matches!(launch.as_slice(), [Effect::SpawnSubagent { .. }]));
+        assert!(
+            launch
+                .iter()
+                .any(|effect| matches!(effect, Effect::SpawnSubagent { .. }))
+        );
         let effects = state.cancel_run(&run_id).expect("cancel native child");
         assert!(effects.iter().any(|effect| matches!(
             effect,
@@ -13045,11 +13108,9 @@ tool_profile = "none"
             agent: "explorer".to_owned(),
             task: "Map auth".to_owned(),
         });
-        let [Effect::SpawnSubagent { run_id, provider }] = effects.as_slice() else {
-            panic!("expected a subagent launch");
-        };
+        let (run_id, provider) = spawned_subagent(&effects);
         assert_eq!(provider, CODEX_PROVIDER);
-        let run_id = run_id.clone();
+        let run_id = run_id.to_owned();
         assert!(state.has_running_subagents());
 
         let effects = state.handle_subagent_backend(
@@ -13223,10 +13284,8 @@ model = "claude-agent/sonnet"
                 agent: "explorer".to_owned(),
                 task: format!("Independent investigation {request_id}"),
             });
-            let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
-                panic!("fan-out request should launch a child");
-            };
-            assert!(run_ids.insert(run_id.clone()));
+            let (run_id, _) = spawned_subagent(&effects);
+            assert!(run_ids.insert(run_id.to_owned()));
         }
 
         assert_eq!(state.subagents.len(), super::MAX_CONCURRENT_SUBAGENTS);
@@ -13291,9 +13350,7 @@ model = "claude-agent/sonnet"
             agent: "explorer".to_owned(),
             task: "Map authentication".to_owned(),
         });
-        let [Effect::SpawnSubagent { run_id, provider }] = effects.as_slice() else {
-            panic!("expected explorer launch");
-        };
+        let (run_id, provider) = spawned_subagent(&effects);
         assert_eq!(provider, DEVIN_PROVIDER);
 
         let effects = state.handle_subagent_backend(
@@ -13326,10 +13383,8 @@ model = "claude-agent/sonnet"
             agent: "explorer".to_owned(),
             task: "Map authentication".to_owned(),
         });
-        let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
-            panic!("expected explorer launch");
-        };
-        let run_id = run_id.clone();
+        let (run_id, _) = spawned_subagent(&effects);
+        let run_id = run_id.to_owned();
 
         let retry = state.subagent_launch_failed(&run_id, "Devin is unavailable".to_owned());
         assert!(matches!(
@@ -13372,10 +13427,8 @@ model = "claude-agent/sonnet"
             agent: "explorer".to_owned(),
             task: "Map authentication".to_owned(),
         });
-        let [Effect::SpawnSubagent { run_id, .. }] = effects.as_slice() else {
-            panic!("expected explorer launch");
-        };
-        let run_id = run_id.clone();
+        let (run_id, _) = spawned_subagent(&effects);
+        let run_id = run_id.to_owned();
         let _ = state.handle_subagent_backend(
             &run_id,
             BackendEvent::Ready(BackendIdentity {
@@ -13423,11 +13476,17 @@ model = "claude-agent/sonnet"
 
         let [
             Effect::SpawnSubagent { run_id, .. },
+            Effect::RecordInvocation(invocation),
             Effect::PersistSubagent(record),
         ] = effects.as_slice()
         else {
-            panic!("expected child launch and durable orchestration projection");
+            panic!(
+                "expected child launch, invocation telemetry, and durable orchestration projection"
+            );
         };
+        assert_eq!(invocation.invocation_key, format!("archetype:{run_id}"));
+        assert_eq!(invocation.kind, nakode_protocol::InvocationKind::Archetype);
+        assert_eq!(invocation.identity, "explorer");
         assert_eq!(&record.parent_session_id, "logical-parent");
         assert_eq!(&record.id, run_id);
         assert_eq!(record.objective, "Map persistence");

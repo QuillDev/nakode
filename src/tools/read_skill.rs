@@ -51,9 +51,11 @@ impl Tool for ReadSkillTool {
                 let skill = catalogue.find(name).ok_or_else(|| {
                     format!("skill {name:?} is not installed in the current Nakode workspace")
                 })?;
-                Ok::<_, String>(skill.instructions.clone())
+                Ok::<_, String>((skill.instructions.clone(), skill.stable_id().to_owned()))
             })();
-            result.map_or_else(ToolResult::failure, ToolResult::success)
+            result.map_or_else(ToolResult::failure, |(instructions, identity)| {
+                ToolResult::success(instructions).with_invocation_identity(identity)
+            })
         })
     }
 }

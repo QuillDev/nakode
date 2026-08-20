@@ -2219,6 +2219,7 @@ impl ServerCore {
         self.ensure_workspace(workspace_id)?;
         let slug = definition.slug.clone();
         let definition = AgentDefinition {
+            id: String::new(),
             slug: definition.slug,
             description: definition.description,
             system_prompt: definition.system_prompt,
@@ -2505,9 +2506,11 @@ impl ServerCore {
                 limit_bytes,
             } => self.query_run_text_window(&run_id, field, before_byte, limit_bytes),
             Query::GetArtifact { artifact_id } => self.query_artifact(&artifact_id),
-            Query::GetDiagnostics { .. } => Err(service_error(
+            Query::GetDiagnostics { .. }
+            | Query::GetInvocationSummary
+            | Query::GetInvocationTimeline { .. } => Err(service_error(
                 ErrorCode::Internal,
-                "diagnostics is served by the native runtime",
+                "telemetry queries are served by the native runtime",
                 false,
             )),
         }

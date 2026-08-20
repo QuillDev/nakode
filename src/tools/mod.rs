@@ -53,6 +53,8 @@ pub struct ToolContext<'a> {
 pub struct ToolResult {
     pub output: String,
     pub failed: bool,
+    /// Server-internal stable identity for successful capability invocation telemetry.
+    pub invocation_identity: Option<String>,
 }
 
 impl ToolResult {
@@ -61,6 +63,7 @@ impl ToolResult {
         Self {
             output: output.into(),
             failed: false,
+            invocation_identity: None,
         }
     }
 
@@ -69,7 +72,14 @@ impl ToolResult {
         Self {
             output: output.into(),
             failed: true,
+            invocation_identity: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_invocation_identity(mut self, identity: impl Into<String>) -> Self {
+        self.invocation_identity = Some(identity.into());
+        self
     }
 }
 
@@ -668,7 +678,7 @@ mod tests {
         std::fs::create_dir_all(&skill).expect("skill directory");
         std::fs::write(
             skill.join("SKILL.md"),
-            "---\nname: review\ndescription: Review carefully\n---\n\nFULL REVIEW PROCEDURE\n",
+            "---\nid: fragile.review.v1\nname: review\ndescription: Review carefully\n---\n\nFULL REVIEW PROCEDURE\n",
         )
         .expect("skill definition");
         let mut harness = ToolHarness {
@@ -685,12 +695,17 @@ mod tests {
             .await;
         assert!(!result.failed, "{}", result.output);
         assert!(result.output.contains("FULL REVIEW PROCEDURE"));
+        assert_eq!(
+            result.invocation_identity.as_deref(),
+            Some("fragile.review.v1")
+        );
 
         let missing = harness
             .execute("read_skill", json!({"name": "missing"}))
             .await;
         assert!(missing.failed);
         assert!(missing.output.contains("not installed"));
+        assert!(missing.invocation_identity.is_none());
     }
 
     #[tokio::test]

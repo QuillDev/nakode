@@ -482,6 +482,9 @@ fn api_settings_patch(value: view::SettingsPatch) -> api::SettingsPatch {
             view::SettingsPatch::TerminalImages { mode } => {
                 Patch::TerminalImages(api::TerminalImagesSettingsPatch { mode })
             }
+            view::SettingsPatch::InvocationTelemetry { enabled } => {
+                Patch::InvocationTelemetry(api::InvocationTelemetrySettingsPatch { enabled })
+            }
         }),
     }
 }
@@ -916,6 +919,7 @@ fn settings(value: api::Settings) -> Result<view::SettingsView, String> {
                 return Err("unspecified terminal image mode".into());
             }
         },
+        invocation_telemetry_enabled: value.invocation_telemetry_enabled,
     })
 }
 

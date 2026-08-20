@@ -756,6 +756,8 @@ pub struct SettingsView {
     pub memory: MemorySettingsView,
     pub vision: VisionSettingsView,
     pub terminal_images: TerminalImageModeView,
+    #[serde(default)]
+    pub invocation_telemetry_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -26,6 +27,16 @@ use crate::{
 const PROVIDER_CATALOG_PATH: &str = "config/providers.toml";
 const PROVIDER_CATALOG: &str = include_str!("../config/providers.toml");
 const MAX_BRIDGE_REPLAY_EVENTS_PER_SESSION: usize = 4 * 1_024;
+const INVOCATION_TELEMETRY_MIGRATION_VERSION: i64 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvocationRecord {
+    pub invocation_key: String,
+    pub kind: nakode_protocol::InvocationKind,
+    pub identity: String,
+    pub display_label: String,
+    pub occurred_at_ms: u64,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -552,6 +563,36 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when preference storage cannot be updated.
     fn save_terminal_image_mode(&self, mode: TerminalImageMode) -> Result<(), SessionError>;
+    /// Loads the installation-level local invocation telemetry consent flag. Missing means disabled.
+    ///
+    /// # Errors
+    /// Returns an error when consent storage cannot be read.
+    fn load_invocation_telemetry_enabled(&self) -> Result<bool, SessionError>;
+    /// Atomically changes the installation-level local invocation telemetry consent flag.
+    ///
+    /// # Errors
+    /// Returns an error when consent storage cannot be updated.
+    fn save_invocation_telemetry_enabled(&self, enabled: bool) -> Result<(), SessionError>;
+    /// Idempotently appends one accepted invocation and updates its aggregate in one transaction.
+    ///
+    /// # Errors
+    /// Returns an error when the atomic event and aggregate transaction cannot be committed.
+    fn record_invocation(&self, invocation: &InvocationRecord) -> Result<bool, SessionError>;
+    /// Reads the cheap aggregate projection without scanning event history.
+    ///
+    /// # Errors
+    /// Returns an error when aggregate storage cannot be read or contains invalid values.
+    fn invocation_summary(&self) -> Result<nakode_protocol::InvocationSummary, SessionError>;
+    /// Reads a bounded, server-bucketed half-open event range.
+    ///
+    /// # Errors
+    /// Returns an error when the range is invalid or event storage cannot be read.
+    fn invocation_timeline(
+        &self,
+        start_at_ms: u64,
+        end_at_ms: u64,
+        bucket_width_ms: u64,
+    ) -> Result<nakode_protocol::InvocationTimeline, SessionError>;
 }
 
 pub struct McpInvocationAudit {
@@ -843,6 +884,7 @@ impl SqliteSessionRepository {
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
              );",
         )?;
+        apply_invocation_telemetry_migration(&mut connection)?;
         let bridge_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(session_bridges)")?;
             statement
@@ -1485,6 +1527,59 @@ fn load_owned_provider_sessions(
         .map_err(Into::into)
 }
 
+fn apply_invocation_telemetry_migration(connection: &mut Connection) -> Result<(), SessionError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS nakode_schema_migrations (
+           version INTEGER PRIMARY KEY,
+           name TEXT NOT NULL,
+           applied_at INTEGER NOT NULL
+         );",
+    )?;
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM nakode_schema_migrations WHERE version = ?1",
+            [INVOCATION_TELEMETRY_MIGRATION_VERSION],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS invocation_telemetry_settings (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+         );
+         CREATE TABLE IF NOT EXISTS invocation_events (
+           invocation_key TEXT PRIMARY KEY,
+           kind TEXT NOT NULL CHECK (kind IN ('archetype', 'skill')),
+           identity TEXT NOT NULL,
+           display_label TEXT NOT NULL,
+           occurred_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS invocation_events_kind_time
+           ON invocation_events(occurred_at_ms, kind);
+         CREATE TABLE IF NOT EXISTS invocation_aggregates (
+           kind TEXT NOT NULL CHECK (kind IN ('archetype', 'skill')),
+           identity TEXT NOT NULL,
+           display_label TEXT NOT NULL,
+           invocation_count INTEGER NOT NULL,
+           first_used_at_ms INTEGER NOT NULL,
+           last_used_at_ms INTEGER NOT NULL,
+           PRIMARY KEY(kind, identity)
+         );",
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO nakode_schema_migrations (version, name, applied_at)
+         VALUES (?1, 'opt-in invocation telemetry', unixepoch())",
+        [INVOCATION_TELEMETRY_MIGRATION_VERSION],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     connection.busy_timeout(Duration::from_secs(5))?;
     execute_batch_with_busy_retry(connection, "PRAGMA journal_mode = WAL;")
@@ -1970,6 +2065,8 @@ impl SessionRepository for SqliteSessionRepository {
         transaction.execute("DELETE FROM native_runtime_sessions", [])?;
         transaction.execute("DELETE FROM session_bridge_inbound_events", [])?;
         transaction.execute("DELETE FROM session_bridges", [])?;
+        transaction.execute("DELETE FROM invocation_events", [])?;
+        transaction.execute("DELETE FROM invocation_aggregates", [])?;
         transaction.execute("DELETE FROM sessions", [])?;
         transaction.commit()?;
         Ok(report)
@@ -2834,6 +2931,219 @@ impl SessionRepository for SqliteSessionRepository {
         )?;
         Ok(())
     }
+
+    fn load_invocation_telemetry_enabled(&self) -> Result<bool, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection
+            .query_row(
+                "SELECT enabled FROM invocation_telemetry_settings WHERE singleton = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(Option::unwrap_or_default)
+            .map_err(Into::into)
+    }
+
+    fn save_invocation_telemetry_enabled(&self, enabled: bool) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "INSERT INTO invocation_telemetry_settings (singleton, enabled) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET enabled = excluded.enabled",
+            [enabled],
+        )?;
+        Ok(())
+    }
+
+    fn record_invocation(&self, invocation: &InvocationRecord) -> Result<bool, SessionError> {
+        let occurred_at_ms = i64::try_from(invocation.occurred_at_ms).unwrap_or(i64::MAX);
+        let kind = invocation_kind_value(invocation.kind);
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        // IMMEDIATE makes the consent check, idempotent append, and aggregate update one short
+        // writer-serialized decision. No unrelated read acquires this transaction.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let enabled = transaction
+            .query_row(
+                "SELECT enabled FROM invocation_telemetry_settings WHERE singleton = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        if !enabled {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO invocation_events
+             (invocation_key, kind, identity, display_label, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                invocation.invocation_key,
+                kind,
+                invocation.identity,
+                invocation.display_label,
+                occurred_at_ms
+            ],
+        )?;
+        if inserted == 1 {
+            transaction.execute(
+                "INSERT INTO invocation_aggregates
+                 (kind, identity, display_label, invocation_count, first_used_at_ms, last_used_at_ms)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?4)
+                 ON CONFLICT(kind, identity) DO UPDATE SET
+                   display_label = excluded.display_label,
+                   invocation_count = invocation_aggregates.invocation_count + 1,
+                   first_used_at_ms = MIN(invocation_aggregates.first_used_at_ms, excluded.first_used_at_ms),
+                   last_used_at_ms = MAX(invocation_aggregates.last_used_at_ms, excluded.last_used_at_ms)",
+                params![kind, invocation.identity, invocation.display_label, occurred_at_ms],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(inserted == 1)
+    }
+
+    fn invocation_summary(&self) -> Result<nakode_protocol::InvocationSummary, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let enabled = connection
+            .query_row(
+                "SELECT enabled FROM invocation_telemetry_settings WHERE singleton = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let mut statement = connection.prepare(
+            "SELECT kind, identity, display_label, invocation_count,
+                    first_used_at_ms, last_used_at_ms
+             FROM invocation_aggregates ORDER BY kind, identity",
+        )?;
+        let items = statement
+            .query_map([], |row| {
+                let kind = row.get::<_, String>(0)?;
+                Ok((
+                    kind,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .map(|row| {
+                let (kind, identity, display_label, count, first, last) = row?;
+                Ok(nakode_protocol::InvocationUsage {
+                    kind: parse_invocation_kind(&kind)?,
+                    identity,
+                    display_label,
+                    currently_installed: false,
+                    invocation_count: u64::try_from(count).unwrap_or_default(),
+                    first_used_at_ms: u64::try_from(first).ok(),
+                    last_used_at_ms: u64::try_from(last).ok(),
+                })
+            })
+            .collect::<Result<Vec<_>, SessionError>>()?;
+        Ok(nakode_protocol::InvocationSummary { enabled, items })
+    }
+
+    fn invocation_timeline(
+        &self,
+        start_at_ms: u64,
+        end_at_ms: u64,
+        bucket_width_ms: u64,
+    ) -> Result<nakode_protocol::InvocationTimeline, SessionError> {
+        if bucket_width_ms == 0 || start_at_ms >= end_at_ms {
+            return Err(SessionError::InvalidStoredValue {
+                field: "invocation timeline bounds",
+                value: format!("{start_at_ms}..{end_at_ms}/{bucket_width_ms}"),
+            });
+        }
+        let start = i64::try_from(start_at_ms).unwrap_or(i64::MAX);
+        let end = i64::try_from(end_at_ms).unwrap_or(i64::MAX);
+        let width = i64::try_from(bucket_width_ms).unwrap_or(i64::MAX);
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT (occurred_at_ms - ?1) / ?3 AS bucket_index, kind, COUNT(*)
+             FROM invocation_events
+             WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
+             GROUP BY bucket_index, kind
+             ORDER BY bucket_index, kind",
+        )?;
+        let rows = statement.query_map(params![start, end, width], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut counts = BTreeMap::<u64, (u64, u64)>::new();
+        for row in rows {
+            let (index, kind, count) = row?;
+            let entry = counts
+                .entry(u64::try_from(index).unwrap_or_default())
+                .or_default();
+            match parse_invocation_kind(&kind)? {
+                nakode_protocol::InvocationKind::Archetype => {
+                    entry.0 = u64::try_from(count).unwrap_or_default();
+                }
+                nakode_protocol::InvocationKind::Skill => {
+                    entry.1 = u64::try_from(count).unwrap_or_default();
+                }
+            }
+        }
+        let bucket_count = end_at_ms
+            .saturating_sub(start_at_ms)
+            .div_ceil(bucket_width_ms);
+        let buckets = (0..bucket_count)
+            .map(|index| {
+                let (archetype_count, skill_count) = counts.remove(&index).unwrap_or_default();
+                nakode_protocol::InvocationBucket {
+                    start_at_ms: start_at_ms.saturating_add(index.saturating_mul(bucket_width_ms)),
+                    archetype_count,
+                    skill_count,
+                }
+            })
+            .collect();
+        Ok(nakode_protocol::InvocationTimeline {
+            start_at_ms,
+            end_at_ms,
+            bucket_width_ms,
+            buckets,
+        })
+    }
+}
+
+fn invocation_kind_value(kind: nakode_protocol::InvocationKind) -> &'static str {
+    match kind {
+        nakode_protocol::InvocationKind::Archetype => "archetype",
+        nakode_protocol::InvocationKind::Skill => "skill",
+    }
+}
+
+fn parse_invocation_kind(value: &str) -> Result<nakode_protocol::InvocationKind, SessionError> {
+    match value {
+        "archetype" => Ok(nakode_protocol::InvocationKind::Archetype),
+        "skill" => Ok(nakode_protocol::InvocationKind::Skill),
+        _ => Err(SessionError::InvalidStoredValue {
+            field: "invocation kind",
+            value: value.to_owned(),
+        }),
+    }
 }
 
 fn load_subagent_transcript(
@@ -2971,6 +3281,179 @@ mod tests {
 
         store.save_terminal_image_mode(TerminalImageMode::Off)?;
         assert_eq!(store.load_terminal_image_mode()?, TerminalImageMode::Off);
+        Ok(())
+    }
+
+    #[test]
+    fn invocation_telemetry_defaults_off_is_idempotent_and_survives_restart()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("sessions.db");
+        let store = SqliteSessionRepository::open(&database)?;
+        let archetype = InvocationRecord {
+            invocation_key: "archetype:agent-1".to_owned(),
+            kind: nakode_protocol::InvocationKind::Archetype,
+            identity: "explorer".to_owned(),
+            display_label: "Explorer".to_owned(),
+            occurred_at_ms: 1_000,
+        };
+        assert!(!store.load_invocation_telemetry_enabled()?);
+        assert!(!store.record_invocation(&archetype)?);
+        assert!(store.invocation_summary()?.items.is_empty());
+
+        store.save_invocation_telemetry_enabled(true)?;
+        assert!(store.record_invocation(&archetype)?);
+        assert!(!store.record_invocation(&archetype)?);
+        let skill = InvocationRecord {
+            invocation_key: "skill:session:turn:call".to_owned(),
+            kind: nakode_protocol::InvocationKind::Skill,
+            identity: "review".to_owned(),
+            display_label: "Review".to_owned(),
+            occurred_at_ms: 2_000,
+        };
+        assert!(store.record_invocation(&skill)?);
+        store.save_invocation_telemetry_enabled(false)?;
+        assert!(!store.record_invocation(&InvocationRecord {
+            invocation_key: "archetype:agent-2".to_owned(),
+            occurred_at_ms: 3_000,
+            ..archetype
+        })?);
+        drop(store);
+
+        let restarted = SqliteSessionRepository::open(database)?;
+        let summary = restarted.invocation_summary()?;
+        assert!(!summary.enabled);
+        assert_eq!(summary.items.len(), 2);
+        assert!(summary.items.iter().all(|item| item.invocation_count == 1));
+        let timeline = restarted.invocation_timeline(0, 4_000, 1_000)?;
+        assert_eq!(timeline.buckets.len(), 4);
+        assert_eq!(timeline.buckets[1].archetype_count, 1);
+        assert_eq!(timeline.buckets[2].skill_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_duplicate_invocation_delivery_counts_once() -> Result<(), SessionError> {
+        use std::sync::{Arc, Barrier};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("sessions.db");
+        let setup = SqliteSessionRepository::open(&database)?;
+        setup.save_invocation_telemetry_enabled(true)?;
+        drop(setup);
+        let barrier = Arc::new(Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let store = SqliteSessionRepository::open(database)?;
+                    barrier.wait();
+                    store.record_invocation(&InvocationRecord {
+                        invocation_key: "skill:concurrent".to_owned(),
+                        kind: nakode_protocol::InvocationKind::Skill,
+                        identity: "review".to_owned(),
+                        display_label: "Review".to_owned(),
+                        occurred_at_ms: 1_000,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let inserted = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("recording thread"))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(inserted.into_iter().filter(|inserted| *inserted).count(), 1);
+        let store = SqliteSessionRepository::open(database)?;
+        assert_eq!(store.invocation_summary()?.items[0].invocation_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invocation_event_and_aggregate_update_roll_back_together() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        store.save_invocation_telemetry_enabled(true)?;
+        {
+            let connection = store.connection.lock().expect("database mutex");
+            connection.execute_batch(
+                "CREATE TRIGGER reject_invocation_aggregate
+                 BEFORE INSERT ON invocation_aggregates
+                 BEGIN SELECT RAISE(ABORT, 'aggregate refused'); END;",
+            )?;
+        }
+        let result = store.record_invocation(&InvocationRecord {
+            invocation_key: "skill:atomic".to_owned(),
+            kind: nakode_protocol::InvocationKind::Skill,
+            identity: "review".to_owned(),
+            display_label: "Review".to_owned(),
+            occurred_at_ms: 1_000,
+        });
+        assert!(result.is_err());
+        let connection = store.connection.lock().expect("database mutex");
+        let event_count =
+            connection.query_row("SELECT COUNT(*) FROM invocation_events", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        let aggregate_count =
+            connection.query_row("SELECT COUNT(*) FROM invocation_aggregates", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        assert_eq!((event_count, aggregate_count), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn invocation_timeline_uses_range_index_at_representative_scale() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        {
+            let mut connection = store.connection.lock().expect("database mutex");
+            let transaction = connection.transaction()?;
+            {
+                let mut insert = transaction.prepare(
+                    "INSERT INTO invocation_events
+                     (invocation_key, kind, identity, display_label, occurred_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for index in 0_i64..100_000 {
+                    let kind = if index % 2 == 0 { "archetype" } else { "skill" };
+                    insert.execute(params![
+                        format!("load-{index}"),
+                        kind,
+                        "identity",
+                        "Identity",
+                        index * 1_000
+                    ])?;
+                }
+            }
+            transaction.commit()?;
+        }
+        let timeline = store.invocation_timeline(90_000_000, 100_000_000, 1_000_000)?;
+        assert_eq!(timeline.buckets.len(), 10);
+        assert_eq!(
+            timeline
+                .buckets
+                .iter()
+                .map(|bucket| bucket.archetype_count + bucket.skill_count)
+                .sum::<u64>(),
+            10_000
+        );
+        let connection = store.connection.lock().expect("database mutex");
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT (occurred_at_ms - ?1) / ?3, kind, COUNT(*)
+                 FROM invocation_events
+                 WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
+                 GROUP BY 1, kind",
+            )?
+            .query_map(
+                params![90_000_000_i64, 100_000_000_i64, 1_000_000_i64],
+                |row| row.get::<_, String>(3),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+            .join(" ");
+        assert!(plan.contains("invocation_events_kind_time"), "{plan}");
         Ok(())
     }
 
@@ -4061,6 +4544,14 @@ mod tests {
             firecrawl_api_key: "keep-web-key".to_owned(),
         })?;
 
+        store.save_invocation_telemetry_enabled(true)?;
+        assert!(store.record_invocation(&InvocationRecord {
+            invocation_key: "skill:purge".to_owned(),
+            kind: nakode_protocol::InvocationKind::Skill,
+            identity: "review".to_owned(),
+            display_label: "Review".to_owned(),
+            occurred_at_ms: 1_000,
+        })?);
         seed_mixed_session_state(&store)?;
 
         assert_eq!(
@@ -4074,6 +4565,8 @@ mod tests {
         );
         assert!(store.list_recent("/tmp/first", 500)?.is_empty());
         assert!(store.list_recent("/tmp/second", 500)?.is_empty());
+        assert!(store.invocation_summary()?.items.is_empty());
+        assert!(store.load_invocation_telemetry_enabled()?);
         assert_eq!(store.purge_all()?, SessionPurgeReport::default());
 
         let kept_credential = credentials

@@ -235,6 +235,9 @@ pub enum SettingsPatch {
     TerminalImages {
         mode: String,
     },
+    InvocationTelemetry {
+        enabled: bool,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -575,6 +578,14 @@ pub enum Query {
         days: u16,
         session_limit: u32,
         provider_id: Option<ProviderId>,
+    },
+    /// Returns consent state and one cheap aggregate per historical or currently installed item.
+    GetInvocationSummary,
+    /// Returns server-bucketed counts over one bounded half-open time range.
+    GetInvocationTimeline {
+        start_at_ms: u64,
+        end_at_ms: u64,
+        bucket_width_ms: u64,
     },
 }
 

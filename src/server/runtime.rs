@@ -290,6 +290,9 @@ pub(crate) async fn prepare_runtime(
     state.install_prompt_addenda(prompt_addenda);
     let terminal_image_mode = session_repository.load_terminal_image_mode()?;
     state.install_terminal_image_mode(terminal_image_mode);
+    state.install_invocation_telemetry_enabled(
+        session_repository.load_invocation_telemetry_enabled()?,
+    );
     state.set_nakode_executable(&nakode_executable);
     load_cached_provider_configuration(&mut state, &mut backends, session_repository.as_ref())
         .await;
@@ -707,6 +710,75 @@ impl NativeServerRuntime {
                 });
                 return;
             }
+            nakode_server::ServerRequest::Query {
+                query: Query::GetInvocationSummary,
+                respond,
+                ..
+            } => {
+                let cursor = self.endpoint.cursor();
+                let catalogue = self.core.engine().state().invocation_catalogue();
+                let sessions = Arc::clone(&self.effects.persistence.sessions);
+                tokio::task::spawn_blocking(move || {
+                    let result = sessions
+                        .invocation_summary()
+                        .map(|summary| merge_invocation_catalogue(summary, catalogue))
+                        .map(|summary| Snapshot {
+                            cursor,
+                            value: QueryResult::InvocationSummary(Box::new(summary)),
+                        })
+                        .map_err(|error| ServiceError {
+                            code: ErrorCode::Internal,
+                            message: error.to_string(),
+                            retryable: false,
+                        });
+                    let _ = respond.send(result);
+                });
+                return;
+            }
+            nakode_server::ServerRequest::Query {
+                query:
+                    Query::GetInvocationTimeline {
+                        start_at_ms,
+                        end_at_ms,
+                        bucket_width_ms,
+                    },
+                respond,
+                ..
+            } => {
+                const MIN_BUCKET_MS: u64 = 60 * 60 * 1_000;
+                const MAX_RANGE_MS: u64 = 366 * 24 * 60 * 60 * 1_000;
+                const MAX_BUCKETS: u64 = 1_000;
+                let range = end_at_ms.saturating_sub(start_at_ms);
+                let valid = start_at_ms < end_at_ms
+                    && range <= MAX_RANGE_MS
+                    && bucket_width_ms >= MIN_BUCKET_MS
+                    && range.div_ceil(bucket_width_ms) <= MAX_BUCKETS;
+                if !valid {
+                    let _ = respond.send(Err(ServiceError {
+                        code: ErrorCode::InvalidRequest,
+                        message: "invocation timeline requires a positive range of at most 366 days, buckets of at least one hour, and no more than 1000 buckets".to_owned(),
+                        retryable: false,
+                    }));
+                    return;
+                }
+                let cursor = self.endpoint.cursor();
+                let sessions = Arc::clone(&self.effects.persistence.sessions);
+                tokio::task::spawn_blocking(move || {
+                    let result = sessions
+                        .invocation_timeline(start_at_ms, end_at_ms, bucket_width_ms)
+                        .map(|timeline| Snapshot {
+                            cursor,
+                            value: QueryResult::InvocationTimeline(Box::new(timeline)),
+                        })
+                        .map_err(|error| ServiceError {
+                            code: ErrorCode::Internal,
+                            message: error.to_string(),
+                            retryable: false,
+                        });
+                    let _ = respond.send(result);
+                });
+                return;
+            }
             request => request,
         };
         let mut inbound_event_to_claim = None;
@@ -831,6 +903,33 @@ impl NativeServerRuntime {
             && request.name.starts_with(nakode_protocol::MCP_TOOL_PREFIX)
         {
             self.handle_mcp_tool_request(source, request.clone()).await;
+            return;
+        }
+        if let BackendEvent::SkillInvoked {
+            invocation_key,
+            identity,
+            display_label,
+            occurred_at_ms,
+        } = &event
+        {
+            let invocation = crate::session::InvocationRecord {
+                invocation_key: invocation_key.clone(),
+                kind: nakode_protocol::InvocationKind::Skill,
+                identity: identity.clone(),
+                display_label: display_label.clone(),
+                occurred_at_ms: *occurred_at_ms,
+            };
+            if let Err(error) = self
+                .effects
+                .persistence
+                .sessions
+                .record_invocation(&invocation)
+            {
+                self.core
+                    .engine_mut()
+                    .state_mut()
+                    .session_store_failed(error.to_string());
+            }
             return;
         }
         let event_session_id = match &source {
@@ -1487,6 +1586,45 @@ fn provider_enablement_changes(
         .collect()
 }
 
+fn merge_invocation_catalogue(
+    mut summary: nakode_protocol::InvocationSummary,
+    catalogue: Vec<(nakode_protocol::InvocationKind, String, String)>,
+) -> nakode_protocol::InvocationSummary {
+    let mut positions = summary
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| ((item.kind, item.identity.clone()), index))
+        .collect::<HashMap<_, _>>();
+    for (kind, identity, display_label) in catalogue {
+        if let Some(index) = positions.get(&(kind, identity.clone())).copied() {
+            let item = &mut summary.items[index];
+            item.currently_installed = true;
+            item.display_label = display_label;
+        } else {
+            positions.insert((kind, identity.clone()), summary.items.len());
+            summary.items.push(nakode_protocol::InvocationUsage {
+                kind,
+                identity,
+                display_label,
+                currently_installed: true,
+                invocation_count: 0,
+                first_used_at_ms: None,
+                last_used_at_ms: None,
+            });
+        }
+    }
+    summary.items.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| right.currently_installed.cmp(&left.currently_installed))
+            .then_with(|| right.invocation_count.cmp(&left.invocation_count))
+            .then_with(|| left.display_label.cmp(&right.display_label))
+            .then_with(|| left.identity.cmp(&right.identity))
+    });
+    summary
+}
+
 fn native_service_capabilities() -> ServiceCapabilities {
     ServiceCapabilities {
         supported: [
@@ -1503,6 +1641,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::QuestionTextAnswers,
             ServiceCapability::QueuedPromptSteering,
             ServiceCapability::ArchetypeManagement,
+            ServiceCapability::InvocationTelemetry,
             ServiceCapability::SoulManagement,
             ServiceCapability::McpManagement,
             ServiceCapability::OrchestratorThreadBridge,
@@ -2198,6 +2337,14 @@ impl EffectExecutor {
             }
             Effect::SaveTerminalImageMode(mode) => {
                 save_terminal_image_mode(state, sessions, mode);
+            }
+            Effect::SaveInvocationTelemetryEnabled(enabled) => {
+                save_invocation_telemetry_enabled(state, sessions, enabled);
+            }
+            Effect::RecordInvocation(invocation) => {
+                if let Err(error) = sessions.record_invocation(&invocation) {
+                    state.session_store_failed(error.to_string());
+                }
             }
             Effect::CheckAgentBrowser => check_agent_browser(state).await,
             Effect::SaveMcpServer(_)
@@ -2896,6 +3043,23 @@ fn replace_shared_config<T>(shared: &RwLock<T>, config: T, name: &str) -> Result
     Ok(())
 }
 
+fn save_invocation_telemetry_enabled(
+    state: &mut DomainState,
+    sessions: &dyn SessionRepository,
+    enabled: bool,
+) {
+    if let Err(error) = sessions.save_invocation_telemetry_enabled(enabled) {
+        state.session_store_failed(error.to_string());
+        return;
+    }
+    state.install_invocation_telemetry_enabled(enabled);
+    state.set_status(if enabled {
+        "Local invocation telemetry enabled."
+    } else {
+        "Local invocation telemetry disabled."
+    });
+}
+
 fn save_terminal_image_mode(
     state: &mut DomainState,
     sessions: &dyn SessionRepository,
@@ -3161,15 +3325,17 @@ mod tests {
 
     use nakode_protocol::{
         BridgeContinuationDisposition, BridgeLifecycle, ClientId, Command, CredentialInput,
-        ErrorCode, IdempotencyKey, McpGrantPolicy, OrchestratorKind, PromptInput, Query,
-        QueryResult, ServiceCapability, SessionId,
+        ErrorCode, IdempotencyKey, InvocationKind, InvocationSummary, InvocationUsage,
+        McpGrantPolicy, OrchestratorKind, PromptInput, Query, QueryResult, ServiceCapability,
+        SessionId,
     };
     use tokio::sync::mpsc;
 
     use super::{
         BackendRegistry, BackendSource, EffectExecutor, EffectOrigin, NativeServerRuntime,
         PendingNativeDelegation, PersistenceServices, ProviderCredentialInput, load_subagents,
-        native_service_capabilities, provider_enablement_changes, save_provider_credential,
+        merge_invocation_catalogue, native_service_capabilities, provider_enablement_changes,
+        save_provider_credential,
     };
     use crate::{
         backend::{
@@ -3180,8 +3346,9 @@ mod tests {
         credential::{CredentialStore, SqliteCredentialStore},
         service::ServiceEngine,
         session::{
-            BridgeInboundTurnOriginRecord, BridgePendingInboundRecord, SessionBridgeRecord,
-            SessionRepository, SqliteSessionRepository, SubagentObservability, SubagentRecord,
+            BridgeInboundTurnOriginRecord, BridgePendingInboundRecord, InvocationRecord,
+            SessionBridgeRecord, SessionRepository, SqliteSessionRepository, SubagentObservability,
+            SubagentRecord,
         },
         state::{DomainState, Effect, SubagentStatus},
     };
@@ -3199,6 +3366,72 @@ mod tests {
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn invocation_catalogue_merge_preserves_history_refreshes_labels_and_adds_zero_use_items() {
+        let summary = InvocationSummary {
+            enabled: true,
+            items: vec![
+                InvocationUsage {
+                    kind: InvocationKind::Archetype,
+                    identity: "installed".to_owned(),
+                    display_label: "Old label".to_owned(),
+                    currently_installed: false,
+                    invocation_count: 3,
+                    first_used_at_ms: Some(10),
+                    last_used_at_ms: Some(30),
+                },
+                InvocationUsage {
+                    kind: InvocationKind::Skill,
+                    identity: "deleted".to_owned(),
+                    display_label: "Deleted skill".to_owned(),
+                    currently_installed: false,
+                    invocation_count: 1,
+                    first_used_at_ms: Some(20),
+                    last_used_at_ms: Some(20),
+                },
+            ],
+        };
+        let merged = merge_invocation_catalogue(
+            summary,
+            vec![
+                (
+                    InvocationKind::Skill,
+                    "zero".to_owned(),
+                    "Zero skill".to_owned(),
+                ),
+                (
+                    InvocationKind::Archetype,
+                    "installed".to_owned(),
+                    "Current label".to_owned(),
+                ),
+            ],
+        );
+
+        assert_eq!(merged.items.len(), 3);
+        let installed = merged
+            .items
+            .iter()
+            .find(|item| item.identity == "installed")
+            .expect("installed item");
+        assert!(installed.currently_installed);
+        assert_eq!(installed.display_label, "Current label");
+        assert_eq!(installed.invocation_count, 3);
+        let deleted = merged
+            .items
+            .iter()
+            .find(|item| item.identity == "deleted")
+            .expect("historical item");
+        assert!(!deleted.currently_installed);
+        let zero = merged
+            .items
+            .iter()
+            .find(|item| item.identity == "zero")
+            .expect("zero-use item");
+        assert!(zero.currently_installed);
+        assert_eq!(zero.invocation_count, 0);
+        assert_eq!(zero.first_used_at_ms, None);
     }
 
     #[test]
@@ -3663,6 +3896,91 @@ mod tests {
             )
             .await
             .expect_err("invalid diagnostics query");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
+    }
+
+    #[tokio::test]
+    async fn invocation_queries_are_bounded_and_served_from_durable_projection() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let sessions = Arc::clone(&persistence.sessions);
+        sessions
+            .save_invocation_telemetry_enabled(true)
+            .expect("enable telemetry");
+        sessions
+            .record_invocation(&InvocationRecord {
+                invocation_key: "archetype:agent-1".to_owned(),
+                kind: nakode_protocol::InvocationKind::Archetype,
+                identity: "deleted-agent".to_owned(),
+                display_label: "Deleted agent".to_owned(),
+                occurred_at_ms: 10_000,
+            })
+            .expect("record invocation");
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        state.install_invocation_telemetry_enabled(true);
+        let (runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+
+        let summary = endpoint
+            .execute_query(
+                ClientId::from("invocation-test"),
+                Query::GetInvocationSummary,
+            )
+            .await
+            .expect("summary query");
+        assert!(matches!(
+            summary.value,
+            QueryResult::InvocationSummary(summary)
+                if summary.enabled
+                    && summary.items.len() == 1
+                    && summary.items[0].identity == "deleted-agent"
+                    && !summary.items[0].currently_installed
+        ));
+        let timeline = endpoint
+            .execute_query(
+                ClientId::from("invocation-test"),
+                Query::GetInvocationTimeline {
+                    start_at_ms: 0,
+                    end_at_ms: 3_600_000,
+                    bucket_width_ms: 3_600_000,
+                },
+            )
+            .await
+            .expect("timeline query");
+        assert!(matches!(
+            timeline.value,
+            QueryResult::InvocationTimeline(timeline)
+                if timeline.buckets.len() == 1
+                    && timeline.buckets[0].archetype_count == 1
+        ));
+        let error = endpoint
+            .execute_query(
+                ClientId::from("invocation-test"),
+                Query::GetInvocationTimeline {
+                    start_at_ms: 0,
+                    end_at_ms: 3_600_000,
+                    bucket_width_ms: 1,
+                },
+            )
+            .await
+            .expect_err("tiny bucket must be rejected");
         assert_eq!(error.code, ErrorCode::InvalidRequest);
 
         handle.shutdown().await;

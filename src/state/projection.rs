@@ -1171,6 +1171,7 @@ fn settings_view(state: &DomainState) -> SettingsView {
             TerminalImageMode::On => TerminalImageModeView::On,
             TerminalImageMode::Off => TerminalImageModeView::Off,
         },
+        invocation_telemetry_enabled: state.invocation_telemetry_enabled(),
     }
 }
 

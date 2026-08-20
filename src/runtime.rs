@@ -1244,6 +1244,7 @@ struct ExecutedTool {
     title: String,
     output: String,
     model_output: String,
+    invocation_identity: Option<String>,
     failed: bool,
     denied: bool,
     denial_reason: Option<String>,
@@ -1270,6 +1271,7 @@ impl ExecutedTool {
             title,
             output: result.output,
             model_output,
+            invocation_identity: result.invocation_identity,
             failed: result.failed,
             denied: false,
             denial_reason: None,
@@ -1505,6 +1507,21 @@ async fn record_tool_result(
         })
         .await
         .map_err(|_| "backend event receiver closed".to_owned())?;
+    if !executed.failed
+        && executed.name == "read_skill"
+        && let Some(identity) = executed.invocation_identity.take()
+        && let Some(display_label) = executed.arguments.get("name").and_then(Value::as_str)
+    {
+        events
+            .send(BackendEvent::SkillInvoked {
+                invocation_key: format!("skill:{}:{turn_id}:{}", session.id, executed.call_id),
+                identity,
+                display_label: display_label.to_owned(),
+                occurred_at_ms: executed.started_at_ms,
+            })
+            .await
+            .map_err(|_| "backend event receiver closed".to_owned())?;
+    }
     session.telemetry.tools.push(ToolMetric {
         turn_id: turn_id.to_owned(),
         call_id: executed.call_id.clone(),
@@ -2279,9 +2296,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AgentRuntime, ConversationItem, InferenceEvent, InferenceFuture, InferenceOutput,
-        InferenceProvider, InferenceRequest, QuestionBroker, RuntimeSession, RuntimeSessionStore,
-        RuntimeToolAudit, ToolCall, normalize_history_item, record_tool_result, runtime_tool_audit,
+        AgentRuntime, ConversationItem, ExecutedTool, InferenceEvent, InferenceFuture,
+        InferenceOutput, InferenceProvider, InferenceRequest, QuestionBroker, RuntimeSession,
+        RuntimeSessionStore, RuntimeToolAudit, ToolCall, normalize_history_item,
+        record_tool_result, runtime_tool_audit,
     };
     use crate::backend::{
         BackendEvent, CompactionReason, ItemKind, QuestionOption, QuestionRequest,
@@ -2293,6 +2311,63 @@ mod tests {
     };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn successful_exact_skill_load_emits_one_privacy_minimal_invocation() {
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        session.id = "runtime-session".to_owned();
+        let (events, mut receiver) = mpsc::channel(4);
+        let successful = ExecutedTool::new(
+            "native",
+            ToolCall {
+                id: "call-1".to_owned(),
+                name: "read_skill".to_owned(),
+                arguments: json!({"name": "review"}),
+            },
+            "read_skill · review".to_owned(),
+            ToolResult::success("private instructions").with_invocation_identity("skill-id"),
+            42,
+            1,
+        );
+        record_tool_result(&mut session, successful, "turn-1", &events)
+            .await
+            .expect("skill result");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(BackendEvent::ItemCompleted { .. })
+        ));
+        assert_eq!(
+            receiver.recv().await,
+            Some(BackendEvent::SkillInvoked {
+                invocation_key: "skill:runtime-session:turn-1:call-1".to_owned(),
+                identity: "skill-id".to_owned(),
+                display_label: "review".to_owned(),
+                occurred_at_ms: 42,
+            })
+        );
+        assert!(receiver.try_recv().is_err());
+
+        let failed = ExecutedTool::new(
+            "native",
+            ToolCall {
+                id: "call-2".to_owned(),
+                name: "read_skill".to_owned(),
+                arguments: json!({"name": "missing"}),
+            },
+            "read_skill · missing".to_owned(),
+            ToolResult::failure("not installed"),
+            43,
+            1,
+        );
+        record_tool_result(&mut session, failed, "turn-1", &events)
+            .await
+            .expect("failed skill result");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(BackendEvent::ItemCompleted { .. })
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn native_runtime_history_restores_user_image_attachments() {

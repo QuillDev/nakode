@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -79,6 +83,11 @@ fn default_concurrency() -> u32 {
 // Persisted archetype policy keeps these independent flags for backward-compatible definition files.
 #[allow(clippy::struct_excessive_bools)]
 pub struct AgentDefinition {
+    /// Server-owned immutable local identity used to preserve invocation history across slug changes.
+    /// Older files omit it and use their current slug until the next authoritative save. Callers do
+    /// not control this value: `AgentCatalog::save` always generates or preserves the authority's ID.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub slug: String,
     pub description: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -172,6 +181,7 @@ fn is_default_concurrency(value: &u32) -> bool {
 impl Default for AgentDefinition {
     fn default() -> Self {
         Self {
+            id: String::new(),
             slug: String::new(),
             description: String::new(),
             system_prompt: String::new(),
@@ -202,6 +212,16 @@ impl Default for AgentDefinition {
 }
 
 impl AgentDefinition {
+    /// Stable local identity for telemetry and other historical projections.
+    #[must_use]
+    pub fn stable_id(&self) -> &str {
+        if self.id.is_empty() {
+            &self.slug
+        } else {
+            &self.id
+        }
+    }
+
     #[must_use]
     pub fn provider<'a>(&'a self, parent_provider: &'a str) -> &'a str {
         self.model
@@ -399,6 +419,16 @@ pub enum AgentCatalogError {
     EmptyField { path: String, field: &'static str },
     #[error("agent {slug:?} is defined more than once")]
     DuplicateSlug { slug: String },
+    #[error("agents {first:?} and {second:?} declare the same immutable id {id:?}")]
+    DuplicateIdentity {
+        id: String,
+        first: String,
+        second: String,
+    },
+    #[error(
+        "agent definition {path} has an id that must be 1-128 ASCII letters, digits, dots, colons, underscores, or hyphens"
+    )]
+    InvalidIdentity { path: String },
     #[error("agent {slug:?} model must use provider/model form: {model}")]
     InvalidModel { slug: String, model: String },
     #[error("agent {slug:?} sets reasoning_effort {effort:?} without a model to run it at")]
@@ -464,6 +494,7 @@ impl AgentCatalog {
 
         let mut definitions = Vec::with_capacity(paths.len());
         let mut slugs = HashSet::new();
+        let mut identities = HashMap::new();
         for path in paths {
             let display_path = path.display().to_string();
             let source =
@@ -481,6 +512,15 @@ impl AgentCatalog {
             if !slugs.insert(definition.slug.clone()) {
                 return Err(AgentCatalogError::DuplicateSlug {
                     slug: definition.slug,
+                });
+            }
+            if let Some(first) =
+                identities.insert(definition.stable_id().to_owned(), definition.slug.clone())
+            {
+                return Err(AgentCatalogError::DuplicateIdentity {
+                    id: definition.stable_id().to_owned(),
+                    first,
+                    second: definition.slug,
                 });
             }
             definitions.push(definition);
@@ -534,6 +574,11 @@ impl AgentCatalog {
             });
         }
         self.materialize_if_missing(directory)?;
+        let mut stored = definition.clone();
+        stored.id = previous_slug.and_then(|slug| self.find(slug)).map_or_else(
+            || uuid::Uuid::now_v7().to_string(),
+            |previous| previous.stable_id().to_owned(),
+        );
         if let Some(previous_slug) = previous_slug.filter(|slug| *slug != definition.slug) {
             let previous_path = definition_path(directory, previous_slug);
             let backup = directory.join(format!(".{previous_slug}.toml.rename-backup"));
@@ -543,7 +588,7 @@ impl AgentCatalog {
                     source,
                 }
             })?;
-            if let Err(error) = write_definition(directory, definition) {
+            if let Err(error) = write_definition(directory, &stored) {
                 let _ = fs::rename(&backup, &previous_path);
                 return Err(error);
             }
@@ -557,7 +602,7 @@ impl AgentCatalog {
             }
             return Ok(());
         }
-        write_definition(directory, definition)
+        write_definition(directory, &stored)
     }
 
     /// Removes an archetype from the authoritative workspace catalog.
@@ -650,6 +695,16 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
 // Validation deliberately reports one policy-specific error at a time from this persisted shape;
 // splitting the ordered checks would obscure the single authoritative validation boundary.
 fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalogError> {
+    if !definition.id.is_empty()
+        && (definition.id.len() > 128
+            || !definition.id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'_' | b'-')
+            }))
+    {
+        return Err(AgentCatalogError::InvalidIdentity {
+            path: path.to_owned(),
+        });
+    }
     if definition.slug.is_empty()
         || !definition.slug.chars().all(|character| {
             character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
@@ -1282,6 +1337,11 @@ description = "Research the requested topic and report concrete findings"
             .expect("create disposable");
 
         let created = AgentCatalog::load(directory.path()).expect("inspect created disposable");
+        disposable.id = created
+            .find(&disposable.slug)
+            .expect("created definition")
+            .id
+            .clone();
         assert_eq!(created.find(&disposable.slug), Some(&disposable));
 
         disposable.description = "Updated disposable dashboard verification".to_owned();
@@ -1328,7 +1388,22 @@ description = "Research the requested topic and report concrete findings"
             .expect("save reviewer");
 
         let loaded = AgentCatalog::load(&directory).expect("configured catalog");
-        assert_eq!(loaded.find("reviewer"), Some(&definition));
-        assert_eq!(loaded.definitions(), [definition]);
+        let saved = loaded.find("reviewer").expect("saved definition");
+        assert!(!saved.id.is_empty());
+        let stable_id = saved.stable_id().to_owned();
+
+        let mut renamed = definition;
+        renamed.slug = "change-reviewer".to_owned();
+        loaded
+            .save(&directory, &renamed, Some("reviewer"))
+            .expect("rename reviewer");
+
+        let reloaded = AgentCatalog::load(&directory).expect("renamed catalog");
+        assert!(reloaded.find("reviewer").is_none());
+        let renamed = reloaded
+            .find("change-reviewer")
+            .expect("renamed definition");
+        assert_eq!(renamed.stable_id(), stable_id);
+        assert_eq!(renamed.slug, "change-reviewer");
     }
 }

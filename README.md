@@ -401,7 +401,10 @@ workspace-local skills taking precedence when names overlap:
 Reference a discovered skill anywhere in a prompt with `/skill:<skill-name>`.
 Nakode offers discovered names in composer completion and attaches the selected
 skill instructions to that turn while keeping the original prompt unchanged in
-the visible transcript.
+the visible transcript. Skill publishers should include a bounded immutable `id`
+in YAML frontmatter (for example, `id: fragile.code-review.v1`) so local invocation
+history follows a skill when its directory/load name changes. Legacy skills without
+an `id` remain compatible and use their exact catalogue name as historical identity.
 
 ## Herdr integration
 
