@@ -334,6 +334,13 @@ pub struct TranscriptPage {
     pub has_earlier: bool,
     pub stream_active: bool,
     pub stream_label: String,
+    /// Additive latest-owner anchor; its stable ID may also occur in `entries`.
+    /// Presentation clients that pin it should render that ID once.
+    #[serde(default)]
+    pub current_owner_entry: Option<TranscriptEntryView>,
+    /// Exact tool/diff rows from that owner turn omitted from `entries`.
+    #[serde(default)]
+    pub current_owner_omitted_tool_calls: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

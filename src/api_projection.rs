@@ -1029,6 +1029,11 @@ fn transcript(value: api::TranscriptPage) -> Result<view::TranscriptPage, String
         has_earlier: value.has_earlier,
         stream_active: value.stream_active,
         stream_label: value.stream_label,
+        current_owner_entry: value
+            .current_owner_entry
+            .map(transcript_entry)
+            .transpose()?,
+        current_owner_omitted_tool_calls: value.current_owner_omitted_tool_calls,
     })
 }
 
@@ -1069,9 +1074,9 @@ fn transcript_entry(value: api::TranscriptEntry) -> Result<view::TranscriptEntry
             .collect(),
         provider_id: value.provider_id,
         model_id: value.model_id.map(view::ModelId::from),
-        owner_turn_id: None,
-        resolved_reasoning_effort: None,
-        resolved_fast_mode: None,
+        owner_turn_id: value.owner_turn_id.map(view::TurnId::from),
+        resolved_reasoning_effort: value.resolved_reasoning_effort,
+        resolved_fast_mode: value.resolved_fast_mode,
         source_transport: value.source_transport,
         tool_audit_json: value.tool_audit_json,
         created_at_ms: value.created_at_ms,

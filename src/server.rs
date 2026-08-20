@@ -2561,7 +2561,7 @@ impl ServerCore {
                 before.map_or("", nakode_protocol::EntryId::as_str),
             )
         })?;
-        Ok(QueryResult::Transcript(page))
+        Ok(QueryResult::Transcript(Box::new(page)))
     }
 
     fn query_run_transcript_page(
@@ -2587,7 +2587,7 @@ impl ServerCore {
                 before.map_or("", nakode_protocol::EntryId::as_str),
             )
         })?;
-        Ok(QueryResult::Transcript(page))
+        Ok(QueryResult::Transcript(Box::new(page)))
     }
 
     fn query_transcript_body_window(
@@ -7111,6 +7111,7 @@ first_message = "Starting review"
             else {
                 panic!("transcript result");
             };
+            let page = *page;
             assert!(page.entries.len() <= 37);
             if page.entries.is_empty() {
                 break;

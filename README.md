@@ -341,6 +341,13 @@ origin, and `TranscriptEntryView` plus protobuf fields 9 (`provider_id`) and 10 
 SDK clients. Legacy and provider compatibility history without trustworthy origin leaves both fields
 absent; consumers must not infer them from a current selection or display/model-name parsing.
 
+The public `TranscriptPage` keeps explicit paged history at 128 entries and 512 KiB, while the live
+session snapshot projects up to 256 entries and 1 MiB so inspection clients receive materially more
+recent history without removing a bounded API edge. Newest-page snapshots also project the latest
+owner entry independently and expose the exact number of omitted `Tool`/`Diff` entries carrying that
+owner turn ID. Historical pages omit both current-turn fields; unrelated omitted rows never contribute
+to the count. Entry bodies, audits, redaction and truncation retain their existing bounds.
+
 ## Optional web browsing
 
 Nakode's portable runtime can expose a `browser` tool when a browser add-on is

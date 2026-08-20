@@ -230,6 +230,8 @@ mod tests {
                 has_earlier: false,
                 stream_active: false,
                 stream_label: "reviewer".to_owned(),
+                current_owner_entry: None,
+                current_owner_omitted_tool_calls: 0,
             },
         }
     }

@@ -131,7 +131,7 @@ pub enum QueryResult {
     McpManagement(McpManagementView),
     Sessions(SessionInventory),
     Session(Box<SessionView>),
-    Transcript(crate::TranscriptPage),
+    Transcript(Box<crate::TranscriptPage>),
     TranscriptBody(TranscriptBodyWindow),
     Run(Box<RunView>),
     Runs(crate::RunPage),

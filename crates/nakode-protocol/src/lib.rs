@@ -71,8 +71,14 @@ pub const MAX_ARTIFACT_BYTES: usize = 20 * 1024 * 1024;
 /// Maximum number of semantic entries carried in one transcript snapshot.
 pub const MAX_TRANSCRIPT_PAGE_ENTRIES: usize = 128;
 
-/// Maximum combined UTF-8 body bytes carried in one transcript snapshot.
+/// Maximum combined UTF-8 body bytes carried in one paged transcript query.
 pub const MAX_TRANSCRIPT_PAGE_BODY_BYTES: usize = 512 * 1024;
+
+/// Maximum number of semantic entries carried in a live session snapshot.
+pub const MAX_TRANSCRIPT_SNAPSHOT_ENTRIES: usize = 256;
+
+/// Maximum combined UTF-8 body bytes carried in a live session snapshot.
+pub const MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES: usize = 1024 * 1024;
 
 /// Maximum UTF-8 body bytes retained for one projected transcript entry.
 pub const MAX_TRANSCRIPT_ENTRY_BODY_BYTES: usize = 256 * 1024;

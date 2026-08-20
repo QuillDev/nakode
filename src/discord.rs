@@ -1894,7 +1894,7 @@ async fn start_reconciler(discord: Arc<dyn DiscordApi>, state: Arc<BotState>) {
     }
     let task_state = Arc::clone(&state);
     let handle = tokio::spawn(async move {
-        reconcile_loop(discord, task_state).await;
+        Box::pin(reconcile_loop(discord, task_state)).await;
     });
     state.track_child(&handle);
     *slot = Some(handle);

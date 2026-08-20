@@ -1378,7 +1378,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         let protocol::QueryResult::Transcript(value) = result.value else {
             return Err(tonic::Status::internal("unexpected transcript response"));
         };
-        Ok(tonic::Response::new(transcript(value)))
+        Ok(tonic::Response::new(transcript(*value)))
     }
 
     async fn get_transcript_body_window(
@@ -2219,6 +2219,8 @@ pub(crate) fn transcript(value: protocol::TranscriptPage) -> api::TranscriptPage
         has_earlier: value.has_earlier,
         stream_active: value.stream_active,
         stream_label: value.stream_label,
+        current_owner_entry: value.current_owner_entry.map(transcript_entry),
+        current_owner_omitted_tool_calls: value.current_owner_omitted_tool_calls,
     }
 }
 

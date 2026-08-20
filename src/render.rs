@@ -2413,6 +2413,8 @@ mod tests {
             has_earlier: false,
             stream_active: false,
             stream_label: "Nakode".to_owned(),
+            current_owner_entry: None,
+            current_owner_omitted_tool_calls: 0,
         }
     }
 
@@ -2521,6 +2523,8 @@ mod tests {
                 has_earlier: false,
                 stream_active: matches!(status, RunStatus::Starting | RunStatus::Working),
                 stream_label: "explorer".to_owned(),
+                current_owner_entry: None,
+                current_owner_omitted_tool_calls: 0,
             },
         }
     }
