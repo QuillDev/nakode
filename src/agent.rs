@@ -348,11 +348,20 @@ impl AgentDefinition {
                 );
             }
         }
+        let effective_delegation = effective
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == NAKODE_AGENT_TOOL_NAME));
         if self.can_delegate {
             warnings.push(format!(
                 "Recursive delegation is enabled to depth {}; every child remains parent-attributed.",
                 self.max_delegation_depth
             ));
+            if effective.is_some() && !effective_delegation {
+                warnings.push(
+                    "Recursive delegation is configured, but nakode_agent is absent from the effective tool boundary; this child cannot invoke it."
+                        .to_owned(),
+                );
+            }
         }
         warnings
     }
@@ -1290,6 +1299,35 @@ description = "Research the requested topic and report concrete findings"
         assert_eq!(
             watcher.effective_capabilities(),
             Some(vec!["filesystem_read".to_owned()])
+        );
+    }
+
+    #[test]
+    fn policy_warnings_expose_inert_recursive_delegation_configuration() {
+        let missing_tool = AgentDefinition {
+            tool_profile: AgentToolProfile::Custom,
+            allowed_capabilities: vec!["delegation".to_owned()],
+            allowed_tools: vec!["read".to_owned()],
+            can_delegate: true,
+            max_delegation_depth: 1,
+            ..AgentDefinition::default()
+        };
+        assert!(
+            missing_tool
+                .policy_warnings()
+                .iter()
+                .any(|warning| warning.contains("nakode_agent is absent"))
+        );
+
+        let runnable = AgentDefinition {
+            allowed_tools: vec!["read".to_owned(), "nakode_agent".to_owned()],
+            ..missing_tool
+        };
+        assert!(
+            !runnable
+                .policy_warnings()
+                .iter()
+                .any(|warning| warning.contains("absent from the effective tool boundary"))
         );
     }
 
