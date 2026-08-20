@@ -42,8 +42,6 @@ use crate::{
 
 use super::{BridgeStateCheckpoint, ServerCore};
 
-const SESSION_INVENTORY_LIMIT: usize = 500;
-
 #[derive(Debug, Error)]
 pub enum NativeRuntimeError {
     #[error(transparent)]
@@ -225,7 +223,6 @@ pub(crate) struct PreparedRuntime {
     pub(crate) effects: EffectExecutor,
     pub(crate) providers: Vec<ProviderRecord>,
     pub(crate) sessions: Vec<SessionRecord>,
-    pub(crate) session_inventory_complete: bool,
     pub(crate) delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
     pub(crate) soul_store: crate::soul::SoulStore,
 }
@@ -246,9 +243,6 @@ impl PreparedRuntime {
             self.effects,
             self.delegation_requests,
         );
-        runtime
-            .core
-            .set_session_inventory_complete(self.session_inventory_complete);
         runtime.core.install_soul_store(self.soul_store);
         (runtime, handle)
     }
@@ -293,8 +287,7 @@ pub(crate) async fn prepare_runtime(
     state.set_nakode_executable(&nakode_executable);
     load_cached_provider_configuration(&mut state, &mut backends, session_repository.as_ref())
         .await;
-    let sessions = session_repository.list_recent(&state.workspace, SESSION_INVENTORY_LIMIT)?;
-    let session_inventory_complete = sessions.len() < SESSION_INVENTORY_LIMIT;
+    let sessions = session_repository.list_recent(&state.workspace, 100)?;
     let persistence = PersistenceServices {
         database: session_database,
         sessions: session_repository,
@@ -305,7 +298,6 @@ pub(crate) async fn prepare_runtime(
         effects: EffectExecutor::new(backends, persistence),
         providers,
         sessions,
-        session_inventory_complete,
         delegation_requests,
         soul_store,
     })

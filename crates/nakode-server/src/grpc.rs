@@ -922,16 +922,11 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 limit: request.limit,
             })
             .await?;
-        let protocol::QueryResult::Sessions(inventory) = result.value else {
+        let protocol::QueryResult::Sessions(values) = result.value else {
             return Err(tonic::Status::internal("unexpected sessions response"));
         };
         Ok(tonic::Response::new(api::ListSessionsResponse {
-            sessions: inventory
-                .sessions
-                .into_iter()
-                .map(session_summary)
-                .collect(),
-            complete: inventory.complete,
+            sessions: values.into_iter().map(session_summary).collect(),
         }))
     }
 

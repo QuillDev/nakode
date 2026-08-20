@@ -289,12 +289,7 @@ message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // former initial sessions are rotated to a fresh control-plane successor and deleted.
 // Requires the `SessionDeletion` capability.
 message DeleteSessionRequest { MutationOptions mutation = 1; string session_id = 2; }
-message ListSessionsResponse {
-  repeated SessionSummary sessions = 1;
-  // True only when this response contains the complete canonical logical-session inventory.
-  // False covers bounded startup restoration, request truncation, and older servers.
-  bool complete = 2;
-}
+message ListSessionsResponse { repeated SessionSummary sessions = 1; }
 message GetSessionRequest { string session_id = 1; }
 message WatchSessionRequest { string session_id = 1; optional Cursor after = 2; }
 message SessionSnapshot { Cursor cursor = 1; SessionState state = 2; }

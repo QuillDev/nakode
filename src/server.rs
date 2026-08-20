@@ -97,7 +97,6 @@ pub struct ServerCore {
     mcp_servers: Vec<crate::mcp::McpServerRecord>,
     providers: Vec<ProviderRecord>,
     sessions: Vec<SessionRecord>,
-    session_inventory_complete: bool,
     session_bridges: Vec<SessionBridgeRecord>,
     inbound_event_dispositions: HashMap<(SessionId, String), BridgeContinuationDisposition>,
     command_cache: HashMap<IdempotencyKey, CachedCommand>,
@@ -124,7 +123,6 @@ impl ServerCore {
             mcp_servers: Vec::new(),
             providers,
             sessions,
-            session_inventory_complete: true,
             session_bridges: Vec::new(),
             inbound_event_dispositions: HashMap::new(),
             command_cache: HashMap::new(),
@@ -139,10 +137,6 @@ impl ServerCore {
                 .insert(core.default_session.clone(), projection);
         }
         core
-    }
-
-    pub(crate) fn set_session_inventory_complete(&mut self, complete: bool) {
-        self.session_inventory_complete = complete;
     }
 
     pub(crate) fn install_soul_store(&mut self, store: SoulStore) {
@@ -2450,13 +2444,8 @@ impl ServerCore {
             } => {
                 self.ensure_workspace(&workspace_id).map_err(domain_error)?;
                 let mut sessions = bootstrap().sessions;
-                let limit = usize::try_from(limit).unwrap_or(usize::MAX).min(500);
-                let complete = self.session_inventory_complete && sessions.len() <= limit;
-                sessions.truncate(limit);
-                Ok(QueryResult::Sessions(nakode_protocol::SessionInventory {
-                    sessions,
-                    complete,
-                }))
+                sessions.truncate(usize::try_from(limit).unwrap_or(usize::MAX).min(500));
+                Ok(QueryResult::Sessions(sessions))
             }
             Query::GetSession { session_id } => Ok(QueryResult::Session(Box::new(
                 self.session_view(&session_id)?,
@@ -5222,53 +5211,6 @@ mod tests {
         assert_eq!(discovered.sessions.len(), 1);
         assert_eq!(discovered.sessions[0].id, created_id);
         assert_eq!(discovered.sessions[0].updated_at_ms, 0);
-    }
-
-    #[test]
-    fn session_inventory_is_authoritative_only_when_startup_and_request_are_complete() {
-        let (mut core, _) = ready_codex_server();
-        let workspace_id = core.workspace_bootstrap().workspace_id;
-        for _ in 0..2 {
-            core.create_session_command(&workspace_id, None, &ModelOptions::default(), None)
-                .expect("logical session");
-        }
-
-        let QueryResult::Sessions(complete) = core
-            .query(Query::ListSessions {
-                workspace_id: workspace_id.clone(),
-                limit: 2,
-            })
-            .expect("complete inventory")
-        else {
-            panic!("session inventory result");
-        };
-        assert!(complete.complete);
-        assert_eq!(complete.sessions.len(), 2);
-
-        let QueryResult::Sessions(truncated) = core
-            .query(Query::ListSessions {
-                workspace_id: workspace_id.clone(),
-                limit: 1,
-            })
-            .expect("bounded inventory")
-        else {
-            panic!("session inventory result");
-        };
-        assert!(!truncated.complete);
-        assert_eq!(truncated.sessions.len(), 1);
-
-        core.set_session_inventory_complete(false);
-        let QueryResult::Sessions(startup_partial) = core
-            .query(Query::ListSessions {
-                workspace_id,
-                limit: 500,
-            })
-            .expect("startup-partial inventory")
-        else {
-            panic!("session inventory result");
-        };
-        assert!(!startup_partial.complete);
-        assert_eq!(startup_partial.sessions.len(), 2);
     }
 
     #[test]
