@@ -36,7 +36,8 @@ pub use mcp::{
 };
 pub use service::{
     BridgeContinuationDisposition, CommandAccepted, Cursor, QueryResult, ServiceCapabilities,
-    ServiceCapability, Snapshot, SoulDocumentView, SubscriptionScope, SubscriptionView,
+    ServiceCapability, SessionInventory, Snapshot, SoulDocumentView, SubscriptionScope,
+    SubscriptionView,
 };
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,
