@@ -18,7 +18,7 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read",
-            description: "Read one UTF-8 text file. Output is limited to 2000 lines or 50 KB. Use offset and limit for large files, and issue parallel read calls for independent files or ranges.",
+            description: "Read one UTF-8 text file. Prefer read over bash commands such as cat or sed. Output is limited to 2000 lines or 50 KB. For large files, use offset and limit, then continue with a later offset until complete. Issue parallel read calls for independent files or ranges.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -34,7 +34,7 @@ impl Tool for ReadTool {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Maximum lines to read"
+                        "description": "Maximum lines to read; the 50 KB output limit still applies"
                     }
                 },
                 "required": ["path"],
