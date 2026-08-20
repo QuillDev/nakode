@@ -77,6 +77,13 @@ fn managed_watch<T: Send + 'static>(
     })
 }
 
+/// One logical-session catalogue plus whether it is safe to treat omission as authoritative.
+#[derive(Clone, Debug)]
+pub struct LogicalSessionInventory {
+    pub sessions: Vec<api::SessionSummary>,
+    pub complete: bool,
+}
+
 /// A fully materialized session suitable for direct rendering.
 #[derive(Clone, Debug)]
 pub struct HydratedSession {
@@ -446,6 +453,21 @@ impl NakodeClient {
         limit: u32,
     ) -> Result<Vec<api::SessionSummary>, SdkError> {
         Ok(self
+            .list_session_inventory(workspace_id, limit)
+            .await?
+            .sessions)
+    }
+
+    /// Lists logical sessions and preserves the server's explicit completeness boundary.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn list_session_inventory(
+        &self,
+        workspace_id: impl Into<String>,
+        limit: u32,
+    ) -> Result<LogicalSessionInventory, SdkError> {
+        let response = self
             .transport
             .clone()
             .list_sessions(api::ListSessionsRequest {
@@ -453,8 +475,11 @@ impl NakodeClient {
                 limit,
             })
             .await?
-            .into_inner()
-            .sessions)
+            .into_inner();
+        Ok(LogicalSessionInventory {
+            sessions: response.sessions,
+            complete: response.complete,
+        })
     }
 
     /// Returns authoritative state for one session.

@@ -116,12 +116,18 @@ pub struct CommandAccepted {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionInventory {
+    pub sessions: Vec<SessionSummary>,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum QueryResult {
     Bootstrap(Box<BootstrapView>),
     SoulDocument(SoulDocumentView),
     McpManagement(McpManagementView),
-    Sessions(Vec<SessionSummary>),
+    Sessions(SessionInventory),
     Session(Box<SessionView>),
     Transcript(crate::TranscriptPage),
     TranscriptBody(TranscriptBodyWindow),
