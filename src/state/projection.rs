@@ -1131,6 +1131,9 @@ fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView
             .filter(|model| model.provider == provider.provider)
             .map(|model| model_view(state, model))
             .collect(),
+        available_builtin_tools: state
+            .available_builtin_tools(&provider.provider)
+            .map(<[String]>::to_vec),
     }
 }
 

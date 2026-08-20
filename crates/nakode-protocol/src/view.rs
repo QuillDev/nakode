@@ -115,6 +115,10 @@ pub struct ProviderView {
     /// Full discovered catalogue used by settings; BootstrapView.models may be filtered.
     #[serde(default)]
     pub model_candidates: Vec<ModelView>,
+    /// Canonical built-ins this provider can expose under the current runtime/add-on settings.
+    /// `None` means an older or non-authoritative projection, never an unrestricted default.
+    #[serde(default)]
+    pub available_builtin_tools: Option<Vec<String>>,
 }
 
 /// Product surface that owns the user-facing projection of one logical session.

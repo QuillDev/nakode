@@ -757,6 +757,9 @@ fn provider(value: api::Provider) -> Result<view::ProviderView, String> {
             .map(view::ModelId::from)
             .collect(),
         model_candidates: value.model_candidates.into_iter().map(model).collect(),
+        available_builtin_tools: value
+            .builtin_tool_availability_known
+            .then_some(value.available_builtin_tools),
     })
 }
 

@@ -643,10 +643,19 @@ impl NativeServerRuntime {
             .commit_and_publish_session(&self.endpoint, &pending.session_id);
     }
 
+    fn refresh_builtin_tool_availability(&mut self) {
+        let availability = self
+            .effects
+            .backends
+            .available_builtin_tools(self.core.provider_records());
+        self.core.install_available_builtin_tools(&availability);
+    }
+
     #[allow(clippy::too_many_lines)]
     // The request dispatcher keeps fencing, typed routing, persistence rollback, and response
     // completion in one exhaustive match so a newly added public request cannot bypass a guard.
     async fn handle_request(&mut self, request: nakode_server::ServerRequest) {
+        self.refresh_builtin_tool_availability();
         let request = if self.accepting_work {
             request
         } else {
@@ -854,6 +863,7 @@ impl NativeServerRuntime {
         if updates_provider_model_filter {
             self.synchronize_shared_providers().await;
         }
+        self.refresh_builtin_tool_availability();
         self.refresh_mcp_servers();
         if had_effects {
             self.refresh_catalogs();
@@ -1726,6 +1736,58 @@ impl BackendRegistry {
 
     pub(crate) fn current_vision_config(&self) -> crate::vision::VisionConfig {
         read_shared_config(&self.vision_config)
+    }
+
+    pub(crate) fn available_builtin_tools(
+        &self,
+        providers: &[ProviderRecord],
+    ) -> HashMap<String, Vec<String>> {
+        let runtime_tools = crate::tools::ToolRegistry::base()
+            .with_browser(Arc::clone(&self.web_config))
+            .with_memory(Arc::clone(&self.memory_service))
+            .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone())
+            .with_native_delegation()
+            .definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<std::collections::HashSet<_>>();
+        let canonical = crate::agent::CANONICAL_AGENT_TOOLS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+
+        providers
+            .iter()
+            .map(|provider| {
+                let available =
+                    if !provider.enabled || !self.commands.contains_key(&provider.provider) {
+                        Vec::new()
+                    } else if matches!(
+                        provider.provider.as_str(),
+                        crate::backend::CODEX_PROVIDER
+                            | crate::backend::DEVIN_PROVIDER
+                            | crate::backend::KIMI_PROVIDER
+                            | crate::backend::GLM_PROVIDER
+                    ) {
+                        canonical
+                            .iter()
+                            .filter(|name| runtime_tools.contains(name.as_str()))
+                            .cloned()
+                            .collect()
+                    } else {
+                        let projection = crate::backend::project_provider_tools(
+                            &provider.provider,
+                            Some(&canonical),
+                        );
+                        canonical
+                            .iter()
+                            .filter(|name| !projection.unsupported_canonical_tools.contains(name))
+                            .cloned()
+                            .collect()
+                    };
+                (provider.provider.clone(), available)
+            })
+            .collect()
     }
 
     pub(crate) async fn spawn(
@@ -3340,7 +3402,7 @@ mod tests {
     use crate::{
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendHandle, BackendIdentity,
-            CODEX_PROVIDER, ModelInfo,
+            CODEX_PROVIDER, DEVIN_PROVIDER, ModelInfo,
         },
         config::{Config, OpenAiReasoningEffort},
         credential::{CredentialStore, SqliteCredentialStore},
@@ -3544,6 +3606,54 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn builtin_availability_uses_live_runtime_tools_and_provider_readiness() {
+        use std::{fs, os::unix::fs::PermissionsExt as _};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let (commands, _command_rx) = mpsc::channel(1);
+        registry
+            .commands
+            .insert(CODEX_PROVIDER.to_owned(), commands);
+
+        {
+            let mut web = registry.web_config.write().expect("web config");
+            web.backend = crate::web::WebBackend::Firecrawl;
+            web.firecrawl_api_key = "test-key".to_owned();
+        }
+        let executable = workspace.path().join("mnemosyne");
+        fs::write(&executable, "#!/bin/sh\n").expect("write memory executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("make memory executable runnable");
+        *registry.memory_config.write().expect("memory config") = crate::memory::MemoryConfig {
+            backend: crate::memory::MemoryBackend::Mnemosyne,
+            executable: executable.to_string_lossy().into_owned(),
+            global_bank: "test-global".to_owned(),
+            data_directory: String::new(),
+        };
+
+        let availability = registry.available_builtin_tools(&[
+            provider(CODEX_PROVIDER, true, true),
+            provider(DEVIN_PROVIDER, true, true),
+        ]);
+        let codex = availability
+            .get(CODEX_PROVIDER)
+            .expect("Codex availability");
+        assert!(codex.iter().any(|name| name == "browser"));
+        assert!(codex.iter().any(|name| name == "memory_search"));
+        assert!(codex.iter().any(|name| name == "memory_store"));
+        assert!(!codex.iter().any(|name| name == "vision"));
+        assert!(
+            availability
+                .get(DEVIN_PROVIDER)
+                .expect("unstarted Devin availability")
+                .is_empty(),
+            "an enabled provider without a live command channel is unavailable"
+        );
     }
 
     fn fake_backend() -> (
