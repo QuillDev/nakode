@@ -741,6 +741,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         input,
         protocol::Command::CreateSession {
             workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            working_directory: input.working_directory,
             title: input.title,
             model_id: input.model_id.map(protocol::ModelId::from),
             options: model_options(input.options),
@@ -2041,6 +2042,7 @@ pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSu
         id: value.id.to_string(),
         workspace_id: value.workspace_id.to_string(),
         title: value.title,
+        working_directory: value.working_directory,
         active_provider_id: value.active_provider_id.map(|id| id.to_string()),
         active_model_id: value.active_model_id.map(|id| id.to_string()),
         updated_at_ms: value.updated_at_ms,
@@ -2062,6 +2064,7 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         id: value.id.to_string(),
         revision: value.revision,
         workspace_id: value.workspace_id.to_string(),
+        working_directory: value.working_directory,
         title: value.title,
         status_message: value.status_message,
         diagnostic_count: value.diagnostic_count,

@@ -139,7 +139,11 @@ pub enum NakodeCommand {
     },
     /// Print the private gRPC endpoint used by native frontends.
     #[command(hide = true)]
-    Endpoint,
+    Endpoint {
+        /// Address the stable per-user service rooted at `NAKODE_HOME`.
+        #[arg(long)]
+        global: bool,
+    },
     /// Report persisted token, cache, session, and tool telemetry without prompt content.
     Diagnostics {
         /// Number of days of telemetry to include.
@@ -264,7 +268,7 @@ impl ServiceAction {
             Self::Discord { action } => NakodeCommand::Transport {
                 action: TransportCommand::Discord { action },
             },
-            Self::Endpoint => NakodeCommand::Endpoint,
+            Self::Endpoint => NakodeCommand::Endpoint { global: false },
         }
     }
 }
@@ -413,6 +417,18 @@ impl Config {
             )
         {
             return Ok(self);
+        }
+        if matches!(
+            self.command.as_ref(),
+            Some(NakodeCommand::Endpoint { global: true })
+        ) {
+            self.workspace = nakode_home()?;
+            std::fs::create_dir_all(&self.workspace).map_err(|source| {
+                ConfigError::ResolveWorkspace {
+                    path: self.workspace.clone(),
+                    source,
+                }
+            })?;
         }
         if !self.workspace.exists() {
             return Err(ConfigError::MissingWorkspace(self.workspace));
@@ -563,7 +579,14 @@ mod tests {
                 vec!["nakode", "status", "--json"],
                 NakodeCommand::Status { json: true },
             ),
-            (vec!["nakode", "endpoint"], NakodeCommand::Endpoint),
+            (
+                vec!["nakode", "endpoint"],
+                NakodeCommand::Endpoint { global: false },
+            ),
+            (
+                vec!["nakode", "endpoint", "--global"],
+                NakodeCommand::Endpoint { global: true },
+            ),
         ] {
             let config = Config::try_parse_from(arguments.clone()).expect("lifecycle command");
             assert_eq!(
@@ -678,7 +701,7 @@ mod tests {
         );
         assert_eq!(
             rewritten(ServiceAction::Endpoint),
-            format!("{:?}", NakodeCommand::Endpoint)
+            format!("{:?}", NakodeCommand::Endpoint { global: false })
         );
         assert_eq!(
             rewritten(ServiceAction::Discord {

@@ -170,6 +170,9 @@ message CreateSessionRequest {
   optional string initial_instructions = 8;
   // Optional provider-neutral Chat/Agent external-thread projection intent.
   optional SessionBridgeIntent bridge = 9;
+  // Filesystem/provider process root for this session. Omission inherits the logical workspace path.
+  // The server canonicalizes and persists this directory before publishing the session.
+  optional string working_directory = 10;
 }
 // Supplying tools installs them before a closed session begins provider restoration. An already
 // attached session accepts only the identical table, making client reattachment idempotent without
@@ -686,6 +689,8 @@ message SessionSummary {
   bool running = 8;
   // Unix epoch milliseconds. The immutable logical-session creation boundary.
   int64 created_at_ms = 9;
+  // Canonical filesystem/provider process root, independent from logical workspace ownership.
+  string working_directory = 10;
 }
 enum SessionActivity { SESSION_ACTIVITY_UNSPECIFIED = 0; SESSION_ACTIVITY_IDLE = 1; SESSION_ACTIVITY_CREATING_AGENT_SESSION = 2; SESSION_ACTIVITY_STARTING_TURN = 3; SESSION_ACTIVITY_RUNNING_TURN = 4; SESSION_ACTIVITY_COMPACTING_CONTEXT = 5; SESSION_ACTIVITY_RUNNING_DELEGATES = 6; SESSION_ACTIVITY_RUNNING_SHELL = 7; }
 message TokenUsage { uint64 input_tokens = 1; uint64 output_tokens = 2; uint64 cached_input_tokens = 3; uint64 cache_write_tokens = 4; }
@@ -749,6 +754,8 @@ message SessionState {
   // Includes direct runs and recursively delegated descendants. Presence distinguishes a real zero
   // from an older server that predates this field.
   optional uint64 runs_total = 28;
+  // Canonical filesystem/provider process root, independent from logical workspace ownership.
+  string working_directory = 29;
 }
 message ExternalToolCall { string id = 1; string name = 2; string arguments_json = 3; }
 

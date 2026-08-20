@@ -924,6 +924,7 @@ pub enum Effect {
         provider: String,
         provider_session_id: String,
         workspace: String,
+        working_directory: String,
         title: String,
         model: Option<String>,
         options: ModelOptions,
@@ -1007,7 +1008,10 @@ pub struct DomainState {
     #[cfg(test)]
     pub client: ClientPresentationState,
     pub connection: ConnectionState,
+    /// Logical workspace/service ownership path.
     pub workspace: String,
+    /// Filesystem and provider process root for this logical session.
+    pub working_directory: String,
     pub backend_provider: String,
     pub backend_name: String,
     pub backend_capabilities: BackendCapabilities,
@@ -1652,6 +1656,7 @@ impl DomainState {
         backend_name: impl Into<String>,
     ) -> Self {
         let backend_name = backend_name.into();
+        let workspace = workspace.into();
         let transcript = DomainTranscript::new(scrollback);
         let provider = provider.into();
         let mut provider_contexts = HashMap::new();
@@ -1670,7 +1675,8 @@ impl DomainState {
             #[cfg(test)]
             client: ClientPresentationState::default(),
             connection: ConnectionState::Starting,
-            workspace: workspace.into(),
+            working_directory: workspace.clone(),
+            workspace,
             backend_provider: provider,
             backend_name: backend_name.clone(),
             backend_capabilities: BackendCapabilities::default(),
@@ -2938,6 +2944,8 @@ impl DomainState {
             return Vec::new();
         }
         self.pending_handoff = None;
+        self.working_directory
+            .clone_from(&session.working_directory);
         self.selected_model.clone_from(&session.model);
         self.session_model_options_override = session
             .model
@@ -5252,9 +5260,10 @@ impl DomainState {
         replace_builtin_tools: bool,
         allowed_builtin_tools: Option<Vec<String>>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        if tools.is_empty() && allowed_builtin_tools.is_none() {
+        if tools.is_empty() && allowed_builtin_tools.is_none() && !replace_builtin_tools {
             return Err(DomainCommandError::Invalid(
-                "at least one external tool is required".to_owned(),
+                "at least one external tool, builtin allowlist, or explicit empty replacement is required"
+                    .to_owned(),
             ));
         }
         let mut names = HashSet::new();
@@ -5912,6 +5921,7 @@ impl DomainState {
                 provider: self.backend_provider.clone(),
                 provider_session_id: provider_session_id.clone(),
                 workspace: self.workspace.clone(),
+                working_directory: self.working_directory.clone(),
                 title: prompt.text.clone(),
                 model: self.selected_model.clone(),
                 options: prompt.options.clone(),
@@ -6454,6 +6464,7 @@ impl DomainState {
                 provider: self.backend_provider.clone(),
                 provider_session_id: provider_session_id.clone(),
                 workspace: self.workspace.clone(),
+                working_directory: self.working_directory.clone(),
                 title: prompt.text.clone(),
                 model: self.selected_model.clone(),
                 options: prompt.options.clone(),
@@ -7380,6 +7391,34 @@ impl DomainState {
         };
         self.prompt_addenda
             .apply(&base, self.selected_model.as_deref())
+    }
+
+    /// Sets the already canonicalized filesystem/provider root before a fresh session is published.
+    pub fn set_working_directory(&mut self, working_directory: String) {
+        self.working_directory = working_directory;
+    }
+
+    /// Omits memory tools only when memory is explicitly configured off.
+    ///
+    /// Configured but unavailable backends remain requested so genuine installation, locking, or
+    /// transient failures continue to fail closed at the runtime boundary.
+    #[must_use]
+    pub fn omit_disabled_memory_tools(
+        &self,
+        mut tools: nakode_protocol::SessionToolConfiguration,
+    ) -> nakode_protocol::SessionToolConfiguration {
+        if self.memory_config.backend != MemoryBackend::Disabled {
+            return tools;
+        }
+        let Some(allowed) = tools.allowed_builtin_tools.as_mut() else {
+            return tools;
+        };
+        allowed.retain(|name| !matches!(name.as_str(), "memory_search" | "memory_store"));
+        if allowed.is_empty() {
+            tools.allowed_builtin_tools = None;
+            tools.replace_builtin_tools = true;
+        }
+        tools
     }
 
     /// Installs bounded client-owned provider instructions before the first provider session starts.
@@ -8805,6 +8844,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-with-mcp".to_owned(),
             workspace: state.workspace.clone(),
+            working_directory: state.workspace.clone(),
             title: "Diagram work".to_owned(),
             model: Some("model-a".to_owned()),
             model_options: crate::backend::ModelOptions::default(),
@@ -11453,6 +11493,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-resumed".to_owned(),
             workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
             title: "Previous work".to_owned(),
             model: Some("model-a".to_owned()),
             model_options: crate::backend::ModelOptions::default(),
@@ -12173,6 +12214,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "codex-restored".to_owned(),
             workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
             title: "Restored transition".to_owned(),
             model: Some("devin-acp/devin-model".to_owned()),
             model_options: ModelOptions::default(),

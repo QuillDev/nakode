@@ -186,6 +186,9 @@ pub struct SessionSummary {
     pub id: SessionId,
     pub workspace_id: WorkspaceId,
     pub title: String,
+    /// Canonical filesystem/provider process root, independent from logical workspace ownership.
+    #[serde(default)]
+    pub working_directory: String,
     pub active_provider_id: Option<ProviderId>,
     pub active_model_id: Option<ModelId>,
     pub updated_at_ms: i64,
@@ -772,6 +775,9 @@ pub struct SessionView {
     pub id: SessionId,
     pub revision: u64,
     pub workspace_id: WorkspaceId,
+    /// Canonical filesystem/provider process root, independent from logical workspace ownership.
+    #[serde(default)]
+    pub working_directory: String,
     pub title: String,
     pub status_message: String,
     pub diagnostic_count: u64,

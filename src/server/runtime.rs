@@ -1140,10 +1140,14 @@ impl NativeServerRuntime {
                 session_id,
                 provider,
             } => {
+                let working_directory = self.core.engine_for(session_id).map_or_else(
+                    || self.effects.backends.config.workspace.clone(),
+                    |engine| PathBuf::from(&engine.state().working_directory),
+                );
                 let _ = self
                     .effects
                     .backends
-                    .send_session(session_id, provider, command)
+                    .send_session(session_id, provider, &working_directory, command)
                     .await;
             }
             BackendSource::Subagent(run_id) => {
@@ -1161,6 +1165,7 @@ impl NativeServerRuntime {
         origin: EffectOrigin,
     ) {
         let mut ordinary = Vec::new();
+        let mut sync_memory_config = false;
         for effect in effects {
             match effect {
                 Effect::SaveMcpServer(server) => {
@@ -1307,13 +1312,23 @@ impl NativeServerRuntime {
                         },
                     );
                 }
+                Effect::SaveMemoryConfig(config) => {
+                    sync_memory_config = true;
+                    ordinary.push(Effect::SaveMemoryConfig(config));
+                }
                 effect => ordinary.push(effect),
             }
         }
+        let mut executed = false;
         if let Some(engine) = self.core.engine_for_mut(session_id) {
             self.effects
                 .execute(session_id, engine.state_mut(), ordinary, origin)
                 .await;
+            executed = true;
+        }
+        if executed && sync_memory_config {
+            let memory_config = self.effects.backends.current_memory_config();
+            self.core.install_memory_config(&memory_config);
         }
     }
 
@@ -1473,6 +1488,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::ExternalTools,
             ServiceCapability::InitialSessionTools,
             ServiceCapability::BuiltinToolAllowlists,
+            ServiceCapability::SessionWorkingDirectories,
             ServiceCapability::InitialSessionModel,
             ServiceCapability::InitialSessionInstructions,
             ServiceCapability::SessionDeletion,
@@ -1630,17 +1646,23 @@ impl BackendRegistry {
         if self.commands.contains_key(provider) {
             return Ok(());
         }
-        let handle = self.spawn_provider_handle(provider).await?;
+        let handle = self
+            .spawn_provider_handle(provider, &self.config.workspace)
+            .await?;
         self.insert_provider_control(provider.to_owned(), handle);
         Ok(())
     }
 
-    async fn spawn_provider_handle(&self, provider: &str) -> Result<BackendHandle, BackendError> {
+    async fn spawn_provider_handle(
+        &self,
+        provider: &str,
+        working_directory: &Path,
+    ) -> Result<BackendHandle, BackendError> {
         let credential = self.provider_credentials.get(provider).cloned();
         let handle = match provider {
             crate::backend::CODEX_PROVIDER => {
                 codex::spawn(
-                    codex::BackendConfig::native(self.config.workspace.clone())
+                    codex::BackendConfig::native(working_directory.to_path_buf())
                         .with_credential(credential)
                         .with_reasoning_effort(self.config.openai_reasoning_effort.as_str())
                         .with_compaction_threshold_percent(usize::from(
@@ -1656,7 +1678,7 @@ impl BackendRegistry {
             }
             crate::backend::CLAUDE_PROVIDER => {
                 claude::spawn(
-                    claude::BackendConfig::native(self.config.workspace.clone())
+                    claude::BackendConfig::native(working_directory.to_path_buf())
                         .with_credential(credential)
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
@@ -1664,7 +1686,7 @@ impl BackendRegistry {
             }
             crate::backend::CURSOR_PROVIDER => {
                 cursor::spawn(
-                    cursor::BackendConfig::native(self.config.workspace.clone())
+                    cursor::BackendConfig::native(working_directory.to_path_buf())
                         .with_credential(credential)
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
@@ -1672,7 +1694,7 @@ impl BackendRegistry {
             }
             crate::backend::KIMI_PROVIDER => {
                 kimi::spawn(
-                    kimi::BackendConfig::native(self.config.workspace.clone())
+                    kimi::BackendConfig::native(working_directory.to_path_buf())
                         .with_credential(credential)
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
@@ -1687,7 +1709,7 @@ impl BackendRegistry {
             }
             crate::backend::GLM_PROVIDER => {
                 glm::spawn(
-                    glm::BackendConfig::native(self.config.workspace.clone())
+                    glm::BackendConfig::native(working_directory.to_path_buf())
                         .with_credential(credential)
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
@@ -1702,7 +1724,7 @@ impl BackendRegistry {
             }
             crate::backend::DEVIN_PROVIDER => {
                 devin::spawn(
-                    devin::BackendConfig::native(self.config.workspace.clone())
+                    devin::BackendConfig::native(working_directory.to_path_buf())
                         .with_credential(credential)
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
@@ -1839,6 +1861,7 @@ impl BackendRegistry {
         &mut self,
         run_id: String,
         provider: &str,
+        working_directory: &Path,
     ) -> Result<(), BackendError> {
         if let Some(cooldown) = self.active_cooldown(provider) {
             return Err(BackendError::ProviderCoolingDown {
@@ -1852,7 +1875,9 @@ impl BackendRegistry {
                 provider: provider.to_owned(),
             });
         }
-        let handle = self.spawn_provider_handle(provider).await?;
+        let handle = self
+            .spawn_provider_handle(provider, working_directory)
+            .await?;
         let (commands, mut events, task) = handle.into_parts();
         self.reap_finished_tasks();
         self.subagent_commands.insert(run_id.clone(), commands);
@@ -1950,6 +1975,7 @@ impl BackendRegistry {
         &mut self,
         session_id: &nakode_protocol::SessionId,
         provider: &str,
+        working_directory: &Path,
         command: BackendCommand,
     ) -> Result<(), SessionBackendError> {
         if !self.commands.contains_key(provider) {
@@ -1960,7 +1986,9 @@ impl BackendRegistry {
         }
         let key = (session_id.clone(), provider.to_owned());
         if !self.session_commands.contains_key(&key) {
-            let handle = self.spawn_provider_handle(provider).await?;
+            let handle = self
+                .spawn_provider_handle(provider, working_directory)
+                .await?;
             self.insert_session(session_id.clone(), provider.to_owned(), handle);
         }
         let Some(commands) = self.session_commands.get(&key) else {
@@ -2064,7 +2092,7 @@ impl EffectExecutor {
             }
             Effect::RunShell { id, command } => {
                 self.shell_processes
-                    .spawn(PathBuf::from(&state.workspace), id, command);
+                    .spawn(PathBuf::from(&state.working_directory), id, command);
             }
             Effect::CancelShell(id) => {
                 if !self.shell_processes.cancel(&id) {
@@ -2332,6 +2360,7 @@ fn execute_persistence_effect(
             provider,
             provider_session_id,
             workspace,
+            working_directory,
             title,
             model,
             options,
@@ -2341,6 +2370,7 @@ fn execute_persistence_effect(
             &provider,
             &provider_session_id,
             &workspace,
+            &working_directory,
             &title,
             model.as_deref(),
             &options,
@@ -2403,6 +2433,7 @@ fn persist_session(
     provider: &str,
     provider_session_id: &str,
     workspace: &str,
+    working_directory: &str,
     title: &str,
     model: Option<&str>,
     options: &crate::backend::ModelOptions,
@@ -2412,6 +2443,7 @@ fn persist_session(
         provider,
         provider_session_id,
         workspace,
+        working_directory,
         title,
         model,
         options,
@@ -2467,7 +2499,15 @@ async fn send_backend_command(
     command: BackendCommand,
 ) {
     let provider = state.backend_provider.clone();
-    if let Err(error) = backends.send_session(session_id, &provider, command).await {
+    if let Err(error) = backends
+        .send_session(
+            session_id,
+            &provider,
+            Path::new(&state.working_directory),
+            command,
+        )
+        .await
+    {
         state.handle_provider_backend(
             &provider,
             BackendEvent::Disconnected {
@@ -2484,7 +2524,14 @@ async fn spawn_subagent(
     run_id: &str,
     provider: &str,
 ) {
-    if let Err(error) = backends.spawn_subagent(run_id.to_owned(), provider).await {
+    if let Err(error) = backends
+        .spawn_subagent(
+            run_id.to_owned(),
+            provider,
+            Path::new(&state.working_directory),
+        )
+        .await
+    {
         pending.extend(state.subagent_launch_failed(run_id, error.to_string()));
     }
 }
@@ -3715,6 +3762,7 @@ mod tests {
                 false,
                 Command::CreateSession {
                     workspace_id,
+                    working_directory: None,
                     title: None,
                     model_id: None,
                     options: nakode_protocol::ModelOptions::default(),
@@ -4173,6 +4221,7 @@ mod tests {
             .send_session(
                 session_id,
                 CODEX_PROVIDER,
+                Path::new("/tmp"),
                 BackendCommand::StartSession {
                     model: Some(model.to_owned()),
                     instructions: None,
@@ -4224,6 +4273,7 @@ mod tests {
             .send_session(
                 &first_id,
                 CODEX_PROVIDER,
+                Path::new("/tmp/first"),
                 BackendCommand::StartSession {
                     model: Some("model-first".to_owned()),
                     instructions: None,
@@ -4242,6 +4292,7 @@ mod tests {
             .send_session(
                 &second_id,
                 CODEX_PROVIDER,
+                Path::new("/tmp/second"),
                 BackendCommand::StartSession {
                     model: Some("model-second".to_owned()),
                     instructions: None,

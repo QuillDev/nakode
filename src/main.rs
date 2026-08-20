@@ -48,7 +48,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NakodeCommand::Restart => service_cli::restart(&config).await?,
         NakodeCommand::Status { json } => service_cli::status(&config, json).await?,
         NakodeCommand::Logs { follow, lines } => service_cli::logs(&config, follow, lines).await?,
-        NakodeCommand::Endpoint => service_cli::endpoint(&config).await?,
+        NakodeCommand::Endpoint { .. } => service_cli::endpoint(&config).await?,
         NakodeCommand::Transport {
             action: TransportCommand::Discord { action },
         } => discord::run_command(&config, action).await?,

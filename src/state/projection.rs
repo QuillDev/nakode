@@ -67,6 +67,7 @@ pub fn bootstrap(
             SessionSummary {
                 id: SessionId::from(state.nakode_session_id.clone()),
                 workspace_id: workspace_id.clone(),
+                working_directory: state.working_directory.clone(),
                 title: active_session.title.clone(),
                 active_provider_id: provider_id(&state.backend_provider),
                 active_model_id: state.selected_model.clone().map(ModelId::from),
@@ -230,6 +231,7 @@ fn session_view(
         id: session_id.clone(),
         revision,
         workspace_id: workspace_id.clone(),
+        working_directory: state.working_directory.clone(),
         title: session_title(state, sessions),
         status_message: state.status_message.clone(),
         diagnostic_count: u64::try_from(state.diagnostic_count).unwrap_or(u64::MAX),
@@ -1558,6 +1560,7 @@ fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> Sessi
     SessionSummary {
         id: SessionId::from(session.id.clone()),
         workspace_id: workspace_id.clone(),
+        working_directory: session.working_directory.clone(),
         title: session.title.clone(),
         active_provider_id: provider_id(&session.provider),
         active_model_id: session.model.clone().map(ModelId::from),
