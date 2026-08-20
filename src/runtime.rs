@@ -3235,6 +3235,7 @@ mod tests {
         let provider = Arc::new(CompactionProvider::new(false));
         let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider.clone());
         let mut session = large_session(Some(50_000));
+        let instructions_before = session.instructions.clone();
         let (events, mut receiver) = mpsc::channel(16);
 
         runtime
@@ -3250,6 +3251,7 @@ mod tests {
             .expect("turn completes after proactive compaction");
 
         assert_eq!(session.compactions.len(), 1);
+        assert_eq!(session.instructions, instructions_before);
         assert!(matches!(
             session.history.first(),
             Some(ConversationItem::Compaction { .. })
@@ -3258,6 +3260,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].tools.is_empty());
         assert!(!requests[1].tools.is_empty());
+        assert_eq!(requests[1].instructions, instructions_before);
         drop(requests);
         drop(events);
         let emitted = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();

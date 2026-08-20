@@ -7,6 +7,7 @@ use crate::tools::NAKODE_AGENT_TOOL_NAME;
 
 pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "read",
+    "read_skill",
     "grep",
     "find",
     "ls",
@@ -228,13 +229,16 @@ impl AgentDefinition {
     }
 
     /// The exact built-ins a delegated run receives, or `None` when a legacy custom definition
-    /// intentionally retains the provider runtime's defaults.
+    /// intentionally retains the provider runtime's defaults. Every profile except `none` also
+    /// receives Nakode's server-owned `read_skill` context tool unless it explicitly denies it.
+    /// That tool accepts no path and projects installed operating instructions rather than granting
+    /// general filesystem access, so it intentionally requires no filesystem capability.
     ///
     /// Capabilities are structural enforcement, not labels: a configured tool that requires an
     /// absent capability is removed from the runtime allowlist even for legacy deny-only policy.
     #[must_use]
     pub fn builtin_tool_allowlist(&self) -> Option<Vec<String>> {
-        let configured =
+        let mut configured =
             if self.tool_profile == AgentToolProfile::Custom && self.allowed_tools.is_empty() {
                 if self.denied_tools.is_empty() {
                     return None;
@@ -247,6 +251,12 @@ impl AgentDefinition {
             } else {
                 self.allowed_tools.clone()
             };
+        if self.tool_profile != AgentToolProfile::None
+            && !configured.iter().any(|tool| tool == "read_skill")
+            && !self.denied_tools.iter().any(|tool| tool == "read_skill")
+        {
+            configured.push("read_skill".to_owned());
+        }
         Some(
             configured
                 .into_iter()
@@ -628,6 +638,9 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
         "browser" => Some("network"),
         "memory_store" | "memory_search" => Some("memory"),
         "vision" => Some("vision"),
+        // Installed skills are Nakode-owned instruction context. `read_skill` accepts only an exact
+        // catalogued name and does not grant caller-selected filesystem access.
+        "read_skill" => None,
         NAKODE_AGENT_TOOL_NAME => Some("delegation"),
         _ => None,
     }
@@ -796,6 +809,7 @@ fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalog
         AgentToolProfile::None => &[],
         AgentToolProfile::ReadOnly => &[
             "read",
+            "read_skill",
             "grep",
             "find",
             "ls",
@@ -804,8 +818,19 @@ fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalog
             "memory_search",
             "vision",
         ],
-        AgentToolProfile::CommandRunner => &["read", "grep", "find", "ls", "bash", "todo", "ask"],
-        AgentToolProfile::BoundedWatcher => &["read", "grep", "find", "ls", "todo", "ask"],
+        AgentToolProfile::CommandRunner => &[
+            "read",
+            "read_skill",
+            "grep",
+            "find",
+            "ls",
+            "bash",
+            "todo",
+            "ask",
+        ],
+        AgentToolProfile::BoundedWatcher => {
+            &["read", "read_skill", "grep", "find", "ls", "todo", "ask"]
+        }
         AgentToolProfile::Custom => CANONICAL_AGENT_TOOLS,
     };
     if let Some(name) = definition
@@ -1100,7 +1125,7 @@ description = "Research the requested topic and report concrete findings"
         AgentCatalog::validate_definition(&definition).expect("read-only policy");
         assert_eq!(
             definition.builtin_tool_allowlist(),
-            Some(vec!["read".to_owned()])
+            Some(vec!["read".to_owned(), "read_skill".to_owned()])
         );
 
         definition.allowed_tools = vec!["browser".to_owned()];
@@ -1122,7 +1147,7 @@ description = "Research the requested topic and report concrete findings"
                 .iter()
                 .any(|tool| tool == "bash" || tool == "write" || tool == "edit")
         );
-        assert_eq!(allowed, vec!["todo".to_owned()]);
+        assert_eq!(allowed, vec!["read_skill".to_owned(), "todo".to_owned()]);
         definition.allowed_capabilities = vec!["filesystem_read".to_owned()];
         let allowed = definition
             .builtin_tool_allowlist()
@@ -1152,7 +1177,11 @@ description = "Research the requested topic and report concrete findings"
         };
         assert_eq!(
             read_only.builtin_tool_allowlist(),
-            Some(vec!["read".to_owned(), "grep".to_owned()])
+            Some(vec![
+                "read".to_owned(),
+                "grep".to_owned(),
+                "read_skill".to_owned(),
+            ])
         );
         assert_eq!(
             read_only.effective_capabilities(),
@@ -1170,7 +1199,11 @@ description = "Research the requested topic and report concrete findings"
         };
         assert_eq!(
             command_runner.builtin_tool_allowlist(),
-            Some(vec!["read".to_owned(), "bash".to_owned()])
+            Some(vec![
+                "read".to_owned(),
+                "bash".to_owned(),
+                "read_skill".to_owned(),
+            ])
         );
         assert!(
             command_runner
@@ -1189,6 +1222,14 @@ description = "Research the requested topic and report concrete findings"
         };
         assert_eq!(
             watcher.builtin_tool_allowlist(),
+            Some(vec!["read".to_owned(), "read_skill".to_owned()])
+        );
+        let context_denied = AgentDefinition {
+            denied_tools: vec!["read_skill".to_owned()],
+            ..watcher.clone()
+        };
+        assert_eq!(
+            context_denied.builtin_tool_allowlist(),
             Some(vec!["read".to_owned()])
         );
         assert_eq!(

@@ -1336,7 +1336,17 @@ mod tests {
         assert_eq!(
             tool_names,
             [
-                "read", "write", "edit", "bash", "grep", "find", "ls", "eval", "ask", "todo"
+                "read",
+                "read_skill",
+                "write",
+                "edit",
+                "bash",
+                "grep",
+                "find",
+                "ls",
+                "eval",
+                "ask",
+                "todo"
             ]
         );
         assert!(!tool_names.contains(&"task"));
