@@ -36,17 +36,19 @@ nakode stop
 it is running rather than starting a second one, and stopping a stopped service
 succeeds. `restart` starts a stopped service as well as replacing a running one.
 
-`--workspace <path>` selects the workspace service, defaulting to the current
-directory exactly as before. Each canonical workspace has its own sockets, log,
-and running process; no command reaches a workspace you did not name. After an
-installation, Nakode scans all known workspace services once, skips services
-already running the installed executable, and refreshes idle stale services
-with a bounded amount of concurrency. Active or unidentified services are left
-running and reported.
+One installation-wide service owns the endpoint, provider registry, credentials, transports, and
+persistence for every session. Working directories and filesystem/tool access remain properties of
+individual sessions and are supplied by the frontend creating them, never by lifecycle CLI flags.
 
-The interactive terminal client is one frontend over that service:
+After installation, Nakode preserves an already-current singleton, restarts it only
+when it is stale and quiescent, and retires quiescent legacy per-workspace services.
+Legacy services with active work are left running and reported rather than killed.
+
+The interactive terminal client is one frontend over that service. It derives the new session's
+working directory from its own current directory:
 
 ```sh
+cd /path/to/project
 nakode --tui
 ```
 
@@ -199,10 +201,12 @@ running it again on an already-clean install is a no-op.
 
 ### Start Nakode
 
-Open a project workspace:
+Open a terminal in the project and start the TUI. Each invocation creates a new logical session rooted
+at that current directory:
 
 ```sh
-nakode --workspace /path/to/project
+cd /path/to/project
+nakode --tui
 ```
 
 Then use `/settings` to manage general preferences, agents, models, providers,
@@ -233,10 +237,10 @@ Devin, GLM, and Kimi sessions receive an authoritative Nakode builtin-tool allow
 applies the equivalent SDK allowlist and permission hook. Empty custom policy retains compatibility
 with definitions written before policy fields existed.
 
-Catalogue changes are loaded without restarting the service. The installer refreshes idle stale
-workspace services after installing a Nakode binary whose public protocol changed. Active services
-remain available until their work finishes, and the next frontend endpoint discovery can refresh
-one of them on demand.
+Catalogue changes are loaded without restarting the installation-wide service. After installing a
+Nakode binary whose public protocol changed, the installer refreshes a quiescent stale singleton and
+retires quiescent legacy per-workspace services. Active legacy services remain available until their
+work finishes.
 
 ```toml
 slug = "code-reviewer"
@@ -290,7 +294,7 @@ at another path.
 Personality and Soul content is snapshotted when a Nakode logical session is
 created, and that snapshot is reused by its primary and delegated provider
 sessions. A successful API save is therefore visible to newly created logical
-sessions across running workspace services; already-running and resumed
+sessions through the installation-wide service; already-running and resumed
 sessions retain the instructions they started with. Personality and Soul are
 followed by a protected runtime boundary, so owner content cannot replace
 security, tool-policy, delegation-limit, objective-mismatch, or run-attribution

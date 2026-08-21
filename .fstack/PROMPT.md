@@ -18,5 +18,5 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 For TUI/control/rendering changes also run the committed headless scenario:
 
 ```sh
-cargo run -- --workspace . tui-eval --scenario tests/tui_scenarios/agent_smoke.jsonl
+cargo run -- tui-eval --scenario tests/tui_scenarios/agent_smoke.jsonl
 ```

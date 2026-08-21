@@ -36,6 +36,7 @@ use crate::{
         BridgeDeliveryRecord, BridgeInboundTurnOriginRecord, BridgePendingInboundRecord,
         BridgeProjectionRecord, ProviderRecord, SessionBridgeRecord, SessionRecord,
     },
+    skill::SkillCatalog,
     soul::{SoulError, SoulSource, SoulStore},
     state::{DomainCommandError, Effect},
 };
@@ -836,8 +837,14 @@ impl ServerCore {
             ));
         }
         self.refresh_session_template_addenda()?;
+        let skills = SkillCatalog::load(Path::new(&working_directory)).map_err(|error| {
+            DomainCommandError::Invalid(format!(
+                "failed to load skills for {working_directory}: {error}"
+            ))
+        })?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
+        engine.state_mut().install_skills(skills);
         engine
             .state_mut()
             .set_initial_client_instructions(initial_instructions)?;
@@ -1605,8 +1612,14 @@ impl ServerCore {
         let working_directory =
             canonical_working_directory(Some(&session.working_directory), &session.workspace)?;
         self.refresh_session_template_addenda()?;
+        let skills = SkillCatalog::load(Path::new(&working_directory)).map_err(|error| {
+            DomainCommandError::Invalid(format!(
+                "failed to load skills for {working_directory}: {error}"
+            ))
+        })?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
+        engine.state_mut().install_skills(skills);
         // The workspace template may still carry the bootstrap provider/session identity. Reset that
         // clone before installing client-owned tools; restoration begins only after validation.
         let _discarded_template_effects = engine.state_mut().create_logical_session()?;
@@ -2459,12 +2472,9 @@ impl ServerCore {
         let bootstrap = || self.workspace_bootstrap();
         match query {
             Query::Bootstrap {
-                workspace,
+                workspace: _,
                 session_id,
             } => {
-                if workspace != self.engine().state().workspace {
-                    return Err(not_found("workspace", &workspace));
-                }
                 let mut view = bootstrap();
                 if let Some(session_id) = session_id {
                     view.active_session = Some(self.session_view(&session_id)?);

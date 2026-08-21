@@ -16,7 +16,7 @@ impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit",
-            description: "Edit one UTF-8 file with precise text replacements and return a unified diff. Every edits[].oldText must match one unique, non-overlapping region of the original file. Merge changes in the same block or nearby lines into one entry; use multiple entries in one call for separate locations. Keep oldText as small as possible while still unique, without padding it with large unchanged regions.",
+            description: "Edit one UTF-8 file using exact text replacement and return a unified diff. Every edits[].oldText must identify one unique, non-overlapping region of the original file. Safe normalization handles line endings, trailing whitespace, compatible Unicode, quotes, dashes, and spaces when an exact match is unavailable. Combine nearby changes into one edit and use multiple entries for disjoint changes.",
             parameters: json!({
                 "type": "object",
                 "properties": {

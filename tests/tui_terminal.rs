@@ -206,8 +206,6 @@ fn spawn_tui(workspace: &Path, control_directory: &Path) -> Result<PtySession, B
             )),
             OsString::from(env!("CARGO_BIN_EXE_nakode")),
             OsString::from("--tui"),
-            OsString::from("--workspace"),
-            workspace.as_os_str().to_owned(),
         ],
         workspace,
         PtySize {

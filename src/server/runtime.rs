@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use nakode_protocol::{
     BridgeContinuationDisposition, Command, ErrorCode, Query, QueryResult, ServiceCapabilities,
@@ -41,8 +41,6 @@ use crate::{
 };
 
 use super::{BridgeStateCheckpoint, ServerCore};
-
-const SESSION_INVENTORY_LIMIT: usize = 500;
 
 #[derive(Debug, Error)]
 pub enum NativeRuntimeError {
@@ -262,7 +260,8 @@ pub(crate) async fn prepare_runtime(
     let session_repository = Arc::new(SqliteSessionRepository::open_default()?);
     let session_database = session_repository.database_path().to_path_buf();
     let credential_store = Arc::new(SqliteCredentialStore::open(&session_database)?);
-    let providers = session_repository.list_providers()?;
+    let mut providers = session_repository.list_providers()?;
+    enable_e2e_fixture_provider(&mut providers);
     let (provider_credentials, credential_failures) =
         load_provider_credentials(&providers, credential_store.as_ref());
     let (delegation_tx, delegation_requests) = mpsc::channel(128);
@@ -296,8 +295,8 @@ pub(crate) async fn prepare_runtime(
     state.set_nakode_executable(&nakode_executable);
     load_cached_provider_configuration(&mut state, &mut backends, session_repository.as_ref())
         .await;
-    let sessions = session_repository.list_recent(&state.workspace, SESSION_INVENTORY_LIMIT)?;
-    let session_inventory_complete = sessions.len() < SESSION_INVENTORY_LIMIT;
+    let sessions = session_repository.list_recent_all()?;
+    let session_inventory_complete = true;
     let persistence = PersistenceServices {
         database: session_database,
         sessions: session_repository,
@@ -336,12 +335,7 @@ impl NativeServerRuntime {
             quiesce: quiesce_tx,
         };
         let mut core = ServerCore::new(engine, providers, sessions);
-        let workspace_path = core.engine().state().workspace.clone();
-        match effects
-            .persistence
-            .sessions
-            .list_session_bridges(&workspace_path)
-        {
+        match effects.persistence.sessions.list_session_bridges_all() {
             Ok(bridges) => core.install_session_bridges(bridges),
             Err(error) => core
                 .engine_mut()
@@ -876,7 +870,7 @@ impl NativeServerRuntime {
     }
 
     async fn synchronize_shared_providers(&mut self) {
-        let providers = match self.effects.persistence.sessions.list_providers() {
+        let mut providers = match self.effects.persistence.sessions.list_providers() {
             Ok(providers) => providers,
             Err(error) => {
                 self.core
@@ -886,6 +880,7 @@ impl NativeServerRuntime {
                 return;
             }
         };
+        enable_e2e_fixture_provider(&mut providers);
         if providers == self.core.provider_records() {
             return;
         }
@@ -1087,7 +1082,6 @@ impl NativeServerRuntime {
         self.core
             .commit_and_publish_session(&self.endpoint, &session_id);
     }
-
     #[allow(clippy::too_many_lines)]
     async fn handle_mcp_tool_request(
         &mut self,
@@ -1542,7 +1536,10 @@ impl NativeServerRuntime {
 
     fn refresh_catalogs(&mut self) {
         match self.effects.persistence.sessions.list_providers() {
-            Ok(providers) => self.core.replace_provider_records(providers),
+            Ok(mut providers) => {
+                enable_e2e_fixture_provider(&mut providers);
+                self.core.replace_provider_records(providers);
+            }
             Err(error) => self
                 .core
                 .engine_mut()
@@ -1711,7 +1708,7 @@ pub(crate) struct BackendRegistry {
     pub(crate) provider_cooldowns: HashMap<String, ProviderCooldown>,
     pub(crate) web_config: Arc<RwLock<crate::web::WebConfig>>,
     pub(crate) memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
-    pub(crate) memory_service: crate::memory::SharedMemoryService,
+    pub(crate) memory_services: Mutex<HashMap<String, crate::memory::SharedMemoryService>>,
     pub(crate) vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
     pub(crate) vision_service: Option<crate::vision::SharedVisionService>,
     pub(crate) native_delegation: mpsc::Sender<NativeDelegationRequest>,
@@ -1724,6 +1721,26 @@ pub(crate) struct ProviderCooldown {
 
 const PROVIDER_FATAL_ERROR_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 const SHARED_PROVIDER_SYNC_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(feature = "e2e-fixture-provider")]
+fn e2e_codex_fixture() -> Option<PathBuf> {
+    std::env::var_os("NAKODE_E2E_CODEX_FIXTURE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn enable_e2e_fixture_provider(providers: &mut [ProviderRecord]) {
+    #[cfg(feature = "e2e-fixture-provider")]
+    if e2e_codex_fixture().is_some()
+        && let Some(provider) = providers
+            .iter_mut()
+            .find(|provider| provider.provider == crate::backend::CODEX_PROVIDER)
+    {
+        provider.enabled = true;
+    }
+    #[cfg(not(feature = "e2e-fixture-provider"))]
+    let _ = providers;
+}
 
 impl BackendRegistry {
     pub(crate) fn current_web_config(&self) -> crate::web::WebConfig {
@@ -1742,9 +1759,16 @@ impl BackendRegistry {
         &self,
         providers: &[ProviderRecord],
     ) -> HashMap<String, Vec<String>> {
+        // Availability depends on the configured memory backend, not on a particular project's bank.
+        // Provider execution replaces this catalogue-only service with the session access root's
+        // shared service before any tool call can run.
+        let catalogue_memory = Arc::new(crate::memory::MemoryService::new(
+            Arc::clone(&self.memory_config),
+            "availability".to_owned(),
+        ));
         let runtime_tools = crate::tools::ToolRegistry::base()
             .with_browser(Arc::clone(&self.web_config))
-            .with_memory(Arc::clone(&self.memory_service))
+            .with_memory(catalogue_memory)
             .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone())
             .with_native_delegation()
             .definitions()
@@ -1832,10 +1856,7 @@ impl BackendRegistry {
             provider_cooldowns: HashMap::new(),
             web_config,
             memory_config: Arc::clone(&memory_config),
-            memory_service: Arc::new(crate::memory::MemoryService::new(
-                memory_config,
-                crate::memory::project_bank(&config.workspace),
-            )),
+            memory_services: Mutex::new(HashMap::new()),
             vision_config,
             vision_service,
             native_delegation,
@@ -1868,8 +1889,19 @@ impl BackendRegistry {
         working_directory: &Path,
     ) -> Result<BackendHandle, BackendError> {
         let credential = self.provider_credentials.get(provider).cloned();
+        let memory_service = self.memory_service_for(working_directory).await;
         let handle = match provider {
             crate::backend::CODEX_PROVIDER => {
+                #[cfg(feature = "e2e-fixture-provider")]
+                if let Some(fixture) = e2e_codex_fixture() {
+                    return codex::spawn_compatibility(codex::CompatibilityBackendConfig {
+                        program: PathBuf::from("python3"),
+                        args: vec![fixture.into_os_string()],
+                        workspace: working_directory.to_path_buf(),
+                        credential_home: None,
+                    })
+                    .await;
+                }
                 codex::spawn(
                     codex::BackendConfig::native(working_directory.to_path_buf())
                         .with_credential(credential)
@@ -1880,7 +1912,7 @@ impl BackendRegistry {
                         .with_session_database(self.session_database.clone())
                         .with_native_delegation(self.native_delegation.clone())
                         .with_web_config(Arc::clone(&self.web_config))
-                        .with_memory(Arc::clone(&self.memory_service))
+                        .with_memory(Arc::clone(&memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
@@ -1911,7 +1943,7 @@ impl BackendRegistry {
                         .with_session_database(self.session_database.clone())
                         .with_native_delegation(self.native_delegation.clone())
                         .with_web_config(Arc::clone(&self.web_config))
-                        .with_memory(Arc::clone(&self.memory_service))
+                        .with_memory(Arc::clone(&memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
@@ -1926,7 +1958,7 @@ impl BackendRegistry {
                         .with_session_database(self.session_database.clone())
                         .with_native_delegation(self.native_delegation.clone())
                         .with_web_config(Arc::clone(&self.web_config))
-                        .with_memory(Arc::clone(&self.memory_service))
+                        .with_memory(Arc::clone(&memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
@@ -1941,7 +1973,7 @@ impl BackendRegistry {
                         .with_session_database(self.session_database.clone())
                         .with_native_delegation(self.native_delegation.clone())
                         .with_web_config(Arc::clone(&self.web_config))
-                        .with_memory(Arc::clone(&self.memory_service))
+                        .with_memory(Arc::clone(&memory_service))
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
@@ -1953,6 +1985,20 @@ impl BackendRegistry {
             }
         };
         Ok(handle)
+    }
+
+    async fn memory_service_for(
+        &self,
+        working_directory: &Path,
+    ) -> crate::memory::SharedMemoryService {
+        let project_bank = crate::memory::project_bank(working_directory);
+        let mut services = self.memory_services.lock().await;
+        Arc::clone(services.entry(project_bank.clone()).or_insert_with(|| {
+            Arc::new(crate::memory::MemoryService::new(
+                Arc::clone(&self.memory_config),
+                project_bank,
+            ))
+        }))
     }
 
     pub(crate) async fn stop_provider(&mut self, provider: &str) {
@@ -3075,7 +3121,13 @@ async fn save_memory_config(
         return;
     }
     state.install_memory_config(config);
-    backends.memory_service.reset().await;
+    let memory_services = {
+        let services = backends.memory_services.lock().await;
+        services.values().cloned().collect::<Vec<_>>()
+    };
+    for service in memory_services {
+        service.reset().await;
+    }
     state.set_status("Memory add-on settings saved.");
 }
 
@@ -4825,6 +4877,21 @@ mod tests {
         ));
         assert!(registry.session_commands.is_empty());
         assert!(!registry.commands.contains_key(CODEX_PROVIDER));
+    }
+
+    #[tokio::test]
+    async fn memory_services_are_shared_within_an_access_root_and_isolated_between_roots() {
+        let authority = tempfile::tempdir().expect("authority");
+        let first_root = tempfile::tempdir().expect("first access root");
+        let second_root = tempfile::tempdir().expect("second access root");
+        let registry = empty_registry(authority.path()).await;
+
+        let first = registry.memory_service_for(first_root.path()).await;
+        let repeated = registry.memory_service_for(first_root.path()).await;
+        let second = registry.memory_service_for(second_root.path()).await;
+
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     /// Releasing one session stops its provider children and leaves every other session alone.

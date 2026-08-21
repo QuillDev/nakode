@@ -481,7 +481,7 @@ state, and Ratatui renderer through an in-memory terminal.
 Run the committed smoke scenario with:
 
 ```text
-cargo run -- --workspace . tui-eval \
+cargo run -- tui-eval \
   --scenario tests/tui_scenarios/agent_smoke.jsonl
 ```
 

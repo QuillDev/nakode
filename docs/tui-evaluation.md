@@ -23,13 +23,13 @@ printf '%s\n' \
   '{"action":"type","text":"/settings"}' \
   '{"action":"key","key":"enter"}' \
   '{"action":"assert","modal":"settings","screen_contains":["Settings","General"]}' \
-  | target/debug/nakode --workspace . tui-eval
+  | target/debug/nakode tui-eval
 ```
 
 Run a committed scenario:
 
 ```sh
-cargo run -- --workspace . tui-eval \
+cargo run -- tui-eval \
   --scenario tests/tui_scenarios/agent_smoke.jsonl
 ```
 

@@ -120,19 +120,17 @@ queue rows locally.
 
 ## Local endpoint
 
-`nakode endpoint` ensures the workspace server exists and prints a
-machine-readable descriptor for its `grpc+unix` endpoint. The endpoint is
-private to the desktop user. Stopping a renderer does not stop the server or
-cancel server-owned work; stopping the server is an explicit lifecycle action.
+`nakode endpoint` ensures the installation-wide server exists and prints a machine-readable descriptor
+for its `grpc+unix` endpoint. The endpoint is private to the desktop user. Stopping a renderer does not
+stop the server or cancel server-owned work; stopping the server is an explicit lifecycle action.
 
 The earlier `nakode service endpoint` spelling remains supported for installed
 connectors. It prints the same descriptor on standard output and writes only its
 deprecation notice to standard error, so a connector that parses standard output
-is unaffected. `--workspace` continues to select the canonical workspace whose
-service is discovered or started.
+is unaffected. There is no workspace or global endpoint selector.
 
-The TUI uses this exact public SDK path. It is an example frontend, not a
-privileged application runtime.
+The TUI uses this exact public SDK path and passes its current directory when creating a new session.
+It is an example frontend, not a privileged application runtime.
 
 ## Discord orchestrator threads (optional)
 

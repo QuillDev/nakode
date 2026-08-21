@@ -67,9 +67,10 @@ fn deprecated_endpoint_keeps_its_descriptor_on_standard_output() -> TestResult {
         descriptor["workspace"].as_str(),
         Some(
             temp.path()
+                .join(".nakode")
                 .canonicalize()?
                 .to_str()
-                .ok_or("non-UTF-8 workspace")?
+                .ok_or("non-UTF-8 installation workspace")?
         )
     );
     assert!(
@@ -89,8 +90,6 @@ fn deprecated_endpoint_keeps_its_descriptor_on_standard_output() -> TestResult {
 fn nakode(workspace: &Path, control: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nakode"));
     command
-        .arg("--workspace")
-        .arg(workspace)
         .env("NAKODE_CONTROL_DIR", control)
         .env("HOME", workspace)
         .current_dir(workspace);

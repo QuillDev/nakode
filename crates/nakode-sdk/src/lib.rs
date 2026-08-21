@@ -222,10 +222,9 @@ impl NakodeClient {
         response.state.ok_or(SdkError::MissingState("workspace"))
     }
 
-    /// Resolves the logical session a frontend should render, opening a
-    /// requested or existing persisted session or creating the first session
-    /// for an empty workspace. This keeps startup session policy out of
-    /// renderers.
+    /// Resolves the logical session a frontend should render. The workspace is a session access
+    /// root, not a service selector: the installation authority opens the requested session, reuses
+    /// the most recent session rooted there, or creates one with that working directory.
     ///
     /// # Errors
     /// Returns a transport, server status, or missing-state error.
@@ -234,13 +233,24 @@ impl NakodeClient {
         workspace: impl Into<String>,
         requested_session: Option<String>,
     ) -> Result<(api::WorkspaceState, String), SdkError> {
-        let state = self.get_workspace(workspace, None).await?;
+        let requested_workspace = workspace.into();
+        let canonical_workspace = std::fs::canonicalize(&requested_workspace)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&requested_workspace))
+            .to_string_lossy()
+            .into_owned();
+        let state = self
+            .get_workspace(canonical_workspace.clone(), None)
+            .await?;
         let session_id = if let Some(session_id) = requested_session {
             self.open_session(session_id).await?
-        } else if let Some(session) = state.sessions.first() {
+        } else if let Some(session) = state
+            .sessions
+            .iter()
+            .find(|session| session.working_directory == canonical_workspace)
+        {
             self.open_session(session.id.clone()).await?
         } else {
-            self.create_session(state.workspace_id.clone(), None)
+            self.create_session_in_directory(state.workspace_id.clone(), None, canonical_workspace)
                 .await?
         };
         Ok((state, session_id))

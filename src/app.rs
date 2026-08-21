@@ -79,14 +79,12 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         reporter.shutdown().await;
     }
     let resume_session = host.resumable_session_id();
-    let workspace = host.workspace_path().to_owned();
     let restore_result = terminal.restore();
     loop_result?;
     restore_result.map_err(AppError::Terminal)?;
     write_resume_hint(
         &mut io::stdout().lock(),
         &nakode_executable,
-        Path::new(&workspace),
         resume_session.as_deref(),
     )
     .map_err(AppError::Terminal)
@@ -96,9 +94,20 @@ async fn prepare(
     client: &NakodeClient,
     config: &Config,
 ) -> Result<(api::WorkspaceState, HydratedSession), AppError> {
-    let (mut workspace, session_id) = client
-        .open_workspace_session(config.workspace.to_string_lossy(), config.resume.clone())
+    let mut workspace = client
+        .get_workspace(config.workspace.to_string_lossy(), None)
         .await?;
+    let session_id = if let Some(requested) = config.resume.clone() {
+        client.open_session(requested).await?
+    } else {
+        client
+            .create_session_in_directory(
+                workspace.workspace_id.clone(),
+                None,
+                config.workspace.to_string_lossy(),
+            )
+            .await?
+    };
     if let Some(model_id) = &config.model {
         let reasoning_effort = workspace
             .models
@@ -135,7 +144,6 @@ async fn prepare(
 fn write_resume_hint(
     output: &mut impl Write,
     executable: &Path,
-    workspace: &Path,
     session_id: Option<&str>,
 ) -> io::Result<()> {
     let Some(session_id) = session_id else {
@@ -144,9 +152,8 @@ fn write_resume_hint(
     writeln!(output, "\nResume this session with:")?;
     writeln!(
         output,
-        "  {} --workspace {} --resume {session_id}",
+        "  {} --tui --resume {session_id}",
         quote_command_argument(executable),
-        quote_command_argument(workspace),
     )
 }
 
@@ -312,11 +319,11 @@ mod tests {
         super::write_resume_hint(
             &mut output,
             std::path::Path::new("/opt/Nakode/nakode"),
-            std::path::Path::new("/tmp/user's project"),
             Some("session-1"),
         )
         .expect("write hint");
         let output = String::from_utf8(output).expect("UTF-8");
-        assert!(output.contains("--resume session-1"));
+        assert!(output.contains("--tui --resume session-1"));
+        assert!(!output.contains("--workspace"));
     }
 }
