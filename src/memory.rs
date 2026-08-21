@@ -601,7 +601,7 @@ done
 
     #[cfg(unix)]
     #[test]
-    fn memory_tools_are_gated_by_selection_and_executable_availability() {
+    fn memory_tools_require_backend_selection_and_runtime_readiness() {
         use std::{
             fs,
             os::unix::fs::PermissionsExt as _,

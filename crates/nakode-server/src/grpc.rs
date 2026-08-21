@@ -1915,6 +1915,7 @@ fn api_bridge_projection(value: &protocol::BridgeProjectionView) -> api::BridgeP
 }
 
 fn provider(value: protocol::ProviderView) -> api::Provider {
+    let supported_builtin_tools = value.supported_builtin_tools;
     let available_builtin_tools = value.available_builtin_tools;
     api::Provider {
         id: value.id.to_string(),
@@ -1934,6 +1935,8 @@ fn provider(value: protocol::ProviderView) -> api::Provider {
         model_candidates: value.model_candidates.into_iter().map(model).collect(),
         builtin_tool_availability_known: available_builtin_tools.is_some(),
         available_builtin_tools: available_builtin_tools.unwrap_or_default(),
+        builtin_tool_support_known: supported_builtin_tools.is_some(),
+        supported_builtin_tools: supported_builtin_tools.unwrap_or_default(),
     }
 }
 
@@ -2696,6 +2699,7 @@ mod tests {
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
             model_candidates: Vec::new(),
+            supported_builtin_tools: Some(Vec::new()),
             available_builtin_tools,
         };
 

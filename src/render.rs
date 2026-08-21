@@ -2458,6 +2458,7 @@ mod tests {
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
             model_candidates: Vec::new(),
+            supported_builtin_tools: Some(Vec::new()),
             available_builtin_tools: Some(Vec::new()),
         }
     }

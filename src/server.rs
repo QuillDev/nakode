@@ -5437,7 +5437,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_memory_only_allowlist_becomes_an_explicit_empty_replacement() {
+    fn disabled_memory_only_allowlist_remains_a_stable_authorization_boundary() {
         let (mut core, _) = ready_external_tools_server();
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let workspace_id = core.workspace_bootstrap().workspace_id;
@@ -5451,7 +5451,7 @@ mod tests {
         };
         let (created, _) = core
             .create_session_command(&workspace_id, None, &ModelOptions::default(), Some(tools))
-            .expect("disabled memory is a supported empty boundary");
+            .expect("disabled memory does not invalidate stable authorization");
         let (_, effects) = core
             .try_execute_command(Command::SendPrompt {
                 session_id: SessionId::from(created.resource_id.expect("session id")),
@@ -5465,10 +5465,11 @@ mod tests {
             effect,
             crate::state::Effect::Backend(BackendCommand::StartSession {
                 external_tools,
-                replace_builtin_tools: true,
-                allowed_builtin_tools: None,
+                replace_builtin_tools: false,
+                allowed_builtin_tools: Some(allowed),
                 ..
             }) if external_tools.is_empty()
+                && allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
         )));
     }
 
@@ -5503,7 +5504,7 @@ mod tests {
     }
 
     #[test]
-    fn availability_updates_the_template_and_every_loaded_session() {
+    fn availability_updates_preserve_client_authorization_boundaries() {
         let (mut core, loaded_id) = ready_external_tools_server();
         install_available_tools(
             &mut core,
@@ -5529,9 +5530,8 @@ mod tests {
             .engine_for(&loaded_id)
             .expect("loaded session")
             .state()
-            .reconcile_available_builtin_tools(CODEX_PROVIDER, requested);
-        assert!(normalized.allowed_builtin_tools.is_none());
-        assert!(normalized.replace_builtin_tools);
+            .reconcile_available_builtin_tools(CODEX_PROVIDER, requested.clone());
+        assert_eq!(normalized, requested);
 
         let workspace_id = core.workspace_bootstrap().workspace_id;
         core.create_session_command(
@@ -5544,11 +5544,11 @@ mod tests {
                 allowed_builtin_tools: Some(vec!["memory_store".to_owned()]),
             }),
         )
-        .expect("new session inherits disabled memory from template");
+        .expect("disabled add-on does not invalidate stable client authorization");
     }
 
     #[test]
-    fn unavailable_tools_are_omitted_before_persisted_session_resume() {
+    fn disabled_tools_remain_authorized_during_persisted_session_resume() {
         let (mut core, _) = ready_external_tools_server();
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-tools-session");
@@ -5580,18 +5580,19 @@ mod tests {
                 crate::state::Effect::Backend(BackendCommand::ResumeSession {
                     provider_session_id,
                     external_tools,
-                    replace_builtin_tools: true,
-                    allowed_builtin_tools: None,
+                    replace_builtin_tools: false,
+                    allowed_builtin_tools: Some(allowed),
                     ..
                 }) if provider_session_id == "thread-restored"
                     && external_tools == &tools.tools
+                    && allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
             )),
             "{effects:#?}"
         );
     }
 
     #[test]
-    fn configured_but_runtime_unavailable_memory_is_omitted() {
+    fn enabled_but_runtime_unavailable_memory_remains_authorized() {
         let (mut core, _) = ready_external_tools_server();
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-unavailable-memory");
@@ -5621,19 +5622,19 @@ mod tests {
 
         let (_, effects) = core
             .open_session_command(&restored_id, Some(tools))
-            .expect("unavailable memory is removed before runtime validation");
+            .expect("runtime readiness does not rewrite memory authorization");
         assert!(effects.iter().any(|effect| matches!(
             effect,
             crate::state::Effect::Backend(BackendCommand::ResumeSession {
-                replace_builtin_tools: true,
-                allowed_builtin_tools: None,
+                replace_builtin_tools: false,
+                allowed_builtin_tools: Some(allowed),
                 ..
-            })
+            }) if allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
         )));
     }
 
     #[test]
-    fn persisted_session_filters_builtin_tools_the_provider_cannot_expose() {
+    fn persisted_session_surfaces_unsupported_provider_tool_error() {
         let (mut core, _) = ready_external_tools_server();
         core.session_template.handle_provider_backend(
             CLAUDE_PROVIDER,
@@ -5673,17 +5674,11 @@ mod tests {
             ]),
         };
 
-        let (_, effects) = core
+        let error = core
             .open_session_command(&restored_id, Some(tools))
-            .expect("unavailable canonical tools are filtered before resume");
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            crate::state::Effect::Backend(BackendCommand::ResumeSession {
-                replace_builtin_tools: true,
-                allowed_builtin_tools: None,
-                ..
-            })
-        )));
+            .expect_err("unsupported enabled tools must return a provider-specific error");
+        assert!(error.to_string().contains("provider claude-agent"));
+        assert!(error.to_string().contains("memory_search, memory_store"));
     }
 
     #[test]
@@ -5715,7 +5710,7 @@ mod tests {
     }
 
     #[test]
-    fn attached_session_reattach_compares_current_effective_availability() {
+    fn attached_session_reattach_compares_persisted_authorization() {
         let (mut core, _) = ready_external_tools_server();
         install_available_tools(
             &mut core,
@@ -5739,7 +5734,7 @@ mod tests {
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let (_, effects) = core
             .open_session_command(&session_id, Some(tools))
-            .expect("stale allowlist is narrowed before attached-session comparison");
+            .expect("enabled-state change does not mutate attached-session authorization");
         assert!(effects.is_empty());
     }
 

@@ -521,7 +521,9 @@ mod tests {
         prepare_and_validate, resolve_workspace_path,
     };
     use crate::{
+        memory::{MemoryBackend, MemoryConfig, MemoryService},
         runtime::{QuestionBroker, RuntimeSession},
+        vision::VisionConfig,
         web::{WebBackend, WebConfig},
     };
 
@@ -537,17 +539,67 @@ mod tests {
                 .all(|tool| tool.name != "browser")
         );
 
-        {
-            let mut web = config.write().expect("web config");
-            web.backend = WebBackend::Firecrawl;
-            web.firecrawl_api_key = "test-key".to_owned();
-        }
+        config.write().expect("web config").backend = WebBackend::Firecrawl;
+        assert!(
+            registry
+                .definitions()
+                .iter()
+                .all(|tool| tool.name != "browser"),
+            "enabled browser stays unavailable until its credential is configured"
+        );
+        config.write().expect("web config").firecrawl_api_key = "test-key".to_owned();
         assert!(
             registry
                 .definitions()
                 .iter()
                 .any(|tool| tool.name == "browser")
         );
+    }
+
+    #[test]
+    fn vision_tool_requires_enablement_and_provider_readiness() {
+        let config = Arc::new(RwLock::new(VisionConfig::default()));
+        let registry = ToolRegistry::base().with_vision(config.clone(), None);
+        assert!(
+            registry
+                .definitions()
+                .iter()
+                .all(|tool| tool.name != "vision")
+        );
+
+        config.write().expect("vision config").model = Some("openai-codex/vision".to_owned());
+        assert!(
+            registry
+                .definitions()
+                .iter()
+                .all(|tool| tool.name != "vision"),
+            "selected vision remains unavailable without a provider service"
+        );
+    }
+
+    #[test]
+    fn unavailable_memory_tools_are_absent_without_blocking_registry_use() {
+        let config = Arc::new(RwLock::new(MemoryConfig::default()));
+        let service = Arc::new(MemoryService::new(config.clone(), "project".to_owned()));
+        let registry = ToolRegistry::base().with_memory(service);
+        assert!(
+            registry
+                .definitions()
+                .iter()
+                .all(|tool| !matches!(tool.name, "memory_search" | "memory_store"))
+        );
+
+        let mut memory = config.write().expect("memory config");
+        memory.backend = MemoryBackend::Mnemosyne;
+        memory.executable = "missing-mnemosyne-for-registration-test".to_owned();
+        drop(memory);
+        let names = registry
+            .definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"memory_search"));
+        assert!(!names.contains(&"memory_store"));
     }
 
     #[test]

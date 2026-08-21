@@ -27,7 +27,7 @@ impl VisionTool {
     }
 
     fn enabled(&self) -> bool {
-        self.service.is_some() && self.config.read().is_ok_and(|config| config.is_enabled())
+        self.config.read().is_ok_and(|config| config.is_enabled())
     }
 }
 
@@ -57,7 +57,7 @@ impl Tool for VisionTool {
     }
 
     fn available(&self) -> bool {
-        self.enabled()
+        self.service.is_some() && self.enabled()
     }
 
     fn concurrency(&self) -> ToolConcurrency {
@@ -72,9 +72,15 @@ impl Tool for VisionTool {
     ) -> ToolFuture<'a> {
         Box::pin(async move {
             let Some(service) = &self.service else {
-                return ToolResult::failure(
-                    "Vision add-on is unavailable. Configure a supported vision model in /settings.",
-                );
+                let model = self
+                    .config
+                    .read()
+                    .ok()
+                    .and_then(|config| config.model.clone())
+                    .unwrap_or_else(|| "the configured model".to_owned());
+                return ToolResult::failure(format!(
+                    "Vision add-on is enabled with {model}, but that model's provider service is unavailable. Configure its provider credential and reload the provider in /settings."
+                ));
             };
             let result = async {
                 let prompt = required_string(&arguments, "prompt")?;
@@ -139,7 +145,32 @@ fn image_mime(path: &std::path::Path) -> Result<&'static str, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::image_mime;
+    use std::sync::{Arc, RwLock};
+
+    use serde_json::json;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{VisionTool, image_mime};
+    use crate::{
+        backend::PromptImage,
+        runtime::{QuestionBroker, RuntimeSession},
+        tools::{Tool, ToolContext},
+        vision::{VisionConfig, VisionFuture, VisionService},
+    };
+
+    struct RecordingVision;
+
+    impl VisionService for RecordingVision {
+        fn analyze<'a>(
+            &'a self,
+            prompt: &'a str,
+            images: Vec<PromptImage>,
+            _cancellation: &'a CancellationToken,
+        ) -> VisionFuture<'a> {
+            Box::pin(async move { Ok(format!("{prompt}:{}", images.len())) })
+        }
+    }
 
     #[test]
     fn recognizes_supported_image_extensions() {
@@ -148,5 +179,71 @@ mod tests {
             Ok("image/png")
         );
         assert!(image_mime(std::path::Path::new("notes.txt")).is_err());
+    }
+
+    #[tokio::test]
+    async fn configured_vision_is_registered_and_invokes_its_service() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        tokio::fs::write(workspace.path().join("screen.png"), b"image")
+            .await
+            .expect("image fixture");
+        let config = Arc::new(RwLock::new(VisionConfig {
+            model: Some("openai-codex/vision-test".to_owned()),
+        }));
+        let tool = VisionTool::new(config, Some(Arc::new(RecordingVision)));
+        assert!(tool.available());
+
+        let (events, _event_rx) = mpsc::channel(1);
+        let questions = QuestionBroker::default();
+        let mut session = RuntimeSession::new("model".to_owned(), String::new());
+        let result = tool
+            .execute(
+                ToolContext {
+                    workspace: workspace.path(),
+                    session: &mut session,
+                    backend_events: &events,
+                    turn_id: "turn",
+                    questions: &questions,
+                    delegation: None,
+                },
+                json!({"path": "screen.png", "prompt": "inspect"}),
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!result.failed, "{}", result.output);
+        assert_eq!(result.output, "inspect:1");
+    }
+
+    #[tokio::test]
+    async fn configured_vision_without_provider_service_has_an_actionable_error() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = Arc::new(RwLock::new(VisionConfig {
+            model: Some("openai-codex/vision-test".to_owned()),
+        }));
+        let tool = VisionTool::new(config, None);
+        assert!(!tool.available());
+
+        let (events, _event_rx) = mpsc::channel(1);
+        let questions = QuestionBroker::default();
+        let mut session = RuntimeSession::new("model".to_owned(), String::new());
+        let result = tool
+            .execute(
+                ToolContext {
+                    workspace: workspace.path(),
+                    session: &mut session,
+                    backend_events: &events,
+                    turn_id: "turn",
+                    questions: &questions,
+                    delegation: None,
+                },
+                json!({"path": "screen.png", "prompt": "inspect"}),
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.failed);
+        assert!(result.output.contains("openai-codex/vision-test"));
+        assert!(result.output.contains("provider credential"));
     }
 }
