@@ -21,8 +21,8 @@ pub enum UpdateError {
     MissingInstaller(String),
     #[error("failed to start git: {0}")]
     StartGit(#[source] std::io::Error),
-    #[error("git could not update the Nakode source checkout (exit status {status}){hint}")]
-    GitFailed { status: ExitStatus, hint: String },
+    #[error("git could not update the Nakode source checkout (exit status {status})")]
+    GitFailed { status: ExitStatus },
     #[error("failed to start install.sh: {0}")]
     StartInstaller(#[source] std::io::Error),
     #[error("install.sh could not install the updated Nakode build (exit status {0})")]
@@ -65,10 +65,7 @@ fn run_from(source: &Path) -> Result<(), UpdateError> {
         .status()
         .map_err(UpdateError::StartGit)?;
     if !status.success() {
-        return Err(UpdateError::GitFailed {
-            status,
-            hint: origin_auth_hint(source),
-        });
+        return Err(UpdateError::GitFailed { status });
     }
 
     println!("Installing the updated Nakode build…");
@@ -129,7 +126,10 @@ fn is_managed_upstream_url(url: &str) -> bool {
 }
 
 fn should_retarget_remote(url: &str) -> bool {
-    is_managed_upstream_url(url) && url != CANONICAL_SOURCE_REMOTE
+    // Compare normalized repository identity rather than the literal URL so an
+    // equivalent spelling of the canonical remote -- SSH, scp-like, or
+    // credential-bearing -- is recognized as already correct and left alone.
+    is_managed_upstream_url(url) && repo_key(url) != repo_key(CANONICAL_SOURCE_REMOTE)
 }
 
 fn remote_has_userinfo(url: &str) -> bool {
@@ -178,26 +178,9 @@ fn retarget_managed_source_remote(source: &Path) -> Result<(), UpdateError> {
         .status()
         .map_err(UpdateError::StartGit)?;
     if !status.success() {
-        return Err(UpdateError::GitFailed {
-            status,
-            hint: origin_auth_hint(source),
-        });
+        return Err(UpdateError::GitFailed { status });
     }
     Ok(())
-}
-
-fn origin_auth_hint(source: &Path) -> String {
-    let Ok(Some(url)) = origin_remote_url(source) else {
-        return String::new();
-    };
-    if repo_key(&url).is_some_and(|key| key.contains("origin.cursor.com")) {
-        "\nIf git cannot reach Cursor Origin, install the Origin CLI and sign in:\n  \
-         curl -fsSL https://downloads.cursor.com/origin/install.sh | sh\n  \
-         origin auth login"
-            .to_owned()
-    } else {
-        String::new()
-    }
 }
 
 #[cfg(test)]
@@ -279,10 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn retargets_every_managed_url_except_the_canonical_github_remote() {
-        assert!(!should_retarget_remote(
-            "https://github.com/QuillDev/nakode.git"
-        ));
+    fn retargets_only_remotes_pointing_away_from_the_canonical_repository() {
         assert!(should_retarget_remote(
             "https://origin.cursor.com/git/fragile-inc/nakode.git"
         ));
@@ -293,6 +273,18 @@ mod tests {
         assert!(!should_retarget_remote(
             "https://github.com/someone/nakode.git"
         ));
+
+        // Every spelling of the canonical repository is already correct, so the
+        // configured remote is preserved instead of rewritten to the HTTPS form.
+        for url in [
+            "https://github.com/QuillDev/nakode.git",
+            "https://github.com/QuillDev/nakode",
+            "git@github.com:QuillDev/nakode.git",
+            "git@github.com:QuillDev/nakode",
+            "ssh://git@github.com/QuillDev/nakode.git",
+        ] {
+            assert!(!should_retarget_remote(url), "{url}");
+        }
     }
 
     #[test]
@@ -411,6 +403,27 @@ mod tests {
                 .expect("read origin")
                 .as_deref(),
             Some(CANONICAL_SOURCE_REMOTE)
+        );
+    }
+
+    #[test]
+    fn preserves_an_ssh_spelling_of_the_canonical_github_remote() {
+        let source = tempdir().expect("temporary checkout");
+        init_git_repo(source.path());
+        let ssh_remote = "git@github.com:QuillDev/nakode.git";
+        let status = Command::new("git")
+            .args(["remote", "add", "origin", ssh_remote])
+            .current_dir(source.path())
+            .status()
+            .expect("git remote add");
+        assert!(status.success());
+
+        retarget_managed_source_remote(source.path()).expect("keep the SSH remote");
+        assert_eq!(
+            origin_remote_url(source.path())
+                .expect("read origin")
+                .as_deref(),
+            Some(ssh_remote)
         );
     }
 }
