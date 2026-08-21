@@ -51,7 +51,7 @@ impl Tool for MemorySearchTool {
     }
 
     fn available(&self) -> bool {
-        self.service.enabled()
+        self.service.available()
     }
 
     fn concurrency(&self) -> ToolConcurrency {
@@ -203,7 +203,7 @@ impl Tool for MemoryStoreTool {
     }
 
     fn available(&self) -> bool {
-        self.service.enabled()
+        self.service.available()
     }
 
     fn execute<'a>(

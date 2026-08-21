@@ -1958,21 +1958,19 @@ impl BackendRegistry {
         providers
             .iter()
             .map(|provider| {
-                let available =
-                    if !provider.enabled || !self.commands.contains_key(&provider.provider) {
-                        Vec::new()
-                    } else if matches!(
+                let available = if !provider.enabled
+                    || !self.commands.contains_key(&provider.provider)
+                {
+                    Vec::new()
+                } else {
+                    let supported = if matches!(
                         provider.provider.as_str(),
                         crate::backend::CODEX_PROVIDER
                             | crate::backend::DEVIN_PROVIDER
                             | crate::backend::KIMI_PROVIDER
                             | crate::backend::GLM_PROVIDER
                     ) {
-                        canonical
-                            .iter()
-                            .filter(|name| runtime_tools.contains(name.as_str()))
-                            .cloned()
-                            .collect()
+                        canonical.clone()
                     } else {
                         let projection = crate::backend::project_provider_tools(
                             &provider.provider,
@@ -1984,6 +1982,11 @@ impl BackendRegistry {
                             .cloned()
                             .collect()
                     };
+                    supported
+                        .into_iter()
+                        .filter(|name| runtime_tools.contains(name.as_str()))
+                        .collect()
+                };
                 (provider.provider.clone(), available)
             })
             .collect()
@@ -3836,7 +3839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builtin_availability_uses_addon_enablement_not_runtime_readiness() {
+    async fn builtin_availability_requires_addon_enablement_and_runtime_readiness() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut registry = empty_registry(workspace.path()).await;
         let (commands, _command_rx) = mpsc::channel(1);
@@ -3862,10 +3865,10 @@ mod tests {
         let codex = availability
             .get(CODEX_PROVIDER)
             .expect("Codex availability");
-        assert!(codex.iter().any(|name| name == "browser"));
-        assert!(codex.iter().any(|name| name == "memory_search"));
-        assert!(codex.iter().any(|name| name == "memory_store"));
-        assert!(codex.iter().any(|name| name == "vision"));
+        assert!(!codex.iter().any(|name| name == "browser"));
+        assert!(!codex.iter().any(|name| name == "memory_search"));
+        assert!(!codex.iter().any(|name| name == "memory_store"));
+        assert!(!codex.iter().any(|name| name == "vision"));
 
         registry.web_config.write().expect("web config").backend = crate::web::WebBackend::Disabled;
         registry

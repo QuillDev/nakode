@@ -74,7 +74,12 @@ impl Tool for BrowserTool {
     }
 
     fn available(&self) -> bool {
-        self.config().backend != WebBackend::Disabled
+        let config = self.config();
+        match config.backend {
+            WebBackend::Disabled => false,
+            WebBackend::AgentBrowser => crate::memory::executable_available("agent-browser"),
+            WebBackend::Firecrawl => !config.firecrawl_api_key.trim().is_empty(),
+        }
     }
 
     fn execute<'a>(

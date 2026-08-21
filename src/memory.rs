@@ -200,13 +200,6 @@ impl MemoryService {
     }
 
     #[must_use]
-    pub fn enabled(&self) -> bool {
-        self.config
-            .read()
-            .is_ok_and(|config| config.backend != MemoryBackend::Disabled)
-    }
-
-    #[must_use]
     pub fn available(&self) -> bool {
         self.operational.load(Ordering::Relaxed)
             && self.config.read().is_ok_and(|config| config.available())
@@ -608,7 +601,7 @@ done
 
     #[cfg(unix)]
     #[test]
-    fn memory_tools_are_gated_by_backend_selection_not_readiness() {
+    fn memory_tools_require_backend_selection_and_runtime_readiness() {
         use std::{
             fs,
             os::unix::fs::PermissionsExt as _,
@@ -662,16 +655,11 @@ done
         assert!(names.contains(&"memory_store"));
 
         config.write().expect("config lock").global_bank.clear();
-        let definitions = registry.definitions();
         assert!(
-            definitions
+            registry
+                .definitions()
                 .iter()
-                .any(|definition| definition.name == "memory_search")
-        );
-        assert!(
-            definitions
-                .iter()
-                .any(|definition| definition.name == "memory_store")
+                .all(|definition| !definition.name.starts_with("memory_"))
         );
     }
 

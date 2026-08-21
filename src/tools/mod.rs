@@ -544,13 +544,20 @@ mod tests {
             registry
                 .definitions()
                 .iter()
-                .any(|tool| tool.name == "browser"),
-            "enabled browser registration must not depend on credential readiness"
+                .all(|tool| tool.name != "browser"),
+            "enabled browser stays unavailable until its credential is configured"
+        );
+        config.write().expect("web config").firecrawl_api_key = "test-key".to_owned();
+        assert!(
+            registry
+                .definitions()
+                .iter()
+                .any(|tool| tool.name == "browser")
         );
     }
 
     #[test]
-    fn vision_tool_tracks_configured_enablement_without_requiring_provider_readiness() {
+    fn vision_tool_requires_enablement_and_provider_readiness() {
         let config = Arc::new(RwLock::new(VisionConfig::default()));
         let registry = ToolRegistry::base().with_vision(config.clone(), None);
         assert!(
@@ -565,12 +572,13 @@ mod tests {
             registry
                 .definitions()
                 .iter()
-                .any(|tool| tool.name == "vision")
+                .all(|tool| tool.name != "vision"),
+            "selected vision remains unavailable without a provider service"
         );
     }
 
     #[test]
-    fn memory_tools_track_enablement_without_requiring_runtime_readiness() {
+    fn unavailable_memory_tools_are_absent_without_blocking_registry_use() {
         let config = Arc::new(RwLock::new(MemoryConfig::default()));
         let service = Arc::new(MemoryService::new(config.clone(), "project".to_owned()));
         let registry = ToolRegistry::base().with_memory(service);
@@ -590,8 +598,8 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-        assert!(names.contains(&"memory_search"));
-        assert!(names.contains(&"memory_store"));
+        assert!(!names.contains(&"memory_search"));
+        assert!(!names.contains(&"memory_store"));
     }
 
     #[test]

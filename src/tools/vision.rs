@@ -57,7 +57,7 @@ impl Tool for VisionTool {
     }
 
     fn available(&self) -> bool {
-        self.enabled()
+        self.service.is_some() && self.enabled()
     }
 
     fn concurrency(&self) -> ToolConcurrency {
@@ -222,7 +222,7 @@ mod tests {
             model: Some("openai-codex/vision-test".to_owned()),
         }));
         let tool = VisionTool::new(config, None);
-        assert!(tool.available());
+        assert!(!tool.available());
 
         let (events, _event_rx) = mpsc::channel(1);
         let questions = QuestionBroker::default();
