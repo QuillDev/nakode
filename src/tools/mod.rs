@@ -688,7 +688,10 @@ mod tests {
         let mut harness = ToolHarness {
             registry: ToolRegistry::base(),
             workspace: directory.path(),
-            session: RuntimeSession::new("test-model".to_owned(), String::new()),
+            session: RuntimeSession::new(
+                "test-model".to_owned(),
+                "[Nakode Available Skills]\n- review: Review carefully\n  Load: read_skill({\"name\":\"review\"})\n[/Nakode Available Skills]".to_owned(),
+            ),
             events: mpsc::channel(8).0,
             questions: QuestionBroker::default(),
             cancellation: CancellationToken::new(),
@@ -704,11 +707,20 @@ mod tests {
             Some("fragile.review.v1")
         );
 
+        harness.session.instructions =
+            "[Nakode Available Skills]\n[/Nakode Available Skills]".to_owned();
+        let disabled = harness
+            .execute("read_skill", json!({"name": "review"}))
+            .await;
+        assert!(disabled.failed);
+        assert!(disabled.output.contains("disabled or was not available"));
+        assert!(disabled.invocation_identity.is_none());
+
         let missing = harness
             .execute("read_skill", json!({"name": "missing"}))
             .await;
         assert!(missing.failed);
-        assert!(missing.output.contains("not installed"));
+        assert!(missing.output.contains("disabled or was not available"));
         assert!(missing.invocation_identity.is_none());
     }
 

@@ -2,7 +2,10 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolConcurrency, ToolContext, ToolFuture, ToolResult, required_string};
-use crate::{runtime::ToolDefinition, skill::SkillCatalog};
+use crate::{
+    runtime::ToolDefinition,
+    skill::{SkillCatalog, skill_is_advertised},
+};
 
 pub struct ReadSkillTool;
 
@@ -46,6 +49,11 @@ impl Tool for ReadSkillTool {
         Box::pin(async move {
             let result = (|| {
                 let name = required_string(&arguments, "name")?;
+                if !skill_is_advertised(&context.session.instructions, name) {
+                    return Err(format!(
+                        "skill {name:?} is disabled or was not available when this session started"
+                    ));
+                }
                 let catalogue = SkillCatalog::load(context.workspace)
                     .map_err(|error| format!("could not load installed skills: {error}"))?;
                 let skill = catalogue.find(name).ok_or_else(|| {

@@ -752,6 +752,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             initial_instructions: input.initial_instructions,
             bridge: bridge_intent(input.bridge)?,
             mcp_grant: mcp_grant(input.mcp_grant)?,
+            profile_id: input.profile_id,
+            disabled_skill_ids: Vec::new(),
         }
     );
     command_rpc!(
@@ -1188,6 +1190,47 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .collect()
         }
     );
+    command_rpc!(
+        set_skill_enabled,
+        api::SetSkillEnabledRequest,
+        input,
+        protocol::Command::SetSkillEnabled {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            profile_id: input.profile_id,
+            skill_id: input.skill_id,
+            enabled: input.enabled,
+        }
+    );
+    async fn list_skills(
+        &self,
+        request: tonic::Request<api::ListSkillsRequest>,
+    ) -> Result<tonic::Response<api::SkillCatalogue>, tonic::Status> {
+        let input = request.into_inner();
+        let result = self
+            .query(protocol::Query::ListSkills {
+                workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+                profile_id: input.profile_id,
+            })
+            .await?;
+        let protocol::QueryResult::Skills(value) = result.value else {
+            return Err(tonic::Status::internal(
+                "unexpected skill catalogue response",
+            ));
+        };
+        Ok(tonic::Response::new(api::SkillCatalogue {
+            skills: value
+                .skills
+                .into_iter()
+                .map(|skill| api::Skill {
+                    id: skill.id,
+                    name: skill.name,
+                    description: skill.description,
+                    enabled: skill.enabled,
+                    available: skill.available,
+                })
+                .collect(),
+        }))
+    }
     command_rpc!(
         begin_provider_authentication,
         api::BeginProviderAuthenticationRequest,
@@ -1784,8 +1827,11 @@ pub(crate) fn workspace(value: protocol::BootstrapView) -> api::WorkspaceState {
             .skills
             .into_iter()
             .map(|skill| api::Skill {
+                id: skill.name.clone(),
                 name: skill.name,
                 description: skill.description,
+                enabled: true,
+                available: true,
             })
             .collect(),
         settings: Some(settings(value.settings)),

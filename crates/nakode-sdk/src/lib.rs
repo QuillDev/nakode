@@ -294,6 +294,7 @@ impl NakodeClient {
                 mcp_grant: None,
                 bridge: None,
                 working_directory: Some(working_directory.into()),
+                profile_id: None,
             }
         )?;
         result
@@ -329,6 +330,7 @@ impl NakodeClient {
                 mcp_grant: None,
                 bridge: Some(bridge),
                 working_directory: None,
+                profile_id: None,
             }
         )?;
         result
@@ -379,6 +381,7 @@ impl NakodeClient {
                 mcp_grant: None,
                 bridge: None,
                 working_directory: None,
+                profile_id: None,
             }
         )?;
         result
@@ -414,6 +417,7 @@ impl NakodeClient {
                 initial_instructions,
                 bridge: None,
                 working_directory: None,
+                profile_id: None,
             }
         )?;
         result
@@ -860,6 +864,7 @@ impl NakodeClient {
         set_provider_model_filter,
         api::SetProviderModelFilterRequest
     );
+    typed_mutation!(set_skill_enabled, api::SetSkillEnabledRequest);
     typed_mutation!(set_provider_enabled, api::SetProviderEnabledRequest);
     typed_mutation!(
         begin_provider_authentication,
@@ -1011,6 +1016,26 @@ impl NakodeClient {
             .transport
             .clone()
             .get_invocation_timeline(request)
+            .await?
+            .into_inner())
+    }
+
+    /// Returns the full profile-scoped manageable skill catalogue, including unavailable rows.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn list_skills(
+        &self,
+        workspace_id: impl Into<String>,
+        profile_id: impl Into<String>,
+    ) -> Result<api::SkillCatalogue, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .list_skills(api::ListSkillsRequest {
+                workspace_id: workspace_id.into(),
+                profile_id: profile_id.into(),
+            })
             .await?
             .into_inner())
     }

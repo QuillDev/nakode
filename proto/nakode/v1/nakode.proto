@@ -71,6 +71,8 @@ service NakodeService {
   rpc SelectModel(SelectModelRequest) returns (MutationResult);
   rpc SetProviderEnabled(SetProviderEnabledRequest) returns (MutationResult);
   rpc SetProviderModelFilter(SetProviderModelFilterRequest) returns (MutationResult);
+  rpc ListSkills(ListSkillsRequest) returns (SkillCatalogue);
+  rpc SetSkillEnabled(SetSkillEnabledRequest) returns (MutationResult);
   rpc BeginProviderAuthentication(BeginProviderAuthenticationRequest) returns (MutationResult);
   rpc SetProviderCredential(SetProviderCredentialRequest) returns (MutationResult);
   rpc ClearProviderCredential(ClearProviderCredentialRequest) returns (MutationResult);
@@ -177,6 +179,8 @@ message CreateSessionRequest {
   // Filesystem/provider process root for this session. Omission inherits the logical workspace path.
   // The server canonicalizes and persists this directory before publishing the session.
   optional string working_directory = 10;
+  // Stable client profile selecting Nakode-owned skill availability. Omission preserves legacy defaults.
+  optional string profile_id = 11;
 }
 // Supplying tools installs them before a closed session begins provider restoration. An already
 // attached session accepts only the identical table, making client reattachment idempotent without
@@ -495,6 +499,15 @@ message ModelTarget {
 message SelectModelRequest { MutationOptions mutation = 1; ModelTarget target = 2; string model_id = 3; ModelOptions options = 4; }
 message SetProviderEnabledRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; }
 message SetProviderModelFilterRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; repeated string selected_model_ids = 4; }
+message ListSkillsRequest { string workspace_id = 1; string profile_id = 2; }
+message SetSkillEnabledRequest {
+  MutationOptions mutation = 1;
+  string workspace_id = 2;
+  string profile_id = 3;
+  string skill_id = 4;
+  bool enabled = 5;
+}
+message SkillCatalogue { repeated Skill skills = 1; }
 message BeginProviderAuthenticationRequest { MutationOptions mutation = 1; string provider_id = 2; }
 message SetProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; string kind = 3; string credential = 4; }
 message ClearProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; }
@@ -696,7 +709,13 @@ message AgentDefinition {
   bool dashboard_tools_injected = 31;
   uint32 policy_projection_version = 32;
 }
-message Skill { string name = 1; string description = 2; }
+message Skill {
+  string name = 1;
+  string description = 2;
+  string id = 3;
+  bool enabled = 4;
+  bool available = 5;
+}
 
 message WebSettings { string backend = 1; bool credential_configured = 2; AgentBrowser agent_browser = 3; }
 message AgentBrowser { enum State { STATE_UNSPECIFIED = 0; STATE_CHECKING = 1; STATE_AVAILABLE = 2; STATE_UNAVAILABLE = 3; } State state = 1; optional string version = 2; }

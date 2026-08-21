@@ -35,6 +35,8 @@ pub enum ServiceCapability {
     QueuedPromptSteering,
     /// Local-only, owner-opted invocation metadata settings and bounded usage queries.
     InvocationTelemetry,
+    /// Profile-scoped stable skill availability can be listed and changed through the public API.
+    SkillAvailability,
     /// Owner-facing clients may inspect and atomically mutate the authoritative archetype catalogue.
     ArchetypeManagement,
     /// Owner-facing clients may inspect and atomically mutate Nakode's one configured SOUL.md.
@@ -124,11 +126,26 @@ pub struct SessionInventory {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManageableSkillView {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillCatalogueView {
+    pub skills: Vec<ManageableSkillView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum QueryResult {
     Bootstrap(Box<BootstrapView>),
     SoulDocument(SoulDocumentView),
     McpManagement(McpManagementView),
+    Skills(SkillCatalogueView),
     Sessions(SessionInventory),
     Session(Box<SessionView>),
     Transcript(Box<crate::TranscriptPage>),

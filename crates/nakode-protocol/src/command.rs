@@ -266,6 +266,12 @@ pub enum Command {
         /// Explicit, deny-by-default Nakode MCP server grants for this session.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mcp_grant: Option<McpSessionGrant>,
+        /// Stable client profile selecting authoritative skill availability.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        /// Runtime-resolved disabled identities. Clients cannot set this through gRPC.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        disabled_skill_ids: Vec<String>,
     },
     OpenSession {
         session_id: SessionId,
@@ -421,6 +427,12 @@ pub enum Command {
         provider_id: ProviderId,
         enabled: bool,
     },
+    SetSkillEnabled {
+        workspace_id: WorkspaceId,
+        profile_id: String,
+        skill_id: String,
+        enabled: bool,
+    },
     SetProviderModelFilter {
         provider_id: ProviderId,
         enabled: bool,
@@ -513,6 +525,10 @@ pub enum Query {
     Bootstrap {
         workspace: String,
         session_id: Option<SessionId>,
+    },
+    ListSkills {
+        workspace_id: WorkspaceId,
+        profile_id: String,
     },
     GetSoul {
         workspace_id: WorkspaceId,
