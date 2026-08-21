@@ -4,8 +4,9 @@ set -eu
 script_directory="$(CDPATH= cd -P "$(dirname "$0")" && pwd -P)"
 invocation_directory="$(pwd -P)"
 
-# Canonical managed-source remote. Cursor Origin and non-canonical GitHub
-# remotes are rewritten to this so `nakode update` follows the GitHub project.
+# Canonical managed-source remote. A retired Cursor Origin remote is rewritten
+# to this so `nakode update` follows the GitHub project. A remote that already
+# points at this repository is left exactly as the user configured it.
 canonical_source_remote='https://github.com/QuillDev/nakode.git'
 
 usage() {
@@ -53,17 +54,36 @@ strip_url_credentials() {
   esac
 }
 
-is_managed_upstream_url() {
+normalize_upstream_url() {
   cleaned=$(strip_url_credentials "$1")
   cleaned=${cleaned%/}
   cleaned=${cleaned%.git}
-  case "$cleaned" in
+  printf '%s\n' "$cleaned"
+}
+
+# Every spelling of the canonical GitHub repository. A remote matching one of
+# these already points at the right place, so it is preserved exactly as
+# configured instead of being rewritten to the HTTPS form.
+is_canonical_upstream_url() {
+  case "$(normalize_upstream_url "$1")" in
     https://github.com/QuillDev/nakode | \
       http://github.com/QuillDev/nakode | \
       git@github.com:QuillDev/nakode | \
       ssh://git@github.com/QuillDev/nakode | \
-      ssh://github.com/QuillDev/nakode | \
-      https://origin.cursor.com/git/fragile-inc/nakode | \
+      ssh://github.com/QuillDev/nakode)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Retired Cursor Origin locations. These are migrated to the canonical GitHub
+# remote so an existing Origin checkout can still update.
+is_retired_upstream_url() {
+  case "$(normalize_upstream_url "$1")" in
+    https://origin.cursor.com/git/fragile-inc/nakode | \
       http://origin.cursor.com/git/fragile-inc/nakode | \
       https://origin.cursor.com/fragile-inc/nakode | \
       http://origin.cursor.com/fragile-inc/nakode | \
@@ -90,10 +110,10 @@ normalize_managed_source_remote() {
   fi
 
   current_remote="$(git -C "$script_directory" config --get remote.origin.url 2>/dev/null || true)"
-  if [ -z "$current_remote" ] || [ "$current_remote" = "$canonical_source_remote" ]; then
+  if [ -z "$current_remote" ] || is_canonical_upstream_url "$current_remote"; then
     return 0
   fi
-  if ! is_managed_upstream_url "$current_remote"; then
+  if ! is_retired_upstream_url "$current_remote"; then
     return 0
   fi
 
