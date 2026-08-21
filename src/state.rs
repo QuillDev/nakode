@@ -5312,28 +5312,9 @@ impl DomainState {
         replace_builtin_tools: bool,
         allowed_builtin_tools: Option<&[String]>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        let mut effective_stored = self.allowed_builtin_tools.as_ref().map(|allowed| {
-            self.available_builtin_tools(&self.backend_provider)
-                .map_or_else(
-                    || allowed.clone(),
-                    |available| {
-                        allowed
-                            .iter()
-                            .filter(|name| available.contains(name))
-                            .cloned()
-                            .collect()
-                    },
-                )
-        });
-        let effective_replace = if effective_stored.as_ref().is_some_and(Vec::is_empty) {
-            effective_stored = None;
-            true
-        } else {
-            self.replace_builtin_tools
-        };
         if self.external_tools == tools
-            && effective_replace == replace_builtin_tools
-            && effective_stored.as_deref() == allowed_builtin_tools
+            && self.replace_builtin_tools == replace_builtin_tools
+            && self.allowed_builtin_tools.as_deref() == allowed_builtin_tools
         {
             return Ok(Vec::new());
         }
@@ -7515,27 +7496,16 @@ impl DomainState {
         self.working_directory = working_directory;
     }
 
-    /// Intersects a client authorization boundary with the provider's current runtime availability.
+    /// Preserves the client's authorization boundary across current add-on enablement.
     ///
-    /// A missing internal projection is retained only for non-native/unit-test callers; the native
-    /// server installs a presence-aware map before every public create/open request.
+    /// Runtime tool registration applies the live enabled state. Destructively intersecting this
+    /// policy would prevent a repaired or newly enabled add-on from appearing after resume.
     #[must_use]
     pub fn reconcile_available_builtin_tools(
         &self,
-        provider: &str,
-        mut tools: nakode_protocol::SessionToolConfiguration,
+        _provider: &str,
+        tools: nakode_protocol::SessionToolConfiguration,
     ) -> nakode_protocol::SessionToolConfiguration {
-        let Some(available) = self.available_builtin_tools(provider) else {
-            return tools;
-        };
-        let Some(allowed) = tools.allowed_builtin_tools.as_mut() else {
-            return tools;
-        };
-        allowed.retain(|name| available.contains(name));
-        if allowed.is_empty() {
-            tools.allowed_builtin_tools = None;
-            tools.replace_builtin_tools = true;
-        }
         tools
     }
 

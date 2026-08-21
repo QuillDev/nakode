@@ -1103,6 +1103,18 @@ fn model_view(state: &DomainState, model: &ModelInfo) -> ModelView {
     }
 }
 
+fn supported_builtin_tools(provider: &str) -> Vec<String> {
+    let canonical = crate::agent::CANONICAL_AGENT_TOOLS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let projection = crate::backend::project_provider_tools(provider, Some(&canonical));
+    canonical
+        .into_iter()
+        .filter(|name| !projection.unsupported_canonical_tools.contains(name))
+        .collect()
+}
+
 fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView {
     let connection = state.provider_connection(&provider.provider).map_or_else(
         || {
@@ -1154,6 +1166,7 @@ fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView
             .filter(|model| model.provider == provider.provider)
             .map(|model| model_view(state, model))
             .collect(),
+        supported_builtin_tools: Some(supported_builtin_tools(&provider.provider)),
         available_builtin_tools: state
             .available_builtin_tools(&provider.provider)
             .map(<[String]>::to_vec),

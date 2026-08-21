@@ -327,7 +327,7 @@ impl AgentRuntime {
     /// # Errors
     ///
     /// Returns an error when a tool name is empty or duplicated, a tool schema is not valid JSON,
-    /// or the requested canonical builtin set is unavailable in this adapter runtime.
+    /// or the requested canonical builtin set is invalid for this adapter runtime.
     pub async fn configure_external_tools(
         &self,
         session_id: &str,
@@ -360,25 +360,6 @@ impl AgentRuntime {
                 description: tool.description,
                 parameters,
             });
-        }
-        if !replace_builtin_tools && let Some(allowed) = allowed_builtin_tools.as_ref() {
-            let available = self
-                .tools
-                .definitions()
-                .into_iter()
-                .map(|tool| tool.name)
-                .collect::<std::collections::HashSet<_>>();
-            let unavailable = allowed
-                .iter()
-                .filter(|name| !available.contains(name.as_str()))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !unavailable.is_empty() {
-                return Err(format!(
-                    "requested canonical builtin tools are unavailable: {}",
-                    unavailable.join(", ")
-                ));
-            }
         }
         self.external_tools.sessions.lock().await.insert(
             session_id.to_owned(),
@@ -2879,7 +2860,7 @@ mod tests {
             .expect_err("custom tools cannot inherit builtin authority");
         assert!(collision.contains("collides with canonical builtin"));
 
-        let unavailable_memory = runtime
+        runtime
             .configure_external_tools(
                 "memory-session",
                 Vec::new(),
@@ -2889,9 +2870,17 @@ mod tests {
                 None,
             )
             .await
-            .expect_err("an adapter cannot advertise uninstalled memory tools");
-        assert!(unavailable_memory.contains("memory_search"));
-        assert!(unavailable_memory.contains("memory_store"));
+            .expect("authorization does not depend on current add-on registration");
+        assert!(
+            runtime
+                .builtin_tool_allowed("memory-session", "memory_search")
+                .await
+        );
+        assert!(
+            runtime
+                .builtin_tool_allowed("memory-session", "memory_store")
+                .await
+        );
 
         runtime
             .configure_external_tools(

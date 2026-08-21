@@ -115,6 +115,10 @@ pub struct ProviderView {
     /// Full discovered catalogue used by settings; BootstrapView.models may be filtered.
     #[serde(default)]
     pub model_candidates: Vec<ModelView>,
+    /// Canonical built-ins this provider adapter can project, independent of add-on enablement.
+    /// `None` means an older or non-authoritative projection.
+    #[serde(default)]
+    pub supported_builtin_tools: Option<Vec<String>>,
     /// Canonical built-ins this provider can expose under the current runtime/add-on settings.
     /// `None` means an older or non-authoritative projection, never an unrestricted default.
     #[serde(default)]

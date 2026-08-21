@@ -3835,11 +3835,8 @@ mod tests {
         .await
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn builtin_availability_uses_live_runtime_tools_and_provider_readiness() {
-        use std::{fs, os::unix::fs::PermissionsExt as _};
-
+    async fn builtin_availability_uses_addon_enablement_not_runtime_readiness() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut registry = empty_registry(workspace.path()).await;
         let (commands, _command_rx) = mpsc::channel(1);
@@ -3847,21 +3844,16 @@ mod tests {
             .commands
             .insert(CODEX_PROVIDER.to_owned(), commands);
 
-        {
-            let mut web = registry.web_config.write().expect("web config");
-            web.backend = crate::web::WebBackend::Firecrawl;
-            web.firecrawl_api_key = "test-key".to_owned();
-        }
-        let executable = workspace.path().join("mnemosyne");
-        fs::write(&executable, "#!/bin/sh\n").expect("write memory executable");
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
-            .expect("make memory executable runnable");
+        registry.web_config.write().expect("web config").backend =
+            crate::web::WebBackend::Firecrawl;
         *registry.memory_config.write().expect("memory config") = crate::memory::MemoryConfig {
             backend: crate::memory::MemoryBackend::Mnemosyne,
-            executable: executable.to_string_lossy().into_owned(),
-            global_bank: "test-global".to_owned(),
+            executable: "missing-mnemosyne".to_owned(),
+            global_bank: String::new(),
             data_directory: String::new(),
         };
+        registry.vision_config.write().expect("vision config").model =
+            Some("openai-codex/vision-test".to_owned());
 
         let availability = registry.available_builtin_tools(&[
             provider(CODEX_PROVIDER, true, true),
@@ -3873,7 +3865,25 @@ mod tests {
         assert!(codex.iter().any(|name| name == "browser"));
         assert!(codex.iter().any(|name| name == "memory_search"));
         assert!(codex.iter().any(|name| name == "memory_store"));
-        assert!(!codex.iter().any(|name| name == "vision"));
+        assert!(codex.iter().any(|name| name == "vision"));
+
+        registry.web_config.write().expect("web config").backend = crate::web::WebBackend::Disabled;
+        registry
+            .memory_config
+            .write()
+            .expect("memory config")
+            .backend = crate::memory::MemoryBackend::Disabled;
+        registry.vision_config.write().expect("vision config").model = None;
+        let disabled = registry.available_builtin_tools(&[provider(CODEX_PROVIDER, true, true)]);
+        let codex_disabled = disabled.get(CODEX_PROVIDER).expect("Codex availability");
+        assert!(codex_disabled.iter().all(|name| name != "browser"));
+        assert!(
+            codex_disabled
+                .iter()
+                .all(|name| !matches!(name.as_str(), "memory_search" | "memory_store"))
+        );
+        assert!(codex_disabled.iter().all(|name| name != "vision"));
+
         assert!(
             availability
                 .get(DEVIN_PROVIDER)

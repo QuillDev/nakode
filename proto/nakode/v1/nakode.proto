@@ -667,9 +667,12 @@ message Provider {
   bool model_filter_enabled = 9;
   repeated string selected_model_ids = 10;
   repeated Model model_candidates = 11;
-  // Presence-aware, provider/session-start availability. False is the fail-closed legacy case.
+  // Presence-aware, provider/session-start enabled add-ons and tools. False is legacy.
   repeated string available_builtin_tools = 12;
   bool builtin_tool_availability_known = 13;
+  // Presence-aware adapter support, independent of current add-on enablement.
+  repeated string supported_builtin_tools = 14;
+  bool builtin_tool_support_known = 15;
 }
 message ModelConfiguration { repeated string reasoning_efforts = 1; bool fast_mode_configurable = 2; bool vision_eligible = 3; bool accepts_image_input = 4; }
 message Model { string id = 1; string provider_id = 2; string model_slug = 3; string display_name = 4; bool is_default = 5; optional string reasoning_effort = 6; bool fast_mode = 7; ModelConfiguration configuration = 8; }
