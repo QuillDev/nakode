@@ -12,6 +12,7 @@ mod nakode_agent;
 pub(crate) use nakode_agent::NAKODE_AGENT_TOOL_NAME;
 mod process;
 mod read;
+mod read_skill;
 mod todo;
 mod truncate;
 mod vision;
@@ -52,6 +53,8 @@ pub struct ToolContext<'a> {
 pub struct ToolResult {
     pub output: String,
     pub failed: bool,
+    /// Server-internal stable identity for successful capability invocation telemetry.
+    pub invocation_identity: Option<String>,
 }
 
 impl ToolResult {
@@ -60,6 +63,7 @@ impl ToolResult {
         Self {
             output: output.into(),
             failed: false,
+            invocation_identity: None,
         }
     }
 
@@ -68,7 +72,14 @@ impl ToolResult {
         Self {
             output: output.into(),
             failed: true,
+            invocation_identity: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_invocation_identity(mut self, identity: impl Into<String>) -> Self {
+        self.invocation_identity = Some(identity.into());
+        self
     }
 }
 
@@ -103,6 +114,7 @@ impl ToolRegistry {
         Self {
             tools: vec![
                 Arc::new(read::ReadTool),
+                Arc::new(read_skill::ReadSkillTool),
                 Arc::new(write::WriteTool),
                 Arc::new(edit::EditTool),
                 Arc::new(bash::BashTool),
@@ -545,7 +557,17 @@ mod tests {
         assert_eq!(
             names,
             [
-                "read", "write", "edit", "bash", "grep", "find", "ls", "eval", "ask", "todo"
+                "read",
+                "read_skill",
+                "write",
+                "edit",
+                "bash",
+                "grep",
+                "find",
+                "ls",
+                "eval",
+                "ask",
+                "todo"
             ]
         );
     }
@@ -563,6 +585,7 @@ mod tests {
         };
 
         assert_eq!(properties("read"), ["limit", "offset", "path"]);
+        assert_eq!(properties("read_skill"), ["name"]);
         assert_eq!(properties("write"), ["content", "path"]);
         assert_eq!(properties("edit"), ["edits", "path"]);
         assert_eq!(
@@ -646,6 +669,43 @@ mod tests {
             "full {}-byte output remains in the transcript",
             output.len()
         )));
+    }
+
+    #[tokio::test]
+    async fn installed_skills_load_by_catalogue_name_through_the_registry() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let skill = directory.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill).expect("skill directory");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nid: fragile.review.v1\nname: review\ndescription: Review carefully\n---\n\nFULL REVIEW PROCEDURE\n",
+        )
+        .expect("skill definition");
+        let mut harness = ToolHarness {
+            registry: ToolRegistry::base(),
+            workspace: directory.path(),
+            session: RuntimeSession::new("test-model".to_owned(), String::new()),
+            events: mpsc::channel(8).0,
+            questions: QuestionBroker::default(),
+            cancellation: CancellationToken::new(),
+        };
+
+        let result = harness
+            .execute("read_skill", json!({"name": "review"}))
+            .await;
+        assert!(!result.failed, "{}", result.output);
+        assert!(result.output.contains("FULL REVIEW PROCEDURE"));
+        assert_eq!(
+            result.invocation_identity.as_deref(),
+            Some("fragile.review.v1")
+        );
+
+        let missing = harness
+            .execute("read_skill", json!({"name": "missing"}))
+            .await;
+        assert!(missing.failed);
+        assert!(missing.output.contains("not installed"));
+        assert!(missing.invocation_identity.is_none());
     }
 
     #[tokio::test]

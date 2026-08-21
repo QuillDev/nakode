@@ -1,9 +1,12 @@
 use serde_json::{Map, Value, json};
+use similar::TextDiff;
 use tokio_util::sync::CancellationToken;
+use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
     Tool, ToolContext, ToolFuture, ToolResult, required_string, resolve_workspace_path,
-    write::atomic_write,
+    truncate_output, write::atomic_write,
 };
 use crate::runtime::ToolDefinition;
 
@@ -13,7 +16,7 @@ impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit",
-            description: "Edit one UTF-8 file using exact text replacement. Every edits[].oldText must identify one unique, non-overlapping region of the original file. Combine nearby changes into one edit and use multiple entries for disjoint changes.",
+            description: "Edit one UTF-8 file with precise text replacements and return a unified diff. Every edits[].oldText must match one unique, non-overlapping region of the original file. Merge changes in the same block or nearby lines into one entry; use multiple entries in one call for separate locations. Keep oldText as small as possible while still unique, without padding it with large unchanged regions.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -24,18 +27,18 @@ impl Tool for EditTool {
                     "edits": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "Disjoint replacements, all matched against the original file",
+                        "description": "One or more targeted replacements, all matched against the original file rather than the results of earlier entries. Entries must not overlap or nest; merge changes to the same block or nearby lines.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "oldText": {
                                     "type": "string",
                                     "minLength": 1,
-                                    "description": "Exact text for one unique replacement; keep it small but include enough context to be unique"
+                                    "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap any other edits[].oldText in this call."
                                 },
                                 "newText": {
                                     "type": "string",
-                                    "description": "Replacement text"
+                                    "description": "Replacement text for this targeted edit; use an empty string to delete oldText"
                                 }
                             },
                             "required": ["oldText", "newText"],
@@ -159,6 +162,7 @@ async fn edit_file(
         "\n"
     };
     let original = without_bom.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized_original = normalize_for_fuzzy_match(&original);
     let mut matched = Vec::with_capacity(edits.len());
     for (edit_index, edit) in edits.iter().enumerate() {
         if cancellation.is_cancelled() {
@@ -173,8 +177,14 @@ async fn edit_file(
             .ok_or_else(|| format!("edit {} is missing string argument newText", edit_index + 1))?
             .replace("\r\n", "\n")
             .replace('\r', "\n");
-        let (index, length) =
-            unique_match(&original, &old_text, supplied, edit_index, edits.len())?;
+        let (index, length) = unique_match(
+            &original,
+            &normalized_original,
+            &old_text,
+            supplied,
+            edit_index,
+            edits.len(),
+        )?;
         matched.push(MatchedEdit {
             index,
             length,
@@ -189,13 +199,19 @@ async fn edit_file(
             );
         }
     }
-    let mut updated = original;
+    let mut updated = original.clone();
     for edit in matched.iter().rev() {
         updated.replace_range(
             edit.index..edit.index.saturating_add(edit.length),
             &edit.replacement,
         );
     }
+    if updated == original {
+        return Err(format!(
+            "edit made no changes to {supplied}; oldText and newText resolve to identical content"
+        ));
+    }
+    let diff = unified_diff(supplied, &original, &updated);
     if line_ending == "\r\n" {
         updated = updated.replace('\n', "\r\n");
     }
@@ -204,58 +220,69 @@ async fn edit_file(
         return Err("edit interrupted".to_owned());
     }
     atomic_write(&path, updated.as_bytes(), cancellation).await?;
-    Ok(format!(
-        "Successfully replaced {} block(s) in {supplied}.",
-        edits.len()
+    Ok(truncate_output(
+        format!(
+            "Successfully replaced {} block(s) in {supplied}.\n\n{diff}",
+            edits.len()
+        )
+        .into_bytes(),
     ))
 }
 
 fn unique_match(
     contents: &str,
+    normalized_contents: &NormalizedText,
     old_text: &str,
     path: &str,
     edit_index: usize,
     total_edits: usize,
 ) -> Result<(usize, usize), String> {
     let exact = contents.match_indices(old_text).collect::<Vec<_>>();
-    match exact.as_slice() {
-        [(index, _)] => return Ok((*index, old_text.len())),
-        [_, _, ..] => {
-            return Err(duplicate_match_error(
-                contents,
-                old_text,
-                path,
-                edit_index,
-                total_edits,
-            ));
-        }
-        [] => {}
+    if exact.len() > 1 {
+        return Err(duplicate_match_error(
+            contents,
+            exact.iter().map(|(index, _)| *index),
+            path,
+            edit_index,
+            "locations",
+        ));
     }
-    let fuzzy = fuzzy_line_matches(contents, old_text);
-    match fuzzy.as_slice() {
-        [matched] => Ok(*matched),
-        [_, _, ..] => Err(format!(
-            "edit {} matched multiple whitespace-normalized blocks in {path}; include more surrounding context",
-            edit_index + 1
-        )),
-        [] => Err(format!(
-            "edit {} could not find oldText in {path}; re-read the surrounding lines before retrying",
-            edit_index + 1
-        )),
+    let fuzzy = fuzzy_matches(normalized_contents, old_text);
+    if fuzzy.len() > 1 {
+        return Err(duplicate_match_error(
+            contents,
+            fuzzy.iter().map(|(index, _)| *index),
+            path,
+            edit_index,
+            "normalized locations",
+        ));
     }
+    if let [(index, _)] = exact.as_slice() {
+        return Ok((*index, old_text.len()));
+    }
+    if let [matched] = fuzzy.as_slice() {
+        return Ok(*matched);
+    }
+    let label = if total_edits == 1 {
+        "edit".to_owned()
+    } else {
+        format!("edit {}", edit_index + 1)
+    };
+    Err(format!(
+        "{label} could not find oldText in {path}; re-read the surrounding lines before retrying"
+    ))
 }
 
 fn duplicate_match_error(
     contents: &str,
-    old_text: &str,
+    indexes: impl Iterator<Item = usize>,
     path: &str,
     edit_index: usize,
-    _total_edits: usize,
+    match_kind: &str,
 ) -> String {
-    let lines = contents
-        .match_indices(old_text)
+    let lines = indexes
         .take(8)
-        .map(|(index, _)| {
+        .map(|index| {
             contents[..index]
                 .bytes()
                 .filter(|byte| *byte == b'\n')
@@ -266,62 +293,117 @@ fn duplicate_match_error(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "edit {} matched multiple locations in {path} at lines {lines}; keep oldText small but add enough surrounding context to make it unique",
+        "edit {} matched multiple {match_kind} in {path} at lines {lines}; keep oldText small but add enough surrounding context to make it unique",
         edit_index + 1
     )
 }
 
-fn fuzzy_line_matches(contents: &str, old_text: &str) -> Vec<(usize, usize)> {
-    let old_lines = old_text.split('\n').collect::<Vec<_>>();
-    if old_lines.is_empty() {
+#[derive(Debug)]
+struct NormalizedText {
+    text: String,
+    original_boundaries: Vec<Option<usize>>,
+}
+
+fn fuzzy_matches(normalized_contents: &NormalizedText, old_text: &str) -> Vec<(usize, usize)> {
+    let normalized_old_text = normalize_for_fuzzy_match(old_text).text;
+    if normalized_old_text.is_empty() {
         return Vec::new();
     }
-    let content_lines = line_spans(contents);
-    content_lines
-        .windows(old_lines.len())
-        .filter(|window| {
-            window
-                .iter()
-                .zip(&old_lines)
-                .all(|((_, _, line), old)| normalize_line(line) == normalize_line(old))
+    let mut matches = normalized_contents
+        .text
+        .match_indices(&normalized_old_text)
+        .filter_map(|(start, _)| {
+            let end = start.saturating_add(normalized_old_text.len());
+            let original_start = normalized_contents
+                .original_boundaries
+                .get(start)
+                .copied()
+                .flatten()?;
+            let original_end = normalized_contents
+                .original_boundaries
+                .get(end)
+                .copied()
+                .flatten()?;
+            Some((original_start, original_end.saturating_sub(original_start)))
         })
-        .map(|window| {
-            let start = window[0].0;
-            let end = window.last().map_or(start, |line| line.1);
-            (start, end.saturating_sub(start))
-        })
-        .collect()
+        .collect::<Vec<_>>();
+    matches.dedup();
+    matches
 }
 
-fn line_spans(contents: &str) -> Vec<(usize, usize, &str)> {
-    let mut offset = 0;
-    contents
-        .split_inclusive('\n')
-        .map(|line| {
-            let start = offset;
-            offset += line.len();
-            (start, offset, line.strip_suffix('\n').unwrap_or(line))
-        })
-        .collect()
+fn normalize_for_fuzzy_match(value: &str) -> NormalizedText {
+    let mut normalized = NormalizedText {
+        text: String::new(),
+        original_boundaries: vec![Some(0)],
+    };
+    let mut original_offset = 0_usize;
+    for segment in value.split_inclusive('\n') {
+        let (line, has_newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, false), |line| (line, true));
+        let line_start: usize = original_offset;
+        let mut units: Vec<(usize, usize, String)> = line
+            .grapheme_indices(true)
+            .map(|(relative_start, grapheme)| {
+                let start = line_start.saturating_add(relative_start);
+                let end = start.saturating_add(grapheme.len());
+                let text = grapheme.nfkc().map(normalize_character).collect::<String>();
+                (start, end, text)
+            })
+            .collect::<Vec<_>>();
+        while units
+            .last()
+            .is_some_and(|(_, _, text)| text.chars().all(char::is_whitespace))
+        {
+            units.pop();
+        }
+        for (start, end, text) in units {
+            append_normalized_unit(&mut normalized, &text, start, end);
+        }
+        let line_end = line_start.saturating_add(line.len());
+        normalized.original_boundaries[normalized.text.len()] = Some(line_end);
+        if has_newline {
+            append_normalized_unit(&mut normalized, "\n", line_end, line_end.saturating_add(1));
+        }
+        original_offset = original_offset.saturating_add(segment.len());
+    }
+    normalized.original_boundaries[normalized.text.len()] = Some(value.len());
+    normalized
 }
 
-fn normalize_line(line: &str) -> String {
-    line.trim_end()
-        .replace(['\u{2018}', '\u{2019}'], "'")
-        .replace(['\u{201c}', '\u{201d}'], "\"")
-        .replace(
-            [
-                '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}',
-            ],
-            "-",
-        )
-        .replace(
-            [
-                '\u{00a0}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}',
-                '\u{2008}', '\u{2009}', '\u{200a}', '\u{202f}', '\u{205f}', '\u{3000}',
-            ],
-            " ",
-        )
+fn append_normalized_unit(
+    normalized: &mut NormalizedText,
+    unit: &str,
+    original_start: usize,
+    original_end: usize,
+) {
+    let normalized_start = normalized.text.len();
+    normalized.original_boundaries[normalized_start] = Some(original_start);
+    normalized.text.push_str(unit);
+    normalized
+        .original_boundaries
+        .resize(normalized.text.len().saturating_add(1), None);
+    normalized.original_boundaries[normalized.text.len()] = Some(original_end);
+}
+
+const fn normalize_character(character: char) -> char {
+    match character {
+        '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => '\'',
+        '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => '"',
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+        | '\u{2212}' => '-',
+        '\u{00a0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+        | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200a}' | '\u{202f}' | '\u{205f}'
+        | '\u{3000}' => ' ',
+        _ => character,
+    }
+}
+
+fn unified_diff(path: &str, original: &str, updated: &str) -> String {
+    let diff = TextDiff::from_lines(original, updated);
+    let mut unified = diff.unified_diff();
+    unified.context_radius(4).header(path, path);
+    unified.to_string()
 }
 
 #[cfg(test)]
@@ -337,7 +419,7 @@ mod tests {
         std::fs::write(workspace.path().join("file.txt"), "alpha\nmiddle\nomega\n")
             .expect("fixture");
 
-        super::edit_file(
+        let output = super::edit_file(
             workspace.path(),
             &json!({
                 "path": "file.txt",
@@ -355,6 +437,10 @@ mod tests {
             std::fs::read_to_string(workspace.path().join("file.txt")).expect("updated"),
             "first\nmiddle\nlast\n"
         );
+        assert!(output.starts_with("Successfully replaced 2 block(s) in file.txt."));
+        assert!(output.contains("--- file.txt\n+++ file.txt"));
+        assert!(output.contains("-alpha\n+first"));
+        assert!(output.contains("-omega\n+last"));
     }
 
     #[tokio::test]
@@ -375,11 +461,111 @@ mod tests {
             &CancellationToken::new(),
         )
         .await
-        .expect("fuzzy edit");
+        .expect("edit");
 
         assert_eq!(
             std::fs::read_to_string(workspace.path().join("file.txt")).expect("updated"),
             "\u{feff}first\r\nomega\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn fuzzy_edit_replaces_only_the_normalized_substring() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            workspace.path().join("file.txt"),
+            "hello \u{201c}world\u{201d}\nnext\n",
+        )
+        .expect("fixture");
+
+        super::edit_file(
+            workspace.path(),
+            &json!({
+                "path": "file.txt",
+                "edits": [{"oldText": "hello \"world\"", "newText": "hello \"earth\""}]
+            }),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("fuzzy edit");
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("file.txt")).expect("updated"),
+            "hello \"earth\"\nnext\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn fuzzy_edit_handles_compatibility_unicode_and_trailing_whitespace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            workspace.path().join("file.txt"),
+            "\u{ff26}\u{ff4f}\u{ff4f} and cafe\u{301}  \nnext\n",
+        )
+        .expect("fixture");
+
+        super::edit_file(
+            workspace.path(),
+            &json!({
+                "path": "file.txt",
+                "edits": [{"oldText": "Foo and caf\u{e9}\t", "newText": "Bar"}]
+            }),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("fuzzy edit");
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("file.txt")).expect("updated"),
+            "Bar\nnext\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn fuzzy_equivalent_duplicates_are_rejected() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            workspace.path().join("file.txt"),
+            "say \"hello\"\nsay \u{201c}hello\u{201d}\n",
+        )
+        .expect("fixture");
+
+        let error = super::edit_file(
+            workspace.path(),
+            &json!({
+                "path": "file.txt",
+                "edits": [{"oldText": "say \"hello\"", "newText": "say \"goodbye\""}]
+            }),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("ambiguous edit");
+
+        assert!(error.contains("multiple normalized locations"));
+        assert!(error.contains("lines 1, 2"));
+    }
+
+    #[tokio::test]
+    async fn no_op_edit_is_rejected_without_rewriting_the_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("file.txt");
+        std::fs::write(&path, "unchanged\n").expect("fixture");
+
+        let error = super::edit_file(
+            workspace.path(),
+            &json!({
+                "path": "file.txt",
+                "edits": [{"oldText": "unchanged", "newText": "unchanged"}]
+            }),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("no-op edit");
+
+        assert!(error.contains("made no changes"));
+        assert_eq!(
+            std::fs::read_to_string(path).expect("unchanged file"),
+            "unchanged\n"
         );
     }
 

@@ -4,9 +4,9 @@ set -eu
 script_directory="$(CDPATH= cd -P "$(dirname "$0")" && pwd -P)"
 invocation_directory="$(pwd -P)"
 
-# Canonical managed-source remote. GitHub and legacy Origin /git/ remotes are
-# rewritten to this so `nakode update` can pull after the move to Origin.
-canonical_source_remote='https://origin.cursor.com/fragile-inc/nakode.git'
+# Canonical managed-source remote. Cursor Origin and non-canonical GitHub
+# remotes are rewritten to this so `nakode update` follows the GitHub project.
+canonical_source_remote='https://github.com/QuillDev/nakode.git'
 
 usage() {
   cat <<EOF
@@ -25,9 +25,8 @@ Options:
 
 The default prefix is \$HOME/.local, or \$PREFIX when that variable is set.
 
-Clone and update from Cursor Origin:
+Clone and update from GitHub:
   $canonical_source_remote
-Sign in first with the Origin CLI (\`origin auth login\`) so git can reach it.
 EOF
 }
 

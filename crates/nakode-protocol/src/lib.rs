@@ -10,6 +10,7 @@ mod diagnostics;
 mod discord;
 mod error;
 mod ids;
+mod invocation;
 mod mcp;
 mod service;
 mod view;
@@ -30,13 +31,17 @@ pub use ids::{
     PromptId, ProviderId, RequestId, RunId, ServerEpoch, SessionId, SubscriptionId, TurnId,
     WorkspaceId,
 };
+pub use invocation::{
+    InvocationBucket, InvocationKind, InvocationSummary, InvocationTimeline, InvocationUsage,
+};
 pub use mcp::{
     MCP_TOOL_PREFIX, McpGrantPolicy, McpManagementView, McpServerInput, McpServerView,
     McpSessionGrant, McpSessionSurface, McpTemplateView, McpToolView,
 };
 pub use service::{
     BridgeContinuationDisposition, CommandAccepted, Cursor, QueryResult, ServiceCapabilities,
-    ServiceCapability, Snapshot, SoulDocumentView, SubscriptionScope, SubscriptionView,
+    ServiceCapability, SessionInventory, Snapshot, SoulDocumentView, SubscriptionScope,
+    SubscriptionView,
 };
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,

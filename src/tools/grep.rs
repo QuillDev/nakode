@@ -26,7 +26,7 @@ impl Tool for GrepTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "grep",
-            description: "Search file contents for a regex or literal string. Returns matching lines with paths and line numbers, respects .gitignore, and includes hidden files.",
+            description: "Search file contents for a regex or literal string. Returns matching lines with line numbers and paths relative to the searched directory, or the file name when searching one file. Respects .gitignore and includes hidden files.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -40,7 +40,7 @@ impl Tool for GrepTool {
                     },
                     "glob": {
                         "type": "string",
-                        "description": "Optional file filter such as *.rs or **/*.test.rs"
+                        "description": "Optional file filter relative to the search path, such as *.rs or **/*.test.rs"
                     },
                     "ignoreCase": {
                         "type": "boolean",

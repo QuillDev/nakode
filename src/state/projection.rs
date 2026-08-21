@@ -1171,6 +1171,7 @@ fn settings_view(state: &DomainState) -> SettingsView {
             TerminalImageMode::On => TerminalImageModeView::On,
             TerminalImageMode::Off => TerminalImageModeView::Off,
         },
+        invocation_telemetry_enabled: state.invocation_telemetry_enabled(),
     }
 }
 
@@ -2217,7 +2218,7 @@ mod tests {
         assert_eq!(run.policy.provider, CODEX_PROVIDER);
         assert!(run.policy.policy_available);
         assert!(run.policy.provider_tools_restricted);
-        assert!(run.policy.provider_allowed_tools.is_empty());
+        assert_eq!(run.policy.provider_allowed_tools, ["read_skill"]);
         assert_eq!(
             run.policy.unsupported_canonical_tools.len(),
             MAX_RUN_POLICY_ITEMS

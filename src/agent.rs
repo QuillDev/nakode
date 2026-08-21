@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -7,6 +11,7 @@ use crate::tools::NAKODE_AGENT_TOOL_NAME;
 
 pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "read",
+    "read_skill",
     "grep",
     "find",
     "ls",
@@ -78,6 +83,11 @@ fn default_concurrency() -> u32 {
 // Persisted archetype policy keeps these independent flags for backward-compatible definition files.
 #[allow(clippy::struct_excessive_bools)]
 pub struct AgentDefinition {
+    /// Server-owned immutable local identity used to preserve invocation history across slug changes.
+    /// Older files omit it and use their current slug until the next authoritative save. Callers do
+    /// not control this value: `AgentCatalog::save` always generates or preserves the authority's ID.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub slug: String,
     pub description: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -171,6 +181,7 @@ fn is_default_concurrency(value: &u32) -> bool {
 impl Default for AgentDefinition {
     fn default() -> Self {
         Self {
+            id: String::new(),
             slug: String::new(),
             description: String::new(),
             system_prompt: String::new(),
@@ -201,6 +212,16 @@ impl Default for AgentDefinition {
 }
 
 impl AgentDefinition {
+    /// Stable local identity for telemetry and other historical projections.
+    #[must_use]
+    pub fn stable_id(&self) -> &str {
+        if self.id.is_empty() {
+            &self.slug
+        } else {
+            &self.id
+        }
+    }
+
     #[must_use]
     pub fn provider<'a>(&'a self, parent_provider: &'a str) -> &'a str {
         self.model
@@ -228,13 +249,16 @@ impl AgentDefinition {
     }
 
     /// The exact built-ins a delegated run receives, or `None` when a legacy custom definition
-    /// intentionally retains the provider runtime's defaults.
+    /// intentionally retains the provider runtime's defaults. Every profile except `none` also
+    /// receives Nakode's server-owned `read_skill` context tool unless it explicitly denies it.
+    /// That tool accepts no path and projects installed operating instructions rather than granting
+    /// general filesystem access, so it intentionally requires no filesystem capability.
     ///
     /// Capabilities are structural enforcement, not labels: a configured tool that requires an
     /// absent capability is removed from the runtime allowlist even for legacy deny-only policy.
     #[must_use]
     pub fn builtin_tool_allowlist(&self) -> Option<Vec<String>> {
-        let configured =
+        let mut configured =
             if self.tool_profile == AgentToolProfile::Custom && self.allowed_tools.is_empty() {
                 if self.denied_tools.is_empty() {
                     return None;
@@ -247,6 +271,12 @@ impl AgentDefinition {
             } else {
                 self.allowed_tools.clone()
             };
+        if self.tool_profile != AgentToolProfile::None
+            && !configured.iter().any(|tool| tool == "read_skill")
+            && !self.denied_tools.iter().any(|tool| tool == "read_skill")
+        {
+            configured.push("read_skill".to_owned());
+        }
         Some(
             configured
                 .into_iter()
@@ -389,6 +419,16 @@ pub enum AgentCatalogError {
     EmptyField { path: String, field: &'static str },
     #[error("agent {slug:?} is defined more than once")]
     DuplicateSlug { slug: String },
+    #[error("agents {first:?} and {second:?} declare the same immutable id {id:?}")]
+    DuplicateIdentity {
+        id: String,
+        first: String,
+        second: String,
+    },
+    #[error(
+        "agent definition {path} has an id that must be 1-128 ASCII letters, digits, dots, colons, underscores, or hyphens"
+    )]
+    InvalidIdentity { path: String },
     #[error("agent {slug:?} model must use provider/model form: {model}")]
     InvalidModel { slug: String, model: String },
     #[error("agent {slug:?} sets reasoning_effort {effort:?} without a model to run it at")]
@@ -454,6 +494,7 @@ impl AgentCatalog {
 
         let mut definitions = Vec::with_capacity(paths.len());
         let mut slugs = HashSet::new();
+        let mut identities = HashMap::new();
         for path in paths {
             let display_path = path.display().to_string();
             let source =
@@ -471,6 +512,15 @@ impl AgentCatalog {
             if !slugs.insert(definition.slug.clone()) {
                 return Err(AgentCatalogError::DuplicateSlug {
                     slug: definition.slug,
+                });
+            }
+            if let Some(first) =
+                identities.insert(definition.stable_id().to_owned(), definition.slug.clone())
+            {
+                return Err(AgentCatalogError::DuplicateIdentity {
+                    id: definition.stable_id().to_owned(),
+                    first,
+                    second: definition.slug,
                 });
             }
             definitions.push(definition);
@@ -524,6 +574,11 @@ impl AgentCatalog {
             });
         }
         self.materialize_if_missing(directory)?;
+        let mut stored = definition.clone();
+        stored.id = previous_slug.and_then(|slug| self.find(slug)).map_or_else(
+            || uuid::Uuid::now_v7().to_string(),
+            |previous| previous.stable_id().to_owned(),
+        );
         if let Some(previous_slug) = previous_slug.filter(|slug| *slug != definition.slug) {
             let previous_path = definition_path(directory, previous_slug);
             let backup = directory.join(format!(".{previous_slug}.toml.rename-backup"));
@@ -533,7 +588,7 @@ impl AgentCatalog {
                     source,
                 }
             })?;
-            if let Err(error) = write_definition(directory, definition) {
+            if let Err(error) = write_definition(directory, &stored) {
                 let _ = fs::rename(&backup, &previous_path);
                 return Err(error);
             }
@@ -547,7 +602,7 @@ impl AgentCatalog {
             }
             return Ok(());
         }
-        write_definition(directory, definition)
+        write_definition(directory, &stored)
     }
 
     /// Removes an archetype from the authoritative workspace catalog.
@@ -628,6 +683,9 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
         "browser" => Some("network"),
         "memory_store" | "memory_search" => Some("memory"),
         "vision" => Some("vision"),
+        // Installed skills are Nakode-owned instruction context. `read_skill` accepts only an exact
+        // catalogued name and does not grant caller-selected filesystem access.
+        "read_skill" => None,
         NAKODE_AGENT_TOOL_NAME => Some("delegation"),
         _ => None,
     }
@@ -637,6 +695,16 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
 // Validation deliberately reports one policy-specific error at a time from this persisted shape;
 // splitting the ordered checks would obscure the single authoritative validation boundary.
 fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalogError> {
+    if !definition.id.is_empty()
+        && (definition.id.len() > 128
+            || !definition.id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'_' | b'-')
+            }))
+    {
+        return Err(AgentCatalogError::InvalidIdentity {
+            path: path.to_owned(),
+        });
+    }
     if definition.slug.is_empty()
         || !definition.slug.chars().all(|character| {
             character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
@@ -796,6 +864,7 @@ fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalog
         AgentToolProfile::None => &[],
         AgentToolProfile::ReadOnly => &[
             "read",
+            "read_skill",
             "grep",
             "find",
             "ls",
@@ -804,8 +873,19 @@ fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalog
             "memory_search",
             "vision",
         ],
-        AgentToolProfile::CommandRunner => &["read", "grep", "find", "ls", "bash", "todo", "ask"],
-        AgentToolProfile::BoundedWatcher => &["read", "grep", "find", "ls", "todo", "ask"],
+        AgentToolProfile::CommandRunner => &[
+            "read",
+            "read_skill",
+            "grep",
+            "find",
+            "ls",
+            "bash",
+            "todo",
+            "ask",
+        ],
+        AgentToolProfile::BoundedWatcher => {
+            &["read", "read_skill", "grep", "find", "ls", "todo", "ask"]
+        }
         AgentToolProfile::Custom => CANONICAL_AGENT_TOOLS,
     };
     if let Some(name) = definition
@@ -1100,7 +1180,7 @@ description = "Research the requested topic and report concrete findings"
         AgentCatalog::validate_definition(&definition).expect("read-only policy");
         assert_eq!(
             definition.builtin_tool_allowlist(),
-            Some(vec!["read".to_owned()])
+            Some(vec!["read".to_owned(), "read_skill".to_owned()])
         );
 
         definition.allowed_tools = vec!["browser".to_owned()];
@@ -1122,7 +1202,7 @@ description = "Research the requested topic and report concrete findings"
                 .iter()
                 .any(|tool| tool == "bash" || tool == "write" || tool == "edit")
         );
-        assert_eq!(allowed, vec!["todo".to_owned()]);
+        assert_eq!(allowed, vec!["read_skill".to_owned(), "todo".to_owned()]);
         definition.allowed_capabilities = vec!["filesystem_read".to_owned()];
         let allowed = definition
             .builtin_tool_allowlist()
@@ -1152,7 +1232,11 @@ description = "Research the requested topic and report concrete findings"
         };
         assert_eq!(
             read_only.builtin_tool_allowlist(),
-            Some(vec!["read".to_owned(), "grep".to_owned()])
+            Some(vec![
+                "read".to_owned(),
+                "grep".to_owned(),
+                "read_skill".to_owned(),
+            ])
         );
         assert_eq!(
             read_only.effective_capabilities(),
@@ -1170,7 +1254,11 @@ description = "Research the requested topic and report concrete findings"
         };
         assert_eq!(
             command_runner.builtin_tool_allowlist(),
-            Some(vec!["read".to_owned(), "bash".to_owned()])
+            Some(vec![
+                "read".to_owned(),
+                "bash".to_owned(),
+                "read_skill".to_owned(),
+            ])
         );
         assert!(
             command_runner
@@ -1189,6 +1277,14 @@ description = "Research the requested topic and report concrete findings"
         };
         assert_eq!(
             watcher.builtin_tool_allowlist(),
+            Some(vec!["read".to_owned(), "read_skill".to_owned()])
+        );
+        let context_denied = AgentDefinition {
+            denied_tools: vec!["read_skill".to_owned()],
+            ..watcher.clone()
+        };
+        assert_eq!(
+            context_denied.builtin_tool_allowlist(),
             Some(vec!["read".to_owned()])
         );
         assert_eq!(
@@ -1241,6 +1337,11 @@ description = "Research the requested topic and report concrete findings"
             .expect("create disposable");
 
         let created = AgentCatalog::load(directory.path()).expect("inspect created disposable");
+        disposable.id = created
+            .find(&disposable.slug)
+            .expect("created definition")
+            .id
+            .clone();
         assert_eq!(created.find(&disposable.slug), Some(&disposable));
 
         disposable.description = "Updated disposable dashboard verification".to_owned();
@@ -1287,7 +1388,22 @@ description = "Research the requested topic and report concrete findings"
             .expect("save reviewer");
 
         let loaded = AgentCatalog::load(&directory).expect("configured catalog");
-        assert_eq!(loaded.find("reviewer"), Some(&definition));
-        assert_eq!(loaded.definitions(), [definition]);
+        let saved = loaded.find("reviewer").expect("saved definition");
+        assert!(!saved.id.is_empty());
+        let stable_id = saved.stable_id().to_owned();
+
+        let mut renamed = definition;
+        renamed.slug = "change-reviewer".to_owned();
+        loaded
+            .save(&directory, &renamed, Some("reviewer"))
+            .expect("rename reviewer");
+
+        let reloaded = AgentCatalog::load(&directory).expect("renamed catalog");
+        assert!(reloaded.find("reviewer").is_none());
+        let renamed = reloaded
+            .find("change-reviewer")
+            .expect("renamed definition");
+        assert_eq!(renamed.stable_id(), stable_id);
+        assert_eq!(renamed.slug, "change-reviewer");
     }
 }

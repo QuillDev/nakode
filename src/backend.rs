@@ -557,6 +557,13 @@ pub enum BackendEvent {
         turn_id: String,
         item: NormalizedItem,
     },
+    /// Privacy-minimal accepted exact skill load. The invocation key survives provider replay.
+    SkillInvoked {
+        invocation_key: String,
+        identity: String,
+        display_label: String,
+        occurred_at_ms: u64,
+    },
     ItemDelta {
         turn_id: String,
         item_id: String,

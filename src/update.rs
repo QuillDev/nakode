@@ -6,7 +6,7 @@ use std::{
 use thiserror::Error;
 
 const SOURCE_DIRECTORY: &str = ".nakode/src";
-const CANONICAL_SOURCE_REMOTE: &str = "https://origin.cursor.com/fragile-inc/nakode.git";
+const CANONICAL_SOURCE_REMOTE: &str = "https://github.com/QuillDev/nakode.git";
 
 #[derive(Debug, Error)]
 pub enum UpdateError {
@@ -14,7 +14,7 @@ pub enum UpdateError {
     MissingHome,
     #[error(
         "the managed Nakode source checkout was not found at {0}\n\
-         Reinstall Nakode with the Cursor Origin command in README.md to create it"
+         Reinstall Nakode with the GitHub command in README.md to create it"
     )]
     MissingSource(String),
     #[error("the Nakode installer was not found at {0}")]
@@ -279,8 +279,8 @@ mod tests {
     }
 
     #[test]
-    fn retargets_every_managed_url_except_the_canonical_https_remote() {
-        assert!(should_retarget_remote(
+    fn retargets_every_managed_url_except_the_canonical_github_remote() {
+        assert!(!should_retarget_remote(
             "https://github.com/QuillDev/nakode.git"
         ));
         assert!(should_retarget_remote(
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn retargets_a_github_origin_remote_to_cursor_origin() {
+    fn retargets_cursor_origin_remote_to_github() {
         let source = tempdir().expect("temporary checkout");
         init_git_repo(source.path());
         let status = Command::new("git")
@@ -334,14 +334,14 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "https://github.com/QuillDev/nakode.git",
+                "https://origin.cursor.com/fragile-inc/nakode.git",
             ])
             .current_dir(source.path())
             .status()
             .expect("git remote add");
         assert!(status.success());
 
-        retarget_managed_source_remote(source.path()).expect("retarget GitHub remote");
+        retarget_managed_source_remote(source.path()).expect("retarget Origin remote");
         assert_eq!(
             origin_remote_url(source.path())
                 .expect("read origin")
@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_unrelated_remotes_and_canonical_origin_unchanged() {
+    fn leaves_unrelated_remotes_and_canonical_github_unchanged() {
         let source = tempdir().expect("temporary checkout");
         init_git_repo(source.path());
         let status = Command::new("git")

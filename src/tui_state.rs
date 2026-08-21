@@ -367,6 +367,7 @@ mod tests {
                 },
                 vision: VisionSettingsView { model_id: None },
                 terminal_images: TerminalImageModeView::Auto,
+                invocation_telemetry_enabled: false,
             },
             sessions: Vec::new(),
             active_session: None,

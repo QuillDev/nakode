@@ -19,15 +19,15 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash",
-            description: "Execute a shell command in the workspace and return stdout and stderr. Use read, grep, find, and ls for file exploration. Commands have no deadline unless timeout is supplied.",
+            description: "Execute a shell command in the workspace and return stdout and stderr. Use read, grep, find, and ls instead of shell commands for file exploration. Commands have no deadline unless timeout is supplied.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to execute"},
-                    "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "env": {"type": "object", "description": "Environment variables to set for the command", "additionalProperties": {"type": "string"}},
                     "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600, "description": "Optional timeout in seconds"},
                     "cwd": {"type": "string", "description": "Workspace-relative working directory"},
-                    "pty": {"type": "boolean", "description": "Use terminal semantics; defaults to false"}
+                    "pty": {"type": "boolean", "description": "Use terminal semantics for commands that require a TTY; defaults to false"}
                 },
                 "required": ["command"],
                 "additionalProperties": false

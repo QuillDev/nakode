@@ -128,19 +128,12 @@ model.
 
 ## Installation
 
-Nakode requires Git and Rust 1.88 or newer. Source is hosted on Cursor Origin.
-Sign in with the Origin CLI before cloning or running `nakode update`:
-
-```sh
-curl -fsSL https://downloads.cursor.com/origin/install.sh | sh
-origin auth login
-```
-
-Then install Nakode with this command:
+Nakode requires Git and Rust 1.88 or newer. Source is hosted on GitHub.
+Install Nakode with this command:
 
 ```sh
 mkdir -p "$HOME/.nakode" && \
-  git clone https://origin.cursor.com/fragile-inc/nakode.git "$HOME/.nakode/src" && \
+  git clone https://github.com/QuillDev/nakode.git "$HOME/.nakode/src" && \
   "$HOME/.nakode/src/install.sh"
 ```
 
@@ -156,8 +149,8 @@ Update the checkout, rebuild Nakode, and replace the installed executable with:
 nakode update
 ```
 
-`nakode update` retargets a GitHub or legacy Origin `/git/` remote to
-`https://origin.cursor.com/fragile-inc/nakode.git` when needed, then runs
+`nakode update` retargets a recognized Cursor Origin or non-canonical GitHub
+remote to `https://github.com/QuillDev/nakode.git`, then runs
 `git pull --ff-only` in `~/.nakode/src` and that checkout's `install.sh`.
 `nakode --update` is supported as a convenience alias.
 
@@ -401,7 +394,10 @@ workspace-local skills taking precedence when names overlap:
 Reference a discovered skill anywhere in a prompt with `/skill:<skill-name>`.
 Nakode offers discovered names in composer completion and attaches the selected
 skill instructions to that turn while keeping the original prompt unchanged in
-the visible transcript.
+the visible transcript. Skill publishers should include a bounded immutable `id`
+in YAML frontmatter (for example, `id: fragile.code-review.v1`) so local invocation
+history follows a skill when its directory/load name changes. Legacy skills without
+an `id` remain compatible and use their exact catalogue name as historical identity.
 
 ## Herdr integration
 

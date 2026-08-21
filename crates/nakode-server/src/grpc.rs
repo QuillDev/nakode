@@ -438,6 +438,9 @@ fn settings_patch(
         Patch::TerminalImages(value) => {
             Ok(protocol::SettingsPatch::TerminalImages { mode: value.mode })
         }
+        Patch::InvocationTelemetry(value) => Ok(protocol::SettingsPatch::InvocationTelemetry {
+            enabled: value.enabled,
+        }),
     }
 }
 
@@ -922,11 +925,16 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 limit: request.limit,
             })
             .await?;
-        let protocol::QueryResult::Sessions(values) = result.value else {
+        let protocol::QueryResult::Sessions(inventory) = result.value else {
             return Err(tonic::Status::internal("unexpected sessions response"));
         };
         Ok(tonic::Response::new(api::ListSessionsResponse {
-            sessions: values.into_iter().map(session_summary).collect(),
+            sessions: inventory
+                .sessions
+                .into_iter()
+                .map(session_summary)
+                .collect(),
+            complete: inventory.complete,
         }))
     }
 
@@ -1476,6 +1484,39 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         Ok(tonic::Response::new(diagnostics(*value)))
     }
 
+    async fn get_invocation_summary(
+        &self,
+        _request: tonic::Request<api::GetInvocationSummaryRequest>,
+    ) -> Result<tonic::Response<api::InvocationSummary>, tonic::Status> {
+        let result = self.query(protocol::Query::GetInvocationSummary).await?;
+        let protocol::QueryResult::InvocationSummary(value) = result.value else {
+            return Err(tonic::Status::internal(
+                "unexpected invocation summary response",
+            ));
+        };
+        Ok(tonic::Response::new(invocation_summary(*value)))
+    }
+
+    async fn get_invocation_timeline(
+        &self,
+        request: tonic::Request<api::GetInvocationTimelineRequest>,
+    ) -> Result<tonic::Response<api::InvocationTimeline>, tonic::Status> {
+        let request = request.into_inner();
+        let result = self
+            .query(protocol::Query::GetInvocationTimeline {
+                start_at_ms: request.start_at_ms,
+                end_at_ms: request.end_at_ms,
+                bucket_width_ms: request.bucket_width_ms,
+            })
+            .await?;
+        let protocol::QueryResult::InvocationTimeline(value) = result.value else {
+            return Err(tonic::Status::internal(
+                "unexpected invocation timeline response",
+            ));
+        };
+        Ok(tonic::Response::new(invocation_timeline(*value)))
+    }
+
     async fn get_server_info(
         &self,
         _request: tonic::Request<()>,
@@ -2016,6 +2057,7 @@ fn settings(value: protocol::SettingsView) -> api::Settings {
             protocol::TerminalImageModeView::On => api::TerminalImageMode::On as i32,
             protocol::TerminalImageModeView::Off => api::TerminalImageMode::Off as i32,
         },
+        invocation_telemetry_enabled: value.invocation_telemetry_enabled,
     }
 }
 
@@ -2475,6 +2517,45 @@ pub(crate) fn artifact(value: protocol::ArtifactView) -> api::Artifact {
         media_type: value.media_type,
         byte_length: value.byte_length,
         data: value.data,
+    }
+}
+
+fn invocation_summary(value: protocol::InvocationSummary) -> api::InvocationSummary {
+    api::InvocationSummary {
+        enabled: value.enabled,
+        items: value
+            .items
+            .into_iter()
+            .map(|item| api::InvocationUsage {
+                kind: match item.kind {
+                    protocol::InvocationKind::Archetype => api::InvocationKind::Archetype as i32,
+                    protocol::InvocationKind::Skill => api::InvocationKind::Skill as i32,
+                },
+                identity: item.identity,
+                display_label: item.display_label,
+                currently_installed: item.currently_installed,
+                invocation_count: item.invocation_count,
+                first_used_at_ms: item.first_used_at_ms,
+                last_used_at_ms: item.last_used_at_ms,
+            })
+            .collect(),
+    }
+}
+
+fn invocation_timeline(value: protocol::InvocationTimeline) -> api::InvocationTimeline {
+    api::InvocationTimeline {
+        start_at_ms: value.start_at_ms,
+        end_at_ms: value.end_at_ms,
+        bucket_width_ms: value.bucket_width_ms,
+        buckets: value
+            .buckets
+            .into_iter()
+            .map(|bucket| api::InvocationBucket {
+                start_at_ms: bucket.start_at_ms,
+                archetype_count: bucket.archetype_count,
+                skill_count: bucket.skill_count,
+            })
+            .collect(),
     }
 }
 

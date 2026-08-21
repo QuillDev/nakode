@@ -26,7 +26,7 @@ impl Tool for FindTool {
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Glob pattern such as *.rs, **/*.json, or src/**/*.test.rs"
+                        "description": "Glob matched against paths relative to the search directory; patterns without / match file names, for example *.rs, **/*.json, or src/**/*.test.rs"
                     },
                     "path": {
                         "type": "string",

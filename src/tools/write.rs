@@ -12,12 +12,12 @@ impl Tool for WriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write",
-            description: "Atomically create or overwrite a complete UTF-8 file, creating parent directories as needed. Prefer edit for modifying an existing file when an exact replacement is practical.",
+            description: "Atomically create or overwrite a complete UTF-8 file, creating parent directories as needed. Use write only for new files or complete rewrites; prefer edit for targeted changes to an existing file.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Workspace-relative file path"},
-                    "content": {"type": "string", "description": "Complete replacement contents"}
+                    "content": {"type": "string", "description": "Complete file contents; existing content is replaced"}
                 },
                 "required": ["path", "content"],
                 "additionalProperties": false

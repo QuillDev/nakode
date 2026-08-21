@@ -33,6 +33,8 @@ pub enum ServiceCapability {
     QuestionTextAnswers,
     /// `SteerQueuedPrompt` atomically redirects active work to a server-owned follow-up.
     QueuedPromptSteering,
+    /// Local-only, owner-opted invocation metadata settings and bounded usage queries.
+    InvocationTelemetry,
     /// Owner-facing clients may inspect and atomically mutate the authoritative archetype catalogue.
     ArchetypeManagement,
     /// Owner-facing clients may inspect and atomically mutate Nakode's one configured SOUL.md.
@@ -116,12 +118,18 @@ pub struct CommandAccepted {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionInventory {
+    pub sessions: Vec<SessionSummary>,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum QueryResult {
     Bootstrap(Box<BootstrapView>),
     SoulDocument(SoulDocumentView),
     McpManagement(McpManagementView),
-    Sessions(Vec<SessionSummary>),
+    Sessions(SessionInventory),
     Session(Box<SessionView>),
     Transcript(crate::TranscriptPage),
     TranscriptBody(TranscriptBodyWindow),
@@ -130,6 +138,8 @@ pub enum QueryResult {
     RunText(RunTextWindow),
     Artifact(ArtifactView),
     Diagnostics(Box<crate::DiagnosticsReport>),
+    InvocationSummary(Box<crate::InvocationSummary>),
+    InvocationTimeline(Box<crate::InvocationTimeline>),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
