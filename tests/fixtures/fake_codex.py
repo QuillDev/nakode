@@ -6,6 +6,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -255,6 +256,7 @@ for raw_line in sys.stdin:
                         },
                     }
                 )
+                time.sleep(0.05)
             send(
                 {
                     "method": "item/completed",

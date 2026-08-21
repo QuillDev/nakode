@@ -30,6 +30,9 @@ incremental = true
 [features]
 default = []
 codex-process-adapter = []
+# Compiles a deterministic Codex process override exclusively for cross-repository E2E tests.
+# Production builds do not include or recognize the fixture-provider environment variable.
+e2e-fixture-provider = ["codex-process-adapter"]
 
 [dependencies]
 anyhow = "1"

@@ -80,11 +80,6 @@ impl TuiClientState {
             .then(|| active.id.to_string())
     }
 
-    #[must_use]
-    pub(crate) fn workspace_path(&self) -> &str {
-        &self.bootstrap.workspace_path
-    }
-
     /// Replaces the workspace projection from one authoritative SDK snapshot.
     pub(crate) fn install_workspace(
         &mut self,

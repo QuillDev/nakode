@@ -537,7 +537,11 @@ mod tests {
                 .all(|tool| tool.name != "browser")
         );
 
-        config.write().expect("web config").backend = WebBackend::AgentBrowser;
+        {
+            let mut web = config.write().expect("web config");
+            web.backend = WebBackend::Firecrawl;
+            web.firecrawl_api_key = "test-key".to_owned();
+        }
         assert!(
             registry
                 .definitions()

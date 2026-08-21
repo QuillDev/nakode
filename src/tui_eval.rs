@@ -890,6 +890,7 @@ fn install_ready_view(
         model_filter_enabled: false,
         selected_model_ids: Vec::new(),
         model_candidates: Vec::new(),
+        available_builtin_tools: Some(Vec::new()),
     };
     if let Some(existing) = view
         .providers

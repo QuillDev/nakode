@@ -286,6 +286,13 @@ pub trait SessionRepository: Send + Sync {
     ) -> Result<Vec<SessionBridgeRecord>, SessionError> {
         Ok(Vec::new())
     }
+    /// Lists bridge state across the installation-wide session inventory.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried or decoded.
+    fn list_session_bridges_all(&self) -> Result<Vec<SessionBridgeRecord>, SessionError> {
+        Ok(Vec::new())
+    }
     /// Replaces one server-serialized bridge record. Implementations must persist atomically.
     ///
     /// # Errors
@@ -339,6 +346,14 @@ pub trait SessionRepository: Send + Sync {
         workspace: &str,
         limit: usize,
     ) -> Result<Vec<SessionRecord>, SessionError>;
+    /// Lists the most recently used sessions across the installation.
+    ///
+    /// A single Nakode service owns every workspace. Workspace paths remain per-session access
+    /// roots rather than persistence or process partitions.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried.
+    fn list_recent_all(&self) -> Result<Vec<SessionRecord>, SessionError>;
     /// Finds a session by its full id or unambiguous prefix.
     ///
     /// # Errors
@@ -1715,6 +1730,25 @@ impl SessionRepository for SqliteSessionRepository {
             .map_err(Into::into)
     }
 
+    fn list_session_bridges_all(&self) -> Result<Vec<SessionBridgeRecord>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id, workspace, kind, lifecycle, display_title, revision, transport,
+                    external_parent_id, external_thread_id, last_delivered_turn_id,
+                    last_delivered_kind, delivery_json, live_turn_id, live_external_message_id,
+                    active_source_message_id, pending_inbound_json, inbound_turn_origins_json,
+                    updated_at_ms
+             FROM session_bridges ORDER BY updated_at_ms, session_id",
+        )?;
+        statement
+            .query_map([], Self::bridge_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     fn save_session_bridge(&self, bridge: &SessionBridgeRecord) -> Result<(), SessionError> {
         let mut connection = self
             .connection
@@ -1840,6 +1874,25 @@ impl SessionRepository for SqliteSessionRepository {
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
         let rows = statement.query_map(params![workspace, bounded_limit], Self::row)?;
+        let mut records = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for record in &mut records {
+            record.owner_turns = load_owner_turns(&connection, &record.id)?;
+            record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
+        }
+        Ok(records)
+    }
+
+    fn list_recent_all(&self) -> Result<Vec<SessionRecord>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
+             FROM sessions ORDER BY updated_at DESC",
+        )?;
+        let rows = statement.query_map([], Self::row)?;
         let mut records = rows.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         for record in &mut records {

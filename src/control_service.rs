@@ -66,9 +66,9 @@ pub struct ServerReport {
     pub capabilities: Vec<String>,
 }
 
-/// Process identity published by a running workspace service.
+/// Process identity published by the installation-wide service.
 ///
-/// The file lives beside the workspace's sockets, is written when the service
+/// The file lives beside the installation's sockets, is written when the service
 /// acquires its lease, and is removed when that lease is released. It is only
 /// trusted while the lifecycle socket answers, so a record left behind by a
 /// killed process is never reported as a live one.
@@ -112,7 +112,7 @@ impl ExecutableIdentity {
     }
 }
 
-/// How endpoint discovery obtained the verified workspace service.
+/// How endpoint discovery obtained the verified installation service.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointActivation {
@@ -124,6 +124,7 @@ pub enum EndpointActivation {
 /// Verified endpoint and identities returned to native frontend connectors.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FrontendEndpoint {
+    pub workspace: PathBuf,
     pub endpoint: PathBuf,
     pub lifecycle_socket: PathBuf,
     pub cli: ExecutableIdentity,
@@ -132,24 +133,24 @@ pub struct FrontendEndpoint {
     pub activation: EndpointActivation,
 }
 
-/// Result of starting a workspace service.
+/// Result of starting the installation service.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartOutcome {
     Started,
     AlreadyRunning,
 }
 
-/// Result of stopping a workspace service.
+/// Result of stopping the installation service.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StopOutcome {
     Stopped,
     AlreadyStopped,
 }
 
-/// Where one canonical workspace service keeps its runtime state.
+/// Where the installation-wide service keeps its runtime state.
 ///
-/// Resolving once keeps every operation on a single workspace and avoids
-/// re-deriving the same directory per lookup.
+/// Caller workspaces intentionally do not participate in this identity. Resolving from any
+/// workspace therefore yields the same sockets, lease, log, and process record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServicePaths {
     lifecycle: PathBuf,
@@ -160,14 +161,25 @@ pub struct ServicePaths {
 }
 
 impl ServicePaths {
-    /// Resolves the service runtime for one canonical workspace.
+    /// Resolves the installation-wide service runtime.
+    ///
+    /// The workspace argument is retained for source compatibility with callers that select a
+    /// session access root. It never participates in daemon identity.
     ///
     /// # Errors
     /// Returns an error when the private runtime directory cannot be prepared.
     pub fn resolve(workspace: &Path) -> Result<Self, ControlError> {
+        Self::resolve_in(&control_directory()?, &installation_workspace()?, workspace)
+    }
+
+    fn resolve_in(
+        control_root: &Path,
+        installation_workspace: &Path,
+        _session_access_root: &Path,
+    ) -> Result<Self, ControlError> {
         Ok(Self::in_directory(&workspace_runtime_directory_in(
-            &control_directory()?,
-            workspace,
+            control_root,
+            installation_workspace,
         )?))
     }
 
@@ -237,6 +249,8 @@ pub struct BulkServiceShutdownReport {
 pub struct StaleServiceRefreshReport {
     pub current: usize,
     pub restarted: usize,
+    /// Legacy per-workspace daemons or stale runtime sets retired during singleton migration.
+    pub retired: usize,
     pub active: Vec<String>,
     pub inactive: Vec<String>,
     pub unavailable: Vec<String>,
@@ -360,7 +374,7 @@ pub enum ControlError {
         path: String,
         source: std::io::Error,
     },
-    #[error("cannot activate stale Nakode workspace service: {0}")]
+    #[error("cannot activate stale Nakode installation service: {0}")]
     StaleServiceActivation(String),
 }
 
@@ -393,6 +407,7 @@ enum LifecycleResponse {
 /// Returns when socket acquisition, runtime preparation, or a server component
 /// fails.
 pub async fn run_service(config: Config) -> Result<(), ControlError> {
+    let config = installation_config(&config)?;
     let paths = ServicePaths::of(&config)?;
     let mut lease = WorkspaceServerLease::acquire(&paths, &config.workspace).await?;
     // Only a backgrounded service writes into the captured log, and only it may
@@ -542,18 +557,19 @@ async fn handle_lifecycle_connection(
         },
         LifecycleRequest::Shutdown => LifecycleResponse::Ok,
         LifecycleRequest::QuiesceShutdown => match runtime {
-            Some(runtime) => match tokio::time::timeout(Duration::from_secs(3), runtime.quiesce())
-                .await
-            {
-                Ok(Ok(())) => {
-                    should_shutdown = true;
-                    LifecycleResponse::Ok
+            Some(runtime) => {
+                match tokio::time::timeout(Duration::from_secs(3), runtime.quiesce()).await {
+                    Ok(Ok(())) => {
+                        should_shutdown = true;
+                        LifecycleResponse::Ok
+                    }
+                    Ok(Err(message)) => LifecycleResponse::Error { message },
+                    Err(_) => LifecycleResponse::Error {
+                        message: "timed out while atomically fencing the installation service"
+                            .to_owned(),
+                    },
                 }
-                Ok(Err(message)) => LifecycleResponse::Error { message },
-                Err(_) => LifecycleResponse::Error {
-                    message: "timed out while atomically fencing the workspace service".to_owned(),
-                },
-            },
+            }
             None => LifecycleResponse::Error {
                 message: "atomic quiescent shutdown is unavailable".to_owned(),
             },
@@ -652,7 +668,7 @@ impl Drop for WorkspaceServerLease {
     }
 }
 
-/// Records this process as the owner of the workspace service.
+/// Records this process as the owner of the installation service.
 ///
 /// A service that cannot publish its process record still serves clients, so a
 /// write failure only costs `nakode status` its process detail.
@@ -730,7 +746,7 @@ fn read_runtime_record(runtime_path: &Path) -> Option<ServiceRuntimeRecord> {
 
 /// Computes the immutable content identity used by endpoint activation.
 ///
-/// The service calls this once while acquiring its workspace lease. Connectors compute it for the
+/// The service calls this once while acquiring its installation lease. Connectors compute it for the
 /// executable they are about to spawn. No running process ever re-hashes a path after publication.
 fn executable_identity(path: &Path) -> Result<ExecutableIdentity, ControlError> {
     use std::io::Read;
@@ -1028,8 +1044,6 @@ fn detach_service_process(_command: &mut tokio::process::Command) {}
 
 fn service_arguments(config: &Config) -> Vec<OsString> {
     let mut arguments = vec![
-        OsString::from("--workspace"),
-        config.workspace.as_os_str().to_owned(),
         OsString::from("--scrollback"),
         OsString::from(config.scrollback.to_string()),
         OsString::from("--compaction-threshold-percent"),
@@ -1224,6 +1238,8 @@ pub async fn frontend_api_endpoint_report(
     executable: &Path,
     config: &Config,
 ) -> Result<FrontendEndpoint, ControlError> {
+    let config = installation_config(config)?;
+    let config = &config;
     let paths = ServicePaths::of(config)?;
     let cli = executable_identity(executable)?;
     let _activation_lease = match ActivationLease::acquire(paths.activation()).await {
@@ -1251,6 +1267,7 @@ pub async fn frontend_api_endpoint_report(
         if service_can_be_reused(old_record.as_ref(), &cli, old_server.as_ref()) {
             return verified_frontend_endpoint(
                 &paths,
+                &config.workspace,
                 cli,
                 EndpointActivation::Reused,
                 "reusing compatible service",
@@ -1264,6 +1281,7 @@ pub async fn frontend_api_endpoint_report(
     ensure_api_service(&paths, executable, config).await?;
     verified_frontend_endpoint(
         &paths,
+        &config.workspace,
         cli,
         EndpointActivation::Started,
         "service was started",
@@ -1321,6 +1339,7 @@ async fn activate_stale_service(
     }
     verified_frontend_endpoint(
         paths,
+        &config.workspace,
         cli,
         EndpointActivation::RestartedStaleService,
         "stale service was restarted",
@@ -1386,6 +1405,7 @@ async fn wait_for_api(api_path: &Path, workspace: &Path) -> Result<(), ControlEr
 
 async fn verified_frontend_endpoint(
     paths: &ServicePaths,
+    workspace: &Path,
     cli: ExecutableIdentity,
     activation: EndpointActivation,
     action: &str,
@@ -1413,6 +1433,7 @@ async fn verified_frontend_endpoint(
         )));
     }
     Ok(FrontendEndpoint {
+        workspace: workspace.to_path_buf(),
         endpoint: paths.api().to_path_buf(),
         lifecycle_socket: paths.lifecycle().to_path_buf(),
         cli,
@@ -1612,7 +1633,8 @@ async fn api_ready(path: &Path, workspace: &Path) -> bool {
 /// # Errors
 /// Returns an error when lifecycle state cannot be read reliably.
 pub async fn service_status(config: &Config) -> Result<ServiceStatus, ControlError> {
-    let paths = ServicePaths::of(config)?;
+    let config = installation_config(config)?;
+    let paths = ServicePaths::of(&config)?;
     let current = std::env::current_exe().map_err(|source| ControlError::ExecutableIdentity {
         path: "current executable".to_owned(),
         source,
@@ -1684,7 +1706,7 @@ fn format_utc_timestamp(unix_ms: u64) -> String {
     )
 }
 
-/// Starts the workspace service in the background when it is not already
+/// Starts the installation service in the background when it is not already
 /// running, and waits until it accepts connections.
 ///
 /// # Errors
@@ -1694,15 +1716,16 @@ pub async fn start_service(
     executable: &Path,
     config: &Config,
 ) -> Result<StartOutcome, ControlError> {
-    let paths = ServicePaths::of(config)?;
-    if ping_at(paths.lifecycle(), config).await.is_ok() {
+    let config = installation_config(config)?;
+    let paths = ServicePaths::of(&config)?;
+    if ping_at(paths.lifecycle(), &config).await.is_ok() {
         return Ok(StartOutcome::AlreadyRunning);
     }
-    ensure_api_service(&paths, executable, config).await?;
+    ensure_api_service(&paths, executable, &config).await?;
     Ok(StartOutcome::Started)
 }
 
-/// Stops the workspace service and waits until it releases its sockets.
+/// Stops the installation service and waits until it releases its sockets.
 ///
 /// # Errors
 /// Returns an error when a live service rejects the request or keeps its
@@ -1761,14 +1784,15 @@ async fn restart_service_with_request(
     config: &Config,
     request: LifecycleRequest,
 ) -> Result<(), ControlError> {
-    let paths = ServicePaths::of(config)?;
+    let config = installation_config(config)?;
+    let paths = ServicePaths::of(&config)?;
     let running = service_running_at(paths.lifecycle()).await?;
     shutdown_service_with_request(&paths, &request).await?;
 
     if running {
         for _ in 0..SERVICE_STOP_ATTEMPTS {
             if !paths.lifecycle().exists() && !paths.api().exists() {
-                return ensure_service(&paths, executable, config).await;
+                return ensure_service(&paths, executable, &config).await;
             }
             tokio::time::sleep(SERVICE_START_RETRY).await;
         }
@@ -1780,7 +1804,7 @@ async fn restart_service_with_request(
     // A stopped process can leave socket files behind after an unclean exit.
     let _ = std::fs::remove_file(paths.lifecycle());
     let _ = std::fs::remove_file(paths.api());
-    ensure_service(&paths, executable, config).await
+    ensure_service(&paths, executable, &config).await
 }
 
 /// Stops the workspace server if one is currently running.
@@ -1826,16 +1850,13 @@ pub async fn shutdown_all_services() -> Result<BulkServiceShutdownReport, Contro
     shutdown_all_services_in(&control_directory()?).await
 }
 
-/// Restarts stale workspace services after a new executable has been installed.
+/// Reconciles the installation service and legacy workspace runtimes after a new executable is
+/// installed.
 ///
-/// Runtime directories are scanned once, current services are discarded without opening their
-/// sockets, stale services are probed concurrently with a small fixed bound, and replacements
-/// are started only after the old service reports no live work. Stale socket sets with no reachable
-/// listener are reported as inactive without starting a service or touching workspace, log,
-/// runtime-record, socket, or session state. Socket sets observed as partly reachable are reported
-/// as unavailable and likewise left untouched. Older services that predate the quiescent lifecycle
-/// request use the legacy shutdown request only after that read-only check. Reachable services with
-/// active work or no recoverable workspace identity are left untouched.
+/// Runtime directories are scanned once. A current singleton is preserved; a stale quiescent
+/// singleton is restarted. Quiescent legacy runtimes are retired instead of restarted, while legacy
+/// runtimes with live work are preserved and reported. Dead legacy socket sets are removed. Partly
+/// reachable, unidentified, or otherwise unsafe runtimes are left untouched and reported.
 ///
 /// # Errors
 ///
@@ -1844,7 +1865,10 @@ pub async fn restart_stale_services(
     executable: &Path,
 ) -> Result<StaleServiceRefreshReport, ControlError> {
     let cli = executable_identity(executable)?;
-    let directories = runtime_directories(&control_directory()?)?;
+    let control_root = control_directory()?;
+    let singleton_directory =
+        workspace_runtime_directory_in(&control_root, &installation_workspace()?)?;
+    let directories = runtime_directories(&control_root)?;
     let mut report = StaleServiceRefreshReport::default();
     let mut candidates = Vec::new();
 
@@ -1854,7 +1878,8 @@ pub async fn restart_stale_services(
             continue;
         }
         let record = read_runtime_record(paths.runtime());
-        if runtime_matches_cli(record.as_ref(), &cli) {
+        let is_singleton = directory == singleton_directory;
+        if is_singleton && runtime_matches_cli(record.as_ref(), &cli) {
             report.current += 1;
             continue;
         }
@@ -1862,13 +1887,19 @@ pub async fn restart_stale_services(
             .as_ref()
             .and_then(|record| record.workspace.clone())
             .or_else(|| workspace_from_log(paths.log()));
-        candidates.push((directory, workspace));
+        candidates.push((directory, workspace, is_singleton));
     }
 
-    let results = stream::iter(candidates.into_iter().map(|(directory, workspace)| {
-        let executable = executable.to_path_buf();
-        async move { refresh_stale_service(&executable, &directory, workspace).await }
-    }))
+    let results = stream::iter(
+        candidates
+            .into_iter()
+            .map(|(directory, workspace, is_singleton)| {
+                let executable = executable.to_path_buf();
+                async move {
+                    refresh_stale_service(&executable, &directory, workspace, is_singleton).await
+                }
+            }),
+    )
     .buffer_unordered(STALE_SERVICE_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
@@ -1876,6 +1907,7 @@ pub async fn restart_stale_services(
     for result in results {
         match result {
             StaleServiceRefreshOutcome::Restarted => report.restarted += 1,
+            StaleServiceRefreshOutcome::Retired => report.retired += 1,
             StaleServiceRefreshOutcome::Active(workspace) => report.active.push(workspace),
             StaleServiceRefreshOutcome::Inactive(detail) => report.inactive.push(detail),
             StaleServiceRefreshOutcome::Unavailable(detail) => report.unavailable.push(detail),
@@ -1894,6 +1926,7 @@ pub async fn restart_stale_services(
 #[derive(Debug)]
 enum StaleServiceRefreshOutcome {
     Restarted,
+    Retired,
     Active(String),
     Inactive(String),
     Unavailable(String),
@@ -1905,11 +1938,18 @@ async fn refresh_stale_service(
     executable: &Path,
     directory: &Path,
     workspace: Option<PathBuf>,
+    is_singleton: bool,
 ) -> StaleServiceRefreshOutcome {
     let paths = ServicePaths::in_directory(directory);
     let lifecycle_reachable = socket_is_live(paths.lifecycle()).await;
     let api_reachable = socket_is_live(paths.api()).await;
     match (lifecycle_reachable, api_reachable) {
+        (false, false) if !is_singleton => {
+            let _ = std::fs::remove_file(paths.lifecycle());
+            let _ = std::fs::remove_file(paths.api());
+            let _ = std::fs::remove_file(paths.runtime());
+            return StaleServiceRefreshOutcome::Retired;
+        }
         (false, false) => {
             return StaleServiceRefreshOutcome::Inactive(stale_service_diagnostic(
                 &paths,
@@ -1941,6 +1981,35 @@ async fn refresh_stale_service(
             return StaleServiceRefreshOutcome::Active(workspace.display().to_string());
         }
         return StaleServiceRefreshOutcome::Failure(format!("{}: {reason}", workspace.display()));
+    }
+
+    if !is_singleton {
+        let shutdown = match expect_ok(paths.lifecycle(), &LifecycleRequest::QuiesceShutdown).await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if is_legacy_quiescent_rejection(&error) => {
+                expect_ok(paths.lifecycle(), &LifecycleRequest::Shutdown).await
+            }
+            Err(error) => Err(error),
+        };
+        return match shutdown {
+            Ok(()) => {
+                for _ in 0..SERVICE_STOP_ATTEMPTS {
+                    if !paths.lifecycle().exists() && !paths.api().exists() {
+                        return StaleServiceRefreshOutcome::Retired;
+                    }
+                    tokio::time::sleep(SERVICE_START_RETRY).await;
+                }
+                StaleServiceRefreshOutcome::Failure(format!(
+                    "{}: legacy service acknowledged shutdown but retained sockets",
+                    workspace.display()
+                ))
+            }
+            Err(error) => StaleServiceRefreshOutcome::Failure(format!(
+                "{}: failed to retire legacy service: {error}",
+                workspace.display()
+            )),
+        };
     }
 
     let restart = match restart_service_quiescent(executable, &config).await {
@@ -2094,7 +2163,7 @@ fn remove_stale_socket(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// Controls one frontend transport in a running workspace service without
+/// Controls one frontend transport in the running installation service without
 /// changing the native server lifecycle.
 ///
 /// # Errors
@@ -2121,7 +2190,7 @@ pub async fn transport_action(
     }
 }
 
-/// Returns the private directory holding all workspace service runtimes.
+/// Returns the private directory holding the installation service and discoverable legacy runtimes.
 fn control_directory() -> Result<PathBuf, ControlError> {
     let directory = if let Some(configured) = std::env::var_os("NAKODE_CONTROL_DIR") {
         PathBuf::from(configured)
@@ -2143,6 +2212,22 @@ fn prepare_private_directory(directory: &Path) -> Result<(), ControlError> {
             .map_err(|source| socket_error(directory, source))?;
     }
     Ok(())
+}
+
+fn installation_workspace() -> Result<PathBuf, ControlError> {
+    let workspace = crate::config::nakode_home().map_err(|error| {
+        ControlError::ServiceRejected(format!(
+            "failed to resolve the Nakode installation home: {error}"
+        ))
+    })?;
+    prepare_private_directory(&workspace)?;
+    std::fs::canonicalize(&workspace).map_err(|source| socket_error(&workspace, source))
+}
+
+fn installation_config(config: &Config) -> Result<Config, ControlError> {
+    let mut config = config.clone();
+    config.workspace = installation_workspace()?;
+    Ok(config)
 }
 
 fn workspace_runtime_directory_in(
@@ -2293,7 +2378,7 @@ mod tests {
         std::fs::write(paths.runtime(), "preserved record\n").expect("runtime record");
 
         let outcome =
-            refresh_stale_service(Path::new("/unused/nakode"), directory.path(), None).await;
+            refresh_stale_service(Path::new("/unused/nakode"), directory.path(), None, true).await;
 
         assert!(
             matches!(outcome, StaleServiceRefreshOutcome::Inactive(detail)
@@ -2315,6 +2400,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_refresh_retires_inactive_legacy_runtime_without_restarting_it() {
+        let directory = tempfile::tempdir().expect("runtime directory");
+        let paths = ServicePaths::in_directory(directory.path());
+        drop(std::os::unix::net::UnixListener::bind(paths.lifecycle()).expect("lifecycle socket"));
+        drop(std::os::unix::net::UnixListener::bind(paths.api()).expect("API socket"));
+        std::fs::write(paths.runtime(), "legacy record\n").expect("runtime record");
+
+        let outcome = refresh_stale_service(
+            Path::new("/missing/nakode"),
+            directory.path(),
+            Some(PathBuf::from("/legacy-workspace")),
+            false,
+        )
+        .await;
+
+        assert!(matches!(outcome, StaleServiceRefreshOutcome::Retired));
+        assert!(!paths.lifecycle().exists());
+        assert!(!paths.api().exists());
+        assert!(!paths.runtime().exists());
+    }
+
+    #[tokio::test]
     async fn stale_refresh_reports_identified_inactive_sockets_without_starting_service() {
         let directory = tempfile::tempdir().expect("runtime directory");
         let paths = ServicePaths::in_directory(directory.path());
@@ -2326,6 +2433,7 @@ mod tests {
             Path::new("/missing/nakode"),
             directory.path(),
             Some(workspace.clone()),
+            true,
         )
         .await;
 
@@ -2351,6 +2459,7 @@ mod tests {
             Path::new("/unused/nakode"),
             directory.path(),
             Some(workspace.clone()),
+            true,
         )
         .await;
 
@@ -2534,8 +2643,6 @@ mod tests {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         let expected = vec![
-            "--workspace".to_owned(),
-            workspace.path().to_string_lossy().into_owned(),
             "--scrollback".to_owned(),
             "4321".to_owned(),
             "--compaction-threshold-percent".to_owned(),
@@ -2644,6 +2751,29 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[test]
+    fn service_paths_are_independent_of_session_access_root() {
+        let control_root = tempfile::tempdir().expect("control root");
+        let installation_workspace = tempfile::tempdir().expect("installation workspace");
+        let first_access_root = tempfile::tempdir().expect("first access root");
+        let second_access_root = tempfile::tempdir().expect("second access root");
+
+        let first = ServicePaths::resolve_in(
+            control_root.path(),
+            installation_workspace.path(),
+            first_access_root.path(),
+        )
+        .expect("first service paths");
+        let second = ServicePaths::resolve_in(
+            control_root.path(),
+            installation_workspace.path(),
+            second_access_root.path(),
+        )
+        .expect("second service paths");
+
+        assert_eq!(first, second);
     }
 
     #[tokio::test]

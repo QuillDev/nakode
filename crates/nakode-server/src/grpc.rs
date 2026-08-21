@@ -1378,7 +1378,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         let protocol::QueryResult::Transcript(value) = result.value else {
             return Err(tonic::Status::internal("unexpected transcript response"));
         };
-        Ok(tonic::Response::new(transcript(value)))
+        Ok(tonic::Response::new(transcript(*value)))
     }
 
     async fn get_transcript_body_window(
@@ -1869,6 +1869,7 @@ fn api_bridge_projection(value: &protocol::BridgeProjectionView) -> api::BridgeP
 }
 
 fn provider(value: protocol::ProviderView) -> api::Provider {
+    let available_builtin_tools = value.available_builtin_tools;
     api::Provider {
         id: value.id.to_string(),
         display_name: value.display_name,
@@ -1885,6 +1886,8 @@ fn provider(value: protocol::ProviderView) -> api::Provider {
             .map(|id| id.to_string())
             .collect(),
         model_candidates: value.model_candidates.into_iter().map(model).collect(),
+        builtin_tool_availability_known: available_builtin_tools.is_some(),
+        available_builtin_tools: available_builtin_tools.unwrap_or_default(),
     }
 }
 
@@ -2219,6 +2222,8 @@ pub(crate) fn transcript(value: protocol::TranscriptPage) -> api::TranscriptPage
         has_earlier: value.has_earlier,
         stream_active: value.stream_active,
         stream_label: value.stream_label,
+        current_owner_entry: value.current_owner_entry.map(transcript_entry),
+        current_owner_omitted_tool_calls: value.current_owner_omitted_tool_calls,
     }
 }
 
@@ -2630,6 +2635,32 @@ fn diagnostics_totals(value: &protocol::DiagnosticsUsageTotals) -> api::Diagnost
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_builtin_availability_preserves_known_empty_and_legacy_absence() {
+        let view = |available_builtin_tools| protocol::ProviderView {
+            id: protocol::ProviderId::from("openai-codex"),
+            display_name: "Codex".to_owned(),
+            enabled: true,
+            credential_configured: true,
+            credential_kind: None,
+            connection: protocol::ConnectionView::Ready,
+            capabilities: protocol::ProviderCapabilities::default(),
+            authentication: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
+            model_candidates: Vec::new(),
+            available_builtin_tools,
+        };
+
+        let known = provider(view(Some(Vec::new())));
+        assert!(known.builtin_tool_availability_known);
+        assert!(known.available_builtin_tools.is_empty());
+
+        let legacy = provider(view(None));
+        assert!(!legacy.builtin_tool_availability_known);
+        assert!(legacy.available_builtin_tools.is_empty());
+    }
 
     #[test]
     fn discord_management_capability_is_advertised_only_when_injected() {

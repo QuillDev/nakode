@@ -7,15 +7,16 @@ use nakode_protocol::{
     MAX_ARTIFACT_BYTES, MAX_RUN_POLICY_ITEMS, MAX_RUN_POLICY_TEXT_BYTES, MAX_RUN_TEXT_BYTES,
     MAX_RUN_TOOL_DENIAL_TEXT_BYTES, MAX_RUN_TOOL_DENIALS, MAX_SESSION_RUNS, MAX_SESSION_RUNS_BYTES,
     MAX_TRANSCRIPT_ENTRY_BODY_BYTES, MAX_TRANSCRIPT_PAGE_BODY_BYTES, MAX_TRANSCRIPT_PAGE_ENTRIES,
-    MemorySettingsView, ModelConfigurationView, ModelId, ModelOptions as ProtocolModelOptions,
-    ModelView, NoticeLevel, NoticeView, PromptAttachment as ProtocolPromptAttachment, PromptId,
-    ProviderAuthenticationView, ProviderCapabilities, ProviderCapability, ProviderId, ProviderView,
-    QueueItemView, RecoverablePromptView, RunId, RunOutcome, RunPage, RunPolicyView, RunStatus,
-    RunTextField, RunTextWindow, RunToolDenialView, RunView, SessionActivity, SessionId,
-    SessionSummary, SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView,
-    TodoPhaseView, TodoStatusView, TranscriptBodyWindow, TranscriptEntryKind,
-    TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TurnId, TurnStatus, TurnView,
-    VisionSettingsView, WebSettingsView, WorkspaceId,
+    MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES, MAX_TRANSCRIPT_SNAPSHOT_ENTRIES, MemorySettingsView,
+    ModelConfigurationView, ModelId, ModelOptions as ProtocolModelOptions, ModelView, NoticeLevel,
+    NoticeView, PromptAttachment as ProtocolPromptAttachment, PromptId, ProviderAuthenticationView,
+    ProviderCapabilities, ProviderCapability, ProviderId, ProviderView, QueueItemView,
+    RecoverablePromptView, RunId, RunOutcome, RunPage, RunPolicyView, RunStatus, RunTextField,
+    RunTextWindow, RunToolDenialView, RunView, SessionActivity, SessionId, SessionSummary,
+    SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView, TodoPhaseView,
+    TodoStatusView, TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus,
+    TranscriptEntryView, TranscriptPage, TurnId, TurnStatus, TurnView, VisionSettingsView,
+    WebSettingsView, WorkspaceId,
 };
 
 use super::{
@@ -94,12 +95,7 @@ pub fn bootstrap(
                 providers
                     .iter()
                     .find(|p| p.provider == model.provider)
-                    .is_none_or(|p| {
-                        !p.model_filter_enabled
-                            || p.selected_model_ids
-                                .iter()
-                                .any(|id| id == &model.qualified_id())
-                    })
+                    .is_none_or(|p| model_filter_passes(state, p, model))
             })
             .map(|model| model_view(state, model))
             .collect(),
@@ -1064,6 +1060,34 @@ fn notice_views(state: &DomainState, revision: u64) -> Vec<NoticeView> {
         .collect()
 }
 
+/// Whether `model` survives its provider's discovery filter in the ordinary catalogue.
+///
+/// An enabled filter whose selection matches **no currently discovered model** — an empty
+/// selection, or one whose every entry went stale — fails open rather than hiding the provider's
+/// entire catalogue: that state comes from a never-configured toggle or a discovery refresh that
+/// renamed everything, and silently projecting zero models breaks pickers and exact-ID
+/// reconciliation for no possible intent. Selections that still match at least one discovered
+/// model filter normally, so a deliberate hide-everything-but-x keeps working.
+fn model_filter_passes(state: &DomainState, provider: &ProviderRecord, model: &ModelInfo) -> bool {
+    if !provider.model_filter_enabled {
+        return true;
+    }
+    if provider
+        .selected_model_ids
+        .iter()
+        .any(|id| id == &model.qualified_id())
+    {
+        return true;
+    }
+    !state.models.iter().any(|candidate| {
+        candidate.provider == model.provider
+            && provider
+                .selected_model_ids
+                .iter()
+                .any(|id| id == &candidate.qualified_id())
+    })
+}
+
 fn model_view(state: &DomainState, model: &ModelInfo) -> ModelView {
     let qualified = model.qualified_id();
     let options = state.model_options_for_qualified(&qualified);
@@ -1130,6 +1154,9 @@ fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView
             .filter(|model| model.provider == provider.provider)
             .map(|model| model_view(state, model))
             .collect(),
+        available_builtin_tools: state
+            .available_builtin_tools(&provider.provider)
+            .map(<[String]>::to_vec),
     }
 }
 
@@ -1279,8 +1306,8 @@ fn transcript_page(transcript: &DomainTranscript) -> TranscriptPage {
     projected_transcript_page(
         transcript,
         None,
-        MAX_TRANSCRIPT_PAGE_ENTRIES,
-        MAX_TRANSCRIPT_PAGE_BODY_BYTES,
+        MAX_TRANSCRIPT_SNAPSHOT_ENTRIES,
+        MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES,
     )
     .expect("an unbounded recent transcript page always exists")
 }
@@ -1412,7 +1439,26 @@ fn projected_transcript_page(
         return None;
     }
 
-    let mut remaining_body_bytes = body_budget;
+    let current_owner = if before.is_none() {
+        entries
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == EntryKind::User)
+            .copied()
+    } else {
+        None
+    };
+    let current_owner_body = current_owner.map(|entry| {
+        utf8_tail(
+            &entry.body,
+            body_budget.min(MAX_TRANSCRIPT_ENTRY_BODY_BYTES),
+        )
+    });
+    let current_owner_truncated = current_owner
+        .zip(current_owner_body)
+        .is_some_and(|(entry, body)| body.len() < entry.body.len());
+    let mut remaining_body_bytes =
+        body_budget.saturating_sub(current_owner_body.map_or(0, str::len));
     let mut projected = Vec::with_capacity(limit.min(entries.len()));
     let mut truncated_body = false;
     for entry in entries[..end].iter().rev().take(limit) {
@@ -1440,11 +1486,36 @@ fn projected_transcript_page(
     }
     projected.reverse();
     let omitted_entries = projected.len() < end;
+    let projected_ids = projected
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let current_owner_entry = current_owner
+        .zip(current_owner_body)
+        .map(|(entry, body)| transcript_entry_view(transcript, entry, body, false));
+    let current_owner_omitted_tool_calls = current_owner
+        .and_then(|entry| entry.owner_turn_id.as_deref())
+        .map_or(0, |turn_id| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    matches!(entry.kind, EntryKind::Tool | EntryKind::Diff)
+                        && entry.owner_turn_id.as_deref() == Some(turn_id)
+                        && !projected_ids.contains(entry.id.as_str())
+                })
+                .count()
+        });
     Some(TranscriptPage {
         entries: projected,
-        has_earlier: transcript.has_earlier_entries() || omitted_entries || truncated_body,
+        has_earlier: transcript.has_earlier_entries()
+            || omitted_entries
+            || truncated_body
+            || current_owner_truncated,
         stream_active: before.is_none() && transcript.stream_active(),
         stream_label: transcript.stream_label().to_owned(),
+        current_owner_entry,
+        current_owner_omitted_tool_calls: u64::try_from(current_owner_omitted_tool_calls)
+            .unwrap_or(u64::MAX),
     })
 }
 
@@ -1550,6 +1621,8 @@ fn empty_transcript_page() -> TranscriptPage {
         has_earlier: false,
         stream_active: false,
         stream_label: String::new(),
+        current_owner_entry: None,
+        current_owner_omitted_tool_calls: 0,
     }
 }
 
@@ -1770,8 +1843,8 @@ mod tests {
         EntryId, MAX_API_MESSAGE_BYTES, MAX_ARTIFACT_BYTES, MAX_RUN_POLICY_ITEMS,
         MAX_RUN_POLICY_TEXT_BYTES, MAX_RUN_TEXT_BYTES, MAX_RUN_TOOL_DENIAL_TEXT_BYTES,
         MAX_RUN_TOOL_DENIALS, MAX_SESSION_RUNS, MAX_TRANSCRIPT_ENTRY_BODY_BYTES,
-        MAX_TRANSCRIPT_PAGE_BODY_BYTES, RunId, RunOutcome, RunStatus, TranscriptEntryKind,
-        TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
+        MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES, MAX_TRANSCRIPT_SNAPSHOT_ENTRIES, RunId, RunOutcome,
+        RunStatus, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
     };
 
     use super::{artifact_view, bootstrap, capabilities_view, model_configuration, run_outcome};
@@ -1906,6 +1979,43 @@ mod tests {
     }
 
     #[test]
+    fn provider_filter_with_no_live_selection_fails_open_instead_of_hiding_the_provider() {
+        // Regression: an enabled filter whose selection is empty (or whose every entry went stale)
+        // must not project an empty catalogue — that state is a never-configured toggle or a
+        // discovery rename, not intent, and it breaks pickers and exact-ID reconciliation.
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        state.models = vec![
+            model(CODEX_PROVIDER, "visible"),
+            model(CODEX_PROVIDER, "also-visible"),
+        ];
+        for selected_model_ids in [Vec::new(), vec![format!("{CODEX_PROVIDER}/renamed-away")]] {
+            let providers = vec![ProviderRecord {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                enabled: true,
+                credential: None,
+                model_filter_enabled: true,
+                selected_model_ids,
+            }];
+            let view = bootstrap(&state, 1, &providers, &[]);
+            assert_eq!(
+                view.models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["openai-codex/visible", "openai-codex/also-visible"]
+            );
+            let codex = view
+                .providers
+                .iter()
+                .find(|provider| provider.id.as_str() == CODEX_PROVIDER)
+                .expect("Codex provider");
+            assert!(codex.model_filter_enabled);
+            assert_eq!(codex.model_candidates.len(), 2);
+        }
+    }
+
+    #[test]
     fn bootstrap_contains_stable_semantic_ids_and_no_secret_settings() {
         let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
         state.web_config.firecrawl_api_key = "must-not-leak".to_owned();
@@ -1985,7 +2095,7 @@ mod tests {
         let snapshot = bootstrap(&state, 3, &[], &[]);
         let session = snapshot.active_session.expect("active session");
         assert!(session.transcript.has_earlier);
-        assert!(session.transcript.entries.len() <= nakode_protocol::MAX_TRANSCRIPT_PAGE_ENTRIES);
+        assert!(session.transcript.entries.len() <= MAX_TRANSCRIPT_SNAPSHOT_ENTRIES);
         assert!(
             session
                 .transcript
@@ -1993,7 +2103,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.body.len())
                 .sum::<usize>()
-                <= MAX_TRANSCRIPT_PAGE_BODY_BYTES
+                <= MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES
         );
         let last = session.transcript.entries.last().expect("latest entry");
         assert!(last.body_start_byte > 0);
@@ -2016,6 +2126,136 @@ mod tests {
                 .iter()
                 .any(|visible| visible.id == entry.id)
         }));
+    }
+
+    #[test]
+    fn current_owner_metadata_is_additive_when_the_owner_row_is_retained() {
+        let mut transcript = DomainTranscript::new(10);
+        transcript.upsert(
+            "owner",
+            EntryKind::User,
+            "YOU",
+            "Inspect one file",
+            EntryStatus::Complete,
+        );
+        transcript.set_turn_attribution("owner", "turn-retained", None, false);
+        transcript.upsert(
+            "read",
+            EntryKind::Tool,
+            "read",
+            "README.md",
+            EntryStatus::Complete,
+        );
+        transcript.set_turn_attribution("read", "turn-retained", None, false);
+
+        let page = super::projected_transcript_page(&transcript, None, 10, 1_024)
+            .expect("untruncated current page");
+        let owner = page.current_owner_entry.as_ref().expect("current owner");
+        assert!(page.entries.iter().any(|entry| entry.id == owner.id));
+        assert_eq!(page.current_owner_omitted_tool_calls, 0);
+    }
+
+    #[test]
+    fn current_owner_metadata_preserves_omitted_prompt_and_counts_only_its_omitted_tools() {
+        let mut transcript = DomainTranscript::new(100);
+        transcript.upsert(
+            "owner",
+            EntryKind::User,
+            "YOU",
+            "Inspect the transcript window",
+            EntryStatus::Complete,
+        );
+        transcript.set_turn_attribution("owner", "turn-7", None, false);
+        for (key, kind, status) in [
+            ("read-1", EntryKind::Tool, EntryStatus::Complete),
+            ("assistant", EntryKind::Assistant, EntryStatus::Complete),
+            ("grep-2", EntryKind::Tool, EntryStatus::Failed),
+            ("warning", EntryKind::Warning, EntryStatus::Complete),
+            ("read-3", EntryKind::Diff, EntryStatus::Complete),
+            ("read-4", EntryKind::Tool, EntryStatus::Running),
+        ] {
+            transcript.upsert(key, kind, key, key, status);
+            transcript.set_turn_attribution(key, "turn-7", None, false);
+        }
+
+        let page = super::projected_transcript_page(&transcript, None, 3, 1_024)
+            .expect("bounded current page");
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            ["warning", "read-3", "read-4"]
+        );
+        let owner = page
+            .current_owner_entry
+            .as_ref()
+            .expect("omitted owner message");
+        assert_eq!(owner.body, "Inspect the transcript window");
+        assert!(owner.created_at_ms.is_some());
+        assert_eq!(page.current_owner_omitted_tool_calls, 2);
+
+        let history = super::projected_transcript_page(&transcript, Some(&owner.id), 3, 1_024)
+            .expect("historical page");
+        assert_eq!(history.current_owner_entry, None);
+        assert_eq!(history.current_owner_omitted_tool_calls, 0);
+    }
+
+    #[test]
+    fn current_owner_tool_omission_count_includes_body_budget_eviction() {
+        let mut transcript = DomainTranscript::new(100);
+        transcript.upsert(
+            "owner",
+            EntryKind::User,
+            "YOU",
+            "Keep this turn visible",
+            EntryStatus::Complete,
+        );
+        transcript.set_turn_attribution("owner", "turn-budget", None, false);
+        transcript.upsert(
+            "omitted-tool",
+            EntryKind::Tool,
+            "read",
+            "tool body",
+            EntryStatus::Complete,
+        );
+        transcript.set_turn_attribution("omitted-tool", "turn-budget", None, false);
+        transcript.upsert(
+            "latest-message",
+            EntryKind::Assistant,
+            "Nakode",
+            "1234567890",
+            EntryStatus::Complete,
+        );
+        transcript.set_turn_attribution("latest-message", "turn-budget", None, false);
+
+        let page = super::projected_transcript_page(&transcript, None, 10, 30)
+            .expect("body-budgeted current page");
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Nakode"]
+        );
+        assert!(page.has_earlier);
+        let projected_body_bytes = page
+            .entries
+            .iter()
+            .map(|entry| entry.body.len())
+            .sum::<usize>()
+            + page
+                .current_owner_entry
+                .as_ref()
+                .map_or(0, |entry| entry.body.len());
+        assert!(projected_body_bytes <= 30);
+        assert_eq!(page.current_owner_omitted_tool_calls, 1);
+        assert_eq!(
+            page.current_owner_entry
+                .as_ref()
+                .map(|entry| entry.body.as_str()),
+            Some("Keep this turn visible")
+        );
     }
 
     #[test]
@@ -2460,6 +2700,8 @@ mod tests {
             has_earlier: false,
             stream_active: false,
             stream_label: "reviewer".to_owned(),
+            current_owner_entry: None,
+            current_owner_omitted_tool_calls: 0,
         }
     }
 

@@ -642,7 +642,22 @@ enum ProviderCapability {
 enum ConnectionState { CONNECTION_STATE_UNSPECIFIED = 0; CONNECTION_STATE_DISABLED = 1; CONNECTION_STATE_STARTING = 2; CONNECTION_STATE_READY = 3; CONNECTION_STATE_FAILED = 4; CONNECTION_STATE_DISCONNECTED = 5; }
 message Connection { ConnectionState state = 1; optional string message = 2; }
 message ProviderAuthentication { enum Kind { KIND_UNSPECIFIED = 0; KIND_STARTING = 1; KIND_API_KEY_REQUIRED = 2; KIND_CHALLENGE = 3; } Kind kind = 1; optional string dashboard_url = 2; optional string credential_kind = 3; optional string verification_url = 4; optional string user_code = 5; }
-message Provider { string id = 1; string display_name = 2; bool enabled = 3; bool credential_configured = 4; optional string credential_kind = 5; Connection connection = 6; ProviderCapabilities capabilities = 7; optional ProviderAuthentication authentication = 8; bool model_filter_enabled = 9; repeated string selected_model_ids = 10; repeated Model model_candidates = 11; }
+message Provider {
+  string id = 1;
+  string display_name = 2;
+  bool enabled = 3;
+  bool credential_configured = 4;
+  optional string credential_kind = 5;
+  Connection connection = 6;
+  ProviderCapabilities capabilities = 7;
+  optional ProviderAuthentication authentication = 8;
+  bool model_filter_enabled = 9;
+  repeated string selected_model_ids = 10;
+  repeated Model model_candidates = 11;
+  // Presence-aware, provider/session-start availability. False is the fail-closed legacy case.
+  repeated string available_builtin_tools = 12;
+  bool builtin_tool_availability_known = 13;
+}
 message ModelConfiguration { repeated string reasoning_efforts = 1; bool fast_mode_configurable = 2; bool vision_eligible = 3; bool accepts_image_input = 4; }
 message Model { string id = 1; string provider_id = 2; string model_slug = 3; string display_name = 4; bool is_default = 5; optional string reasoning_effort = 6; bool fast_mode = 7; ModelConfiguration configuration = 8; }
 message AgentDefinition {
@@ -799,7 +814,17 @@ message TranscriptEntry {
   // External transport that originated this user turn. Absent for dashboard/SDK-origin input.
   optional string source_transport = 16;
 }
-message TranscriptPage { repeated TranscriptEntry entries = 1; bool has_earlier = 2; bool stream_active = 3; string stream_label = 4; }
+message TranscriptPage {
+  repeated TranscriptEntry entries = 1;
+  bool has_earlier = 2;
+  bool stream_active = 3;
+  string stream_label = 4;
+  // Additive latest-owner anchor with normal body bounds. The same stable ID may also occur in entries;
+  // presentation clients that pin this row should render it once by ID.
+  optional TranscriptEntry current_owner_entry = 5;
+  // Exact tool/diff rows from that owner turn omitted from entries.
+  uint64 current_owner_omitted_tool_calls = 6;
+}
 message TranscriptBodyWindow { string entry_id = 1; string body = 2; uint64 start_byte = 3; uint64 total_bytes = 4; bool has_earlier = 5; }
 message QueueItem { string id = 1; string summary = 2; uint32 attachment_count = 3; string text = 4; bool redirecting = 5; }
 message RecoverablePrompt { string id = 1; string text = 2; repeated PromptAttachment attachments = 3; }

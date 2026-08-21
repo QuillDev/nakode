@@ -11,9 +11,10 @@ use thiserror::Error;
     about = "The Nakode agent service",
     long_about = "Nakode is a provider-neutral agent service. It owns sessions, providers, tools, \
 and orchestration, and keeps running with no client attached.\n\n\
-Run `nakode start` to bring the service up in the background, or `nakode run` to keep it in the \
-foreground. --workspace selects the canonical workspace whose isolated service is addressed.\n\n\
-The interactive terminal client is one frontend over that service: run `nakode --tui`."
+Run `nakode start` to bring the installation service up in the background, or `nakode run` to keep it \
+in the foreground. There is exactly one service endpoint per user installation.\n\n\
+The interactive terminal client is one frontend over that service: run `nakode --tui` from the \
+directory where a new session should start."
 )]
 pub struct Config {
     #[command(subcommand)]
@@ -27,8 +28,8 @@ pub struct Config {
     #[arg(long)]
     pub update: bool,
 
-    /// Workspace made available to enabled providers and selecting its isolated service.
-    #[arg(long, env = "NAKODE_WORKSPACE", default_value = ".")]
+    /// Working directory captured from the implementing client's process context.
+    #[arg(skip = PathBuf::from("."))]
     pub workspace: PathBuf,
 
     /// Initial provider-qualified model (`provider/model`).
@@ -139,11 +140,7 @@ pub enum NakodeCommand {
     },
     /// Print the private gRPC endpoint used by native frontends.
     #[command(hide = true)]
-    Endpoint {
-        /// Address the stable per-user service rooted at `NAKODE_HOME`.
-        #[arg(long)]
-        global: bool,
-    },
+    Endpoint,
     /// Report persisted token, cache, session, and tool telemetry without prompt content.
     Diagnostics {
         /// Number of days of telemetry to include.
@@ -268,7 +265,7 @@ impl ServiceAction {
             Self::Discord { action } => NakodeCommand::Transport {
                 action: TransportCommand::Discord { action },
             },
-            Self::Endpoint => NakodeCommand::Endpoint { global: false },
+            Self::Endpoint => NakodeCommand::Endpoint,
         }
     }
 }
@@ -330,22 +327,18 @@ pub enum ConfigError {
 }
 
 impl Config {
-    /// Builds the default service configuration for a known canonical workspace.
+    /// Builds the default configuration with an explicit internal execution directory.
     ///
-    /// Global service maintenance has no single caller workspace from which to inherit command
-    /// line options, so it uses the normal CLI defaults for each discovered workspace.
+    /// This is not a public daemon selector. It is used while inspecting legacy runtime metadata and
+    /// by tests that need a deterministic process context.
     ///
     /// # Errors
     ///
     /// Returns an error when the canonical workspace is invalid or the default configuration
     /// cannot be validated.
     pub fn for_workspace(workspace: PathBuf) -> Result<Self, ConfigError> {
-        let arguments = [
-            std::ffi::OsString::from("nakode"),
-            std::ffi::OsString::from("--workspace"),
-            workspace.into_os_string(),
-        ];
-        let config = Self::try_parse_from(arguments)?;
+        let mut config = Self::try_parse_from(["nakode"])?;
+        config.workspace = workspace;
         config.validated()
     }
 
@@ -361,12 +354,6 @@ impl Config {
     }
 
     fn apply_legacy_environment(&mut self) {
-        if std::env::var_os("NAKODE_WORKSPACE").is_none()
-            && self.workspace == Path::new(".")
-            && let Some(workspace) = std::env::var_os("NAKO_AGENT_WORKSPACE")
-        {
-            self.workspace = workspace.into();
-        }
         if std::env::var_os("NAKODE_MODEL").is_none()
             && self.model.is_none()
             && let Some(model) = std::env::var_os("NAKO_AGENT_MODEL")
@@ -417,18 +404,6 @@ impl Config {
             )
         {
             return Ok(self);
-        }
-        if matches!(
-            self.command.as_ref(),
-            Some(NakodeCommand::Endpoint { global: true })
-        ) {
-            self.workspace = nakode_home()?;
-            std::fs::create_dir_all(&self.workspace).map_err(|source| {
-                ConfigError::ResolveWorkspace {
-                    path: self.workspace.clone(),
-                    source,
-                }
-            })?;
         }
         if !self.workspace.exists() {
             return Err(ConfigError::MissingWorkspace(self.workspace));
@@ -579,14 +554,7 @@ mod tests {
                 vec!["nakode", "status", "--json"],
                 NakodeCommand::Status { json: true },
             ),
-            (
-                vec!["nakode", "endpoint"],
-                NakodeCommand::Endpoint { global: false },
-            ),
-            (
-                vec!["nakode", "endpoint", "--global"],
-                NakodeCommand::Endpoint { global: true },
-            ),
+            (vec!["nakode", "endpoint"], NakodeCommand::Endpoint),
         ] {
             let config = Config::try_parse_from(arguments.clone()).expect("lifecycle command");
             assert_eq!(
@@ -595,6 +563,8 @@ mod tests {
                 "{arguments:?} did not parse as {expected:?}"
             );
         }
+        assert!(Config::try_parse_from(["nakode", "endpoint", "--global"]).is_err());
+        assert!(Config::try_parse_from(["nakode", "--workspace", "/tmp", "endpoint"]).is_err());
     }
 
     #[test]
@@ -701,7 +671,7 @@ mod tests {
         );
         assert_eq!(
             rewritten(ServiceAction::Endpoint),
-            format!("{:?}", NakodeCommand::Endpoint { global: false })
+            format!("{:?}", NakodeCommand::Endpoint)
         );
         assert_eq!(
             rewritten(ServiceAction::Discord {

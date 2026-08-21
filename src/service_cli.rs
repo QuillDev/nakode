@@ -1,8 +1,7 @@
 //! Command implementations for the service-facing `nakode` CLI.
 //!
-//! `--workspace` selects the canonical workspace service every command here
-//! reaches. None of these commands enumerate or act on a workspace the caller
-//! did not name.
+//! Every command here reaches the one installation-wide service. A caller's current directory is
+//! not a daemon selector and does not partition endpoint or lifecycle state.
 
 use std::fmt::Write;
 
@@ -71,9 +70,10 @@ pub async fn restart_stale() -> Result<(), ControlError> {
     let executable = current_executable()?;
     let report = control_service::restart_stale_services(&executable).await?;
     println!(
-        "Nakode services: {} current, {} restarted, {} active, {} inactive, {} unavailable, {} unknown, {} failed",
+        "Nakode service: {} current, {} restarted, {} legacy retired, {} active, {} inactive, {} unavailable, {} unknown, {} failed",
         report.current,
         report.restarted,
+        report.retired,
         report.active.len(),
         report.inactive.len(),
         report.unavailable.len(),
@@ -157,7 +157,7 @@ pub async fn endpoint(config: &Config) -> Result<(), ControlError> {
     let descriptor = serde_json::json!({
         "version": 1,
         "transport": "grpc+unix",
-        "workspace": config.workspace,
+        "workspace": report.workspace,
         "endpoint": report.endpoint,
         "lifecycle_endpoint": report.lifecycle_socket,
         "cli": report.cli,

@@ -36,6 +36,7 @@ use crate::{
         BridgeDeliveryRecord, BridgeInboundTurnOriginRecord, BridgePendingInboundRecord,
         BridgeProjectionRecord, ProviderRecord, SessionBridgeRecord, SessionRecord,
     },
+    skill::SkillCatalog,
     soul::{SoulError, SoulSource, SoulStore},
     state::{DomainCommandError, Effect},
 };
@@ -185,6 +186,19 @@ impl ServerCore {
     pub(crate) fn install_session_bridges(&mut self, bridges: Vec<SessionBridgeRecord>) {
         self.session_bridges = bridges;
         self.published_workspace = Some(self.workspace_bootstrap());
+    }
+
+    pub(crate) fn install_available_builtin_tools(
+        &mut self,
+        availability: &HashMap<String, Vec<String>>,
+    ) {
+        self.session_template
+            .install_available_builtin_tools(availability.clone());
+        for engine in self.sessions_by_id.values_mut() {
+            engine
+                .state_mut()
+                .install_available_builtin_tools(availability.clone());
+        }
     }
 
     pub(crate) fn remember_durable_bridge_inbound_event(
@@ -823,8 +837,14 @@ impl ServerCore {
             ));
         }
         self.refresh_session_template_addenda()?;
+        let skills = SkillCatalog::load(Path::new(&working_directory)).map_err(|error| {
+            DomainCommandError::Invalid(format!(
+                "failed to load skills for {working_directory}: {error}"
+            ))
+        })?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
+        engine.state_mut().install_skills(skills);
         engine
             .state_mut()
             .set_initial_client_instructions(initial_instructions)?;
@@ -840,7 +860,10 @@ impl ServerCore {
             )?);
         }
         if let Some(tools) = tools {
-            let tools = engine.state().omit_disabled_memory_tools(tools);
+            let provider = engine.state().active_provider_id().to_owned();
+            let tools = engine
+                .state()
+                .reconcile_available_builtin_tools(&provider, tools);
             effects.extend(engine.state_mut().configure_session_tools(
                 tools.tools,
                 tools.replace_builtin_tools,
@@ -1542,10 +1565,15 @@ impl ServerCore {
                     return Err(DomainCommandError::NotFound(session_id.to_string()));
                 }
                 if let Some(tools) = tools {
+                    let provider = self
+                        .session_engine_mut(loaded)?
+                        .state()
+                        .active_provider_id()
+                        .to_owned();
                     let tools = self
                         .session_engine_mut(loaded)?
                         .state()
-                        .omit_disabled_memory_tools(tools);
+                        .reconcile_available_builtin_tools(&provider, tools);
                     self.session_engine_mut(loaded)?
                         .state_mut()
                         .configure_or_validate_external_tools(
@@ -1584,24 +1612,22 @@ impl ServerCore {
         let working_directory =
             canonical_working_directory(Some(&session.working_directory), &session.workspace)?;
         self.refresh_session_template_addenda()?;
+        let skills = SkillCatalog::load(Path::new(&working_directory)).map_err(|error| {
+            DomainCommandError::Invalid(format!(
+                "failed to load skills for {working_directory}: {error}"
+            ))
+        })?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
+        engine.state_mut().install_skills(skills);
         // The workspace template may still carry the bootstrap provider/session identity. Reset that
         // clone before installing client-owned tools; restoration begins only after validation.
         let _discarded_template_effects = engine.state_mut().create_logical_session()?;
         if let Some(tools) = tools {
-            let tools = engine.state().omit_disabled_memory_tools(tools);
-            if let Some(allowed) = tools.allowed_builtin_tools.as_deref() {
-                let projection =
-                    crate::backend::project_provider_tools(&session.provider, Some(allowed));
-                if !projection.unsupported_canonical_tools.is_empty() {
-                    return Err(DomainCommandError::Invalid(format!(
-                        "provider {} cannot project allowed builtin tools: {}",
-                        session.provider,
-                        projection.unsupported_canonical_tools.join(", ")
-                    )));
-                }
-            }
+            let tools = engine
+                .state()
+                .reconcile_available_builtin_tools(&session.provider, tools);
+            Self::validate_provider_tool_projection(&session.provider, &tools)?;
             engine.state_mut().configure_session_tools(
                 tools.tools,
                 tools.replace_builtin_tools,
@@ -1619,6 +1645,24 @@ impl ServerCore {
         let loaded_id = SessionId::from(session.id.clone());
         self.sessions_by_id.insert(loaded_id.clone(), engine);
         Ok(Self::accepted(Some(session.id), effects))
+    }
+
+    fn validate_provider_tool_projection(
+        provider: &str,
+        tools: &nakode_protocol::SessionToolConfiguration,
+    ) -> Result<(), DomainCommandError> {
+        let Some(allowed) = tools.allowed_builtin_tools.as_deref() else {
+            return Ok(());
+        };
+        let projection = crate::backend::project_provider_tools(provider, Some(allowed));
+        if projection.unsupported_canonical_tools.is_empty() {
+            Ok(())
+        } else {
+            Err(DomainCommandError::Invalid(format!(
+                "provider {provider} cannot project allowed builtin tools: {}",
+                projection.unsupported_canonical_tools.join(", ")
+            )))
+        }
     }
 
     fn select_model_command(
@@ -2428,12 +2472,9 @@ impl ServerCore {
         let bootstrap = || self.workspace_bootstrap();
         match query {
             Query::Bootstrap {
-                workspace,
+                workspace: _,
                 session_id,
             } => {
-                if workspace != self.engine().state().workspace {
-                    return Err(not_found("workspace", &workspace));
-                }
                 let mut view = bootstrap();
                 if let Some(session_id) = session_id {
                     view.active_session = Some(self.session_view(&session_id)?);
@@ -2561,7 +2602,7 @@ impl ServerCore {
                 before.map_or("", nakode_protocol::EntryId::as_str),
             )
         })?;
-        Ok(QueryResult::Transcript(page))
+        Ok(QueryResult::Transcript(Box::new(page)))
     }
 
     fn query_run_transcript_page(
@@ -2587,7 +2628,7 @@ impl ServerCore {
                 before.map_or("", nakode_protocol::EntryId::as_str),
             )
         })?;
-        Ok(QueryResult::Transcript(page))
+        Ok(QueryResult::Transcript(Box::new(page)))
     }
 
     fn query_transcript_body_window(
@@ -4129,7 +4170,7 @@ fn service_error(code: ErrorCode, message: &str, retryable: bool) -> ServiceErro
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
 
     use nakode_protocol::{
         AgentDefinitionInput, BridgeContinuationDisposition, BridgeLifecycle, BridgeProjectionKind,
@@ -4153,7 +4194,6 @@ mod tests {
             PromptImage, TurnOutcome,
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
-        memory::{MemoryBackend, MemoryConfig},
         personality::PromptAddenda,
         service::ServiceEngine,
         session::{
@@ -4163,6 +4203,13 @@ mod tests {
         soul::{SoulSource, SoulStore},
         state::{AppState, DomainCommandError},
     };
+
+    fn install_available_tools(core: &mut ServerCore, provider: &str, tools: &[&str]) {
+        core.install_available_builtin_tools(&HashMap::from([(
+            provider.to_owned(),
+            tools.iter().map(|name| (*name).to_owned()).collect(),
+        )]));
+    }
 
     fn dashboard_tools(name: &str, replace_builtin_tools: bool) -> SessionToolConfiguration {
         SessionToolConfiguration {
@@ -5351,8 +5398,9 @@ mod tests {
     }
 
     #[test]
-    fn disabled_memory_only_allowlist_becomes_an_explicit_empty_replacement() {
+    fn unavailable_memory_only_allowlist_becomes_an_explicit_empty_replacement() {
         let (mut core, _) = ready_external_tools_server();
+        install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let workspace_id = core.workspace_bootstrap().workspace_id;
         let tools = SessionToolConfiguration {
             tools: Vec::new(),
@@ -5416,14 +5464,13 @@ mod tests {
     }
 
     #[test]
-    fn memory_configuration_updates_the_template_and_every_loaded_session() {
+    fn availability_updates_the_template_and_every_loaded_session() {
         let (mut core, loaded_id) = ready_external_tools_server();
-        core.install_memory_config(&MemoryConfig {
-            backend: MemoryBackend::Mnemosyne,
-            executable: "/definitely/missing/mnemosyne".to_owned(),
-            global_bank: "configured-memory".to_owned(),
-            data_directory: String::new(),
-        });
+        install_available_tools(
+            &mut core,
+            CODEX_PROVIDER,
+            &["read", "memory_search", "memory_store", "browser", "vision"],
+        );
         let requested = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: false,
@@ -5433,17 +5480,17 @@ mod tests {
             core.engine_for(&loaded_id)
                 .expect("loaded session")
                 .state()
-                .omit_disabled_memory_tools(requested.clone())
+                .reconcile_available_builtin_tools(CODEX_PROVIDER, requested.clone())
                 .allowed_builtin_tools,
             requested.allowed_builtin_tools
         );
 
-        core.install_memory_config(&MemoryConfig::default());
+        install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let normalized = core
             .engine_for(&loaded_id)
             .expect("loaded session")
             .state()
-            .omit_disabled_memory_tools(requested);
+            .reconcile_available_builtin_tools(CODEX_PROVIDER, requested);
         assert!(normalized.allowed_builtin_tools.is_none());
         assert!(normalized.replace_builtin_tools);
 
@@ -5462,8 +5509,9 @@ mod tests {
     }
 
     #[test]
-    fn disabled_memory_tools_are_omitted_before_persisted_session_resume() {
+    fn unavailable_tools_are_omitted_before_persisted_session_resume() {
         let (mut core, _) = ready_external_tools_server();
+        install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-tools-session");
         core.replace_session_records(vec![SessionRecord {
             id: restored_id.to_string(),
@@ -5504,14 +5552,9 @@ mod tests {
     }
 
     #[test]
-    fn configured_but_unavailable_memory_remains_in_the_requested_tool_boundary() {
+    fn configured_but_runtime_unavailable_memory_is_omitted() {
         let (mut core, _) = ready_external_tools_server();
-        core.install_memory_config(&MemoryConfig {
-            backend: MemoryBackend::Mnemosyne,
-            executable: "/definitely/missing/mnemosyne".to_owned(),
-            global_bank: "configured-memory".to_owned(),
-            data_directory: String::new(),
-        });
+        install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-unavailable-memory");
         core.replace_session_records(vec![SessionRecord {
             id: restored_id.to_string(),
@@ -5539,25 +5582,33 @@ mod tests {
 
         let (_, effects) = core
             .open_session_command(&restored_id, Some(tools))
-            .expect("configured memory remains requested for runtime validation");
+            .expect("unavailable memory is removed before runtime validation");
         assert!(effects.iter().any(|effect| matches!(
             effect,
             crate::state::Effect::Backend(BackendCommand::ResumeSession {
-                allowed_builtin_tools: Some(allowed),
+                replace_builtin_tools: true,
+                allowed_builtin_tools: None,
                 ..
-            }) if allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
+            })
         )));
     }
 
     #[test]
-    fn persisted_session_rejects_builtin_tools_the_provider_cannot_expose() {
+    fn persisted_session_filters_builtin_tools_the_provider_cannot_expose() {
         let (mut core, _) = ready_external_tools_server();
-        core.install_memory_config(&MemoryConfig {
-            backend: MemoryBackend::Mnemosyne,
-            executable: "/definitely/missing/mnemosyne".to_owned(),
-            global_bank: "configured-memory".to_owned(),
-            data_directory: String::new(),
-        });
+        core.session_template.handle_provider_backend(
+            CLAUDE_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CLAUDE_PROVIDER.to_owned(),
+                display_name: "Claude".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities {
+                    resume: CapabilitySupport::Supported,
+                    ..BackendCapabilities::default()
+                },
+            }),
+        );
+        install_available_tools(&mut core, CLAUDE_PROVIDER, &["read", "ask"]);
         let restored_id = SessionId::from("restored-claude-session");
         core.replace_session_records(vec![SessionRecord {
             id: restored_id.to_string(),
@@ -5583,11 +5634,17 @@ mod tests {
             ]),
         };
 
-        let error = core
+        let (_, effects) = core
             .open_session_command(&restored_id, Some(tools))
-            .expect_err("Claude cannot claim canonical memory support");
-        assert!(error.to_string().contains("memory_search"));
-        assert!(error.to_string().contains("memory_store"));
+            .expect("unavailable canonical tools are filtered before resume");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::ResumeSession {
+                replace_builtin_tools: true,
+                allowed_builtin_tools: None,
+                ..
+            })
+        )));
     }
 
     #[test]
@@ -5616,6 +5673,35 @@ mod tests {
             )
             .expect_err("different table must fail closed");
         assert!(error.to_string().contains("different tool table"));
+    }
+
+    #[test]
+    fn attached_session_reattach_compares_current_effective_availability() {
+        let (mut core, _) = ready_external_tools_server();
+        install_available_tools(
+            &mut core,
+            CODEX_PROVIDER,
+            &["read", "memory_search", "memory_store"],
+        );
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let mut tools = dashboard_tools("ReadAssociatedTicket", false);
+        tools.allowed_builtin_tools =
+            Some(vec!["memory_search".to_owned(), "memory_store".to_owned()]);
+        let (created, _) = core
+            .create_session_command(
+                &workspace_id,
+                None,
+                &ModelOptions::default(),
+                Some(tools.clone()),
+            )
+            .expect("session created while memory is available");
+        let session_id = SessionId::from(created.resource_id.expect("logical session id"));
+
+        install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
+        let (_, effects) = core
+            .open_session_command(&session_id, Some(tools))
+            .expect("stale allowlist is narrowed before attached-session comparison");
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -7111,6 +7197,7 @@ first_message = "Starting review"
             else {
                 panic!("transcript result");
             };
+            let page = *page;
             assert!(page.entries.len() <= 37);
             if page.entries.is_empty() {
                 break;

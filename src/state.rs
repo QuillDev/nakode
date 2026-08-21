@@ -1091,6 +1091,7 @@ pub struct DomainState {
     terminal_image_mode: TerminalImageMode,
     invocation_telemetry_enabled: bool,
     agent_browser_status: AgentBrowserStatus,
+    available_builtin_tools: HashMap<String, Vec<String>>,
 }
 
 /// Legacy test-only alias for reducer tests that still exercise old client
@@ -1186,6 +1187,8 @@ impl DomainState {
         self.invocation_telemetry_enabled = source.invocation_telemetry_enabled;
         self.agent_browser_status
             .clone_from(&source.agent_browser_status);
+        self.available_builtin_tools
+            .clone_from(&source.available_builtin_tools);
     }
 
     pub fn install_model_options(&mut self, provider: &str, model: &str, options: ModelOptions) {
@@ -1257,6 +1260,17 @@ impl DomainState {
 
     pub fn install_memory_config(&mut self, config: MemoryConfig) {
         self.memory_config = config;
+    }
+
+    pub fn install_available_builtin_tools(&mut self, availability: HashMap<String, Vec<String>>) {
+        self.available_builtin_tools = availability;
+    }
+
+    #[must_use]
+    pub fn available_builtin_tools(&self, provider: &str) -> Option<&[String]> {
+        self.available_builtin_tools
+            .get(provider)
+            .map(Vec::as_slice)
     }
 
     #[cfg(test)]
@@ -1790,6 +1804,7 @@ impl DomainState {
             terminal_image_mode: TerminalImageMode::default(),
             invocation_telemetry_enabled: false,
             agent_browser_status: AgentBrowserStatus::Unavailable,
+            available_builtin_tools: HashMap::new(),
         }
     }
 
@@ -2600,6 +2615,11 @@ impl DomainState {
             picker.authentication = None;
         }
         true
+    }
+
+    #[must_use]
+    pub fn active_provider_id(&self) -> &str {
+        &self.backend_provider
     }
 
     #[must_use]
@@ -5292,9 +5312,28 @@ impl DomainState {
         replace_builtin_tools: bool,
         allowed_builtin_tools: Option<&[String]>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
+        let mut effective_stored = self.allowed_builtin_tools.as_ref().map(|allowed| {
+            self.available_builtin_tools(&self.backend_provider)
+                .map_or_else(
+                    || allowed.clone(),
+                    |available| {
+                        allowed
+                            .iter()
+                            .filter(|name| available.contains(name))
+                            .cloned()
+                            .collect()
+                    },
+                )
+        });
+        let effective_replace = if effective_stored.as_ref().is_some_and(Vec::is_empty) {
+            effective_stored = None;
+            true
+        } else {
+            self.replace_builtin_tools
+        };
         if self.external_tools == tools
-            && self.replace_builtin_tools == replace_builtin_tools
-            && self.allowed_builtin_tools.as_deref() == allowed_builtin_tools
+            && effective_replace == replace_builtin_tools
+            && effective_stored.as_deref() == allowed_builtin_tools
         {
             return Ok(Vec::new());
         }
@@ -7476,22 +7515,23 @@ impl DomainState {
         self.working_directory = working_directory;
     }
 
-    /// Omits memory tools only when memory is explicitly configured off.
+    /// Intersects a client authorization boundary with the provider's current runtime availability.
     ///
-    /// Configured but unavailable backends remain requested so genuine installation, locking, or
-    /// transient failures continue to fail closed at the runtime boundary.
+    /// A missing internal projection is retained only for non-native/unit-test callers; the native
+    /// server installs a presence-aware map before every public create/open request.
     #[must_use]
-    pub fn omit_disabled_memory_tools(
+    pub fn reconcile_available_builtin_tools(
         &self,
+        provider: &str,
         mut tools: nakode_protocol::SessionToolConfiguration,
     ) -> nakode_protocol::SessionToolConfiguration {
-        if self.memory_config.backend != MemoryBackend::Disabled {
+        let Some(available) = self.available_builtin_tools(provider) else {
             return tools;
-        }
+        };
         let Some(allowed) = tools.allowed_builtin_tools.as_mut() else {
             return tools;
         };
-        allowed.retain(|name| !matches!(name.as_str(), "memory_search" | "memory_store"));
+        allowed.retain(|name| available.contains(name));
         if allowed.is_empty() {
             tools.allowed_builtin_tools = None;
             tools.replace_builtin_tools = true;

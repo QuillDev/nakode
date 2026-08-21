@@ -115,6 +115,10 @@ pub struct ProviderView {
     /// Full discovered catalogue used by settings; BootstrapView.models may be filtered.
     #[serde(default)]
     pub model_candidates: Vec<ModelView>,
+    /// Canonical built-ins this provider can expose under the current runtime/add-on settings.
+    /// `None` means an older or non-authoritative projection, never an unrestricted default.
+    #[serde(default)]
+    pub available_builtin_tools: Option<Vec<String>>,
 }
 
 /// Product surface that owns the user-facing projection of one logical session.
@@ -334,6 +338,13 @@ pub struct TranscriptPage {
     pub has_earlier: bool,
     pub stream_active: bool,
     pub stream_label: String,
+    /// Additive latest-owner anchor; its stable ID may also occur in `entries`.
+    /// Presentation clients that pin it should render that ID once.
+    #[serde(default)]
+    pub current_owner_entry: Option<TranscriptEntryView>,
+    /// Exact tool/diff rows from that owner turn omitted from `entries`.
+    #[serde(default)]
+    pub current_owner_omitted_tool_calls: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -864,6 +875,9 @@ pub struct BootstrapView {
     #[serde(default)]
     pub session_bridges: Vec<SessionBridgeView>,
     pub providers: Vec<ProviderView>,
+    /// The ordinary catalogue: each provider's discovered models, narrowed by its model filter
+    /// when the filter is enabled and still selects at least one discovered model. A filter whose
+    /// selection matches nothing discovered fails open, so this never silently empties a provider.
     pub models: Vec<ModelView>,
     pub agents: Vec<AgentDefinitionView>,
     pub skills: Vec<SkillView>,
