@@ -875,6 +875,9 @@ pub struct BootstrapView {
     #[serde(default)]
     pub session_bridges: Vec<SessionBridgeView>,
     pub providers: Vec<ProviderView>,
+    /// The ordinary catalogue: each provider's discovered models, narrowed by its model filter
+    /// when the filter is enabled and still selects at least one discovered model. A filter whose
+    /// selection matches nothing discovered fails open, so this never silently empties a provider.
     pub models: Vec<ModelView>,
     pub agents: Vec<AgentDefinitionView>,
     pub skills: Vec<SkillView>,

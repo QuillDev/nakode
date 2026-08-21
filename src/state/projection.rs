@@ -95,12 +95,7 @@ pub fn bootstrap(
                 providers
                     .iter()
                     .find(|p| p.provider == model.provider)
-                    .is_none_or(|p| {
-                        !p.model_filter_enabled
-                            || p.selected_model_ids
-                                .iter()
-                                .any(|id| id == &model.qualified_id())
-                    })
+                    .is_none_or(|p| model_filter_passes(state, p, model))
             })
             .map(|model| model_view(state, model))
             .collect(),
@@ -1065,6 +1060,34 @@ fn notice_views(state: &DomainState, revision: u64) -> Vec<NoticeView> {
         .collect()
 }
 
+/// Whether `model` survives its provider's discovery filter in the ordinary catalogue.
+///
+/// An enabled filter whose selection matches **no currently discovered model** — an empty
+/// selection, or one whose every entry went stale — fails open rather than hiding the provider's
+/// entire catalogue: that state comes from a never-configured toggle or a discovery refresh that
+/// renamed everything, and silently projecting zero models breaks pickers and exact-ID
+/// reconciliation for no possible intent. Selections that still match at least one discovered
+/// model filter normally, so a deliberate hide-everything-but-x keeps working.
+fn model_filter_passes(state: &DomainState, provider: &ProviderRecord, model: &ModelInfo) -> bool {
+    if !provider.model_filter_enabled {
+        return true;
+    }
+    if provider
+        .selected_model_ids
+        .iter()
+        .any(|id| id == &model.qualified_id())
+    {
+        return true;
+    }
+    !state.models.iter().any(|candidate| {
+        candidate.provider == model.provider
+            && provider
+                .selected_model_ids
+                .iter()
+                .any(|id| id == &candidate.qualified_id())
+    })
+}
+
 fn model_view(state: &DomainState, model: &ModelInfo) -> ModelView {
     let qualified = model.qualified_id();
     let options = state.model_options_for_qualified(&qualified);
@@ -1953,6 +1976,43 @@ mod tests {
                 .iter()
                 .any(|id| id.as_str() == "openai-codex/stale")
         );
+    }
+
+    #[test]
+    fn provider_filter_with_no_live_selection_fails_open_instead_of_hiding_the_provider() {
+        // Regression: an enabled filter whose selection is empty (or whose every entry went stale)
+        // must not project an empty catalogue — that state is a never-configured toggle or a
+        // discovery rename, not intent, and it breaks pickers and exact-ID reconciliation.
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        state.models = vec![
+            model(CODEX_PROVIDER, "visible"),
+            model(CODEX_PROVIDER, "also-visible"),
+        ];
+        for selected_model_ids in [Vec::new(), vec![format!("{CODEX_PROVIDER}/renamed-away")]] {
+            let providers = vec![ProviderRecord {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                enabled: true,
+                credential: None,
+                model_filter_enabled: true,
+                selected_model_ids,
+            }];
+            let view = bootstrap(&state, 1, &providers, &[]);
+            assert_eq!(
+                view.models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["openai-codex/visible", "openai-codex/also-visible"]
+            );
+            let codex = view
+                .providers
+                .iter()
+                .find(|provider| provider.id.as_str() == CODEX_PROVIDER)
+                .expect("Codex provider");
+            assert!(codex.model_filter_enabled);
+            assert_eq!(codex.model_candidates.len(), 2);
+        }
     }
 
     #[test]

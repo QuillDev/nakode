@@ -108,7 +108,10 @@ Providers are disabled on a fresh installation. Start Nakode, open
 and select from their available models. Provider details can independently enable a model filter and
 select exact provider/model IDs from a searchable, scrollable catalogue. Filtering defaults off.
 When enabled it changes ordinary model discovery only: exact persisted or explicitly requested IDs
-remain addressable, and stale selected IDs remain visible rather than being substituted.
+remain addressable, and stale selected IDs remain visible rather than being substituted. A filter
+whose selection no longer matches any discovered model (for example an enabled filter with an
+empty selection) fails open and shows the provider's full catalogue, since silently hiding every
+discovered model is never the intent of a selection that selects nothing.
 
 Nakode does not require the separate Codex, Devin, Kimi, or z.ai applications. Claude
 uses the official Claude Agent SDK and the login managed by an installed Claude Code
