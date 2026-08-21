@@ -2472,9 +2472,12 @@ impl ServerCore {
         let bootstrap = || self.workspace_bootstrap();
         match query {
             Query::Bootstrap {
-                workspace: _,
+                workspace,
                 session_id,
             } => {
+                if workspace != self.engine().state().workspace {
+                    return Err(not_found("workspace", &workspace));
+                }
                 let mut view = bootstrap();
                 if let Some(session_id) = session_id {
                     view.active_session = Some(self.session_view(&session_id)?);
@@ -5241,6 +5244,28 @@ mod tests {
         }
         chunks.reverse();
         chunks.concat()
+    }
+
+    #[test]
+    fn workspace_bootstrap_accepts_only_the_authoritative_workspace_path() {
+        let (core, _) = ready_codex_server();
+        let authoritative = core.engine().state().workspace.clone();
+
+        let accepted = core.query(Query::Bootstrap {
+            workspace: authoritative.clone(),
+            session_id: None,
+        });
+        assert!(accepted.is_ok());
+
+        let missing = "/tmp/unregistered-workspace";
+        let error = core
+            .query(Query::Bootstrap {
+                workspace: missing.to_owned(),
+                session_id: None,
+            })
+            .expect_err("an access root is not an authoritative workspace");
+        assert!(error.message.contains(missing));
+        assert_eq!(core.engine().state().workspace, authoritative);
     }
 
     #[test]

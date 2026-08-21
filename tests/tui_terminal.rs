@@ -18,7 +18,8 @@ static TUI_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 const TUI_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
-fn tui_exit_restores_terminal_modes() -> Result<(), Box<dyn Error>> {
+fn tui_from_unregistered_current_directory_reaches_terminal_and_restores_modes()
+-> Result<(), Box<dyn Error>> {
     let _guard = TUI_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
