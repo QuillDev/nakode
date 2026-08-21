@@ -20,6 +20,7 @@ use crate::{
     mcp::McpServerRecord,
     memory::{MemoryBackend, MemoryConfig},
     settings::TerminalImageMode,
+    skill::SkillPreference,
     vision::VisionConfig,
     web::{WebBackend, WebConfig},
 };
@@ -276,6 +277,25 @@ pub enum SessionError {
 }
 
 pub trait SessionRepository: Send + Sync {
+    /// Returns every persisted skill choice for one client profile, including unavailable skills.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried or decoded.
+    fn list_skill_preferences(
+        &self,
+        _profile_id: &str,
+    ) -> Result<Vec<SkillPreference>, SessionError> {
+        Ok(Vec::new())
+    }
+
+    /// Upserts one stable skill identity for one client profile.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
+    fn set_skill_preference(&self, _preference: &SkillPreference) -> Result<(), SessionError> {
+        Ok(())
+    }
+
     /// Lists bridge state for logical sessions in one canonical workspace.
     ///
     /// # Errors
@@ -737,6 +757,17 @@ impl SqliteSessionRepository {
              );
              CREATE INDEX IF NOT EXISTS session_bridge_inbound_events_recorded
                ON session_bridge_inbound_events(session_id, recorded_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS skill_preferences (
+               profile_id TEXT NOT NULL,
+               skill_id TEXT NOT NULL,
+               last_name TEXT NOT NULL,
+               last_description TEXT NOT NULL,
+               enabled INTEGER NOT NULL DEFAULT 1,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(profile_id, skill_id)
+             );
+             CREATE INDEX IF NOT EXISTS skill_preferences_profile_name
+               ON skill_preferences(profile_id, last_name COLLATE NOCASE);
              CREATE TABLE IF NOT EXISTS provider_models (
                provider TEXT NOT NULL,
                model_id TEXT NOT NULL,
@@ -1708,6 +1739,51 @@ fn seed_provider_catalog(connection: &Connection) -> Result<(), SessionError> {
 }
 
 impl SessionRepository for SqliteSessionRepository {
+    fn list_skill_preferences(
+        &self,
+        profile_id: &str,
+    ) -> Result<Vec<SkillPreference>, SessionError> {
+        let connection = self.connection.lock().expect("session database lock");
+        let mut statement = connection.prepare(
+            "SELECT profile_id, skill_id, last_name, last_description, enabled
+             FROM skill_preferences WHERE profile_id = ?1
+             ORDER BY last_name COLLATE NOCASE, skill_id",
+        )?;
+        let rows = statement.query_map(params![profile_id], |row| {
+            Ok(SkillPreference {
+                profile_id: row.get(0)?,
+                skill_id: row.get(1)?,
+                last_name: row.get(2)?,
+                last_description: row.get(3)?,
+                enabled: row.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SessionError::from)
+    }
+
+    fn set_skill_preference(&self, preference: &SkillPreference) -> Result<(), SessionError> {
+        let connection = self.connection.lock().expect("session database lock");
+        connection.execute(
+            "INSERT INTO skill_preferences
+               (profile_id, skill_id, last_name, last_description, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
+             ON CONFLICT(profile_id, skill_id) DO UPDATE SET
+               last_name = excluded.last_name,
+               last_description = excluded.last_description,
+               enabled = excluded.enabled,
+               updated_at = excluded.updated_at",
+            params![
+                preference.profile_id,
+                preference.skill_id,
+                preference.last_name,
+                preference.last_description,
+                i64::from(preference.enabled),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn list_session_bridges(
         &self,
         workspace: &str,
@@ -4144,6 +4220,42 @@ mod tests {
             restored
                 .owned_provider_sessions
                 .contains(&(CODEX_PROVIDER.to_owned(), "codex-primary".to_owned()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persists_independent_profile_skill_preferences_across_restart() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("skills.db");
+        let store = SqliteSessionRepository::open(&path)?;
+        store.set_skill_preference(&SkillPreference {
+            profile_id: "profile-a".to_owned(),
+            skill_id: "stable.review".to_owned(),
+            last_name: "Review".to_owned(),
+            last_description: "Reviews changes".to_owned(),
+            enabled: false,
+        })?;
+        store.set_skill_preference(&SkillPreference {
+            profile_id: "profile-b".to_owned(),
+            skill_id: "stable.review".to_owned(),
+            last_name: "Review".to_owned(),
+            last_description: "Reviews changes".to_owned(),
+            enabled: true,
+        })?;
+        drop(store);
+
+        let restored = SqliteSessionRepository::open(path)?;
+        let profile_a = restored.list_skill_preferences("profile-a")?;
+        let profile_b = restored.list_skill_preferences("profile-b")?;
+        assert_eq!(profile_a.len(), 1);
+        assert!(!profile_a[0].enabled);
+        assert_eq!(profile_b.len(), 1);
+        assert!(profile_b[0].enabled);
+        assert!(
+            restored
+                .list_skill_preferences("legacy-profile")?
+                .is_empty()
         );
         Ok(())
     }

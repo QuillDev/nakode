@@ -536,7 +536,9 @@ impl ServerCore {
                 initial_instructions,
                 bridge,
                 mcp_grant,
-            } => self.create_session_command_with_mcp(
+                profile_id: _,
+                disabled_skill_ids,
+            } => self.create_session_command_with_mcp_and_skills(
                 &workspace_id,
                 working_directory.as_deref(),
                 title.as_deref(),
@@ -546,6 +548,7 @@ impl ServerCore {
                 initial_instructions.as_deref(),
                 bridge,
                 mcp_grant.as_ref(),
+                &disabled_skill_ids,
             ),
             Command::OpenSession {
                 session_id,
@@ -712,6 +715,9 @@ impl ServerCore {
                 session_id,
                 command,
             } => self.run_shell_command(&session_id, command),
+            Command::SetSkillEnabled { .. } => Err(DomainCommandError::Invalid(
+                "skill availability is served by the native persistence runtime".to_owned(),
+            )),
             Command::SetProviderModelFilter {
                 provider_id,
                 enabled,
@@ -813,9 +819,8 @@ impl ServerCore {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    // Session creation mirrors the versioned public command. Keeping every typed option explicit
-    // prevents bridge/MCP/default policy from being hidden in a frontend-owned bag of values.
     fn create_session_command_with_mcp(
         &mut self,
         workspace_id: &WorkspaceId,
@@ -828,6 +833,36 @@ impl ServerCore {
         bridge: Option<SessionBridgeIntent>,
         mcp_grant: Option<&McpSessionGrant>,
     ) -> DomainCommandOutcome {
+        self.create_session_command_with_mcp_and_skills(
+            workspace_id,
+            working_directory,
+            title,
+            model_id,
+            options,
+            tools,
+            initial_instructions,
+            bridge,
+            mcp_grant,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    // Session creation mirrors the versioned public command. Keeping every typed option explicit
+    // prevents bridge/MCP/default policy from being hidden in a frontend-owned bag of values.
+    fn create_session_command_with_mcp_and_skills(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        working_directory: Option<&str>,
+        title: Option<&str>,
+        model_id: Option<&nakode_protocol::ModelId>,
+        options: &nakode_protocol::ModelOptions,
+        tools: Option<nakode_protocol::SessionToolConfiguration>,
+        initial_instructions: Option<&str>,
+        bridge: Option<SessionBridgeIntent>,
+        mcp_grant: Option<&McpSessionGrant>,
+        disabled_skill_ids: &[String],
+    ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
         let working_directory =
             canonical_working_directory(working_directory, &self.session_template.workspace)?;
@@ -837,11 +872,13 @@ impl ServerCore {
             ));
         }
         self.refresh_session_template_addenda()?;
-        let skills = SkillCatalog::load(Path::new(&working_directory)).map_err(|error| {
-            DomainCommandError::Invalid(format!(
-                "failed to load skills for {working_directory}: {error}"
-            ))
-        })?;
+        let skills = SkillCatalog::load(Path::new(&working_directory))
+            .map(|catalogue| catalogue.without_ids(disabled_skill_ids))
+            .map_err(|error| {
+                DomainCommandError::Invalid(format!(
+                    "failed to load skills for {working_directory}: {error}"
+                ))
+            })?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
         engine.state_mut().install_skills(skills);
@@ -2548,6 +2585,7 @@ impl ServerCore {
             } => self.query_run_text_window(&run_id, field, before_byte, limit_bytes),
             Query::GetArtifact { artifact_id } => self.query_artifact(&artifact_id),
             Query::GetDiagnostics { .. }
+            | Query::ListSkills { .. }
             | Query::GetInvocationSummary
             | Query::GetInvocationTimeline { .. } => Err(service_error(
                 ErrorCode::Internal,
@@ -3415,6 +3453,7 @@ impl ServerCore {
             | Command::SetWorkspaceBridgeLifecycle { .. }
             | Command::SelectModel { .. }
             | Command::SetProviderModelFilter { .. }
+            | Command::SetSkillEnabled { .. }
             | Command::SetProviderEnabled { .. }
             | Command::BeginProviderAuthentication { .. }
             | Command::SetProviderCredential { .. }

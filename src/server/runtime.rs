@@ -666,7 +666,181 @@ impl NativeServerRuntime {
                 request => request,
             }
         };
+        let mut request = request;
+        let skill_profile_error = if let nakode_server::ServerRequest::Command {
+            command:
+                Command::CreateSession {
+                    profile_id: Some(profile_id),
+                    disabled_skill_ids,
+                    ..
+                },
+            ..
+        } = &mut request
+        {
+            if profile_id.trim().is_empty() || profile_id.len() > 200 {
+                Some("profile_id must be non-empty and at most 200 bytes".to_owned())
+            } else {
+                match self
+                    .effects
+                    .persistence
+                    .sessions
+                    .list_skill_preferences(profile_id)
+                {
+                    Ok(preferences) => {
+                        *disabled_skill_ids = preferences
+                            .into_iter()
+                            .filter(|preference| !preference.enabled)
+                            .map(|preference| preference.skill_id)
+                            .collect();
+                        None
+                    }
+                    Err(error) => Some(format!(
+                        "could not load profile skill availability: {error}"
+                    )),
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(message) = skill_profile_error {
+            if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                let _ = respond.send(Err(ServiceError {
+                    code: ErrorCode::Internal,
+                    message,
+                    retryable: true,
+                }));
+            }
+            return;
+        }
         let request = match request {
+            nakode_server::ServerRequest::Query {
+                query:
+                    Query::ListSkills {
+                        workspace_id,
+                        profile_id,
+                    },
+                respond,
+                ..
+            } => {
+                let cursor = self.endpoint.cursor();
+                let current_workspace =
+                    crate::state::projection::workspace_id(&self.core.engine().state().workspace);
+                if workspace_id != current_workspace
+                    || profile_id.trim().is_empty()
+                    || profile_id.len() > 200
+                {
+                    let _ = respond.send(Err(ServiceError {
+                        code: ErrorCode::InvalidRequest,
+                        message: "workspace and a bounded profile_id are required".to_owned(),
+                        retryable: false,
+                    }));
+                    return;
+                }
+                let workspace = PathBuf::from(&self.core.engine().state().workspace);
+                let sessions = Arc::clone(&self.effects.persistence.sessions);
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| {
+                        let catalogue = crate::skill::SkillCatalog::load(&workspace)
+                            .map_err(|error| error.to_string())?;
+                        let preferences = sessions
+                            .list_skill_preferences(&profile_id)
+                            .map_err(|error| error.to_string())?;
+                        Ok::<_, String>(nakode_protocol::SkillCatalogueView {
+                            skills: catalogue
+                                .manageable(&preferences, &profile_id)
+                                .into_iter()
+                                .map(|skill| nakode_protocol::ManageableSkillView {
+                                    id: skill.id,
+                                    name: skill.name,
+                                    description: skill.description,
+                                    enabled: skill.enabled,
+                                    available: skill.available,
+                                })
+                                .collect(),
+                        })
+                    })()
+                    .map(|catalogue| Snapshot {
+                        cursor,
+                        value: QueryResult::Skills(catalogue),
+                    })
+                    .map_err(|message| ServiceError {
+                        code: ErrorCode::Internal,
+                        message,
+                        retryable: true,
+                    });
+                    let _ = respond.send(result);
+                });
+                return;
+            }
+            nakode_server::ServerRequest::Command {
+                command:
+                    Command::SetSkillEnabled {
+                        workspace_id,
+                        profile_id,
+                        skill_id,
+                        enabled,
+                    },
+                respond,
+                ..
+            } => {
+                let current_workspace =
+                    crate::state::projection::workspace_id(&self.core.engine().state().workspace);
+                if workspace_id != current_workspace
+                    || profile_id.trim().is_empty()
+                    || profile_id.len() > 200
+                    || skill_id.trim().is_empty()
+                    || skill_id.len() > 128
+                {
+                    let _ = respond.send(Err(ServiceError {
+                        code: ErrorCode::InvalidRequest,
+                        message: "workspace, profile_id, and stable skill_id are required"
+                            .to_owned(),
+                        retryable: false,
+                    }));
+                    return;
+                }
+                let workspace = PathBuf::from(&self.core.engine().state().workspace);
+                let sessions = Arc::clone(&self.effects.persistence.sessions);
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| {
+                        let catalogue = crate::skill::SkillCatalog::load(&workspace)
+                            .map_err(|error| error.to_string())?;
+                        let preferences = sessions
+                            .list_skill_preferences(&profile_id)
+                            .map_err(|error| error.to_string())?;
+                        let row = catalogue
+                            .manageable(&preferences, &profile_id)
+                            .into_iter()
+                            .find(|skill| skill.id == skill_id)
+                            .ok_or_else(|| {
+                                format!("skill identity {skill_id:?} is not installed or retained")
+                            })?;
+                        sessions
+                            .set_skill_preference(&crate::skill::SkillPreference {
+                                profile_id,
+                                skill_id: row.id.clone(),
+                                last_name: row.name,
+                                last_description: row.description,
+                                enabled,
+                            })
+                            .map_err(|error| error.to_string())?;
+                        Ok::<_, String>(nakode_protocol::CommandAccepted {
+                            resource_id: Some(row.id),
+                            revision: None,
+                            bridge_continuation: None,
+                            replayed_bridge_continuation: None,
+                            replayed_bridge_source_active: None,
+                        })
+                    })()
+                    .map_err(|message| ServiceError {
+                        code: ErrorCode::InvalidRequest,
+                        message,
+                        retryable: false,
+                    });
+                    let _ = respond.send(result);
+                });
+                return;
+            }
             nakode_server::ServerRequest::Query {
                 query:
                     Query::GetDiagnostics {
@@ -1649,6 +1823,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::QueuedPromptSteering,
             ServiceCapability::ArchetypeManagement,
             ServiceCapability::InvocationTelemetry,
+            ServiceCapability::SkillAvailability,
             ServiceCapability::SoulManagement,
             ServiceCapability::McpManagement,
             ServiceCapability::OrchestratorThreadBridge,
@@ -4258,6 +4433,8 @@ mod tests {
                     initial_instructions: None,
                     bridge: None,
                     mcp_grant: None,
+                    profile_id: None,
+                    disabled_skill_ids: Vec::new(),
                 },
             )
             .await

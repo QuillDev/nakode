@@ -79,6 +79,8 @@ mod tests {
             "RunShell",
             "SelectModel",
             "SetProviderModelFilter",
+            "ListSkills",
+            "SetSkillEnabled",
             "SetProviderEnabled",
             "BeginProviderAuthentication",
             "SetProviderCredential",

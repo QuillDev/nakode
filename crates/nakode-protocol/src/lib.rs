@@ -39,9 +39,9 @@ pub use mcp::{
     McpSessionGrant, McpSessionSurface, McpTemplateView, McpToolView,
 };
 pub use service::{
-    BridgeContinuationDisposition, CommandAccepted, Cursor, QueryResult, ServiceCapabilities,
-    ServiceCapability, SessionInventory, Snapshot, SoulDocumentView, SubscriptionScope,
-    SubscriptionView,
+    BridgeContinuationDisposition, CommandAccepted, Cursor, ManageableSkillView, QueryResult,
+    ServiceCapabilities, ServiceCapability, SessionInventory, SkillCatalogueView, Snapshot,
+    SoulDocumentView, SubscriptionScope, SubscriptionView,
 };
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,
