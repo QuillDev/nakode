@@ -59,7 +59,7 @@ pub struct ServiceStatus {
 }
 
 /// Server and API identity reported by a running service through `GetServerInfo`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ServerReport {
     pub server_version: String,
     pub api_version: String,
@@ -107,7 +107,7 @@ pub struct ExecutableIdentity {
 
 impl ExecutableIdentity {
     #[must_use]
-    fn same_build(&self, other: &Self) -> bool {
+    pub(crate) fn same_build(&self, other: &Self) -> bool {
         self.sha256 == other.sha256 && self.size == other.size
     }
 }
@@ -126,6 +126,9 @@ pub enum EndpointActivation {
 pub struct FrontendEndpoint {
     pub workspace: PathBuf,
     pub endpoint: PathBuf,
+    /// Installation-scoped activation status endpoint. It may be helper-owned while `endpoint`
+    /// remains owned by an older API-compatible service.
+    pub activation_endpoint: PathBuf,
     pub lifecycle_socket: PathBuf,
     pub cli: ExecutableIdentity,
     pub service: ServiceRuntimeRecord,
@@ -158,6 +161,10 @@ pub struct ServicePaths {
     log: PathBuf,
     runtime: PathBuf,
     activation: PathBuf,
+    activation_api: PathBuf,
+    activation_journal: PathBuf,
+    activation_helper_lock: PathBuf,
+    activation_log: PathBuf,
 }
 
 impl ServicePaths {
@@ -192,6 +199,10 @@ impl ServicePaths {
             log: directory.join("service.log"),
             runtime: directory.join("service.json"),
             activation: directory.join("activation.lock"),
+            activation_api: directory.join("activation.sock"),
+            activation_journal: directory.join("activation.json"),
+            activation_helper_lock: directory.join("activation-helper.lock"),
+            activation_log: directory.join("activation.log"),
         }
     }
 
@@ -231,6 +242,30 @@ impl ServicePaths {
     #[must_use]
     pub fn activation(&self) -> &Path {
         &self.activation
+    }
+
+    /// Helper-owned `ActivationService` socket while activation is pending.
+    #[must_use]
+    pub fn activation_api(&self) -> &Path {
+        &self.activation_api
+    }
+
+    /// Durable, versioned deferred-activation journal.
+    #[must_use]
+    pub fn activation_journal(&self) -> &Path {
+        &self.activation_journal
+    }
+
+    /// Long-lived singleton lease owned by the installed activation helper.
+    #[must_use]
+    pub fn activation_helper_lock(&self) -> &Path {
+        &self.activation_helper_lock
+    }
+
+    /// Captured output from the detached activation helper.
+    #[must_use]
+    pub fn activation_log(&self) -> &Path {
+        &self.activation_log
     }
 }
 
@@ -385,6 +420,9 @@ enum LifecycleRequest {
     Ping,
     Shutdown,
     QuiesceShutdown,
+    ForceShutdown {
+        expected: Vec<crate::server::runtime::QuiescenceBlocker>,
+    },
     Transport {
         name: String,
         action: TransportAction,
@@ -435,6 +473,11 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
         "workspace gRPC listener lease",
     ))?;
     let endpoint = handle.endpoint().clone();
+    let service_executable =
+        std::env::current_exe().map_err(|source| ControlError::ExecutableIdentity {
+            path: "current executable".to_owned(),
+            source,
+        })?;
     let transports = TransportSupervisor::default();
     let mut lifecycle = tokio::spawn(run_lifecycle_listener(
         lifecycle_listener,
@@ -447,6 +490,8 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
         grpc_listener,
         grpc_path.clone(),
         endpoint,
+        paths.clone(),
+        service_executable,
     ));
     let mut actor = tokio::spawn(runtime.run());
     transports.autostart().await;
@@ -572,6 +617,26 @@ async fn handle_lifecycle_connection(
                 message: "atomic quiescent shutdown is unavailable".to_owned(),
             },
         },
+        LifecycleRequest::ForceShutdown { expected } => match runtime {
+            Some(runtime) => {
+                match tokio::time::timeout(Duration::from_secs(3), runtime.force_quiesce(expected))
+                    .await
+                {
+                    Ok(Ok(())) => {
+                        should_shutdown = true;
+                        LifecycleResponse::Ok
+                    }
+                    Ok(Err(message)) => LifecycleResponse::Error { message },
+                    Err(_) => LifecycleResponse::Error {
+                        message: "timed out while atomically comparing the activation blockers"
+                            .to_owned(),
+                    },
+                }
+            }
+            None => LifecycleResponse::Error {
+                message: "conditional activation is unavailable".to_owned(),
+            },
+        },
         LifecycleRequest::Transport { name, action } => {
             match transports.control(&name, action).await {
                 Ok(status) => LifecycleResponse::Transport { status },
@@ -599,10 +664,15 @@ async fn run_grpc_listener(
     listener: UnixListener,
     _path: PathBuf,
     endpoint: nakode_server::ServerEndpoint,
+    paths: ServicePaths,
+    executable: PathBuf,
 ) -> Result<(), ControlError> {
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     tonic::transport::Server::builder()
         .add_service(nakode_server::grpc::GrpcService::new(endpoint).into_server())
+        .add_service(
+            crate::activation::ActivationGrpcService::read_only(paths, executable).into_server(),
+        )
         .serve_with_incoming(incoming)
         .await?;
     Ok(())
@@ -704,7 +774,7 @@ fn publish_runtime_record(runtime_path: &Path, workspace: &Path) {
 
 /// Writes a file that only the desktop user can read, matching the sockets and
 /// log it sits beside.
-fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
@@ -732,7 +802,7 @@ fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     }
 }
 
-fn read_runtime_record(runtime_path: &Path) -> Option<ServiceRuntimeRecord> {
+pub(crate) fn read_runtime_record(runtime_path: &Path) -> Option<ServiceRuntimeRecord> {
     let encoded = std::fs::read(runtime_path).ok()?;
     serde_json::from_slice(&encoded).ok()
 }
@@ -741,7 +811,7 @@ fn read_runtime_record(runtime_path: &Path) -> Option<ServiceRuntimeRecord> {
 ///
 /// The service calls this once while acquiring its installation lease. Connectors compute it for the
 /// executable they are about to spawn. No running process ever re-hashes a path after publication.
-fn executable_identity(path: &Path) -> Result<ExecutableIdentity, ControlError> {
+pub(crate) fn executable_identity(path: &Path) -> Result<ExecutableIdentity, ControlError> {
     use std::io::Read;
 
     let canonical =
@@ -818,7 +888,7 @@ pub fn service_runtime_record(paths: &ServicePaths) -> Option<ServiceRuntimeReco
 /// Confirm with a second probe: a live listener stays connectable, while a released one refuses the
 /// retry. Only a failing connect can classify a socket as dead, so this never steals the path from
 /// a busy server.
-async fn socket_is_live(path: &Path) -> bool {
+pub(crate) async fn socket_is_live(path: &Path) -> bool {
     if UnixStream::connect(path).await.is_err() {
         return false;
     }
@@ -826,7 +896,7 @@ async fn socket_is_live(path: &Path) -> bool {
     UnixStream::connect(path).await.is_ok()
 }
 
-async fn bind_service_listener(path: &Path) -> Result<UnixListener, ControlError> {
+pub(crate) async fn bind_service_listener(path: &Path) -> Result<UnixListener, ControlError> {
     if path.exists() {
         if socket_is_live(path).await {
             return Err(ControlError::AlreadyRunning(path.display().to_string()));
@@ -977,7 +1047,7 @@ fn service_command(executable: &Path, config: &Config) -> tokio::process::Comman
 /// descriptors onto the same appending file description, so the two streams
 /// interleave in write order instead of overwriting each other. A workspace
 /// whose log cannot be opened still gets a service; it only loses `nakode logs`.
-fn capture_service_output(command: &mut tokio::process::Command, log: &Path) {
+pub(crate) fn capture_service_output(command: &mut tokio::process::Command, log: &Path) {
     match open_service_log(log) {
         Ok((log, output, errors)) => {
             command
@@ -1007,7 +1077,7 @@ fn open_service_log(log: &Path) -> Result<(PathBuf, Stdio, Stdio), ControlError>
 }
 
 #[cfg(unix)]
-fn detach_service_process(command: &mut tokio::process::Command) {
+pub(crate) fn detach_service_process(command: &mut tokio::process::Command) {
     use std::os::unix::process::CommandExt;
 
     // SAFETY: `setsid` is a single async-signal-safe system call. The closure
@@ -1022,7 +1092,7 @@ fn detach_service_process(command: &mut tokio::process::Command) {
 }
 
 #[cfg(windows)]
-fn detach_service_process(command: &mut tokio::process::Command) {
+pub(crate) fn detach_service_process(command: &mut tokio::process::Command) {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -1033,7 +1103,7 @@ fn detach_service_process(command: &mut tokio::process::Command) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn detach_service_process(_command: &mut tokio::process::Command) {}
+pub(crate) fn detach_service_process(_command: &mut tokio::process::Command) {}
 
 fn service_arguments(config: &Config) -> Vec<OsString> {
     let mut arguments = vec![
@@ -1082,13 +1152,13 @@ fn service_configuration_fingerprint(config: &Config) -> String {
     format!("{:x}", digest.finalize())
 }
 
-struct ActivationLease {
+pub(crate) struct ActivationLease {
     path: PathBuf,
     owner: String,
 }
 
 impl ActivationLease {
-    async fn acquire(path: &Path) -> Result<Self, ControlError> {
+    pub(crate) async fn acquire(path: &Path) -> Result<Self, ControlError> {
         use std::io::Write;
 
         for _ in 0..ACTIVATION_LOCK_ATTEMPTS {
@@ -1162,7 +1232,7 @@ fn activation_lock_owner_is_abandoned(owner: Option<&str>) -> bool {
 }
 
 #[cfg(unix)]
-fn activation_owner_is_alive(pid: u32) -> bool {
+pub(crate) fn activation_owner_is_alive(pid: u32) -> bool {
     use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 
     let Ok(pid) = i32::try_from(pid) else {
@@ -1175,7 +1245,7 @@ fn activation_owner_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn activation_owner_is_alive(_pid: u32) -> bool {
+pub(crate) fn activation_owner_is_alive(_pid: u32) -> bool {
     false
 }
 
@@ -1235,7 +1305,7 @@ pub async fn frontend_api_endpoint_report(
     let config = &config;
     let paths = ServicePaths::of(config)?;
     let cli = executable_identity(executable)?;
-    let _activation_lease = match ActivationLease::acquire(paths.activation()).await {
+    let activation_lease = match ActivationLease::acquire(paths.activation()).await {
         Ok(lease) => lease,
         Err(error) => {
             let record = read_runtime_record(paths.runtime());
@@ -1258,6 +1328,7 @@ pub async fn frontend_api_endpoint_report(
         let old_record = read_runtime_record(paths.runtime());
         let old_server = server_report(paths.api()).await;
         if service_can_be_reused(old_record.as_ref(), &cli, old_server.as_ref()) {
+            drop(activation_lease);
             return verified_frontend_endpoint(
                 &paths,
                 &config.workspace,
@@ -1268,10 +1339,19 @@ pub async fn frontend_api_endpoint_report(
             .await;
         }
 
-        return activate_stale_service(&paths, executable, config, cli, old_record).await;
+        return activate_stale_service(
+            &paths,
+            executable,
+            config,
+            cli,
+            old_record,
+            activation_lease,
+        )
+        .await;
     }
 
     ensure_api_service(&paths, executable, config).await?;
+    drop(activation_lease);
     verified_frontend_endpoint(
         &paths,
         &config.workspace,
@@ -1288,6 +1368,7 @@ async fn activate_stale_service(
     config: &Config,
     cli: ExecutableIdentity,
     old_record: Option<ServiceRuntimeRecord>,
+    activation_lease: ActivationLease,
 ) -> Result<FrontendEndpoint, ControlError> {
     let old_server = server_report(paths.api()).await;
     ensure_stale_service_is_quiescent(paths.api(), &config.workspace)
@@ -1330,6 +1411,7 @@ async fn activate_stale_service(
         )
         .await);
     }
+    drop(activation_lease);
     verified_frontend_endpoint(
         paths,
         &config.workspace,
@@ -1386,7 +1468,7 @@ pub async fn frontend_api_endpoint(
         .endpoint)
 }
 
-async fn wait_for_api(api_path: &Path, workspace: &Path) -> Result<(), ControlError> {
+pub(crate) async fn wait_for_api(api_path: &Path, workspace: &Path) -> Result<(), ControlError> {
     for _ in 0..SERVICE_START_ATTEMPTS {
         if api_ready(api_path, workspace).await {
             return Ok(());
@@ -1425,9 +1507,29 @@ async fn verified_frontend_endpoint(
             "the ready service is neither the invoking CLI build nor API-compatible",
         )));
     }
+    let installed_is_running = service
+        .executable
+        .as_ref()
+        .is_some_and(|running| running.same_build(&cli));
+    let activation_endpoint = if installed_is_running {
+        crate::activation::observe_current_service(paths, &cli, &service, server.as_ref())
+            .await
+            .map_err(|error| ControlError::ServiceRejected(error.to_string()))?;
+        paths.api().to_path_buf()
+    } else {
+        crate::activation::schedule_deferred_activation(
+            paths,
+            &cli.path,
+            "installed binary is waiting for the API-compatible running service to become quiescent",
+        )
+        .await
+        .map_err(|error| ControlError::ServiceRejected(error.to_string()))?;
+        paths.activation_api().to_path_buf()
+    };
     Ok(FrontendEndpoint {
         workspace: workspace.to_path_buf(),
         endpoint: paths.api().to_path_buf(),
+        activation_endpoint,
         lifecycle_socket: paths.lifecycle().to_path_buf(),
         cli,
         service,
@@ -1473,7 +1575,7 @@ async fn ensure_stale_service_is_quiescent(
         .map_err(|_| "timed out while proving that the stale service has no live work".to_owned())?
 }
 
-fn session_has_live_work(session: &nakode_sdk::v1::SessionState) -> bool {
+pub(crate) fn session_has_live_work(session: &nakode_sdk::v1::SessionState) -> bool {
     session.activity != nakode_sdk::v1::SessionActivity::Idle as i32 || !session.queue.is_empty()
 }
 
@@ -1670,7 +1772,7 @@ pub async fn service_status(config: &Config) -> Result<ServiceStatus, ControlErr
 ///
 /// Status reporting must never bring a service up, so an unreachable or
 /// still-starting API is reported as absent rather than retried.
-async fn server_report(api_path: &Path) -> Option<ServerReport> {
+pub(crate) async fn server_report(api_path: &Path) -> Option<ServerReport> {
     let query = async {
         let client = nakode_sdk::NakodeClient::connect_unix(api_path.to_owned())
             .await
@@ -1768,8 +1870,24 @@ pub async fn restart_service(executable: &Path, config: &Config) -> Result<(), C
     restart_service_with_request(executable, config, LifecycleRequest::Shutdown).await
 }
 
-async fn restart_service_quiescent(executable: &Path, config: &Config) -> Result<(), ControlError> {
+pub(crate) async fn restart_service_quiescent(
+    executable: &Path,
+    config: &Config,
+) -> Result<(), ControlError> {
     restart_service_with_request(executable, config, LifecycleRequest::QuiesceShutdown).await
+}
+
+pub(crate) async fn restart_service_conditionally(
+    executable: &Path,
+    config: &Config,
+    expected: Vec<crate::server::runtime::QuiescenceBlocker>,
+) -> Result<(), ControlError> {
+    restart_service_with_request(
+        executable,
+        config,
+        LifecycleRequest::ForceShutdown { expected },
+    )
+    .await
 }
 
 async fn restart_service_with_request(
@@ -1859,8 +1977,9 @@ pub async fn restart_stale_services(
 ) -> Result<StaleServiceRefreshReport, ControlError> {
     let cli = executable_identity(executable)?;
     let control_root = control_directory()?;
+    let installation_workspace = installation_workspace()?;
     let singleton_directory =
-        workspace_runtime_directory_in(&control_root, &installation_workspace()?)?;
+        workspace_runtime_directory_in(&control_root, &installation_workspace)?;
     let directories = runtime_directories(&control_root)?;
     let mut report = StaleServiceRefreshReport::default();
     let mut candidates = Vec::new();
@@ -1876,10 +1995,14 @@ pub async fn restart_stale_services(
             report.current += 1;
             continue;
         }
-        let workspace = record
-            .as_ref()
-            .and_then(|record| record.workspace.clone())
-            .or_else(|| workspace_from_log(paths.log()));
+        let workspace = if is_singleton {
+            Some(installation_workspace.clone())
+        } else {
+            record
+                .as_ref()
+                .and_then(|record| record.workspace.clone())
+                .or_else(|| workspace_from_log(paths.log()))
+        };
         candidates.push((directory, workspace, is_singleton));
     }
 
@@ -1927,13 +2050,12 @@ enum StaleServiceRefreshOutcome {
     Failure(String),
 }
 
-async fn refresh_stale_service(
+async fn classify_stale_socket_state(
     executable: &Path,
-    directory: &Path,
-    workspace: Option<PathBuf>,
+    paths: &ServicePaths,
+    workspace: Option<&Path>,
     is_singleton: bool,
-) -> StaleServiceRefreshOutcome {
-    let paths = ServicePaths::in_directory(directory);
+) -> Option<StaleServiceRefreshOutcome> {
     let lifecycle_reachable = socket_is_live(paths.lifecycle()).await;
     let api_reachable = socket_is_live(paths.api()).await;
     match (lifecycle_reachable, api_reachable) {
@@ -1941,21 +2063,45 @@ async fn refresh_stale_service(
             let _ = std::fs::remove_file(paths.lifecycle());
             let _ = std::fs::remove_file(paths.api());
             let _ = std::fs::remove_file(paths.runtime());
-            return StaleServiceRefreshOutcome::Retired;
+            Some(StaleServiceRefreshOutcome::Retired)
         }
-        (false, false) => {
-            return StaleServiceRefreshOutcome::Inactive(stale_service_diagnostic(
-                &paths,
-                workspace.as_deref(),
-            ));
-        }
-        (true, true) => {}
+        (false, false) => Some(StaleServiceRefreshOutcome::Inactive(
+            stale_service_diagnostic(paths, workspace),
+        )),
+        (true, true) => None,
         _ => {
-            return StaleServiceRefreshOutcome::Unavailable(format!(
+            if is_singleton {
+                let reason = format!(
+                    "lifecycle_reachable={lifecycle_reachable} api_reachable={api_reachable}"
+                );
+                if let Err(error) =
+                    crate::activation::schedule_deferred_activation(paths, executable, reason).await
+                {
+                    return Some(StaleServiceRefreshOutcome::Failure(format!(
+                        "{}; could not schedule deferred activation: {error}",
+                        stale_service_diagnostic(paths, workspace)
+                    )));
+                }
+            }
+            Some(StaleServiceRefreshOutcome::Unavailable(format!(
                 "{} lifecycle_reachable={lifecycle_reachable} api_reachable={api_reachable}",
-                stale_service_diagnostic(&paths, workspace.as_deref())
-            ));
+                stale_service_diagnostic(paths, workspace)
+            )))
         }
+    }
+}
+
+async fn refresh_stale_service(
+    executable: &Path,
+    directory: &Path,
+    workspace: Option<PathBuf>,
+    is_singleton: bool,
+) -> StaleServiceRefreshOutcome {
+    let paths = ServicePaths::in_directory(directory);
+    if let Some(outcome) =
+        classify_stale_socket_state(executable, &paths, workspace.as_deref(), is_singleton).await
+    {
+        return outcome;
     }
     let Some(workspace) = workspace else {
         return StaleServiceRefreshOutcome::Unknown(stale_service_diagnostic(&paths, None));
@@ -1971,7 +2117,35 @@ async fn refresh_stale_service(
     };
     if let Err(reason) = ensure_stale_service_is_quiescent(paths.api(), &config.workspace).await {
         if reason.starts_with("live work is still owned") {
+            if is_singleton
+                && let Err(error) = crate::activation::schedule_deferred_activation(
+                    &paths,
+                    executable,
+                    reason.clone(),
+                )
+                .await
+            {
+                return StaleServiceRefreshOutcome::Failure(format!(
+                    "{}: installed successfully, but could not schedule deferred activation: {error}",
+                    workspace.display()
+                ));
+            }
             return StaleServiceRefreshOutcome::Active(workspace.display().to_string());
+        }
+        if is_singleton {
+            if let Err(error) =
+                crate::activation::schedule_deferred_activation(&paths, executable, reason.clone())
+                    .await
+            {
+                return StaleServiceRefreshOutcome::Failure(format!(
+                    "{}: {reason}; could not schedule deferred activation: {error}",
+                    workspace.display()
+                ));
+            }
+            return StaleServiceRefreshOutcome::Unavailable(format!(
+                "{}: {reason}",
+                workspace.display()
+            ));
         }
         return StaleServiceRefreshOutcome::Failure(format!("{}: {reason}", workspace.display()));
     }
@@ -2217,7 +2391,7 @@ fn installation_workspace() -> Result<PathBuf, ControlError> {
     std::fs::canonicalize(&workspace).map_err(|source| socket_error(&workspace, source))
 }
 
-fn installation_config(config: &Config) -> Result<Config, ControlError> {
+pub(crate) fn installation_config(config: &Config) -> Result<Config, ControlError> {
     let mut config = config.clone();
     config.workspace = installation_workspace()?;
     Ok(config)
@@ -2440,7 +2614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_refresh_reports_partly_reachable_runtime_as_unavailable() {
+    async fn stale_refresh_reports_partly_reachable_legacy_runtime_as_unavailable() {
         let directory = tempfile::tempdir().expect("runtime directory");
         let paths = ServicePaths::in_directory(directory.path());
         let lifecycle = std::os::unix::net::UnixListener::bind(paths.lifecycle())
@@ -2452,7 +2626,7 @@ mod tests {
             Path::new("/unused/nakode"),
             directory.path(),
             Some(workspace.clone()),
-            true,
+            false,
         )
         .await;
 

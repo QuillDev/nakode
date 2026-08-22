@@ -101,6 +101,10 @@ mod tests {
             "GetArtifact",
             "GetDiagnostics",
             "GetServerInfo",
+            "GetActivationStatus",
+            "WatchActivationStatus",
+            "ForceActivationRecheck",
+            "ForceActivate",
         ];
         assert_eq!(methods, required.into_iter().map(str::to_owned).collect());
     }

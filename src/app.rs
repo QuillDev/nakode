@@ -6,7 +6,7 @@ use std::{
 
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
-use nakode_sdk::{HydratedSession, NakodeClient, SdkError, Watch, v1 as api};
+use nakode_sdk::{HydratedSession, NakodeClient, SdkError, SessionAttachment, Watch, v1 as api};
 use thiserror::Error;
 use tokio::time::MissedTickBehavior;
 
@@ -46,7 +46,11 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let workspace_id = workspace.workspace_id.clone();
     let session_id = session.state.id.clone();
     let mut workspace_updates = client.watch_workspace(workspace_id);
-    let mut session_updates = client.watch_hydrated_session(session_id, config.scrollback);
+    let mut session_updates = client.watch_attached_hydrated_session(
+        session_id,
+        config.scrollback,
+        SessionAttachment::default(),
+    );
 
     let mut bootstrap = api_projection::workspace(workspace).map_err(AppError::Projection)?;
     bootstrap.active_session = None;
@@ -249,7 +253,11 @@ async fn run_loop(context: RunLoopContext<'_>) -> Result<(), AppError> {
                 .await?;
             host.install_session(hydrated)
                 .map_err(AppError::Projection)?;
-            *session_updates = client.watch_hydrated_session(session_id.to_string(), scrollback);
+            *session_updates = client.watch_attached_hydrated_session(
+                session_id.to_string(),
+                scrollback,
+                SessionAttachment::default(),
+            );
             session_watch_open = true;
             dirty = true;
         }

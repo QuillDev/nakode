@@ -299,6 +299,8 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
         program: PathBuf::from("python3"),
         args: vec![
             OsString::from(fixture),
+            OsString::from("--gate-root"),
+            gate_dir.path().as_os_str().to_owned(),
             OsString::from("--init-gate"),
             gate.clone().into_os_string(),
         ],
@@ -323,7 +325,19 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
             enabled_skill_ids: Vec::new(),
         })
         .await?;
-    let mut gate_writer = open_gate_writer(&gate).await?;
+    let mut gate_writer = match open_gate_writer(&gate).await {
+        Ok(writer) => writer,
+        Err(error) => {
+            let diagnostic = timeout(Duration::from_secs(1), backend.events.recv())
+                .await
+                .ok()
+                .flatten();
+            return Err(format!(
+                "{error}; backend event after initialization-gate failure: {diagnostic:?}"
+            )
+            .into());
+        }
+    };
     gate_writer.write_all(b"1")?;
     drop(gate_writer);
 

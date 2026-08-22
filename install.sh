@@ -284,12 +284,13 @@ fi
 # replacement. Refresh every idle stale workspace service only after the new
 # executable is in place. The helper is invoked by explicit path so this works
 # even when the caller is still running the previous Nakode binary.
-printf '%s\n' 'Refreshing stale Nakode services...'
+printf '%s\n' 'Activating idle Nakode services or scheduling safe deferred activation...'
 "$destination" restart-stale ||
-  printf '%s\n' 'Nakode installed, but stale workspace services could not be refreshed.' >&2
+  printf '%s\n' 'Nakode installed, but running-service activation could not be started; run nakode endpoint for diagnostics.' >&2
 
-printf '\nInstalled %s\n' "$destination"
+printf '\nInstalled binary %s\n' "$destination"
 printf '%s\n' "$built_version"
+printf '%s\n' 'Running-service activation may be immediate or safely deferred while live work finishes.'
 
 case ":${PATH:-}:" in
   *:"$bin_directory":*) ;;

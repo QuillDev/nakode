@@ -94,6 +94,136 @@ service NakodeService {
   rpc GetServerInfo(google.protobuf.Empty) returns (ServerInfo);
 }
 
+// ActivationService is the installation-scoped update activation boundary. While an older
+// API-compatible Nakode service owns live work, the newly installed helper serves this service on a
+// separate Unix socket. After cutover, the current Nakode service serves the same contract.
+service ActivationService {
+  rpc GetActivationStatus(GetActivationStatusRequest) returns (ActivationStatus);
+  rpc WatchActivationStatus(WatchActivationStatusRequest) returns (stream ActivationStatus);
+  rpc ForceActivationRecheck(ActivationMutationRequest) returns (ActivationStatus);
+  // Available only when the running service advertises ConditionalActivationForce. The running
+  // service atomically compares and fences the exact blocker identity/revision set before shutdown.
+  rpc ForceActivate(ForceActivateRequest) returns (ActivationStatus);
+}
+
+message GetActivationStatusRequest {}
+message WatchActivationStatusRequest {
+  optional uint64 after_revision = 1;
+  // Revisions restart for each durable activation attempt. Supplying both fields prevents a new
+  // lower-revision attempt from being hidden by a watch that began during the prior attempt.
+  string after_attempt_id = 2;
+}
+message ActivationMutationRequest {
+  // Stable across retries of one logical operation. Nakode replays both accepted status and a
+  // durably recorded rejection, including an execution failure returned after initial acceptance.
+  string idempotency_key = 1;
+}
+message ForceActivateRequest {
+  // Stable across retries of one logical destructive request; see ActivationMutationRequest.
+  string idempotency_key = 1;
+  uint64 expected_activation_revision = 2;
+  repeated ActivationBlocker expected_blockers = 3;
+  // Revisions are attempt-local, so destructive confirmation must also fence the durable attempt.
+  string expected_attempt_id = 4;
+}
+
+enum ActivationPhase {
+  ACTIVATION_PHASE_UNSPECIFIED = 0;
+  ACTIVATION_PHASE_CURRENT = 1;
+  ACTIVATION_PHASE_INSTALLED_PENDING = 2;
+  ACTIVATION_PHASE_CHECKING = 3;
+  ACTIVATION_PHASE_BLOCKED = 4;
+  ACTIVATION_PHASE_ACTIVATING = 5;
+  ACTIVATION_PHASE_FORCING = 6;
+  ACTIVATION_PHASE_ACTIVATED = 7;
+  ACTIVATION_PHASE_FAILED = 8;
+  ACTIVATION_PHASE_CANCELLED = 9;
+}
+
+enum ActivationCheckTrigger {
+  ACTIVATION_CHECK_TRIGGER_UNSPECIFIED = 0;
+  ACTIVATION_CHECK_TRIGGER_INSTALLED = 1;
+  ACTIVATION_CHECK_TRIGGER_SCHEDULED = 2;
+  ACTIVATION_CHECK_TRIGGER_MANUAL = 3;
+  ACTIVATION_CHECK_TRIGGER_FORCED = 4;
+  ACTIVATION_CHECK_TRIGGER_RECOVERED = 5;
+}
+
+enum ActivationCheckResult {
+  ACTIVATION_CHECK_RESULT_UNSPECIFIED = 0;
+  ACTIVATION_CHECK_RESULT_BLOCKED = 1;
+  ACTIVATION_CHECK_RESULT_ACTIVATED = 2;
+  ACTIVATION_CHECK_RESULT_FAILED = 3;
+  ACTIVATION_CHECK_RESULT_CANCELLED = 4;
+}
+
+message ActivationExecutableIdentity {
+  string path = 1;
+  string sha256 = 2;
+  uint64 size = 3;
+  optional uint64 modified_at_unix_ms = 4;
+  optional string device = 5;
+  optional string inode = 6;
+  string version = 7;
+}
+
+message ActivationRunningService {
+  uint32 pid = 1;
+  uint64 started_at_unix_ms = 2;
+  string version = 3;
+  optional ActivationExecutableIdentity executable = 4;
+  optional string api_version = 5;
+  repeated string capabilities = 6;
+}
+
+message ActivationHelperIdentity {
+  uint32 pid = 1;
+  string instance_id = 2;
+  uint64 started_at_unix_ms = 3;
+  uint64 heartbeat_at_unix_ms = 4;
+}
+
+message ActivationBlocker {
+  string session_id = 1;
+  string title = 2;
+  uint64 session_revision = 3;
+  SessionActivity activity = 4;
+  uint32 queue_count = 5;
+  repeated string reasons = 6;
+}
+
+message ActivationCheckRecord {
+  uint64 sequence = 1;
+  ActivationCheckTrigger trigger = 2;
+  uint64 started_at_unix_ms = 3;
+  uint64 finished_at_unix_ms = 4;
+  ActivationCheckResult result = 5;
+  uint32 blocker_count = 6;
+  string detail = 7;
+}
+
+message ActivationFailure {
+  string message = 1;
+  bool retryable = 2;
+}
+
+message ActivationStatus {
+  uint32 schema_version = 1;
+  string attempt_id = 2;
+  uint64 revision = 3;
+  ActivationPhase phase = 4;
+  ActivationExecutableIdentity installed = 5;
+  optional ActivationRunningService running = 6;
+  optional ActivationHelperIdentity helper = 7;
+  uint64 cadence_ms = 8;
+  optional uint64 last_check_at_unix_ms = 9;
+  optional uint64 next_check_at_unix_ms = 10;
+  repeated ActivationBlocker blockers = 11;
+  repeated ActivationCheckRecord history = 12;
+  optional ActivationFailure failure = 13;
+  bool supports_force = 14;
+}
+
 message MutationOptions {
   // SDK-generated and stable across a retry of one logical operation.
   string idempotency_key = 1;

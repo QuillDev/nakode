@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod agent;
 pub mod agent_cli;
 pub(crate) mod api_projection;

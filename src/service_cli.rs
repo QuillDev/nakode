@@ -81,7 +81,9 @@ pub async fn restart_stale() -> Result<(), ControlError> {
         report.failures.len()
     );
     for workspace in report.active {
-        eprintln!("nakode: left active stale service running: {workspace}");
+        eprintln!(
+            "nakode: installed update pending activation; left live stale service running safely: {workspace}"
+        );
     }
     for detail in report.inactive {
         eprintln!(
@@ -159,10 +161,30 @@ pub async fn endpoint(config: &Config) -> Result<(), ControlError> {
         "transport": "grpc+unix",
         "workspace": report.workspace,
         "endpoint": report.endpoint,
+        "activation_endpoint": report.activation_endpoint,
         "lifecycle_endpoint": report.lifecycle_socket,
         "cli": report.cli,
         "service": report.service,
         "server": report.server,
+        "activation": report.activation,
+    });
+    println!("{}", serde_json::to_string(&descriptor)?);
+    Ok(())
+}
+
+/// Prints the installation-scoped public activation endpoint descriptor.
+///
+/// # Errors
+/// Returns an error when endpoint discovery cannot verify the service/helper owners.
+pub async fn activation_endpoint(config: &Config) -> Result<(), ControlError> {
+    let executable = current_executable()?;
+    let report = control_service::frontend_api_endpoint_report(&executable, config).await?;
+    let descriptor = serde_json::json!({
+        "version": 1,
+        "transport": "grpc+unix",
+        "workspace": report.workspace,
+        "endpoint": report.activation_endpoint,
+        "service_endpoint": report.endpoint,
         "activation": report.activation,
     });
     println!("{}", serde_json::to_string(&descriptor)?);

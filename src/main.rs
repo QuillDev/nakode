@@ -1,6 +1,6 @@
 use clap::CommandFactory;
 use nakode::{
-    agent_cli, app,
+    activation, agent_cli, app,
     config::{Config, NakodeCommand},
     diagnostics, purge, service_cli, tui_eval, update,
 };
@@ -49,6 +49,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NakodeCommand::Status { json } => service_cli::status(&config, json).await?,
         NakodeCommand::Logs { follow, lines } => service_cli::logs(&config, follow, lines).await?,
         NakodeCommand::Endpoint => service_cli::endpoint(&config).await?,
+        NakodeCommand::ActivationEndpoint => service_cli::activation_endpoint(&config).await?,
+        NakodeCommand::ActivationHelper => activation::run_helper(config).await?,
         NakodeCommand::Diagnostics {
             days,
             sessions,

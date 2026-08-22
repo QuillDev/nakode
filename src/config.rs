@@ -136,6 +136,12 @@ pub enum NakodeCommand {
     /// Print the private gRPC endpoint used by native frontends.
     #[command(hide = true)]
     Endpoint,
+    /// Print the public activation-status gRPC endpoint selected for this installation.
+    #[command(hide = true)]
+    ActivationEndpoint,
+    /// Run the detached deferred-activation singleton.
+    #[command(hide = true)]
+    ActivationHelper,
     /// Report persisted token, cache, session, and tool telemetry without prompt content.
     Diagnostics {
         /// Number of days of telemetry to include.

@@ -78,7 +78,9 @@ fn run_from(source: &Path) -> Result<(), UpdateError> {
         return Err(UpdateError::InstallerFailed(status));
     }
 
-    println!("Nakode is up to date.");
+    println!(
+        "Nakode update installation completed. Running-service activation is reported separately."
+    );
     Ok(())
 }
 
