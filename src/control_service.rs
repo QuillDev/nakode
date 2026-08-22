@@ -478,6 +478,11 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
             path: "current executable".to_owned(),
             source,
         })?;
+    let remote_config = crate::remote::load()
+        .map_err(|error| ControlError::ServiceRejected(error.to_string()))?
+        .filter(|value| value.enabled);
+    let server_id = crate::remote::installation_server_id()
+        .map_err(|error| ControlError::ServiceRejected(error.to_string()))?;
     let transports = TransportSupervisor::default();
     let mut lifecycle = tokio::spawn(run_lifecycle_listener(
         lifecycle_listener,
@@ -489,16 +494,20 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
     let mut grpc = tokio::spawn(run_grpc_listener(
         grpc_listener,
         grpc_path.clone(),
-        endpoint,
+        endpoint.clone(),
         paths.clone(),
         service_executable,
+        server_id.clone(),
     ));
+    let mut remote_grpc =
+        tokio::spawn(run_remote_grpc_listener(remote_config, endpoint, server_id));
     let mut actor = tokio::spawn(runtime.run());
     transports.autostart().await;
 
     let result = tokio::select! {
         result = &mut lifecycle => flatten_component(result, "lifecycle listener"),
         result = &mut grpc => flatten_component(result, "gRPC listener"),
+        result = &mut remote_grpc => flatten_component(result, "remote gRPC listener"),
         result = &mut actor => match result {
             Ok(()) => Err(ControlError::ComponentStopped("native runtime")),
             Err(_) => Err(ControlError::ComponentStopped("native runtime task")),
@@ -514,6 +523,7 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
     handle.shutdown().await;
     lifecycle.abort();
     grpc.abort();
+    remote_grpc.abort();
     transports.stop_all().await;
     if !actor.is_finished() {
         let _ = actor.await;
@@ -666,14 +676,46 @@ async fn run_grpc_listener(
     endpoint: nakode_server::ServerEndpoint,
     paths: ServicePaths,
     executable: PathBuf,
+    server_id: String,
 ) -> Result<(), ControlError> {
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     tonic::transport::Server::builder()
-        .add_service(nakode_server::grpc::GrpcService::new(endpoint).into_server())
+        .add_service(
+            nakode_server::grpc::GrpcService::new(endpoint)
+                .with_server_id(server_id)
+                .into_server(),
+        )
         .add_service(
             crate::activation::ActivationGrpcService::read_only(paths, executable).into_server(),
         )
         .serve_with_incoming(incoming)
+        .await?;
+    Ok(())
+}
+
+async fn run_remote_grpc_listener(
+    config: Option<crate::remote::RemoteConfig>,
+    endpoint: nakode_server::ServerEndpoint,
+    server_id: String,
+) -> Result<(), ControlError> {
+    let Some(config) = config else {
+        std::future::pending::<()>().await;
+        return Ok(());
+    };
+    let identity = tonic::transport::Identity::from_pem(
+        config.certificate_pem.as_bytes(),
+        config.private_key_pem.as_bytes(),
+    );
+    let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+    eprintln!("nakode remote API listening at {}", config.bind);
+    tonic::transport::Server::builder()
+        .tls_config(tls)?
+        .add_service(
+            nakode_server::grpc::GrpcService::new(endpoint)
+                .with_server_id(server_id)
+                .into_authenticated_server(config.api_key),
+        )
+        .serve(config.bind)
         .await?;
     Ok(())
 }

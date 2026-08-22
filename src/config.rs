@@ -142,6 +142,11 @@ pub enum NakodeCommand {
     /// Run the detached deferred-activation singleton.
     #[command(hide = true)]
     ActivationHelper,
+    /// Configure authenticated remote client access.
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
     /// Report persisted token, cache, session, and tool telemetry without prompt content.
     Diagnostics {
         /// Number of days of telemetry to include.
@@ -192,6 +197,26 @@ pub enum NakodeCommand {
         /// Terminal height in cells.
         #[arg(long, default_value_t = 28, value_parser = clap::value_parser!(u16).range(8..))]
         height: u16,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum RemoteAction {
+    /// Enable TLS remote access and generate a new API key.
+    Enable {
+        /// TCP address the service will listen on after restart.
+        #[arg(long, default_value = "127.0.0.1:7342")]
+        bind: std::net::SocketAddr,
+    },
+    /// Disable the remote listener after restart.
+    Disable,
+    /// Revoke the current client key and print its replacement.
+    RegenerateKey,
+    /// Print non-secret remote listener status.
+    Status {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 

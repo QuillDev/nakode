@@ -10,6 +10,7 @@ import "google/protobuf/empty.proto";
 // Watch methods emit authoritative replacement snapshots, not reducer events.
 service NakodeService {
   rpc GetWorkspace(GetWorkspaceRequest) returns (WorkspaceSnapshot);
+  rpc InspectWorkspacePath(InspectWorkspacePathRequest) returns (WorkspacePathInspection);
   rpc WatchWorkspace(WatchWorkspaceRequest) returns (stream WorkspaceSnapshot);
   rpc ReloadWorkspace(ReloadWorkspaceRequest) returns (MutationResult);
   // Reads and atomically persists Nakode's single configured SOUL.md. Existing provider sessions
@@ -239,9 +240,26 @@ message MutationResult {
 }
 
 message Cursor { string server_epoch = 1; uint64 sequence = 2; }
-message ServerInfo { string server_version = 1; string api_version = 2; repeated string capabilities = 3; }
+message ServerInfo {
+  string server_version = 1;
+  string api_version = 2;
+  repeated string capabilities = 3;
+  // Stable identity of this Nakode installation, used to detect endpoint replacement.
+  string server_id = 4;
+}
 
 message GetWorkspaceRequest { string workspace = 1; optional string session_id = 2; }
+message InspectWorkspacePathRequest {
+  string path = 1;
+  optional string expected_git_repository = 2;
+}
+message WorkspacePathInspection {
+  string canonical_path = 1;
+  optional string git_repository = 2;
+  optional string branch = 3;
+  optional string revision = 4;
+  bool dirty = 5;
+}
 // `after` is a resume hint. The server may always answer with a newer full
 // replacement snapshot, so clients never need to reduce replay events.
 message WatchWorkspaceRequest { string workspace_id = 1; optional Cursor after = 2; }

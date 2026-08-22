@@ -21,7 +21,11 @@ use nakode_api::v1::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, Endpoint};
+use tonic::{
+    metadata::AsciiMetadataValue,
+    service::{Interceptor, interceptor::InterceptedService},
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
+};
 use tower::service_fn;
 
 pub use nakode_api::v1;
@@ -103,11 +107,32 @@ pub struct SessionAttachment {
     pub profile_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ClientApiKey {
+    authorization: Option<AsciiMetadataValue>,
+}
+
+impl Interceptor for ClientApiKey {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(value) = &self.authorization {
+            request
+                .metadata_mut()
+                .insert("authorization", value.clone());
+        }
+        Ok(request)
+    }
+}
+
+type ApiTransport = InterceptedService<Channel, ClientApiKey>;
+
 /// Cloneable high-level client. A clone shares the reconnecting HTTP/2
 /// channel but each request and watch has independent generated client state.
 #[derive(Clone)]
 pub struct NakodeClient {
-    transport: NakodeServiceClient<Channel>,
+    transport: NakodeServiceClient<ApiTransport>,
 }
 
 /// Attempt-qualified activation watch cursor. Revisions are monotonic only within one activation
@@ -411,7 +436,37 @@ impl NakodeClient {
             }))
             .await?;
         Ok(Self {
-            transport: configured_transport(channel),
+            transport: configured_transport(channel, ClientApiKey::default()),
+        })
+    }
+
+    /// Connects to an authenticated TLS Nakode endpoint.
+    ///
+    /// # Errors
+    /// Returns when TLS setup, endpoint connection, or API-key metadata is invalid.
+    pub async fn connect_remote(
+        endpoint: impl AsRef<str>,
+        ca_certificate_pem: impl AsRef<[u8]>,
+        tls_server_name: impl Into<String>,
+        api_key: impl AsRef<str>,
+    ) -> Result<Self, SdkError> {
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca_certificate_pem))
+            .domain_name(tls_server_name.into());
+        let channel = Endpoint::from_shared(endpoint.as_ref().to_owned())?
+            .tls_config(tls)?
+            .connect()
+            .await?;
+        let authorization = format!("Bearer {}", api_key.as_ref())
+            .parse()
+            .map_err(|_| SdkError::InvalidProjection("invalid remote API key".to_owned()))?;
+        Ok(Self {
+            transport: configured_transport(
+                channel,
+                ClientApiKey {
+                    authorization: Some(authorization),
+                },
+            ),
         })
     }
 
@@ -428,8 +483,28 @@ impl NakodeClient {
     #[must_use]
     pub fn from_channel(channel: Channel) -> Self {
         Self {
-            transport: configured_transport(channel),
+            transport: configured_transport(channel, ClientApiKey::default()),
         }
+    }
+
+    /// Validates and describes one executable path on the server machine without creating a session.
+    ///
+    /// # Errors
+    /// Returns a transport or server validation error.
+    pub async fn inspect_workspace_path(
+        &self,
+        path: impl Into<String>,
+        expected_git_repository: Option<String>,
+    ) -> Result<api::WorkspacePathInspection, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .inspect_workspace_path(api::InspectWorkspacePathRequest {
+                path: path.into(),
+                expected_git_repository,
+            })
+            .await?
+            .into_inner())
     }
 
     /// Returns authoritative workspace state.
@@ -1771,8 +1846,11 @@ impl NakodeClient {
     }
 }
 
-fn configured_transport(channel: Channel) -> NakodeServiceClient<Channel> {
-    NakodeServiceClient::new(channel)
+fn configured_transport(
+    channel: Channel,
+    interceptor: ClientApiKey,
+) -> NakodeServiceClient<ApiTransport> {
+    NakodeServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
         .max_encoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
 }

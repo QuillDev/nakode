@@ -1,8 +1,8 @@
 use clap::CommandFactory;
 use nakode::{
     activation, agent_cli, app,
-    config::{Config, NakodeCommand},
-    diagnostics, purge, service_cli, tui_eval, update,
+    config::{Config, NakodeCommand, RemoteAction},
+    diagnostics, purge, remote, service_cli, tui_eval, update,
 };
 
 #[tokio::main]
@@ -51,6 +51,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NakodeCommand::Endpoint => service_cli::endpoint(&config).await?,
         NakodeCommand::ActivationEndpoint => service_cli::activation_endpoint(&config).await?,
         NakodeCommand::ActivationHelper => activation::run_helper(config).await?,
+        NakodeCommand::Remote { action } => run_remote(&action)?,
         NakodeCommand::Diagnostics {
             days,
             sessions,
@@ -102,6 +103,58 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             unreachable!("deprecated service actions are rewritten before dispatch")
         }
         NakodeCommand::Update => unreachable!("update commands return before dispatch"),
+    }
+    Ok(())
+}
+
+fn run_remote(action: &RemoteAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        RemoteAction::Enable { bind } => {
+            let configured = remote::enable(*bind)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&remote::public_connection(&configured))?
+            );
+            eprintln!("Restart Nakode to apply the remote listener configuration.");
+        }
+        RemoteAction::Disable => {
+            remote::disable()?;
+            println!("Nakode remote access disabled. Restart Nakode to apply.");
+        }
+        RemoteAction::RegenerateKey => {
+            let configured = remote::regenerate_key()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&remote::public_connection(&configured))?
+            );
+            eprintln!("Restart Nakode to revoke the previous key.");
+        }
+        RemoteAction::Status { json } => {
+            let configured = remote::load()?;
+            if *json {
+                let value = configured.as_ref().map_or_else(
+                    || serde_json::json!({"enabled": false}),
+                    |value| {
+                        serde_json::json!({
+                            "enabled": value.enabled,
+                            "bind": value.bind,
+                            "server_id": value.server_id,
+                            "tls_server_name": remote::TLS_SERVER_NAME,
+                        })
+                    },
+                );
+                println!("{}", serde_json::to_string(&value)?);
+            } else if let Some(value) = configured {
+                println!(
+                    "Nakode remote access: {} at {} (server {})",
+                    if value.enabled { "enabled" } else { "disabled" },
+                    value.bind,
+                    value.server_id
+                );
+            } else {
+                println!("Nakode remote access: not configured");
+            }
+        }
     }
     Ok(())
 }
