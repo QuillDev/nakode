@@ -1226,8 +1226,9 @@ pub struct DomainState {
     initial_model: Option<String>,
     agents: AgentCatalog,
     skills: SkillCatalog,
-    /// Immutable stable identities authorized when this logical session was created or first
-    /// reconciled from a pre-snapshot legacy record. `Some([])` intentionally authorizes none.
+    /// Persisted client profile whose current Nakode skill preferences govern this session.
+    skill_profile_id: Option<String>,
+    /// Current stable identities enabled by that profile. Updated by Nakode profile mutations.
     enabled_skill_ids: Option<Vec<String>>,
     prompt_addenda: PromptAddenda,
     initial_client_instructions: Option<String>,
@@ -1980,6 +1981,7 @@ impl DomainState {
             initial_model,
             agents: AgentCatalog::default(),
             skills: SkillCatalog::default(),
+            skill_profile_id: None,
             enabled_skill_ids: None,
             prompt_addenda: PromptAddenda::default(),
             initial_client_instructions: None,
@@ -2035,6 +2037,15 @@ impl DomainState {
         Ok(())
     }
 
+    pub fn set_skill_profile(&mut self, profile_id: Option<String>) {
+        self.skill_profile_id = profile_id;
+    }
+
+    #[must_use]
+    pub fn skill_profile_id(&self) -> Option<&str> {
+        self.skill_profile_id.as_deref()
+    }
+
     pub fn install_skills(&mut self, skills: SkillCatalog) {
         self.skills = match &self.enabled_skill_ids {
             Some(enabled) => skills.into_only_ids(enabled),
@@ -2053,6 +2064,11 @@ impl DomainState {
         let enabled = enabled_skill_ids.map_or_else(|| skills.stable_ids(), <[String]>::to_vec);
         self.skills = skills.into_only_ids(&enabled);
         self.enabled_skill_ids = Some(enabled);
+    }
+
+    #[must_use]
+    pub fn skill_catalogue(&self) -> SkillCatalog {
+        self.skills.clone()
     }
 
     #[must_use]
@@ -6836,6 +6852,7 @@ impl DomainState {
             prompt: wire_text,
             attachments: prompt.attachments,
             model: prompt.model,
+            skill_catalogue: self.skill_catalogue(),
         })]
     }
 
@@ -8524,6 +8541,7 @@ impl DomainState {
                 prompt,
                 attachments: Vec::new(),
                 model,
+                skill_catalogue: self.skill_catalogue(),
             },
         });
         effects

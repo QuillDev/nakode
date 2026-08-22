@@ -1239,6 +1239,8 @@ impl AgentRuntime {
             session.owner_session_id.clone(),
             session.parent_run_id.clone(),
         );
+        isolated_session.enabled_skill_ids = session.enabled_skill_ids.clone();
+        isolated_session.skill_catalogue = session.skill_catalogue.clone();
         let result = match prepare_and_validate(tool.as_ref(), arguments.clone()) {
             Ok(arguments) => {
                 tool.execute(
@@ -1605,6 +1607,9 @@ pub struct RuntimeSession {
     /// provider-runtime rows persisted before authoritative skill snapshots were introduced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_skill_ids: Option<Vec<String>>,
+    /// Turn-fresh effective catalogue copied from Nakode's in-process profile authority.
+    #[serde(skip)]
+    pub skill_catalogue: crate::skill::SkillCatalog,
     /// Logical control-plane owner; absent only in old persisted provider payloads and isolated tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_session_id: Option<String>,
@@ -1629,6 +1634,7 @@ impl RuntimeSession {
             reasoning_effort: None,
             fast_mode: false,
             enabled_skill_ids: None,
+            skill_catalogue: crate::skill::SkillCatalog::default(),
             owner_session_id: None,
             parent_run_id: None,
         }

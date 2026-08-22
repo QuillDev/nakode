@@ -188,6 +188,49 @@ impl ServerCore {
         self.published_workspace = Some(self.workspace_bootstrap());
     }
 
+    pub(crate) fn install_skill_authority(
+        &mut self,
+        catalogue: &SkillCatalog,
+        preferences: &HashMap<String, Vec<crate::skill::SkillPreference>>,
+    ) {
+        let installed_ids = catalogue.stable_ids();
+        self.engine_mut()
+            .state_mut()
+            .install_skill_snapshot(catalogue.clone(), Some(&installed_ids));
+        self.session_template
+            .install_skill_snapshot(catalogue.clone(), Some(&installed_ids));
+        for engine in self.sessions_by_id.values_mut() {
+            let Some(profile_id) = engine.state().skill_profile_id().map(str::to_owned) else {
+                continue;
+            };
+            let effective = catalogue.enabled_for(
+                preferences
+                    .get(&profile_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                &profile_id,
+            );
+            let ids = effective.stable_ids();
+            engine
+                .state_mut()
+                .install_skill_snapshot(effective, Some(&ids));
+        }
+    }
+
+    pub(crate) fn install_profile_skill_catalogue(
+        &mut self,
+        profile_id: &str,
+        catalogue: &SkillCatalog,
+    ) {
+        for engine in self.sessions_by_id.values_mut() {
+            if engine.state().skill_profile_id() == Some(profile_id) {
+                engine
+                    .state_mut()
+                    .install_skill_snapshot(catalogue.clone(), Some(&catalogue.stable_ids()));
+            }
+        }
+    }
+
     pub(crate) fn install_available_builtin_tools(
         &mut self,
         availability: &HashMap<String, Vec<String>>,
@@ -616,7 +659,7 @@ impl ServerCore {
                 initial_instructions,
                 bridge,
                 mcp_grant,
-                profile_id: _,
+                profile_id,
                 disabled_skill_ids,
             } => self.create_session_command_with_mcp_and_skills(
                 &workspace_id,
@@ -628,13 +671,22 @@ impl ServerCore {
                 initial_instructions.as_deref(),
                 bridge,
                 mcp_grant.as_ref(),
+                profile_id,
                 &disabled_skill_ids,
             ),
             Command::OpenSession {
                 session_id,
                 tools,
                 mcp_grant,
-            } => self.open_session_command_with_mcp(&session_id, tools, mcp_grant.as_ref()),
+                profile_id,
+                enabled_skill_ids,
+            } => self.open_session_command_with_mcp_and_profile(
+                &session_id,
+                tools,
+                mcp_grant.as_ref(),
+                profile_id,
+                &enabled_skill_ids,
+            ),
             Command::SetSessionBridgeLifecycle {
                 session_id,
                 lifecycle,
@@ -927,6 +979,7 @@ impl ServerCore {
             initial_instructions,
             bridge,
             mcp_grant,
+            None,
             &[],
         )
     }
@@ -945,6 +998,7 @@ impl ServerCore {
         initial_instructions: Option<&str>,
         bridge: Option<SessionBridgeIntent>,
         mcp_grant: Option<&McpSessionGrant>,
+        profile_id: Option<String>,
         disabled_skill_ids: &[String],
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
@@ -965,6 +1019,7 @@ impl ServerCore {
             })?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
+        engine.state_mut().set_skill_profile(profile_id);
         engine.state_mut().install_skill_snapshot(skills, None);
         engine
             .state_mut()
@@ -1658,11 +1713,24 @@ impl ServerCore {
         self.open_session_command_with_mcp(session_id, tools, None)
     }
 
+    #[cfg(test)]
     fn open_session_command_with_mcp(
         &mut self,
         session_id: &SessionId,
         tools: Option<nakode_protocol::SessionToolConfiguration>,
         mcp_grant: Option<&McpSessionGrant>,
+    ) -> DomainCommandOutcome {
+        self.open_session_command_with_mcp_and_profile(session_id, tools, mcp_grant, None, &[])
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_session_command_with_mcp_and_profile(
+        &mut self,
+        session_id: &SessionId,
+        tools: Option<nakode_protocol::SessionToolConfiguration>,
+        mcp_grant: Option<&McpSessionGrant>,
+        profile_id: Option<String>,
+        enabled_skill_ids: &[String],
     ) -> DomainCommandOutcome {
         let loaded = self
             .sessions_by_id
@@ -1703,7 +1771,13 @@ impl ServerCore {
                             tools.allowed_builtin_tools.as_deref(),
                         )?;
                 }
-                // Opening an attached session is a reattachment, not a reconfiguration. The
+                if let Some(profile_id) = profile_id {
+                    let state = self.session_engine_mut(loaded)?.state_mut();
+                    let skills = state.skill_catalogue().only_ids(enabled_skill_ids);
+                    state.set_skill_profile(Some(profile_id));
+                    state.install_skill_snapshot(skills, Some(enabled_skill_ids));
+                }
+                // Opening an attached session is a reattachment, not a tool reconfiguration. The
                 // runtime already owns its installed MCP tools, so a caller's current grant must
                 // not make an otherwise valid reattach fail or mutate the active session.
                 return Ok(Self::accepted(Some(loaded.to_string()), Vec::new()));
@@ -1733,16 +1807,20 @@ impl ServerCore {
         let working_directory =
             canonical_working_directory(Some(&session.working_directory), &session.workspace)?;
         self.refresh_session_template_addenda()?;
-        let skills = SkillCatalog::load(Path::new(&working_directory)).map_err(|error| {
-            DomainCommandError::Invalid(format!(
-                "failed to load skills for {working_directory}: {error}"
-            ))
-        })?;
+        let authoritative_ids = profile_id
+            .as_ref()
+            .map(|_| enabled_skill_ids)
+            .or(session.enabled_skill_ids.as_deref());
+        let skills = authoritative_ids.map_or_else(
+            || self.session_template.skill_catalogue(),
+            |ids| self.session_template.skill_catalogue().only_ids(ids),
+        );
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
+        engine.state_mut().set_skill_profile(profile_id);
         engine
             .state_mut()
-            .install_skill_snapshot(skills, session.enabled_skill_ids.as_deref());
+            .install_skill_snapshot(skills, authoritative_ids);
         // The workspace template may still carry the bootstrap provider/session identity. Reset that
         // clone before installing client-owned tools; restoration begins only after validation.
         let _discarded_template_effects = engine.state_mut().create_logical_session()?;

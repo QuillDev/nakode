@@ -109,6 +109,7 @@ async fn verify_successful_turn(backend: &mut BackendHandle, session_id: &str) -
             prompt: "hello devin".to_owned(),
             attachments: Vec::new(),
             model: None,
+            skill_catalogue: nakode::skill::SkillCatalog::default(),
         })
         .await?;
     let mut streamed = String::new();
@@ -154,6 +155,7 @@ async fn verify_failure_and_steering(backend: &mut BackendHandle, session_id: &s
             prompt: "fail prompt".to_owned(),
             attachments: Vec::new(),
             model: None,
+            skill_catalogue: nakode::skill::SkillCatalog::default(),
         })
         .await?;
     assert!(matches!(
@@ -231,6 +233,7 @@ async fn verify_resume_and_cancellation(
             prompt: "wait for cancel".to_owned(),
             attachments: Vec::new(),
             model: None,
+            skill_catalogue: nakode::skill::SkillCatalog::default(),
         })
         .await?;
     assert!(matches!(

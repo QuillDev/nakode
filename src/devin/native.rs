@@ -460,6 +460,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             prompt,
             attachments,
             model,
+            skill_catalogue,
         } => {
             start_turn(
                 provider_session_id,
@@ -467,6 +468,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                 prompt,
                 attachments,
                 model,
+                skill_catalogue,
                 context,
             )
             .await;
@@ -648,6 +650,7 @@ async fn start_turn(
     prompt: String,
     attachments: Vec<crate::backend::PromptAttachment>,
     model: Option<String>,
+    skill_catalogue: crate::skill::SkillCatalog,
     context: &mut CommandContext<'_>,
 ) {
     let Some(runtime) = context.runtime else {
@@ -677,6 +680,8 @@ async fn start_turn(
         .await;
         return;
     };
+    session.enabled_skill_ids = Some(skill_catalogue.stable_ids());
+    session.skill_catalogue = skill_catalogue;
     if let Some(model) = model {
         if session.model != model {
             session.context_window = None;

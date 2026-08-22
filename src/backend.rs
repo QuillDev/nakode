@@ -691,6 +691,8 @@ pub enum BackendCommand {
         prompt: String,
         attachments: Vec<PromptAttachment>,
         model: Option<String>,
+        /// Current Nakode-cached effective catalogue for the logical session's profile.
+        skill_catalogue: crate::skill::SkillCatalog,
     },
     SteerTurn {
         provider_session_id: String,

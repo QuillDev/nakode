@@ -98,6 +98,7 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
             prompt: "hello fixture".to_owned(),
             attachments: Vec::new(),
             model: Some("fixture-model".to_owned()),
+            skill_catalogue: nakode::skill::SkillCatalog::default(),
         })
         .await?;
     backend
