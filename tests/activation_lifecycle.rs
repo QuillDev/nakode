@@ -276,7 +276,11 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
     .await?;
     eprintln!("activation lifecycle: held owner turn is active");
 
-    let refresh = installation.output(&installation.installed_binary, &["restart-stale"])?;
+    let refresh = installation.output_with_limit(
+        &installation.installed_binary,
+        &["restart-stale"],
+        COLD_START_LIMIT,
+    )?;
     ensure_success("restart-stale", &refresh)?;
     let refresh_stderr = String::from_utf8(refresh.stderr)?;
     assert!(
