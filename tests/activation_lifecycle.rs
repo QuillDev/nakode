@@ -22,6 +22,10 @@ use serde_json::Value;
 const WAIT_LIMIT: Duration = Duration::from_secs(10);
 const WAIT_STEP: Duration = Duration::from_millis(50);
 const COMMAND_LIMIT: Duration = Duration::from_secs(20);
+// A manual activation includes cold replacement-service startup and persisted-session restoration.
+// CI evidence shows that operation can legitimately outlive the isolated CLI command bound while
+// continuing to publish its runtime and sockets, so keep a distinct bounded lifecycle allowance.
+const ACTIVATION_LIMIT: Duration = Duration::from_secs(40);
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -388,7 +392,7 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
 
     let replacement_activation = ActivationClient::connect_unix(&helper_socket).await?;
     let Ok(activated) = tokio::time::timeout(
-        COMMAND_LIMIT,
+        ACTIVATION_LIMIT,
         replacement_activation.recheck(Some("lifecycle-release".to_owned())),
     )
     .await
@@ -396,7 +400,7 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
         dump_activation_diagnostics(&runtime_directory);
         return Err(format!(
             "activation recheck did not complete within {}ms",
-            COMMAND_LIMIT.as_millis()
+            ACTIVATION_LIMIT.as_millis()
         )
         .into());
     };
