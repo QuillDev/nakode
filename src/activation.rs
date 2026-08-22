@@ -620,6 +620,38 @@ pub(crate) async fn schedule_deferred_activation(
     }
     drop(activation);
     ensure_helper_process(paths, executable).await?;
+    wait_for_helper_endpoint(paths).await
+}
+
+/// Recovers the helper for an already-recorded deferred activation without rediscovering the
+/// running service first.
+///
+/// The pending journal is durable activation authority. Endpoint discovery must use it directly:
+/// probing the old service again can compose several independent readiness bounds and prevent a
+/// crashed singleton helper from being recovered within the public command deadline.
+pub(crate) async fn recover_deferred_helper(
+    paths: &ServicePaths,
+    executable: &Path,
+) -> Result<bool, ActivationError> {
+    let installed = executable_identity(executable)?;
+    let activation = ActivationLease::acquire(paths.activation()).await?;
+    let pending = read_journal(paths)?.is_some_and(|journal| {
+        journal.installed.executable.same_build(&installed)
+            && !matches!(
+                journal.phase,
+                Phase::Current | Phase::Activated | Phase::Cancelled
+            )
+    });
+    drop(activation);
+    if !pending {
+        return Ok(false);
+    }
+    ensure_helper_process(paths, executable).await?;
+    wait_for_helper_endpoint(paths).await?;
+    Ok(true)
+}
+
+async fn wait_for_helper_endpoint(paths: &ServicePaths) -> Result<(), ActivationError> {
     for _ in 0..40 {
         if tokio::net::UnixStream::connect(paths.activation_api())
             .await

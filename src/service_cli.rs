@@ -178,13 +178,13 @@ pub async fn endpoint(config: &Config) -> Result<(), ControlError> {
 /// Returns an error when endpoint discovery cannot verify the service/helper owners.
 pub async fn activation_endpoint(config: &Config) -> Result<(), ControlError> {
     let executable = current_executable()?;
-    let report = control_service::frontend_api_endpoint_report(&executable, config).await?;
+    let report = control_service::frontend_activation_endpoint_report(&executable, config).await?;
     let descriptor = serde_json::json!({
         "version": 1,
         "transport": "grpc+unix",
         "workspace": report.workspace,
-        "endpoint": report.activation_endpoint,
-        "service_endpoint": report.endpoint,
+        "endpoint": report.endpoint,
+        "service_endpoint": report.service_endpoint,
         "activation": report.activation,
     });
     println!("{}", serde_json::to_string(&descriptor)?);
