@@ -49,6 +49,8 @@ pub enum ServiceCapability {
     OrchestratorThreadBridge,
     /// The lifecycle socket can atomically compare/fence a confirmed blocker set before forced activation.
     ConditionalActivationForce,
+    /// Read-only server-side canonical path and Git placement inspection.
+    WorkspacePathInspection,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -122,6 +124,15 @@ pub struct CommandAccepted {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspacePathInspectionView {
+    pub canonical_path: String,
+    pub git_repository: Option<String>,
+    pub branch: Option<String>,
+    pub revision: Option<String>,
+    pub dirty: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionInventory {
     pub sessions: Vec<SessionSummary>,
     pub complete: bool,
@@ -144,6 +155,7 @@ pub struct SkillCatalogueView {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum QueryResult {
+    WorkspacePathInspection(WorkspacePathInspectionView),
     Bootstrap(Box<BootstrapView>),
     SoulDocument(SoulDocumentView),
     McpManagement(McpManagementView),

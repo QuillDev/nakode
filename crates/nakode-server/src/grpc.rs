@@ -3,29 +3,72 @@
 //! Conversion lives here so provider/runtime protocol types never leak into
 //! the public generated contract. The adapter never owns domain state.
 
-use std::pin::Pin;
+use std::{pin::Pin, sync::Arc};
 
 use futures_util::Stream;
 use nakode_api::v1 as api;
 use nakode_protocol as protocol;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::service::Interceptor;
 
 use crate::{PublishedEvent, ServerEndpoint};
+
+#[derive(Clone, Debug)]
+pub struct ApiKeyInterceptor {
+    expected: Arc<str>,
+}
+
+impl ApiKeyInterceptor {
+    #[must_use]
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            expected: Arc::from(format!("Bearer {}", api_key.into())),
+        }
+    }
+}
+
+impl Interceptor for ApiKeyInterceptor {
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        use subtle::ConstantTimeEq;
+
+        let supplied = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let matches = supplied.len() == self.expected.len()
+            && bool::from(supplied.as_bytes().ct_eq(self.expected.as_bytes()));
+        if matches {
+            Ok(request)
+        } else {
+            Err(tonic::Status::unauthenticated("invalid Nakode API key"))
+        }
+    }
+}
 
 /// Public gRPC facade over one authoritative [`ServerEndpoint`].
 #[derive(Clone)]
 pub struct GrpcService {
     endpoint: ServerEndpoint,
     client_id: protocol::ClientId,
+    server_id: String,
 }
 
 impl GrpcService {
     #[must_use]
     pub fn new(endpoint: ServerEndpoint) -> Self {
+        let server_id = endpoint.epoch().to_string();
         Self {
             endpoint,
             client_id: protocol::ClientId::new(format!("grpc-{}", uuid::Uuid::now_v7())),
+            server_id,
         }
+    }
+
+    #[must_use]
+    pub fn with_server_id(mut self, server_id: impl Into<String>) -> Self {
+        self.server_id = server_id.into();
+        self
     }
 
     #[must_use]
@@ -33,6 +76,19 @@ impl GrpcService {
         api::nakode_service_server::NakodeServiceServer::new(self)
             .max_decoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
             .max_encoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
+    }
+
+    pub fn into_authenticated_server(
+        self,
+        api_key: impl Into<String>,
+    ) -> tonic::service::interceptor::InterceptedService<
+        api::nakode_service_server::NakodeServiceServer<Self>,
+        ApiKeyInterceptor,
+    > {
+        tonic::service::interceptor::InterceptedService::new(
+            self.into_server(),
+            ApiKeyInterceptor::new(api_key),
+        )
     }
 
     async fn execute_mutation(
@@ -434,6 +490,31 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         Ok(tonic::Response::new(api::WorkspaceSnapshot {
             cursor: Some(cursor(&result.cursor)),
             state: Some(workspace(*value)),
+        }))
+    }
+
+    async fn inspect_workspace_path(
+        &self,
+        request: tonic::Request<api::InspectWorkspacePathRequest>,
+    ) -> Result<tonic::Response<api::WorkspacePathInspection>, tonic::Status> {
+        let request = request.into_inner();
+        let result = self
+            .query(protocol::Query::InspectWorkspacePath {
+                path: request.path,
+                expected_git_repository: request.expected_git_repository,
+            })
+            .await?;
+        let protocol::QueryResult::WorkspacePathInspection(value) = result.value else {
+            return Err(tonic::Status::internal(
+                "unexpected workspace path inspection response",
+            ));
+        };
+        Ok(tonic::Response::new(api::WorkspacePathInspection {
+            canonical_path: value.canonical_path,
+            git_repository: value.git_repository,
+            branch: value.branch,
+            revision: value.revision,
+            dirty: value.dirty,
         }))
     }
 
@@ -1448,6 +1529,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .iter()
                 .map(|value| format!("{value:?}"))
                 .collect(),
+            server_id: self.server_id.clone(),
         }))
     }
 }
@@ -1459,7 +1541,10 @@ fn drain_pending_publications(publications: &mut tokio::sync::broadcast::Receive
     let mut drained = 0;
     while drained < crate::DEFAULT_PUBLICATION_CAPACITY {
         match publications.try_recv() {
-            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => drained += 1,
+            Ok(_) => drained += 1,
+            // `Lagged` advances the receiver to the oldest retained publication but does not return
+            // one, so it must not consume the bounded drain budget.
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
             Err(
                 tokio::sync::broadcast::error::TryRecvError::Empty
                 | tokio::sync::broadcast::error::TryRecvError::Closed,
@@ -2654,6 +2739,31 @@ fn diagnostics_totals(value: &protocol::DiagnosticsUsageTotals) -> api::Diagnost
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_interceptor_rejects_missing_and_wrong_credentials() {
+        let mut interceptor = ApiKeyInterceptor::new("nk_correct");
+        assert_eq!(
+            interceptor
+                .call(tonic::Request::new(()))
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let mut wrong = tonic::Request::new(());
+        wrong
+            .metadata_mut()
+            .insert("authorization", "Bearer nk_wrong".parse().unwrap());
+        assert_eq!(
+            interceptor.call(wrong).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        let mut correct = tonic::Request::new(());
+        correct
+            .metadata_mut()
+            .insert("authorization", "Bearer nk_correct".parse().unwrap());
+        assert!(interceptor.call(correct).is_ok());
+    }
 
     #[test]
     fn replacement_watch_drain_discards_queued_intermediate_invalidations() {

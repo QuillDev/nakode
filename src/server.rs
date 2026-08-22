@@ -2809,6 +2809,12 @@ impl ServerCore {
     fn query(&self, query: Query) -> Result<QueryResult, ServiceError> {
         let bootstrap = || self.workspace_bootstrap();
         match query {
+            Query::InspectWorkspacePath {
+                path,
+                expected_git_repository,
+            } => Ok(QueryResult::WorkspacePathInspection(
+                inspect_workspace_path(&path, expected_git_repository.as_deref())?,
+            )),
             Query::Bootstrap {
                 workspace: _,
                 session_id,
@@ -3860,6 +3866,137 @@ impl ServerCore {
     }
 }
 
+fn inspect_workspace_path(
+    requested: &str,
+    expected_git_repository: Option<&str>,
+) -> Result<nakode_protocol::WorkspacePathInspectionView, ServiceError> {
+    let canonical_path =
+        canonical_working_directory(Some(requested), requested).map_err(domain_error)?;
+    let git = |arguments: &[&str]| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(["-C", canonical_path.as_str()])
+            .args(arguments)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let git_repository = git(&["config", "--get", "remote.origin.url"])
+        .filter(|value| !value.is_empty())
+        .map(|value| sanitized_repository_identity(&value));
+    if let Some(expected) = expected_git_repository {
+        let expected = sanitized_repository_identity(expected);
+        let actual = git_repository.as_deref().ok_or_else(|| {
+            service_error(
+                ErrorCode::Conflict,
+                "workspace path has no configured origin repository",
+                false,
+            )
+        })?;
+        if actual != expected {
+            let message =
+                format!("workspace repository mismatch: expected {expected}, found {actual}");
+            return Err(service_error(ErrorCode::Conflict, &message, false));
+        }
+    }
+    let branch =
+        git(&["symbolic-ref", "--quiet", "--short", "HEAD"]).filter(|value| !value.is_empty());
+    let revision = git(&["rev-parse", "HEAD"]).filter(|value| !value.is_empty());
+    let dirty = git(&["status", "--porcelain=v1", "--untracked-files=normal"])
+        .is_some_and(|value| !value.is_empty());
+    Ok(nakode_protocol::WorkspacePathInspectionView {
+        canonical_path,
+        git_repository,
+        branch,
+        revision,
+        dirty,
+    })
+}
+
+fn sanitized_repository_identity(value: &str) -> String {
+    const UNRECOGNIZED: &str = "[unrecognized repository]";
+
+    let value = value.trim();
+    if value.chars().any(char::is_whitespace) || value.contains(['?', '#']) {
+        return UNRECOGNIZED.to_owned();
+    }
+
+    if value.contains("://") {
+        if let Ok(parsed) = reqwest::Url::parse(value)
+            && matches!(parsed.scheme(), "http" | "https" | "ssh" | "git")
+            && let Some(host) = parsed.host_str()
+            && let Some(path) = canonical_repository_path(parsed.path())
+        {
+            return canonical_repository_identity(host, parsed.port(), &path);
+        }
+        return UNRECOGNIZED.to_owned();
+    }
+
+    if let Some((authority, path)) = value.split_once(':')
+        && !authority.contains('/')
+        && !path
+            .split('/')
+            .next()
+            .is_some_and(|component| component.contains('@') || component.parse::<u16>().is_ok())
+        && let Some(path) = canonical_repository_path(path)
+    {
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        if !host.is_empty() {
+            return canonical_repository_identity(host, None, &path);
+        }
+    }
+
+    if let Some((authority, path)) = value.split_once('/')
+        && let Some(path) = canonical_repository_path(path)
+    {
+        let authority = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let (host, port) = authority
+            .rsplit_once(':')
+            .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, Some(port))))
+            .unwrap_or((authority, None));
+        if !host.is_empty() {
+            return canonical_repository_identity(host, port, &path);
+        }
+    }
+
+    UNRECOGNIZED.to_owned()
+}
+
+fn canonical_repository_identity(host: &str, port: Option<u16>, path: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    let path = if host == "github.com" {
+        path.to_ascii_lowercase()
+    } else {
+        path.to_owned()
+    };
+    match port {
+        Some(port) => format!("{host}:{port}/{path}"),
+        None => format!("{host}/{path}"),
+    }
+}
+
+fn canonical_repository_path(value: &str) -> Option<String> {
+    let mut path = value.trim_matches('/');
+    if let Some(without_suffix) = path.strip_suffix(".git") {
+        path = without_suffix.trim_end_matches('/');
+    }
+    if path.is_empty()
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return None;
+    }
+    Some(path.to_owned())
+}
+
 fn canonical_working_directory(
     requested: Option<&str>,
     workspace: &str,
@@ -4527,7 +4664,11 @@ fn service_error(code: ErrorCode, message: &str, retryable: bool) -> ServiceErro
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::{
+        collections::{BTreeSet, HashMap},
+        fs,
+        process::Command as ProcessCommand,
+    };
 
     use nakode_protocol::{
         AgentDefinitionInput, BridgeContinuationDisposition, BridgeLifecycle, BridgeProjectionKind,
@@ -4542,7 +4683,10 @@ mod tests {
     use nakode_server::{PublishedEvent, ServerEndpoint, ServerRequest};
     use tokio::sync::broadcast;
 
-    use super::{IDEMPOTENCY_CAPACITY, ServerCore, unix_timestamp_ms};
+    use super::{
+        IDEMPOTENCY_CAPACITY, ServerCore, inspect_workspace_path, sanitized_repository_identity,
+        unix_timestamp_ms,
+    };
     use crate::{
         agent::{AgentCatalog, AgentDefinition},
         backend::{
@@ -4652,6 +4796,130 @@ mod tests {
         workspace_id: &WorkspaceId,
     ) -> super::DomainCommandOutcome {
         core.create_session_command(workspace_id, None, &ModelOptions::default(), None)
+    }
+
+    #[test]
+    fn repository_identity_removes_credentials_and_normalizes_transport_spelling() {
+        assert_eq!(
+            sanitized_repository_identity("https://token:secret@example.invalid/team/repo.git"),
+            "example.invalid/team/repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("git@example.invalid:team/repo.git"),
+            "example.invalid/team/repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("ssh://git@example.invalid/team/repo.git"),
+            "example.invalid/team/repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("https://github.com/QuillDev/Nakode.git"),
+            "github.com/quilldev/nakode"
+        );
+        assert_eq!(
+            sanitized_repository_identity("github.com/quilldev/nakode"),
+            "github.com/quilldev/nakode"
+        );
+        assert_eq!(
+            sanitized_repository_identity("token:secret@example.invalid/team/Repo.git/"),
+            "example.invalid/team/Repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("example.invalid:8443/team/Repo.git/"),
+            "example.invalid:8443/team/Repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("https://example.invalid/team/Repo.git/"),
+            "example.invalid/team/Repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("file:///tmp/repo.git"),
+            "[unrecognized repository]"
+        );
+        assert_eq!(
+            sanitized_repository_identity("https://example.invalid/team/repo.git?token=secret"),
+            "[unrecognized repository]"
+        );
+    }
+
+    #[test]
+    fn workspace_path_inspection_reports_git_identity_and_dirty_state() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        for arguments in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "nakode@example.invalid"],
+            vec!["config", "user.name", "Nakode Test"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "ssh://example.invalid/team/repo.git",
+            ],
+        ] {
+            assert!(
+                ProcessCommand::new("git")
+                    .arg("-C")
+                    .arg(directory.path())
+                    .args(arguments)
+                    .status()
+                    .expect("run git")
+                    .success()
+            );
+        }
+        fs::write(directory.path().join("tracked.txt"), "initial\n").expect("write fixture");
+        for arguments in [vec!["add", "tracked.txt"], vec!["commit", "-m", "initial"]] {
+            assert!(
+                ProcessCommand::new("git")
+                    .arg("-C")
+                    .arg(directory.path())
+                    .args(arguments)
+                    .status()
+                    .expect("run git")
+                    .success()
+            );
+        }
+
+        let clean = inspect_workspace_path(
+            directory.path().to_str().unwrap(),
+            Some("ssh://example.invalid/team/repo.git"),
+        )
+        .expect("inspect clean repository");
+        assert_eq!(
+            clean.canonical_path,
+            directory.path().canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            clean.git_repository.as_deref(),
+            Some("example.invalid/team/repo")
+        );
+        assert_eq!(clean.branch.as_deref(), Some("main"));
+        assert_eq!(clean.revision.as_deref().map(str::len), Some(40));
+        assert!(!clean.dirty);
+
+        fs::write(directory.path().join("untracked.txt"), "dirty\n").expect("dirty fixture");
+        assert!(
+            inspect_workspace_path(directory.path().to_str().unwrap(), None)
+                .expect("inspect dirty repository")
+                .dirty
+        );
+        let mismatch = inspect_workspace_path(
+            directory.path().to_str().unwrap(),
+            Some("ssh://example.invalid/other.git"),
+        )
+        .expect_err("reject repository mismatch");
+        assert_eq!(mismatch.code, ErrorCode::Conflict);
+    }
+
+    #[test]
+    fn workspace_path_inspection_rejects_missing_or_non_directory_paths() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let file = directory.path().join("file.txt");
+        fs::write(&file, "not a directory").expect("write fixture");
+        for path in [file, directory.path().join("missing")] {
+            let error = inspect_workspace_path(path.to_str().unwrap(), None)
+                .expect_err("invalid inspection path");
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+        }
     }
 
     #[test]

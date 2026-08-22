@@ -40,6 +40,18 @@ One installation-wide service owns the endpoint, provider registry, credentials,
 persistence for every session. Working directories and filesystem/tool access remain properties of
 individual sessions and are supplied by the frontend creating them, never by lifecycle CLI flags.
 
+Remote client access is opt-in and additive to the private Unix endpoint:
+
+```sh
+nakode remote enable --bind 0.0.0.0:7342  # emits the TLS/enrollment descriptor
+nakode restart                             # applies listener or key changes
+nakode remote status
+nakode remote regenerate-key               # restart revokes the old key
+nakode remote disable                       # restart removes the TCP listener
+```
+
+The descriptor contains a random 256-bit bearer key and pinned self-signed TLS identity; handle it as a secret. The installation keeps a stable server ID across key regeneration. Remote frontends use the same `nakode.v1` service, including read-only `InspectWorkspacePath` for server-side canonical path and Git placement checks. Nakode remains the sole session, provider, tool, persistence, lifecycle, and resumability authority.
+
 After installation, Nakode preserves an already-current singleton, restarts it only
 when it is stale and quiescent, and retires quiescent legacy per-workspace services.
 Legacy services with active work are left running and reported rather than killed.

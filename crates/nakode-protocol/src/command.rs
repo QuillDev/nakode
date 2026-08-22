@@ -538,6 +538,10 @@ pub enum Query {
         workspace: String,
         session_id: Option<SessionId>,
     },
+    InspectWorkspacePath {
+        path: String,
+        expected_git_repository: Option<String>,
+    },
     ListSkills {
         workspace_id: WorkspaceId,
         profile_id: String,

@@ -2158,6 +2158,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::McpManagement,
             ServiceCapability::OrchestratorThreadBridge,
             ServiceCapability::ConditionalActivationForce,
+            ServiceCapability::WorkspacePathInspection,
         ]
         .into_iter()
         .collect(),

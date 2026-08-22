@@ -29,6 +29,7 @@ mod native_client;
 pub mod personality;
 pub mod pty;
 pub mod purge;
+pub mod remote;
 pub mod render;
 pub mod runtime;
 pub mod searchable_dropdown;
