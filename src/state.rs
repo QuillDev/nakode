@@ -229,7 +229,7 @@ fn append_archetype_policy_instructions(instructions: &mut String, policy: &Agen
     );
     if reserve > 0 {
         instructions.push_str(
-            "\n\n[Nakode Convergence Contract]\nTreat a verified partial result as successful work. Assess whether the objective can be completed at about 60% of the research budget. At 80%, stop opening new investigation branches. When Nakode announces the protected finalization reserve, do not request or attempt tools; synthesize the best final or partial report from evidence already gathered. If completion is impossible, include this exact structure and do not chase one more fact:\n[Nakode Continuation Proposition]\nVerified findings so far: <findings with retained evidence/citations>\nMaterial unresolved boundary: <one bounded boundary>\nWhy it matters: <impact on the objective>\nRecommended archetype: <one archetype>\nExact bounded follow-up objective: <one objective>\nEvidence/citations to inherit: <entry ids, files, commands, or results>\nCan proceed independently: <yes or no>\n[/Nakode Continuation Proposition]\n[/Nakode Convergence Contract]",
+            "\n\n[Nakode Convergence Contract]\nTreat a verified partial result as successful work. Assess whether the objective can be completed at about 60% of the research budget. At 80%, stop opening new investigation branches. When Nakode announces the protected finalization reserve, do not request or attempt tools; synthesize the best final or partial report from evidence already gathered. If completion is impossible, return this exact top-level structure and do not chase one more fact:\n[Nakode Partial Result]\n<best partial report from retained evidence>\n[Nakode Continuation Proposition]\nVerified findings so far: <findings with retained evidence/citations>\nMaterial unresolved boundary: <one bounded boundary>\nWhy it matters: <impact on the objective>\nRecommended archetype: <one archetype>\nExact bounded follow-up objective: <one objective>\nEvidence/citations to inherit: <entry ids, files, commands, or results>\nCan proceed independently: <yes or no>\n[/Nakode Continuation Proposition]\n[/Nakode Partial Result]\n[/Nakode Convergence Contract]",
         );
     }
 }
@@ -9075,9 +9075,21 @@ fn latest_reasoning_summary(text: &str) -> &str {
 }
 
 fn parse_continuation_proposition(report: &str) -> Option<(ContinuationProposition, bool)> {
-    let start = report.find("[Nakode Continuation Proposition]")?;
-    let report = &report[start + "[Nakode Continuation Proposition]".len()..];
-    let end = report.find("[/Nakode Continuation Proposition]")?;
+    const PARTIAL_START: &str = "[Nakode Partial Result]";
+    const PARTIAL_END: &str = "[/Nakode Partial Result]";
+    const PROPOSITION_START: &str = "[Nakode Continuation Proposition]";
+    const PROPOSITION_END: &str = "[/Nakode Continuation Proposition]";
+
+    // Only a top-level partial-result envelope is authoritative. A completed answer may quote or
+    // explain the proposition contract without declaring itself incomplete.
+    let report = report
+        .trim()
+        .strip_prefix(PARTIAL_START)?
+        .strip_suffix(PARTIAL_END)?
+        .trim();
+    let start = report.find(PROPOSITION_START)?;
+    let report = &report[start + PROPOSITION_START.len()..];
+    let end = report.find(PROPOSITION_END)?;
     let report = &report[..end];
     let field = |label: &str| {
         report
@@ -9285,6 +9297,7 @@ mod tests {
         assert!(instructions.contains("Research/tool work budget: 41"));
         assert!(instructions.contains("about 60% of the research budget"));
         assert!(instructions.contains("At 80%, stop opening new investigation branches"));
+        assert!(instructions.contains("[Nakode Partial Result]"));
         assert!(instructions.contains("[Nakode Continuation Proposition]"));
         assert!(instructions.contains("Exact bounded follow-up objective:"));
     }
@@ -9307,7 +9320,7 @@ mod tests {
 
     #[test]
     fn continuation_proposition_parser_requires_the_complete_bounded_contract() {
-        let report = "Useful partial.\n[Nakode Continuation Proposition]\nVerified findings so far: src/state.rs owns terminal projection\nMaterial unresolved boundary: protocol restoration coverage\nWhy it matters: clients must agree after restart\nRecommended archetype: repo-explorer\nExact bounded follow-up objective: trace restored run projection only\nEvidence/citations to inherit: src/state.rs:8600, src/session.rs:3100\nCan proceed independently: yes\n[/Nakode Continuation Proposition]";
+        let report = "[Nakode Partial Result]\nUseful partial.\n[Nakode Continuation Proposition]\nVerified findings so far: src/state.rs owns terminal projection\nMaterial unresolved boundary: protocol restoration coverage\nWhy it matters: clients must agree after restart\nRecommended archetype: repo-explorer\nExact bounded follow-up objective: trace restored run projection only\nEvidence/citations to inherit: src/state.rs:8600, src/session.rs:3100\nCan proceed independently: yes\n[/Nakode Continuation Proposition]\n[/Nakode Partial Result]";
         let (proposition, truncated) = parse_continuation_proposition(report).expect("proposition");
         assert_eq!(
             proposition.follow_up_objective,
@@ -9317,9 +9330,15 @@ mod tests {
         assert!(proposition.can_proceed_independently);
         assert!(!truncated);
         assert!(parse_continuation_proposition("partial without contract").is_none());
+        assert!(
+            parse_continuation_proposition(
+                "A completed explanation quotes [Nakode Continuation Proposition]\nVerified findings so far: example\nMaterial unresolved boundary: example\nWhy it matters: example\nRecommended archetype: repo-explorer\nExact bounded follow-up objective: example\nEvidence/citations to inherit: example\nCan proceed independently: no\n[/Nakode Continuation Proposition] without declaring a partial result."
+            )
+            .is_none()
+        );
 
         let oversized = format!(
-            "[Nakode Continuation Proposition]\nVerified findings so far: {}\nMaterial unresolved boundary: boundary\nWhy it matters: impact\nRecommended archetype: repo-explorer\nExact bounded follow-up objective: objective\nEvidence/citations to inherit: {}\nCan proceed independently: no\n[/Nakode Continuation Proposition]",
+            "[Nakode Partial Result]\n[Nakode Continuation Proposition]\nVerified findings so far: {}\nMaterial unresolved boundary: boundary\nWhy it matters: impact\nRecommended archetype: repo-explorer\nExact bounded follow-up objective: objective\nEvidence/citations to inherit: {}\nCan proceed independently: no\n[/Nakode Continuation Proposition]\n[/Nakode Partial Result]",
             "x".repeat(MAX_SALVAGED_EVIDENCE_BYTES + 1),
             (0..MAX_SALVAGED_EVIDENCE + 2)
                 .map(|index| format!("entry-{index}"))
@@ -14291,7 +14310,7 @@ model = "claude-agent/sonnet"
         state.session_id = Some("parent-session".to_owned());
         state.install_agents(explorer_catalog());
         let run_id = begin_mocked_subagent(&mut state);
-        let report = "[Nakode Continuation Proposition]\nVerified findings so far: claimed without evidence\nMaterial unresolved boundary: all repository facts\nWhy it matters: no facts were checked\nRecommended archetype: explorer\nExact bounded follow-up objective: inspect one file\nEvidence/citations to inherit: none\nCan proceed independently: no\n[/Nakode Continuation Proposition]";
+        let report = "[Nakode Partial Result]\n[Nakode Continuation Proposition]\nVerified findings so far: claimed without evidence\nMaterial unresolved boundary: all repository facts\nWhy it matters: no facts were checked\nRecommended archetype: explorer\nExact bounded follow-up objective: inspect one file\nEvidence/citations to inherit: none\nCan proceed independently: no\n[/Nakode Continuation Proposition]\n[/Nakode Partial Result]";
         state.handle_subagent_backend(
             &run_id,
             BackendEvent::ItemCompleted {
