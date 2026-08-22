@@ -14,7 +14,10 @@ use std::{
 };
 
 use futures_util::{Stream, StreamExt};
-use nakode_api::v1::{self as api, nakode_service_client::NakodeServiceClient};
+use nakode_api::v1::{
+    self as api, activation_service_client::ActivationServiceClient,
+    nakode_service_client::NakodeServiceClient,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_stream::wrappers::ReceiverStream;
@@ -91,11 +94,261 @@ pub struct HydratedSession {
     pub artifacts: HashMap<String, api::Artifact>,
 }
 
+/// Client-owned attachment inputs that must be re-established before a persisted logical session is
+/// accepted after a service generation changes.
+#[derive(Clone, Debug, Default)]
+pub struct SessionAttachment {
+    pub tools: Option<api::SessionToolConfiguration>,
+    pub mcp_grant: Option<api::McpSessionGrant>,
+    pub profile_id: Option<String>,
+}
+
 /// Cloneable high-level client. A clone shares the reconnecting HTTP/2
 /// channel but each request and watch has independent generated client state.
 #[derive(Clone)]
 pub struct NakodeClient {
     transport: NakodeServiceClient<Channel>,
+}
+
+/// Attempt-qualified activation watch cursor. Revisions are monotonic only within one activation
+/// attempt, so clients must retain both fields when a later update may begin at a lower revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationCursor {
+    pub attempt_id: String,
+    pub revision: u64,
+}
+
+/// Cloneable client for installation-scoped update activation status and mutations.
+#[derive(Clone)]
+pub struct ActivationClient {
+    transport: ActivationServiceClient<Channel>,
+}
+
+impl ActivationClient {
+    /// Connects to the activation endpoint selected by `nakode endpoint`. While an older service
+    /// owns work this is the helper socket; after cutover it is the ordinary service API socket.
+    ///
+    /// # Errors
+    /// Returns when the endpoint is invalid or cannot be reached.
+    #[cfg(unix)]
+    pub async fn connect_unix(path: impl Into<PathBuf>) -> Result<Self, SdkError> {
+        let path = path.into();
+        let channel = Endpoint::from_static("http://nakode.local")
+            .connect_with_connector(service_fn(move |_| {
+                let path = path.clone();
+                async move {
+                    tokio::net::UnixStream::connect(path)
+                        .await
+                        .map(hyper_util::rt::TokioIo::new)
+                }
+            }))
+            .await?;
+        Ok(Self::from_channel(channel))
+    }
+
+    #[cfg(not(unix))]
+    pub async fn connect_unix(_path: impl Into<PathBuf>) -> Result<Self, SdkError> {
+        Err(SdkError::InvalidEndpoint(
+            tonic::transport::Error::from_source(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Unix sockets are unavailable",
+            )),
+        ))
+    }
+
+    #[must_use]
+    pub fn from_channel(channel: Channel) -> Self {
+        Self {
+            transport: configured_activation_transport(channel),
+        }
+    }
+
+    /// Returns the durable authoritative activation snapshot.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn get_status(&self) -> Result<api::ActivationStatus, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .get_activation_status(api::GetActivationStatusRequest {})
+            .await?
+            .into_inner())
+    }
+
+    /// Watches complete replacement activation snapshots from one endpoint generation.
+    /// Callers rediscover the endpoint after the terminal `activated` snapshot or an unavailable
+    /// transport, because helper-to-service handoff intentionally changes the socket path.
+    ///
+    /// # Errors
+    /// Returns when the initial watch cannot be established.
+    pub async fn watch_status(
+        &self,
+        after_revision: Option<u64>,
+    ) -> Result<Watch<api::ActivationStatus>, SdkError> {
+        self.watch_status_after(after_revision.map(|revision| ActivationCursor {
+            attempt_id: String::new(),
+            revision,
+        }))
+        .await
+    }
+
+    /// Watches one endpoint generation after an attempt-qualified cursor. Prefer this over
+    /// [`Self::watch_status`] when the caller has already observed a complete activation snapshot.
+    ///
+    /// # Errors
+    /// Returns when the initial watch cannot be established.
+    pub async fn watch_status_after(
+        &self,
+        after: Option<ActivationCursor>,
+    ) -> Result<Watch<api::ActivationStatus>, SdkError> {
+        let request = match after {
+            Some(cursor) => api::WatchActivationStatusRequest {
+                after_revision: Some(cursor.revision),
+                after_attempt_id: cursor.attempt_id,
+            },
+            None => api::WatchActivationStatusRequest {
+                after_revision: None,
+                after_attempt_id: String::new(),
+            },
+        };
+        let stream = self
+            .transport
+            .clone()
+            .watch_activation_status(request)
+            .await?
+            .into_inner();
+        Ok(Box::pin(stream.map(|result| result.map_err(Into::into))))
+    }
+
+    /// Watches activation status across helper-to-service endpoint handoff. The resolver must perform
+    /// fresh installation-scoped endpoint discovery on every call. A unary snapshot is reconciled
+    /// before each stream so a new attempt with a lower numeric revision is never hidden.
+    pub fn watch_status_with_rediscovery<Discover, Discovery>(
+        discover: Discover,
+        after: Option<ActivationCursor>,
+    ) -> Watch<api::ActivationStatus>
+    where
+        Discover: Fn() -> Discovery + Send + Sync + 'static,
+        Discovery: Future<Output = Result<Self, SdkError>> + Send + 'static,
+    {
+        let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
+        let task = tokio::spawn(async move {
+            let mut cursor = after;
+            let mut reconnect_reported = false;
+            loop {
+                let client = match discover().await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        if !report_sdk_watch_error(&sender, &mut reconnect_reported, error).await {
+                            return;
+                        }
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                };
+                let status = match client.get_status().await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        if !report_sdk_watch_error(&sender, &mut reconnect_reported, error).await {
+                            return;
+                        }
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                };
+                reconnect_reported = false;
+                if activation_cursor_changed(cursor.as_ref(), &status) {
+                    cursor = Some(activation_cursor(&status));
+                    if sender.send(Ok(status.clone())).await.is_err() {
+                        return;
+                    }
+                }
+                let mut stream = match client
+                    .watch_status_after(Some(activation_cursor(&status)))
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        if !report_sdk_watch_error(&sender, &mut reconnect_reported, error).await {
+                            return;
+                        }
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                };
+                while let Some(update) = stream.next().await {
+                    match update {
+                        Ok(status) => {
+                            reconnect_reported = false;
+                            if activation_cursor_changed(cursor.as_ref(), &status) {
+                                cursor = Some(activation_cursor(&status));
+                                if sender.send(Ok(status)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if !report_sdk_watch_error(&sender, &mut reconnect_reported, error)
+                                .await
+                            {
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        });
+        managed_watch(receiver, task)
+    }
+
+    /// Requests an immediate safe quiescence check. The SDK supplies an idempotency key when the
+    /// caller does not need to replay a prior logical request.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn recheck(
+        &self,
+        idempotency_key: Option<String>,
+    ) -> Result<api::ActivationStatus, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .force_activation_recheck(api::ActivationMutationRequest {
+                idempotency_key: idempotency_key
+                    .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+            })
+            .await?
+            .into_inner())
+    }
+
+    /// Destructively activates only if the running service atomically observes the exact confirmed
+    /// blocker identity/revision set, activation attempt, and activation revision.
+    ///
+    /// # Errors
+    /// Returns a transport or capability/fence status error.
+    pub async fn force_activate(
+        &self,
+        expected_attempt_id: String,
+        expected_activation_revision: u64,
+        expected_blockers: Vec<api::ActivationBlocker>,
+        idempotency_key: Option<String>,
+    ) -> Result<api::ActivationStatus, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .force_activate(api::ForceActivateRequest {
+                idempotency_key: idempotency_key
+                    .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+                expected_activation_revision,
+                expected_blockers,
+                expected_attempt_id,
+            })
+            .await?
+            .into_inner())
+    }
 }
 
 macro_rules! typed_mutation {
@@ -435,15 +688,36 @@ impl NakodeClient {
         tools: Option<api::SessionToolConfiguration>,
         profile_id: Option<String>,
     ) -> Result<String, SdkError> {
+        self.open_session_with_attachment(
+            session_id,
+            SessionAttachment {
+                tools,
+                mcp_grant: None,
+                profile_id,
+            },
+        )
+        .await
+    }
+
+    /// Opens or reattaches to a logical session after atomically restoring every client-owned
+    /// attachment input. Callers should retain this value for generation-changing reconnects.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn open_session_with_attachment(
+        &self,
+        session_id: impl Into<String>,
+        attachment: SessionAttachment,
+    ) -> Result<String, SdkError> {
         let result = send_mutation!(
             self,
             open_session,
             api::OpenSessionRequest {
                 mutation: Some(mutation(None)),
                 session_id: session_id.into(),
-                tools,
-                mcp_grant: None,
-                profile_id,
+                tools: attachment.tools,
+                mcp_grant: attachment.mcp_grant,
+                profile_id: attachment.profile_id,
             }
         )?;
         result
@@ -1123,9 +1397,29 @@ impl NakodeClient {
         managed_watch(receiver, task)
     }
 
+    /// Watches one already-attached logical session. This reconnects transport streams but does not
+    /// mutate server attachment state; use [`Self::watch_attached_session`] across service cutovers.
     pub fn watch_session(&self, session_id: impl Into<String>) -> Watch<api::SessionState> {
+        self.watch_session_with_attachment(session_id.into(), None)
+    }
+
+    /// Watches one logical session and re-establishes its exact client-owned attachment if a new
+    /// service generation reports the persisted ID as not yet open. Reattachment must return the
+    /// same logical ID before any replacement snapshot is published.
+    pub fn watch_attached_session(
+        &self,
+        session_id: impl Into<String>,
+        attachment: SessionAttachment,
+    ) -> Watch<api::SessionState> {
+        self.watch_session_with_attachment(session_id.into(), Some(attachment))
+    }
+
+    fn watch_session_with_attachment(
+        &self,
+        session_id: String,
+        attachment: Option<SessionAttachment>,
+    ) -> Watch<api::SessionState> {
         let client = self.clone();
-        let session_id = session_id.into();
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
         let task = tokio::spawn(async move {
             let mut after = None;
@@ -1153,9 +1447,36 @@ impl NakodeClient {
                                         }
                                         continue;
                                     };
+                                    if state.id != session_id {
+                                        let _ = sender
+                                            .send(Err(SdkError::InvalidProjection(format!(
+                                                "session watch for {session_id} returned logical ID {}",
+                                                state.id
+                                            ))))
+                                            .await;
+                                        return;
+                                    }
                                     if sender.send(Ok(state)).await.is_err() {
                                         return;
                                     }
+                                }
+                                Err(error)
+                                    if error.code() == tonic::Code::NotFound
+                                        && attachment.is_some() =>
+                                {
+                                    if !reattach_watched_session(
+                                        &client,
+                                        &session_id,
+                                        attachment.clone().unwrap_or_default(),
+                                        &sender,
+                                        &mut reconnect_reported,
+                                        &mut after,
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                    break;
                                 }
                                 Err(error) => {
                                     if !report_watch_error(&sender, &mut reconnect_reported, error)
@@ -1166,6 +1487,20 @@ impl NakodeClient {
                                     break;
                                 }
                             }
+                        }
+                    }
+                    Err(error) if error.code() == tonic::Code::NotFound && attachment.is_some() => {
+                        if !reattach_watched_session(
+                            &client,
+                            &session_id,
+                            attachment.clone().unwrap_or_default(),
+                            &sender,
+                            &mut reconnect_reported,
+                            &mut after,
+                        )
+                        .await
+                        {
+                            return;
                         }
                     }
                     Err(error) => {
@@ -1190,6 +1525,32 @@ impl NakodeClient {
     ) -> Watch<HydratedSession> {
         let client = self.clone();
         let mut source = self.watch_session(session_id);
+        let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
+        let task = tokio::spawn(async move {
+            while let Some(update) = source.next().await {
+                let hydrated = match update {
+                    Ok(state) => client.hydrate_session(state, limit).await,
+                    Err(error) => Err(error),
+                };
+                if sender.send(hydrated).await.is_err() {
+                    return;
+                }
+            }
+        });
+        managed_watch(receiver, task)
+    }
+
+    /// Watches a fully hydrated authoritative session while restoring the retained attachment after
+    /// a service-generation handoff. Each replacement snapshot keeps the same logical session ID.
+    #[must_use]
+    pub fn watch_attached_hydrated_session(
+        &self,
+        session_id: impl Into<String>,
+        limit: usize,
+        attachment: SessionAttachment,
+    ) -> Watch<HydratedSession> {
+        let client = self.clone();
+        let mut source = self.watch_attached_session(session_id, attachment);
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
         let task = tokio::spawn(async move {
             while let Some(update) = source.next().await {
@@ -1416,6 +1777,12 @@ fn configured_transport(channel: Channel) -> NakodeServiceClient<Channel> {
         .max_encoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
 }
 
+fn configured_activation_transport(channel: Channel) -> ActivationServiceClient<Channel> {
+    ActivationServiceClient::new(channel)
+        .max_decoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
+        .max_encoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
+}
+
 fn bridge_continuation_mutation(
     request: &api::ContinueSessionFromBridgeRequest,
 ) -> api::MutationOptions {
@@ -1452,6 +1819,73 @@ fn retryable_status(status: &tonic::Status) -> bool {
         status.code(),
         tonic::Code::Unavailable | tonic::Code::Unknown
     )
+}
+
+fn activation_cursor(status: &api::ActivationStatus) -> ActivationCursor {
+    ActivationCursor {
+        attempt_id: status.attempt_id.clone(),
+        revision: status.revision,
+    }
+}
+
+fn activation_cursor_changed(
+    previous: Option<&ActivationCursor>,
+    status: &api::ActivationStatus,
+) -> bool {
+    previous.is_none_or(|previous| {
+        previous.attempt_id != status.attempt_id || previous.revision != status.revision
+    })
+}
+
+async fn reattach_session(
+    client: &NakodeClient,
+    expected_session_id: &str,
+    attachment: SessionAttachment,
+) -> Result<(), SdkError> {
+    let reopened = client
+        .open_session_with_attachment(expected_session_id.to_owned(), attachment)
+        .await?;
+    if reopened == expected_session_id {
+        Ok(())
+    } else {
+        Err(SdkError::InvalidProjection(format!(
+            "Nakode reopened logical session {reopened}, expected {expected_session_id}"
+        )))
+    }
+}
+
+async fn reattach_watched_session(
+    client: &NakodeClient,
+    expected_session_id: &str,
+    attachment: SessionAttachment,
+    sender: &tokio::sync::mpsc::Sender<Result<api::SessionState, SdkError>>,
+    reconnect_reported: &mut bool,
+    after: &mut Option<api::Cursor>,
+) -> bool {
+    match reattach_session(client, expected_session_id, attachment).await {
+        Ok(()) => {
+            *reconnect_reported = false;
+            *after = None;
+            true
+        }
+        Err(error @ SdkError::InvalidProjection(_)) => {
+            let _ = sender.send(Err(error)).await;
+            false
+        }
+        Err(error) => report_sdk_watch_error(sender, reconnect_reported, error).await,
+    }
+}
+
+async fn report_sdk_watch_error<T>(
+    sender: &tokio::sync::mpsc::Sender<Result<T, SdkError>>,
+    already_reported: &mut bool,
+    error: SdkError,
+) -> bool {
+    if *already_reported {
+        return true;
+    }
+    *already_reported = true;
+    sender.send(Err(error)).await.is_ok()
 }
 
 async fn report_watch_error<T>(
@@ -1545,12 +1979,29 @@ fn session_artifact_ids(session: &api::SessionState) -> HashSet<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        path::{Path, PathBuf},
+        pin::Pin,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
     };
 
-    use super::{SdkError, api, bridge_continuation_mutation, managed_watch, retry_transport};
+    use futures_util::{Stream, StreamExt};
+    use nakode_protocol as protocol;
+    use nakode_server::{ServerEndpoint, ServerRequest, ServerRequests};
+    use tokio::net::UnixListener;
+    use tokio_stream::wrappers::UnixListenerStream;
+    use tonic::{Request as TonicRequest, Response, Status};
+
+    use super::{
+        ActivationClient, ActivationCursor, NakodeClient, SdkError, SessionAttachment,
+        activation_cursor_changed, api, bridge_continuation_mutation, managed_watch,
+        retry_transport,
+    };
 
     fn bridge_request(
         session_id: &str,
@@ -1572,6 +2023,545 @@ mod tests {
     #[derive(Clone)]
     struct Request {
         idempotency_key: String,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SessionServerMode {
+        ReattachSame,
+        ReattachDifferent,
+        SnapshotDifferent,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedAttachment {
+        session_id: String,
+        tools: Option<protocol::SessionToolConfiguration>,
+        mcp_grant: Option<protocol::McpSessionGrant>,
+        profile_id: Option<String>,
+    }
+
+    struct TestUnixServer {
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        server: tokio::task::JoinHandle<()>,
+        actor: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl TestUnixServer {
+        async fn stop(mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if tokio::time::timeout(Duration::from_secs(1), &mut self.server)
+                .await
+                .is_err()
+            {
+                self.server.abort();
+                let _ = self.server.await;
+            }
+            if let Some(actor) = self.actor.take() {
+                actor.abort();
+                let _ = actor.await;
+            }
+        }
+    }
+
+    fn session_view(id: &str) -> protocol::SessionView {
+        protocol::SessionView {
+            id: protocol::SessionId::from(id),
+            revision: 1,
+            workspace_id: protocol::WorkspaceId::from("workspace-a"),
+            working_directory: "/tmp/workspace-a".to_owned(),
+            title: "Attached session".to_owned(),
+            status_message: "Ready".to_owned(),
+            diagnostic_count: 0,
+            activity: protocol::SessionActivity::Idle,
+            selected_provider_id: None,
+            selected_model_id: None,
+            selected_model_options: protocol::ModelOptions::default(),
+            active_agent_session: None,
+            active_turn: None,
+            last_turn: None,
+            next_turn_configuration_pending: false,
+            next_turn_transition: None,
+            context_usage: None,
+            transcript: protocol::TranscriptPage {
+                entries: Vec::new(),
+                has_earlier: false,
+                stream_active: false,
+                stream_label: String::new(),
+                current_owner_entry: None,
+                current_owner_omitted_tool_calls: 0,
+            },
+            recoverable_prompt: None,
+            queue: Vec::new(),
+            interactions: Vec::new(),
+            todos: Vec::new(),
+            runs: Vec::new(),
+            runs_total: Some(0),
+            runs_has_earlier: false,
+            notices: Vec::new(),
+            external_tool_calls: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_owner_activity_at_ms: 0,
+        }
+    }
+
+    fn session_server_snapshot(
+        endpoint: &ServerEndpoint,
+        scope: protocol::SubscriptionScope,
+        attached: bool,
+        mode: SessionServerMode,
+    ) -> Result<protocol::Snapshot<protocol::SubscriptionView>, protocol::ServiceError> {
+        let protocol::SubscriptionScope::Session { session_id } = scope else {
+            return Err(protocol::ServiceError {
+                code: protocol::ErrorCode::InvalidRequest,
+                message: "session subscription required".to_owned(),
+                retryable: false,
+            });
+        };
+        if !attached && !matches!(mode, SessionServerMode::SnapshotDifferent) {
+            return Err(protocol::ServiceError {
+                code: protocol::ErrorCode::NotFound,
+                message: "session is persisted but not attached".to_owned(),
+                retryable: false,
+            });
+        }
+        let projected_id = if matches!(mode, SessionServerMode::SnapshotDifferent) {
+            "different-session"
+        } else {
+            session_id.as_str()
+        };
+        Ok(protocol::Snapshot {
+            cursor: endpoint.cursor(),
+            value: protocol::SubscriptionView::Session(Box::new(session_view(projected_id))),
+        })
+    }
+
+    async fn run_session_actor(
+        actor_endpoint: ServerEndpoint,
+        mut requests: ServerRequests,
+        mode: SessionServerMode,
+        captured: Arc<Mutex<Option<CapturedAttachment>>>,
+    ) {
+        let mut attached = false;
+        while let Some(request) = requests.recv().await {
+            match request {
+                ServerRequest::Subscribe { scope, respond, .. } => {
+                    let _ = respond.send(session_server_snapshot(
+                        &actor_endpoint,
+                        scope,
+                        attached,
+                        mode,
+                    ));
+                }
+                ServerRequest::Command {
+                    command:
+                        protocol::Command::OpenSession {
+                            session_id,
+                            tools,
+                            mcp_grant,
+                            profile_id,
+                            ..
+                        },
+                    respond,
+                    ..
+                } => {
+                    *captured.lock().expect("captured attachment") = Some(CapturedAttachment {
+                        session_id: session_id.to_string(),
+                        tools,
+                        mcp_grant,
+                        profile_id,
+                    });
+                    attached = true;
+                    let resource_id = if matches!(mode, SessionServerMode::ReattachDifferent) {
+                        "different-session".to_owned()
+                    } else {
+                        session_id.to_string()
+                    };
+                    let _ = respond.send(Ok(protocol::CommandAccepted {
+                        resource_id: Some(resource_id),
+                        revision: Some(1),
+                        bridge_continuation: None,
+                        replayed_bridge_continuation: None,
+                        replayed_bridge_source_active: None,
+                    }));
+                }
+                ServerRequest::Command { respond, .. } => {
+                    let _ = respond.send(Err(protocol::ServiceError {
+                        code: protocol::ErrorCode::InvalidRequest,
+                        message: "unexpected command".to_owned(),
+                        retryable: false,
+                    }));
+                }
+                ServerRequest::Query { respond, .. } => {
+                    let _ = respond.send(Err(protocol::ServiceError {
+                        code: protocol::ErrorCode::InvalidRequest,
+                        message: "unexpected query".to_owned(),
+                        retryable: false,
+                    }));
+                }
+            }
+        }
+    }
+
+    fn spawn_session_server(
+        path: &Path,
+        mode: SessionServerMode,
+        captured: Arc<Mutex<Option<CapturedAttachment>>>,
+    ) -> TestUnixServer {
+        let listener = UnixListener::bind(path).expect("bind fake Nakode API");
+        let (endpoint, requests) =
+            ServerEndpoint::channel("sdk-test", protocol::ServiceCapabilities::default(), 8);
+        let actor = tokio::spawn(run_session_actor(
+            endpoint.clone(),
+            requests,
+            mode,
+            captured,
+        ));
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let incoming = UnixListenerStream::new(listener);
+        let server = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(nakode_server::grpc::GrpcService::new(endpoint).into_server())
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = stopped.await;
+                })
+                .await;
+        });
+        TestUnixServer {
+            shutdown: Some(shutdown),
+            server,
+            actor: Some(actor),
+        }
+    }
+
+    #[derive(Clone)]
+    enum ActivationWatchBehavior {
+        Empty,
+        Pending(Arc<AtomicUsize>),
+    }
+
+    struct DropAwareActivationStream {
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Stream for DropAwareActivationStream {
+        type Item = Result<api::ActivationStatus, Status>;
+
+        fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for DropAwareActivationStream {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeActivationService {
+        status: api::ActivationStatus,
+        behavior: ActivationWatchBehavior,
+        requests: Arc<Mutex<Vec<api::WatchActivationStatusRequest>>>,
+    }
+
+    #[tonic::async_trait]
+    impl api::activation_service_server::ActivationService for FakeActivationService {
+        async fn get_activation_status(
+            &self,
+            _request: TonicRequest<api::GetActivationStatusRequest>,
+        ) -> Result<Response<api::ActivationStatus>, Status> {
+            Ok(Response::new(self.status.clone()))
+        }
+
+        type WatchActivationStatusStream =
+            Pin<Box<dyn Stream<Item = Result<api::ActivationStatus, Status>> + Send + 'static>>;
+
+        async fn watch_activation_status(
+            &self,
+            request: TonicRequest<api::WatchActivationStatusRequest>,
+        ) -> Result<Response<Self::WatchActivationStatusStream>, Status> {
+            self.requests
+                .lock()
+                .expect("activation requests")
+                .push(request.into_inner());
+            let stream: Self::WatchActivationStatusStream = match &self.behavior {
+                ActivationWatchBehavior::Empty => Box::pin(futures_util::stream::empty()),
+                ActivationWatchBehavior::Pending(dropped) => Box::pin(DropAwareActivationStream {
+                    dropped: Arc::clone(dropped),
+                }),
+            };
+            Ok(Response::new(stream))
+        }
+
+        async fn force_activation_recheck(
+            &self,
+            _request: TonicRequest<api::ActivationMutationRequest>,
+        ) -> Result<Response<api::ActivationStatus>, Status> {
+            Err(Status::unimplemented("not used by SDK transport tests"))
+        }
+
+        async fn force_activate(
+            &self,
+            _request: TonicRequest<api::ForceActivateRequest>,
+        ) -> Result<Response<api::ActivationStatus>, Status> {
+            Err(Status::unimplemented("not used by SDK transport tests"))
+        }
+    }
+
+    fn spawn_activation_server(path: &Path, service: FakeActivationService) -> TestUnixServer {
+        let listener = UnixListener::bind(path).expect("bind fake activation API");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let incoming = UnixListenerStream::new(listener);
+        let server = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(api::activation_service_server::ActivationServiceServer::new(service))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = stopped.await;
+                })
+                .await;
+        });
+        TestUnixServer {
+            shutdown: Some(shutdown),
+            server,
+            actor: None,
+        }
+    }
+
+    fn activation_status(
+        attempt_id: &str,
+        revision: u64,
+        phase: api::ActivationPhase,
+    ) -> api::ActivationStatus {
+        api::ActivationStatus {
+            attempt_id: attempt_id.to_owned(),
+            revision,
+            phase: phase as i32,
+            ..api::ActivationStatus::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn attached_watch_reopens_same_id_and_forwards_every_attachment() {
+        let directory = tempfile::tempdir().expect("SDK transport directory");
+        let socket = directory.path().join("nakode.sock");
+        let captured = Arc::new(Mutex::new(None));
+        let server = spawn_session_server(
+            &socket,
+            SessionServerMode::ReattachSame,
+            Arc::clone(&captured),
+        );
+        let client = NakodeClient::connect_unix(&socket)
+            .await
+            .expect("connect fake Nakode API");
+        let attachment = SessionAttachment {
+            tools: Some(api::SessionToolConfiguration {
+                tools: vec![api::ExternalToolDefinition {
+                    name: "ticket_lookup".to_owned(),
+                    description: "Look up one ticket".to_owned(),
+                    input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                }],
+                replace_builtin_tools: true,
+                allowed_builtin_tools: vec!["read".to_owned()],
+            }),
+            mcp_grant: Some(api::McpSessionGrant {
+                surface: api::McpSessionSurface::CodingAgent as i32,
+                server_ids: vec!["linear".to_owned()],
+            }),
+            profile_id: Some("profile-a".to_owned()),
+        };
+        let mut watch = client.watch_attached_session("session-a", attachment);
+        let state = tokio::time::timeout(Duration::from_secs(3), watch.next())
+            .await
+            .expect("reattached snapshot deadline")
+            .expect("reattached snapshot")
+            .expect("valid reattached snapshot");
+        assert_eq!(state.id, "session-a");
+
+        let captured = captured
+            .lock()
+            .expect("captured attachment")
+            .clone()
+            .expect("open-session attachment");
+        assert_eq!(captured.session_id, "session-a");
+        assert_eq!(captured.profile_id.as_deref(), Some("profile-a"));
+        let tools = captured.tools.expect("forwarded tools");
+        assert!(tools.replace_builtin_tools);
+        assert_eq!(tools.allowed_builtin_tools, Some(vec!["read".to_owned()]));
+        assert_eq!(tools.tools.len(), 1);
+        assert_eq!(tools.tools[0].name, "ticket_lookup");
+        let grant = captured.mcp_grant.expect("forwarded MCP grant");
+        assert_eq!(
+            grant.surface,
+            Some(protocol::McpSessionSurface::CodingAgent)
+        );
+        assert_eq!(grant.server_ids, ["linear"]);
+
+        drop(watch);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn attached_watch_rejects_identity_changes_from_reopen_and_snapshot() {
+        for (name, mode) in [
+            ("reopen", SessionServerMode::ReattachDifferent),
+            ("snapshot", SessionServerMode::SnapshotDifferent),
+        ] {
+            let directory = tempfile::tempdir().expect("SDK transport directory");
+            let socket = directory.path().join(format!("nakode-{name}.sock"));
+            let server = spawn_session_server(&socket, mode, Arc::new(Mutex::new(None)));
+            let client = NakodeClient::connect_unix(&socket)
+                .await
+                .expect("connect fake Nakode API");
+            let mut watch =
+                client.watch_attached_session("session-a", SessionAttachment::default());
+            let error = tokio::time::timeout(Duration::from_secs(3), watch.next())
+                .await
+                .expect("projection error deadline")
+                .expect("projection error item")
+                .expect_err("identity change must be terminal");
+            assert!(
+                matches!(error, SdkError::InvalidProjection(_)),
+                "{name}: {error}"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), watch.next())
+                    .await
+                    .expect("terminated producer deadline")
+                    .is_none(),
+                "{name}: producer continued after identity violation"
+            );
+            server.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn activation_watch_rediscovery_hands_off_sockets_and_sends_attempt_cursor() {
+        let directory = tempfile::tempdir().expect("activation transport directory");
+        let helper_socket = directory.path().join("helper.sock");
+        let service_socket = directory.path().join("service.sock");
+        let helper_requests = Arc::new(Mutex::new(Vec::new()));
+        let service_requests = Arc::new(Mutex::new(Vec::new()));
+        let helper = spawn_activation_server(
+            &helper_socket,
+            FakeActivationService {
+                status: activation_status("attempt-a", 2, api::ActivationPhase::Blocked),
+                behavior: ActivationWatchBehavior::Empty,
+                requests: Arc::clone(&helper_requests),
+            },
+        );
+        let service = spawn_activation_server(
+            &service_socket,
+            FakeActivationService {
+                status: activation_status("attempt-a", 3, api::ActivationPhase::Activated),
+                behavior: ActivationWatchBehavior::Empty,
+                requests: Arc::clone(&service_requests),
+            },
+        );
+        let discoveries = Arc::new(AtomicUsize::new(0));
+        let mut watch = ActivationClient::watch_status_with_rediscovery(
+            {
+                let discoveries = Arc::clone(&discoveries);
+                let helper_socket = helper_socket.clone();
+                let service_socket = service_socket.clone();
+                move || {
+                    let path = if discoveries.fetch_add(1, Ordering::SeqCst) == 0 {
+                        helper_socket.clone()
+                    } else {
+                        service_socket.clone()
+                    };
+                    async move { ActivationClient::connect_unix(path).await }
+                }
+            },
+            None,
+        );
+        let blocked = tokio::time::timeout(Duration::from_secs(3), watch.next())
+            .await
+            .expect("helper snapshot deadline")
+            .expect("helper snapshot")
+            .expect("helper status");
+        assert_eq!(blocked.phase, api::ActivationPhase::Blocked as i32);
+        let activated = tokio::time::timeout(Duration::from_secs(3), watch.next())
+            .await
+            .expect("service snapshot deadline")
+            .expect("service snapshot")
+            .expect("service status");
+        assert_eq!(activated.phase, api::ActivationPhase::Activated as i32);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !helper_requests.lock().expect("helper requests").is_empty()
+                    && !service_requests
+                        .lock()
+                        .expect("service requests")
+                        .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attempt-qualified watches reached both endpoints");
+        let helper_request = helper_requests.lock().expect("helper requests")[0].clone();
+        assert_eq!(helper_request.after_attempt_id, "attempt-a");
+        assert_eq!(helper_request.after_revision, Some(2));
+        let service_request = service_requests.lock().expect("service requests")[0].clone();
+        assert_eq!(service_request.after_attempt_id, "attempt-a");
+        assert_eq!(service_request.after_revision, Some(3));
+
+        drop(watch);
+        helper.stop().await;
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_rediscovering_activation_watch_cancels_real_transport_stream() {
+        let directory = tempfile::tempdir().expect("activation transport directory");
+        let socket = directory.path().join("activation.sock");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let server = spawn_activation_server(
+            &socket,
+            FakeActivationService {
+                status: activation_status("attempt-a", 2, api::ActivationPhase::Blocked),
+                behavior: ActivationWatchBehavior::Pending(Arc::clone(&dropped)),
+                requests: Arc::clone(&requests),
+            },
+        );
+        let mut watch = ActivationClient::watch_status_with_rediscovery(
+            {
+                let socket = PathBuf::from(&socket);
+                move || {
+                    let socket = socket.clone();
+                    async move { ActivationClient::connect_unix(socket).await }
+                }
+            },
+            None,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(3), watch.next())
+            .await
+            .expect("initial activation status deadline")
+            .expect("initial activation status")
+            .expect("valid activation status");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.lock().expect("activation requests").is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transport watch established");
+        drop(watch);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while dropped.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server transport stream dropped with SDK consumer");
+        server.stop().await;
     }
 
     #[tokio::test]
@@ -1605,6 +2595,24 @@ mod tests {
         })
         .await
         .expect("producer is cancelled with the consumer");
+    }
+
+    #[test]
+    fn activation_cursor_treats_a_new_attempt_with_a_lower_revision_as_new() {
+        let previous = ActivationCursor {
+            attempt_id: "attempt-a".to_owned(),
+            revision: 50,
+        };
+        let mut next = api::ActivationStatus {
+            attempt_id: "attempt-b".to_owned(),
+            revision: 1,
+            ..Default::default()
+        };
+        assert!(activation_cursor_changed(Some(&previous), &next));
+        next.attempt_id = previous.attempt_id.clone();
+        assert!(activation_cursor_changed(Some(&previous), &next));
+        next.revision = previous.revision;
+        assert!(!activation_cursor_changed(Some(&previous), &next));
     }
 
     #[test]

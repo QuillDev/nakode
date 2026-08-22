@@ -47,6 +47,8 @@ pub enum ServiceCapability {
     McpManagement,
     /// Typed Chat/Agent external-thread intent, lifecycle, binding, and delivery checkpoints.
     OrchestratorThreadBridge,
+    /// The lifecycle socket can atomically compare/fence a confirmed blocker set before forced activation.
+    ConditionalActivationForce,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

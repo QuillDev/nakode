@@ -3438,7 +3438,7 @@ impl ServerCore {
         })
     }
 
-    pub(crate) fn live_work_session_ids(&self) -> Vec<String> {
+    pub(crate) fn live_work_sessions(&self) -> Vec<(String, u64)> {
         // In-memory turns, queues, shells, and delegates exist only in attached engines. Persisted
         // records outside this map are closed snapshots and cannot own process-local live work.
         self.sessions_by_id
@@ -3449,7 +3449,7 @@ impl ServerCore {
                     .active_session?;
                 (!matches!(session.activity, nakode_protocol::SessionActivity::Idle)
                     || !session.queue.is_empty())
-                .then(|| session_id.to_string())
+                .then(|| (session_id.to_string(), session.revision))
             })
             .collect()
     }

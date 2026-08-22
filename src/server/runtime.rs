@@ -5,7 +5,7 @@
 //! resources. Frontends reach this owner only through the service protocol.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -113,6 +113,12 @@ enum EffectOrigin {
     Subagent,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
+pub(crate) struct QuiescenceBlocker {
+    pub session_id: String,
+    pub session_revision: u64,
+}
+
 #[derive(Clone)]
 pub(crate) struct NativeServerHandle {
     endpoint: ServerEndpoint,
@@ -120,7 +126,13 @@ pub(crate) struct NativeServerHandle {
     quiesce: mpsc::Sender<QuiesceRequest>,
 }
 
+enum QuiesceMode {
+    Safe,
+    Force { expected: Vec<QuiescenceBlocker> },
+}
+
 struct QuiesceRequest {
+    mode: QuiesceMode,
     respond: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
@@ -538,15 +550,30 @@ impl NativeServerRuntime {
     }
 
     fn handle_quiesce(&mut self, request: QuiesceRequest) {
-        let mut running = self.core.live_work_session_ids();
-        running.extend(
-            self.pending_native_delegations
-                .values()
-                .map(|pending| pending.session_id.to_string()),
-        );
-        running.sort();
-        running.dedup();
-        if running.is_empty() {
+        let mut running = self
+            .core
+            .live_work_sessions()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        for pending in self.pending_native_delegations.values() {
+            running.entry(pending.session_id.to_string()).or_insert(0);
+        }
+        let running = running
+            .into_iter()
+            .map(|(session_id, session_revision)| QuiescenceBlocker {
+                session_id,
+                session_revision,
+            })
+            .collect::<Vec<_>>();
+        let (accepted, forced) = match &request.mode {
+            QuiesceMode::Safe => (running.is_empty(), false),
+            QuiesceMode::Force { expected } => {
+                let mut expected = expected.clone();
+                expected.sort();
+                (expected == running, true)
+            }
+        };
+        if accepted {
             self.accepting_work = false;
             if request.respond.send(Ok(())).is_err() {
                 // A bounded lifecycle caller abandoned the response. No other actor branch can run
@@ -554,10 +581,19 @@ impl NativeServerRuntime {
                 self.accepting_work = true;
             }
         } else {
-            let _ = request.respond.send(Err(format!(
-                "live work is still owned by session(s) {}",
-                running.join(", ")
-            )));
+            let detail = running
+                .iter()
+                .map(|blocker| format!("{}@{}", blocker.session_id, blocker.session_revision))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = if forced {
+                format!(
+                    "live work changed before conditional activation; current session(s) {detail}"
+                )
+            } else {
+                format!("live work is still owned by session(s) {detail}")
+            };
+            let _ = request.respond.send(Err(message));
         }
     }
 
@@ -2121,6 +2157,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::SoulManagement,
             ServiceCapability::McpManagement,
             ServiceCapability::OrchestratorThreadBridge,
+            ServiceCapability::ConditionalActivationForce,
         ]
         .into_iter()
         .collect(),
@@ -2133,9 +2170,21 @@ impl NativeServerHandle {
     }
 
     pub(crate) async fn quiesce(&self) -> Result<(), String> {
+        self.request_quiescence(QuiesceMode::Safe).await
+    }
+
+    pub(crate) async fn force_quiesce(
+        &self,
+        expected: Vec<QuiescenceBlocker>,
+    ) -> Result<(), String> {
+        self.request_quiescence(QuiesceMode::Force { expected })
+            .await
+    }
+
+    async fn request_quiescence(&self, mode: QuiesceMode) -> Result<(), String> {
         let (respond, response) = tokio::sync::oneshot::channel();
         self.quiesce
-            .send(QuiesceRequest { respond })
+            .send(QuiesceRequest { mode, respond })
             .await
             .map_err(|_| "native runtime stopped before quiescence could be checked".to_owned())?;
         response
@@ -4141,7 +4190,8 @@ mod tests {
     use super::{
         BackendRegistry, BackendSource, EffectExecutor, EffectOrigin, McpCallCompletion,
         NativeServerRuntime, PendingMcpCall, PendingNativeDelegation, PersistenceServices,
-        ProviderCredentialInput, SessionBackendTasks, load_subagents, merge_invocation_catalogue,
+        ProviderCredentialInput, QuiesceMode, QuiesceRequest, QuiescenceBlocker,
+        SessionBackendTasks, load_subagents, merge_invocation_catalogue,
         native_service_capabilities, provider_enablement_changes, save_provider_credential,
     };
     use crate::{
@@ -4996,9 +5046,85 @@ mod tests {
         let (respond, response) = tokio::sync::oneshot::channel();
         drop(response);
 
-        runtime.handle_quiesce(super::QuiesceRequest { respond });
+        runtime.handle_quiesce(super::QuiesceRequest {
+            mode: super::QuiesceMode::Safe,
+            respond,
+        });
 
         assert!(runtime.accepting_work);
+    }
+
+    #[tokio::test]
+    async fn conditional_quiescence_accepts_only_the_actor_owned_exact_blocker_set() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let (delegation_response, _delegation_result) = tokio::sync::oneshot::channel();
+        let cancellation_task = tokio::spawn(std::future::pending());
+        runtime.pending_native_delegations.insert(
+            1,
+            PendingNativeDelegation {
+                session_id: session_id.clone(),
+                run_id: "run-a".to_owned(),
+                respond: delegation_response,
+                cancellation_task,
+            },
+        );
+
+        let (changed_response, changed_result) = tokio::sync::oneshot::channel();
+        runtime.handle_quiesce(QuiesceRequest {
+            mode: QuiesceMode::Force {
+                expected: vec![QuiescenceBlocker {
+                    session_id: session_id.to_string(),
+                    session_revision: 1,
+                }],
+            },
+            respond: changed_response,
+        });
+        let changed = changed_result
+            .await
+            .expect("changed force response")
+            .expect_err("changed blocker revision must refuse");
+        assert!(changed.contains("live work changed before conditional activation"));
+        assert!(runtime.accepting_work);
+
+        let (exact_response, exact_result) = tokio::sync::oneshot::channel();
+        runtime.handle_quiesce(QuiesceRequest {
+            mode: QuiesceMode::Force {
+                expected: vec![QuiescenceBlocker {
+                    session_id: session_id.to_string(),
+                    session_revision: 0,
+                }],
+            },
+            respond: exact_response,
+        });
+        exact_result
+            .await
+            .expect("exact force response")
+            .expect("exact blocker set fences the runtime");
+        assert!(!runtime.accepting_work);
+
+        let pending = runtime
+            .pending_native_delegations
+            .remove(&1)
+            .expect("pending delegation");
+        pending.cancellation_task.abort();
+        runtime.effects.shutdown().await;
     }
 
     #[tokio::test]

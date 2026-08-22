@@ -20,6 +20,18 @@ def fail(request_id, message):
 
 
 initialized = False
+gate_root_value = os.environ.get("NAKODE_E2E_GATE_ROOT")
+if "--gate-root" in sys.argv:
+    gate_root_index = sys.argv.index("--gate-root") + 1
+    if gate_root_index >= len(sys.argv):
+        sys.stderr.write("--gate-root requires a directory path\n")
+        sys.exit(2)
+    gate_root_value = sys.argv[gate_root_index]
+gate_root = os.path.realpath(gate_root_value or tempfile.gettempdir())
+if not os.path.isdir(gate_root):
+    sys.stderr.write(f"fixture gate root is not a directory: {gate_root!r}\n")
+    sys.exit(2)
+
 init_gate = None
 if "--init-gate" in sys.argv:
     gate_index = sys.argv.index("--init-gate") + 1
@@ -27,9 +39,11 @@ if "--init-gate" in sys.argv:
         sys.stderr.write("--init-gate requires a FIFO path\n")
         sys.exit(2)
     candidate = os.path.realpath(sys.argv[gate_index])
-    temp_root = os.path.realpath(tempfile.gettempdir())
-    if os.path.commonpath((candidate, temp_root)) != temp_root:
-        sys.stderr.write("--init-gate must be inside the system temporary directory\n")
+    if os.path.commonpath((candidate, gate_root)) != gate_root:
+        sys.stderr.write(
+            f"--init-gate must be inside the configured fixture gate root "
+            f"(gate={candidate!r}, gate_root={gate_root!r})\n"
+        )
         sys.exit(2)
     try:
         if not stat.S_ISFIFO(os.stat(candidate).st_mode):
@@ -39,6 +53,24 @@ if "--init-gate" in sys.argv:
         sys.stderr.write(f"invalid initialization gate: {error}\n")
         sys.exit(2)
     init_gate = Path(candidate)
+turn_gate = None
+turn_gate_value = os.environ.get("NAKODE_E2E_TURN_GATE")
+if turn_gate_value:
+    candidate = os.path.realpath(turn_gate_value)
+    if os.path.commonpath((candidate, gate_root)) != gate_root:
+        sys.stderr.write(
+            f"NAKODE_E2E_TURN_GATE must be inside the configured fixture gate root "
+            f"(gate={candidate!r}, gate_root={gate_root!r})\n"
+        )
+        sys.exit(2)
+    try:
+        if not stat.S_ISFIFO(os.stat(candidate).st_mode):
+            sys.stderr.write("NAKODE_E2E_TURN_GATE must reference a FIFO\n")
+            sys.exit(2)
+    except OSError as error:
+        sys.stderr.write(f"invalid turn gate: {error}\n")
+        sys.exit(2)
+    turn_gate = Path(candidate)
 unique_ids = os.environ.get("NAKODE_E2E_UNIQUE_CODEX_IDS") == "1"
 id_suffix = f"-{os.getpid()}" if unique_ids else ""
 thread_id = f"thread-fixture{id_suffix}"
@@ -157,8 +189,10 @@ for raw_line in sys.stdin:
         send({"method": "thread/started", "params": {"thread": {"id": thread_id}}})
     elif method == "thread/resume":
         params = message.get("params", {})
+        resumed_thread_id = params.get("threadId")
         if (
-            params.get("threadId") != thread_id
+            not isinstance(resumed_thread_id, str)
+            or not resumed_thread_id.startswith("thread-fixture")
             or not params.get("cwd")
             or params.get("approvalPolicy") != "never"
             or params.get("sandbox") != "danger-full-access"
@@ -170,6 +204,9 @@ for raw_line in sys.stdin:
         ):
             fail(request_id, "thread/resume fields do not match")
             continue
+        # A replacement fixture process models a provider bridge reconnecting to the stable
+        # provider-owned thread recorded by the previous Nakode service generation.
+        thread_id = resumed_thread_id
         send(
             {
                 "id": request_id,
@@ -229,7 +266,14 @@ for raw_line in sys.stdin:
                 "params": {"threadId": thread_id, "turn": {"id": turn_id}},
             }
         )
-        if prompt == "hello fixture":
+        if turn_gate and prompt == "hello fixture":
+            try:
+                with turn_gate.open("rb") as gate:
+                    gate.read(1)
+            except OSError as error:
+                sys.stderr.write(f"failed to wait on turn gate: {error}\n")
+                sys.exit(2)
+        if prompt in ("hello fixture", "idle fixture"):
             send(
                 {
                     "method": "item/started",

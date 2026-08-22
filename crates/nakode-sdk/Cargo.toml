@@ -19,3 +19,9 @@ tonic = "0.14.6"
 tower = { version = "0.5", features = ["util"] }
 sha2 = "0.10"
 uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+nakode-protocol = { path = "../nakode-protocol" }
+nakode-server = { path = "../nakode-server" }
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
