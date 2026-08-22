@@ -188,6 +188,49 @@ impl ServerCore {
         self.published_workspace = Some(self.workspace_bootstrap());
     }
 
+    pub(crate) fn install_skill_authority(
+        &mut self,
+        catalogue: &SkillCatalog,
+        preferences: &HashMap<String, Vec<crate::skill::SkillPreference>>,
+    ) {
+        let installed_ids = catalogue.stable_ids();
+        self.engine_mut()
+            .state_mut()
+            .install_skill_snapshot(catalogue.clone(), Some(&installed_ids));
+        self.session_template
+            .install_skill_snapshot(catalogue.clone(), Some(&installed_ids));
+        for engine in self.sessions_by_id.values_mut() {
+            let Some(profile_id) = engine.state().skill_profile_id().map(str::to_owned) else {
+                continue;
+            };
+            let effective = catalogue.enabled_for(
+                preferences
+                    .get(&profile_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                &profile_id,
+            );
+            let ids = effective.stable_ids();
+            engine
+                .state_mut()
+                .install_skill_snapshot(effective, Some(&ids));
+        }
+    }
+
+    pub(crate) fn install_profile_skill_catalogue(
+        &mut self,
+        profile_id: &str,
+        catalogue: &SkillCatalog,
+    ) {
+        for engine in self.sessions_by_id.values_mut() {
+            if engine.state().skill_profile_id() == Some(profile_id) {
+                engine
+                    .state_mut()
+                    .install_skill_snapshot(catalogue.clone(), Some(&catalogue.stable_ids()));
+            }
+        }
+    }
+
     pub(crate) fn install_available_builtin_tools(
         &mut self,
         availability: &HashMap<String, Vec<String>>,
@@ -639,7 +682,7 @@ impl ServerCore {
                 initial_instructions,
                 bridge,
                 mcp_grant,
-                profile_id: _,
+                profile_id,
                 disabled_skill_ids,
             } => self.create_session_command_with_mcp_and_skills(
                 &workspace_id,
@@ -651,13 +694,22 @@ impl ServerCore {
                 initial_instructions.as_deref(),
                 bridge,
                 mcp_grant.as_ref(),
+                profile_id,
                 &disabled_skill_ids,
             ),
             Command::OpenSession {
                 session_id,
                 tools,
                 mcp_grant,
-            } => self.open_session_command_with_mcp(&session_id, tools, mcp_grant.as_ref()),
+                profile_id,
+                enabled_skill_ids,
+            } => self.open_session_command_with_mcp_and_profile(
+                &session_id,
+                tools,
+                mcp_grant.as_ref(),
+                profile_id,
+                &enabled_skill_ids,
+            ),
             Command::SetSessionBridgeLifecycle {
                 session_id,
                 lifecycle,
@@ -950,6 +1002,7 @@ impl ServerCore {
             initial_instructions,
             bridge,
             mcp_grant,
+            None,
             &[],
         )
     }
@@ -968,6 +1021,7 @@ impl ServerCore {
         initial_instructions: Option<&str>,
         bridge: Option<SessionBridgeIntent>,
         mcp_grant: Option<&McpSessionGrant>,
+        profile_id: Option<String>,
         disabled_skill_ids: &[String],
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
@@ -988,7 +1042,8 @@ impl ServerCore {
             })?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
-        engine.state_mut().install_skills(skills);
+        engine.state_mut().set_skill_profile(profile_id);
+        engine.state_mut().install_skill_snapshot(skills, None);
         engine
             .state_mut()
             .set_initial_client_instructions(initial_instructions)?;
@@ -1681,11 +1736,24 @@ impl ServerCore {
         self.open_session_command_with_mcp(session_id, tools, None)
     }
 
+    #[cfg(test)]
     fn open_session_command_with_mcp(
         &mut self,
         session_id: &SessionId,
         tools: Option<nakode_protocol::SessionToolConfiguration>,
         mcp_grant: Option<&McpSessionGrant>,
+    ) -> DomainCommandOutcome {
+        self.open_session_command_with_mcp_and_profile(session_id, tools, mcp_grant, None, &[])
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_session_command_with_mcp_and_profile(
+        &mut self,
+        session_id: &SessionId,
+        tools: Option<nakode_protocol::SessionToolConfiguration>,
+        mcp_grant: Option<&McpSessionGrant>,
+        profile_id: Option<String>,
+        enabled_skill_ids: &[String],
     ) -> DomainCommandOutcome {
         let loaded = self
             .sessions_by_id
@@ -1726,7 +1794,13 @@ impl ServerCore {
                             tools.allowed_builtin_tools.as_deref(),
                         )?;
                 }
-                // Opening an attached session is a reattachment, not a reconfiguration. The
+                if let Some(profile_id) = profile_id {
+                    let state = self.session_engine_mut(loaded)?.state_mut();
+                    let skills = state.skill_catalogue().only_ids(enabled_skill_ids);
+                    state.set_skill_profile(Some(profile_id));
+                    state.install_skill_snapshot(skills, Some(enabled_skill_ids));
+                }
+                // Opening an attached session is a reattachment, not a tool reconfiguration. The
                 // runtime already owns its installed MCP tools, so a caller's current grant must
                 // not make an otherwise valid reattach fail or mutate the active session.
                 return Ok(Self::accepted(Some(loaded.to_string()), Vec::new()));
@@ -1756,14 +1830,20 @@ impl ServerCore {
         let working_directory =
             canonical_working_directory(Some(&session.working_directory), &session.workspace)?;
         self.refresh_session_template_addenda()?;
-        let skills = SkillCatalog::load(Path::new(&working_directory)).map_err(|error| {
-            DomainCommandError::Invalid(format!(
-                "failed to load skills for {working_directory}: {error}"
-            ))
-        })?;
+        let authoritative_ids = profile_id
+            .as_ref()
+            .map(|_| enabled_skill_ids)
+            .or(session.enabled_skill_ids.as_deref());
+        let skills = authoritative_ids.map_or_else(
+            || self.session_template.skill_catalogue(),
+            |ids| self.session_template.skill_catalogue().only_ids(ids),
+        );
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
-        engine.state_mut().install_skills(skills);
+        engine.state_mut().set_skill_profile(profile_id);
+        engine
+            .state_mut()
+            .install_skill_snapshot(skills, authoritative_ids);
         // The workspace template may still carry the bootstrap provider/session identity. Reset that
         // clone before installing client-owned tools; restoration begins only after validation.
         let _discarded_template_effects = engine.state_mut().create_logical_session()?;
@@ -1785,10 +1865,42 @@ impl ServerCore {
                 .state_mut()
                 .configure_mcp_archetype_grants(archetype_grants);
         }
-        let effects = engine.state_mut().begin_resume(session.clone());
+        let mut effects = engine.state_mut().begin_resume(session.clone());
+        Self::prepend_resume_hydration_effects(&session, &engine, &mut effects);
         let loaded_id = SessionId::from(session.id.clone());
         self.sessions_by_id.insert(loaded_id.clone(), engine);
         Ok(Self::accepted(Some(session.id), effects))
+    }
+
+    fn prepend_resume_hydration_effects(
+        session: &SessionRecord,
+        engine: &ServiceEngine,
+        effects: &mut Vec<Effect>,
+    ) {
+        if effects.is_empty() {
+            return;
+        }
+        // Hydrate persisted children as soon as an accepted resume begins so clients can inspect
+        // terminal evidence without waiting for the provider handshake. A rejected resume must
+        // not install child state into an engine that has no logical session identity.
+        effects.insert(0, Effect::LoadSubagents(session.id.clone()));
+        Self::persist_legacy_skill_snapshot(session, engine, effects);
+    }
+
+    fn persist_legacy_skill_snapshot(
+        session: &SessionRecord,
+        engine: &ServiceEngine,
+        effects: &mut Vec<Effect>,
+    ) {
+        if session.enabled_skill_ids.is_none() {
+            effects.insert(
+                0,
+                Effect::PersistSessionSkillSnapshot {
+                    session_id: session.id.clone(),
+                    enabled_skill_ids: engine.state().enabled_skill_ids(),
+                },
+            );
+        }
     }
 
     fn validate_provider_tool_projection(
@@ -4615,11 +4727,16 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
 
-        core.open_session_command(&restored_id, None)
+        let (_, effects) = core
+            .open_session_command(&restored_id, None)
             .expect("persisted cwd restores");
+        assert!(effects.iter().any(
+            |effect| matches!(effect, crate::state::Effect::LoadSubagents(parent) if parent == restored_id.as_str())
+        ));
         assert_eq!(
             core.engine_for(&restored_id)
                 .expect("restored engine")
@@ -4632,6 +4749,48 @@ mod tests {
             .open_session_command(&restored_id, None)
             .expect_err("deleted cwd must not fall back to workspace");
         assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[test]
+    fn rejected_restored_open_does_not_load_subagents() {
+        let (mut core, _) = ready_codex_server();
+        let directory = tempfile::tempdir().expect("persisted cwd");
+        let restored_id = SessionId::from("resume-unsupported-session");
+        core.replace_session_records(vec![SessionRecord {
+            id: restored_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-resume-unsupported".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            working_directory: directory
+                .path()
+                .canonicalize()
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            title: "Resume unsupported".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            last_owner_activity_at: None,
+            enabled_skill_ids: None,
+            owned_provider_sessions: Vec::new(),
+        }]);
+
+        let (_, effects) = core
+            .open_session_command(&restored_id, None)
+            .expect("open reports the resume rejection in session state");
+
+        assert!(effects.is_empty());
+        assert!(
+            core.engine_for(&restored_id)
+                .expect("restored engine")
+                .state()
+                .status_message
+                .contains("does not support session resume")
+        );
     }
 
     #[test]
@@ -5744,6 +5903,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let mut tools = dashboard_tools("DashboardRead", false);
@@ -5753,6 +5913,16 @@ mod tests {
         let (_, effects) = core
             .open_session_command(&restored_id, Some(tools.clone()))
             .expect("atomic restored open");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::state::Effect::PersistSessionSkillSnapshot {
+                    session_id,
+                    ..
+                } if session_id == restored_id.as_str()
+            )),
+            "legacy rows must be bound to an explicit snapshot on first resume: {effects:#?}"
+        );
         assert!(
             effects.iter().any(|effect| matches!(
                 effect,
@@ -5789,6 +5959,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: Some(Vec::new()),
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
@@ -5806,10 +5977,12 @@ mod tests {
         assert!(effects.iter().any(|effect| matches!(
             effect,
             crate::state::Effect::Backend(BackendCommand::ResumeSession {
+                enabled_skill_ids,
                 replace_builtin_tools: false,
                 allowed_builtin_tools: Some(allowed),
                 ..
-            }) if allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
+            }) if enabled_skill_ids.is_empty()
+                && allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
         )));
     }
 
@@ -5844,6 +6017,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
@@ -5973,6 +6147,7 @@ mod tests {
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let loaded_before_open = core.sessions_by_id.len();
@@ -6002,6 +6177,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
 
@@ -8012,11 +8188,10 @@ first_message = "Starting review"
         );
     }
 
-    /// A session stuck busy behind a dead backend is deletable too.
+    /// A legacy session with orphaned busy display state behind a dead backend is deletable too.
     ///
-    /// `handle_disconnected` drops the turn but never marks a running subagent stopped, so `is_busy`
-    /// stays true for good. Refusing this one for "work in flight" asked the caller to cancel work
-    /// that nothing was doing, which is the second way a dead session became permanently stuck.
+    /// Live disconnect handling now settles executable delegated runs. This guard remains for older
+    /// or otherwise inconsistent in-memory projections that have no execution left to cancel.
     #[test]
     fn a_session_stuck_busy_behind_a_dead_backend_is_deletable() {
         let (mut core, _) = ready_codex_server();
@@ -8203,6 +8378,7 @@ first_message = "Starting review"
             created_at: 0,
             updated_at: 0,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
 

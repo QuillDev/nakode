@@ -764,6 +764,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             session_id: protocol::SessionId::from(input.session_id),
             tools: session_tools(input.tools),
             mcp_grant: mcp_grant(input.mcp_grant)?,
+            profile_id: input.profile_id,
+            enabled_skill_ids: Vec::new(),
         }
     );
 
@@ -1210,6 +1212,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             .query(protocol::Query::ListSkills {
                 workspace_id: protocol::WorkspaceId::from(input.workspace_id),
                 profile_id: input.profile_id,
+                refresh: input.refresh,
             })
             .await?;
         let protocol::QueryResult::Skills(value) = result.value else {

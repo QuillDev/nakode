@@ -751,6 +751,11 @@ mod tests {
             cancellation: CancellationToken::new(),
         };
 
+        let enabled_catalogue =
+            crate::skill::SkillCatalog::load(directory.path()).expect("effective skill catalogue");
+        harness.session.skill_catalogue = enabled_catalogue.clone();
+        harness.session.enabled_skill_ids = Some(enabled_catalogue.stable_ids());
+
         let result = harness
             .execute("read_skill", json!({"name": "review"}))
             .await;
@@ -761,20 +766,28 @@ mod tests {
             Some("fragile.review.v1")
         );
 
-        harness.session.instructions =
-            "[Nakode Available Skills]\n[/Nakode Available Skills]".to_owned();
+        // Current profile authority wins over stale prompt/session projections. Literal invocation
+        // cannot override a disabled skill, even when old instructions still advertise its name.
+        harness.session.skill_catalogue = crate::skill::SkillCatalog::default();
         let disabled = harness
             .execute("read_skill", json!({"name": "review"}))
             .await;
         assert!(disabled.failed);
-        assert!(disabled.output.contains("disabled or was not available"));
+        assert!(disabled.output.contains("disabled or unavailable"));
         assert!(disabled.invocation_identity.is_none());
+
+        // An acknowledged profile enablement takes effect on the next turn/runtime projection.
+        harness.session.skill_catalogue = enabled_catalogue;
+        let reenabled = harness
+            .execute("read_skill", json!({"name": "review"}))
+            .await;
+        assert!(!reenabled.failed, "{}", reenabled.output);
 
         let missing = harness
             .execute("read_skill", json!({"name": "missing"}))
             .await;
         assert!(missing.failed);
-        assert!(missing.output.contains("disabled or was not available"));
+        assert!(missing.output.contains("disabled or unavailable"));
         assert!(missing.invocation_identity.is_none());
     }
 

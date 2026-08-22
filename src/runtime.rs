@@ -1240,6 +1240,8 @@ impl AgentRuntime {
             session.owner_session_id.clone(),
             session.parent_run_id.clone(),
         );
+        isolated_session.enabled_skill_ids = session.enabled_skill_ids.clone();
+        isolated_session.skill_catalogue = session.skill_catalogue.clone();
         let result = match prepare_and_validate(tool.as_ref(), arguments.clone()) {
             Ok(arguments) => {
                 tool.execute(
@@ -1603,6 +1605,13 @@ pub struct RuntimeSession {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub fast_mode: bool,
+    /// Stable skill identities authorized by the owning logical session. `None` exists only for
+    /// provider-runtime rows persisted before authoritative skill snapshots were introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_skill_ids: Option<Vec<String>>,
+    /// Turn-fresh effective catalogue copied from Nakode's in-process profile authority.
+    #[serde(skip)]
+    pub skill_catalogue: crate::skill::SkillCatalog,
     /// Logical control-plane owner; absent only in old persisted provider payloads and isolated tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_session_id: Option<String>,
@@ -1626,6 +1635,8 @@ impl RuntimeSession {
             telemetry: RuntimeTelemetry::default(),
             reasoning_effort: None,
             fast_mode: false,
+            enabled_skill_ids: None,
+            skill_catalogue: crate::skill::SkillCatalog::default(),
             owner_session_id: None,
             parent_run_id: None,
         }
@@ -1634,6 +1645,12 @@ impl RuntimeSession {
     #[must_use]
     pub fn with_provider(mut self, provider_id: impl Into<String>) -> Self {
         self.provider_id = provider_id.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_enabled_skill_ids(mut self, enabled_skill_ids: Vec<String>) -> Self {
+        self.enabled_skill_ids = Some(enabled_skill_ids);
         self
     }
 
@@ -2732,12 +2749,21 @@ mod tests {
             Box::pin(async move {
                 if call == 0 {
                     assert_eq!(request.tools.len(), 1);
-                    assert_eq!(request.tools[0].name, "DashboardRead");
+                    assert_eq!(request.tools[0].name, "MoveAssociatedTicketToStage");
+                    assert_eq!(
+                        request.tools[0].parameters,
+                        json!({
+                            "type": "object",
+                            "properties": { "stageId": { "type": "string", "format": "uuid" } },
+                            "required": ["stageId"],
+                            "additionalProperties": false
+                        })
+                    );
                     return Ok(InferenceOutput {
                         tool_calls: vec![ToolCall {
                             id: "provider-call".to_owned(),
-                            name: "DashboardRead".to_owned(),
-                            arguments: json!({"ticketId": "ticket-1"}),
+                            name: "MoveAssociatedTicketToStage".to_owned(),
+                            arguments: json!({"stageId": "33333333-3333-4333-8333-333333333333"}),
                         }],
                         ..InferenceOutput::default()
                     });
@@ -2976,7 +3002,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_tools_replace_builtins_and_resume_the_agent_loop() {
+    async fn session_bound_stage_tool_is_provider_neutral_audited_and_resumes_the_agent_loop() {
         let directory = tempfile::tempdir().expect("workspace");
         let provider = Arc::new(ExternalToolProvider {
             calls: AtomicUsize::new(0),
@@ -2987,9 +3013,16 @@ mod tests {
             .configure_external_tools(
                 &session.id,
                 vec![nakode_protocol::ExternalToolDefinition {
-                    name: "DashboardRead".to_owned(),
-                    description: "Read the dashboard.".to_owned(),
-                    input_schema_json: json!({"type": "object"}).to_string(),
+                    name: "MoveAssociatedTicketToStage".to_owned(),
+                    description: "Move the attached ticket to an exact authoritative stage id."
+                        .to_owned(),
+                    input_schema_json: json!({
+                        "type": "object",
+                        "properties": { "stageId": { "type": "string", "format": "uuid" } },
+                        "required": ["stageId"],
+                        "additionalProperties": false
+                    })
+                    .to_string(),
                 }],
                 true,
                 None,
@@ -3023,8 +3056,11 @@ mod tests {
                 break request;
             }
         };
-        assert_eq!(request.name, "DashboardRead");
-        assert_eq!(request.arguments_json, r#"{"ticketId":"ticket-1"}"#);
+        assert_eq!(request.name, "MoveAssociatedTicketToStage");
+        assert_eq!(
+            request.arguments_json,
+            r#"{"stageId":"33333333-3333-4333-8333-333333333333"}"#
+        );
         assert!(
             runtime
                 .resolve_external_tool(&request.id, ToolResult::success("dashboard result"))
@@ -3047,7 +3083,7 @@ mod tests {
                 ..
             } if call_id == "provider-call"
                 && kind == "custom"
-                && arguments["ticketId"] == "ticket-1"
+                && arguments["stageId"] == "33333333-3333-4333-8333-333333333333"
                 && output == "dashboard result"
         ));
         let restored = normalize_history_item("session-external", 1, tool_result);
@@ -3930,6 +3966,7 @@ mod tests {
         let _repository = SqliteSessionRepository::open(&database).expect("session repository");
         let store = RuntimeSessionStore::new(database, "test-provider");
         let mut session = RuntimeSession::new("test-model".to_owned(), "Be concise.".to_owned())
+            .with_enabled_skill_ids(vec!["stable.review".to_owned()])
             .with_reasoning_effort(Some("low".to_owned()));
         session.telemetry.tools.push(super::ToolMetric {
             turn_id: "turn-1".to_owned(),
@@ -3968,6 +4005,10 @@ mod tests {
         assert_eq!(restored.id, session.id);
         assert_eq!(restored.model, "test-model");
         assert_eq!(restored.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            restored.enabled_skill_ids.as_deref(),
+            Some(["stable.review".to_owned()].as_slice())
+        );
         assert_eq!(restored.telemetry.tools.len(), 1);
         assert_eq!(restored.telemetry.tools[0].output_bytes, 40_000);
         let history = restored.normalized_history();

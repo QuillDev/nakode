@@ -288,6 +288,8 @@ message OpenSessionRequest {
   string session_id = 2;
   optional SessionToolConfiguration tools = 3;
   optional McpSessionGrant mcp_grant = 4;
+  // Rebinds legacy sessions and confirms the authoritative profile for restored sessions.
+  optional string profile_id = 5;
 }
 message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // Removes a logical session and its persisted history. Deletion is AUTHORITATIVE: a
@@ -500,7 +502,7 @@ message ModelTarget {
 message SelectModelRequest { MutationOptions mutation = 1; ModelTarget target = 2; string model_id = 3; ModelOptions options = 4; }
 message SetProviderEnabledRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; }
 message SetProviderModelFilterRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; repeated string selected_model_ids = 4; }
-message ListSkillsRequest { string workspace_id = 1; string profile_id = 2; }
+message ListSkillsRequest { string workspace_id = 1; string profile_id = 2; bool refresh = 3; }
 message SetSkillEnabledRequest {
   MutationOptions mutation = 1;
   string workspace_id = 2;
