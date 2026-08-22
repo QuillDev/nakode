@@ -408,10 +408,30 @@ workspace-local skills taking precedence when names overlap:
 Reference a discovered skill anywhere in a prompt with `/skill:<skill-name>`.
 Nakode offers discovered names in composer completion and attaches the selected
 skill instructions to that turn while keeping the original prompt unchanged in
-the visible transcript. Skill publishers should include a bounded immutable `id`
-in YAML frontmatter (for example, `id: fragile.code-review.v1`) so local invocation
-history follows a skill when its directory/load name changes. Legacy skills without
-an `id` remain compatible and use their exact catalogue name as historical identity.
+the visible transcript. A single-file skill is complete in `SKILL.md`. When a
+package genuinely needs multiple instruction files, declare them explicitly in
+frontmatter; each component may declare nested components the same way:
+
+```yaml
+---
+name: code-review
+components:
+  - policy.md
+  - references/language.md
+---
+```
+
+Nakode loads `SKILL.md` first, then components depth-first in declaration order,
+de-duplicates repeated references, and returns the whole aggregate from one
+`read_skill` call with the complete ordered component list visible to the agent.
+Component paths are package-relative: absolute paths, parent traversal, symlink
+escapes, cycles, and missing or unreadable files reject the skill instead of
+silently returning partial instructions. Undeclared companion files are not
+loaded, and frontmatter fields other than the supported metadata remain inert.
+Skill publishers should include a bounded immutable `id` in YAML frontmatter
+(for example, `id: fragile.code-review.v1`) so local invocation history follows
+a skill when its directory/load name changes. Legacy skills without an `id`
+remain compatible and use their exact catalogue name as historical identity.
 
 ## Herdr integration
 

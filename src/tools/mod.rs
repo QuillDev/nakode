@@ -734,9 +734,10 @@ mod tests {
         std::fs::create_dir_all(&skill).expect("skill directory");
         std::fs::write(
             skill.join("SKILL.md"),
-            "---\nid: fragile.review.v1\nname: review\ndescription: Review carefully\n---\n\nFULL REVIEW PROCEDURE\n",
+            "---\nid: fragile.review.v1\nname: review\ndescription: Review carefully\ncomponents:\n  - policy.md\n---\n\nFULL REVIEW PROCEDURE\n",
         )
         .expect("skill definition");
+        std::fs::write(skill.join("policy.md"), "COMPLETE POLICY\n").expect("skill component");
         let mut harness = ToolHarness {
             registry: ToolRegistry::base(),
             workspace: directory.path(),
@@ -754,6 +755,14 @@ mod tests {
             .await;
         assert!(!result.failed, "{}", result.output);
         assert!(result.output.contains("FULL REVIEW PROCEDURE"));
+        assert!(
+            result
+                .output
+                .contains("Loaded components (in order):\n- SKILL.md\n- policy.md")
+        );
+        assert!(result.output.contains("## Loaded component: SKILL.md"));
+        assert!(result.output.contains("## Loaded component: policy.md"));
+        assert!(result.output.contains("COMPLETE POLICY"));
         assert_eq!(
             result.invocation_identity.as_deref(),
             Some("fragile.review.v1")
