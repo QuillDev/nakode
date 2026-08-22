@@ -52,12 +52,6 @@ cd /path/to/project
 nakode --tui
 ```
 
-Frontend transports are managed under `transport`:
-
-```sh
-nakode transport discord status
-```
-
 The earlier `nakode service <action>` spellings still work. Each prints a
 deprecation notice on standard error naming its replacement, then does the work.
 

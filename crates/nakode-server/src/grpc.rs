@@ -3,7 +3,7 @@
 //! Conversion lives here so provider/runtime protocol types never leak into
 //! the public generated contract. The adapter never owns domain state.
 
-use std::{pin::Pin, sync::Arc};
+use std::pin::Pin;
 
 use futures_util::Stream;
 use nakode_api::v1 as api;
@@ -12,35 +12,11 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{PublishedEvent, ServerEndpoint};
 
-/// Root-owned Discord management mutation injected into the dependency-neutral gRPC facade.
-/// Credential debug output remains redacted through [`protocol::CredentialInput`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DiscordManagementMutation {
-    Save(protocol::DiscordIntegrationInput),
-    SetEnabled(bool),
-    Restart,
-}
-
-/// Dependency-inverted authority for installation configuration and the current service's Discord
-/// transport. The root application implements this because it owns private credential storage and
-/// transport supervision; `nakode-server` never depends on either implementation.
-#[tonic::async_trait]
-pub trait DiscordManagement: Send + Sync {
-    async fn get(&self) -> Result<protocol::DiscordIntegrationView, protocol::ServiceError>;
-
-    async fn mutate(
-        &self,
-        idempotency_key: protocol::IdempotencyKey,
-        mutation: DiscordManagementMutation,
-    ) -> Result<protocol::DiscordIntegrationView, protocol::ServiceError>;
-}
-
 /// Public gRPC facade over one authoritative [`ServerEndpoint`].
 #[derive(Clone)]
 pub struct GrpcService {
     endpoint: ServerEndpoint,
     client_id: protocol::ClientId,
-    discord_management: Option<Arc<dyn DiscordManagement>>,
 }
 
 impl GrpcService {
@@ -49,15 +25,7 @@ impl GrpcService {
         Self {
             endpoint,
             client_id: protocol::ClientId::new(format!("grpc-{}", uuid::Uuid::now_v7())),
-            discord_management: None,
         }
-    }
-
-    /// Installs the root-owned Discord configuration and transport authority.
-    #[must_use]
-    pub fn with_discord_management(mut self, management: Arc<dyn DiscordManagement>) -> Self {
-        self.discord_management = Some(management);
-        self
     }
 
     #[must_use]
@@ -122,30 +90,6 @@ impl GrpcService {
             .await
             .map_err(status)
     }
-
-    fn discord_management(&self) -> Result<Arc<dyn DiscordManagement>, tonic::Status> {
-        self.discord_management.clone().ok_or_else(|| {
-            tonic::Status::unimplemented("Discord management is unavailable in this service")
-        })
-    }
-
-    fn discord_mutation_key(
-        options: Option<api::MutationOptions>,
-    ) -> Result<protocol::IdempotencyKey, tonic::Status> {
-        let options =
-            options.ok_or_else(|| tonic::Status::invalid_argument("mutation is required"))?;
-        if options.idempotency_key.is_empty() {
-            return Err(tonic::Status::invalid_argument(
-                "mutation.idempotency_key is required",
-            ));
-        }
-        if options.expected_revision.is_some() {
-            return Err(tonic::Status::invalid_argument(
-                "Discord management mutations do not accept expected_revision",
-            ));
-        }
-        Ok(protocol::IdempotencyKey::new(options.idempotency_key))
-    }
 }
 
 type ApiStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
@@ -163,32 +107,6 @@ fn status(error: protocol::ServiceError) -> tonic::Status {
         protocol::ErrorCode::Internal => tonic::Code::Internal,
     };
     tonic::Status::new(code, error.message)
-}
-
-fn discord_integration(value: protocol::DiscordIntegrationView) -> api::DiscordIntegration {
-    let runtime_state = match value.runtime_state {
-        protocol::DiscordRuntimeState::Disabled => api::discord_integration::RuntimeState::Disabled,
-        protocol::DiscordRuntimeState::Stopped => api::discord_integration::RuntimeState::Stopped,
-        protocol::DiscordRuntimeState::Running => api::discord_integration::RuntimeState::Running,
-        protocol::DiscordRuntimeState::Failed => api::discord_integration::RuntimeState::Failed,
-    };
-    api::DiscordIntegration {
-        enabled: value.enabled,
-        configuration_complete: value.configuration_complete,
-        token_configured: value.token_configured,
-        chat_channel_id: value.chat_channel_id,
-        agent_channel_id: value.agent_channel_id,
-        primary_user_id: value.primary_user_id,
-        runtime_state: runtime_state.into(),
-        runtime_error: value.runtime_error,
-    }
-}
-
-fn advertise_capability(
-    value: protocol::ServiceCapability,
-    discord_management_available: bool,
-) -> bool {
-    value != protocol::ServiceCapability::DiscordManagement || discord_management_available
 }
 
 fn prompt(value: Option<api::PromptInput>) -> Result<protocol::PromptInput, tonic::Status> {
@@ -680,64 +598,6 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
 
-    async fn get_discord_integration(
-        &self,
-        _request: tonic::Request<api::GetDiscordIntegrationRequest>,
-    ) -> Result<tonic::Response<api::DiscordIntegration>, tonic::Status> {
-        let value = self.discord_management()?.get().await.map_err(status)?;
-        Ok(tonic::Response::new(discord_integration(value)))
-    }
-
-    async fn save_discord_integration(
-        &self,
-        request: tonic::Request<api::SaveDiscordIntegrationRequest>,
-    ) -> Result<tonic::Response<api::DiscordIntegration>, tonic::Status> {
-        let input = request.into_inner();
-        let key = Self::discord_mutation_key(input.mutation)?;
-        let value = self
-            .discord_management()?
-            .mutate(
-                key,
-                DiscordManagementMutation::Save(protocol::DiscordIntegrationInput {
-                    chat_channel_id: input.chat_channel_id,
-                    agent_channel_id: input.agent_channel_id,
-                    primary_user_id: input.primary_user_id,
-                    bot_token: input.bot_token.map(protocol::CredentialInput),
-                }),
-            )
-            .await
-            .map_err(status)?;
-        Ok(tonic::Response::new(discord_integration(value)))
-    }
-
-    async fn set_discord_integration_enabled(
-        &self,
-        request: tonic::Request<api::SetDiscordIntegrationEnabledRequest>,
-    ) -> Result<tonic::Response<api::DiscordIntegration>, tonic::Status> {
-        let input = request.into_inner();
-        let key = Self::discord_mutation_key(input.mutation)?;
-        let value = self
-            .discord_management()?
-            .mutate(key, DiscordManagementMutation::SetEnabled(input.enabled))
-            .await
-            .map_err(status)?;
-        Ok(tonic::Response::new(discord_integration(value)))
-    }
-
-    async fn restart_discord_integration(
-        &self,
-        request: tonic::Request<api::RestartDiscordIntegrationRequest>,
-    ) -> Result<tonic::Response<api::DiscordIntegration>, tonic::Status> {
-        let input = request.into_inner();
-        let key = Self::discord_mutation_key(input.mutation)?;
-        let value = self
-            .discord_management()?
-            .mutate(key, DiscordManagementMutation::Restart)
-            .await
-            .map_err(status)?;
-        Ok(tonic::Response::new(discord_integration(value)))
-    }
-
     command_rpc!(
         create_session,
         api::CreateSessionRequest,
@@ -847,6 +707,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 session_id: protocol::SessionId::from(input.session_id),
                 projection_kind,
                 turn_id: protocol::TurnId::from(input.turn_id),
+                clear_active_source_message_id: input.clear_active_source_message_id,
             }
         })
     );
@@ -1582,7 +1443,6 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .capabilities()
                 .supported
                 .iter()
-                .filter(|value| advertise_capability(**value, self.discord_management.is_some()))
                 .map(|value| format!("{value:?}"))
                 .collect(),
         }))
@@ -2837,49 +2697,6 @@ mod tests {
         let legacy = provider(view(None));
         assert!(!legacy.builtin_tool_availability_known);
         assert!(legacy.available_builtin_tools.is_empty());
-    }
-
-    #[test]
-    fn discord_management_capability_is_advertised_only_when_injected() {
-        assert!(!advertise_capability(
-            protocol::ServiceCapability::DiscordManagement,
-            false,
-        ));
-        assert!(advertise_capability(
-            protocol::ServiceCapability::DiscordManagement,
-            true,
-        ));
-        assert!(advertise_capability(
-            protocol::ServiceCapability::OrchestratorThreadBridge,
-            false,
-        ));
-    }
-
-    #[test]
-    fn discord_mutations_require_an_idempotency_key_without_a_revision() {
-        let missing = GrpcService::discord_mutation_key(None).expect_err("missing options");
-        assert_eq!(missing.code(), tonic::Code::InvalidArgument);
-
-        let blank = GrpcService::discord_mutation_key(Some(api::MutationOptions {
-            idempotency_key: String::new(),
-            expected_revision: None,
-        }))
-        .expect_err("blank idempotency key");
-        assert_eq!(blank.code(), tonic::Code::InvalidArgument);
-
-        let revision = GrpcService::discord_mutation_key(Some(api::MutationOptions {
-            idempotency_key: "discord-save".to_owned(),
-            expected_revision: Some(4),
-        }))
-        .expect_err("installation state has no workspace revision");
-        assert_eq!(revision.code(), tonic::Code::InvalidArgument);
-
-        let key = GrpcService::discord_mutation_key(Some(api::MutationOptions {
-            idempotency_key: "discord-save".to_owned(),
-            expected_revision: None,
-        }))
-        .expect("valid key");
-        assert_eq!(key.as_str(), "discord-save");
     }
 
     #[test]

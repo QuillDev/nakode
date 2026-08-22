@@ -59,8 +59,7 @@ wait.
    cannot be reproduced or attributed.
 2. **Clean compilation dominates genuine quality-gate time.** Compilation is
    70 s on a 14-core local machine, versus less than 13 s for execution. The
-   dependency graph includes image, terminal, gRPC, HTTP/TLS, Discord, and
-   bundled SQLite stacks. Network fetching is only 9 s locally.
+   dependency graph includes image, terminal, gRPC, HTTP/TLS, and bundled SQLite stacks. Network fetching is only 9 s locally.
 3. **Serial test and Clippy commands duplicate artifact traversal.** Clippy
    takes another 37 s after the test build. They have the same failure
    semantics whether placed in parallel required jobs, so serializing them is

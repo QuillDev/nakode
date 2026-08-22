@@ -132,33 +132,6 @@ is unaffected. There is no workspace or global endpoint selector.
 The TUI uses this exact public SDK path and passes its current directory when creating a new session.
 It is an example frontend, not a privileged application runtime.
 
-## Discord orchestrator threads (optional)
-
-Discord is a native Nakode transport. Nakode—not a frontend—owns the bot token, gateway client,
-logical-session/thread mappings, inbound authorization and deduplication, delivery checkpoints, and
-archive state. Frontends such as FStack only attach a typed `SessionBridgeIntent` while creating a
-session and issue typed open/archive lifecycle commands when the corresponding dashboard object is
-opened or closed. They must not read Nakode persistence or call Discord directly.
-
-Configure the transport through the secret-safe CLI:
-
-```bash
-nakode transport discord setup \
-  --chat-channel-id <CHAT_PARENT_SNOWFLAKE> \
-  --agent-channel-id <AGENT_PARENT_SNOWFLAKE> \
-  --primary-user-id <PRIMARY_USER_SNOWFLAKE>
-nakode transport discord status
-```
-
-`setup` reads the credential privately without echo; status never prints it. The public IDs and private token are installation-level, while ingress/recovery state remains isolated by canonical workspace. Configuration is optional and an unconfigured transport does not affect normal sessions. Each bridged Chat or Agent session gets one lazily-created thread under its configured parent channel. Nakode persists the stable pairing,
-reuses it after restart, archives/unarchives it from lifecycle intent, projects user-visible live and
-final transcript output, and accepts a continuation only from the configured user while the logical
-session is authoritatively idle.
-
-See [`discord-orchestrator-threads.md`](discord-orchestrator-threads.md) for intents, permissions,
-reaction semantics, retries, limits, failure behavior, and the current deterministic-only live-test
-status.
-
 ## Adding a product capability
 
 Implement features in this order:

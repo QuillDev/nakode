@@ -294,6 +294,7 @@ pub(crate) struct TransportSupervisor {
 }
 
 impl TransportSupervisor {
+    #[cfg(test)]
     pub(crate) fn new(
         transports: impl IntoIterator<Item = (String, Arc<dyn TransportController>)>,
     ) -> Self {
@@ -434,9 +435,7 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
         "workspace gRPC listener lease",
     ))?;
     let endpoint = handle.endpoint().clone();
-    let transports = crate::discord::transport_supervisor(&config.workspace, grpc_path.clone());
-    let discord_management =
-        crate::discord::management_service(&config.workspace, transports.clone());
+    let transports = TransportSupervisor::default();
     let mut lifecycle = tokio::spawn(run_lifecycle_listener(
         lifecycle_listener,
         lifecycle_path,
@@ -448,7 +447,6 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
         grpc_listener,
         grpc_path.clone(),
         endpoint,
-        discord_management,
     ));
     let mut actor = tokio::spawn(runtime.run());
     transports.autostart().await;
@@ -601,15 +599,10 @@ async fn run_grpc_listener(
     listener: UnixListener,
     _path: PathBuf,
     endpoint: nakode_server::ServerEndpoint,
-    discord_management: Arc<dyn nakode_server::grpc::DiscordManagement>,
 ) -> Result<(), ControlError> {
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     tonic::transport::Server::builder()
-        .add_service(
-            nakode_server::grpc::GrpcService::new(endpoint)
-                .with_discord_management(discord_management)
-                .into_server(),
-        )
+        .add_service(nakode_server::grpc::GrpcService::new(endpoint).into_server())
         .serve_with_incoming(incoming)
         .await?;
     Ok(())

@@ -42,6 +42,8 @@ use crate::{
 
 use super::{BridgeStateCheckpoint, ServerCore};
 
+const SESSION_BACKEND_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Error)]
 pub enum NativeRuntimeError {
     #[error(transparent)]
@@ -990,7 +992,7 @@ impl NativeServerRuntime {
                 }
             }
         }
-        let rollback = BridgeMutationRollback::capture(&request, &self.core);
+        let mut rollback = BridgeMutationRollback::capture(&request, &self.core);
         let mut outcome = self.core.handle(&self.endpoint, request);
         let replay_disposition = outcome.bridge_continuation();
         let inbound_event_to_claim =
@@ -1011,9 +1013,10 @@ impl NativeServerRuntime {
             &mut effects,
             inbound_event_to_claim.as_ref(),
         ) {
-            // Discord and the provider must observe bridge work only after its durable authority
-            // checkpoint. Restore both logical-session and idempotency state so a same-process retry
-            // (including the same key) can execute rather than replaying an un-dispatched success.
+            // The external transport and provider must observe bridge work only after its durable
+            // authority checkpoint. Restore both logical-session and idempotency state so a
+            // same-process retry (including the same key) can execute rather than replaying an
+            // un-dispatched success.
             match rollback {
                 Some(rollback) => rollback.restore(&mut self.core),
                 None => {
@@ -1028,6 +1031,66 @@ impl NativeServerRuntime {
                 retryable: true,
             });
             return;
+        }
+        if let Some(delete_session_id) = take_delete_session_effect(&mut effects) {
+            let canonical_id = nakode_protocol::SessionId::from(delete_session_id.clone());
+            remove_session_release_effect(&mut effects, &delete_session_id);
+            let terminated_shell_ids = self.terminate_deleted_session_work(&canonical_id).await;
+            // Provider tasks can persist native history during their terminal path. Fence and await
+            // every backend before the repository transaction so a successful deletion cannot be
+            // repopulated by a completion racing behind its acknowledgement.
+            if let Err(error) = self.effects.backends.stop_session(&canonical_id).await {
+                match rollback.take() {
+                    Some(rollback) => rollback.restore(&mut self.core),
+                    None => self.accepting_work = false,
+                }
+                self.fail_terminated_session_shells(
+                    &canonical_id,
+                    &terminated_shell_ids,
+                    "session deletion stopped the shell before backend teardown failed",
+                );
+                outcome.respond_with_error(ServiceError {
+                    code: ErrorCode::Internal,
+                    message: format!(
+                        "session backends did not stop cleanly; retry the operation: {error}"
+                    ),
+                    retryable: true,
+                });
+                return;
+            }
+            if let Err(error) = self.effects.persistence.sessions.delete(&delete_session_id) {
+                // DeleteSession mutates the complete in-memory projection (including default-session
+                // and bridge state) before effects run. Restore the pre-command checkpoint so
+                // same-process retries, including the same idempotency key, execute instead of
+                // replaying a false success.
+                match rollback.take() {
+                    Some(rollback) => rollback.restore(&mut self.core),
+                    None => self.accepting_work = false,
+                }
+                if let Some(engine) = self.core.engine_for_mut(&canonical_id) {
+                    let provider = engine.state().active_provider_id().to_owned();
+                    engine.state_mut().handle_provider_backend(
+                        &provider,
+                        BackendEvent::Disconnected {
+                            reason: "provider stopped before durable session deletion failed"
+                                .to_owned(),
+                        },
+                    );
+                }
+                self.fail_terminated_session_shells(
+                    &canonical_id,
+                    &terminated_shell_ids,
+                    "shell stopped before durable session deletion failed",
+                );
+                outcome.respond_with_error(ServiceError {
+                    code: ErrorCode::Internal,
+                    message: format!(
+                        "session deletion was not durably committed; retry the operation: {error}"
+                    ),
+                    retryable: true,
+                });
+                return;
+            }
         }
         self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);
@@ -1383,6 +1446,13 @@ impl NativeServerRuntime {
         let Some(pending) = self.pending_mcp_calls.remove(&completion.call_id) else {
             return;
         };
+        // A delayed tool completion must never recreate a provider backend after its logical session
+        // was deleted. Deletion removes owned calls proactively; this check also closes the race for a
+        // completion already queued in the runtime mailbox.
+        if self.core.engine_for(&pending.session_id).is_none() {
+            pending.cancellation.cancel();
+            return;
+        }
         let (output, failed, status) = match completion.result {
             Ok(output) => (output, false, "succeeded"),
             Err(error) => (
@@ -1613,6 +1683,16 @@ impl NativeServerRuntime {
                     sync_memory_config = true;
                     ordinary.push(Effect::SaveMemoryConfig(config));
                 }
+                Effect::ReleaseSessionBackends(id) => {
+                    // DeleteSession removes a non-default engine before runtime effects execute. Backend
+                    // release therefore cannot depend on finding that engine's DomainState; doing so
+                    // would discard the shutdown effect and orphan its provider processes.
+                    let _ = self
+                        .effects
+                        .backends
+                        .stop_session(&nakode_protocol::SessionId::from(id))
+                        .await;
+                }
                 effect => ordinary.push(effect),
             }
         }
@@ -1662,6 +1742,70 @@ impl NativeServerRuntime {
     fn cancel_mcp_discovery(&mut self, server_id: &str) {
         if let Some(pending) = self.pending_mcp_discoveries.remove(server_id) {
             pending.cancellation.cancel();
+        }
+    }
+
+    async fn terminate_deleted_session_work(
+        &mut self,
+        session_id: &nakode_protocol::SessionId,
+    ) -> Vec<String> {
+        self.cancel_session_mcp_calls(session_id);
+        let delegation_ids = self
+            .pending_native_delegations
+            .iter()
+            .filter(|(_, pending)| &pending.session_id == session_id)
+            .map(|(request_id, _)| *request_id)
+            .collect::<Vec<_>>();
+        for request_id in delegation_ids {
+            if let Some(pending) = self.pending_native_delegations.remove(&request_id) {
+                pending.cancellation_task.abort();
+                let _ = pending
+                    .respond
+                    .send(Err("parent session was deleted".to_owned()));
+            }
+        }
+        let shell_ids = self
+            .shell_owners
+            .iter()
+            .filter(|(_, owner)| *owner == session_id)
+            .map(|(shell_id, _)| shell_id.clone())
+            .collect::<Vec<_>>();
+        for shell_id in &shell_ids {
+            self.shell_owners.remove(shell_id);
+            self.effects.shell_processes.terminate(shell_id).await;
+        }
+        shell_ids
+    }
+
+    fn fail_terminated_session_shells(
+        &mut self,
+        session_id: &nakode_protocol::SessionId,
+        shell_ids: &[String],
+        reason: &str,
+    ) {
+        if shell_ids.is_empty() {
+            return;
+        }
+        if let Some(engine) = self.core.engine_for_mut(session_id) {
+            for shell_id in shell_ids {
+                engine.state_mut().shell_failed(shell_id, reason);
+            }
+        }
+        self.core
+            .commit_and_publish_session(&self.endpoint, session_id);
+    }
+
+    fn cancel_session_mcp_calls(&mut self, session_id: &nakode_protocol::SessionId) {
+        let call_ids = self
+            .pending_mcp_calls
+            .iter()
+            .filter(|(_, pending)| &pending.session_id == session_id)
+            .map(|(call_id, _)| call_id.clone())
+            .collect::<Vec<_>>();
+        for call_id in call_ids {
+            if let Some(pending) = self.pending_mcp_calls.remove(&call_id) {
+                pending.cancellation.cancel();
+            }
         }
     }
 
@@ -1840,7 +1984,6 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::SoulManagement,
             ServiceCapability::McpManagement,
             ServiceCapability::OrchestratorThreadBridge,
-            ServiceCapability::DiscordManagement,
         ]
         .into_iter()
         .collect(),
@@ -1877,6 +2020,11 @@ pub(crate) struct BackendRegistrySpawn {
     pub(crate) native_delegation: mpsc::Sender<NativeDelegationRequest>,
 }
 
+struct SessionBackendTasks {
+    backend: tokio::task::JoinHandle<()>,
+    event_forwarder: tokio::task::JoinHandle<()>,
+}
+
 pub(crate) struct BackendRegistry {
     /// Provider-scoped handles own authentication, readiness, and model catalogs.
     pub(crate) commands: HashMap<String, mpsc::Sender<BackendCommand>>,
@@ -1884,8 +2032,13 @@ pub(crate) struct BackendRegistry {
     /// may supervise only the logical session named by this key.
     pub(crate) session_commands:
         HashMap<(nakode_protocol::SessionId, String), mpsc::Sender<BackendCommand>>,
+    /// Backend and event-forwarding tasks retained by canonical session/provider identity so a
+    /// destructive delete can await provider termination before removing durable history.
+    session_tasks: HashMap<(nakode_protocol::SessionId, String), Vec<SessionBackendTasks>>,
     pub(crate) subagent_commands: HashMap<String, mpsc::Sender<BackendCommand>>,
     pub(crate) subagent_providers: HashMap<String, String>,
+    subagent_parents: HashMap<String, nakode_protocol::SessionId>,
+    subagent_tasks: HashMap<String, Vec<SessionBackendTasks>>,
     pub(crate) events: mpsc::Receiver<(BackendSource, BackendEvent)>,
     pub(crate) event_tx: mpsc::Sender<(BackendSource, BackendEvent)>,
     pub(crate) tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -2041,8 +2194,11 @@ impl BackendRegistry {
         let mut registry = Self {
             commands: HashMap::new(),
             session_commands: HashMap::new(),
+            session_tasks: HashMap::new(),
             subagent_commands: HashMap::new(),
             subagent_providers: HashMap::new(),
+            subagent_parents: HashMap::new(),
+            subagent_tasks: HashMap::new(),
             events,
             event_tx: event_tx.clone(),
             tasks: Vec::new(),
@@ -2200,16 +2356,23 @@ impl BackendRegistry {
 
     pub(crate) async fn stop_provider(&mut self, provider: &str) {
         self.stop_provider_control(provider).await;
-        let session_keys = self
+        let mut session_keys = self
             .session_commands
             .keys()
             .filter(|(_, session_provider)| session_provider == provider)
             .cloned()
             .collect::<Vec<_>>();
-        for key in session_keys {
-            if let Some(commands) = self.session_commands.remove(&key) {
-                let _ = commands.send(BackendCommand::Shutdown).await;
+        for key in self
+            .session_tasks
+            .keys()
+            .filter(|(_, session_provider)| session_provider == provider)
+        {
+            if !session_keys.contains(key) {
+                session_keys.push(key.clone());
             }
+        }
+        for key in session_keys {
+            let _ = self.stop_session_backend(key).await;
         }
     }
 
@@ -2225,25 +2388,88 @@ impl BackendRegistry {
     /// adapter over its life, and a delete that left either behind would leave a provider child
     /// writing to history that has gone. Idempotent — a session with no backend attached is the
     /// normal case for a dead one, and finding nothing to stop is a success.
-    pub(crate) async fn stop_session(&mut self, session_id: &nakode_protocol::SessionId) {
-        let keys = self
+    pub(crate) async fn stop_session(
+        &mut self,
+        session_id: &nakode_protocol::SessionId,
+    ) -> Result<(), String> {
+        let mut keys = self
             .session_commands
             .keys()
             .filter(|(id, _)| id == session_id)
             .cloned()
             .collect::<Vec<_>>();
-        for key in keys {
-            if let Some(commands) = self.session_commands.remove(&key) {
-                let _ = commands.send(BackendCommand::Shutdown).await;
+        for key in self.session_tasks.keys().filter(|(id, _)| id == session_id) {
+            if !keys.contains(key) {
+                keys.push(key.clone());
             }
         }
+        for key in keys {
+            self.stop_session_backend(key).await?;
+        }
+        let run_ids = self
+            .subagent_parents
+            .iter()
+            .filter(|(_, parent)| *parent == session_id)
+            .map(|(run_id, _)| run_id.clone())
+            .collect::<Vec<_>>();
+        for run_id in run_ids {
+            self.stop_subagent(&run_id).await?;
+        }
+        Ok(())
     }
 
-    /// Drops the join handles of supervisors that have already exited.
+    async fn stop_session_backend(
+        &mut self,
+        key: (nakode_protocol::SessionId, String),
+    ) -> Result<(), String> {
+        if let Some(commands) = self.session_commands.get(&key).cloned() {
+            match tokio::time::timeout(
+                SESSION_BACKEND_STOP_TIMEOUT,
+                commands.send(BackendCommand::Shutdown),
+            )
+            .await
+            {
+                Ok(_) => {
+                    self.session_commands.remove(&key);
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "timed out sending shutdown to {} backend for session {}",
+                        key.1, key.0
+                    ));
+                }
+            }
+        }
+        let Some(task_sets) = self.session_tasks.remove(&key) else {
+            return Ok(());
+        };
+        let mut task_sets = task_sets.into_iter();
+        while let Some(mut tasks) = task_sets.next() {
+            // The event forwarder can be blocked sending into the runtime that is currently awaiting
+            // this teardown. Abort it first; the provider then observes its receiver closing in
+            // addition to the explicit Shutdown command.
+            tasks.event_forwarder.abort();
+            if tokio::time::timeout(SESSION_BACKEND_STOP_TIMEOUT, &mut tasks.backend)
+                .await
+                .is_err()
+            {
+                let mut retained = vec![tasks];
+                retained.extend(task_sets);
+                self.session_tasks.insert(key.clone(), retained);
+                return Err(format!(
+                    "timed out waiting for {} backend to stop for session {}",
+                    key.1, key.0
+                ));
+            }
+            let _ = tasks.event_forwarder.await;
+        }
+        Ok(())
+    }
+
+    /// Drops the join handles of provider-control and subagent supervisors that have already exited.
     ///
-    /// `tasks` is only ever pushed to and is awaited once, in `shutdown`. Every session and every
-    /// subagent adds two handles, so without this the vector grows with churn for the life of the
-    /// process and keeps a `JoinHandle` per session that has long since ended.
+    /// Session handles are retained separately by identity and are removed synchronously by
+    /// `stop_session`, so destructive deletion can await them rather than merely reaping them later.
     fn reap_finished_tasks(&mut self) {
         self.tasks.retain(|task| !task.is_finished());
     }
@@ -2288,12 +2514,10 @@ impl BackendRegistry {
         handle: BackendHandle,
     ) {
         let (commands, mut events, task) = handle.into_parts();
-        self.reap_finished_tasks();
-        self.session_commands
-            .insert((session_id.clone(), provider.clone()), commands);
-        self.tasks.push(task);
+        let key = (session_id.clone(), provider.clone());
+        self.session_commands.insert(key.clone(), commands);
         let event_tx = self.event_tx.clone();
-        self.tasks.push(tokio::spawn(async move {
+        let event_forwarder = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 if event_tx
                     .send((
@@ -2309,11 +2533,19 @@ impl BackendRegistry {
                     break;
                 }
             }
-        }));
+        });
+        self.session_tasks
+            .entry(key)
+            .or_default()
+            .push(SessionBackendTasks {
+                backend: task,
+                event_forwarder,
+            });
     }
 
     pub(crate) async fn spawn_subagent(
         &mut self,
+        parent_session_id: nakode_protocol::SessionId,
         run_id: String,
         provider: &str,
         working_directory: &Path,
@@ -2334,23 +2566,31 @@ impl BackendRegistry {
             .spawn_provider_handle(provider, working_directory)
             .await?;
         let (commands, mut events, task) = handle.into_parts();
-        self.reap_finished_tasks();
         self.subagent_commands.insert(run_id.clone(), commands);
         self.subagent_providers
             .insert(run_id.clone(), provider.to_owned());
-        self.tasks.push(task);
+        self.subagent_parents
+            .insert(run_id.clone(), parent_session_id);
         let event_tx = self.event_tx.clone();
-        self.tasks.push(tokio::spawn(async move {
+        let forwarded_run_id = run_id.clone();
+        let event_forwarder = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 if event_tx
-                    .send((BackendSource::Subagent(run_id.clone()), event))
+                    .send((BackendSource::Subagent(forwarded_run_id.clone()), event))
                     .await
                     .is_err()
                 {
                     break;
                 }
             }
-        }));
+        });
+        self.subagent_tasks
+            .entry(run_id)
+            .or_default()
+            .push(SessionBackendTasks {
+                backend: task,
+                event_forwarder,
+            });
         Ok(())
     }
 
@@ -2469,11 +2709,44 @@ impl BackendRegistry {
         commands.send(command).await.is_ok()
     }
 
-    pub(crate) async fn stop_subagent(&mut self, run_id: &str) {
-        self.subagent_providers.remove(run_id);
-        if let Some(commands) = self.subagent_commands.remove(run_id) {
-            let _ = commands.send(BackendCommand::Shutdown).await;
+    pub(crate) async fn stop_subagent(&mut self, run_id: &str) -> Result<(), String> {
+        if let Some(commands) = self.subagent_commands.get(run_id).cloned() {
+            match tokio::time::timeout(
+                SESSION_BACKEND_STOP_TIMEOUT,
+                commands.send(BackendCommand::Shutdown),
+            )
+            .await
+            {
+                Ok(_) => {
+                    self.subagent_commands.remove(run_id);
+                }
+                Err(_) => {
+                    return Err(format!("timed out sending shutdown to subagent {run_id}"));
+                }
+            }
         }
+        let Some(task_sets) = self.subagent_tasks.remove(run_id) else {
+            self.subagent_providers.remove(run_id);
+            self.subagent_parents.remove(run_id);
+            return Ok(());
+        };
+        let mut task_sets = task_sets.into_iter();
+        while let Some(mut tasks) = task_sets.next() {
+            tasks.event_forwarder.abort();
+            if tokio::time::timeout(SESSION_BACKEND_STOP_TIMEOUT, &mut tasks.backend)
+                .await
+                .is_err()
+            {
+                let mut retained = vec![tasks];
+                retained.extend(task_sets);
+                self.subagent_tasks.insert(run_id.to_owned(), retained);
+                return Err(format!("timed out waiting for subagent {run_id} to stop"));
+            }
+            let _ = tasks.event_forwarder.await;
+        }
+        self.subagent_providers.remove(run_id);
+        self.subagent_parents.remove(run_id);
+        Ok(())
     }
 
     pub(crate) async fn clear_provider_credential(&mut self, provider: &str) -> io::Result<()> {
@@ -2485,7 +2758,7 @@ impl BackendRegistry {
             .map(|(run_id, _)| run_id.clone())
             .collect::<Vec<_>>();
         for run_id in run_ids {
-            self.stop_subagent(&run_id).await;
+            let _ = self.stop_subagent(&run_id).await;
         }
         self.provider_credentials.remove(provider);
         if provider == crate::backend::CODEX_PROVIDER {
@@ -2494,15 +2767,50 @@ impl BackendRegistry {
         Ok(())
     }
 
-    pub(crate) async fn shutdown(self) {
+    pub(crate) async fn shutdown(mut self) {
         for commands in self.commands.values() {
             let _ = commands.send(BackendCommand::Shutdown).await;
         }
-        for commands in self.session_commands.values() {
-            let _ = commands.send(BackendCommand::Shutdown).await;
+        let mut session_ids = self
+            .session_commands
+            .keys()
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in self.session_tasks.keys().map(|(session_id, _)| session_id) {
+            if !session_ids.contains(session_id) {
+                session_ids.push(session_id.clone());
+            }
         }
-        for commands in self.subagent_commands.values() {
-            let _ = commands.send(BackendCommand::Shutdown).await;
+        for session_id in session_ids {
+            let _ = self.stop_session(&session_id).await;
+        }
+        // Process shutdown cannot leave a timed-out session task detached. Cancellation drops the
+        // provider future and its supervised child resources even when graceful shutdown did not
+        // finish inside the mutation-oriented deadline.
+        for (_, task_sets) in self.session_tasks.drain() {
+            for tasks in task_sets {
+                tasks.event_forwarder.abort();
+                tasks.backend.abort();
+                let _ = tasks.event_forwarder.await;
+                let _ = tasks.backend.await;
+            }
+        }
+        let mut run_ids = self.subagent_commands.keys().cloned().collect::<Vec<_>>();
+        for run_id in self.subagent_tasks.keys() {
+            if !run_ids.contains(run_id) {
+                run_ids.push(run_id.clone());
+            }
+        }
+        for run_id in run_ids {
+            let _ = self.stop_subagent(&run_id).await;
+        }
+        for (_, task_sets) in self.subagent_tasks.drain() {
+            for tasks in task_sets {
+                tasks.event_forwarder.abort();
+                tasks.backend.abort();
+                let _ = tasks.event_forwarder.await;
+                let _ = tasks.backend.await;
+            }
         }
         for task in self.tasks {
             let _ = task.await;
@@ -2563,9 +2871,12 @@ impl EffectExecutor {
             Effect::SubagentBackend { run_id, command } => {
                 send_subagent_command(state, &self.backends, pending, &run_id, command).await;
             }
-            Effect::StopSubagent(run_id) => self.backends.stop_subagent(&run_id).await,
+            Effect::StopSubagent(run_id) => {
+                let _ = self.backends.stop_subagent(&run_id).await;
+            }
             Effect::ReleaseSessionBackends(id) => {
-                self.backends
+                let _ = self
+                    .backends
                     .stop_session(&nakode_protocol::SessionId::from(id))
                     .await;
             }
@@ -2623,7 +2934,7 @@ impl EffectExecutor {
             Effect::ReloadConfiguration => apply_configuration_reload(state, pending),
             #[cfg(test)]
             Effect::ResolveSession(id) => resolve_session(state, sessions, pending, &id),
-            persistence_effect @ (Effect::PersistSession { .. }
+            effect @ (Effect::PersistSession { .. }
             | Effect::PersistSessionBridge(_)
             | Effect::PersistModels { .. }
             | Effect::SetDefaultModel { .. }
@@ -2635,9 +2946,11 @@ impl EffectExecutor {
             | Effect::TransitionSessionPrimary { .. }
             | Effect::UpdateSessionLastTurn { .. }
             | Effect::RecordOwnerActivity(_)
-            | Effect::TouchSession(_)
-            | Effect::DeleteSession(_)) => {
-                execute_persistence_effect(state, sessions, persistence_effect);
+            | Effect::TouchSession(_)) => {
+                execute_persistence_effect(state, sessions, effect);
+            }
+            Effect::DeleteSession(_) => {
+                unreachable!("session deletion is a required pre-effect durability checkpoint")
             }
             Effect::SaveWebConfig(config) => {
                 save_web_config(state, &self.backends, sessions, config);
@@ -2893,7 +3206,6 @@ fn execute_persistence_effect(
                 state.session_store_failed(error.to_string());
             }
         }
-        Effect::DeleteSession(id) => delete_session(state, sessions, &id),
         _ => unreachable!("only persistence effects are routed here"),
     }
 }
@@ -2998,6 +3310,7 @@ async fn spawn_subagent(
 ) {
     if let Err(error) = backends
         .spawn_subagent(
+            nakode_protocol::SessionId::from(state.nakode_session_id.clone()),
             run_id.to_owned(),
             provider,
             Path::new(&state.working_directory),
@@ -3245,6 +3558,28 @@ fn install_changed_agent_catalog(
     }
 }
 
+fn take_delete_session_effect(effects: &mut Vec<Effect>) -> Option<String> {
+    let index = effects
+        .iter()
+        .position(|effect| matches!(effect, Effect::DeleteSession(_)))?;
+    let Effect::DeleteSession(session_id) = effects.remove(index) else {
+        unreachable!("the located effect is a session deletion")
+    };
+    debug_assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeleteSession(_))),
+        "one command must not delete multiple sessions"
+    );
+    Some(session_id)
+}
+
+fn remove_session_release_effect(effects: &mut Vec<Effect>, session_id: &str) {
+    effects.retain(|effect| {
+        !matches!(effect, Effect::ReleaseSessionBackends(released) if released == session_id)
+    });
+}
+
 fn record_owner_activity(state: &mut DomainState, sessions: &dyn SessionRepository, id: &str) {
     if let Err(error) = sessions.record_owner_activity(id) {
         state.session_store_failed(error.to_string());
@@ -3253,12 +3588,6 @@ fn record_owner_activity(state: &mut DomainState, sessions: &dyn SessionReposito
 
 fn touch_session(state: &mut DomainState, sessions: &dyn SessionRepository, id: &str) {
     if let Err(error) = sessions.touch(id) {
-        state.session_store_failed(error.to_string());
-    }
-}
-
-fn delete_session(state: &mut DomainState, sessions: &dyn SessionRepository, id: &str) {
-    if let Err(error) = sessions.delete(id) {
         state.session_store_failed(error.to_string());
     }
 }
@@ -3641,21 +3970,22 @@ mod tests {
         collections::{HashMap, HashSet, VecDeque},
         path::Path,
         sync::{Arc, RwLock},
+        time::{Duration, Instant},
     };
 
     use nakode_protocol::{
         BridgeContinuationDisposition, BridgeLifecycle, ClientId, Command, CredentialInput,
         ErrorCode, IdempotencyKey, InvocationKind, InvocationSummary, InvocationUsage,
         McpGrantPolicy, OrchestratorKind, PromptInput, Query, QueryResult, ServiceCapability,
-        SessionId,
+        SessionId, TranscriptEntryStatus,
     };
     use tokio::sync::mpsc;
 
     use super::{
-        BackendRegistry, BackendSource, EffectExecutor, EffectOrigin, NativeServerRuntime,
-        PendingNativeDelegation, PersistenceServices, ProviderCredentialInput, load_subagents,
-        merge_invocation_catalogue, native_service_capabilities, provider_enablement_changes,
-        save_provider_credential,
+        BackendRegistry, BackendSource, EffectExecutor, EffectOrigin, McpCallCompletion,
+        NativeServerRuntime, PendingMcpCall, PendingNativeDelegation, PersistenceServices,
+        ProviderCredentialInput, SessionBackendTasks, load_subagents, merge_invocation_catalogue,
+        native_service_capabilities, provider_enablement_changes, save_provider_credential,
     };
     use crate::{
         backend::{
@@ -4568,6 +4898,513 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_session_cancels_mcp_calls_and_delayed_completion_cannot_respawn_backend() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        runtime.pending_mcp_calls.insert(
+            "owned-call".to_owned(),
+            PendingMcpCall {
+                source: BackendSource::Primary {
+                    session_id: session_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                },
+                session_id: session_id.clone(),
+                run_id: None,
+                server_id: "server".to_owned(),
+                remote_name: "tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                started_at_ms: 1,
+                started: Instant::now(),
+                cancellation: cancellation.clone(),
+            },
+        );
+
+        runtime.cancel_session_mcp_calls(&session_id);
+
+        assert!(cancellation.is_cancelled());
+        assert!(runtime.pending_mcp_calls.is_empty());
+
+        let deleted_id = SessionId::from("already-deleted-session");
+        let delayed_cancellation = tokio_util::sync::CancellationToken::new();
+        runtime.pending_mcp_calls.insert(
+            "delayed-call".to_owned(),
+            PendingMcpCall {
+                source: BackendSource::Primary {
+                    session_id: deleted_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                },
+                session_id: deleted_id.clone(),
+                run_id: None,
+                server_id: "server".to_owned(),
+                remote_name: "tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                started_at_ms: 1,
+                started: Instant::now(),
+                cancellation: delayed_cancellation.clone(),
+            },
+        );
+        runtime
+            .complete_mcp_call(McpCallCompletion {
+                call_id: "delayed-call".to_owned(),
+                result: Ok("late result".to_owned()),
+            })
+            .await;
+
+        assert!(delayed_cancellation.is_cancelled());
+        assert!(
+            !runtime
+                .effects
+                .backends
+                .session_commands
+                .keys()
+                .any(|(candidate, _)| candidate == &deleted_id),
+            "a delayed MCP completion must not recreate a deleted session backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_backend_teardown_fails_delete_boundedly_and_retry_converges() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let sessions = Arc::clone(&persistence.sessions);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        sessions
+            .create_with_id(
+                session_id.as_str(),
+                CODEX_PROVIDER,
+                "stalled-delete-provider-session",
+                &state.workspace,
+                &state.working_directory,
+                "Stalled delete test",
+                None,
+                &crate::backend::ModelOptions::default(),
+            )
+            .expect("persist session before deletion");
+
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, events) = mpsc::channel(1);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let stalled_task = tokio::spawn(async move {
+            assert!(matches!(
+                command_rx.recv().await,
+                Some(BackendCommand::Shutdown)
+            ));
+            let _ = released.await;
+        });
+        let mut registry = empty_registry(workspace.path()).await;
+        registry.insert_session(
+            session_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            BackendHandle::new(commands, events, stalled_task),
+        );
+        let effects = EffectExecutor::new(registry, persistence);
+        let (runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+        let key = IdempotencyKey::from("stalled-delete-retry");
+        let command = Command::DeleteSession {
+            session_id: session_id.clone(),
+        };
+
+        let started = Instant::now();
+        let failure = endpoint
+            .execute_command(
+                ClientId::from("stalled-delete-test"),
+                key.clone(),
+                None,
+                false,
+                command.clone(),
+            )
+            .await
+            .expect_err("stalled backend prevents durable deletion");
+        assert_eq!(failure.code, ErrorCode::Internal);
+        assert!(failure.retryable);
+        assert!(failure.message.contains("did not stop cleanly"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            sessions
+                .find(session_id.as_str())
+                .expect("durable session lookup")
+                .is_some()
+        );
+        endpoint
+            .execute_query(
+                ClientId::from("stalled-delete-test"),
+                Query::GetSession {
+                    session_id: session_id.clone(),
+                },
+            )
+            .await
+            .expect("runtime continues serving after bounded teardown failure");
+
+        release.send(()).expect("release stalled backend");
+        endpoint
+            .execute_command(
+                ClientId::from("stalled-delete-test"),
+                key,
+                None,
+                false,
+                command,
+            )
+            .await
+            .expect("same-key retry waits for termination and deletes");
+        assert_eq!(
+            sessions.find(session_id.as_str()).expect("session lookup"),
+            None
+        );
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn session_delete_waits_for_backend_terminal_persistence_before_durable_purge() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let database = workspace.path().join("sessions.sqlite3");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let sessions = Arc::clone(&persistence.sessions);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let provider_session_id = "terminal-persistence-provider-session";
+        let subagent_provider_session_id = "terminal-persistence-subagent-session";
+        let run_id = "terminal-persistence-subagent";
+        sessions
+            .create_with_id(
+                session_id.as_str(),
+                CODEX_PROVIDER,
+                provider_session_id,
+                &state.workspace,
+                &state.working_directory,
+                "Terminal persistence delete test",
+                None,
+                &crate::backend::ModelOptions::default(),
+            )
+            .expect("persist session before deletion");
+        sessions
+            .save_subagent(&SubagentRecord {
+                parent_session_id: session_id.to_string(),
+                id: run_id.to_owned(),
+                agent: "reviewer".to_owned(),
+                provider: CODEX_PROVIDER.to_owned(),
+                model: None,
+                provider_session_id: Some(subagent_provider_session_id.to_owned()),
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                objective: "Finish before deletion".to_owned(),
+                status: SubagentStatus::Working,
+                latest_activity: "Working".to_owned(),
+                transcript: Vec::new(),
+                observability: SubagentObservability::default(),
+            })
+            .expect("persist owned subagent");
+
+        let (commands, mut command_rx) = mpsc::channel(8);
+        let (_event_tx, events) = mpsc::channel(8);
+        let terminal_database = database.clone();
+        let terminal_task = tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                if matches!(command, BackendCommand::Shutdown) {
+                    let connection = rusqlite::Connection::open(terminal_database)
+                        .expect("terminal persistence connection");
+                    connection
+                        .execute(
+                            "INSERT INTO native_runtime_sessions
+                             (provider, session_id, session_json, updated_at)
+                             VALUES (?1, ?2, '{}', unixepoch())",
+                            rusqlite::params![CODEX_PROVIDER, provider_session_id],
+                        )
+                        .expect("backend terminal persistence");
+                    break;
+                }
+            }
+        });
+        let mut registry = empty_registry(workspace.path()).await;
+        registry.insert_session(
+            session_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            BackendHandle::new(commands, events, terminal_task),
+        );
+        let (subagent_commands, mut subagent_command_rx) = mpsc::channel(8);
+        let child_terminal_database = database.clone();
+        let child_terminal_task = tokio::spawn(async move {
+            while let Some(command) = subagent_command_rx.recv().await {
+                if matches!(command, BackendCommand::Shutdown) {
+                    let connection = rusqlite::Connection::open(child_terminal_database)
+                        .expect("subagent terminal persistence connection");
+                    connection
+                        .execute(
+                            "INSERT INTO native_runtime_sessions
+                             (provider, session_id, session_json, updated_at)
+                             VALUES (?1, ?2, '{}', unixepoch())",
+                            rusqlite::params![CODEX_PROVIDER, subagent_provider_session_id],
+                        )
+                        .expect("subagent terminal persistence");
+                    break;
+                }
+            }
+        });
+        registry
+            .subagent_commands
+            .insert(run_id.to_owned(), subagent_commands);
+        registry
+            .subagent_providers
+            .insert(run_id.to_owned(), CODEX_PROVIDER.to_owned());
+        registry
+            .subagent_parents
+            .insert(run_id.to_owned(), session_id.clone());
+        registry.subagent_tasks.insert(
+            run_id.to_owned(),
+            vec![SessionBackendTasks {
+                backend: child_terminal_task,
+                event_forwarder: tokio::spawn(std::future::pending()),
+            }],
+        );
+        let effects = EffectExecutor::new(registry, persistence);
+        let (runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+
+        endpoint
+            .execute_command(
+                ClientId::from("terminal-persistence-delete-test"),
+                IdempotencyKey::from("terminal-persistence-delete"),
+                None,
+                false,
+                Command::DeleteSession {
+                    session_id: session_id.clone(),
+                },
+            )
+            .await
+            .expect("delete waits for backend termination then commits");
+
+        assert_eq!(
+            sessions.find(session_id.as_str()).expect("session lookup"),
+            None
+        );
+        let connection = rusqlite::Connection::open(&database).expect("verification connection");
+        let native_rows = |provider_session_id: &str| {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM native_runtime_sessions
+                     WHERE provider = ?1 AND session_id = ?2",
+                    rusqlite::params![CODEX_PROVIDER, provider_session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("native history count")
+        };
+        assert_eq!(
+            native_rows(provider_session_id),
+            0,
+            "primary terminal persistence must land before the deleting transaction purges native history"
+        );
+        assert_eq!(
+            native_rows(subagent_provider_session_id),
+            0,
+            "subagent terminal persistence must land before the deleting transaction purges owned native history"
+        );
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn failed_session_delete_is_not_confirmed_and_same_key_retry_can_converge() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let database = workspace.path().join("sessions.sqlite3");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let sessions = Arc::clone(&persistence.sessions);
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let shell_effects = state
+            .run_shell_command("sleep 30".to_owned())
+            .expect("start shell before deletion");
+        let [
+            Effect::RunShell {
+                id: shell_id,
+                command: shell_command,
+            },
+        ] = shell_effects.as_slice()
+        else {
+            panic!("shell effect")
+        };
+        let shell_id = shell_id.clone();
+        let shell_command = shell_command.clone();
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        sessions
+            .create_with_id(
+                session_id.as_str(),
+                CODEX_PROVIDER,
+                "durable-delete-provider-session",
+                &state.workspace,
+                &state.working_directory,
+                "Durable delete test",
+                None,
+                &crate::backend::ModelOptions::default(),
+            )
+            .expect("persist session before deletion");
+        let breaker = rusqlite::Connection::open(&database).expect("breaker connection");
+        breaker
+            .execute_batch(
+                "CREATE TRIGGER fail_session_delete \
+                 BEFORE DELETE ON sessions \
+                 BEGIN SELECT RAISE(ABORT, 'forced session delete failure'); END;",
+            )
+            .expect("failure trigger");
+
+        let (mut runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        runtime
+            .shell_owners
+            .insert(shell_id.clone(), session_id.clone());
+        runtime.effects.shell_processes.spawn(
+            workspace.path().to_path_buf(),
+            shell_id.clone(),
+            shell_command,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+        let key = IdempotencyKey::from("durable-delete-retry");
+        let command = Command::DeleteSession {
+            session_id: session_id.clone(),
+        };
+
+        let failure = endpoint
+            .execute_command(
+                ClientId::from("durable-delete-test"),
+                key.clone(),
+                None,
+                false,
+                command.clone(),
+            )
+            .await
+            .expect_err("durable delete failure must fail the mutation");
+        assert_eq!(failure.code, ErrorCode::Internal);
+        assert!(failure.retryable);
+        assert!(failure.message.contains("not durably committed"));
+        assert!(
+            sessions
+                .find(session_id.as_str())
+                .expect("durable session lookup")
+                .is_some(),
+            "the failed transaction retains durable history"
+        );
+        let QueryResult::Session(restored) = endpoint
+            .execute_query(
+                ClientId::from("durable-delete-test"),
+                Query::GetSession {
+                    session_id: session_id.clone(),
+                },
+            )
+            .await
+            .expect("failed deletion restores the live projection")
+            .value
+        else {
+            panic!("session query result")
+        };
+        assert_eq!(restored.id, session_id);
+        let restored_shell = restored
+            .transcript
+            .entries
+            .iter()
+            .find(|entry| entry.title == "$ sleep 30")
+            .expect("terminated shell remains as settled transcript evidence");
+        assert_eq!(restored_shell.status, TranscriptEntryStatus::Failed);
+        assert!(
+            restored_shell
+                .body
+                .contains("durable session deletion failed")
+        );
+
+        breaker
+            .execute_batch("DROP TRIGGER fail_session_delete;")
+            .expect("drop failure trigger");
+        endpoint
+            .execute_command(
+                ClientId::from("durable-delete-test"),
+                key,
+                None,
+                false,
+                command,
+            )
+            .await
+            .expect("same-key retry executes after rollback");
+        assert_eq!(
+            sessions
+                .find(session_id.as_str())
+                .expect("durable session lookup"),
+            None
+        );
+        let missing = endpoint
+            .execute_query(
+                ClientId::from("durable-delete-test"),
+                Query::GetSession { session_id },
+            )
+            .await
+            .expect_err("successful deletion evicts the live projection");
+        assert_eq!(missing.code, ErrorCode::NotFound);
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn failed_bridge_checkpoint_rolls_back_same_process_for_same_and_new_keys() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -4721,7 +5558,7 @@ mod tests {
                 "bridge-stable-prompt".to_owned(),
                 "continue".to_owned(),
                 Vec::new(),
-                Some("discord".to_owned()),
+                Some("thread-transport".to_owned()),
             )
             .expect("stable prompt starts");
         sessions
@@ -4732,7 +5569,7 @@ mod tests {
                 lifecycle: BridgeLifecycle::Open,
                 display_title: "Acknowledgement retry".to_owned(),
                 revision: 1,
-                transport: Some("discord".to_owned()),
+                transport: Some("thread-transport".to_owned()),
                 external_parent_id: Some("100".to_owned()),
                 external_thread_id: Some("101".to_owned()),
                 last_projected: None,
@@ -4837,7 +5674,7 @@ mod tests {
             stored_bridge.inbound_turn_origins,
             [BridgeInboundTurnOriginRecord {
                 turn_id: "provider-generated-turn".to_owned(),
-                transport: "discord".to_owned(),
+                transport: "thread-transport".to_owned(),
             }],
             "terminal retry persists source provenance and acknowledgement as one final bridge state"
         );
@@ -4868,7 +5705,7 @@ mod tests {
                 lifecycle: BridgeLifecycle::Open,
                 display_title: "Inbound ledger".to_owned(),
                 revision: 1,
-                transport: Some("discord".to_owned()),
+                transport: Some("thread-transport".to_owned()),
                 external_parent_id: Some("100".to_owned()),
                 external_thread_id: Some("101".to_owned()),
                 last_projected: None,
@@ -4901,7 +5738,7 @@ mod tests {
                 false,
                 Command::ContinueSessionFromBridge {
                     session_id: session_id.clone(),
-                    transport: "discord".to_owned(),
+                    transport: "thread-transport".to_owned(),
                     external_thread_id: "101".to_owned(),
                     external_event_id: "event-1".to_owned(),
                     source_message_id: "message-1".to_owned(),
@@ -4948,7 +5785,7 @@ mod tests {
                 false,
                 Command::ContinueSessionFromBridge {
                     session_id: session_id.clone(),
-                    transport: "discord".to_owned(),
+                    transport: "thread-transport".to_owned(),
                     external_thread_id: "999".to_owned(),
                     external_event_id: "event-1".to_owned(),
                     source_message_id: "message-1".to_owned(),
@@ -4970,7 +5807,7 @@ mod tests {
                 false,
                 Command::ContinueSessionFromBridge {
                     session_id: session_id.clone(),
-                    transport: "discord".to_owned(),
+                    transport: "thread-transport".to_owned(),
                     external_thread_id: "101".to_owned(),
                     external_event_id: "event-1".to_owned(),
                     source_message_id: "message-1".to_owned(),
@@ -5217,7 +6054,10 @@ mod tests {
         );
         registry.insert_session(survivor.clone(), CODEX_PROVIDER.to_owned(), kept);
 
-        registry.stop_session(&doomed).await;
+        registry
+            .stop_session(&doomed)
+            .await
+            .expect("doomed backends stop");
 
         assert!(matches!(
             codex_commands.recv().await,
@@ -5246,6 +6086,55 @@ mod tests {
         );
     }
 
+    /// The delete path evicts a non-default engine before dispatching its release effect. Runtime
+    /// release must therefore not require a surviving `DomainState` projection.
+    #[tokio::test]
+    async fn release_effect_stops_backends_after_the_session_projection_is_absent() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let mut registry = empty_registry(workspace.path()).await;
+        let absent = SessionId::from("deleted-before-effects");
+        let (backend, mut commands, _events) = fake_backend();
+        registry.insert_session(absent.clone(), CODEX_PROVIDER.to_owned(), backend);
+        let effects = EffectExecutor::new(registry, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        assert!(runtime.core.engine_for(&absent).is_none());
+
+        runtime
+            .execute_effects(
+                &absent,
+                vec![Effect::ReleaseSessionBackends(absent.to_string())],
+                EffectOrigin::ClientCommand,
+            )
+            .await;
+
+        assert!(matches!(
+            commands.recv().await,
+            Some(BackendCommand::Shutdown)
+        ));
+        assert!(
+            !runtime
+                .effects
+                .backends
+                .session_commands
+                .keys()
+                .any(|(session_id, _)| session_id == &absent)
+        );
+    }
+
     /// Releasing a session with nothing attached is a success, which is the dead-session case.
     #[tokio::test]
     async fn releasing_a_session_with_no_backend_is_idempotent() {
@@ -5253,8 +6142,14 @@ mod tests {
         let mut registry = empty_registry(workspace.path()).await;
         let absent = SessionId::from("session-absent");
 
-        registry.stop_session(&absent).await;
-        registry.stop_session(&absent).await;
+        registry
+            .stop_session(&absent)
+            .await
+            .expect("first absent stop");
+        registry
+            .stop_session(&absent)
+            .await
+            .expect("repeated absent stop");
 
         assert!(registry.session_commands.is_empty());
     }
@@ -5273,7 +6168,10 @@ mod tests {
             let session_id = SessionId::from(format!("session-{cycle}"));
             let (handle, commands, events) = fake_backend();
             registry.insert_session(session_id.clone(), CODEX_PROVIDER.to_owned(), handle);
-            registry.stop_session(&session_id).await;
+            registry
+                .stop_session(&session_id)
+                .await
+                .expect("session backend stops");
             // Dropping both ends is what ends the forwarder and the supervisor this test is counting.
             drop(commands);
             drop(events);

@@ -127,7 +127,7 @@ pub struct ProviderView {
 
 /// Product surface that owns the user-facing projection of one logical session.
 ///
-/// This is intentionally transport-neutral: Discord, Slack, or another thread transport may map
+/// This is intentionally transport-neutral: any external thread transport may map
 /// the same Chat/Agent distinction to different destinations.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

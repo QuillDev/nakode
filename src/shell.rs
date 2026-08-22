@@ -87,6 +87,19 @@ impl ShellProcesses {
         })
     }
 
+    pub async fn terminate(&mut self, id: &str) -> bool {
+        let Some(process) = self.tasks.remove(id) else {
+            return false;
+        };
+        process.cancellation.cancel();
+        // A destructive session boundary cannot wait for this task to publish its final event through
+        // the runtime actor that is currently awaiting termination. Aborting drops the kill-on-drop
+        // child process future and then joins the cancelled supervisor.
+        process.task.abort();
+        let _ = process.task.await;
+        true
+    }
+
     pub fn complete(&mut self, id: &str) {
         self.tasks.remove(id);
     }

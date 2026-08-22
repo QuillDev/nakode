@@ -486,10 +486,14 @@ pub trait SessionRepository: Send + Sync {
     /// Takes the session row, its runs and their turns (by cascade), and the native runtime history
     /// keyed by the provider session it resolves to. That last table carries no foreign key back to
     /// `sessions`, so it is deleted explicitly — a cascade cannot reach it, and it is where the bulk of
-    /// a session's bytes actually live.
+    /// a session's bytes actually live. Any retained orchestrator bridge is archived in the same
+    /// transaction so a failed delete cannot partially settle its lifecycle.
+    ///
+    /// Deletion is idempotent when the logical session is already absent. An independently retained
+    /// bridge with that exact session id is still archived.
     ///
     /// # Errors
-    /// Returns an error when the session is unknown or the transaction cannot be committed.
+    /// Returns an error when persistence cannot be queried or the transaction cannot be committed.
     fn delete(&self, id: &str) -> Result<(), SessionError>;
     /// Deletes every logical session and every session-scoped persistence row.
     ///
@@ -2082,7 +2086,7 @@ impl SessionRepository for SqliteSessionRepository {
                 unix_timestamp().saturating_mul(1000)
             ],
         )?;
-        // Discord only replays a bounded recent gateway window. Retain a generous per-session
+        // External transports only replay a bounded recent event window. Retain a generous per-session
         // durable replay ledger, plus any currently unacknowledged accepted prompt, instead of
         // allowing an old long-lived conversation to grow this table forever.
         transaction.execute(
@@ -2187,13 +2191,14 @@ impl SessionRepository for SqliteSessionRepository {
             exact.owned_provider_sessions = load_owned_provider_sessions(&connection, &exact.id)?;
             return Ok(Some(exact));
         }
-        let pattern = format!("{id}%");
         let mut statement = connection.prepare(
             "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
-             FROM sessions WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
+             FROM sessions
+             WHERE substr(id, 1, length(?1)) = ?1
+             ORDER BY updated_at DESC LIMIT 2",
         )?;
         let matches = statement
-            .query_map([pattern], Self::row)?
+            .query_map([id], Self::row)?
             .collect::<Result<Vec<_>, _>>()?;
         match matches.as_slice() {
             [] => Ok(None),
@@ -2331,43 +2336,51 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     fn delete(&self, id: &str) -> Result<(), SessionError> {
-        // Resolved through `find` so deletion accepts exactly the ids every other call does, prefixes
-        // included, and so an ambiguous prefix is refused here rather than deleting an arbitrary match.
-        let record = self
-            .find(id)?
-            .ok_or_else(|| SessionError::SessionNotFound(id.to_owned()))?;
+        // Resolve prefixes exactly as every other session operation does. A fully absent id is an
+        // idempotent success, but an ambiguous prefix remains an error and must never pick a victim.
+        let record = self.find(id)?;
+        let resolved_id = record
+            .as_ref()
+            .map_or_else(|| id.to_owned(), |record| record.id.clone());
         let mut connection = self
             .connection
             .lock()
             .expect("session database mutex poisoned");
         let transaction = connection.transaction()?;
-        // The transcript first. It is keyed by the PROVIDER session id and has no foreign key to
-        // `sessions`, so nothing removes it on our behalf; dropping the parent row first would leave it
-        // unreachable and permanent — which is the orphan this table already accumulates.
+        // Bridge identity is intentionally retained for thread history, but deletion is its terminal
+        // lifecycle boundary. Archive it in this transaction before deleting the session hierarchy so
+        // repository failure can roll back both pieces of authority together.
         transaction.execute(
-            "DELETE FROM native_runtime_sessions WHERE provider = ?1 AND session_id = ?2",
-            params![record.provider, record.provider_session_id],
+            "UPDATE session_bridges
+             SET lifecycle = 'archived', revision = revision + 1, updated_at_ms = ?1
+             WHERE session_id = ?2 AND lifecycle != 'archived'",
+            params![unix_timestamp().saturating_mul(1_000), resolved_id],
         )?;
-        for (provider, provider_session_id) in &record.owned_provider_sessions {
+        if let Some(record) = record {
+            // The transcript first. It is keyed by the PROVIDER session id and has no foreign key to
+            // `sessions`, so nothing removes it on our behalf; dropping the parent row first would leave it
+            // unreachable and permanent — which is the orphan this table already accumulates.
             transaction.execute(
                 "DELETE FROM native_runtime_sessions WHERE provider = ?1 AND session_id = ?2",
-                params![provider, provider_session_id],
+                params![record.provider, record.provider_session_id],
             )?;
-        }
-        // This normalized replay ledger predates a foreign key so remove its session-owned rows
-        // explicitly; otherwise individual session deletion leaves permanent idempotency orphans.
-        transaction.execute(
-            "DELETE FROM session_bridge_inbound_events WHERE session_id = ?1",
-            [&record.id],
-        )?;
-        // Then the session itself. `orchestration_runs` and `agent_turns` go with it by cascade, which
-        // the connection's `PRAGMA foreign_keys = ON` is what makes true.
-        let removed =
+            for (provider, provider_session_id) in &record.owned_provider_sessions {
+                transaction.execute(
+                    "DELETE FROM native_runtime_sessions WHERE provider = ?1 AND session_id = ?2",
+                    params![provider, provider_session_id],
+                )?;
+            }
+            // This normalized replay ledger predates a foreign key so remove its session-owned rows
+            // explicitly; otherwise individual session deletion leaves permanent idempotency orphans.
+            transaction.execute(
+                "DELETE FROM session_bridge_inbound_events WHERE session_id = ?1",
+                [&record.id],
+            )?;
+            // Then the session itself. `orchestration_runs` and `agent_turns` go with it by cascade, which
+            // the connection's `PRAGMA foreign_keys = ON` is what makes true.
             transaction.execute("DELETE FROM sessions WHERE id = ?1", params![record.id])?;
-        transaction.commit()?;
-        if removed == 0 {
-            return Err(SessionError::SessionNotFound(id.to_owned()));
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -4017,8 +4030,31 @@ mod tests {
     }
 
     #[test]
+    fn session_prefix_lookup_treats_sql_wildcards_as_literal_characters() -> Result<(), SessionError>
+    {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let target = store.create_with_id(
+            "literal-prefix-target",
+            CODEX_PROVIDER,
+            "literal-prefix-provider",
+            "/tmp/project",
+            "/tmp/project",
+            "Literal prefix",
+            None,
+            &ModelOptions::default(),
+        )?;
+
+        assert_eq!(store.find("literal%")?, None);
+        assert_eq!(store.find("literal_")?, None);
+        store.delete("literal%")?;
+        assert_eq!(store.find(&target.id)?, Some(target));
+        Ok(())
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
-    fn bridge_state_survives_session_delete_while_replay_rows_are_removed()
+    fn bridge_state_is_archived_by_session_delete_while_replay_rows_are_removed()
     -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
@@ -4036,7 +4072,7 @@ mod tests {
             lifecycle: nakode_protocol::BridgeLifecycle::Open,
             display_title: "Agent bridge".to_owned(),
             revision: 7,
-            transport: Some("discord".to_owned()),
+            transport: Some("thread-transport".to_owned()),
             external_parent_id: Some("100".to_owned()),
             external_thread_id: Some("101".to_owned()),
             last_projected: Some(BridgeProjectionRecord {
@@ -4068,7 +4104,7 @@ mod tests {
             }),
             inbound_turn_origins: vec![BridgeInboundTurnOriginRecord {
                 turn_id: "turn-2".to_owned(),
-                transport: "discord".to_owned(),
+                transport: "thread-transport".to_owned(),
             }],
             updated_at_ms: 123,
         };
@@ -4114,10 +4150,17 @@ mod tests {
         );
 
         store.delete(&session.id)?;
+        let archived_bridges = store.list_session_bridges("/tmp/project")?;
+        assert_eq!(archived_bridges.len(), 1);
         assert_eq!(
-            store.list_session_bridges("/tmp/project")?,
-            vec![persisted_bridge],
-            "single-session deletion preserves the thread identity for archival"
+            archived_bridges[0].lifecycle,
+            nakode_protocol::BridgeLifecycle::Archived
+        );
+        assert_eq!(archived_bridges[0].revision, persisted_bridge.revision + 1);
+        assert_eq!(archived_bridges[0].session_id, persisted_bridge.session_id);
+        assert_eq!(
+            archived_bridges[0].external_thread_id,
+            persisted_bridge.external_thread_id
         );
 
         assert_eq!(
@@ -4154,7 +4197,7 @@ mod tests {
             lifecycle: nakode_protocol::BridgeLifecycle::Open,
             display_title: "Ledger bridge".to_owned(),
             revision: 1,
-            transport: Some("discord".to_owned()),
+            transport: Some("thread-transport".to_owned()),
             external_parent_id: Some("100".to_owned()),
             external_thread_id: Some("101".to_owned()),
             last_projected: None,
@@ -4239,7 +4282,7 @@ mod tests {
             lifecycle: nakode_protocol::BridgeLifecycle::Open,
             display_title: "First".to_owned(),
             revision: 1,
-            transport: Some("discord".to_owned()),
+            transport: Some("thread-transport".to_owned()),
             external_parent_id: Some("100".to_owned()),
             external_thread_id: Some("101".to_owned()),
             last_projected: None,
@@ -4745,12 +4788,10 @@ mod tests {
         assert_eq!(store.find(&kept.id)?, Some(kept));
         assert_eq!(native_rows("kept-provider-session")?, 1);
 
-        // Deleting what is already gone is an error, not a silent success: a caller retrying a failed
-        // cleanup should be told the id means nothing rather than believing it removed something.
-        assert!(matches!(
-            store.delete(&doomed.id),
-            Err(SessionError::SessionNotFound(id)) if id == doomed.id
-        ));
+        // Deleting what is already gone is an idempotent success. This lets a retry converge when a
+        // prior response was lost after the durable transaction committed.
+        store.delete(&doomed.id)?;
+        assert_eq!(store.find(&doomed.id)?, None);
         Ok(())
     }
 

@@ -3473,6 +3473,14 @@ impl DomainState {
             ));
         }
         self.validate_prompt(&text)?;
+        if let Some(matches) = self.prompt_identity_matches(&prompt_id, &text, &attachments) {
+            if matches {
+                return Ok(Vec::new());
+            }
+            return Err(DomainCommandError::Conflict(
+                "the prompt operation id was already used for different prompt content".to_owned(),
+            ));
+        }
         if !self.connection.is_ready() {
             return Err(DomainCommandError::Conflict(
                 "the selected provider is not ready".to_owned(),
@@ -3527,14 +3535,39 @@ impl DomainState {
         text: String,
         attachments: Vec<PromptAttachment>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        self.validate_prompt(&text)?;
+        self.enqueue_prompt_with_id(Self::next_id("msg"), text, attachments)
+    }
+
+    /// Adds a prompt with the stable identity of the mutation that submitted it.
+    ///
+    /// Queue membership and the eventual owner transcript row retain this identity, allowing a
+    /// client to replace an awaiting-acknowledgement presentation without matching text or position.
+    pub(crate) fn enqueue_prompt_with_id(
+        &mut self,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
         if !self.is_busy() {
-            return self.submit_prompt(text, attachments);
+            return self.submit_prompt_with_id(prompt_id, text, attachments);
+        }
+        if prompt_id.is_empty() || prompt_id.len() > 128 {
+            return Err(DomainCommandError::Invalid(
+                "prompt operation id must contain 1 to 128 bytes".to_owned(),
+            ));
+        }
+        self.validate_prompt(&text)?;
+        if let Some(matches) = self.prompt_identity_matches(&prompt_id, &text, &attachments) {
+            if matches {
+                return Ok(Vec::new());
+            }
+            return Err(DomainCommandError::Conflict(
+                "the prompt operation id was already used for different prompt content".to_owned(),
+            ));
         }
         self.recoverable_prompt = None;
-        let id = Self::next_id("msg");
         self.queue.push_back(QueuedPrompt {
-            id,
+            id: prompt_id,
             text,
             attachments,
             source_transport: None,
@@ -3546,6 +3579,77 @@ impl DomainState {
             .map(Effect::RecordOwnerActivity)
             .into_iter()
             .collect())
+    }
+
+    fn prompt_identity_matches(
+        &self,
+        prompt_id: &str,
+        text: &str,
+        attachments: &[PromptAttachment],
+    ) -> Option<bool> {
+        if let Some(prompt) = self
+            .recoverable_prompt
+            .as_ref()
+            .filter(|prompt| prompt.id == prompt_id)
+        {
+            // A provider rejection before acceptance leaves the owner row in place for recovery.
+            // Matching content is therefore replayable rather than an already-settled duplicate;
+            // reusing the identity for different content remains a conflict.
+            if prompt.text == text && prompt.attachments == attachments {
+                return None;
+            }
+            return Some(false);
+        }
+        if let Some(prompt) = self.queue.iter().find(|prompt| prompt.id == prompt_id) {
+            return Some(prompt.text == text && prompt.attachments == attachments);
+        }
+        if let Some(prompt) = self
+            .starting_turn
+            .as_ref()
+            .filter(|prompt| prompt.id == prompt_id)
+        {
+            return Some(prompt.text == text && prompt.attachments == attachments);
+        }
+        if let Some(prompt) = self
+            .pending_session_prompt
+            .as_ref()
+            .filter(|prompt| prompt.id == prompt_id)
+        {
+            return Some(prompt.text == text && prompt.attachments == attachments);
+        }
+
+        let key = format!("user:{prompt_id}");
+        let entry = self
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.key.as_deref() == Some(key.as_str()))?;
+        let expected_images = attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment
+                    .image
+                    .as_ref()
+                    .map(|image| (attachment.label.as_str(), image))
+            })
+            .collect::<Vec<_>>();
+        let expected_local_files = attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment.path.as_ref().map(|path| {
+                    (
+                        attachment.label.clone(),
+                        path.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let actual_images = self.transcript.image_artifacts(entry).collect::<Vec<_>>();
+        Some(
+            entry.body == text
+                && self.transcript.local_files(&key) == expected_local_files.as_slice()
+                && actual_images == expected_images,
+        )
     }
 
     /// Removes one queued prompt by its stable server-owned identity.
@@ -3788,8 +3892,9 @@ impl DomainState {
     /// decide which internal cancellation operations are required.
     ///
     /// # Errors
-    /// Rejects the request when no cancellable work exists or when the active
-    /// provider cannot interrupt its turn.
+    /// Rejects the request when the active provider cannot interrupt its turn. An idle session is an
+    /// idempotent success, which lets lifecycle clients safely stop-before-close without racing the
+    /// final completion snapshot.
     pub fn cancel_session_work(&mut self) -> Result<Vec<Effect>, DomainCommandError> {
         let active_turn = self.active_turn.as_ref().map(|turn| turn.id.clone());
         let context_compaction = self
@@ -3813,9 +3918,7 @@ impl DomainState {
             && active_runs.is_empty()
             && active_shells.is_empty()
         {
-            return Err(DomainCommandError::NotFound(
-                "no cancellable work is active for this session".to_owned(),
-            ));
+            return Ok(Vec::new());
         }
 
         let mut effects = Vec::new();
@@ -6704,38 +6807,7 @@ impl DomainState {
             attachments: prompt.attachments,
             source_transport: prompt.source_transport,
         };
-        let user_key = format!("user:{}", prompt.id);
-        let images = prompt
-            .attachments
-            .iter()
-            .filter_map(|attachment| {
-                attachment
-                    .image
-                    .clone()
-                    .map(|image| (attachment.label.clone(), image))
-            })
-            .collect::<Vec<_>>();
-        self.transcript.set_labeled_images(user_key.clone(), images);
-        self.transcript.upsert(
-            user_key.clone(),
-            EntryKind::User,
-            format!("YOU · {}", prompt.id),
-            &prompt.text,
-            EntryStatus::Complete,
-        );
-        self.transcript.set_origin(
-            &user_key,
-            Some(self.backend_provider.as_str()),
-            prompt.resolved_model.as_deref(),
-        );
-        self.transcript.set_model_options(
-            &user_key,
-            prompt.options.reasoning_effort.as_deref(),
-            prompt.options.fast_mode,
-        );
-        self.transcript
-            .set_source_transport(&user_key, prompt.source_transport.as_deref());
-        self.transcript.set_stream_active(true);
+        self.record_outgoing_user_prompt(&prompt);
 
         if let Some(provider_session_id) = self.provider_session_id.clone() {
             let persist = self.session_id.is_none().then(|| Effect::PersistSession {
@@ -6772,6 +6844,55 @@ impl DomainState {
                 timeout_seconds: None,
             })]
         }
+    }
+
+    fn record_outgoing_user_prompt(&mut self, prompt: &OutgoingPrompt) {
+        let user_key = format!("user:{}", prompt.id);
+        let images = prompt
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment
+                    .image
+                    .clone()
+                    .map(|image| (attachment.label.clone(), image))
+            })
+            .collect();
+        let local_files = prompt
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment.path.as_ref().map(|path| {
+                    (
+                        attachment.label.clone(),
+                        path.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        self.transcript
+            .set_local_files(user_key.clone(), local_files);
+        self.transcript.set_labeled_images(user_key.clone(), images);
+        self.transcript.upsert(
+            user_key.clone(),
+            EntryKind::User,
+            format!("YOU · {}", prompt.id),
+            &prompt.text,
+            EntryStatus::Complete,
+        );
+        self.transcript.set_origin(
+            &user_key,
+            Some(self.backend_provider.as_str()),
+            prompt.resolved_model.as_deref(),
+        );
+        self.transcript.set_model_options(
+            &user_key,
+            prompt.options.reasoning_effort.as_deref(),
+            prompt.options.fast_mode,
+        );
+        self.transcript
+            .set_source_transport(&user_key, prompt.source_transport.as_deref());
+        self.transcript.set_stream_active(true);
     }
 
     fn start_prompt_on_session(
@@ -7014,6 +7135,18 @@ impl DomainState {
                     turn.options.fast_mode,
                 );
             }
+            let local_files = attachments
+                .iter()
+                .filter_map(|attachment| {
+                    attachment.path.as_ref().map(|path| {
+                        (
+                            attachment.label.clone(),
+                            path.to_string_lossy().into_owned(),
+                        )
+                    })
+                })
+                .collect();
+            self.transcript.set_local_files(&item_id, local_files);
             self.transcript.set_labeled_images(
                 &item_id,
                 attachments
@@ -11184,6 +11317,99 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .map(|prompt| prompt.text.as_str()),
             Some("fail before acceptance")
         );
+    }
+
+    #[test]
+    fn rejected_turn_start_replays_the_same_prompt_identity_once_more() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("session-1".to_owned());
+        state.session_id = Some("nakode-session-1".to_owned());
+        let prompt_id = "stable-owner-prompt";
+        state
+            .submit_prompt_with_id(
+                prompt_id.to_owned(),
+                "fail before acceptance".to_owned(),
+                Vec::new(),
+            )
+            .expect("prompt accepted");
+
+        state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::StartTurn,
+            code: -32602,
+            message: "prompt failed".to_owned(),
+        });
+
+        let replay = state
+            .submit_prompt_with_id(
+                prompt_id.to_owned(),
+                "fail before acceptance".to_owned(),
+                Vec::new(),
+            )
+            .expect("failed prompt identity remains replayable");
+        assert!(replay.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, .. })
+                if client_id == prompt_id
+        )));
+        assert!(state.recoverable_prompt().is_none());
+
+        let duplicate = state
+            .submit_prompt_with_id(
+                prompt_id.to_owned(),
+                "fail before acceptance".to_owned(),
+                Vec::new(),
+            )
+            .expect("in-flight replay is exactly-once");
+        assert!(duplicate.is_empty());
+    }
+
+    #[test]
+    fn restored_local_file_prompt_retains_stable_identity() {
+        let prompt_id = "restored-local-file";
+        let mut state = ready_state();
+        state.provider_session_id = Some("session-1".to_owned());
+        state.install_history(vec![SessionHistoryItem {
+            turn_id: "turn-1".to_owned(),
+            provider_id: Some(CODEX_PROVIDER.to_owned()),
+            model_id: Some("model-a".to_owned()),
+            attachments: vec![PromptAttachment {
+                label: "context".to_owned(),
+                path: Some(Path::new("src/context.rs").to_path_buf()),
+                image: None,
+            }],
+            item: NormalizedItem {
+                id: format!("user:{prompt_id}"),
+                kind: ItemKind::User,
+                title: "YOU".to_owned(),
+                body: "inspect this file once".to_owned(),
+                status: ItemStatus::Complete,
+                tool_audit_json: None,
+            },
+        }]);
+
+        let duplicate = state
+            .submit_prompt_with_id(
+                prompt_id.to_owned(),
+                "inspect this file once".to_owned(),
+                vec![PromptAttachment {
+                    label: "context".to_owned(),
+                    path: Some(Path::new("src/context.rs").to_path_buf()),
+                    image: None,
+                }],
+            )
+            .expect("identical restored local-file prompt converges");
+        assert!(duplicate.is_empty());
+
+        let conflict = state.submit_prompt_with_id(
+            prompt_id.to_owned(),
+            "inspect this file once".to_owned(),
+            vec![PromptAttachment {
+                label: "context".to_owned(),
+                path: Some(Path::new("src/different.rs").to_path_buf()),
+                image: None,
+            }],
+        );
+        assert!(matches!(conflict, Err(DomainCommandError::Conflict(_))));
     }
 
     #[test]
