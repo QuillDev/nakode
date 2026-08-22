@@ -75,6 +75,7 @@ pub fn bootstrap(
                 active_model_id: state.selected_model.clone().map(ModelId::from),
                 updated_at_ms: 0,
                 created_at_ms: 0,
+                last_owner_activity_at_ms: 0,
                 owned_provider_sessions: owned_provider_sessions(state),
                 running: state.is_busy(),
             },
@@ -224,6 +225,9 @@ fn session_view(
     let updated_at_ms = persisted.map_or(0, |session| {
         unix_seconds_to_milliseconds(session.updated_at)
     });
+    let last_owner_activity_at_ms = persisted
+        .and_then(|session| session.last_owner_activity_at)
+        .map_or(0, unix_seconds_to_milliseconds);
     SessionView {
         id: session_id.clone(),
         revision,
@@ -265,6 +269,7 @@ fn session_view(
             .collect(),
         created_at_ms,
         updated_at_ms,
+        last_owner_activity_at_ms,
     }
 }
 
@@ -1814,6 +1819,9 @@ fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> Sessi
         active_model_id: session.model.clone().map(ModelId::from),
         updated_at_ms: unix_seconds_to_milliseconds(session.updated_at),
         created_at_ms: unix_seconds_to_milliseconds(session.created_at),
+        last_owner_activity_at_ms: session
+            .last_owner_activity_at
+            .map_or(0, unix_seconds_to_milliseconds),
         owned_provider_sessions: owned_provider_session(
             &session.provider,
             Some(&session.provider_session_id),

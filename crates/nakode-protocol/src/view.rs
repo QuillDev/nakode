@@ -203,6 +203,10 @@ pub struct SessionSummary {
     /// Immutable logical-session creation boundary, in Unix epoch milliseconds.
     #[serde(default)]
     pub created_at_ms: i64,
+    /// Latest accepted or terminal owner-turn boundary, in Unix epoch milliseconds.
+    /// Zero means unavailable for compatibility with projections predating this field.
+    #[serde(default)]
+    pub last_owner_activity_at_ms: i64,
     /// Provider-native resources whose lifecycle belongs to this logical session.
     #[serde(default)]
     pub owned_provider_sessions: Vec<OwnedProviderSessionView>,
@@ -901,6 +905,10 @@ pub struct SessionView {
     pub created_at_ms: i64,
     #[serde(default)]
     pub updated_at_ms: i64,
+    /// Latest accepted or terminal owner-turn boundary. Generic touches never change it.
+    /// Zero means unavailable for compatibility with projections predating this field.
+    #[serde(default)]
+    pub last_owner_activity_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

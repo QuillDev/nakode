@@ -1110,6 +1110,7 @@ pub enum Effect {
         session_id: String,
         turn: crate::session::PersistedTurnConfiguration,
     },
+    RecordOwnerActivity(String),
     TouchSession(String),
     SaveWebConfig(WebConfig),
     SaveMemoryConfig(MemoryConfig),
@@ -3510,7 +3511,12 @@ impl DomainState {
             source_transport: None,
         });
         self.status_message = format!("Queued message {}.", self.queue.len());
-        Ok(Vec::new())
+        Ok(self
+            .session_id
+            .clone()
+            .map(Effect::RecordOwnerActivity)
+            .into_iter()
+            .collect())
     }
 
     /// Removes one queued prompt by its stable server-owned identity.
@@ -5951,7 +5957,16 @@ impl DomainState {
             BackendEvent::ApprovalResolved { request_id } => {
                 self.resolve_external_approval(&request_id);
             }
-            BackendEvent::SteerAccepted { turn_id } => self.handle_steer_accepted(&turn_id),
+            BackendEvent::SteerAccepted { turn_id } => {
+                if self.handle_steer_accepted(&turn_id) {
+                    return self
+                        .session_id
+                        .clone()
+                        .map(Effect::RecordOwnerActivity)
+                        .into_iter()
+                        .collect();
+                }
+            }
             BackendEvent::InterruptAccepted => {
                 self.set_status("Interrupt accepted; waiting for the turn to stop…");
             }
@@ -6410,10 +6425,10 @@ impl DomainState {
         }
     }
 
-    fn handle_steer_accepted(&mut self, turn_id: &str) {
+    fn handle_steer_accepted(&mut self, turn_id: &str) -> bool {
         let Some(pending) = self.pending_steer.take() else {
             self.set_status("A late steer response arrived after the turn ended.");
-            return;
+            return false;
         };
         if pending.turn_id != turn_id || !self.turn_is_current(turn_id) {
             let queued = pending.queued_origin.is_some();
@@ -6422,7 +6437,7 @@ impl DomainState {
             } else {
                 "A late steer response was ignored."
             });
-            return;
+            return false;
         }
         if let Some(origin) = &pending.queued_origin {
             let Some(position) = self
@@ -6433,7 +6448,7 @@ impl DomainState {
                 self.set_status(
                     "Steering was accepted, but its reserved queued message was unavailable.",
                 );
-                return;
+                return false;
             };
             self.queue.remove(position);
         }
@@ -6444,6 +6459,7 @@ impl DomainState {
             EntryStatus::Complete,
         );
         self.set_status("Steering guidance accepted.");
+        true
     }
 
     fn restore_redirect_start(&mut self, pending: RedirectStart) -> bool {
@@ -6703,6 +6719,9 @@ impl DomainState {
                 options: prompt.options.clone(),
             });
             let mut effects = self.start_prompt_on_session(prompt, provider_session_id);
+            if let Some(session_id) = self.session_id.clone() {
+                effects.insert(0, Effect::RecordOwnerActivity(session_id));
+            }
             if let Some(persist) = persist {
                 effects.insert(0, persist);
             }
@@ -9615,6 +9634,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             owner_turns: Vec::new(),
             created_at: 1,
             updated_at: 2,
+            last_owner_activity_at: None,
             owned_provider_sessions: Vec::new(),
         };
 
@@ -10282,7 +10302,11 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.session_id = Some("nakode-session-1".to_owned());
         state.client.editor.set_text("first");
         let first = state.submit_editor();
-        assert!(matches!(first.as_slice(), [Effect::Backend(_)]));
+        assert!(matches!(
+            first.as_slice(),
+            [Effect::RecordOwnerActivity(session_id), Effect::Backend(_)]
+                if session_id == "nakode-session-1"
+        ));
         state.handle_backend(BackendEvent::TurnAccepted {
             turn_id: "turn-1".to_owned(),
         });
@@ -10301,8 +10325,11 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert_eq!(state.queue.len(), 1);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::UpdateSessionLastTurn { session_id, .. }, Effect::Backend(_)]
-                if session_id == "nakode-session-1"
+            [
+                Effect::UpdateSessionLastTurn { session_id, .. },
+                Effect::RecordOwnerActivity(activity_session_id),
+                Effect::Backend(_)
+            ] if session_id == "nakode-session-1" && activity_session_id == session_id
         ));
     }
 
@@ -10827,6 +10854,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     #[test]
     fn steer_is_recorded_only_after_provider_acceptance() {
         let mut state = ready_state();
+        state.session_id = Some("nakode-session-1".to_owned());
         state.provider_session_id = Some("thread-1".to_owned());
         state.active_turn = Some(super::ActiveTurn {
             id: "turn-1".to_owned(),
@@ -10847,9 +10875,13 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .all(|entry| entry.kind != EntryKind::Steering)
         );
 
-        state.handle_backend(BackendEvent::SteerAccepted {
+        let activity = state.handle_backend(BackendEvent::SteerAccepted {
             turn_id: "turn-1".to_owned(),
         });
+        assert!(matches!(
+            activity.as_slice(),
+            [Effect::RecordOwnerActivity(session_id)] if session_id == "nakode-session-1"
+        ));
         assert!(
             state.transcript.entries().iter().any(|entry| {
                 entry.kind == EntryKind::Steering && entry.body == "focus on tests"
@@ -11177,8 +11209,11 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         });
         assert!(matches!(
             effects.as_slice(),
-            [Effect::UpdateSessionLastTurn { session_id, .. }, Effect::Backend(_)]
-                if session_id == "nakode-session-1"
+            [
+                Effect::UpdateSessionLastTurn { session_id, .. },
+                Effect::RecordOwnerActivity(activity_session_id),
+                Effect::Backend(_)
+            ] if session_id == "nakode-session-1" && activity_session_id == session_id
         ));
     }
 
@@ -12293,6 +12328,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             }],
             created_at: 1,
             updated_at: 2,
+            last_owner_activity_at: Some(2),
             owned_provider_sessions: Vec::new(),
         };
         assert!(matches!(
@@ -13043,6 +13079,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             }],
             created_at: 1,
             updated_at: 2,
+            last_owner_activity_at: Some(2),
             owned_provider_sessions: Vec::new(),
         };
         state.begin_resume(session.clone());
