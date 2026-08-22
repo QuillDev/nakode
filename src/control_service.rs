@@ -30,8 +30,8 @@ const ACTIVATION_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 const LIFECYCLE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(8);
 // A newly spawned service may bind its socket before its lifecycle task starts responding. Startup
 // polling must stay brief so one queued probe cannot consume the whole readiness retry budget.
-const SERVICE_START_PING_TIMEOUT: Duration = Duration::from_millis(250);
-const API_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const SERVICE_START_PING_TIMEOUT: Duration = Duration::from_millis(100);
+const API_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 const EXECUTABLE_IDENTITY_BUFFER_SIZE: usize = 1024 * 1024;
 const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
 const RESUME_ENVIRONMENT_KEYS: [&str; 2] = ["NAKODE_RESUME", "NAKO_AGENT_RESUME"];
