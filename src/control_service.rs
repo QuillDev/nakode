@@ -32,6 +32,7 @@ const LIFECYCLE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(8);
 // polling must stay brief so one queued probe cannot consume the whole readiness retry budget.
 const SERVICE_START_PING_TIMEOUT: Duration = Duration::from_millis(250);
 const API_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const EXECUTABLE_IDENTITY_BUFFER_SIZE: usize = 1024 * 1024;
 const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
 const RESUME_ENVIRONMENT_KEYS: [&str; 2] = ["NAKODE_RESUME", "NAKO_AGENT_RESUME"];
 const SERVICE_EXECUTABLE_IDENTITY_ENVIRONMENT: &str = "NAKODE_SERVICE_EXECUTABLE_IDENTITY";
@@ -848,7 +849,10 @@ pub(crate) fn executable_identity(path: &Path) -> Result<ExecutableIdentity, Con
             source,
         })?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 8 * 1024];
+    // Debug and instrumented builds can be hundreds of megabytes. Large buffered reads keep
+    // endpoint discovery bounded on slower CI and installation filesystems without changing the
+    // content identity contract.
+    let mut buffer = vec![0_u8; EXECUTABLE_IDENTITY_BUFFER_SIZE];
     loop {
         let read = file
             .read(&mut buffer)
