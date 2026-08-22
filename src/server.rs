@@ -965,7 +965,7 @@ impl ServerCore {
             })?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
-        engine.state_mut().install_skills(skills);
+        engine.state_mut().install_skill_snapshot(skills, None);
         engine
             .state_mut()
             .set_initial_client_instructions(initial_instructions)?;
@@ -1740,7 +1740,9 @@ impl ServerCore {
         })?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
-        engine.state_mut().install_skills(skills);
+        engine
+            .state_mut()
+            .install_skill_snapshot(skills, session.enabled_skill_ids.as_deref());
         // The workspace template may still carry the bootstrap provider/session identity. Reset that
         // clone before installing client-owned tools; restoration begins only after validation.
         let _discarded_template_effects = engine.state_mut().create_logical_session()?;
@@ -1762,10 +1764,27 @@ impl ServerCore {
                 .state_mut()
                 .configure_mcp_archetype_grants(archetype_grants);
         }
-        let effects = engine.state_mut().begin_resume(session.clone());
+        let mut effects = engine.state_mut().begin_resume(session.clone());
+        Self::persist_legacy_skill_snapshot(&session, &engine, &mut effects);
         let loaded_id = SessionId::from(session.id.clone());
         self.sessions_by_id.insert(loaded_id.clone(), engine);
         Ok(Self::accepted(Some(session.id), effects))
+    }
+
+    fn persist_legacy_skill_snapshot(
+        session: &SessionRecord,
+        engine: &ServiceEngine,
+        effects: &mut Vec<Effect>,
+    ) {
+        if session.enabled_skill_ids.is_none() {
+            effects.insert(
+                0,
+                Effect::PersistSessionSkillSnapshot {
+                    session_id: session.id.clone(),
+                    enabled_skill_ids: engine.state().enabled_skill_ids(),
+                },
+            );
+        }
     }
 
     fn validate_provider_tool_projection(
@@ -4552,6 +4571,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
 
@@ -5681,6 +5701,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let mut tools = dashboard_tools("DashboardRead", false);
@@ -5690,6 +5711,16 @@ mod tests {
         let (_, effects) = core
             .open_session_command(&restored_id, Some(tools.clone()))
             .expect("atomic restored open");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::state::Effect::PersistSessionSkillSnapshot {
+                    session_id,
+                    ..
+                } if session_id == restored_id.as_str()
+            )),
+            "legacy rows must be bound to an explicit snapshot on first resume: {effects:#?}"
+        );
         assert!(
             effects.iter().any(|effect| matches!(
                 effect,
@@ -5726,6 +5757,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: Some(Vec::new()),
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
@@ -5743,10 +5775,12 @@ mod tests {
         assert!(effects.iter().any(|effect| matches!(
             effect,
             crate::state::Effect::Backend(BackendCommand::ResumeSession {
+                enabled_skill_ids,
                 replace_builtin_tools: false,
                 allowed_builtin_tools: Some(allowed),
                 ..
-            }) if allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
+            }) if enabled_skill_ids.is_empty()
+                && allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
         )));
     }
 
@@ -5781,6 +5815,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
@@ -5910,6 +5945,7 @@ mod tests {
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let loaded_before_open = core.sessions_by_id.len();
@@ -5939,6 +5975,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
 
@@ -8056,6 +8093,7 @@ first_message = "Starting review"
             created_at: 0,
             updated_at: 0,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
 

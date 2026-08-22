@@ -83,6 +83,9 @@ pub struct SessionRecord {
     pub updated_at: i64,
     /// Latest accepted or terminal owner-turn boundary. Generic persistence touches never change it.
     pub last_owner_activity_at: Option<i64>,
+    /// Immutable stable skill identities authorized for this logical session. `None` is a legacy
+    /// row and defaults to all installed skills once; `Some([])` intentionally authorizes none.
+    pub enabled_skill_ids: Option<Vec<String>>,
     /// Additional provider-native resources owned by delegated runs beneath this session.
     pub owned_provider_sessions: Vec<(String, String)>,
 }
@@ -444,6 +447,7 @@ pub trait SessionRepository: Send + Sync {
             title,
             model,
             &ModelOptions::default(),
+            None,
         )
     }
     /// Creates a logical session using an identity assigned before provider work begins.
@@ -461,7 +465,20 @@ pub trait SessionRepository: Send + Sync {
         title: &str,
         model: Option<&str>,
         options: &ModelOptions,
+        enabled_skill_ids: Option<&[String]>,
     ) -> Result<SessionRecord, SessionError>;
+
+    /// Binds a legacy logical session to the stable skill identities resolved at first open.
+    ///
+    /// # Errors
+    /// Returns an error when the session is unknown or the snapshot cannot be persisted.
+    fn set_session_skill_snapshot(
+        &self,
+        _id: &str,
+        _enabled_skill_ids: &[String],
+    ) -> Result<(), SessionError> {
+        Ok(())
+    }
     /// Atomically replaces one logical session's primary provider-native resource while retaining
     /// the previous primary as owned history for restart cleanup and deletion.
     ///
@@ -778,6 +795,7 @@ impl SqliteSessionRepository {
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL,
                last_owner_activity_at INTEGER,
+               enabled_skill_ids_json TEXT,
                UNIQUE(provider, provider_session_id)
              );
              CREATE INDEX IF NOT EXISTS sessions_workspace_updated
@@ -1117,6 +1135,7 @@ impl SqliteSessionRepository {
             ("last_turn_outcome", "TEXT"),
             ("working_directory", "TEXT"),
             ("last_owner_activity_at", "INTEGER"),
+            ("enabled_skill_ids_json", "TEXT"),
         ] {
             if !session_columns.iter().any(|existing| existing == column) {
                 writeln!(
@@ -1386,6 +1405,16 @@ impl SqliteSessionRepository {
             }),
             _ => None,
         };
+        let enabled_skill_ids_json = row.get::<_, Option<String>>(17)?;
+        let enabled_skill_ids = enabled_skill_ids_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|source| SessionError::InvalidStoredJson {
+                    field: "sessions.enabled_skill_ids_json",
+                    source,
+                })
+            })
+            .transpose()
+            .map_err(|error| stored_session_conversion_error(17, error))?;
         Ok(SessionRecord {
             id: row.get(0)?,
             provider: row.get(1)?,
@@ -1403,6 +1432,7 @@ impl SqliteSessionRepository {
             created_at: row.get(13)?,
             updated_at: row.get(14)?,
             last_owner_activity_at: row.get(16)?,
+            enabled_skill_ids,
             owned_provider_sessions: Vec::new(),
         })
     }
@@ -1501,6 +1531,10 @@ fn save_session_bridge_on(
         ],
     )?;
     Ok(())
+}
+
+fn stored_session_conversion_error(column: usize, error: SessionError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(error))
 }
 
 fn stored_bridge_conversion_error(column: usize, error: SessionError) -> rusqlite::Error {
@@ -2136,7 +2170,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
@@ -2156,7 +2190,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let rows = statement.query_map([], Self::row)?;
@@ -2176,7 +2210,7 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
+                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json
                  FROM sessions WHERE id = ?1",
                 [id],
                 Self::row,
@@ -2189,7 +2223,7 @@ impl SessionRepository for SqliteSessionRepository {
         }
         let pattern = format!("{id}%");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json
              FROM sessions WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
         )?;
         let matches = statement
@@ -2218,6 +2252,7 @@ impl SessionRepository for SqliteSessionRepository {
         title: &str,
         model: Option<&str>,
         options: &ModelOptions,
+        enabled_skill_ids: Option<&[String]>,
     ) -> Result<SessionRecord, SessionError> {
         let now = unix_timestamp();
         let title = title.lines().next().unwrap_or("New session").trim();
@@ -2226,18 +2261,29 @@ impl SessionRepository for SqliteSessionRepository {
         } else {
             title
         };
+        let enabled_skill_ids_json = enabled_skill_ids
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|source| SessionError::InvalidStoredJson {
+                field: "sessions.enabled_skill_ids_json",
+                source,
+            })?;
         let connection = self
             .connection
             .lock()
             .expect("session database mutex poisoned");
         connection.execute(
             "INSERT INTO sessions
-             (id, provider, provider_session_id, workspace, working_directory, title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at, last_owner_activity_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)
+             (id, provider, provider_session_id, workspace, working_directory, title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at, last_owner_activity_at, enabled_skill_ids_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10, ?11)
              ON CONFLICT(provider, provider_session_id) DO UPDATE SET
                model = excluded.model,
                model_reasoning_effort = excluded.model_reasoning_effort,
                model_fast_mode = excluded.model_fast_mode,
+               enabled_skill_ids_json = COALESCE(
+                 sessions.enabled_skill_ids_json,
+                 excluded.enabled_skill_ids_json
+               ),
                updated_at = excluded.updated_at,
                last_owner_activity_at = MAX(
                  COALESCE(sessions.last_owner_activity_at, 0),
@@ -2253,15 +2299,49 @@ impl SessionRepository for SqliteSessionRepository {
                 model,
                 options.reasoning_effort,
                 i64::from(options.fast_mode),
-                now
+                now,
+                enabled_skill_ids_json,
             ],
         )?;
         connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
         ).map_err(Into::into)
+    }
+
+    fn set_session_skill_snapshot(
+        &self,
+        id: &str,
+        enabled_skill_ids: &[String],
+    ) -> Result<(), SessionError> {
+        let encoded = serde_json::to_string(enabled_skill_ids).map_err(|source| {
+            SessionError::InvalidStoredJson {
+                field: "sessions.enabled_skill_ids_json",
+                source,
+            }
+        })?;
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE sessions SET enabled_skill_ids_json = ?2
+             WHERE id = ?1 AND enabled_skill_ids_json IS NULL",
+            params![id, encoded],
+        )?;
+        if changed == 0 {
+            let exists = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(SessionError::SessionNotFound(id.to_owned()));
+            }
+        }
+        Ok(())
     }
 
     fn transition_primary(
@@ -3880,6 +3960,7 @@ mod tests {
             "Session",
             None,
             &ModelOptions::default(),
+            None,
         )?;
         assert_eq!(created.working_directory, "/explicit/repository");
         assert_eq!(
@@ -4341,6 +4422,14 @@ mod tests {
         assert_eq!(restored.created_at, 10);
         assert_eq!(restored.updated_at, 12);
         assert_eq!(restored.last_owner_activity_at, None);
+        assert_eq!(restored.enabled_skill_ids, None);
+
+        store.set_session_skill_snapshot("legacy", &[])?;
+        drop(store);
+        let upgraded = SqliteSessionRepository::open(&database)?
+            .find("legacy")?
+            .expect("upgraded legacy row");
+        assert_eq!(upgraded.enabled_skill_ids, Some(Vec::new()));
         Ok(())
     }
 
@@ -4486,6 +4575,47 @@ mod tests {
     }
 
     #[test]
+    fn session_skill_snapshot_preserves_all_enabled_identities_across_restart()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("session-skills.db");
+        let store = SqliteSessionRepository::open(&path)?;
+        let enabled = vec!["stable.review".to_owned(), "stable.testing".to_owned()];
+        let created = store.create_with_id(
+            "logical-session",
+            CODEX_PROVIDER,
+            "provider-session",
+            "/tmp/project",
+            "/tmp/project",
+            "Skills",
+            None,
+            &ModelOptions::default(),
+            Some(&enabled),
+        )?;
+        assert_eq!(
+            created.enabled_skill_ids.as_deref(),
+            Some(enabled.as_slice())
+        );
+        store.set_session_skill_snapshot("logical-session", &[])?;
+        assert_eq!(
+            store
+                .find("logical-session")?
+                .expect("already snapshotted session")
+                .enabled_skill_ids
+                .as_deref(),
+            Some(enabled.as_slice()),
+            "legacy migration must not overwrite an explicit snapshot"
+        );
+        drop(store);
+
+        let restored = SqliteSessionRepository::open(path)?
+            .find("logical-session")?
+            .expect("restored session");
+        assert_eq!(restored.enabled_skill_ids, Some(enabled));
+        Ok(())
+    }
+
+    #[test]
     fn persists_independent_profile_skill_preferences_across_restart() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("skills.db");
@@ -4504,13 +4634,38 @@ mod tests {
             last_description: "Reviews changes".to_owned(),
             enabled: true,
         })?;
+        store.set_skill_preference(&SkillPreference {
+            profile_id: "profile-a".to_owned(),
+            skill_id: "stable.testing".to_owned(),
+            last_name: "Testing".to_owned(),
+            last_description: "Runs tests".to_owned(),
+            enabled: false,
+        })?;
+        store.set_skill_preference(&SkillPreference {
+            profile_id: "profile-a".to_owned(),
+            skill_id: "stable.review".to_owned(),
+            last_name: "Review".to_owned(),
+            last_description: "Reviews changes".to_owned(),
+            enabled: true,
+        })?;
         drop(store);
 
         let restored = SqliteSessionRepository::open(path)?;
         let profile_a = restored.list_skill_preferences("profile-a")?;
         let profile_b = restored.list_skill_preferences("profile-b")?;
-        assert_eq!(profile_a.len(), 1);
-        assert!(!profile_a[0].enabled);
+        assert_eq!(profile_a.len(), 2);
+        assert!(
+            profile_a
+                .iter()
+                .find(|preference| preference.skill_id == "stable.review")
+                .is_some_and(|preference| preference.enabled)
+        );
+        assert!(
+            profile_a
+                .iter()
+                .find(|preference| preference.skill_id == "stable.testing")
+                .is_some_and(|preference| !preference.enabled)
+        );
         assert_eq!(profile_b.len(), 1);
         assert!(profile_b[0].enabled);
         assert!(

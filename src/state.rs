@@ -1078,6 +1078,10 @@ pub enum Effect {
         model: Option<String>,
         options: ModelOptions,
     },
+    PersistSessionSkillSnapshot {
+        session_id: String,
+        enabled_skill_ids: Vec<String>,
+    },
     PersistModels {
         provider: String,
         models: Vec<ModelInfo>,
@@ -1222,6 +1226,9 @@ pub struct DomainState {
     initial_model: Option<String>,
     agents: AgentCatalog,
     skills: SkillCatalog,
+    /// Immutable stable identities authorized when this logical session was created or first
+    /// reconciled from a pre-snapshot legacy record. `Some([])` intentionally authorizes none.
+    enabled_skill_ids: Option<Vec<String>>,
     prompt_addenda: PromptAddenda,
     initial_client_instructions: Option<String>,
     agent_directory: PathBuf,
@@ -1346,7 +1353,7 @@ impl DomainState {
         self.default_model_options
             .clone_from(&source.default_model_options);
         self.agents.clone_from(&source.agents);
-        self.skills.clone_from(&source.skills);
+        self.install_skills(source.skills.clone());
         // Prompt addenda are a logical-session instruction snapshot. Never propagate a
         // workspace reload into sessions that have already started: later delegated
         // provider sessions must retain their owner's original instructions too.
@@ -1973,6 +1980,7 @@ impl DomainState {
             initial_model,
             agents: AgentCatalog::default(),
             skills: SkillCatalog::default(),
+            enabled_skill_ids: None,
             prompt_addenda: PromptAddenda::default(),
             initial_client_instructions: None,
             agent_directory: PathBuf::from(".nakode/agents"),
@@ -2028,7 +2036,28 @@ impl DomainState {
     }
 
     pub fn install_skills(&mut self, skills: SkillCatalog) {
-        self.skills = skills;
+        self.skills = match &self.enabled_skill_ids {
+            Some(enabled) => skills.into_only_ids(enabled),
+            None => skills,
+        };
+    }
+
+    /// Installs the immutable skill authority for one logical session. A missing legacy snapshot
+    /// defaults to all currently installed skills exactly once; the caller durably records the
+    /// resulting IDs so later resumes and restarts cannot silently expand authority.
+    pub fn install_skill_snapshot(
+        &mut self,
+        skills: SkillCatalog,
+        enabled_skill_ids: Option<&[String]>,
+    ) {
+        let enabled = enabled_skill_ids.map_or_else(|| skills.stable_ids(), <[String]>::to_vec);
+        self.skills = skills.into_only_ids(&enabled);
+        self.enabled_skill_ids = Some(enabled);
+    }
+
+    #[must_use]
+    pub fn enabled_skill_ids(&self) -> Vec<String> {
+        self.enabled_skill_ids.clone().unwrap_or_default()
     }
 
     pub fn configuration_reloaded(
@@ -3265,6 +3294,7 @@ impl DomainState {
         effects.push(Effect::Backend(BackendCommand::ResumeSession {
             provider_session_id: session.provider_session_id,
             owner_session_id: Some(self.nakode_session_id.clone()),
+            enabled_skill_ids: self.enabled_skill_ids(),
             external_tools: self.provider_external_tools(),
             replace_builtin_tools: self.replace_builtin_tools,
             allowed_builtin_tools: self.allowed_builtin_tools.clone(),
@@ -6764,6 +6794,7 @@ impl DomainState {
                 instructions: Some(self.nakode_system_instructions()),
                 owner_session_id: Some(self.nakode_session_id.clone()),
                 parent_run_id: None,
+                enabled_skill_ids: self.enabled_skill_ids(),
                 external_tools: self.provider_external_tools(),
                 replace_builtin_tools: self.replace_builtin_tools,
                 allowed_builtin_tools: self.allowed_builtin_tools.clone(),
@@ -8341,6 +8372,7 @@ impl DomainState {
                 instructions,
                 owner_session_id: Some(self.nakode_session_id.clone()),
                 parent_run_id: Some(run_id.to_owned()),
+                enabled_skill_ids: self.enabled_skill_ids(),
                 external_tools,
                 replace_builtin_tools,
                 allowed_builtin_tools,
@@ -9430,6 +9462,49 @@ mod tests {
     }
 
     #[test]
+    fn session_skill_snapshot_drives_catalogue_start_projection_and_reload() {
+        let workspace = tempdir().expect("skill workspace");
+        for (directory_name, id, description) in [
+            ("review", "stable.review", "Review code"),
+            ("testing", "stable.testing", "Run tests"),
+        ] {
+            let directory = workspace.path().join(".agents/skills").join(directory_name);
+            fs::create_dir_all(&directory).expect("skill directory");
+            fs::write(
+                directory.join("SKILL.md"),
+                format!(
+                    "---\nid: {id}\nname: {directory_name}\ndescription: {description}\n---\n\nFull instructions.\n"
+                ),
+            )
+            .expect("skill definition");
+        }
+        let catalogue = SkillCatalog::load(workspace.path()).expect("skill catalogue");
+        let mut state = ready_state();
+        state.install_skill_snapshot(catalogue.clone(), Some(&["stable.review".to_owned()]));
+
+        let rendered = state.rendered_skill_catalogue();
+        assert!(rendered.contains("read_skill({\"name\":\"review\"})"));
+        assert!(!rendered.contains("read_skill({\"name\":\"testing\"})"));
+
+        // A workspace/service reload discovers all installed skills but must retain the logical
+        // session's immutable stable-ID authority rather than re-advertising disabled entries.
+        state.install_skills(catalogue);
+        assert_eq!(state.enabled_skill_ids(), ["stable.review"]);
+        assert!(!state.rendered_skill_catalogue().contains("testing"));
+
+        let effects = state
+            .submit_prompt("inspect".to_owned(), Vec::new())
+            .expect("first prompt");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(BackendCommand::StartSession {
+                enabled_skill_ids,
+                ..
+            })] if enabled_skill_ids == &["stable.review".to_owned()]
+        ));
+    }
+
+    #[test]
     fn primary_system_instructions_include_model_personality_and_soul() {
         let directory = tempdir().expect("config directory");
         let personalities = directory.path().join("personalities.toml");
@@ -9664,6 +9739,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         };
 
@@ -12366,6 +12442,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         };
         assert!(matches!(
@@ -13117,6 +13194,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         };
         state.begin_resume(session.clone());

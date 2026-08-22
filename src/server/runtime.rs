@@ -2624,6 +2624,7 @@ impl EffectExecutor {
             #[cfg(test)]
             Effect::ResolveSession(id) => resolve_session(state, sessions, pending, &id),
             persistence_effect @ (Effect::PersistSession { .. }
+            | Effect::PersistSessionSkillSnapshot { .. }
             | Effect::PersistSessionBridge(_)
             | Effect::PersistModels { .. }
             | Effect::SetDefaultModel { .. }
@@ -2843,6 +2844,15 @@ fn execute_persistence_effect(
             model.as_deref(),
             &options,
         ),
+        Effect::PersistSessionSkillSnapshot {
+            session_id,
+            enabled_skill_ids,
+        } => {
+            if let Err(error) = sessions.set_session_skill_snapshot(&session_id, &enabled_skill_ids)
+            {
+                state.session_store_failed(error.to_string());
+            }
+        }
         Effect::PersistModels { provider, models } => {
             persist_models(state, sessions, &provider, &models);
         }
@@ -2910,6 +2920,7 @@ fn persist_session(
     model: Option<&str>,
     options: &crate::backend::ModelOptions,
 ) {
+    let enabled_skill_ids = state.enabled_skill_ids();
     match sessions.create_with_id(
         &state.nakode_session_id,
         provider,
@@ -2919,6 +2930,7 @@ fn persist_session(
         title,
         model,
         options,
+        Some(&enabled_skill_ids),
     ) {
         Ok(record) => state.session_persisted(&record),
         Err(error) => state.session_store_failed(error.to_string()),
@@ -5019,6 +5031,7 @@ mod tests {
                     timeout_seconds: None,
                     owner_session_id: None,
                     parent_run_id: None,
+                    enabled_skill_ids: Vec::new(),
                 },
             )
             .await
@@ -5072,6 +5085,7 @@ mod tests {
                     timeout_seconds: None,
                     owner_session_id: None,
                     parent_run_id: None,
+                    enabled_skill_ids: Vec::new(),
                 },
             )
             .await
@@ -5092,6 +5106,7 @@ mod tests {
                     timeout_seconds: None,
                     owner_session_id: None,
                     parent_run_id: None,
+                    enabled_skill_ids: Vec::new(),
                 },
             )
             .await
