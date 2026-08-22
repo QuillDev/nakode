@@ -423,6 +423,7 @@ mod tests {
             external_tool_calls: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            last_owner_activity_at_ms: 0,
         }
     }
 

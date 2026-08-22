@@ -81,6 +81,8 @@ pub struct SessionRecord {
     pub created_at: i64,
     /// Unix epoch seconds at the latest persistence touch; converted exactly once at API projection.
     pub updated_at: i64,
+    /// Latest accepted or terminal owner-turn boundary. Generic persistence touches never change it.
+    pub last_owner_activity_at: Option<i64>,
     /// Additional provider-native resources owned by delegated runs beneath this session.
     pub owned_provider_sessions: Vec<(String, String)>,
 }
@@ -466,7 +468,12 @@ pub trait SessionRepository: Send + Sync {
         model: Option<&str>,
         options: &ModelOptions,
     ) -> Result<(), SessionError>;
-    /// Persists immutable attribution for the latest terminal owner turn.
+    /// Records an accepted owner activity without allowing an older observation to move it backward.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
+    fn record_owner_activity(&self, id: &str) -> Result<(), SessionError>;
+    /// Persists immutable attribution for the latest terminal owner turn and its activity boundary.
     ///
     /// # Errors
     /// Returns an error when persistence cannot be updated.
@@ -719,6 +726,7 @@ impl SqliteSessionRepository {
                last_turn_outcome TEXT,
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL,
+               last_owner_activity_at INTEGER,
                UNIQUE(provider, provider_session_id)
              );
              CREATE INDEX IF NOT EXISTS sessions_workspace_updated
@@ -1051,6 +1059,7 @@ impl SqliteSessionRepository {
             ("last_turn_fast_mode", "INTEGER NOT NULL DEFAULT 0"),
             ("last_turn_outcome", "TEXT"),
             ("working_directory", "TEXT"),
+            ("last_owner_activity_at", "INTEGER"),
         ] {
             if !session_columns.iter().any(|existing| existing == column) {
                 writeln!(
@@ -1330,6 +1339,7 @@ impl SqliteSessionRepository {
             owner_turns: Vec::new(),
             created_at: row.get(13)?,
             updated_at: row.get(14)?,
+            last_owner_activity_at: row.get(16)?,
             owned_provider_sessions: Vec::new(),
         })
     }
@@ -1945,7 +1955,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
@@ -1965,7 +1975,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let rows = statement.query_map([], Self::row)?;
@@ -1985,7 +1995,7 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
+                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
                  FROM sessions WHERE id = ?1",
                 [id],
                 Self::row,
@@ -1998,7 +2008,7 @@ impl SessionRepository for SqliteSessionRepository {
         }
         let pattern = format!("{id}%");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
              FROM sessions WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 2",
         )?;
         let matches = statement
@@ -2041,13 +2051,17 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         connection.execute(
             "INSERT INTO sessions
-             (id, provider, provider_session_id, workspace, working_directory, title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+             (id, provider, provider_session_id, workspace, working_directory, title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at, last_owner_activity_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)
              ON CONFLICT(provider, provider_session_id) DO UPDATE SET
                model = excluded.model,
                model_reasoning_effort = excluded.model_reasoning_effort,
                model_fast_mode = excluded.model_fast_mode,
-               updated_at = excluded.updated_at",
+               updated_at = excluded.updated_at,
+               last_owner_activity_at = MAX(
+                 COALESCE(sessions.last_owner_activity_at, 0),
+                 excluded.last_owner_activity_at
+               )",
             params![
                 id,
                 provider,
@@ -2062,7 +2076,7 @@ impl SessionRepository for SqliteSessionRepository {
             ],
         )?;
         connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace)
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -2229,6 +2243,27 @@ impl SessionRepository for SqliteSessionRepository {
         Ok(())
     }
 
+    fn record_owner_activity(&self, id: &str) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let observed_at = unix_timestamp();
+        let updated = connection.execute(
+            "UPDATE sessions
+             SET last_owner_activity_at = MAX(
+               COALESCE(last_owner_activity_at, 0),
+               ?1
+             )
+             WHERE id = ?2",
+            params![observed_at, id],
+        )?;
+        if updated == 0 {
+            return Err(SessionError::SessionNotFound(id.to_owned()));
+        }
+        Ok(())
+    }
+
     fn update_last_turn(
         &self,
         id: &str,
@@ -2239,6 +2274,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let transaction = connection.transaction()?;
+        let observed_at = unix_timestamp();
         let (outcome, outcome_code) = match turn.outcome {
             TurnOutcome::Completed => ("completed", 1_i64),
             TurnOutcome::Interrupted => ("interrupted", 2_i64),
@@ -2247,7 +2283,8 @@ impl SessionRepository for SqliteSessionRepository {
         let updated = transaction.execute(
             "UPDATE sessions
              SET last_turn_id = ?1, last_turn_model = ?2, last_turn_reasoning_effort = ?3,
-                 last_turn_fast_mode = ?4, last_turn_outcome = ?5, updated_at = ?6
+                 last_turn_fast_mode = ?4, last_turn_outcome = ?5, updated_at = ?6,
+                 last_owner_activity_at = MAX(COALESCE(last_owner_activity_at, 0), ?6)
              WHERE id = ?7",
             params![
                 turn.id,
@@ -2255,7 +2292,7 @@ impl SessionRepository for SqliteSessionRepository {
                 turn.options.reasoning_effort,
                 i64::from(turn.options.fast_mode),
                 outcome,
-                unix_timestamp(),
+                observed_at,
                 id
             ],
         )?;
@@ -4080,6 +4117,87 @@ mod tests {
 
         assert!(store.save_session_bridges(&[first, second]).is_err());
         assert!(store.list_session_bridges("/tmp/project")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn owner_activity_is_monotonic_and_generic_touch_does_not_change_it() -> Result<(), SessionError>
+    {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("activity.db"))?;
+        let session = store.create(
+            CODEX_PROVIDER,
+            "provider-activity",
+            "/tmp/project",
+            "Initial owner prompt",
+            Some("model-a"),
+        )?;
+        {
+            let connection = store.connection.lock().expect("database mutex");
+            connection.execute(
+                "UPDATE sessions SET updated_at = 1, last_owner_activity_at = 4000000000 WHERE id = ?1",
+                [&session.id],
+            )?;
+        }
+
+        store.touch(&session.id)?;
+        store.record_owner_activity(&session.id)?;
+        let turn = PersistedTurnConfiguration {
+            id: "turn-terminal".to_owned(),
+            model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
+            outcome: TurnOutcome::Completed,
+        };
+        store.update_last_turn(&session.id, &turn)?;
+        let future = store.find(&session.id)?.expect("session");
+        assert!(future.updated_at > 1);
+        assert_eq!(future.last_owner_activity_at, Some(4_000_000_000));
+
+        store.connection.lock().expect("database mutex").execute(
+            "UPDATE sessions SET last_owner_activity_at = NULL WHERE id = ?1",
+            [&session.id],
+        )?;
+        store.record_owner_activity(&session.id)?;
+        assert!(
+            store
+                .find(&session.id)?
+                .expect("recorded activity")
+                .last_owner_activity_at
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_session_schema_adds_nullable_owner_activity_without_data_loss()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("legacy-activity.db");
+        let legacy = Connection::open(&database)?;
+        legacy.execute_batch(
+            "CREATE TABLE sessions (
+               id TEXT PRIMARY KEY,
+               provider TEXT NOT NULL,
+               provider_session_id TEXT NOT NULL,
+               workspace TEXT NOT NULL,
+               title TEXT NOT NULL,
+               model TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               UNIQUE(provider, provider_session_id)
+             );
+             INSERT INTO sessions
+               (id, provider, provider_session_id, workspace, title, model, created_at, updated_at)
+             VALUES
+               ('legacy', 'openai-codex', 'native', '/tmp/project', 'Legacy', NULL, 10, 12);",
+        )?;
+        drop(legacy);
+
+        let store = SqliteSessionRepository::open(&database)?;
+        let restored = store.find("legacy")?.expect("legacy row");
+        assert_eq!(restored.created_at, 10);
+        assert_eq!(restored.updated_at, 12);
+        assert_eq!(restored.last_owner_activity_at, None);
         Ok(())
     }
 

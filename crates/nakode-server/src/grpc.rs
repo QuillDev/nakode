@@ -2159,6 +2159,7 @@ pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSu
         active_model_id: value.active_model_id.map(|id| id.to_string()),
         updated_at_ms: value.updated_at_ms,
         created_at_ms: value.created_at_ms,
+        last_owner_activity_at_ms: value.last_owner_activity_at_ms,
         owned_provider_sessions: value
             .owned_provider_sessions
             .into_iter()
@@ -2210,6 +2211,7 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
             .collect(),
         created_at_ms: value.created_at_ms,
         updated_at_ms: value.updated_at_ms,
+        last_owner_activity_at_ms: value.last_owner_activity_at_ms,
     }
 }
 

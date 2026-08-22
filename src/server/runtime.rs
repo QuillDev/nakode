@@ -2627,6 +2627,7 @@ impl EffectExecutor {
             | Effect::UpdateSessionModel { .. }
             | Effect::TransitionSessionPrimary { .. }
             | Effect::UpdateSessionLastTurn { .. }
+            | Effect::RecordOwnerActivity(_)
             | Effect::TouchSession(_)
             | Effect::DeleteSession(_)) => {
                 execute_persistence_effect(state, sessions, persistence_effect);
@@ -2875,6 +2876,7 @@ fn execute_persistence_effect(
         Effect::UpdateSessionLastTurn { session_id, turn } => {
             update_session_last_turn(state, sessions, &session_id, &turn);
         }
+        Effect::RecordOwnerActivity(id) => record_owner_activity(state, sessions, &id),
         Effect::TouchSession(id) => touch_session(state, sessions, &id),
         Effect::PersistSessionBridge(bridge) => {
             if let Err(error) = sessions.save_session_bridge(&bridge) {
@@ -3230,6 +3232,12 @@ fn install_changed_agent_catalog(
             state.set_status(success_message);
         }
         Err(error) => state.session_store_failed(error.to_string()),
+    }
+}
+
+fn record_owner_activity(state: &mut DomainState, sessions: &dyn SessionRepository, id: &str) {
+    if let Err(error) = sessions.record_owner_activity(id) {
+        state.session_store_failed(error.to_string());
     }
 }
 
