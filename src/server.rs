@@ -417,6 +417,10 @@ impl ServerCore {
         &self.providers
     }
 
+    pub(crate) fn configured_vision_model_provider(&self) -> Option<&str> {
+        self.session_template.configured_vision_model_provider()
+    }
+
     pub(crate) fn replace_session_records(&mut self, sessions: Vec<SessionRecord>) {
         self.sessions = sessions;
     }

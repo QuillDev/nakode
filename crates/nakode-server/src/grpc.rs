@@ -2113,6 +2113,24 @@ fn settings(value: protocol::SettingsView) -> api::Settings {
         }),
         vision: Some(api::VisionSettings {
             model_id: value.vision.model_id.map(|id| id.to_string()),
+            availability: match value.vision.availability {
+                protocol::VisionAvailabilityView::Unknown => api::VisionAvailability::Unspecified,
+                protocol::VisionAvailabilityView::Disabled => api::VisionAvailability::Disabled,
+                protocol::VisionAvailabilityView::Ready => api::VisionAvailability::Ready,
+                protocol::VisionAvailabilityView::ModelUnavailable => {
+                    api::VisionAvailability::ModelUnavailable
+                }
+                protocol::VisionAvailabilityView::ModelUnsupported => {
+                    api::VisionAvailability::ModelUnsupported
+                }
+                protocol::VisionAvailabilityView::ProviderUnavailable => {
+                    api::VisionAvailability::ProviderUnavailable
+                }
+                protocol::VisionAvailabilityView::ServiceUnavailable => {
+                    api::VisionAvailability::ServiceUnavailable
+                }
+            } as i32,
+            diagnostic: value.vision.diagnostic,
         }),
         terminal_images: match value.terminal_images {
             protocol::TerminalImageModeView::Auto => api::TerminalImageMode::Auto as i32,

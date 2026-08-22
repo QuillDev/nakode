@@ -725,7 +725,20 @@ message Skill {
 message WebSettings { string backend = 1; bool credential_configured = 2; AgentBrowser agent_browser = 3; }
 message AgentBrowser { enum State { STATE_UNSPECIFIED = 0; STATE_CHECKING = 1; STATE_AVAILABLE = 2; STATE_UNAVAILABLE = 3; } State state = 1; optional string version = 2; }
 message MemorySettings { string backend = 1; string executable = 2; string global_bank = 3; string data_directory = 4; bool configured = 5; bool available = 6; }
-message VisionSettings { optional string model_id = 1; }
+enum VisionAvailability {
+  VISION_AVAILABILITY_UNSPECIFIED = 0;
+  VISION_AVAILABILITY_DISABLED = 1;
+  VISION_AVAILABILITY_READY = 2;
+  VISION_AVAILABILITY_MODEL_UNAVAILABLE = 3;
+  VISION_AVAILABILITY_MODEL_UNSUPPORTED = 4;
+  VISION_AVAILABILITY_PROVIDER_UNAVAILABLE = 5;
+  VISION_AVAILABILITY_SERVICE_UNAVAILABLE = 6;
+}
+message VisionSettings {
+  optional string model_id = 1;
+  VisionAvailability availability = 2;
+  string diagnostic = 3;
+}
 enum TerminalImageMode { TERMINAL_IMAGE_MODE_UNSPECIFIED = 0; TERMINAL_IMAGE_MODE_AUTO = 1; TERMINAL_IMAGE_MODE_ON = 2; TERMINAL_IMAGE_MODE_OFF = 3; }
 message Settings {
   WebSettings web = 1;
