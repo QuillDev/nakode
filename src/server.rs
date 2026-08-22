@@ -715,6 +715,10 @@ impl ServerCore {
                 parent_run_id,
             } => self.delegate_command(&session_id, &agent_slug, &task, parent_run_id.as_ref()),
             Command::CancelRun { run_id } => self.cancel_run_command(&run_id),
+            Command::ContinueRun {
+                run_id,
+                additional_turns,
+            } => self.continue_run_command(&run_id, additional_turns),
             Command::RunShell {
                 session_id,
                 command,
@@ -2003,6 +2007,19 @@ impl ServerCore {
             .state_mut()
             .cancel_run(run_id.as_str())?;
         Ok(Self::accepted(Some(run_id.to_string()), effects))
+    }
+
+    fn continue_run_command(
+        &mut self,
+        run_id: &RunId,
+        additional_turns: u32,
+    ) -> DomainCommandOutcome {
+        let session_id = self.session_for_run(run_id)?;
+        let (successor_run_id, effects) = self
+            .session_engine_mut(&session_id)?
+            .state_mut()
+            .continue_subagent(run_id.as_str(), additional_turns)?;
+        Ok(Self::accepted(Some(successor_run_id), effects))
     }
 
     fn run_shell_command(
@@ -3453,7 +3470,9 @@ impl ServerCore {
             Command::ResolveInteraction { interaction_id, .. } => {
                 self.session_for_interaction(interaction_id).ok()
             }
-            Command::CancelRun { run_id } => self.session_for_run(run_id).ok(),
+            Command::CancelRun { run_id } | Command::ContinueRun { run_id, .. } => {
+                self.session_for_run(run_id).ok()
+            }
             Command::CreateSession { .. }
             | Command::SetWorkspaceBridgeLifecycle { .. }
             | Command::SelectModel { .. }
@@ -7077,7 +7096,7 @@ first_message = "Starting review"
     fn list_runs_pages_every_omitted_run_with_an_exclusive_cursor() {
         let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
         let session_id = SessionId::from(state.nakode_session_id.clone());
-        state.install_subagents(
+        let _ = state.install_subagents(
             (0..130)
                 .map(|index| SubagentRecord {
                     parent_session_id: session_id.to_string(),
@@ -7136,7 +7155,7 @@ first_message = "Starting review"
         let objective = "objective-é".repeat(MAX_RUN_TEXT_BYTES / 4);
         let latest_activity = "activity-🦀".repeat(MAX_RUN_TEXT_BYTES / 4);
         let result = "result-λ".repeat(MAX_RUN_TEXT_BYTES / 4);
-        state.install_subagents(vec![SubagentRecord {
+        let _ = state.install_subagents(vec![SubagentRecord {
             parent_session_id: session_id.to_string(),
             id: "run-long-text".to_owned(),
             agent: "reviewer".to_owned(),
@@ -7193,7 +7212,7 @@ first_message = "Starting review"
     fn run_transcript_pages_recover_every_older_entry() {
         let mut state = AppState::new_unconfigured("/tmp/project", None, 500);
         let session_id = SessionId::from(state.nakode_session_id.clone());
-        state.install_subagents(vec![SubagentRecord {
+        let _ = state.install_subagents(vec![SubagentRecord {
             parent_session_id: session_id.to_string(),
             id: "run-history".to_owned(),
             agent: "reviewer".to_owned(),
@@ -7428,7 +7447,7 @@ first_message = "Starting review"
     async fn run_subscriptions_receive_bounded_run_deltas_directly() {
         let mut state = AppState::new_unconfigured("/tmp/project", None, 5_000);
         let session_id = SessionId::from(state.nakode_session_id.clone());
-        state.install_subagents(vec![SubagentRecord {
+        let _ = state.install_subagents(vec![SubagentRecord {
             parent_session_id: session_id.to_string(),
             id: "run-stream".to_owned(),
             agent: "reviewer".to_owned(),

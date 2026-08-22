@@ -87,6 +87,7 @@ service NakodeService {
   rpc GetRun(GetRunRequest) returns (RunSnapshot);
   rpc WatchRun(WatchRunRequest) returns (stream RunSnapshot);
   rpc CancelRun(CancelRunRequest) returns (MutationResult);
+  rpc ContinueRun(ContinueRunRequest) returns (MutationResult);
 
   rpc GetTranscriptPage(GetTranscriptPageRequest) returns (TranscriptPage);
   rpc GetTranscriptBodyWindow(GetTranscriptBodyWindowRequest) returns (TranscriptBodyWindow);
@@ -569,6 +570,7 @@ message GetRunRequest { string run_id = 1; }
 message WatchRunRequest { string run_id = 1; optional Cursor after = 2; }
 message RunSnapshot { Cursor cursor = 1; RunState state = 2; }
 message CancelRunRequest { MutationOptions mutation = 1; string run_id = 2; }
+message ContinueRunRequest { MutationOptions mutation = 1; string run_id = 2; uint32 additional_turns = 3; }
 
 enum TranscriptOwnerKind { TRANSCRIPT_OWNER_KIND_UNSPECIFIED = 0; TRANSCRIPT_OWNER_KIND_SESSION = 1; TRANSCRIPT_OWNER_KIND_RUN = 2; }
 message GetTranscriptPageRequest { TranscriptOwnerKind owner_kind = 1; string owner_id = 2; optional string before_entry_id = 3; uint32 limit = 4; }
@@ -886,8 +888,8 @@ message TodoPhase { string name = 1; repeated TodoItem tasks = 2; }
 enum NoticeLevel { NOTICE_LEVEL_UNSPECIFIED = 0; NOTICE_LEVEL_INFO = 1; NOTICE_LEVEL_WARNING = 2; NOTICE_LEVEL_ERROR = 3; }
 message Notice { string id = 1; NoticeLevel level = 2; string message = 3; }
 
-enum RunStatus { RUN_STATUS_UNSPECIFIED = 0; RUN_STATUS_STARTING = 1; RUN_STATUS_WORKING = 2; RUN_STATUS_COMPLETED = 3; RUN_STATUS_INTERRUPTED = 4; RUN_STATUS_FAILED = 5; }
-message RunOutcome { enum Kind { KIND_UNSPECIFIED = 0; KIND_COMPLETED = 1; KIND_FAILED = 2; KIND_INTERRUPTED = 3; } Kind kind = 1; string body = 2; }
+enum RunStatus { RUN_STATUS_UNSPECIFIED = 0; RUN_STATUS_STARTING = 1; RUN_STATUS_WORKING = 2; RUN_STATUS_COMPLETED = 3; RUN_STATUS_INTERRUPTED = 4; RUN_STATUS_FAILED = 5; RUN_STATUS_PARTIAL = 6; }
+message RunOutcome { enum Kind { KIND_UNSPECIFIED = 0; KIND_COMPLETED = 1; KIND_FAILED = 2; KIND_INTERRUPTED = 3; KIND_PARTIAL = 4; } Kind kind = 1; string body = 2; }
 message RunPolicy {
   repeated string allowed_capabilities = 1;
   repeated string denied_capabilities = 2;
@@ -917,6 +919,33 @@ message RunToolDenial {
   uint64 tool_total_bytes = 5;
   uint64 reason_start_byte = 6;
   uint64 reason_total_bytes = 7;
+}
+message SalvagedEvidence {
+  string entry_id = 1;
+  string title = 2;
+  string body = 3;
+  bool truncated = 4;
+}
+message ContinuationProposition {
+  repeated string verified_findings = 1;
+  string unresolved_boundary = 2;
+  string why_it_matters = 3;
+  string recommended_archetype = 4;
+  string follow_up_objective = 5;
+  repeated string inherited_evidence = 6;
+  bool can_proceed_independently = 7;
+}
+message RunSalvage {
+  string terminal_reason = 1;
+  string original_objective = 2;
+  repeated string completed_work = 3;
+  repeated SalvagedEvidence verified_evidence = 4;
+  optional SalvagedEvidence last_successful_evidence = 5;
+  repeated string unresolved_questions = 6;
+  ContinuationProposition continuation = 7;
+  bool can_resume = 8;
+  bool redacted = 9;
+  bool truncated = 10;
 }
 message RunState {
   string id = 1;
@@ -952,6 +981,12 @@ message RunState {
   RunPolicy policy = 31;
   repeated RunToolDenial tool_denials = 32;
   uint32 tool_denials_retained_total = 33;
+  optional RunSalvage salvage = 34;
+  optional string continued_from_run_id = 35;
+  optional string continued_by_run_id = 36;
+  uint32 continuation_depth = 37;
+  optional uint32 additional_turns = 38;
+  repeated SalvagedEvidence inherited_evidence = 39;
 }
 message RunTextWindow { string run_id = 1; RunTextField field = 2; string text = 3; uint64 start_byte = 4; uint64 total_bytes = 5; bool has_earlier = 6; }
 message Artifact { string id = 1; string label = 2; string media_type = 3; uint64 byte_length = 4; bytes data = 5; }

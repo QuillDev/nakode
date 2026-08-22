@@ -470,6 +470,7 @@ pub enum RunStatus {
     Starting,
     Working,
     Completed,
+    Partial,
     Interrupted,
     Failed,
 }
@@ -478,6 +479,7 @@ pub enum RunStatus {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RunOutcome {
     Completed { body: String },
+    Partial { body: String },
     Failed { reason: String },
     Interrupted { reason: String },
 }
@@ -529,6 +531,39 @@ pub struct RunToolDenialView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SalvagedEvidenceView {
+    pub entry_id: String,
+    pub title: String,
+    pub body: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContinuationPropositionView {
+    pub verified_findings: Vec<String>,
+    pub unresolved_boundary: String,
+    pub why_it_matters: String,
+    pub recommended_archetype: String,
+    pub follow_up_objective: String,
+    pub inherited_evidence: Vec<String>,
+    pub can_proceed_independently: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunSalvageView {
+    pub terminal_reason: String,
+    pub original_objective: String,
+    pub completed_work: Vec<String>,
+    pub verified_evidence: Vec<SalvagedEvidenceView>,
+    pub last_successful_evidence: Option<SalvagedEvidenceView>,
+    pub unresolved_questions: Vec<String>,
+    pub continuation: ContinuationPropositionView,
+    pub can_resume: bool,
+    pub redacted: bool,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunView {
     pub id: RunId,
     #[serde(default)]
@@ -558,6 +593,18 @@ pub struct RunView {
     pub policy: RunPolicyView,
     #[serde(default)]
     pub tool_denials: Vec<RunToolDenialView>,
+    #[serde(default)]
+    pub salvage: Option<RunSalvageView>,
+    #[serde(default)]
+    pub continued_from_run_id: Option<RunId>,
+    #[serde(default)]
+    pub continued_by_run_id: Option<RunId>,
+    #[serde(default)]
+    pub continuation_depth: u32,
+    #[serde(default)]
+    pub additional_turns: Option<u32>,
+    #[serde(default)]
+    pub inherited_evidence: Vec<SalvagedEvidenceView>,
     /// Total denials still present in the authoritative retained transcript before projection caps.
     #[serde(default)]
     pub tool_denials_retained_total: u32,
@@ -1182,6 +1229,7 @@ mod tests {
             owner_turn_id: None,
             resolved_reasoning_effort: None,
             resolved_fast_mode: None,
+            source_transport: None,
             tool_audit_json: None,
         };
         let value = serde_json::to_value(entry).expect("serialize transcript entry");

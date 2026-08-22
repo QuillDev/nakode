@@ -17,11 +17,14 @@ use crate::{
         PromptAttachment, QuestionRequest, SessionHistoryItem, TodoPhase, TurnOutcome,
         display_qualified_model_name,
     },
-    domain_transcript::{DomainTranscript, EntryKind, EntryStatus},
+    domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
     handoff::HandoffPackage,
     memory::{MemoryBackend, MemoryConfig},
     personality::PromptAddenda,
-    session::{SessionRecord, SubagentObservability, SubagentRecord},
+    session::{
+        ContinuationProposition, SalvagedEvidence, SessionRecord, SubagentObservability,
+        SubagentRecord, SubagentSalvage,
+    },
     settings::TerminalImageMode,
     skill::SkillCatalog,
     tools::NAKODE_AGENT_TOOL_NAME,
@@ -39,6 +42,129 @@ use crate::{
 };
 
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
+const MAX_CONTINUATION_DEPTH: u32 = 3;
+const MAX_SALVAGED_EVIDENCE: usize = 8;
+const MAX_SALVAGED_EVIDENCE_BYTES: usize = 4 * 1024;
+
+fn bounded_salvage_text(value: &str) -> (String, bool) {
+    if value.len() <= MAX_SALVAGED_EVIDENCE_BYTES {
+        return (value.to_owned(), false);
+    }
+    let end = value
+        .char_indices()
+        .take_while(|(index, _)| *index <= MAX_SALVAGED_EVIDENCE_BYTES)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or_default();
+    (
+        format!("{}\n[truncated from {} bytes]", &value[..end], value.len()),
+        true,
+    )
+}
+
+fn contains_redaction_marker(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("[redacted]") || lower.contains("<redacted>")
+}
+
+fn json_contains_redaction(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => contains_redaction_marker(value),
+        serde_json::Value::Array(values) => values.iter().any(json_contains_redaction),
+        serde_json::Value::Object(values) => {
+            values
+                .get("redacted")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || values.values().any(json_contains_redaction)
+        }
+        _ => false,
+    }
+}
+
+fn transcript_entry_contains_redaction(entry: &TranscriptEntry) -> bool {
+    contains_redaction_marker(&entry.body)
+        || entry
+            .tool_audit_json
+            .as_deref()
+            .and_then(|audit| serde_json::from_str::<serde_json::Value>(audit).ok())
+            .is_some_and(|audit| json_contains_redaction(&audit))
+}
+
+fn successful_tool_evidence(entry: &TranscriptEntry) -> bool {
+    if entry.kind != EntryKind::Tool
+        || entry.status != EntryStatus::Complete
+        || entry.body.trim().is_empty()
+    {
+        return false;
+    }
+    entry.tool_audit_json.as_deref().is_none_or(|audit| {
+        serde_json::from_str::<serde_json::Value>(audit).is_ok_and(|audit| {
+            audit.get("failed").and_then(serde_json::Value::as_bool) != Some(true)
+                && audit.get("denied").and_then(serde_json::Value::as_bool) != Some(true)
+                && audit.get("status").and_then(serde_json::Value::as_str) != Some("failed")
+        })
+    })
+}
+
+fn successful_diff_evidence(entry: &TranscriptEntry) -> bool {
+    entry.kind == EntryKind::Diff
+        && entry.status == EntryStatus::Complete
+        && !entry.body.trim().is_empty()
+}
+
+fn retained_entry_is_verified(entry: &TranscriptEntry) -> bool {
+    successful_tool_evidence(entry) || successful_diff_evidence(entry)
+}
+
+fn render_salvage(salvage: &SubagentSalvage) -> String {
+    let completed = if salvage.completed_work.is_empty() {
+        "- No completed tool or artifact entries were retained.".to_owned()
+    } else {
+        salvage
+            .completed_work
+            .iter()
+            .map(|work| format!("- {work}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let evidence = if salvage.verified_evidence.is_empty() {
+        "- No verified successful tool result or completed diff artifact was recoverable."
+            .to_owned()
+    } else {
+        salvage
+            .verified_evidence
+            .iter()
+            .map(|item| format!("- [{}] {}\n  {}", item.entry_id, item.title, item.body))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let last = salvage.last_successful_evidence.as_ref().map_or_else(
+        || "none".to_owned(),
+        |item| format!("[{}] {}", item.entry_id, item.title),
+    );
+    let unresolved = salvage.unresolved_questions.join("; ");
+    format!(
+        "[Nakode Partial Result]\nTerminal reason: {}\nOriginal objective: {}\nCompleted work:\n{}\nVerified evidence recovered from retained successful tool results or completed diff artifacts:\n{}\nLast successful evidence: {}\nUnresolved questions: {}\nSuggested continuation objective: {}\nCan resume this native run: {}\nRedaction applied: {}\nTruncation applied: {}\n\n[Nakode Continuation Proposition]\nVerified findings so far: {}\nMaterial unresolved boundary: {}\nWhy it matters: {}\nRecommended archetype: {}\nExact bounded follow-up objective: {}\nEvidence/citations to inherit: {}\nCan proceed independently: {}\n[/Nakode Continuation Proposition]\n[/Nakode Partial Result]",
+        salvage.terminal_reason,
+        salvage.original_objective,
+        completed,
+        evidence,
+        last,
+        unresolved,
+        salvage.continuation.follow_up_objective,
+        salvage.can_resume,
+        salvage.redacted,
+        salvage.truncated,
+        salvage.continuation.verified_findings.join("; "),
+        salvage.continuation.unresolved_boundary,
+        salvage.continuation.why_it_matters,
+        salvage.continuation.recommended_archetype,
+        salvage.continuation.follow_up_objective,
+        salvage.continuation.inherited_evidence.join(", "),
+        salvage.continuation.can_proceed_independently,
+    )
+}
 
 fn model_supports_options(model: &ModelInfo) -> bool {
     let configuration = projection::model_configuration(model, false);
@@ -86,11 +212,26 @@ fn append_archetype_policy_instructions(instructions: &mut String, policy: &Agen
         AgentToolProfile::BoundedWatcher => "bounded_watcher",
         AgentToolProfile::Custom => "custom",
     };
+    let reserve = policy.finalization_reserve_turns();
+    let work_turns = policy
+        .max_turns
+        .map(|maximum| maximum.saturating_sub(reserve));
     let _ = write!(
         instructions,
-        "\n\n[Nakode Archetype Policy]\nTool profile: {tool_profile}\nAllowed tools: {allowed_tools}\nDenied tools: {denied_tools}\nNetwork is {network}. File writes are {file_writes}. Recursive delegation is {delegation} (maximum depth {}). Parent attribution is required.\nExpected task shape: {}\nOutput contract: {}\n[/Nakode Archetype Policy]",
-        policy.max_delegation_depth, policy.task_shape, policy.output_contract,
+        "\n\n[Nakode Archetype Policy]\nTool profile: {tool_profile}\nAllowed tools: {allowed_tools}\nDenied tools: {denied_tools}\nNetwork is {network}. File writes are {file_writes}. Recursive delegation is {delegation} (maximum depth {}). Parent attribution is required.\nExpected task shape: {}\nOutput contract: {}\nConfigured hard turn maximum: {}. Protected tool-free finalization reserve: {reserve}. Research/tool work budget: {}.\n[/Nakode Archetype Policy]",
+        policy.max_delegation_depth,
+        policy.task_shape,
+        policy.output_contract,
+        policy
+            .max_turns
+            .map_or_else(|| "runtime default".to_owned(), |turns| turns.to_string()),
+        work_turns.map_or_else(|| "runtime default".to_owned(), |turns| turns.to_string()),
     );
+    if reserve > 0 {
+        instructions.push_str(
+            "\n\n[Nakode Convergence Contract]\nTreat a verified partial result as successful work. Assess whether the objective can be completed at about 60% of the research budget. At 80%, stop opening new investigation branches. When Nakode announces the protected finalization reserve, do not request or attempt tools; synthesize the best final or partial report from evidence already gathered. If completion is impossible, return this exact top-level structure and do not chase one more fact:\n[Nakode Partial Result]\n<best partial report from retained evidence>\n[Nakode Continuation Proposition]\nVerified findings so far: <findings with retained evidence/citations>\nMaterial unresolved boundary: <one bounded boundary>\nWhy it matters: <impact on the objective>\nRecommended archetype: <one archetype>\nExact bounded follow-up objective: <one objective>\nEvidence/citations to inherit: <entry ids, files, commands, or results>\nCan proceed independently: <yes or no>\n[/Nakode Continuation Proposition]\n[/Nakode Partial Result]\n[/Nakode Convergence Contract]",
+        );
+    }
 }
 
 fn append_skill_catalogue_instructions(instructions: &mut String, catalogue: &str) {
@@ -950,7 +1091,8 @@ pub enum Effect {
         model: String,
         options: ModelOptions,
     },
-    PersistSubagent(SubagentRecord),
+    PersistSubagent(Box<SubagentRecord>),
+    PersistSubagentContinuation(Box<(SubagentRecord, SubagentRecord)>),
     LoadSubagents(String),
     UpdateSessionModel {
         session_id: String,
@@ -2501,7 +2643,9 @@ impl DomainState {
         };
     }
 
-    pub fn install_subagents(&mut self, mut records: Vec<SubagentRecord>) {
+    /// Installs persisted delegated runs and returns any records whose abnormal terminal state was
+    /// authoritatively salvaged during restoration so the server can persist the corrected snapshot.
+    pub fn install_subagents(&mut self, mut records: Vec<SubagentRecord>) -> Vec<SubagentRecord> {
         // This is the authoritative run boundary for both restoration and embedded/paged projection:
         // oldest first by immutable start time, with stable run identity breaking timestamp ties.
         records.sort_by(|left, right| {
@@ -2513,10 +2657,14 @@ impl DomainState {
         self.subagents.clear();
         self.subagent_executions.clear();
         self.subagent_chats.clear();
+        let mut corrected_run_ids = Vec::new();
         for mut record in records {
+            let parent_session_id = record.parent_session_id.clone();
+            let mut needs_persistence = false;
             let mut status = record.status;
             let mut latest_activity = record.latest_activity;
             if matches!(status, SubagentStatus::Starting | SubagentStatus::Working) {
+                needs_persistence = true;
                 status = SubagentStatus::Interrupted;
                 "Interrupted when the previous server stopped".clone_into(&mut latest_activity);
                 record.observability.ended_at_ms = Some(unix_time_ms());
@@ -2532,7 +2680,7 @@ impl DomainState {
             if status == SubagentStatus::Interrupted {
                 transcript.finish_running(EntryStatus::Interrupted);
             }
-            let run = SubagentRun {
+            let mut run = SubagentRun {
                 id: record.id.clone(),
                 agent: record.agent,
                 provider: record.provider,
@@ -2549,8 +2697,6 @@ impl DomainState {
                 latest_activity,
                 observability: record.observability,
             };
-            self.subagents.push(run.clone());
-            self.sync_inline_subagent(&run);
             self.subagent_chats.insert(
                 record.id,
                 SubagentChat {
@@ -2558,7 +2704,43 @@ impl DomainState {
                     reasoning_summaries: ReasoningSummaryTracker::default(),
                 },
             );
+            if run.status == SubagentStatus::Interrupted && run.observability.salvage.is_none() {
+                needs_persistence = true;
+                let salvage = self.build_subagent_salvage(&run, "interrupted");
+                let useful_partial =
+                    !salvage.verified_evidence.is_empty() || !salvage.completed_work.is_empty();
+                let salvage_body = render_salvage(&salvage);
+                run.observability.salvage = Some(salvage);
+                if useful_partial {
+                    run.status = SubagentStatus::Partial;
+                    "Partial result preserved after restoration"
+                        .clone_into(&mut run.latest_activity);
+                }
+                if let Some(chat) = self.subagent_chats.get_mut(&run.id) {
+                    chat.transcript.push(
+                        EntryKind::System,
+                        "SALVAGED PARTIAL RESULT",
+                        salvage_body,
+                        if useful_partial {
+                            EntryStatus::Complete
+                        } else {
+                            EntryStatus::Failed
+                        },
+                    );
+                }
+            }
+            self.subagents.push(run.clone());
+            self.sync_inline_subagent(&run);
+            if needs_persistence {
+                corrected_run_ids.push((run.id, parent_session_id));
+            }
         }
+        corrected_run_ids
+            .iter()
+            .filter_map(|(run_id, parent_session_id)| {
+                self.subagent_record_with_parent(run_id, parent_session_id.clone())
+            })
+            .collect()
     }
 
     pub fn session_store_failed(&mut self, message: impl Into<String>) {
@@ -4338,42 +4520,11 @@ impl DomainState {
                 "the delegated run is no longer active".to_owned(),
             ));
         }
-        let Some(mut execution) = self.subagent_executions.remove(run_id) else {
-            return Err(DomainCommandError::NotFound(run_id.to_owned()));
-        };
-        execution.run.status = SubagentStatus::Interrupted;
-        "Interrupted".clone_into(&mut execution.run.latest_activity);
-        execution.run.observability.ended_at_ms = Some(unix_time_ms());
-        execution.run.observability.termination_kind = Some("cancelled".to_owned());
-        execution.run.observability.termination_detail =
-            Some("Interrupted by a client.".to_owned());
-        if let Some(run) = self.subagents.iter_mut().find(|run| run.id == run_id) {
-            run.clone_from(&execution.run);
-        }
-        self.sync_inline_subagent(&execution.run);
-        if let Some(chat) = self.subagent_chats.get_mut(run_id) {
-            chat.transcript.push(
-                EntryKind::System,
-                "INTERRUPTED",
-                "Interrupted by a client.",
-                EntryStatus::Interrupted,
-            );
-            chat.transcript.finish_running(EntryStatus::Interrupted);
-        }
         self.status_message = format!("Interrupted delegated run {run_id}.");
-        let mut effects = self
-            .persist_subagent_effect(run_id)
-            .into_iter()
-            .collect::<Vec<_>>();
-        effects.push(Effect::CompleteAgentRequest {
-            request_id: execution.request_id,
-            result: format!(
-                "[Subagent Result] [{}] [{}]\nInterrupted by a client.",
-                execution.run.id, execution.run.agent
-            ),
-            success: false,
-        });
-        effects.push(Effect::StopSubagent(run_id.to_owned()));
+        let mut effects = self.finish_subagent(run_id, Err("Interrupted by a client.".to_owned()));
+        if let Some(effect) = self.persist_subagent_effect(run_id) {
+            effects.insert(0, effect);
+        }
         Ok(effects)
     }
 
@@ -6092,7 +6243,7 @@ impl DomainState {
             .map(|turn| (turn.id.clone(), turn))
             .collect();
         self.install_history(history);
-        self.install_subagents(Vec::new());
+        let _ = self.install_subagents(Vec::new());
         self.status_message = format!("Resumed session {}.", short_id(&session.id));
         let mut effects = vec![
             Effect::TouchSession(session.id.clone()),
@@ -6588,6 +6739,7 @@ impl DomainState {
                 replace_builtin_tools: self.replace_builtin_tools,
                 allowed_builtin_tools: self.allowed_builtin_tools.clone(),
                 max_turns: None,
+                finalization_reserve_turns: 0,
                 timeout_seconds: None,
             })]
         }
@@ -7186,6 +7338,37 @@ impl DomainState {
                 "agent {agent_slug:?} is disabled; enable it before delegation"
             )));
         }
+        self.validate_subagent_concurrency(agent_slug, definition.max_concurrency)?;
+        let task = task.trim();
+        if task.is_empty() {
+            return Err(DomainCommandError::Invalid(
+                "agent invocation requires a non-empty task".to_owned(),
+            ));
+        }
+        let validator_slug = std::env::var("NAKODE_SECURITY_VALIDATOR_AGENT")
+            .unwrap_or_else(|_| "security-validator".to_owned());
+        if agent_slug == validator_slug
+            && (definition
+                .model
+                .as_ref()
+                .is_none_or(|model| !model.to_ascii_lowercase().contains("sonnet"))
+                || definition
+                    .fallback_models
+                    .iter()
+                    .any(|model| !model.to_ascii_lowercase().contains("sonnet")))
+        {
+            return Err(DomainCommandError::Invalid(format!(
+                "security validator {validator_slug:?} must configure only Sonnet-tier models"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_subagent_concurrency(
+        &self,
+        agent_slug: &str,
+        max_concurrency: u32,
+    ) -> Result<(), DomainCommandError> {
         let running_total = self
             .subagents
             .iter()
@@ -7212,32 +7395,9 @@ impl DomainState {
                     )
             })
             .count();
-        if running_for_archetype >= definition.max_concurrency as usize {
+        if running_for_archetype >= max_concurrency as usize {
             return Err(DomainCommandError::Conflict(format!(
-                "agent {agent_slug:?} already has its configured {} concurrent run(s)",
-                definition.max_concurrency
-            )));
-        }
-        let task = task.trim();
-        if task.is_empty() {
-            return Err(DomainCommandError::Invalid(
-                "agent invocation requires a non-empty task".to_owned(),
-            ));
-        }
-        let validator_slug = std::env::var("NAKODE_SECURITY_VALIDATOR_AGENT")
-            .unwrap_or_else(|_| "security-validator".to_owned());
-        if agent_slug == validator_slug
-            && (definition
-                .model
-                .as_ref()
-                .is_none_or(|model| !model.to_ascii_lowercase().contains("sonnet"))
-                || definition
-                    .fallback_models
-                    .iter()
-                    .any(|model| !model.to_ascii_lowercase().contains("sonnet")))
-        {
-            return Err(DomainCommandError::Invalid(format!(
-                "security validator {validator_slug:?} must configure only Sonnet-tier models"
+                "agent {agent_slug:?} already has its configured {max_concurrency} concurrent run(s)"
             )));
         }
         Ok(())
@@ -7378,6 +7538,200 @@ impl DomainState {
         ];
         if let Some(effect) = self.persist_subagent_effect(&run_id) {
             effects.push(effect);
+        }
+        Ok((run_id, effects))
+    }
+
+    /// Starts one explicitly authorized, bounded successor for a terminal delegated run.
+    /// The successor inherits the source policy snapshot and retained evidence, but is a distinct
+    /// lifecycle event with immutable lineage rather than an implicit provider retry.
+    /// # Errors
+    ///
+    /// Returns an error when the source is ineligible, already continued, beyond depth limits,
+    /// lacks verified retained work, has an invalid policy snapshot, or concurrency is exhausted.
+    #[allow(clippy::too_many_lines)]
+    pub fn continue_subagent(
+        &mut self,
+        source_run_id: &str,
+        additional_turns: u32,
+    ) -> Result<(String, Vec<Effect>), DomainCommandError> {
+        if !(8..=100).contains(&additional_turns) {
+            return Err(DomainCommandError::Invalid(
+                "continuation additional_turns must be between 8 and 100".to_owned(),
+            ));
+        }
+        let parent_session_id = self.session_id.clone().ok_or_else(|| {
+            DomainCommandError::Conflict(
+                "a delegated run continuation requires an active logical session".to_owned(),
+            )
+        })?;
+        let source = self
+            .subagents
+            .iter()
+            .find(|run| run.id == source_run_id)
+            .cloned()
+            .ok_or_else(|| DomainCommandError::NotFound(source_run_id.to_owned()))?;
+        if !matches!(
+            source.status,
+            SubagentStatus::Partial | SubagentStatus::Failed | SubagentStatus::Interrupted
+        ) {
+            return Err(DomainCommandError::Conflict(
+                "only a terminal incomplete delegated run can be continued".to_owned(),
+            ));
+        }
+        if source.observability.continued_by_run_id.is_some() {
+            return Err(DomainCommandError::Conflict(
+                "the delegated run already has a continuation successor".to_owned(),
+            ));
+        }
+        if source.observability.continuation_depth >= MAX_CONTINUATION_DEPTH {
+            return Err(DomainCommandError::Unsupported(format!(
+                "the continuation depth limit ({MAX_CONTINUATION_DEPTH}) is exhausted"
+            )));
+        }
+        let salvage = source.observability.salvage.clone().ok_or_else(|| {
+            DomainCommandError::Conflict(
+                "the delegated run has no authoritative continuation proposition".to_owned(),
+            )
+        })?;
+        if salvage.verified_evidence.is_empty() && salvage.completed_work.is_empty() {
+            return Err(DomainCommandError::Conflict(
+                "the delegated run has no verified retained work to inherit".to_owned(),
+            ));
+        }
+        let mut definition: AgentDefinition =
+            serde_json::from_str(&source.observability.policy_json).map_err(|error| {
+                DomainCommandError::Invalid(format!(
+                    "the delegated run's immutable policy snapshot is invalid: {error}"
+                ))
+            })?;
+        definition.max_turns = Some(additional_turns);
+        self.validate_subagent_concurrency(&definition.slug, definition.max_concurrency)?;
+
+        let continuation_depth = source.observability.continuation_depth + 1;
+        let run_id = Self::next_id("agent");
+        let model_targets = agent_model_targets(&definition, &self.backend_provider);
+        let provider = model_targets[0].provider.clone();
+        let inherited_evidence = salvage.verified_evidence.clone();
+        let inherited_text = inherited_evidence
+            .iter()
+            .map(|evidence| {
+                format!(
+                    "[{}] {}\n{}",
+                    evidence.entry_id, evidence.title, evidence.body
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let task = format!(
+            "{}\n\n[Nakode Authorized Continuation]\nSource run: {}\nContinuation depth: {continuation_depth}/{MAX_CONTINUATION_DEPTH}\nAdditional hard turn budget: {additional_turns}\nDo not repeat completed research. Treat inherited evidence as retained authoritative tool or diff evidence, preserve its explicit truncation limits, and verify any new conclusion.\n\nInherited evidence:\n{}\n[/Nakode Authorized Continuation]",
+            salvage.continuation.follow_up_objective,
+            source.id,
+            if inherited_text.is_empty() {
+                "No verified retained tool result or diff artifact was retained."
+            } else {
+                &inherited_text
+            },
+        );
+        let run = SubagentRun {
+            id: run_id.clone(),
+            agent: definition.slug.clone(),
+            provider: provider.clone(),
+            model: model_targets[0].model.clone(),
+            provider_session_id: None,
+            usage: crate::backend::BackendTokenUsage::default(),
+            objective: salvage.continuation.follow_up_objective.clone(),
+            status: SubagentStatus::Starting,
+            latest_activity: "Starting bounded continuation…".to_owned(),
+            observability: SubagentObservability {
+                parent_run_id: source.observability.parent_run_id.clone(),
+                archetype_purpose: definition.description.clone(),
+                policy_json: serde_json::to_string(&definition).unwrap_or_else(|_| "{}".to_owned()),
+                remaining_delegation_depth: source.observability.remaining_delegation_depth,
+                started_at_ms: unix_time_ms(),
+                continued_from_run_id: Some(source.id.clone()),
+                continuation_depth,
+                additional_turns: Some(additional_turns),
+                inherited_evidence,
+                ..SubagentObservability::default()
+            },
+        };
+        let insertion = self
+            .subagents
+            .binary_search_by(|existing| {
+                existing
+                    .observability
+                    .started_at_ms
+                    .cmp(&run.observability.started_at_ms)
+                    .then_with(|| existing.id.cmp(&run.id))
+            })
+            .unwrap_or_else(|index| index);
+        self.subagents.insert(insertion, run.clone());
+        if let Some(source) = self
+            .subagents
+            .iter_mut()
+            .find(|candidate| candidate.id == source_run_id)
+        {
+            source.observability.continued_by_run_id = Some(run_id.clone());
+        }
+        self.sync_inline_subagent(&run);
+        let mut transcript = DomainTranscript::new(self.transcript_limit);
+        transcript.set_stream_label(definition.slug.clone());
+        transcript.set_stream_active(true);
+        transcript.push(
+            EntryKind::User,
+            "AUTHORIZED CONTINUATION",
+            definition.initial_prompt(&task),
+            EntryStatus::Complete,
+        );
+        self.subagent_chats.insert(
+            run_id.clone(),
+            SubagentChat {
+                transcript,
+                reasoning_summaries: ReasoningSummaryTracker::default(),
+            },
+        );
+        let invocation_at_ms = run.observability.started_at_ms;
+        let invocation_identity = definition.stable_id().to_owned();
+        let invocation_label = definition.slug.clone();
+        self.subagent_executions.insert(
+            run_id.clone(),
+            SubagentExecution {
+                run,
+                definition,
+                request_id: 0,
+                task,
+                parent_run_id: source.observability.parent_run_id,
+                remaining_delegation_depth: source.observability.remaining_delegation_depth,
+                session_id: None,
+                response: String::new(),
+                model_targets,
+                model_target_index: 0,
+            },
+        );
+        self.status_message =
+            format!("Started bounded continuation {run_id} from delegated run {source_run_id}.");
+        let mut effects = vec![
+            Effect::SpawnSubagent {
+                run_id: run_id.clone(),
+                provider,
+            },
+            Effect::RecordInvocation(crate::session::InvocationRecord {
+                invocation_key: format!("archetype:{run_id}"),
+                kind: nakode_protocol::InvocationKind::Archetype,
+                identity: invocation_identity,
+                display_label: invocation_label,
+                occurred_at_ms: invocation_at_ms,
+            }),
+        ];
+        if let (Some(source_record), Some(successor_record)) = (
+            self.subagent_record_with_parent(source_run_id, parent_session_id.clone()),
+            self.subagent_record_with_parent(&run_id, parent_session_id),
+        ) {
+            effects.push(Effect::PersistSubagentContinuation(Box::new((
+                source_record,
+                successor_record,
+            ))));
         }
         Ok((run_id, effects))
     }
@@ -7799,7 +8153,11 @@ impl DomainState {
         self.finish_subagent_transcript(run_id, status);
         match outcome {
             TurnOutcome::Completed => self.finish_subagent(run_id, Ok(())),
-            TurnOutcome::Interrupted | TurnOutcome::Failed => self.finish_subagent(
+            TurnOutcome::Interrupted => self.finish_subagent(
+                run_id,
+                Err(error.unwrap_or_else(|| "Subagent turn was interrupted.".to_owned())),
+            ),
+            TurnOutcome::Failed => self.finish_subagent(
                 run_id,
                 Err(error.unwrap_or_else(|| "Subagent turn failed.".to_owned())),
             ),
@@ -7854,7 +8212,7 @@ impl DomainState {
         self.finish_subagent(run_id, Err(message))
     }
 
-    #[allow(clippy::format_push_string)]
+    #[allow(clippy::format_push_string, clippy::too_many_lines)]
     fn start_subagent_session(
         &mut self,
         run_id: &str,
@@ -7930,6 +8288,7 @@ impl DomainState {
         }
         let allowed_builtin_tools = provider_projection.allowed_tools;
         let max_turns = execution.definition.max_turns;
+        let finalization_reserve_turns = execution.definition.finalization_reserve_turns();
         let timeout_seconds = execution.definition.timeout_seconds;
         let instructions =
             Some(prompt_addenda.apply(&validator_instructions, qualified_model.as_deref()));
@@ -7957,6 +8316,7 @@ impl DomainState {
                 replace_builtin_tools,
                 allowed_builtin_tools,
                 max_turns,
+                finalization_reserve_turns,
                 timeout_seconds,
             },
         }]
@@ -8119,6 +8479,8 @@ impl DomainState {
             body,
             entry_status(item.status),
         );
+        chat.transcript
+            .set_tool_audit(&item.id, item.tool_audit_json.as_deref().map(str::to_owned));
     }
 
     fn record_subagent_artifact(
@@ -8202,108 +8564,235 @@ impl DomainState {
             })
             .map(|(run_id, _)| run_id.clone())
             .collect::<Vec<_>>();
-        let mut effects = Vec::with_capacity(run_ids.len() * 2);
+        let mut effects = Vec::with_capacity(run_ids.len() * 3);
         for run_id in &run_ids {
-            let Some(mut execution) = self.subagent_executions.remove(run_id) else {
-                continue;
-            };
-            execution.run.status = SubagentStatus::Interrupted;
-            "Interrupted by parent".clone_into(&mut execution.run.latest_activity);
-            execution.run.observability.ended_at_ms = Some(unix_time_ms());
-            execution.run.observability.termination_kind = Some("cancelled".to_owned());
-            execution.run.observability.termination_detail =
-                Some("Interrupted by the parent agent.".to_owned());
-            if let Some(displayed) = self.subagents.iter_mut().find(|run| run.id == *run_id) {
-                displayed.clone_from(&execution.run);
-            }
-            self.sync_inline_subagent(&execution.run);
-            let result = format!(
-                "[Subagent Result] [{}] [{}]\nInterrupted by the parent agent.",
-                execution.run.id, execution.run.agent
+            effects.extend(
+                self.finish_subagent(run_id, Err("Interrupted by the parent agent.".to_owned())),
             );
-            if let Some(chat) = self.subagent_chats.get_mut(run_id) {
-                chat.transcript.push(
-                    EntryKind::System,
-                    "INTERRUPTED",
-                    "Interrupted by the parent agent.",
-                    EntryStatus::Interrupted,
-                );
-                chat.transcript.finish_running(EntryStatus::Interrupted);
-            }
             if let Some(effect) = self.persist_subagent_effect(run_id) {
                 effects.push(effect);
             }
-            effects.push(Effect::CompleteAgentRequest {
-                request_id: execution.request_id,
-                result,
-                success: false,
-            });
-            effects.push(Effect::StopSubagent(run_id.clone()));
         }
         (run_ids.len(), effects)
     }
 
+    fn build_subagent_salvage(&self, run: &SubagentRun, terminal_reason: &str) -> SubagentSalvage {
+        let entries = self
+            .subagent_chats
+            .get(&run.id)
+            .map(|chat| chat.transcript.entries())
+            .unwrap_or_default();
+        let completed_work = entries
+            .iter()
+            .filter(|entry| retained_entry_is_verified(entry))
+            .map(|entry| {
+                let (work, work_truncated) =
+                    bounded_salvage_text(&format!("[{}] {}", entry.id, entry.title));
+                (work, work_truncated)
+            })
+            .collect::<Vec<_>>();
+        let completed_work_truncated = completed_work.iter().any(|(_, truncated)| *truncated);
+        let mut completed_work = completed_work
+            .into_iter()
+            .map(|(work, _)| work)
+            .collect::<Vec<_>>();
+        completed_work.dedup();
+        completed_work.truncate(MAX_SALVAGED_EVIDENCE);
+
+        let (terminal_reason, terminal_reason_truncated) = bounded_salvage_text(terminal_reason);
+        let (original_objective, objective_truncated) = bounded_salvage_text(&run.objective);
+        let redacted = entries.iter().any(transcript_entry_contains_redaction)
+            || contains_redaction_marker(&original_objective)
+            || contains_redaction_marker(&terminal_reason);
+        let mut truncated = completed_work_truncated
+            || terminal_reason_truncated
+            || objective_truncated
+            || entries
+                .iter()
+                .filter(|entry| retained_entry_is_verified(entry))
+                .count()
+                > MAX_SALVAGED_EVIDENCE;
+        let mut verified_evidence = entries
+            .iter()
+            .rev()
+            .filter(|entry| retained_entry_is_verified(entry))
+            .take(MAX_SALVAGED_EVIDENCE)
+            .map(|entry| {
+                let (body, body_truncated) = bounded_salvage_text(entry.body.trim());
+                let (title, title_truncated) = bounded_salvage_text(&entry.title);
+                let (entry_id, id_truncated) = bounded_salvage_text(&entry.id);
+                truncated |= body_truncated || title_truncated || id_truncated;
+                SalvagedEvidence {
+                    entry_id,
+                    title,
+                    body,
+                    truncated: body_truncated || title_truncated || id_truncated,
+                }
+            })
+            .collect::<Vec<_>>();
+        verified_evidence.reverse();
+        let last_successful_evidence = verified_evidence.last().cloned();
+        let inherited_evidence = verified_evidence
+            .iter()
+            .map(|evidence| format!("[{}] {}", evidence.entry_id, evidence.title))
+            .collect::<Vec<_>>();
+        let (follow_up_objective, follow_up_truncated) = bounded_salvage_text(&format!(
+            "Continue the bounded objective {original_objective:?} from retained evidence without repeating completed research; resolve the missing synthesis or remaining boundary."
+        ));
+        truncated |= follow_up_truncated;
+        SubagentSalvage {
+            terminal_reason,
+            original_objective,
+            completed_work,
+            verified_evidence,
+            last_successful_evidence,
+            unresolved_questions: vec![
+                "The delegate did not produce a complete verified final synthesis before termination."
+                    .to_owned(),
+            ],
+            continuation: ContinuationProposition {
+                verified_findings: inherited_evidence
+                    .iter()
+                    .map(|citation| {
+                        format!("Authoritative successful tool evidence is retained at {citation}.")
+                    })
+                    .collect(),
+                unresolved_boundary:
+                    "Complete synthesis and any objective boundary not proved by retained successful tool results."
+                        .to_owned(),
+                why_it_matters: "The original delegated objective remains incomplete.".to_owned(),
+                recommended_archetype: run.agent.clone(),
+                follow_up_objective,
+                inherited_evidence,
+                can_proceed_independently: false,
+            },
+            // Linked continuation is provider-neutral. We do not claim hidden provider context can
+            // be resumed unless a future adapter supplies an authoritative resume contract.
+            can_resume: false,
+            redacted,
+            truncated,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn finish_subagent(&mut self, run_id: &str, outcome: Result<(), String>) -> Vec<Effect> {
         let Some(mut execution) = self.subagent_executions.remove(run_id) else {
             return Vec::new();
         };
         execution.run.observability.objective_mismatch_handoff =
             objective_mismatch_handoff(&execution.response);
-        let (success, body) = match outcome {
-            Ok(()) if !execution.response.trim().is_empty() => {
-                execution.run.status = SubagentStatus::Completed;
-                "Completed".clone_into(&mut execution.run.latest_activity);
-                execution.run.observability.termination_kind = Some("completed".to_owned());
-                execution.run.observability.termination_detail = None;
-                (true, execution.response.trim().to_owned())
-            }
-            Ok(()) => {
-                execution.run.status = SubagentStatus::Failed;
-                "Returned no response".clone_into(&mut execution.run.latest_activity);
-                execution.run.observability.termination_kind = Some("failed".to_owned());
-                execution.run.observability.termination_detail =
-                    Some("Subagent returned no assistant response.".to_owned());
-                if let Some(chat) = self.subagent_chats.get_mut(run_id) {
-                    chat.transcript.push(
-                        EntryKind::Error,
-                        "ERROR",
-                        "Subagent returned no assistant response.",
-                        EntryStatus::Failed,
-                    );
-                    chat.transcript.finish_running(EntryStatus::Failed);
+        let failure = match outcome {
+            Ok(()) if !execution.response.trim().is_empty() => None,
+            Ok(()) => Some("Subagent returned no assistant response.".to_owned()),
+            Err(message) => Some(message),
+        };
+        let (success, body) = if let Some(message) = failure {
+            let termination_kind =
+                if message.starts_with("archetype runtime reached its configured maximum") {
+                    "hard_turn_limit"
+                } else if message.starts_with("archetype runtime exceeded its configured") {
+                    "timed_out"
+                } else if message.to_ascii_lowercase().contains("interrupt") {
+                    "interrupted"
+                } else if message == "Subagent returned no assistant response." {
+                    "empty_response"
+                } else {
+                    "failed"
+                };
+            let mut salvage = self.build_subagent_salvage(&execution.run, termination_kind);
+            let (terminal_reason, terminal_truncated) =
+                bounded_salvage_text(&format!("{termination_kind}: {message}"));
+            salvage.terminal_reason = terminal_reason;
+            salvage.truncated |= terminal_truncated;
+            let useful_partial =
+                !salvage.verified_evidence.is_empty() || !salvage.completed_work.is_empty();
+            let salvage_body = render_salvage(&salvage);
+            execution.run.status = if useful_partial {
+                SubagentStatus::Partial
+            } else if termination_kind == "interrupted" {
+                SubagentStatus::Interrupted
+            } else {
+                SubagentStatus::Failed
+            };
+            execution.run.latest_activity = if useful_partial {
+                "Partial result preserved".to_owned()
+            } else {
+                summarize_activity(&message, "Failed")
+            };
+            execution.run.observability.termination_kind = Some(termination_kind.to_owned());
+            execution.run.observability.termination_detail = Some(message.clone());
+            execution.run.observability.salvage = Some(salvage);
+            if let Some(chat) = self.subagent_chats.get_mut(run_id) {
+                if !chat
+                    .transcript
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.kind == EntryKind::Error && entry.body == message)
+                {
+                    chat.transcript
+                        .push(EntryKind::Error, "ERROR", message, EntryStatus::Failed);
                 }
-                (false, "Subagent returned no assistant response.".to_owned())
-            }
-            Err(message) => {
-                execution.run.status = SubagentStatus::Failed;
-                execution.run.latest_activity = summarize_activity(&message, "Failed");
-                execution.run.observability.termination_kind = Some(
-                    if message.starts_with("archetype runtime exceeded its configured") {
-                        "timed_out"
+                chat.transcript.push(
+                    EntryKind::System,
+                    "SALVAGED PARTIAL RESULT",
+                    salvage_body.clone(),
+                    if useful_partial {
+                        EntryStatus::Complete
                     } else {
-                        "failed"
-                    }
-                    .to_owned(),
+                        EntryStatus::Failed
+                    },
                 );
-                execution.run.observability.termination_detail = Some(message.clone());
-                if let Some(chat) = self.subagent_chats.get_mut(run_id) {
-                    if !chat
-                        .transcript
-                        .entries()
-                        .iter()
-                        .any(|entry| entry.kind == EntryKind::Error && entry.body == message)
-                    {
-                        chat.transcript.push(
-                            EntryKind::Error,
-                            "ERROR",
-                            message.clone(),
-                            EntryStatus::Failed,
-                        );
-                    }
-                    chat.transcript.finish_running(EntryStatus::Failed);
-                }
-                (false, message)
+                chat.transcript
+                    .finish_running(if termination_kind == "interrupted" {
+                        EntryStatus::Interrupted
+                    } else {
+                        EntryStatus::Failed
+                    });
             }
+            (useful_partial, salvage_body)
+        } else if let Some((continuation, continuation_truncated)) =
+            parse_continuation_proposition(execution.response.trim())
+        {
+            let mut salvage = self.build_subagent_salvage(&execution.run, "partial_report");
+            let useful_partial =
+                !salvage.verified_evidence.is_empty() || !salvage.completed_work.is_empty();
+            salvage.terminal_reason = if useful_partial {
+                "partial_report: delegate returned an explicit bounded continuation proposition"
+                    .to_owned()
+            } else {
+                "unverified_partial_report: no successful tool evidence or completed artifact was retained"
+                    .to_owned()
+            };
+            salvage.unresolved_questions = vec![continuation.unresolved_boundary.clone()];
+            salvage.continuation = continuation;
+            salvage.truncated |= continuation_truncated;
+            execution.run.status = if useful_partial {
+                SubagentStatus::Partial
+            } else {
+                SubagentStatus::Failed
+            };
+            execution.run.latest_activity = if useful_partial {
+                "Partial result reported".to_owned()
+            } else {
+                "Unverified partial report retained".to_owned()
+            };
+            execution.run.observability.termination_kind = Some(
+                if useful_partial {
+                    "partial_report"
+                } else {
+                    "unverified_partial_report"
+                }
+                .to_owned(),
+            );
+            execution.run.observability.termination_detail = None;
+            execution.run.observability.salvage = Some(salvage);
+            (useful_partial, execution.response.trim().to_owned())
+        } else {
+            execution.run.status = SubagentStatus::Completed;
+            "Completed".clone_into(&mut execution.run.latest_activity);
+            execution.run.observability.termination_kind = Some("completed".to_owned());
+            execution.run.observability.termination_detail = None;
+            (true, execution.response.trim().to_owned())
         };
         execution.run.observability.ended_at_ms = Some(unix_time_ms());
         if let Some(displayed) = self.subagents.iter_mut().find(|run| run.id == run_id) {
@@ -8324,11 +8813,14 @@ impl DomainState {
         ]
     }
 
-    fn persist_subagent_effect(&self, run_id: &str) -> Option<Effect> {
-        let parent_session_id = self.session_id.clone()?;
+    fn subagent_record_with_parent(
+        &self,
+        run_id: &str,
+        parent_session_id: String,
+    ) -> Option<SubagentRecord> {
         let run = self.subagents.iter().find(|run| run.id == run_id)?;
         let chat = self.subagent_chats.get(run_id)?;
-        Some(Effect::PersistSubagent(SubagentRecord {
+        Some(SubagentRecord {
             parent_session_id,
             id: run.id.clone(),
             agent: run.agent.clone(),
@@ -8344,7 +8836,13 @@ impl DomainState {
             latest_activity: run.latest_activity.clone(),
             observability: run.observability.clone(),
             transcript: chat.transcript.entries().to_vec(),
-        }))
+        })
+    }
+
+    fn persist_subagent_effect(&self, run_id: &str) -> Option<Effect> {
+        let parent_session_id = self.session_id.clone()?;
+        self.subagent_record_with_parent(run_id, parent_session_id)
+            .map(|record| Effect::PersistSubagent(Box::new(record)))
     }
 
     fn sync_inline_subagent(&mut self, run: &SubagentRun) {
@@ -8595,6 +9093,79 @@ fn latest_reasoning_summary(text: &str) -> &str {
         .unwrap_or_default()
 }
 
+fn parse_continuation_proposition(report: &str) -> Option<(ContinuationProposition, bool)> {
+    const PARTIAL_START: &str = "[Nakode Partial Result]";
+    const PARTIAL_END: &str = "[/Nakode Partial Result]";
+    const PROPOSITION_START: &str = "[Nakode Continuation Proposition]";
+    const PROPOSITION_END: &str = "[/Nakode Continuation Proposition]";
+
+    // Only a top-level partial-result envelope is authoritative. A completed answer may quote or
+    // explain the proposition contract without declaring itself incomplete.
+    let report = report
+        .trim()
+        .strip_prefix(PARTIAL_START)?
+        .strip_suffix(PARTIAL_END)?
+        .trim();
+    let start = report.find(PROPOSITION_START)?;
+    let report = &report[start + PROPOSITION_START.len()..];
+    let end = report.find(PROPOSITION_END)?;
+    let report = &report[..end];
+    let field = |label: &str| {
+        report
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(label).map(str::trim))
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let verified = field("Verified findings so far:")?;
+    let unresolved_boundary = field("Material unresolved boundary:")?;
+    let why_it_matters = field("Why it matters:")?;
+    let recommended_archetype = field("Recommended archetype:")?;
+    let follow_up_objective = field("Exact bounded follow-up objective:")?;
+    let inherited = field("Evidence/citations to inherit:")?;
+    let independent = field("Can proceed independently:")?;
+    let (verified, verified_truncated) = bounded_salvage_text(&verified);
+    let (unresolved_boundary, unresolved_truncated) = bounded_salvage_text(&unresolved_boundary);
+    let (why_it_matters, why_truncated) = bounded_salvage_text(&why_it_matters);
+    let (recommended_archetype, archetype_truncated) = bounded_salvage_text(&recommended_archetype);
+    let (follow_up_objective, objective_truncated) = bounded_salvage_text(&follow_up_objective);
+    let inherited_values = inherited
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut truncated = verified_truncated
+        || unresolved_truncated
+        || why_truncated
+        || archetype_truncated
+        || objective_truncated
+        || inherited_values.len() > MAX_SALVAGED_EVIDENCE;
+    let inherited_evidence = inherited_values
+        .into_iter()
+        .take(MAX_SALVAGED_EVIDENCE)
+        .map(|value| {
+            let (value, value_truncated) = bounded_salvage_text(value);
+            truncated |= value_truncated;
+            value
+        })
+        .collect();
+    Some((
+        ContinuationProposition {
+            verified_findings: vec![verified],
+            unresolved_boundary,
+            why_it_matters,
+            recommended_archetype,
+            follow_up_objective,
+            inherited_evidence,
+            can_proceed_independently: matches!(
+                independent.to_ascii_lowercase().as_str(),
+                "yes" | "true"
+            ),
+        },
+        truncated,
+    ))
+}
+
 fn objective_mismatch_handoff(text: &str) -> Option<String> {
     const START: &str = "[Nakode Objective Mismatch]";
     const END: &str = "[/Nakode Objective Mismatch]";
@@ -8705,7 +9276,7 @@ mod tests {
     use std::{collections::HashSet, fs, path::Path};
 
     use crate::{
-        agent::AgentCatalog,
+        agent::{AgentCatalog, AgentDefinition, AgentToolProfile},
         backend::{
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
             BackendIdentity, BackendOperation, CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER,
@@ -8716,7 +9287,7 @@ mod tests {
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         personality::PromptAddenda,
-        session::{SessionRecord, SubagentObservability, SubagentRecord},
+        session::{SalvagedEvidence, SessionRecord, SubagentObservability, SubagentRecord},
         skill::SkillCatalog,
         state::projection,
     };
@@ -8724,9 +9295,81 @@ mod tests {
 
     use super::{
         AgentEditorField, AgentRequest, AppState, ApprovalDecision, DomainCommandError, Effect,
-        SubagentStatus, model_supports_options, objective_mismatch_handoff,
+        MAX_CONCURRENT_SUBAGENTS, MAX_CONTINUATION_DEPTH, MAX_SALVAGED_EVIDENCE,
+        MAX_SALVAGED_EVIDENCE_BYTES, SubagentStatus, append_archetype_policy_instructions,
+        model_supports_options, objective_mismatch_handoff, parse_continuation_proposition,
         sanitize_client_instructions,
     };
+
+    #[test]
+    fn analytical_archetype_prompt_exposes_convergence_and_protected_reserve() {
+        let policy = AgentDefinition {
+            slug: "failure-triager".to_owned(),
+            max_turns: Some(45),
+            tool_profile: AgentToolProfile::ReadOnly,
+            ..AgentDefinition::default()
+        };
+        let mut instructions = String::new();
+        append_archetype_policy_instructions(&mut instructions, &policy);
+
+        assert!(instructions.contains("Protected tool-free finalization reserve: 4"));
+        assert!(instructions.contains("Research/tool work budget: 41"));
+        assert!(instructions.contains("about 60% of the research budget"));
+        assert!(instructions.contains("At 80%, stop opening new investigation branches"));
+        assert!(instructions.contains("[Nakode Partial Result]"));
+        assert!(instructions.contains("[Nakode Continuation Proposition]"));
+        assert!(instructions.contains("Exact bounded follow-up objective:"));
+    }
+
+    #[test]
+    fn utility_archetype_keeps_its_full_tight_budget() {
+        let policy = AgentDefinition {
+            slug: "test-runner".to_owned(),
+            max_turns: Some(12),
+            tool_profile: AgentToolProfile::CommandRunner,
+            ..AgentDefinition::default()
+        };
+        let mut instructions = String::new();
+        append_archetype_policy_instructions(&mut instructions, &policy);
+
+        assert!(instructions.contains("Protected tool-free finalization reserve: 0"));
+        assert!(instructions.contains("Research/tool work budget: 12"));
+        assert!(!instructions.contains("[Nakode Convergence Contract]"));
+    }
+
+    #[test]
+    fn continuation_proposition_parser_requires_the_complete_bounded_contract() {
+        let report = "[Nakode Partial Result]\nUseful partial.\n[Nakode Continuation Proposition]\nVerified findings so far: src/state.rs owns terminal projection\nMaterial unresolved boundary: protocol restoration coverage\nWhy it matters: clients must agree after restart\nRecommended archetype: repo-explorer\nExact bounded follow-up objective: trace restored run projection only\nEvidence/citations to inherit: src/state.rs:8600, src/session.rs:3100\nCan proceed independently: yes\n[/Nakode Continuation Proposition]\n[/Nakode Partial Result]";
+        let (proposition, truncated) = parse_continuation_proposition(report).expect("proposition");
+        assert_eq!(
+            proposition.follow_up_objective,
+            "trace restored run projection only"
+        );
+        assert_eq!(proposition.inherited_evidence.len(), 2);
+        assert!(proposition.can_proceed_independently);
+        assert!(!truncated);
+        assert!(parse_continuation_proposition("partial without contract").is_none());
+        assert!(
+            parse_continuation_proposition(
+                "A completed explanation quotes [Nakode Continuation Proposition]\nVerified findings so far: example\nMaterial unresolved boundary: example\nWhy it matters: example\nRecommended archetype: repo-explorer\nExact bounded follow-up objective: example\nEvidence/citations to inherit: example\nCan proceed independently: no\n[/Nakode Continuation Proposition] without declaring a partial result."
+            )
+            .is_none()
+        );
+
+        let oversized = format!(
+            "[Nakode Partial Result]\n[Nakode Continuation Proposition]\nVerified findings so far: {}\nMaterial unresolved boundary: boundary\nWhy it matters: impact\nRecommended archetype: repo-explorer\nExact bounded follow-up objective: objective\nEvidence/citations to inherit: {}\nCan proceed independently: no\n[/Nakode Continuation Proposition]\n[/Nakode Partial Result]",
+            "x".repeat(MAX_SALVAGED_EVIDENCE_BYTES + 1),
+            (0..MAX_SALVAGED_EVIDENCE + 2)
+                .map(|index| format!("entry-{index}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        let (proposition, truncated) =
+            parse_continuation_proposition(&oversized).expect("bounded proposition");
+        assert!(truncated);
+        assert_eq!(proposition.inherited_evidence.len(), MAX_SALVAGED_EVIDENCE);
+        assert!(proposition.verified_findings[0].contains("[truncated from"));
+    }
 
     #[test]
     fn objective_mismatch_handoff_requires_the_exact_bounded_report_protocol() {
@@ -8812,6 +9455,9 @@ description = "Delegates exactly one level"
 system_prompt = "Perform bounded work."
 first_message = "Complete the delegated question."
 model = "openai-codex/model-a"
+tool_profile = "custom"
+allowed_capabilities = ["delegation", "filesystem_read"]
+allowed_tools = ["read"]
 can_delegate = true
 max_delegation_depth = 1
 "#,
@@ -11760,7 +12406,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn persisted_subagents_restore_their_clickable_chat_projection() {
         let mut state = ready_state();
         state.session_id = Some("parent-session".to_owned());
-        state.install_subagents(vec![SubagentRecord {
+        let _ = state.install_subagents(vec![SubagentRecord {
             parent_session_id: "parent-session".to_owned(),
             id: "agent-1".to_owned(),
             agent: "explorer".to_owned(),
@@ -11796,6 +12442,15 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 started_at_ms: 100,
                 ended_at_ms: Some(180),
                 termination_kind: Some("completed".to_owned()),
+                continued_from_run_id: Some("agent-0".to_owned()),
+                continuation_depth: 1,
+                additional_turns: Some(12),
+                inherited_evidence: vec![SalvagedEvidence {
+                    entry_id: "tool-1".to_owned(),
+                    title: "read state".to_owned(),
+                    body: "retained source evidence".to_owned(),
+                    truncated: false,
+                }],
                 ..SubagentObservability::default()
             },
         }]);
@@ -11805,6 +12460,18 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert_eq!(
             state.subagents[0].observability.parent_run_id.as_deref(),
             Some("root-run")
+        );
+        assert_eq!(
+            state.subagents[0]
+                .observability
+                .continued_from_run_id
+                .as_deref(),
+            Some("agent-0")
+        );
+        assert_eq!(state.subagents[0].observability.additional_turns, Some(12));
+        assert_eq!(
+            state.subagents[0].observability.inherited_evidence[0].body,
+            "retained source evidence"
         );
         state.client.subagent_modal = Some("agent-1".to_owned());
         let (transcript, scroll) = state
@@ -13195,16 +13862,45 @@ tool_profile = "none"
                 model: "model-a".to_owned(),
             },
         );
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::SubagentBackend {
-                command: BackendCommand::StartTurn { prompt, .. },
-                ..
-            }] if prompt.contains("Inspect the delegated question")
-                && prompt.contains("Map auth")
-                && !prompt.contains("Explore carefully")
-        ));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::SubagentBackend {
+                    command: BackendCommand::StartTurn { prompt, .. },
+                    ..
+                } if prompt.contains("Inspect the delegated question")
+                    && prompt.contains("Map auth")
+                    && !prompt.contains("Explore carefully")
+            )
+        }));
         run_id
+    }
+
+    fn finish_mocked_subagent_with_verified_evidence(state: &mut AppState, run_id: &str) {
+        state.handle_subagent_backend(
+            run_id,
+            BackendEvent::ItemCompleted {
+                turn_id: "child-turn".to_owned(),
+                item: NormalizedItem {
+                    id: format!("evidence-{run_id}"),
+                    kind: ItemKind::Tool,
+                    title: "read lifecycle".to_owned(),
+                    body: "retained authoritative output".to_owned(),
+                    status: ItemStatus::Complete,
+                    tool_audit_json: None,
+                },
+            },
+        );
+        state.handle_subagent_backend(
+            run_id,
+            BackendEvent::TurnCompleted {
+                turn_id: "child-turn".to_owned(),
+                outcome: TurnOutcome::Failed,
+                error: Some(
+                    "archetype runtime reached its configured maximum of 20 turn(s)".to_owned(),
+                ),
+            },
+        );
     }
 
     #[test]
@@ -13643,6 +14339,296 @@ model = "claude-agent/sonnet"
                 entry.kind == EntryKind::Assistant && entry.body == "No findings."
             })
         );
+    }
+
+    #[test]
+    fn unverified_self_reported_partial_is_retained_but_cannot_unlock_continuation() {
+        let mut state = ready_state();
+        state.session_id = Some("parent-session".to_owned());
+        state.install_agents(explorer_catalog());
+        let run_id = begin_mocked_subagent(&mut state);
+        let report = "[Nakode Partial Result]\n[Nakode Continuation Proposition]\nVerified findings so far: claimed without evidence\nMaterial unresolved boundary: all repository facts\nWhy it matters: no facts were checked\nRecommended archetype: explorer\nExact bounded follow-up objective: inspect one file\nEvidence/citations to inherit: none\nCan proceed independently: no\n[/Nakode Continuation Proposition]\n[/Nakode Partial Result]";
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::ItemCompleted {
+                turn_id: "child-turn".to_owned(),
+                item: NormalizedItem {
+                    id: "answer".to_owned(),
+                    kind: ItemKind::Assistant,
+                    title: "ASSISTANT".to_owned(),
+                    body: report.to_owned(),
+                    status: ItemStatus::Complete,
+                    tool_audit_json: None,
+                },
+            },
+        );
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::TurnCompleted {
+                turn_id: "child-turn".to_owned(),
+                outcome: TurnOutcome::Completed,
+                error: None,
+            },
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::CompleteAgentRequest { result, success: false, .. }
+                if result.contains("claimed without evidence"))
+        }));
+        let run = state
+            .subagents
+            .iter()
+            .find(|run| run.id == run_id)
+            .expect("terminal run");
+        assert_eq!(run.status, SubagentStatus::Failed);
+        assert_eq!(
+            run.observability.termination_kind.as_deref(),
+            Some("unverified_partial_report")
+        );
+        assert!(matches!(
+            state.continue_subagent(&run_id, 12),
+            Err(DomainCommandError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn abnormal_terminal_reasons_salvage_retained_evidence_without_fabricating_completion() {
+        let cases = [
+            (TurnOutcome::Completed, None, "empty_response"),
+            (
+                TurnOutcome::Failed,
+                Some("archetype runtime exceeded its configured timeout of 30 second(s)"),
+                "timed_out",
+            ),
+            (
+                TurnOutcome::Interrupted,
+                Some("Subagent turn was interrupted."),
+                "interrupted",
+            ),
+            (
+                TurnOutcome::Failed,
+                Some("provider process crashed"),
+                "failed",
+            ),
+        ];
+        for (outcome, error, expected_reason) in cases {
+            let mut state = ready_state();
+            state.install_agents(explorer_catalog());
+            let run_id = begin_mocked_subagent(&mut state);
+            state.handle_subagent_backend(
+                &run_id,
+                BackendEvent::ItemCompleted {
+                    turn_id: "child-turn".to_owned(),
+                    item: NormalizedItem {
+                        id: "retained-evidence".to_owned(),
+                        kind: ItemKind::Tool,
+                        title: "grep lifecycle".to_owned(),
+                        body: "retained authoritative output".to_owned(),
+                        status: ItemStatus::Complete,
+                        tool_audit_json: None,
+                    },
+                },
+            );
+            let effects = state.handle_subagent_backend(
+                &run_id,
+                BackendEvent::TurnCompleted {
+                    turn_id: "child-turn".to_owned(),
+                    outcome,
+                    error: error.map(str::to_owned),
+                },
+            );
+            assert!(effects.iter().any(|effect| {
+                matches!(effect, Effect::CompleteAgentRequest { success: true, result, .. }
+                    if result.contains("retained authoritative output"))
+            }));
+            let run = state
+                .subagents
+                .iter()
+                .find(|run| run.id == run_id)
+                .expect("terminal run");
+            assert_eq!(run.status, SubagentStatus::Partial);
+            let salvage = run.observability.salvage.as_ref().expect("salvage");
+            assert!(salvage.terminal_reason.starts_with(expected_reason));
+            assert!(
+                salvage
+                    .unresolved_questions
+                    .iter()
+                    .any(|question| question.contains("did not produce a complete"))
+            );
+            assert!(!salvage.can_resume);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn hard_limit_salvages_verified_tool_evidence_and_supports_one_bounded_successor() {
+        let mut state = ready_state();
+        state.session_id = Some("parent-session".to_owned());
+        state.install_agents(explorer_catalog());
+        let run_id = begin_mocked_subagent(&mut state);
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::ItemCompleted {
+                turn_id: "child-turn".to_owned(),
+                item: NormalizedItem {
+                    id: "evidence-1".to_owned(),
+                    kind: ItemKind::Tool,
+                    title: "read src/state.rs".to_owned(),
+                    body: "Verified lifecycle boundary at src/state.rs:8600".to_owned(),
+                    status: ItemStatus::Complete,
+                    tool_audit_json: Some(r#"{"version":1,"failed":false,"denied":false}"#.into()),
+                },
+            },
+        );
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::TurnCompleted {
+                turn_id: "child-turn".to_owned(),
+                outcome: TurnOutcome::Failed,
+                error: Some(
+                    "archetype runtime reached its configured maximum of 20 turn(s)".to_owned(),
+                ),
+            },
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::CompleteAgentRequest { result, success: true, .. }
+                if result.contains("[Nakode Partial Result]")
+                    && result.contains("Verified lifecycle boundary"))
+        }));
+        let source = state
+            .subagents
+            .iter()
+            .find(|run| run.id == run_id)
+            .expect("source run");
+        assert_eq!(source.status, SubagentStatus::Partial);
+        let salvage = source.observability.salvage.as_ref().expect("salvage");
+        assert!(salvage.terminal_reason.contains("hard_turn_limit"));
+        assert!(
+            salvage
+                .verified_evidence
+                .iter()
+                .any(|evidence| evidence.body.contains("Verified lifecycle boundary"))
+        );
+        let source = state
+            .subagents
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .expect("mutable source run");
+        source.observability.parent_run_id = Some("attributed-parent".to_owned());
+        source.observability.remaining_delegation_depth = 2;
+        source.observability.continuation_depth = MAX_CONTINUATION_DEPTH;
+        assert!(matches!(
+            state.continue_subagent(&run_id, 12),
+            Err(DomainCommandError::Unsupported(_))
+        ));
+        state
+            .subagents
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .expect("mutable source run")
+            .observability
+            .continuation_depth = 1;
+
+        let (successor_id, continuation_effects) = state
+            .continue_subagent(&run_id, 12)
+            .expect("authorized bounded continuation");
+        assert!(continuation_effects.iter().any(|effect| {
+            matches!(effect, Effect::SpawnSubagent { run_id, .. } if run_id == &successor_id)
+        }));
+        assert!(continuation_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::PersistSubagentContinuation(records)
+                    if records.0.id == run_id && records.1.id == successor_id
+            )
+        }));
+        let source = state
+            .subagents
+            .iter()
+            .find(|run| run.id == run_id)
+            .expect("source run");
+        assert_eq!(
+            source.observability.continued_by_run_id.as_deref(),
+            Some(successor_id.as_str())
+        );
+        let successor = state
+            .subagents
+            .iter()
+            .find(|run| run.id == successor_id)
+            .expect("successor run");
+        assert_eq!(
+            successor.observability.continued_from_run_id.as_deref(),
+            Some(run_id.as_str())
+        );
+        assert_eq!(successor.observability.additional_turns, Some(12));
+        assert_eq!(successor.observability.continuation_depth, 2);
+        assert_eq!(
+            successor.observability.parent_run_id.as_deref(),
+            Some("attributed-parent")
+        );
+        assert_eq!(successor.observability.remaining_delegation_depth, 2);
+        assert!(!successor.observability.inherited_evidence.is_empty());
+        assert!(
+            successor
+                .observability
+                .inherited_evidence
+                .iter()
+                .any(|evidence| evidence.body.contains("Verified lifecycle boundary"))
+        );
+        assert!(
+            state
+                .subagent_chats
+                .get(&successor_id)
+                .expect("continuation chat")
+                .transcript
+                .entries()
+                .iter()
+                .any(|entry| entry.body.contains("Verified lifecycle boundary"))
+        );
+        assert!(matches!(
+            state.continue_subagent(&run_id, 12),
+            Err(DomainCommandError::Conflict(_))
+        ));
+        assert!(matches!(
+            state.continue_subagent(&successor_id, 7),
+            Err(DomainCommandError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn continuation_respects_global_and_per_archetype_concurrency_limits() {
+        let mut per_archetype = ready_state();
+        per_archetype.session_id = Some("parent-session".to_owned());
+        per_archetype.install_agents(explorer_catalog());
+        let source_id = begin_mocked_subagent(&mut per_archetype);
+        finish_mocked_subagent_with_verified_evidence(&mut per_archetype, &source_id);
+        let source = per_archetype
+            .subagents
+            .iter_mut()
+            .find(|run| run.id == source_id)
+            .expect("source run");
+        let mut policy: AgentDefinition =
+            serde_json::from_str(&source.observability.policy_json).expect("source policy");
+        policy.max_concurrency = 1;
+        source.observability.policy_json = serde_json::to_string(&policy).expect("bounded policy");
+        let _active_same_archetype = begin_mocked_subagent(&mut per_archetype);
+        assert!(matches!(
+            per_archetype.continue_subagent(&source_id, 12),
+            Err(DomainCommandError::Conflict(message)) if message.contains("concurrent")
+        ));
+
+        let mut global = ready_state();
+        global.session_id = Some("parent-session".to_owned());
+        global.install_agents(explorer_catalog());
+        let source_id = begin_mocked_subagent(&mut global);
+        finish_mocked_subagent_with_verified_evidence(&mut global, &source_id);
+        for _ in 0..MAX_CONCURRENT_SUBAGENTS {
+            let _active = begin_mocked_subagent(&mut global);
+        }
+        assert!(matches!(
+            global.continue_subagent(&source_id, 12),
+            Err(DomainCommandError::Conflict(message)) if message.contains("concurrent")
+        ));
     }
 
     #[test]

@@ -1275,6 +1275,16 @@ pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
             })
             .collect(),
         tool_denials_retained_total: value.tool_denials_retained_total,
+        salvage: value.salvage.map(run_salvage).transpose()?,
+        continued_from_run_id: value.continued_from_run_id.map(view::RunId::from),
+        continued_by_run_id: value.continued_by_run_id.map(view::RunId::from),
+        continuation_depth: value.continuation_depth,
+        additional_turns: value.additional_turns,
+        inherited_evidence: value
+            .inherited_evidence
+            .into_iter()
+            .map(salvaged_evidence)
+            .collect(),
         native_session_id: value.native_session_id,
         usage: token_usage(value.usage.unwrap_or_default()),
         objective: value.objective,
@@ -1284,6 +1294,7 @@ pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
             api::RunStatus::Starting => view::RunStatus::Starting,
             api::RunStatus::Working => view::RunStatus::Working,
             api::RunStatus::Completed => view::RunStatus::Completed,
+            api::RunStatus::Partial => view::RunStatus::Partial,
             api::RunStatus::Interrupted => view::RunStatus::Interrupted,
             api::RunStatus::Failed => view::RunStatus::Failed,
             api::RunStatus::Unspecified => return Err("unspecified run status".into()),
@@ -1301,10 +1312,48 @@ pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
     })
 }
 
+fn salvaged_evidence(value: api::SalvagedEvidence) -> view::SalvagedEvidenceView {
+    view::SalvagedEvidenceView {
+        entry_id: value.entry_id,
+        title: value.title,
+        body: value.body,
+        truncated: value.truncated,
+    }
+}
+
+fn run_salvage(value: api::RunSalvage) -> Result<view::RunSalvageView, String> {
+    let continuation = required(value.continuation, "run continuation proposition")?;
+    Ok(view::RunSalvageView {
+        terminal_reason: value.terminal_reason,
+        original_objective: value.original_objective,
+        completed_work: value.completed_work,
+        verified_evidence: value
+            .verified_evidence
+            .into_iter()
+            .map(salvaged_evidence)
+            .collect(),
+        last_successful_evidence: value.last_successful_evidence.map(salvaged_evidence),
+        unresolved_questions: value.unresolved_questions,
+        continuation: view::ContinuationPropositionView {
+            verified_findings: continuation.verified_findings,
+            unresolved_boundary: continuation.unresolved_boundary,
+            why_it_matters: continuation.why_it_matters,
+            recommended_archetype: continuation.recommended_archetype,
+            follow_up_objective: continuation.follow_up_objective,
+            inherited_evidence: continuation.inherited_evidence,
+            can_proceed_independently: continuation.can_proceed_independently,
+        },
+        can_resume: value.can_resume,
+        redacted: value.redacted,
+        truncated: value.truncated,
+    })
+}
+
 fn run_outcome(value: api::RunOutcome) -> Result<view::RunOutcome, String> {
     use api::run_outcome::Kind;
     match Kind::try_from(value.kind).map_err(invalid_enum)? {
         Kind::Completed => Ok(view::RunOutcome::Completed { body: value.body }),
+        Kind::Partial => Ok(view::RunOutcome::Partial { body: value.body }),
         Kind::Failed => Ok(view::RunOutcome::Failed { reason: value.body }),
         Kind::Interrupted => Ok(view::RunOutcome::Interrupted { reason: value.body }),
         Kind::Unspecified => Err("unspecified run outcome".into()),

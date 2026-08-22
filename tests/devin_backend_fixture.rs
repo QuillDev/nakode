@@ -290,6 +290,7 @@ async fn cached_model_selection_is_applied_before_first_prompt() -> TestResult {
             replace_builtin_tools: false,
             allowed_builtin_tools: None,
             max_turns: None,
+            finalization_reserve_turns: 0,
             timeout_seconds: None,
             owner_session_id: None,
             parent_run_id: None,

@@ -526,10 +526,11 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             replace_builtin_tools,
             allowed_builtin_tools,
             max_turns,
+            finalization_reserve_turns,
             timeout_seconds,
         } => (
             "create",
-            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id,"parentRunId":parent_run_id,"maxTurns":max_turns,"timeoutSeconds":timeout_seconds,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools,"allowedBuiltinTools":allowed_builtin_tools}),
+            json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id,"parentRunId":parent_run_id,"maxTurns":max_turns,"finalizationReserveTurns":finalization_reserve_turns,"timeoutSeconds":timeout_seconds,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools,"allowedBuiltinTools":allowed_builtin_tools}),
         ),
         BackendCommand::ResumeSession {
             provider_session_id,
@@ -724,6 +725,7 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
             code: -1,
             message: string(message, "message"),
         },
+        "warning" => BackendEvent::Warning(string(message, "message")),
         "process_release_failed" => process_release_failed_event(message),
         "error" => {
             request_failed(
@@ -1128,6 +1130,9 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("authoritativeAllowedTools(command.allowedBuiltinTools)"));
         assert!(TOOL_POLICY_SOURCE.contains("Archetype policy does not allow"));
         assert!(BRIDGE_SOURCE.contains("maxTurns: session.maxTurns"));
+        assert!(BRIDGE_SOURCE.contains("session.finalizationReserveTurns"));
+        assert!(BRIDGE_SOURCE.contains("session.finalizing"));
+        assert!(BRIDGE_SOURCE.contains("Protected finalization reserve denies new tool use"));
         assert!(BRIDGE_SOURCE.contains("session.timeoutSeconds * 1000"));
     }
 
@@ -1227,6 +1232,7 @@ mod tests {
             replace_builtin_tools: false,
             allowed_builtin_tools: None,
             max_turns: None,
+            finalization_reserve_turns: 0,
             timeout_seconds: None,
         })
         .expect("Claude supports session tools")
@@ -1248,6 +1254,7 @@ mod tests {
             replace_builtin_tools: false,
             allowed_builtin_tools: Some(vec!["Read".to_owned(), "Glob".to_owned()]),
             max_turns: None,
+            finalization_reserve_turns: 0,
             timeout_seconds: None,
         })
         .expect("Claude supports restricted built-in tools")
@@ -1266,6 +1273,7 @@ mod tests {
             replace_builtin_tools: false,
             allowed_builtin_tools: Some(Vec::new()),
             max_turns: None,
+            finalization_reserve_turns: 0,
             timeout_seconds: None,
         })
         .expect("Claude supports an empty built-in boundary")
@@ -1649,6 +1657,7 @@ assert.equal(streamMessageIds.size, 0);
             replace_builtin_tools: true,
             allowed_builtin_tools: Some(vec!["Read".to_owned()]),
             max_turns: Some(4),
+            finalization_reserve_turns: 0,
             timeout_seconds: Some(30),
         };
 
