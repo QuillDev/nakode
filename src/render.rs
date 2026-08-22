@@ -2363,7 +2363,11 @@ mod tests {
                     configured: false,
                     available: false,
                 },
-                vision: VisionSettingsView { model_id: None },
+                vision: VisionSettingsView {
+                    model_id: None,
+                    availability: nakode_protocol::VisionAvailabilityView::Disabled,
+                    diagnostic: String::new(),
+                },
                 terminal_images: TerminalImageModeView::Auto,
                 invocation_telemetry_enabled: false,
             },
