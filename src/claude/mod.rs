@@ -522,6 +522,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             instructions,
             owner_session_id,
             parent_run_id,
+            enabled_skill_ids: _,
             external_tools,
             replace_builtin_tools,
             allowed_builtin_tools,
@@ -535,6 +536,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         BackendCommand::ResumeSession {
             provider_session_id,
             owner_session_id,
+            enabled_skill_ids: _,
             external_tools,
             replace_builtin_tools,
             allowed_builtin_tools,
@@ -996,6 +998,7 @@ fn resume_after_create(command: BackendCommand, message: &Value) -> BackendComma
     match command {
         BackendCommand::StartSession {
             owner_session_id,
+            enabled_skill_ids,
             external_tools,
             replace_builtin_tools,
             allowed_builtin_tools,
@@ -1005,6 +1008,7 @@ fn resume_after_create(command: BackendCommand, message: &Value) -> BackendComma
         } => BackendCommand::ResumeSession {
             provider_session_id: string(message, "sessionId"),
             owner_session_id,
+            enabled_skill_ids,
             external_tools,
             replace_builtin_tools,
             allowed_builtin_tools,
@@ -1240,6 +1244,7 @@ mod tests {
             instructions: None,
             owner_session_id: Some("owner".to_owned()),
             parent_run_id: Some("parent-run".to_owned()),
+            enabled_skill_ids: Vec::new(),
             external_tools: tools.clone(),
             replace_builtin_tools: false,
             allowed_builtin_tools: None,
@@ -1268,6 +1273,7 @@ mod tests {
         let resume = bridge_request(BackendCommand::ResumeSession {
             provider_session_id: "provider-session".to_owned(),
             owner_session_id: Some("owner".to_owned()),
+            enabled_skill_ids: Vec::new(),
             external_tools: tools,
             replace_builtin_tools: false,
             allowed_builtin_tools: None,
@@ -1287,6 +1293,7 @@ mod tests {
             instructions: None,
             owner_session_id: Some("owner".to_owned()),
             parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: false,
             allowed_builtin_tools: Some(vec!["Read".to_owned(), "Glob".to_owned()]),
@@ -1306,6 +1313,7 @@ mod tests {
             instructions: None,
             owner_session_id: Some("owner".to_owned()),
             parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: false,
             allowed_builtin_tools: Some(Vec::new()),
@@ -1696,6 +1704,7 @@ assert.equal(streamMessageIds.size, 0);
             instructions: Some("briefing".to_owned()),
             owner_session_id: Some("owner".to_owned()),
             parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: true,
             allowed_builtin_tools: Some(vec!["Read".to_owned()]),

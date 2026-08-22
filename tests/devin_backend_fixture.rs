@@ -203,6 +203,7 @@ async fn verify_resume_and_cancellation(
         .send(BackendCommand::ResumeSession {
             provider_session_id: session_id.to_owned(),
             owner_session_id: None,
+            enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: false,
             allowed_builtin_tools: None,
@@ -294,6 +295,7 @@ async fn cached_model_selection_is_applied_before_first_prompt() -> TestResult {
             timeout_seconds: None,
             owner_session_id: None,
             parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
         })
         .await?;
     match next_event(&mut backend).await? {

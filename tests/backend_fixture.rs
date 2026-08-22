@@ -71,6 +71,7 @@ async fn codex_client_completes_handshake_turn_stream_and_approval() -> TestResu
             timeout_seconds: None,
             owner_session_id: None,
             parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
         })
         .await?;
 
@@ -243,6 +244,7 @@ async fn codex_client_resumes_history_and_unsubscribes() -> TestResult {
         .send(BackendCommand::ResumeSession {
             provider_session_id: "thread-fixture".to_owned(),
             owner_session_id: None,
+            enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: false,
             allowed_builtin_tools: None,
@@ -317,6 +319,7 @@ async fn command_sent_before_initialize_is_deferred_not_dropped() -> TestResult 
             timeout_seconds: None,
             owner_session_id: None,
             parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
         })
         .await?;
     let mut gate_writer = open_gate_writer(&gate).await?;

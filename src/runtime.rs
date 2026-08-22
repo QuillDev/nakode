@@ -1601,6 +1601,10 @@ pub struct RuntimeSession {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub fast_mode: bool,
+    /// Stable skill identities authorized by the owning logical session. `None` exists only for
+    /// provider-runtime rows persisted before authoritative skill snapshots were introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_skill_ids: Option<Vec<String>>,
     /// Logical control-plane owner; absent only in old persisted provider payloads and isolated tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_session_id: Option<String>,
@@ -1624,6 +1628,7 @@ impl RuntimeSession {
             telemetry: RuntimeTelemetry::default(),
             reasoning_effort: None,
             fast_mode: false,
+            enabled_skill_ids: None,
             owner_session_id: None,
             parent_run_id: None,
         }
@@ -1632,6 +1637,12 @@ impl RuntimeSession {
     #[must_use]
     pub fn with_provider(mut self, provider_id: impl Into<String>) -> Self {
         self.provider_id = provider_id.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_enabled_skill_ids(mut self, enabled_skill_ids: Vec<String>) -> Self {
+        self.enabled_skill_ids = Some(enabled_skill_ids);
         self
     }
 
@@ -3947,6 +3958,7 @@ mod tests {
         let _repository = SqliteSessionRepository::open(&database).expect("session repository");
         let store = RuntimeSessionStore::new(database, "test-provider");
         let mut session = RuntimeSession::new("test-model".to_owned(), "Be concise.".to_owned())
+            .with_enabled_skill_ids(vec!["stable.review".to_owned()])
             .with_reasoning_effort(Some("low".to_owned()));
         session.telemetry.tools.push(super::ToolMetric {
             turn_id: "turn-1".to_owned(),
@@ -3985,6 +3997,10 @@ mod tests {
         assert_eq!(restored.id, session.id);
         assert_eq!(restored.model, "test-model");
         assert_eq!(restored.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            restored.enabled_skill_ids.as_deref(),
+            Some(["stable.review".to_owned()].as_slice())
+        );
         assert_eq!(restored.telemetry.tools.len(), 1);
         assert_eq!(restored.telemetry.tools[0].output_bytes, 40_000);
         let history = restored.normalized_history();
