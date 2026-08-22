@@ -1273,6 +1273,7 @@ mod tests {
         let resume = bridge_request(BackendCommand::ResumeSession {
             provider_session_id: "provider-session".to_owned(),
             owner_session_id: Some("owner".to_owned()),
+            enabled_skill_ids: Vec::new(),
             external_tools: tools,
             replace_builtin_tools: false,
             allowed_builtin_tools: None,

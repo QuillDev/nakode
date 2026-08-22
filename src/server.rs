@@ -1765,16 +1765,25 @@ impl ServerCore {
                 .configure_mcp_archetype_grants(archetype_grants);
         }
         let mut effects = engine.state_mut().begin_resume(session.clone());
-        if !effects.is_empty() {
-            // Hydrate persisted children as soon as an accepted resume begins so clients can inspect
-            // terminal evidence without waiting for the provider handshake. A rejected resume must
-            // not install child state into an engine that has no logical session identity.
-            effects.insert(0, Effect::LoadSubagents(session.id.clone()));
-            Self::persist_legacy_skill_snapshot(&session, &engine, &mut effects);
-        }
+        Self::prepend_resume_hydration_effects(&session, &engine, &mut effects);
         let loaded_id = SessionId::from(session.id.clone());
         self.sessions_by_id.insert(loaded_id.clone(), engine);
         Ok(Self::accepted(Some(session.id), effects))
+    }
+
+    fn prepend_resume_hydration_effects(
+        session: &SessionRecord,
+        engine: &ServiceEngine,
+        effects: &mut Vec<Effect>,
+    ) {
+        if effects.is_empty() {
+            return;
+        }
+        // Hydrate persisted children as soon as an accepted resume begins so clients can inspect
+        // terminal evidence without waiting for the provider handshake. A rejected resume must
+        // not install child state into an engine that has no logical session identity.
+        effects.insert(0, Effect::LoadSubagents(session.id.clone()));
+        Self::persist_legacy_skill_snapshot(session, engine, effects);
     }
 
     fn persist_legacy_skill_snapshot(
@@ -4625,6 +4634,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
 
