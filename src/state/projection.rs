@@ -1809,6 +1809,41 @@ fn unix_seconds_to_milliseconds(seconds: i64) -> i64 {
     seconds.saturating_mul(1_000)
 }
 
+pub(crate) fn active_session_summary(
+    state: &DomainState,
+    sessions: &[SessionRecord],
+) -> Option<SessionSummary> {
+    if !state.subagents.is_empty() {
+        // Workspace summaries apply both a run-count and encoded-byte budget. Rebuilding that page
+        // would defeat this lightweight detector, so subagent owners conservatively take the full
+        // workspace projection path.
+        return None;
+    }
+    let workspace_id = workspace_id(&state.workspace);
+    let persisted = sessions
+        .iter()
+        .find(|session| session.id == state.nakode_session_id);
+    Some(SessionSummary {
+        id: SessionId::from(state.nakode_session_id.clone()),
+        workspace_id,
+        working_directory: state.working_directory.clone(),
+        title: session_title(state, sessions),
+        active_provider_id: provider_id(&state.backend_provider),
+        active_model_id: state.selected_model.clone().map(ModelId::from),
+        updated_at_ms: persisted.map_or(0, |session| {
+            unix_seconds_to_milliseconds(session.updated_at)
+        }),
+        created_at_ms: persisted.map_or(0, |session| {
+            unix_seconds_to_milliseconds(session.created_at)
+        }),
+        last_owner_activity_at_ms: persisted
+            .and_then(|session| session.last_owner_activity_at)
+            .map_or(0, unix_seconds_to_milliseconds),
+        owned_provider_sessions: owned_provider_sessions(state),
+        running: activity(state) != SessionActivity::Idle,
+    })
+}
+
 fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> SessionSummary {
     SessionSummary {
         id: SessionId::from(session.id.clone()),
