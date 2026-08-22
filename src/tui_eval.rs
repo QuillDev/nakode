@@ -1043,6 +1043,7 @@ fn install_created_session_view(
                 resolved_reasoning_effort: None,
                 resolved_fast_mode: None,
                 source_transport: None,
+                source_prompt_id: None,
                 tool_audit_json: None,
                 created_at_ms: None,
             });
@@ -1121,6 +1122,7 @@ fn install_item_view(
         resolved_reasoning_effort: None,
         resolved_fast_mode: None,
         source_transport: None,
+        source_prompt_id: None,
         tool_audit_json: None,
         created_at_ms: None,
     };

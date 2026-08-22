@@ -235,6 +235,9 @@ mod tests {
             result: None,
             result_start_byte: 0,
             result_total_bytes: 0,
+            invocation_turn_id: None,
+            invocation_call_id: None,
+            originating_owner_entry: None,
             transcript: TranscriptPage {
                 entries: Vec::new(),
                 has_earlier: false,
@@ -266,6 +269,7 @@ mod tests {
             resolved_reasoning_effort: None,
             resolved_fast_mode: None,
             source_transport: None,
+            source_prompt_id: None,
             tool_audit_json: None,
             created_at_ms: None,
         }

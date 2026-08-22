@@ -624,6 +624,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             session_id: protocol::SessionId::from(input.session_id),
             tools: session_tools(input.tools),
             mcp_grant: mcp_grant(input.mcp_grant)?,
+            profile_id: input.profile_id,
+            enabled_skill_ids: Vec::new(),
         }
     );
 
@@ -1071,6 +1073,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             .query(protocol::Query::ListSkills {
                 workspace_id: protocol::WorkspaceId::from(input.workspace_id),
                 profile_id: input.profile_id,
+                refresh: input.refresh,
             })
             .await?;
         let protocol::QueryResult::Skills(value) = result.value else {
@@ -2222,6 +2225,7 @@ fn transcript_entry(value: protocol::TranscriptEntryView) -> api::TranscriptEntr
         provider_id: value.provider_id,
         model_id: value.model_id.map(|id| id.to_string()),
         source_transport: value.source_transport,
+        source_prompt_id: value.source_prompt_id,
         tool_audit_json: value.tool_audit_json,
         created_at_ms: value.created_at_ms,
         owner_turn_id: value.owner_turn_id.map(|id| id.to_string()),
@@ -2439,6 +2443,9 @@ pub(crate) fn run(value: protocol::RunView) -> api::RunState {
         result: value.result,
         result_start_byte: value.result_start_byte,
         result_total_bytes: value.result_total_bytes,
+        invocation_turn_id: value.invocation_turn_id,
+        invocation_call_id: value.invocation_call_id,
+        originating_owner_entry: value.originating_owner_entry.map(transcript_entry),
         transcript: Some(transcript(value.transcript)),
     }
 }

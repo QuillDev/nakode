@@ -379,12 +379,14 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             timeout_seconds,
             owner_session_id,
             parent_run_id,
+            enabled_skill_ids,
         } => {
             start_session(
                 model,
                 instructions,
                 owner_session_id,
                 parent_run_id,
+                enabled_skill_ids,
                 external_tools,
                 replace_builtin_tools,
                 allowed_builtin_tools,
@@ -398,6 +400,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         BackendCommand::ResumeSession {
             provider_session_id,
             owner_session_id,
+            enabled_skill_ids,
             external_tools,
             replace_builtin_tools,
             allowed_builtin_tools,
@@ -420,7 +423,13 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                 request_failed(context.events, BackendOperation::ResumeSession, error).await;
                 return;
             }
-            resume_session(provider_session_id, owner_session_id, context).await;
+            resume_session(
+                provider_session_id,
+                owner_session_id,
+                enabled_skill_ids,
+                context,
+            )
+            .await;
         }
         BackendCommand::UnsubscribeSession {
             provider_session_id,
@@ -451,6 +460,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             prompt,
             attachments,
             model,
+            skill_catalogue,
         } => {
             start_turn(
                 provider_session_id,
@@ -458,6 +468,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                 prompt,
                 attachments,
                 model,
+                skill_catalogue,
                 context,
             )
             .await;
@@ -508,6 +519,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
 async fn resume_session(
     provider_session_id: String,
     owner_session_id: Option<String>,
+    enabled_skill_ids: Vec<String>,
     context: &mut CommandContext<'_>,
 ) {
     let persisted = context
@@ -529,6 +541,7 @@ async fn resume_session(
     {
         session.owner_session_id = owner_session_id;
         session.parent_run_id = None;
+        session.enabled_skill_ids = Some(enabled_skill_ids);
         if session.context_window.is_none()
             && let Some(api_key) = context.api_key
         {
@@ -637,6 +650,7 @@ async fn start_turn(
     prompt: String,
     attachments: Vec<crate::backend::PromptAttachment>,
     model: Option<String>,
+    skill_catalogue: crate::skill::SkillCatalog,
     context: &mut CommandContext<'_>,
 ) {
     let Some(runtime) = context.runtime else {
@@ -666,6 +680,8 @@ async fn start_turn(
         .await;
         return;
     };
+    session.enabled_skill_ids = Some(skill_catalogue.stable_ids());
+    session.skill_catalogue = skill_catalogue;
     if let Some(model) = model {
         if session.model != model {
             session.context_window = None;
@@ -726,6 +742,7 @@ async fn start_session(
     instructions: Option<String>,
     owner_session_id: Option<String>,
     parent_run_id: Option<String>,
+    enabled_skill_ids: Vec<String>,
     external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
     replace_builtin_tools: bool,
     allowed_builtin_tools: Option<Vec<String>>,
@@ -769,6 +786,7 @@ async fn start_session(
     };
     let selected_id = selected.info.id.clone();
     let session = RuntimeSession::new(selected_id.clone(), instructions.unwrap_or_default())
+        .with_enabled_skill_ids(enabled_skill_ids)
         .with_provider(DEVIN_PROVIDER)
         .with_owner(owner_session_id, parent_run_id)
         .with_context_window(selected.context_window);

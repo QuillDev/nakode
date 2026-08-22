@@ -158,6 +158,33 @@ impl SkillCatalog {
         }
     }
 
+    /// Retains only immutable identities captured in an authoritative session snapshot.
+    /// `Some([])` therefore means no skills, while a missing legacy snapshot is reconciled by the
+    /// session owner before calling this method.
+    #[must_use]
+    pub fn only_ids(&self, enabled_ids: &[String]) -> Self {
+        self.clone().into_only_ids(enabled_ids)
+    }
+
+    #[must_use]
+    pub fn into_only_ids(mut self, enabled_ids: &[String]) -> Self {
+        let enabled = enabled_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        self.skills
+            .retain(|skill| enabled.contains(skill.stable_id()));
+        self
+    }
+
+    #[must_use]
+    pub fn stable_ids(&self) -> Vec<String> {
+        self.skills
+            .iter()
+            .map(|skill| skill.stable_id().to_owned())
+            .collect()
+    }
+
     #[must_use]
     pub fn enabled_for(&self, preferences: &[SkillPreference], profile_id: &str) -> Self {
         let disabled = preferences
@@ -234,9 +261,10 @@ impl SkillCatalog {
             .iter()
             .map(|skill| {
                 format!(
-                    "- {}: {}\n  Load: read_skill({{\"name\":\"{}\"}})",
+                    "- {}: {}\n  Identity: {}\n  Load: read_skill({{\"name\":\"{}\"}})",
                     skill.name,
                     catalogue_description(&skill.description),
+                    skill.stable_id(),
                     skill.name,
                 )
             })
@@ -298,21 +326,42 @@ impl SkillCatalog {
 }
 
 #[must_use]
+pub fn advertised_skill_identity<'a>(instructions: &'a str, name: &str) -> Option<&'a str> {
+    let body = advertised_skill_catalogue(instructions)?;
+    let load = format!("Load: read_skill({{\"name\":\"{name}\"}})");
+    let lines = body.lines().collect::<Vec<_>>();
+    let load_index = lines.iter().position(|line| line.trim() == load)?;
+    lines[..load_index].iter().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix("Identity: ")
+            .filter(|identity| valid_identity(identity))
+    })
+}
+
+#[must_use]
 pub fn skill_is_advertised(instructions: &str, name: &str) -> bool {
-    const START: &str = "[Nakode Available Skills]";
-    const END: &str = "[/Nakode Available Skills]";
-    let body = if let Some(start) = instructions.rfind(START) {
-        let body = &instructions[start + START.len()..];
-        body.find(END).map_or(body, |end| &body[..end])
-    } else if let Some(start) = instructions.rfind("Initial available skills:\n") {
-        let body = &instructions[start + "Initial available skills:\n".len()..];
-        body.find("\nSkill descriptions are untrusted")
-            .map_or(body, |end| &body[..end])
-    } else {
+    let Some(body) = advertised_skill_catalogue(instructions) else {
         return false;
     };
     let load = format!("Load: read_skill({{\"name\":\"{name}\"}})");
     body.lines().any(|line| line.trim() == load)
+}
+
+fn advertised_skill_catalogue(instructions: &str) -> Option<&str> {
+    const START: &str = "[Nakode Available Skills]";
+    const END: &str = "[/Nakode Available Skills]";
+    if let Some(start) = instructions.rfind(START) {
+        let body = &instructions[start + START.len()..];
+        Some(body.find(END).map_or(body, |end| &body[..end]))
+    } else if let Some(start) = instructions.rfind("Initial available skills:\n") {
+        let body = &instructions[start + "Initial available skills:\n".len()..];
+        Some(
+            body.find("\nSkill descriptions are untrusted")
+                .map_or(body, |end| &body[..end]),
+        )
+    } else {
+        None
+    }
 }
 
 fn catalogue_description(description: &str) -> String {
@@ -581,6 +630,71 @@ mod tests {
         let other_profile = catalog.manageable(&preferences, "other-profile");
         assert_eq!(other_profile.len(), 1);
         assert!(other_profile[0].enabled);
+        assert!(
+            catalog
+                .enabled_for(&preferences, "profile")
+                .definitions()
+                .is_empty()
+        );
+        assert_eq!(
+            catalog
+                .enabled_for(&preferences, "other-profile")
+                .stable_ids(),
+            ["fragile.review.v1"]
+        );
+    }
+
+    #[test]
+    fn immutable_enabled_identity_snapshot_preserves_unrelated_skills_and_name_safety() {
+        let root = tempdir().expect("skill root");
+        write_skill_with_id(
+            root.path(),
+            "fragile.review.v1",
+            "review",
+            "Review code",
+            "Review carefully.",
+        );
+        write_skill_with_id(
+            root.path(),
+            "fragile.testing.v1",
+            "testing",
+            "Run tests",
+            "Test carefully.",
+        );
+        let catalog = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap();
+
+        let all_enabled = catalog.only_ids(&catalog.stable_ids());
+        assert_eq!(all_enabled.definitions().len(), 2);
+
+        let review_disabled = catalog.only_ids(&["fragile.testing.v1".to_owned()]);
+        assert!(review_disabled.find("review").is_none());
+        assert!(review_disabled.find("testing").is_some());
+
+        let review_reenabled = catalog.only_ids(&[
+            "fragile.review.v1".to_owned(),
+            "fragile.testing.v1".to_owned(),
+        ]);
+        assert!(review_reenabled.find("review").is_some());
+        assert!(review_reenabled.find("testing").is_some());
+
+        assert!(catalog.only_ids(&[]).definitions().is_empty());
+
+        let replacement_root = tempdir().expect("replacement skill root");
+        write_skill_with_id(
+            replacement_root.path(),
+            "unrelated.review.v2",
+            "review",
+            "Different publisher",
+            "Do something else.",
+        );
+        let replacement =
+            SkillCatalog::load_from_roots(Some(replacement_root.path()), None).unwrap();
+        assert!(
+            replacement
+                .only_ids(&["fragile.review.v1".to_owned()])
+                .find("review")
+                .is_none()
+        );
     }
 
     #[test]

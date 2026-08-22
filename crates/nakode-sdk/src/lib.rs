@@ -408,7 +408,8 @@ impl NakodeClient {
     /// # Errors
     /// Returns a transport or server status error.
     pub async fn open_session(&self, session_id: impl Into<String>) -> Result<String, SdkError> {
-        self.open_session_with_tools(session_id, None).await
+        self.open_session_with_tools_for_profile(session_id, None, None)
+            .await
     }
 
     /// Opens or reattaches to a logical session with its client-owned tools established first.
@@ -420,6 +421,20 @@ impl NakodeClient {
         session_id: impl Into<String>,
         tools: Option<api::SessionToolConfiguration>,
     ) -> Result<String, SdkError> {
+        self.open_session_with_tools_for_profile(session_id, tools, None)
+            .await
+    }
+
+    /// Opens or reattaches to a logical session under a current client skill profile.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn open_session_with_tools_for_profile(
+        &self,
+        session_id: impl Into<String>,
+        tools: Option<api::SessionToolConfiguration>,
+        profile_id: Option<String>,
+    ) -> Result<String, SdkError> {
         let result = send_mutation!(
             self,
             open_session,
@@ -428,6 +443,7 @@ impl NakodeClient {
                 session_id: session_id.into(),
                 tools,
                 mcp_grant: None,
+                profile_id,
             }
         )?;
         result
@@ -993,12 +1009,27 @@ impl NakodeClient {
         workspace_id: impl Into<String>,
         profile_id: impl Into<String>,
     ) -> Result<api::SkillCatalogue, SdkError> {
+        self.list_skills_with_refresh(workspace_id, profile_id, false)
+            .await
+    }
+
+    /// Returns the full profile catalogue after optionally rediscovering installed skills.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn list_skills_with_refresh(
+        &self,
+        workspace_id: impl Into<String>,
+        profile_id: impl Into<String>,
+        refresh: bool,
+    ) -> Result<api::SkillCatalogue, SdkError> {
         Ok(self
             .transport
             .clone()
             .list_skills(api::ListSkillsRequest {
                 workspace_id: workspace_id.into(),
                 profile_id: profile_id.into(),
+                refresh,
             })
             .await?
             .into_inner())
