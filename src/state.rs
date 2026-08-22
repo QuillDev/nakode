@@ -2741,8 +2741,7 @@ impl DomainState {
                 let salvage_body = render_salvage(&salvage);
                 run.observability.salvage = Some(salvage);
                 if useful_partial {
-                    run.status = SubagentStatus::Partial;
-                    "Partial result preserved after restoration"
+                    "Partial evidence preserved after interruption"
                         .clone_into(&mut run.latest_activity);
                 }
                 if let Some(chat) = self.subagent_chats.get_mut(&run.id) {
@@ -2751,7 +2750,7 @@ impl DomainState {
                         "SALVAGED PARTIAL RESULT",
                         salvage_body,
                         if useful_partial {
-                            EntryStatus::Complete
+                            EntryStatus::Interrupted
                         } else {
                             EntryStatus::Failed
                         },
@@ -3340,10 +3339,9 @@ impl DomainState {
     /// Whether a provider backend is still behind this session.
     ///
     /// `is_busy` says what the session was DOING; this says whether anything is left to do it, and
-    /// the two must be read together before refusing an operation for work in flight. A backend that
-    /// dies mid-turn leaves state behind that nothing ever clears: `handle_disconnected` drops the
-    /// turn but never marks a running subagent stopped, so `is_busy` can stay true forever. Asking
-    /// such a session to cancel its work first is asking it to do something it cannot.
+    /// the two must be read together before refusing an operation for work in flight. A legacy or
+    /// partially restored snapshot can retain busy display state after its backend is gone, so an
+    /// authoritative delete must distinguish that orphaned state from executable work.
     #[must_use]
     pub fn provider_is_live(&self) -> bool {
         matches!(
@@ -6020,7 +6018,7 @@ impl DomainState {
             BackendEvent::SessionClosed {
                 provider_session_id,
             } => self.handle_session_closed(&provider_session_id),
-            BackendEvent::Disconnected { reason } => self.handle_disconnected(reason),
+            BackendEvent::Disconnected { reason } => return self.handle_disconnected(reason),
         }
         Vec::new()
     }
@@ -6602,7 +6600,7 @@ impl DomainState {
         }
     }
 
-    fn handle_disconnected(&mut self, reason: String) {
+    fn handle_disconnected(&mut self, reason: String) -> Vec<Effect> {
         let pending_prompt = self
             .pending_session_prompt
             .take()
@@ -6633,6 +6631,8 @@ impl DomainState {
         {
             self.restore_failed_prompt(&prompt);
         }
+        let (_, effects) = self.interrupt_subagents();
+        effects
     }
 
     #[cfg(test)]
@@ -8580,7 +8580,6 @@ impl DomainState {
         self.sync_inline_subagent(&run);
     }
 
-    #[cfg(test)]
     fn interrupt_subagents(&mut self) -> (usize, Vec<Effect>) {
         let run_ids = self
             .subagent_executions
@@ -8736,10 +8735,11 @@ impl DomainState {
             let useful_partial =
                 !salvage.verified_evidence.is_empty() || !salvage.completed_work.is_empty();
             let salvage_body = render_salvage(&salvage);
-            execution.run.status = if useful_partial {
-                SubagentStatus::Partial
-            } else if termination_kind == "interrupted" {
+            let interrupted = termination_kind == "interrupted";
+            execution.run.status = if interrupted {
                 SubagentStatus::Interrupted
+            } else if useful_partial {
+                SubagentStatus::Partial
             } else {
                 SubagentStatus::Failed
             };
@@ -8765,7 +8765,9 @@ impl DomainState {
                     EntryKind::System,
                     "SALVAGED PARTIAL RESULT",
                     salvage_body.clone(),
-                    if useful_partial {
+                    if interrupted {
+                        EntryStatus::Interrupted
+                    } else if useful_partial {
                         EntryStatus::Complete
                     } else {
                         EntryStatus::Failed
@@ -8778,7 +8780,7 @@ impl DomainState {
                         EntryStatus::Failed
                     });
             }
-            (useful_partial, salvage_body)
+            (useful_partial && !interrupted, salvage_body)
         } else if let Some((continuation, continuation_truncated)) =
             parse_continuation_proposition(execution.response.trim())
         {
@@ -14430,24 +14432,36 @@ model = "claude-agent/sonnet"
     #[test]
     fn abnormal_terminal_reasons_salvage_retained_evidence_without_fabricating_completion() {
         let cases = [
-            (TurnOutcome::Completed, None, "empty_response"),
+            (
+                TurnOutcome::Completed,
+                None,
+                "empty_response",
+                SubagentStatus::Partial,
+                true,
+            ),
             (
                 TurnOutcome::Failed,
                 Some("archetype runtime exceeded its configured timeout of 30 second(s)"),
                 "timed_out",
+                SubagentStatus::Partial,
+                true,
             ),
             (
                 TurnOutcome::Interrupted,
                 Some("Subagent turn was interrupted."),
                 "interrupted",
+                SubagentStatus::Interrupted,
+                false,
             ),
             (
                 TurnOutcome::Failed,
                 Some("provider process crashed"),
                 "failed",
+                SubagentStatus::Partial,
+                true,
             ),
         ];
-        for (outcome, error, expected_reason) in cases {
+        for (outcome, error, expected_reason, expected_status, expected_success) in cases {
             let mut state = ready_state();
             state.install_agents(explorer_catalog());
             let run_id = begin_mocked_subagent(&mut state);
@@ -14474,15 +14488,32 @@ model = "claude-agent/sonnet"
                 },
             );
             assert!(effects.iter().any(|effect| {
-                matches!(effect, Effect::CompleteAgentRequest { success: true, result, .. }
-                    if result.contains("retained authoritative output"))
+                matches!(effect, Effect::CompleteAgentRequest { success, result, .. }
+                    if *success == expected_success && result.contains("retained authoritative output"))
             }));
             let run = state
                 .subagents
                 .iter()
                 .find(|run| run.id == run_id)
                 .expect("terminal run");
-            assert_eq!(run.status, SubagentStatus::Partial);
+            assert_eq!(run.status, expected_status);
+            let salvage_entry = state
+                .subagent_chats
+                .get(&run_id)
+                .expect("child chat")
+                .transcript
+                .entries()
+                .iter()
+                .find(|entry| entry.title == "SALVAGED PARTIAL RESULT")
+                .expect("salvage transcript entry");
+            assert_eq!(
+                salvage_entry.status,
+                if outcome == TurnOutcome::Interrupted {
+                    EntryStatus::Interrupted
+                } else {
+                    EntryStatus::Complete
+                }
+            );
             let salvage = run.observability.salvage.as_ref().expect("salvage");
             assert!(salvage.terminal_reason.starts_with(expected_reason));
             assert!(
@@ -14666,6 +14697,82 @@ model = "claude-agent/sonnet"
             global.continue_subagent(&source_id, 12),
             Err(DomainCommandError::Conflict(message)) if message.contains("concurrent")
         ));
+    }
+
+    #[test]
+    fn parent_disconnect_destroys_active_subagent_and_preserves_partial_evidence() {
+        let mut state = ready_state();
+        state.session_id = Some("parent-session".to_owned());
+        state.install_agents(explorer_catalog());
+        let run_id = begin_mocked_subagent(&mut state);
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::ItemCompleted {
+                turn_id: "child-turn".to_owned(),
+                item: NormalizedItem {
+                    id: "retained-evidence".to_owned(),
+                    kind: ItemKind::Tool,
+                    title: "read lifecycle".to_owned(),
+                    body: "authoritative partial evidence".to_owned(),
+                    status: ItemStatus::Complete,
+                    tool_audit_json: None,
+                },
+            },
+        );
+
+        let effects = state.handle_backend(BackendEvent::Disconnected {
+            reason: "parent provider exited".to_owned(),
+        });
+
+        let run = state
+            .subagents
+            .iter()
+            .find(|run| run.id == run_id)
+            .expect("destroyed run remains inspectable");
+        assert_eq!(run.status, SubagentStatus::Interrupted);
+        assert_eq!(
+            run.observability.termination_kind.as_deref(),
+            Some("interrupted")
+        );
+        assert!(run.observability.ended_at_ms.is_some());
+        assert!(!state.has_running_subagents());
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::CompleteAgentRequest { result, success: false, .. }
+                if result.contains("authoritative partial evidence"))
+        }));
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, Effect::StopSubagent(stopped) if stopped == &run_id)
+            )
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::PersistSubagent(record)
+                if record.id == run_id && record.status == SubagentStatus::Interrupted)
+        }));
+    }
+
+    #[test]
+    fn parent_disconnect_destroys_active_subagent_before_any_result() {
+        let mut state = ready_state();
+        state.session_id = Some("parent-session".to_owned());
+        state.install_agents(explorer_catalog());
+        let run_id = begin_mocked_subagent(&mut state);
+
+        let effects = state.handle_backend(BackendEvent::Disconnected {
+            reason: "parent provider exited".to_owned(),
+        });
+
+        assert_eq!(state.subagents[0].status, SubagentStatus::Interrupted);
+        assert!(!state.has_running_subagents());
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, Effect::StopSubagent(stopped) if stopped == &run_id)
+            )
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::PersistSubagent(record)
+                if record.id == run_id && record.status == SubagentStatus::Interrupted)
+        }));
     }
 
     #[test]
