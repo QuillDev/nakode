@@ -752,9 +752,26 @@ pub struct MemorySettingsView {
     pub available: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisionAvailabilityView {
+    #[default]
+    Unknown,
+    Disabled,
+    Ready,
+    ModelUnavailable,
+    ModelUnsupported,
+    ProviderUnavailable,
+    ServiceUnavailable,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VisionSettingsView {
     pub model_id: Option<ModelId>,
+    #[serde(default)]
+    pub availability: VisionAvailabilityView,
+    #[serde(default)]
+    pub diagnostic: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

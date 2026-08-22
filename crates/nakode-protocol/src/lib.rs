@@ -55,8 +55,8 @@ pub use view::{
     SessionBridgeView, SessionMetadataView, SessionSummary, SessionView, SettingsView, SkillView,
     TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TokenUsageView,
     TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView,
-    TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionSettingsView,
-    WebSettingsView,
+    TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionAvailabilityView,
+    VisionSettingsView, WebSettingsView,
 };
 
 /// Maximum encoded Protobuf request or response accepted by Nakode's API.
