@@ -31,6 +31,7 @@ const LIFECYCLE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(8);
 // A newly spawned service may bind its socket before its lifecycle task starts responding. Startup
 // polling must stay brief so one queued probe cannot consume the whole readiness retry budget.
 const SERVICE_START_PING_TIMEOUT: Duration = Duration::from_millis(250);
+const API_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
 const RESUME_ENVIRONMENT_KEYS: [&str; 2] = ["NAKODE_RESUME", "NAKO_AGENT_RESUME"];
 const SERVICE_EXECUTABLE_IDENTITY_ENVIRONMENT: &str = "NAKODE_SERVICE_EXECUTABLE_IDENTITY";
@@ -1597,7 +1598,7 @@ pub async fn frontend_api_endpoint(
 
 pub(crate) async fn wait_for_api(api_path: &Path, workspace: &Path) -> Result<(), ControlError> {
     for _ in 0..SERVICE_START_ATTEMPTS {
-        if api_ready(api_path, workspace).await {
+        if api_ready_with_timeout(api_path, workspace, API_READY_PROBE_TIMEOUT).await {
             return Ok(());
         }
         tokio::time::sleep(SERVICE_START_RETRY).await;
@@ -1817,7 +1818,7 @@ async fn discover_running_api_at(
     // authority and attempting a conflicting start.
     for _ in 0..SERVICE_START_ATTEMPTS {
         tokio::time::sleep(SERVICE_START_RETRY).await;
-        if api_ready(api_path, workspace).await {
+        if api_ready_with_timeout(api_path, workspace, API_READY_PROBE_TIMEOUT).await {
             return Ok(Some(api_path.to_owned()));
         }
     }
@@ -1825,6 +1826,10 @@ async fn discover_running_api_at(
 }
 
 async fn api_ready(path: &Path, workspace: &Path) -> bool {
+    api_ready_with_timeout(path, workspace, Duration::from_secs(1)).await
+}
+
+async fn api_ready_with_timeout(path: &Path, workspace: &Path, timeout: Duration) -> bool {
     let readiness = async {
         let client = nakode_sdk::NakodeClient::connect_unix(path.to_owned())
             .await
@@ -1841,7 +1846,7 @@ async fn api_ready(path: &Path, workspace: &Path) -> bool {
             ))
         }
     };
-    tokio::time::timeout(Duration::from_secs(1), readiness)
+    tokio::time::timeout(timeout, readiness)
         .await
         .is_ok_and(|result| result.is_ok())
 }
