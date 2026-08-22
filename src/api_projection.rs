@@ -659,6 +659,7 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
             .collect(),
         created_at_ms: value.created_at_ms,
         updated_at_ms: value.updated_at_ms,
+        last_owner_activity_at_ms: value.last_owner_activity_at_ms,
     })
 }
 
@@ -951,6 +952,7 @@ fn session_summary(value: api::SessionSummary) -> view::SessionSummary {
         active_model_id: value.active_model_id.map(view::ModelId::from),
         updated_at_ms: value.updated_at_ms,
         created_at_ms: value.created_at_ms,
+        last_owner_activity_at_ms: value.last_owner_activity_at_ms,
         owned_provider_sessions: value
             .owned_provider_sessions
             .into_iter()

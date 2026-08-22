@@ -3207,6 +3207,7 @@ impl ServerCore {
                 active_model_id: session.selected_model_id,
                 updated_at_ms,
                 created_at_ms,
+                last_owner_activity_at_ms: session.last_owner_activity_at_ms,
                 owned_provider_sessions,
                 running: !matches!(session.activity, nakode_protocol::SessionActivity::Idle),
             };
@@ -4437,6 +4438,7 @@ mod tests {
             owner_turns: Vec::new(),
             created_at: 10,
             updated_at: 12,
+            last_owner_activity_at: None,
             owned_provider_sessions: Vec::new(),
         }]);
 
@@ -5565,6 +5567,7 @@ mod tests {
             owner_turns: Vec::new(),
             created_at: 10,
             updated_at: 12,
+            last_owner_activity_at: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let mut tools = dashboard_tools("DashboardRead", false);
@@ -5609,6 +5612,7 @@ mod tests {
             owner_turns: Vec::new(),
             created_at: 10,
             updated_at: 12,
+            last_owner_activity_at: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
@@ -5663,6 +5667,7 @@ mod tests {
             owner_turns: Vec::new(),
             created_at: 10,
             updated_at: 12,
+            last_owner_activity_at: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
@@ -5791,6 +5796,7 @@ mod tests {
             owner_turns: Vec::new(),
             created_at: 1,
             updated_at: 2,
+            last_owner_activity_at: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let loaded_before_open = core.sessions_by_id.len();
@@ -5819,6 +5825,7 @@ mod tests {
             owner_turns: Vec::new(),
             created_at: 10,
             updated_at: 12,
+            last_owner_activity_at: None,
             owned_provider_sessions: Vec::new(),
         }]);
 
@@ -7903,6 +7910,7 @@ first_message = "Starting review"
             owner_turns: Vec::new(),
             created_at: 0,
             updated_at: 0,
+            last_owner_activity_at: None,
             owned_provider_sessions: Vec::new(),
         }]);
 
