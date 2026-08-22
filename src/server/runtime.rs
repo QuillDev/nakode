@@ -3826,7 +3826,7 @@ mod tests {
     }
 
     #[test]
-    fn restoring_active_subagents_durably_persists_verified_partial_salvage() {
+    fn restoring_active_subagents_durably_persists_verified_interrupted_salvage() {
         let workspace = tempfile::tempdir().expect("workspace");
         let sessions = SqliteSessionRepository::open(workspace.path().join("sessions.sqlite3"))
             .expect("session repository");
@@ -3889,14 +3889,14 @@ mod tests {
             .expect("restored runs")
             .pop()
             .expect("run");
-        assert_eq!(restored.status, SubagentStatus::Partial);
+        assert_eq!(restored.status, SubagentStatus::Interrupted);
         let salvage = restored.observability.salvage.expect("persisted salvage");
         assert_eq!(salvage.verified_evidence.len(), 1);
         assert_eq!(
             salvage.verified_evidence[0].body,
             "authoritative retained evidence"
         );
-        assert_eq!(state.subagents[0].status, SubagentStatus::Partial);
+        assert_eq!(state.subagents[0].status, SubagentStatus::Interrupted);
         assert!(state.subagents[0].observability.salvage.is_some());
     }
 

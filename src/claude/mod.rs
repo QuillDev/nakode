@@ -1220,20 +1220,32 @@ mod tests {
         );
     }
 
+    fn ticket_stage_tools() -> Vec<nakode_protocol::ExternalToolDefinition> {
+        vec![
+            nakode_protocol::ExternalToolDefinition {
+                name: "ListAssociatedTicketStages".to_owned(),
+                description: "List exact stage identities for the attached ticket".to_owned(),
+                input_schema_json: r#"{"type":"object","properties":{},"additionalProperties":false}"#
+                    .to_owned(),
+            },
+            nakode_protocol::ExternalToolDefinition {
+                name: "MoveAssociatedTicketToStage".to_owned(),
+                description: "Move the attached ticket by exact stage id".to_owned(),
+                input_schema_json: r#"{"type":"object","properties":{"stageId":{"type":"string","format":"uuid"}},"required":["stageId"],"additionalProperties":false}"#.to_owned(),
+            },
+        ]
+    }
+
     #[test]
     fn claude_external_tools_cross_the_mcp_bridge() {
-        let tool = nakode_protocol::ExternalToolDefinition {
-            name: "ReadAssociatedTicket".to_owned(),
-            description: "Read the attached ticket".to_owned(),
-            input_schema_json: r#"{"type":"object","properties":{}}"#.to_owned(),
-        };
+        let tools = ticket_stage_tools();
         let create = bridge_request(BackendCommand::StartSession {
             model: Some("opus".to_owned()),
             instructions: None,
             owner_session_id: Some("owner".to_owned()),
             parent_run_id: Some("parent-run".to_owned()),
             enabled_skill_ids: Vec::new(),
-            external_tools: vec![tool],
+            external_tools: tools.clone(),
             replace_builtin_tools: false,
             allowed_builtin_tools: None,
             max_turns: None,
@@ -1244,11 +1256,36 @@ mod tests {
         .expect("bridge request");
         assert_eq!(
             create.payload["externalTools"][0]["name"],
-            "ReadAssociatedTicket"
+            "ListAssociatedTicketStages"
+        );
+        assert_eq!(
+            create.payload["externalTools"][1]["name"],
+            "MoveAssociatedTicketToStage"
+        );
+        assert_eq!(
+            create.payload["externalTools"][1]["input_schema_json"],
+            tools[1].input_schema_json
         );
         assert_eq!(create.payload["replaceBuiltinTools"], false);
         assert_eq!(create.payload["parentRunId"], "parent-run");
         assert!(create.payload["allowedBuiltinTools"].is_null());
+
+        let resume = bridge_request(BackendCommand::ResumeSession {
+            provider_session_id: "provider-session".to_owned(),
+            owner_session_id: Some("owner".to_owned()),
+            external_tools: tools,
+            replace_builtin_tools: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
+        })
+        .expect("Claude supports resumed session tools")
+        .expect("resume bridge request");
+        assert_eq!(resume.method, "resume");
+        assert_eq!(
+            resume.payload["externalTools"][1]["name"],
+            "MoveAssociatedTicketToStage"
+        );
 
         let restricted = bridge_request(BackendCommand::StartSession {
             model: None,
@@ -1301,14 +1338,20 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("event: \"external_tool_request\""));
         assert!(BRIDGE_SOURCE.contains("case \"resolve_external_tool\""));
         assert!(BRIDGE_SOURCE.contains("mcp__nakode_external__"));
+    }
+
+    #[test]
+    fn claude_stage_tool_request_preserves_exact_identity_and_arguments() {
         assert!(matches!(
             external_tool_request_event(&json!({
                 "id": "external-1",
-                "name": "ReadAssociatedTicket",
-                "argumentsJson": "{}"
+                "name": "MoveAssociatedTicketToStage",
+                "argumentsJson": r#"{"stageId":"33333333-3333-4333-8333-333333333333"}"#
             })),
             BackendEvent::ExternalToolRequested(ExternalToolRequest { id, name, arguments_json })
-                if id == "external-1" && name == "ReadAssociatedTicket" && arguments_json == "{}"
+                if id == "external-1"
+                    && name == "MoveAssociatedTicketToStage"
+                    && arguments_json == r#"{"stageId":"33333333-3333-4333-8333-333333333333"}"#
         ));
     }
 

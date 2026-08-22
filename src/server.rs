@@ -1765,7 +1765,13 @@ impl ServerCore {
                 .configure_mcp_archetype_grants(archetype_grants);
         }
         let mut effects = engine.state_mut().begin_resume(session.clone());
-        Self::persist_legacy_skill_snapshot(&session, &engine, &mut effects);
+        if !effects.is_empty() {
+            // Hydrate persisted children as soon as an accepted resume begins so clients can inspect
+            // terminal evidence without waiting for the provider handshake. A rejected resume must
+            // not install child state into an engine that has no logical session identity.
+            effects.insert(0, Effect::LoadSubagents(session.id.clone()));
+            Self::persist_legacy_skill_snapshot(&session, &engine, &mut effects);
+        }
         let loaded_id = SessionId::from(session.id.clone());
         self.sessions_by_id.insert(loaded_id.clone(), engine);
         Ok(Self::accepted(Some(session.id), effects))
@@ -4575,8 +4581,12 @@ mod tests {
             owned_provider_sessions: Vec::new(),
         }]);
 
-        core.open_session_command(&restored_id, None)
+        let (_, effects) = core
+            .open_session_command(&restored_id, None)
             .expect("persisted cwd restores");
+        assert!(effects.iter().any(
+            |effect| matches!(effect, crate::state::Effect::LoadSubagents(parent) if parent == restored_id.as_str())
+        ));
         assert_eq!(
             core.engine_for(&restored_id)
                 .expect("restored engine")
@@ -4589,6 +4599,47 @@ mod tests {
             .open_session_command(&restored_id, None)
             .expect_err("deleted cwd must not fall back to workspace");
         assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[test]
+    fn rejected_restored_open_does_not_load_subagents() {
+        let (mut core, _) = ready_codex_server();
+        let directory = tempfile::tempdir().expect("persisted cwd");
+        let restored_id = SessionId::from("resume-unsupported-session");
+        core.replace_session_records(vec![SessionRecord {
+            id: restored_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-resume-unsupported".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            working_directory: directory
+                .path()
+                .canonicalize()
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            title: "Resume unsupported".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            last_owner_activity_at: None,
+            owned_provider_sessions: Vec::new(),
+        }]);
+
+        let (_, effects) = core
+            .open_session_command(&restored_id, None)
+            .expect("open reports the resume rejection in session state");
+
+        assert!(effects.is_empty());
+        assert!(
+            core.engine_for(&restored_id)
+                .expect("restored engine")
+                .state()
+                .status_message
+                .contains("does not support session resume")
+        );
     }
 
     #[test]
@@ -7902,11 +7953,10 @@ first_message = "Starting review"
         );
     }
 
-    /// A session stuck busy behind a dead backend is deletable too.
+    /// A legacy session with orphaned busy display state behind a dead backend is deletable too.
     ///
-    /// `handle_disconnected` drops the turn but never marks a running subagent stopped, so `is_busy`
-    /// stays true for good. Refusing this one for "work in flight" asked the caller to cancel work
-    /// that nothing was doing, which is the second way a dead session became permanently stuck.
+    /// Live disconnect handling now settles executable delegated runs. This guard remains for older
+    /// or otherwise inconsistent in-memory projections that have no execution left to cancel.
     #[test]
     fn a_session_stuck_busy_behind_a_dead_backend_is_deletable() {
         let (mut core, _) = ready_codex_server();
