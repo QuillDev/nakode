@@ -345,6 +345,15 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
     .await?;
     eprintln!("activation lifecycle: replacement helper reclaimed stale socket");
 
+    // Crash the recovered helper while the blocker is still authoritative. This leaves the durable
+    // pending journal as the only activation authority during the later service cutover gap.
+    kill_process(replacement_helper_pid)?;
+    wait_for(WAIT_LIMIT, || async {
+        !process_is_alive(replacement_helper_pid)
+    })
+    .await?;
+    eprintln!("activation lifecycle: replacement helper crashed before cutover");
+
     release_fifo(&installation.turn_gate);
     wait_for(WAIT_LIMIT, || async {
         old_client
@@ -362,6 +371,20 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
     ensure_success("stop", &stop)?;
     wait_for(WAIT_LIMIT, || async { !api_socket.exists() }).await?;
     eprintln!("activation lifecycle: old service absent in post-quiescence cutover gap");
+
+    let gap_descriptor =
+        installation.descriptor(&installation.installed_binary, "activation-endpoint")?;
+    assert_eq!(
+        descriptor_path(&gap_descriptor, "endpoint")?,
+        helper_socket,
+        "durable pending activation did not retain the helper endpoint during cutover"
+    );
+    let cutover_helper_pid = wait_for_helper_pid(&helper_lock).await?;
+    assert_ne!(
+        cutover_helper_pid, replacement_helper_pid,
+        "cutover discovery reused the crashed singleton helper"
+    );
+    eprintln!("activation lifecycle: cutover discovery recovered singleton helper");
 
     let replacement_activation = ActivationClient::connect_unix(&helper_socket).await?;
     let Ok(activated) = tokio::time::timeout(
