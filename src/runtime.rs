@@ -2730,12 +2730,21 @@ mod tests {
             Box::pin(async move {
                 if call == 0 {
                     assert_eq!(request.tools.len(), 1);
-                    assert_eq!(request.tools[0].name, "DashboardRead");
+                    assert_eq!(request.tools[0].name, "MoveAssociatedTicketToStage");
+                    assert_eq!(
+                        request.tools[0].parameters,
+                        json!({
+                            "type": "object",
+                            "properties": { "stageId": { "type": "string", "format": "uuid" } },
+                            "required": ["stageId"],
+                            "additionalProperties": false
+                        })
+                    );
                     return Ok(InferenceOutput {
                         tool_calls: vec![ToolCall {
                             id: "provider-call".to_owned(),
-                            name: "DashboardRead".to_owned(),
-                            arguments: json!({"ticketId": "ticket-1"}),
+                            name: "MoveAssociatedTicketToStage".to_owned(),
+                            arguments: json!({"stageId": "33333333-3333-4333-8333-333333333333"}),
                         }],
                         ..InferenceOutput::default()
                     });
@@ -2974,7 +2983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_tools_replace_builtins_and_resume_the_agent_loop() {
+    async fn session_bound_stage_tool_is_provider_neutral_audited_and_resumes_the_agent_loop() {
         let directory = tempfile::tempdir().expect("workspace");
         let provider = Arc::new(ExternalToolProvider {
             calls: AtomicUsize::new(0),
@@ -2985,9 +2994,16 @@ mod tests {
             .configure_external_tools(
                 &session.id,
                 vec![nakode_protocol::ExternalToolDefinition {
-                    name: "DashboardRead".to_owned(),
-                    description: "Read the dashboard.".to_owned(),
-                    input_schema_json: json!({"type": "object"}).to_string(),
+                    name: "MoveAssociatedTicketToStage".to_owned(),
+                    description: "Move the attached ticket to an exact authoritative stage id."
+                        .to_owned(),
+                    input_schema_json: json!({
+                        "type": "object",
+                        "properties": { "stageId": { "type": "string", "format": "uuid" } },
+                        "required": ["stageId"],
+                        "additionalProperties": false
+                    })
+                    .to_string(),
                 }],
                 true,
                 None,
@@ -3021,8 +3037,11 @@ mod tests {
                 break request;
             }
         };
-        assert_eq!(request.name, "DashboardRead");
-        assert_eq!(request.arguments_json, r#"{"ticketId":"ticket-1"}"#);
+        assert_eq!(request.name, "MoveAssociatedTicketToStage");
+        assert_eq!(
+            request.arguments_json,
+            r#"{"stageId":"33333333-3333-4333-8333-333333333333"}"#
+        );
         assert!(
             runtime
                 .resolve_external_tool(&request.id, ToolResult::success("dashboard result"))
@@ -3045,7 +3064,7 @@ mod tests {
                 ..
             } if call_id == "provider-call"
                 && kind == "custom"
-                && arguments["ticketId"] == "ticket-1"
+                && arguments["stageId"] == "33333333-3333-4333-8333-333333333333"
                 && output == "dashboard result"
         ));
         let restored = normalize_history_item("session-external", 1, tool_result);
