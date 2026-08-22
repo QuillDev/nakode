@@ -45,6 +45,8 @@ pub struct ToolContext<'a> {
     pub session: &'a mut RuntimeSession,
     pub backend_events: &'a mpsc::Sender<BackendEvent>,
     pub turn_id: &'a str,
+    /// Stable provider-neutral call identity for correlation with delegated runs.
+    pub call_id: &'a str,
     pub questions: &'a QuestionBroker,
     pub delegation: Option<&'a mpsc::Sender<NativeDelegationRequest>>,
 }
@@ -993,6 +995,7 @@ mod tests {
                 session: &mut session,
                 backend_events: &events,
                 turn_id: "turn-native",
+                call_id: "call-native",
                 questions: &questions,
                 delegation: Some(&requests),
             },
@@ -1003,6 +1006,8 @@ mod tests {
             let request = receiver.recv().await.expect("server request");
             assert_eq!(request.owner_session_id, "logical-session");
             assert_eq!(request.parent_run_id.as_deref(), Some("parent-run"));
+            assert_eq!(request.invocation_turn_id, "turn-native");
+            assert_eq!(request.invocation_call_id, "call-native");
             assert_eq!(request.agent, "repo-explorer");
             assert_eq!(request.task, "Inspect routing");
             request
@@ -1039,6 +1044,7 @@ mod tests {
                     session: &mut self.session,
                     backend_events: &self.events,
                     turn_id: "turn-1",
+                    call_id: "call-harness",
                     questions: &self.questions,
                     delegation: None,
                 },

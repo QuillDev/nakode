@@ -2362,6 +2362,7 @@ fn transcript_entry(value: protocol::TranscriptEntryView) -> api::TranscriptEntr
         provider_id: value.provider_id,
         model_id: value.model_id.map(|id| id.to_string()),
         source_transport: value.source_transport,
+        source_prompt_id: value.source_prompt_id,
         tool_audit_json: value.tool_audit_json,
         created_at_ms: value.created_at_ms,
         owner_turn_id: value.owner_turn_id.map(|id| id.to_string()),
@@ -2579,6 +2580,9 @@ pub(crate) fn run(value: protocol::RunView) -> api::RunState {
         result: value.result,
         result_start_byte: value.result_start_byte,
         result_total_bytes: value.result_total_bytes,
+        invocation_turn_id: value.invocation_turn_id,
+        invocation_call_id: value.invocation_call_id,
+        originating_owner_entry: value.originating_owner_entry.map(transcript_entry),
         transcript: Some(transcript(value.transcript)),
     }
 }

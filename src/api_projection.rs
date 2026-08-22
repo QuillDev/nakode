@@ -1106,6 +1106,7 @@ fn transcript_entry(value: api::TranscriptEntry) -> Result<view::TranscriptEntry
         resolved_reasoning_effort: value.resolved_reasoning_effort,
         resolved_fast_mode: value.resolved_fast_mode,
         source_transport: value.source_transport,
+        source_prompt_id: value.source_prompt_id,
         tool_audit_json: value.tool_audit_json,
         created_at_ms: value.created_at_ms,
     })
@@ -1308,6 +1309,12 @@ pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
         result: value.result,
         result_start_byte: value.result_start_byte,
         result_total_bytes: value.result_total_bytes,
+        invocation_turn_id: value.invocation_turn_id,
+        invocation_call_id: value.invocation_call_id,
+        originating_owner_entry: value
+            .originating_owner_entry
+            .map(transcript_entry)
+            .transpose()?,
         transcript: transcript(required(value.transcript, "run transcript")?)?,
     })
 }
