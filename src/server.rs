@@ -6543,6 +6543,36 @@ mod tests {
     }
 
     #[test]
+    fn busy_prompt_queue_rejects_oversized_caller_identity_without_mutation() {
+        let (mut core, session_id, _) = busy_server_with_stale_revision("active-turn");
+        let oversized_id = "x".repeat(129);
+        let (result, effects, _effect_session, changed) = core.execute_idempotent(
+            IdempotencyKey::from(oversized_id),
+            None,
+            false,
+            Command::EnqueuePrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "must not queue".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        let error = result.expect_err("oversized prompt identity must be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("1 to 128 bytes"));
+        assert!(effects.is_empty());
+        assert!(!changed);
+        assert!(
+            core.session_view(&session_id)
+                .expect("session view")
+                .queue
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn explicit_enqueued_prompt_retains_mutation_identity_after_promotion() {
         let (mut core, session_id, _) = busy_server_with_stale_revision("active-turn");
         core.execute_idempotent(

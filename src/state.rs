@@ -3502,6 +3502,15 @@ impl DomainState {
         self.submit_prompt_with_id_and_source(prompt_id, text, attachments, None)
     }
 
+    fn validate_prompt_operation_id(prompt_id: &str) -> Result<(), DomainCommandError> {
+        if prompt_id.is_empty() || prompt_id.len() > 128 {
+            return Err(DomainCommandError::Invalid(
+                "prompt operation id must contain 1 to 128 bytes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Submits one transport-origin prompt while retaining its immutable source for transcript
     /// projection and same-transport echo suppression.
     pub(crate) fn submit_prompt_with_id_and_source(
@@ -3511,11 +3520,7 @@ impl DomainState {
         attachments: Vec<PromptAttachment>,
         source_transport: Option<String>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        if prompt_id.is_empty() || prompt_id.len() > 128 {
-            return Err(DomainCommandError::Invalid(
-                "prompt operation id must contain 1 to 128 bytes".to_owned(),
-            ));
-        }
+        Self::validate_prompt_operation_id(&prompt_id)?;
         self.validate_prompt(&text)?;
         if !self.connection.is_ready() {
             return Err(DomainCommandError::Conflict(
@@ -3581,6 +3586,7 @@ impl DomainState {
         text: String,
         attachments: Vec<PromptAttachment>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
+        Self::validate_prompt_operation_id(&prompt_id)?;
         self.validate_prompt(&text)?;
         if !self.is_busy() {
             return self.submit_prompt_with_id(prompt_id, text, attachments);
