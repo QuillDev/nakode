@@ -4836,6 +4836,16 @@ impl DomainState {
             })
     }
 
+    /// Whether this exact discovered model advertises Nakode's affirmative fast-mode request.
+    fn model_offers_fast_mode(&self, provider: &str, model: &str) -> bool {
+        self.models
+            .iter()
+            .find(|candidate| candidate.provider == provider && candidate.id == model)
+            .is_some_and(|candidate| {
+                projection::model_configuration(candidate, false).fast_mode_configurable
+            })
+    }
+
     fn model_options_for_qualified(&self, qualified: &str) -> ModelOptions {
         self.model_options
             .get(qualified)
@@ -4846,6 +4856,13 @@ impl DomainState {
             })
             .cloned()
             .unwrap_or_else(|| self.default_model_options.clone())
+    }
+
+    fn model_options_for_discovered(&self, provider: &str, model: &str) -> ModelOptions {
+        self.models
+            .iter()
+            .find(|candidate| candidate.provider == provider && candidate.id == model)
+            .map_or_else(ModelOptions::default, |model| self.model_options_for(model))
     }
 
     fn model_options_for(&self, model: &ModelInfo) -> ModelOptions {
@@ -7310,6 +7327,21 @@ impl DomainState {
                 )));
             }
         }
+        // `false` is ordinary provider behaviour, not an explicit slow tier. Only an affirmative
+        // request needs a capability, and a definition with no pinned model remains valid because the
+        // resolved parent model is checked when the delegated run starts.
+        if definition.fast_mode
+            && let Some(model) = definition.model.as_deref()
+        {
+            let offered = model
+                .split_once('/')
+                .is_some_and(|(provider, model)| self.model_offers_fast_mode(provider, model));
+            if !offered {
+                return Err(DomainCommandError::Invalid(format!(
+                    "model {model} does not advertise fast-mode selection"
+                )));
+            }
+        }
         if self.agents.definitions().iter().any(|existing| {
             existing.slug == definition.slug
                 && previous_slug.is_none_or(|previous| previous != existing.slug)
@@ -8369,13 +8401,32 @@ impl DomainState {
             return Vec::new();
         };
         let model = target.model.clone();
-        let options_model = model
-            .as_deref()
-            .or((!reported_model.is_empty()).then_some(reported_model));
+        let options_model = (!reported_model.is_empty())
+            .then_some(reported_model)
+            .or(model.as_deref());
         let mut options = options_model
-            .map(|model| self.model_options_for_qualified(&format!("{}/{model}", target.provider)))
+            .map(|model| self.model_options_for_discovered(&target.provider, model))
             .unwrap_or_default();
-        options.fast_mode |= agent_fast_mode;
+        let defined_fast_mode_applied = agent_fast_mode
+            && options_model
+                .is_some_and(|model| self.model_offers_fast_mode(&target.provider, model));
+        if defined_fast_mode_applied {
+            options.fast_mode = true;
+        } else if agent_fast_mode {
+            // A model inherited at delegation time or reached through fallback can differ from the
+            // definition's primary model. Never send an affirmative request that the actual model
+            // does not advertise.
+            options.fast_mode = false;
+            self.record_subagent_message(
+                run_id,
+                EntryKind::Warning,
+                "MODEL",
+                &format!(
+                    "fast mode is not available on {}; running with ordinary provider behaviour",
+                    options_model.unwrap_or(&target.provider)
+                ),
+            );
+        }
         // The archetype's own level beats whatever the workspace has saved for this model — that is
         // what defining one on the definition means. `None` changes nothing, so a definition written
         // before the field existed runs exactly as it did: at the model's own default.
@@ -8420,14 +8471,11 @@ impl DomainState {
         let prompt = execution.definition.initial_prompt(&execution.task);
         self.sync_subagent(run_id);
         let mut effects = Vec::new();
-        // Cursor as before, plus the one new case: an archetype that DEFINES a level has to have it
-        // delivered, and this command is how a level reaches a session.
-        //
-        // Deliberately not widened past that. Every other provider's delegated runs have never been
-        // sent these options — the workspace's own saved level and fast mode are still computed above
-        // and still dropped for them — and starting to send them is a change to how existing runs
-        // behave, which is not this change's business.
-        if defined_effort_applied || target.provider == CURSOR_PROVIDER {
+        // Cursor as before, plus either performance option explicitly defined by this archetype.
+        // Workspace model defaults alone retain their existing provider path; this branch projects
+        // only the archetype contract onto the delegated session before its first turn.
+        if defined_effort_applied || defined_fast_mode_applied || target.provider == CURSOR_PROVIDER
+        {
             effects.push(Effect::SubagentBackend {
                 run_id: run_id.to_owned(),
                 command: BackendCommand::SetSessionOptions {
@@ -13479,6 +13527,101 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    fn archetype_fast_mode_validation_uses_the_discovered_model_capability() {
+        let mut state = ready_state();
+        let supported = AgentDefinition {
+            slug: "fast-reviewer".to_owned(),
+            description: "Reviews quickly".to_owned(),
+            model: Some(format!("{CODEX_PROVIDER}/model-a")),
+            fast_mode: true,
+            ..AgentDefinition::default()
+        };
+        state
+            .validate_agent_definition(&supported, None)
+            .expect("Codex advertises fast mode");
+
+        state.models.push(ModelInfo {
+            provider: "zai-coding".to_owned(),
+            id: "model-standard".to_owned(),
+            is_default: true,
+            capabilities: ModelCapabilities::default(),
+        });
+        let unsupported = AgentDefinition {
+            slug: "standard-reviewer".to_owned(),
+            description: "Reviews ordinarily".to_owned(),
+            model: Some("zai-coding/model-standard".to_owned()),
+            fast_mode: true,
+            ..AgentDefinition::default()
+        };
+        let error = state
+            .validate_agent_definition(&unsupported, None)
+            .expect_err("a model without the advertised capability must reject fast mode");
+        assert!(
+            error
+                .to_string()
+                .contains("does not advertise fast-mode selection")
+        );
+
+        state
+            .validate_agent_definition(
+                &AgentDefinition {
+                    slug: "inherited-reviewer".to_owned(),
+                    description: "Uses the delegating model".to_owned(),
+                    fast_mode: true,
+                    ..AgentDefinition::default()
+                },
+                None,
+            )
+            .expect("an inherited model is validated once it resolves at delegation time");
+    }
+
+    #[test]
+    fn codex_subagent_applies_saved_fast_mode_before_its_first_turn() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("fast-thinker.toml"),
+            format!(
+                r#"
+slug = "fast-thinker"
+description = "Thinks on the priority tier"
+system_prompt = "Think quickly."
+first_message = "Inspect the delegated question."
+model = "{CODEX_PROVIDER}/model-a"
+fast_mode = true
+"#
+            ),
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let run_id = launch_codex_subagent(&mut state, "fast-thinker");
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "codex-fast-child".to_owned(),
+                model: "model-a".to_owned(),
+            },
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::SubagentBackend {
+                    command: BackendCommand::SetSessionOptions {
+                        provider_session_id,
+                        options,
+                    },
+                    ..
+                },
+                Effect::SubagentBackend {
+                    command: BackendCommand::StartTurn { .. },
+                    ..
+                }
+            ] if provider_session_id == "codex-fast-child" && options.fast_mode
+        ));
+    }
+
+    #[test]
     fn cursor_subagent_applies_saved_fast_mode_before_its_first_turn() {
         let directory = tempdir().expect("agent directory");
         fs::write(
@@ -13494,6 +13637,12 @@ fast_mode = true
         )
         .expect("agent definition");
         let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CURSOR_PROVIDER.to_owned(),
+            id: "composer-2.5".to_owned(),
+            is_default: true,
+            capabilities: ModelCapabilities::default(),
+        });
         state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
         let effects = state.invoke_agent(&AgentRequest {
             id: 42,
@@ -13545,6 +13694,147 @@ fast_mode = true
             ] if provider_session_id == "cursor-child"
                 && options.fast_mode
                 && model == "composer-2.5"
+        ));
+    }
+
+    #[test]
+    fn cursor_subagent_drops_defined_fast_mode_when_reported_model_is_incapable() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("cursor-fast.toml"),
+            r#"
+slug = "cursor-fast"
+description = "Requests fast Cursor behavior"
+system_prompt = "Explore carefully."
+first_message = "Inspect the delegated question."
+model = "cursor-sdk/composer-2.5"
+fast_mode = true
+"#,
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        for id in ["composer-2.5", "basic"] {
+            state.models.push(ModelInfo {
+                provider: CURSOR_PROVIDER.to_owned(),
+                id: id.to_owned(),
+                is_default: id == "composer-2.5",
+                capabilities: ModelCapabilities::default(),
+            });
+        }
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 42,
+            agent: "cursor-fast".to_owned(),
+            task: "Map auth".to_owned(),
+        });
+        let (run_id, provider) = spawned_subagent(&effects);
+        assert_eq!(provider, CURSOR_PROVIDER);
+        let run_id = run_id.to_owned();
+
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CURSOR_PROVIDER.to_owned(),
+                display_name: "Cursor".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "cursor-fallback-child".to_owned(),
+                model: "basic".to_owned(),
+            },
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::SubagentBackend {
+                    command: BackendCommand::SetSessionOptions { options, .. },
+                    ..
+                },
+                Effect::SubagentBackend {
+                    command: BackendCommand::StartTurn { .. },
+                    ..
+                }
+            ] if !options.fast_mode
+        ));
+        assert_eq!(
+            state
+                .subagent_executions
+                .get(&run_id)
+                .and_then(|execution| execution.run.model.as_deref()),
+            Some("basic")
+        );
+    }
+
+    #[test]
+    fn cursor_subagent_drops_cached_options_the_discovered_model_does_not_advertise() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("cursor-basic.toml"),
+            r#"
+slug = "cursor-basic"
+description = "Uses ordinary Cursor behavior"
+system_prompt = "Explore carefully."
+first_message = "Inspect the delegated question."
+model = "cursor-sdk/basic"
+"#,
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CURSOR_PROVIDER.to_owned(),
+            id: "basic".to_owned(),
+            is_default: true,
+            capabilities: ModelCapabilities::default(),
+        });
+        state.model_options.insert(
+            format!("{CURSOR_PROVIDER}/basic"),
+            ModelOptions {
+                reasoning_effort: Some("xhigh".to_owned()),
+                fast_mode: true,
+            },
+        );
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 42,
+            agent: "cursor-basic".to_owned(),
+            task: "Map auth".to_owned(),
+        });
+        let (run_id, provider) = spawned_subagent(&effects);
+        assert_eq!(provider, CURSOR_PROVIDER);
+        let run_id = run_id.to_owned();
+
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CURSOR_PROVIDER.to_owned(),
+                display_name: "Cursor".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "cursor-basic-child".to_owned(),
+                model: "basic".to_owned(),
+            },
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::SubagentBackend {
+                    command: BackendCommand::SetSessionOptions { options, .. },
+                    ..
+                },
+                Effect::SubagentBackend {
+                    command: BackendCommand::StartTurn { .. },
+                    ..
+                }
+            ] if !options.fast_mode && options.reasoning_effort.is_none()
         ));
     }
 
