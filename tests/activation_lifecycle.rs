@@ -22,6 +22,9 @@ use serde_json::Value;
 const WAIT_LIMIT: Duration = Duration::from_secs(10);
 const WAIT_STEP: Duration = Duration::from_millis(50);
 const COMMAND_LIMIT: Duration = Duration::from_secs(20);
+// Starting the first isolated service includes cold process and provider initialization. Keep that
+// distinct from the 20-second activation-endpoint contract exercised after deferred activation.
+const COLD_START_LIMIT: Duration = Duration::from_secs(40);
 // A manual activation includes cold replacement-service startup and persisted-session restoration.
 // CI evidence shows that operation can legitimately outlive the isolated CLI command bound while
 // continuing to publish its runtime and sockets, so keep a distinct bounded lifecycle allowance.
@@ -103,16 +106,34 @@ impl IsolatedInstallation {
     }
 
     fn output(&self, executable: &Path, arguments: &[&str]) -> TestResult<Output> {
+        self.output_with_limit(executable, arguments, COMMAND_LIMIT)
+    }
+
+    fn output_with_limit(
+        &self,
+        executable: &Path,
+        arguments: &[&str],
+        limit: Duration,
+    ) -> TestResult<Output> {
         let mut command = self.command(executable);
         command
             .args(arguments)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        wait_for_child_output(command.spawn()?, &arguments.join(" "))
+        wait_for_child_output(command.spawn()?, &arguments.join(" "), limit)
     }
 
     fn descriptor(&self, executable: &Path, command: &str) -> TestResult<Value> {
-        let output = self.output(executable, &[command])?;
+        self.descriptor_with_limit(executable, command, COMMAND_LIMIT)
+    }
+
+    fn descriptor_with_limit(
+        &self,
+        executable: &Path,
+        command: &str,
+        limit: Duration,
+    ) -> TestResult<Value> {
+        let output = self.output_with_limit(executable, &[command], limit)?;
         ensure_success(command, &output)?;
         let line = String::from_utf8(output.stdout)?
             .lines()
@@ -150,7 +171,11 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
         installation.root.path().display()
     );
 
-    let old_descriptor = installation.descriptor(&installation.old_binary, "endpoint")?;
+    let old_descriptor = installation.descriptor_with_limit(
+        &installation.old_binary,
+        "endpoint",
+        COLD_START_LIMIT,
+    )?;
     eprintln!("activation lifecycle: old service endpoint ready");
     let api_socket = descriptor_path(&old_descriptor, "endpoint")?;
     let old_cli_sha = descriptor_string(&old_descriptor, &["cli", "sha256"])?;
@@ -487,18 +512,22 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
     Ok(())
 }
 
-fn wait_for_child_output(mut child: std::process::Child, label: &str) -> TestResult<Output> {
+fn wait_for_child_output(
+    mut child: std::process::Child,
+    label: &str,
+    limit: Duration,
+) -> TestResult<Output> {
     let started = Instant::now();
     loop {
         if child.try_wait()?.is_some() {
             return Ok(child.wait_with_output()?);
         }
-        if started.elapsed() >= COMMAND_LIMIT {
+        if started.elapsed() >= limit {
             let _ = child.kill();
             let output = child.wait_with_output()?;
             return Err(format!(
                 "isolated command {label:?} exceeded {}ms\nstdout:\n{}\nstderr:\n{}",
-                COMMAND_LIMIT.as_millis(),
+                limit.as_millis(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             )
