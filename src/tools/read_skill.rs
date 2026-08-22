@@ -13,7 +13,7 @@ impl Tool for ReadSkillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_skill",
-            description: "Load one operationally complete installed Nakode skill by its exact catalogue name. The result includes the entrypoint and every explicitly declared package component in deterministic order, plus an agent-visible component list. This exposes Nakode-owned instruction context, not arbitrary filesystem paths. Use it when the task matches an available skill trigger; read the returned instructions before acting.",
+            description: "Load one installed Nakode skill by exact catalogue name as structured JSON containing skill_instructions, skill_content, and the auto-discovered components catalogue. Component bodies are loaded separately with read_skill_component, so agents never search package directories or receive unused reference material.",
             parameters: json!({
                 "type": "object",
                 "properties": {

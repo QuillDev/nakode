@@ -10,7 +10,7 @@ Installed skills are returned with current metadata. A saved identity that is no
 
 ## Session lifecycle
 
-Availability is snapshotted when a logical session is created. Disabled skills are removed before the initial instructions and provider prompt are published. Tool authorization checks the immutable skill catalogue advertised in those instructions, so an explicit `read_skill` request for a disabled, newly installed, or otherwise unadvertised skill is refused rather than substituted.
+Availability is snapshotted when a logical session is created. Disabled skills are removed before the initial instructions and provider prompt are published. Tool authorization checks the immutable skill catalogue advertised in those instructions, so an explicit `read_skill` request for a disabled, newly installed, or otherwise unadvertised skill is refused rather than substituted. `read_skill_component` uses the same snapshot and accepts only a component name returned by its parent skill; an explicitly shared cross-package component additionally requires its owning skill to be advertised.
 
 An already-running session keeps its original catalogue. Resuming that same logical session keeps its persisted original instructions and therefore the same authorization. Changes apply to subsequently created sessions. This avoids changing tool authority in the middle of a provider-owned context.
 

@@ -13,6 +13,7 @@ pub(crate) use nakode_agent::NAKODE_AGENT_TOOL_NAME;
 mod process;
 mod read;
 mod read_skill;
+mod read_skill_component;
 mod todo;
 mod truncate;
 mod vision;
@@ -115,6 +116,7 @@ impl ToolRegistry {
             tools: vec![
                 Arc::new(read::ReadTool),
                 Arc::new(read_skill::ReadSkillTool),
+                Arc::new(read_skill_component::ReadSkillComponentTool),
                 Arc::new(write::WriteTool),
                 Arc::new(edit::EditTool),
                 Arc::new(bash::BashTool),
@@ -615,6 +617,7 @@ mod tests {
             [
                 "read",
                 "read_skill",
+                "read_skill_component",
                 "write",
                 "edit",
                 "bash",
@@ -642,6 +645,10 @@ mod tests {
 
         assert_eq!(properties("read"), ["limit", "offset", "path"]);
         assert_eq!(properties("read_skill"), ["name"]);
+        assert_eq!(
+            properties("read_skill_component"),
+            ["component_name", "name"]
+        );
         assert_eq!(properties("write"), ["content", "path"]);
         assert_eq!(properties("edit"), ["edits", "path"]);
         assert_eq!(
@@ -734,7 +741,7 @@ mod tests {
         std::fs::create_dir_all(&skill).expect("skill directory");
         std::fs::write(
             skill.join("SKILL.md"),
-            "---\nid: fragile.review.v1\nname: review\ndescription: Review carefully\ncomponents:\n  - policy.md\n---\n\nFULL REVIEW PROCEDURE\n",
+            "---\nid: fragile.review.v1\nname: review\ndescription: Review carefully\n---\n\nFULL REVIEW PROCEDURE\n",
         )
         .expect("skill definition");
         std::fs::write(skill.join("policy.md"), "COMPLETE POLICY\n").expect("skill component");
@@ -754,19 +761,55 @@ mod tests {
             .execute("read_skill", json!({"name": "review"}))
             .await;
         assert!(!result.failed, "{}", result.output);
-        assert!(result.output.contains("FULL REVIEW PROCEDURE"));
+        assert!(!result.output.contains("COMPLETE POLICY"));
+        let payload: Value = serde_json::from_str(&result.output).expect("read_skill JSON");
         assert!(
-            result
-                .output
-                .contains("Loaded components (in order):\n- SKILL.md\n- policy.md")
+            payload["skill_content"]
+                .as_str()
+                .unwrap()
+                .contains("FULL REVIEW PROCEDURE")
         );
-        assert!(result.output.contains("## Loaded component: SKILL.md"));
-        assert!(result.output.contains("## Loaded component: policy.md"));
-        assert!(result.output.contains("COMPLETE POLICY"));
+        assert!(
+            payload["skill_instructions"]
+                .as_str()
+                .unwrap()
+                .contains("read_skill_component")
+        );
+        assert_eq!(
+            payload["components"],
+            json!([{"file_path": "policy.md", "component_name": "policy"}])
+        );
         assert_eq!(
             result.invocation_identity.as_deref(),
             Some("fragile.review.v1")
         );
+
+        let component = harness
+            .execute(
+                "read_skill_component",
+                json!({"name": "review", "component_name": "policy"}),
+            )
+            .await;
+        assert!(!component.failed, "{}", component.output);
+        let component_payload: Value =
+            serde_json::from_str(&component.output).expect("component JSON");
+        assert_eq!(component_payload["name"], "review");
+        assert_eq!(component_payload["file_path"], "policy.md");
+        assert_eq!(component_payload["component_name"], "policy");
+        assert_eq!(component_payload["component_content"], "COMPLETE POLICY\n");
+        assert_eq!(
+            component.invocation_identity.as_deref(),
+            Some("fragile.review.v1")
+        );
+
+        let unknown_component = harness
+            .execute(
+                "read_skill_component",
+                json!({"name": "review", "component_name": "missing"}),
+            )
+            .await;
+        assert!(unknown_component.failed);
+        assert!(unknown_component.output.contains("was not advertised"));
 
         harness.session.instructions =
             "[Nakode Available Skills]\n[/Nakode Available Skills]".to_owned();
@@ -776,6 +819,19 @@ mod tests {
         assert!(disabled.failed);
         assert!(disabled.output.contains("disabled or was not available"));
         assert!(disabled.invocation_identity.is_none());
+        let disabled_component = harness
+            .execute(
+                "read_skill_component",
+                json!({"name": "review", "component_name": "policy"}),
+            )
+            .await;
+        assert!(disabled_component.failed);
+        assert!(
+            disabled_component
+                .output
+                .contains("disabled or was not available")
+        );
+        assert!(disabled_component.invocation_identity.is_none());
 
         let missing = harness
             .execute("read_skill", json!({"name": "missing"}))
@@ -783,6 +839,56 @@ mod tests {
         assert!(missing.failed);
         assert!(missing.output.contains("disabled or was not available"));
         assert!(missing.invocation_identity.is_none());
+    }
+
+    #[tokio::test]
+    async fn external_skill_components_require_both_skills_to_be_advertised() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let review = directory.path().join(".agents/skills/review");
+        let shared = directory.path().join(".agents/skills/shared");
+        std::fs::create_dir_all(&review).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(
+            review.join("SKILL.md"),
+            "---\nname: review\ncomponents:\n  - ../shared/policy.md\n---\nReview.\n",
+        )
+        .unwrap();
+        std::fs::write(shared.join("SKILL.md"), "---\nname: shared\n---\nShared.\n").unwrap();
+        std::fs::write(shared.join("policy.md"), "EXTERNAL POLICY\n").unwrap();
+        let mut harness = ToolHarness {
+            registry: ToolRegistry::base(),
+            workspace: directory.path(),
+            session: RuntimeSession::new(
+                "test-model".to_owned(),
+                "[Nakode Available Skills]\n- review: Review\n  Load: read_skill({\"name\":\"review\"})\n[/Nakode Available Skills]".to_owned(),
+            ),
+            events: mpsc::channel(8).0,
+            questions: QuestionBroker::default(),
+            cancellation: CancellationToken::new(),
+        };
+
+        let denied = harness
+            .execute(
+                "read_skill_component",
+                json!({"name": "review", "component_name": "shared/policy"}),
+            )
+            .await;
+        assert!(denied.failed);
+        assert!(
+            denied
+                .output
+                .contains("belongs to disabled or unavailable skill")
+        );
+
+        harness.session.instructions = "[Nakode Available Skills]\n- review: Review\n  Load: read_skill({\"name\":\"review\"})\n- shared: Shared\n  Load: read_skill({\"name\":\"shared\"})\n[/Nakode Available Skills]".to_owned();
+        let allowed = harness
+            .execute(
+                "read_skill_component",
+                json!({"name": "review", "component_name": "shared/policy"}),
+            )
+            .await;
+        assert!(!allowed.failed, "{}", allowed.output);
+        assert!(allowed.output.contains("EXTERNAL POLICY"));
     }
 
     #[tokio::test]

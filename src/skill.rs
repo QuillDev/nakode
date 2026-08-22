@@ -12,12 +12,23 @@ use crate::controls::SKILL_PREFIX;
 const SKILL_FILE: &str = "SKILL.md";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillComponent {
+    pub component_name: String,
+    pub file_path: String,
+    pub contents: String,
+    owner_skill: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Skill {
     /// Immutable publisher-defined identity. Legacy skills fall back to their exact load name.
     pub id: String,
     pub name: String,
     pub description: String,
+    /// Structured `read_skill` payload used for direct prompt attachment too.
     pub instructions: String,
+    pub content: String,
+    pub components: Vec<SkillComponent>,
     pub path: PathBuf,
 }
 
@@ -29,6 +40,19 @@ impl Skill {
         } else {
             &self.id
         }
+    }
+    #[must_use]
+    pub fn component(&self, name: &str) -> Option<&SkillComponent> {
+        self.components
+            .iter()
+            .find(|component| component.component_name == name)
+    }
+}
+
+impl SkillComponent {
+    #[must_use]
+    pub fn owner_skill(&self) -> &str {
+        &self.owner_skill
     }
 }
 
@@ -93,16 +117,18 @@ pub enum SkillCatalogError {
     EmptyDefinition { path: String },
     #[error("skill component {component:?} declared by {path} is not a safe package-relative path")]
     InvalidComponent { path: String, component: String },
-    #[error("skill component path {component:?} from {path} resolves outside the skill package")]
+    #[error(
+        "skill component path {component:?} from {path} resolves outside the installed skills catalogue"
+    )]
     ComponentEscape { path: String, component: String },
+    #[error("skill {path} advertises duplicate component name {component:?}")]
+    DuplicateComponent { path: String, component: String },
     #[error("failed to read skill component {component} while loading {path}: {source}")]
     ReadComponent {
         path: String,
         component: String,
         source: std::io::Error,
     },
-    #[error("skill component graph contains a cycle at {path}")]
-    ComponentCycle { path: String },
 }
 
 impl SkillCatalog {
@@ -421,18 +447,33 @@ fn read_skill(path: &Path) -> Result<Skill, SkillCatalogError> {
         path: path.display().to_string(),
         source,
     })?;
-    let mut loaded = Vec::new();
-    let mut complete = HashSet::new();
-    let mut loading = HashSet::new();
-    load_component_graph(
+    let catalogue_root = package_root
+        .parent()
+        .expect("skill package always has a catalogue root");
+    let mut components = discover_package_components(&package_root, directory)?;
+    append_declared_components(
+        path,
         &package_root,
-        Path::new(SKILL_FILE),
-        Some(entrypoint),
-        &mut loaded,
-        &mut complete,
-        &mut loading,
+        catalogue_root,
+        directory,
+        &metadata.components,
+        &mut components,
     )?;
-    let instructions = render_loaded_skill(directory, &loaded);
+    components.sort_unstable_by(|left, right| {
+        left.component_name
+            .cmp(&right.component_name)
+            .then_with(|| left.file_path.cmp(&right.file_path))
+    });
+    if let Some(duplicate) = components
+        .windows(2)
+        .find(|pair| pair[0].component_name == pair[1].component_name)
+    {
+        return Err(SkillCatalogError::DuplicateComponent {
+            path: path.display().to_string(),
+            component: duplicate[0].component_name.clone(),
+        });
+    }
+    let instructions = render_skill_payload(directory, &entrypoint, &components);
 
     Ok(Skill {
         id: metadata.id.unwrap_or_else(|| directory.to_owned()),
@@ -441,101 +482,266 @@ fn read_skill(path: &Path) -> Result<Skill, SkillCatalogError> {
             .description
             .unwrap_or_else(|| format!("use the {directory} skill")),
         instructions,
+        content: entrypoint,
+        components,
         path: path.to_path_buf(),
     })
 }
 
-fn load_component_graph(
+fn append_declared_components(
+    definition: &Path,
     package_root: &Path,
-    relative_path: &Path,
-    known_contents: Option<String>,
-    loaded: &mut Vec<(String, String)>,
-    complete: &mut HashSet<PathBuf>,
-    loading: &mut HashSet<PathBuf>,
+    catalogue_root: &Path,
+    declaring_skill: &str,
+    declared_components: &[String],
+    components: &mut Vec<SkillComponent>,
 ) -> Result<(), SkillCatalogError> {
-    let display_path = slash_path(relative_path);
-    let canonical = fs::canonicalize(package_root.join(relative_path)).map_err(|source| {
-        SkillCatalogError::ReadComponent {
-            path: display_path.clone(),
-            component: display_path.clone(),
+    let mut seen = components
+        .iter()
+        .map(|component| fs::canonicalize(package_root.join(&component.file_path)))
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|source| SkillCatalogError::ReadDirectory {
+            path: package_root.display().to_string(),
             source,
-        }
-    })?;
-    if !canonical.starts_with(package_root) {
-        return Err(SkillCatalogError::ComponentEscape {
-            path: display_path.clone(),
-            component: display_path,
-        });
-    }
-    if complete.contains(&canonical) {
-        return Ok(());
-    }
-    if !loading.insert(canonical.clone()) {
-        return Err(SkillCatalogError::ComponentCycle { path: display_path });
-    }
-
-    let contents = if let Some(contents) = known_contents {
-        contents
-    } else {
-        fs::read_to_string(&canonical).map_err(|source| SkillCatalogError::ReadComponent {
-            path: display_path.clone(),
-            component: display_path.clone(),
-            source,
-        })?
-    };
-    let metadata = frontmatter(&contents);
-    loaded.push((display_path.clone(), contents));
-
-    let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
-    for declared in metadata.components {
-        let declared_path = Path::new(&declared);
-        if !safe_component_path(declared_path) {
+        })?;
+    for declared in declared_components {
+        let declared_path = Path::new(declared);
+        if declared_path.is_absolute()
+            || declared_path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Prefix(_)
+                )
+            })
+        {
             return Err(SkillCatalogError::InvalidComponent {
-                path: display_path.clone(),
-                component: declared,
+                path: definition.display().to_string(),
+                component: declared.clone(),
             });
         }
-        let child = parent.join(declared_path);
-        load_component_graph(package_root, &child, None, loaded, complete, loading)?;
+        let canonical = fs::canonicalize(package_root.join(declared_path)).map_err(|source| {
+            SkillCatalogError::ReadComponent {
+                path: definition.display().to_string(),
+                component: declared.clone(),
+                source,
+            }
+        })?;
+        if !canonical.starts_with(catalogue_root) {
+            return Err(SkillCatalogError::ComponentEscape {
+                path: definition.display().to_string(),
+                component: declared.clone(),
+            });
+        }
+        if seen.insert(canonical.clone()) {
+            components.push(component_from_path(
+                catalogue_root,
+                &canonical,
+                declaring_skill,
+                declared,
+            )?);
+        }
     }
-
-    loading.remove(&canonical);
-    complete.insert(canonical);
     Ok(())
 }
 
-fn render_loaded_skill(name: &str, loaded: &[(String, String)]) -> String {
-    let mut rendered =
-        format!("[Nakode Loaded Skill]\nName: {name}\nLoaded components (in order):\n");
-    for (path, _) in loaded {
-        rendered.push_str("- ");
-        rendered.push_str(path);
-        rendered.push('\n');
-    }
-    rendered.push_str("[/Nakode Loaded Skill]\n");
-    for (path, contents) in loaded {
-        rendered.push_str("\n## Loaded component: ");
-        rendered.push_str(path);
-        rendered.push_str("\n\n");
-        rendered.push_str(contents);
-        if !contents.ends_with('\n') {
-            rendered.push('\n');
-        }
-    }
-    rendered
+fn discover_package_components(
+    package_root: &Path,
+    owner_skill: &str,
+) -> Result<Vec<SkillComponent>, SkillCatalogError> {
+    let mut components = Vec::new();
+    let mut visited_directories = HashSet::new();
+    let mut seen_files = HashSet::new();
+    walk_component_directory(
+        package_root,
+        package_root,
+        owner_skill,
+        &mut visited_directories,
+        &mut seen_files,
+        &mut components,
+    )?;
+    Ok(components)
 }
 
-fn safe_component_path(path: &Path) -> bool {
-    !path.as_os_str().is_empty()
-        && path
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
+fn walk_component_directory(
+    package_root: &Path,
+    directory: &Path,
+    owner_skill: &str,
+    visited_directories: &mut HashSet<PathBuf>,
+    seen_files: &mut HashSet<PathBuf>,
+    components: &mut Vec<SkillComponent>,
+) -> Result<(), SkillCatalogError> {
+    let canonical_directory =
+        fs::canonicalize(directory).map_err(|source| SkillCatalogError::ReadDirectory {
+            path: directory.display().to_string(),
+            source,
+        })?;
+    if !canonical_directory.starts_with(package_root) {
+        return Err(SkillCatalogError::ComponentEscape {
+            path: directory.display().to_string(),
+            component: directory.display().to_string(),
+        });
+    }
+    if !visited_directories.insert(canonical_directory.clone()) {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(&canonical_directory)
+        .map_err(|source| SkillCatalogError::ReadDirectory {
+            path: canonical_directory.display().to_string(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| SkillCatalogError::ReadDirectory {
+            path: canonical_directory.display().to_string(),
+            source,
+        })?;
+    entries.sort_unstable_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
+        let path = entry.path();
+        let canonical =
+            fs::canonicalize(&path).map_err(|source| SkillCatalogError::ReadComponent {
+                path: path.display().to_string(),
+                component: path.display().to_string(),
+                source,
+            })?;
+        if canonical.is_dir() {
+            walk_component_directory(
+                package_root,
+                &canonical,
+                owner_skill,
+                visited_directories,
+                seen_files,
+                components,
+            )?;
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some(SKILL_FILE)
+            || path.extension().and_then(|extension| extension.to_str()) != Some("md")
+            || !seen_files.insert(canonical.clone())
+        {
+            continue;
+        }
+        if !canonical.starts_with(package_root) {
+            return Err(SkillCatalogError::ComponentEscape {
+                path: path.display().to_string(),
+                component: path.display().to_string(),
+            });
+        }
+        let relative =
+            path.strip_prefix(package_root)
+                .map_err(|_| SkillCatalogError::ComponentEscape {
+                    path: path.display().to_string(),
+                    component: path.display().to_string(),
+                })?;
+        components.push(read_component(
+            &canonical,
+            owner_skill,
+            slash_path(relative),
+            component_name(relative),
+        )?);
+    }
+    Ok(())
+}
+
+fn component_from_path(
+    catalogue_root: &Path,
+    canonical: &Path,
+    declaring_skill: &str,
+    declared_path: &str,
+) -> Result<SkillComponent, SkillCatalogError> {
+    if canonical.file_name().and_then(|name| name.to_str()) == Some(SKILL_FILE)
+        || canonical
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("md")
+    {
+        return Err(SkillCatalogError::InvalidComponent {
+            path: declaring_skill.to_owned(),
+            component: declared_path.to_owned(),
+        });
+    }
+    let relative =
+        canonical
+            .strip_prefix(catalogue_root)
+            .map_err(|_| SkillCatalogError::ComponentEscape {
+                path: declaring_skill.to_owned(),
+                component: declared_path.to_owned(),
+            })?;
+    let mut parts = relative.components();
+    let owner_skill = parts
+        .next()
+        .and_then(|part| match part {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .filter(|name| valid_name(name))
+        .ok_or_else(|| SkillCatalogError::InvalidComponent {
+            path: declaring_skill.to_owned(),
+            component: declared_path.to_owned(),
+        })?;
+    let owner_relative = parts.collect::<PathBuf>();
+    let name = component_name(&owner_relative);
+    let component_name = if owner_skill == declaring_skill {
+        name
+    } else {
+        format!("{owner_skill}/{name}")
+    };
+    read_component(
+        canonical,
+        owner_skill,
+        declared_path.to_owned(),
+        component_name,
+    )
+}
+
+fn read_component(
+    canonical: &Path,
+    owner_skill: &str,
+    file_path: String,
+    component_name: String,
+) -> Result<SkillComponent, SkillCatalogError> {
+    let contents =
+        fs::read_to_string(canonical).map_err(|source| SkillCatalogError::ReadComponent {
+            path: canonical.display().to_string(),
+            component: file_path.clone(),
+            source,
+        })?;
+    Ok(SkillComponent {
+        component_name,
+        file_path,
+        contents,
+        owner_skill: owner_skill.to_owned(),
+    })
+}
+
+fn component_name(path: &Path) -> String {
+    let mut without_extension = path.to_path_buf();
+    without_extension.set_extension("");
+    slash_path(&without_extension)
+}
+
+fn render_skill_payload(name: &str, content: &str, components: &[SkillComponent]) -> String {
+    serde_json::json!({
+        "skill_instructions": format!(
+            "Read skill_content first. Components are not loaded automatically. When skill_content references a component or the current step needs one, call read_skill_component with name {name:?} and an exact component_name from components."
+        ),
+        "skill_content": content,
+        "components": components
+            .iter()
+            .map(|component| serde_json::json!({
+                "file_path": component.file_path,
+                "component_name": component.component_name,
+            }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
 }
 
 fn slash_path(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
             std::path::Component::Normal(value) => Some(value.to_string_lossy()),
+            std::path::Component::ParentDir => Some("..".into()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -830,85 +1036,114 @@ mod tests {
     }
 
     #[test]
-    fn single_file_skills_are_complete_and_disclose_the_entrypoint() {
+    fn single_file_skills_return_structured_json_without_components() {
         let root = tempdir().expect("skill root");
         write_skill(root.path(), "review", "review code", "Review carefully.");
 
         let catalog = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap();
-        let instructions = &catalog.find("review").unwrap().instructions;
+        let skill = catalog.find("review").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&skill.instructions).unwrap();
 
-        assert!(instructions.starts_with(
-            "[Nakode Loaded Skill]\nName: review\nLoaded components (in order):\n- SKILL.md\n[/Nakode Loaded Skill]"
-        ));
-        assert!(instructions.contains("## Loaded component: SKILL.md"));
-        assert!(instructions.contains("Review carefully."));
-    }
-
-    #[test]
-    fn declared_components_load_recursively_once_in_depth_first_order() {
-        let root = tempdir().expect("skill root");
-        let skill = root.path().join("review");
-        fs::create_dir_all(skill.join("nested")).unwrap();
-        fs::write(
-            skill.join(SKILL_FILE),
-            "---\nname: review\ndescription: review code\ncomponents:\n  - first.md\n  - last.md\n---\n\nEntrypoint.\n",
-        )
-        .unwrap();
-        fs::write(
-            skill.join("first.md"),
-            "---\ncomponents:\n  - nested/detail.md\n---\n\nFirst.\n",
-        )
-        .unwrap();
-        fs::write(
-            skill.join("nested/detail.md"),
-            "---\ncomponents:\n  - ../ignored.md\n---\n\nDetail.\n",
-        )
-        .unwrap();
-        fs::write(skill.join("last.md"), "Last.\n").unwrap();
-
-        let error = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap_err();
-        assert!(matches!(error, SkillCatalogError::InvalidComponent { .. }));
-
-        fs::write(skill.join("nested/detail.md"), "Detail.\n").unwrap();
-        let catalog = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap();
-        let instructions = &catalog.find("review").unwrap().instructions;
-        let entry = instructions.find("- SKILL.md").unwrap();
-        let first = instructions.find("- first.md").unwrap();
-        let detail = instructions.find("- nested/detail.md").unwrap();
-        let last = instructions.find("- last.md").unwrap();
-        assert!(entry < first && first < detail && detail < last);
-        assert_eq!(instructions.matches("## Loaded component:").count(), 4);
-    }
-
-    #[test]
-    fn duplicate_and_cyclic_component_references_are_handled_explicitly() {
-        let root = tempdir().expect("skill root");
-        let skill = root.path().join("review");
-        fs::create_dir_all(&skill).unwrap();
-        fs::write(
-            skill.join(SKILL_FILE),
-            "---\nname: review\ncomponents:\n  - shared.md\n  - shared.md\n---\n",
-        )
-        .unwrap();
-        fs::write(skill.join("shared.md"), "Shared.\n").unwrap();
-        let catalog = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap();
-        assert_eq!(
-            catalog
-                .find("review")
+        assert!(
+            payload["skill_content"]
+                .as_str()
                 .unwrap()
-                .instructions
-                .matches("## Loaded component: shared.md")
-                .count(),
-            1
+                .contains("Review carefully.")
         );
+        assert_eq!(payload["components"], serde_json::json!([]));
+        assert!(
+            payload["skill_instructions"]
+                .as_str()
+                .unwrap()
+                .contains("read_skill_component")
+        );
+    }
 
+    #[test]
+    fn markdown_components_are_auto_discovered_recursively_in_stable_name_order() {
+        let root = tempdir().expect("skill root");
+        let skill = root.path().join("review");
+        fs::create_dir_all(skill.join("platform/github")).unwrap();
         fs::write(
-            skill.join("shared.md"),
-            "---\ncomponents:\n  - SKILL.md\n---\nShared.\n",
+            skill.join(SKILL_FILE),
+            "---\nname: review\ndescription: review code\n---\n\nRead platform/github/checks.md.\n",
         )
         .unwrap();
-        let error = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap_err();
-        assert!(matches!(error, SkillCatalogError::ComponentCycle { .. }));
+        fs::write(skill.join("z-last.md"), "Last.\n").unwrap();
+        fs::write(skill.join("platform/github/checks.md"), "Checks.\n").unwrap();
+        fs::write(skill.join("ignored.txt"), "Ignored.\n").unwrap();
+
+        let catalog = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap();
+        let skill = catalog.find("review").unwrap();
+        assert_eq!(
+            skill
+                .components
+                .iter()
+                .map(|component| (
+                    component.component_name.as_str(),
+                    component.file_path.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("platform/github/checks", "platform/github/checks.md"),
+                ("z-last", "z-last.md")
+            ]
+        );
+        assert!(!skill.instructions.contains("Checks."));
+        let payload: serde_json::Value = serde_json::from_str(&skill.instructions).unwrap();
+        assert_eq!(
+            payload["components"][0],
+            serde_json::json!({
+                "file_path": "platform/github/checks.md",
+                "component_name": "platform/github/checks"
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_cross_package_components_use_qualified_names_and_file_paths() {
+        let root = tempdir().expect("skill root");
+        let review = root.path().join("review");
+        fs::create_dir_all(&review).unwrap();
+        fs::write(
+            review.join(SKILL_FILE),
+            "---\nname: review\ncomponents:\n  - ../shared/policy.md\n---\n",
+        )
+        .unwrap();
+        write_skill(root.path(), "shared", "shared policy", "Shared entrypoint.");
+        fs::write(root.path().join("shared/policy.md"), "Shared policy.\n").unwrap();
+
+        let catalog = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap();
+        let component = catalog
+            .find("review")
+            .unwrap()
+            .component("shared/policy")
+            .unwrap();
+        assert_eq!(component.file_path, "../shared/policy.md");
+        assert_eq!(component.owner_skill(), "shared");
+    }
+
+    #[test]
+    fn duplicate_logical_component_names_are_rejected() {
+        let root = tempdir().expect("skill root");
+        let review = root.path().join("review");
+        fs::create_dir_all(review.join("shared")).unwrap();
+        fs::write(
+            review.join(SKILL_FILE),
+            "---\nname: review\ncomponents:\n  - ../shared/policy.md\n---\n",
+        )
+        .unwrap();
+        fs::write(review.join("shared/policy.md"), "Local policy.\n").unwrap();
+        write_skill(root.path(), "shared", "shared policy", "Shared entrypoint.");
+        fs::write(root.path().join("shared/policy.md"), "External policy.\n").unwrap();
+
+        let error = SkillCatalog::load_from_roots(Some(root.path()), None)
+            .expect_err("duplicate logical names must fail");
+        assert!(matches!(
+            error,
+            SkillCatalogError::DuplicateComponent { .. }
+        ));
+        assert!(error.to_string().contains("shared/policy"));
     }
 
     #[test]
@@ -923,9 +1158,9 @@ mod tests {
         .unwrap();
         let missing = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap_err();
         assert!(matches!(missing, SkillCatalogError::ReadComponent { .. }));
-        assert!(missing.to_string().contains("missing.md"));
 
-        fs::create_dir(skill.join("missing.md")).unwrap();
+        fs::write(skill.join(SKILL_FILE), "---\nname: review\n---\n").unwrap();
+        fs::write(skill.join("broken.md"), [0xff, 0xfe]).unwrap();
         let unreadable = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap_err();
         assert!(matches!(
             unreadable,
@@ -935,48 +1170,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn canonical_component_identity_deduplicates_aliases_and_detects_symlink_cycles() {
+    fn canonical_component_identity_deduplicates_aliases_and_directory_cycles() {
         let root = tempdir().expect("skill root");
         let skill = root.path().join("review");
         fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join(SKILL_FILE), "---\nname: review\n---\n").unwrap();
         fs::write(skill.join("shared.md"), "Shared.\n").unwrap();
         std::os::unix::fs::symlink("shared.md", skill.join("alias.md")).unwrap();
-        fs::write(
-            skill.join(SKILL_FILE),
-            "---\nname: review\ncomponents:\n  - shared.md\n  - alias.md\n---\n",
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(".", skill.join("loop")).unwrap();
 
         let catalog = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap();
-        let instructions = &catalog.find("review").unwrap().instructions;
-        assert_eq!(instructions.matches("## Loaded component:").count(), 2);
-        assert!(!instructions.contains("## Loaded component: alias.md"));
-
-        fs::write(
-            skill.join("shared.md"),
-            "---\ncomponents:\n  - loop/shared.md\n---\nShared.\n",
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(".", skill.join("loop")).unwrap();
-        let error = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap_err();
-        assert!(matches!(error, SkillCatalogError::ComponentCycle { .. }));
+        let skill = catalog.find("review").unwrap();
+        assert_eq!(skill.components.len(), 1);
+        assert_eq!(skill.components[0].component_name, "alias");
     }
 
     #[cfg(unix)]
     #[test]
-    fn component_symlinks_cannot_escape_the_skill_package() {
+    fn component_symlinks_cannot_escape_the_skill_catalogue() {
         let root = tempdir().expect("skill root");
         let outside = tempdir().expect("outside root");
         let skill = root.path().join("review");
         fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join(SKILL_FILE), "---\nname: review\n---\n").unwrap();
         fs::write(outside.path().join("outside.md"), "Outside.\n").unwrap();
         std::os::unix::fs::symlink(outside.path().join("outside.md"), skill.join("escape.md"))
             .unwrap();
-        fs::write(
-            skill.join(SKILL_FILE),
-            "---\nname: review\ncomponents:\n  - escape.md\n---\n",
-        )
-        .unwrap();
 
         let error = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap_err();
         assert!(matches!(error, SkillCatalogError::ComponentEscape { .. }));

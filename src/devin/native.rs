@@ -1350,6 +1350,7 @@ mod tests {
             [
                 "read",
                 "read_skill",
+                "read_skill_component",
                 "write",
                 "edit",
                 "bash",
