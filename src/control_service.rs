@@ -28,6 +28,9 @@ const ACTIVATION_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 // Server-side quiescence fencing is bounded at three seconds. Leave enough time for that response
 // under load while ensuring endpoint discovery cannot consume the CLI's larger command deadline.
 const LIFECYCLE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(8);
+// A newly spawned service may bind its socket before its lifecycle task starts responding. Startup
+// polling must stay brief so one queued probe cannot consume the whole readiness retry budget.
+const SERVICE_START_PING_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
 const RESUME_ENVIRONMENT_KEYS: [&str; 2] = ["NAKODE_RESUME", "NAKO_AGENT_RESUME"];
 const SERVICE_EXECUTABLE_IDENTITY_ENVIRONMENT: &str = "NAKODE_SERVICE_EXECUTABLE_IDENTITY";
@@ -1087,9 +1090,13 @@ async fn ensure_service_at_with_timeout(
 
     for _ in 0..SERVICE_START_ATTEMPTS {
         tokio::time::sleep(SERVICE_START_RETRY).await;
-        if ping_at_with_timeout(service_path.lifecycle(), config, timeout)
-            .await
-            .is_ok()
+        if ping_at_with_timeout(
+            service_path.lifecycle(),
+            config,
+            timeout.min(SERVICE_START_PING_TIMEOUT),
+        )
+        .await
+        .is_ok()
         {
             return Ok(());
         }
