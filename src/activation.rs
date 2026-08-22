@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use nakode_sdk::v1 as api;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -38,6 +38,7 @@ const CHECK_CADENCE_MS: u64 = 15_000;
 const HELPER_START_GRACE: Duration = Duration::from_secs(5);
 const HELPER_HEARTBEAT_STALE_MS: u64 = CHECK_CADENCE_MS * 2 + 5_000;
 const BLOCKER_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+const BLOCKER_QUERY_CONCURRENCY: usize = 16;
 const WATCH_CADENCE: Duration = Duration::from_millis(250);
 const HISTORY_LIMIT: usize = 50;
 const IDEMPOTENCY_LIMIT: usize = 50;
@@ -1636,15 +1637,30 @@ async fn collect_blockers_unbounded(
         .await
         .map_err(|error| error.to_string())?;
     let mut blockers = Vec::new();
-    for summary in workspace
-        .sessions
-        .into_iter()
-        .filter(|summary| summary.running)
-    {
-        let state = client
-            .get_session(summary.id.clone())
-            .await
-            .map_err(|error| format!("failed to inspect session {}: {error}", summary.id))?;
+    // Workspace summaries are a projection and their `running` bit can lag the authoritative
+    // session snapshot during turn startup. Inspect every listed session so a stale summary can
+    // never make the helper attempt cutover. Bound parallelism and the enclosing deadline keep
+    // large inventories from serially consuming the helper's activation lease.
+    let inspections = futures_util::stream::iter(workspace.sessions).map(|summary| {
+        let client = client.clone();
+        async move {
+            let session_id = summary.id;
+            match client.get_session(session_id.clone()).await {
+                Ok(state) => Ok(Some(state)),
+                Err(nakode_sdk::SdkError::Status(status))
+                    if status.code() == tonic::Code::NotFound =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(format!("failed to inspect session {session_id}: {error}")),
+            }
+        }
+    });
+    let mut inspections = inspections.buffer_unordered(BLOCKER_QUERY_CONCURRENCY);
+    while let Some(state) = inspections.next().await {
+        let Some(state) = state? else {
+            continue;
+        };
         if !session_has_live_work(&state) {
             continue;
         }
