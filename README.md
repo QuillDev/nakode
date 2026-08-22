@@ -405,10 +405,43 @@ workspace-local skills taking precedence when names overlap:
 Reference a discovered skill anywhere in a prompt with `/skill:<skill-name>`.
 Nakode offers discovered names in composer completion and attaches the selected
 skill instructions to that turn while keeping the original prompt unchanged in
-the visible transcript. Skill publishers should include a bounded immutable `id`
-in YAML frontmatter (for example, `id: fragile.code-review.v1`) so local invocation
-history follows a skill when its directory/load name changes. Legacy skills without
-an `id` remain compatible and use their exact catalogue name as historical identity.
+the visible transcript. `SKILL.md` is the operational entrypoint. Every other
+Markdown file below the same skill directory is automatically catalogued as a
+component; `references/github/checks.md` is exposed as component name
+`references/github/checks` with that exact file path. Non-Markdown files and
+nested `SKILL.md` entrypoints are not components.
+
+`read_skill` returns JSON with this shape:
+
+```json
+{
+  "skill_instructions": "Read skill_content first ... load components with read_skill_component ...",
+  "skill_content": "<complete SKILL.md>",
+  "components": [
+    {"file_path": "references/github/checks.md", "component_name": "references/github/checks"}
+  ]
+}
+```
+
+Component bodies are not injected eagerly. Load one by exact advertised name
+with `read_skill_component({"name":"code-review","component_name":"references/github/checks"})`.
+This keeps optional reference material out of model context while ensuring the
+agent never searches package directories or guesses a path.
+
+Only a component outside the skill directory needs an explicit frontmatter
+entry, for example `../shared-review/policy.md`. External declarations must
+resolve to a Markdown component under the same installed skills catalogue, are
+exposed with an owner-qualified component name such as `shared-review/policy`,
+and can be loaded only when that owning skill is also advertised to the session.
+Absolute paths, catalogue escapes, `SKILL.md` imports, symlink escapes, missing
+files, and unreadable components reject the skill instead of exposing arbitrary
+filesystem content. Discovery order and JSON component order are deterministic,
+and canonical identity de-duplicates aliases and directory cycles.
+
+Skill publishers should include a bounded immutable `id` in YAML frontmatter
+(for example, `id: fragile.code-review.v1`) so local invocation history follows
+a skill when its directory/load name changes. Legacy skills without an `id`
+remain compatible and use their exact catalogue name as historical identity.
 
 ## Herdr integration
 

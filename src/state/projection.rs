@@ -2779,7 +2779,10 @@ mod tests {
         assert_eq!(run.policy.provider, CODEX_PROVIDER);
         assert!(run.policy.policy_available);
         assert!(run.policy.provider_tools_restricted);
-        assert_eq!(run.policy.provider_allowed_tools, ["read_skill"]);
+        assert_eq!(
+            run.policy.provider_allowed_tools,
+            ["read_skill", "read_skill_component"]
+        );
         assert_eq!(
             run.policy.unsupported_canonical_tools.len(),
             MAX_RUN_POLICY_ITEMS
