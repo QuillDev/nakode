@@ -787,6 +787,8 @@ impl Drop for HelperLease {
 
 struct ActivationSocketLease {
     path: PathBuf,
+    owner_path: PathBuf,
+    owner: String,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -794,7 +796,7 @@ struct ActivationSocketLease {
 }
 
 impl ActivationSocketLease {
-    fn capture(path: &Path) -> Result<Self, ActivationError> {
+    fn capture(path: &Path, helper_lease: &HelperLease) -> Result<Self, ActivationError> {
         let metadata = std::fs::metadata(path).map_err(|source| ActivationError::Read {
             path: path.display().to_string(),
             source,
@@ -804,6 +806,8 @@ impl ActivationSocketLease {
             use std::os::unix::fs::MetadataExt;
             Ok(Self {
                 path: path.to_owned(),
+                owner_path: helper_lease.path.clone(),
+                owner: helper_lease.owner.clone(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
             })
@@ -813,11 +817,16 @@ impl ActivationSocketLease {
             let _ = metadata;
             Ok(Self {
                 path: path.to_owned(),
+                owner_path: helper_lease.path.clone(),
+                owner: helper_lease.owner.clone(),
             })
         }
     }
 
     fn still_owns_path(&self) -> bool {
+        if !std::fs::read_to_string(&self.owner_path).is_ok_and(|owner| owner == self.owner) {
+            return false;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -866,7 +875,7 @@ pub async fn run_helper(config: Config) -> Result<(), ActivationError> {
         Err(error) => return Err(error),
     };
     let listener = bind_service_listener(paths.activation_api()).await?;
-    let _socket_lease = ActivationSocketLease::capture(paths.activation_api())?;
+    let _socket_lease = ActivationSocketLease::capture(paths.activation_api(), &helper_lease)?;
     let executable = std::env::current_exe().map_err(|source| ActivationError::Write {
         path: "current executable".to_owned(),
         source,
@@ -2670,14 +2679,22 @@ mod tests {
     fn socket_lease_drop_preserves_a_replacement_owner() {
         let directory = tempfile::tempdir().expect("activation directory");
         let socket = directory.path().join("activation.sock");
-        std::fs::write(&socket, "first").expect("first owner");
-        let lease = ActivationSocketLease::capture(&socket).expect("capture socket owner");
-        std::fs::remove_file(&socket).expect("unlink first owner");
-        std::fs::write(&socket, "replacement").expect("replacement owner");
+        let helper_lock = directory.path().join("activation-helper.lock");
+        std::fs::write(&helper_lock, "first").expect("first helper owner");
+        let helper_lease = HelperLease {
+            path: helper_lock.clone(),
+            owner: "first".to_owned(),
+        };
+        std::fs::write(&socket, "first").expect("first socket owner");
+        let lease =
+            ActivationSocketLease::capture(&socket, &helper_lease).expect("capture socket owner");
+        std::fs::remove_file(&socket).expect("unlink first socket owner");
+        std::fs::write(&helper_lock, "replacement").expect("replacement helper owner");
+        std::fs::write(&socket, "replacement").expect("replacement socket owner");
 
         drop(lease);
         assert_eq!(
-            std::fs::read_to_string(socket).expect("replacement remains"),
+            std::fs::read_to_string(socket).expect("replacement socket remains"),
             "replacement"
         );
     }
