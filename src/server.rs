@@ -3917,14 +3917,84 @@ fn inspect_workspace_path(
 }
 
 fn sanitized_repository_identity(value: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(value) else {
-        return value.to_owned();
-    };
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        let _ = parsed.set_username("");
-        let _ = parsed.set_password(None);
+    const UNRECOGNIZED: &str = "[unrecognized repository]";
+
+    let value = value.trim();
+    if value.chars().any(char::is_whitespace) || value.contains(['?', '#']) {
+        return UNRECOGNIZED.to_owned();
     }
-    parsed.to_string()
+
+    if value.contains("://") {
+        if let Ok(parsed) = reqwest::Url::parse(value)
+            && matches!(parsed.scheme(), "http" | "https" | "ssh" | "git")
+            && let Some(host) = parsed.host_str()
+            && let Some(path) = canonical_repository_path(parsed.path())
+        {
+            return canonical_repository_identity(host, parsed.port(), &path);
+        }
+        return UNRECOGNIZED.to_owned();
+    }
+
+    if let Some((authority, path)) = value.split_once(':')
+        && !authority.contains('/')
+        && !path
+            .split('/')
+            .next()
+            .is_some_and(|component| component.contains('@') || component.parse::<u16>().is_ok())
+        && let Some(path) = canonical_repository_path(path)
+    {
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        if !host.is_empty() {
+            return canonical_repository_identity(host, None, &path);
+        }
+    }
+
+    if let Some((authority, path)) = value.split_once('/')
+        && let Some(path) = canonical_repository_path(path)
+    {
+        let authority = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let (host, port) = authority
+            .rsplit_once(':')
+            .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, Some(port))))
+            .unwrap_or((authority, None));
+        if !host.is_empty() {
+            return canonical_repository_identity(host, port, &path);
+        }
+    }
+
+    UNRECOGNIZED.to_owned()
+}
+
+fn canonical_repository_identity(host: &str, port: Option<u16>, path: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    let path = if host == "github.com" {
+        path.to_ascii_lowercase()
+    } else {
+        path.to_owned()
+    };
+    match port {
+        Some(port) => format!("{host}:{port}/{path}"),
+        None => format!("{host}/{path}"),
+    }
+}
+
+fn canonical_repository_path(value: &str) -> Option<String> {
+    let mut path = value.trim_matches('/');
+    if let Some(without_suffix) = path.strip_suffix(".git") {
+        path = without_suffix.trim_end_matches('/');
+    }
+    if path.is_empty()
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return None;
+    }
+    Some(path.to_owned())
 }
 
 fn canonical_working_directory(
@@ -4729,14 +4799,46 @@ mod tests {
     }
 
     #[test]
-    fn repository_identity_removes_url_userinfo_before_projection_or_comparison() {
+    fn repository_identity_removes_credentials_and_normalizes_transport_spelling() {
         assert_eq!(
             sanitized_repository_identity("https://token:secret@example.invalid/team/repo.git"),
-            "https://example.invalid/team/repo.git"
+            "example.invalid/team/repo"
         );
         assert_eq!(
             sanitized_repository_identity("git@example.invalid:team/repo.git"),
-            "git@example.invalid:team/repo.git"
+            "example.invalid/team/repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("ssh://git@example.invalid/team/repo.git"),
+            "example.invalid/team/repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("https://github.com/QuillDev/Nakode.git"),
+            "github.com/quilldev/nakode"
+        );
+        assert_eq!(
+            sanitized_repository_identity("github.com/quilldev/nakode"),
+            "github.com/quilldev/nakode"
+        );
+        assert_eq!(
+            sanitized_repository_identity("token:secret@example.invalid/team/Repo.git/"),
+            "example.invalid/team/Repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("example.invalid:8443/team/Repo.git/"),
+            "example.invalid:8443/team/Repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("https://example.invalid/team/Repo.git/"),
+            "example.invalid/team/Repo"
+        );
+        assert_eq!(
+            sanitized_repository_identity("file:///tmp/repo.git"),
+            "[unrecognized repository]"
+        );
+        assert_eq!(
+            sanitized_repository_identity("https://example.invalid/team/repo.git?token=secret"),
+            "[unrecognized repository]"
         );
     }
 
@@ -4788,7 +4890,7 @@ mod tests {
         );
         assert_eq!(
             clean.git_repository.as_deref(),
-            Some("ssh://example.invalid/team/repo.git")
+            Some("example.invalid/team/repo")
         );
         assert_eq!(clean.branch.as_deref(), Some("main"));
         assert_eq!(clean.revision.as_deref().map(str::len), Some(40));
