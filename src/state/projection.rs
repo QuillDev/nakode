@@ -15,8 +15,8 @@ use nakode_protocol::{
     RunTextWindow, RunToolDenialView, RunView, SessionActivity, SessionId, SessionSummary,
     SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView, TodoPhaseView,
     TodoStatusView, TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus,
-    TranscriptEntryView, TranscriptPage, TurnId, TurnStatus, TurnView, VisionSettingsView,
-    WebSettingsView, WorkspaceId,
+    TranscriptEntryView, TranscriptPage, TurnId, TurnStatus, TurnView, VisionAvailabilityView,
+    VisionSettingsView, WebSettingsView, WorkspaceId,
 };
 
 use super::{
@@ -166,7 +166,7 @@ pub fn bootstrap(
                 description: skill.description.clone(),
             })
             .collect(),
-        settings: settings_view(state),
+        settings: settings_view(state, providers),
         sessions: session_summaries,
         active_session: Some(active_session),
     }
@@ -1178,7 +1178,70 @@ fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView
     }
 }
 
-fn settings_view(state: &DomainState) -> SettingsView {
+fn vision_settings_view(state: &DomainState, providers: &[ProviderRecord]) -> VisionSettingsView {
+    let Some(configured_id) = state.vision_config.model.as_deref() else {
+        return VisionSettingsView {
+            model_id: None,
+            availability: VisionAvailabilityView::Disabled,
+            diagnostic: "The callable vision add-on is disabled.".to_owned(),
+        };
+    };
+    let model_id = Some(ModelId::from(configured_id));
+    let Some(model) = state
+        .models
+        .iter()
+        .find(|model| model.qualified_id() == configured_id)
+    else {
+        return VisionSettingsView {
+            model_id,
+            availability: VisionAvailabilityView::ModelUnavailable,
+            diagnostic: "The selected vision model is no longer in the live provider catalogue. Choose an available vision model.".to_owned(),
+        };
+    };
+    if !model_configuration(model, true).vision_eligible {
+        return VisionSettingsView {
+            model_id,
+            availability: VisionAvailabilityView::ModelUnsupported,
+            diagnostic: "The selected model does not support the callable vision service. Choose a vision-eligible model.".to_owned(),
+        };
+    }
+    let provider = providers
+        .iter()
+        .find(|provider| provider.provider == model.provider);
+    let provider_ready = provider.is_some_and(|provider| {
+        provider.enabled
+            && state
+                .provider_connection(&provider.provider)
+                .is_some_and(|connection| matches!(connection, ConnectionState::Ready { .. }))
+    });
+    if !provider_ready {
+        return VisionSettingsView {
+            model_id,
+            availability: VisionAvailabilityView::ProviderUnavailable,
+            diagnostic:
+                "The selected model's provider is disconnected. Connect or reload that provider."
+                    .to_owned(),
+        };
+    }
+    if state
+        .available_builtin_tools(&model.provider)
+        .is_some_and(|tools| tools.iter().any(|tool| tool == "vision"))
+    {
+        VisionSettingsView {
+            model_id,
+            availability: VisionAvailabilityView::Ready,
+            diagnostic: "The callable vision service is ready.".to_owned(),
+        }
+    } else {
+        VisionSettingsView {
+            model_id,
+            availability: VisionAvailabilityView::ServiceUnavailable,
+            diagnostic: "The selected model has no live provider-backed callable vision service. Reload its provider or choose another vision model.".to_owned(),
+        }
+    }
+}
+
+fn settings_view(state: &DomainState, providers: &[ProviderRecord]) -> SettingsView {
     SettingsView {
         web: WebSettingsView {
             backend: match state.web_config.backend {
@@ -1208,9 +1271,7 @@ fn settings_view(state: &DomainState) -> SettingsView {
             configured: state.memory_config.configured(),
             available: state.memory_config.available(),
         },
-        vision: VisionSettingsView {
-            model_id: state.vision_config.model.clone().map(ModelId::from),
-        },
+        vision: vision_settings_view(state, providers),
         terminal_images: match state.terminal_image_mode {
             TerminalImageMode::Auto => TerminalImageModeView::Auto,
             TerminalImageMode::On => TerminalImageModeView::On,
@@ -1866,13 +1927,17 @@ mod tests {
         MAX_RUN_TOOL_DENIALS, MAX_SESSION_RUNS, MAX_TRANSCRIPT_ENTRY_BODY_BYTES,
         MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES, MAX_TRANSCRIPT_SNAPSHOT_ENTRIES, RunId, RunOutcome,
         RunStatus, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
+        VisionAvailabilityView,
     };
 
-    use super::{artifact_view, bootstrap, capabilities_view, model_configuration, run_outcome};
+    use super::{
+        artifact_view, bootstrap, capabilities_view, model_configuration, run_outcome,
+        vision_settings_view,
+    };
     use crate::{
         backend::{
-            BackendCapabilities, CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER,
-            CapabilitySupport, ModelInfo, PromptImage,
+            BackendCapabilities, BackendEvent, BackendIdentity, CLAUDE_PROVIDER, CODEX_PROVIDER,
+            CURSOR_PROVIDER, CapabilitySupport, ModelInfo, PromptImage,
         },
         domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
         session::{ProviderRecord, SubagentObservability, SubagentRecord},
@@ -1894,6 +1959,75 @@ mod tests {
             !capabilities_view(&BackendCapabilities::default())
                 .supports(nakode_protocol::ProviderCapability::ExternalTools)
         );
+    }
+
+    #[test]
+    fn vision_readiness_reconciles_luna_with_model_and_live_service_authority() {
+        let provider = ProviderRecord {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            enabled: true,
+            credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
+        };
+        let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
+        state.install_vision_config(crate::vision::VisionConfig {
+            model: Some("openai-codex/gpt-5.6-luna".to_owned()),
+        });
+
+        assert_eq!(
+            vision_settings_view(&state, std::slice::from_ref(&provider)).availability,
+            VisionAvailabilityView::ModelUnavailable
+        );
+
+        state.install_vision_config(crate::vision::VisionConfig {
+            model: Some(format!("{CURSOR_PROVIDER}/composer-2")),
+        });
+        state.install_cached_models(vec![model(CURSOR_PROVIDER, "composer-2")]);
+        let cursor_provider = ProviderRecord {
+            provider: CURSOR_PROVIDER.to_owned(),
+            display_name: "Cursor".to_owned(),
+            enabled: true,
+            credential: None,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
+        };
+        assert_eq!(
+            vision_settings_view(&state, &[cursor_provider]).availability,
+            VisionAvailabilityView::ModelUnsupported
+        );
+
+        state.install_vision_config(crate::vision::VisionConfig {
+            model: Some("openai-codex/gpt-5.6-luna".to_owned()),
+        });
+        state.install_cached_models(vec![model(CODEX_PROVIDER, "gpt-5.6-luna")]);
+        assert_eq!(
+            vision_settings_view(&state, std::slice::from_ref(&provider)).availability,
+            VisionAvailabilityView::ProviderUnavailable
+        );
+
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: Some("live".to_owned()),
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        assert_eq!(
+            vision_settings_view(&state, std::slice::from_ref(&provider)).availability,
+            VisionAvailabilityView::ServiceUnavailable
+        );
+
+        state.install_available_builtin_tools(std::collections::HashMap::from([(
+            CODEX_PROVIDER.to_owned(),
+            vec!["vision".to_owned()],
+        )]));
+        let ready = vision_settings_view(&state, &[provider]);
+        assert_eq!(ready.availability, VisionAvailabilityView::Ready);
+        assert!(ready.diagnostic.contains("ready"));
     }
 
     #[test]

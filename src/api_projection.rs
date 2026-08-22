@@ -915,6 +915,26 @@ fn settings(value: api::Settings) -> Result<view::SettingsView, String> {
         },
         vision: view::VisionSettingsView {
             model_id: vision.model_id.map(view::ModelId::from),
+            availability: match api::VisionAvailability::try_from(vision.availability)
+                .map_err(invalid_enum)?
+            {
+                api::VisionAvailability::Disabled => view::VisionAvailabilityView::Disabled,
+                api::VisionAvailability::Ready => view::VisionAvailabilityView::Ready,
+                api::VisionAvailability::ModelUnavailable => {
+                    view::VisionAvailabilityView::ModelUnavailable
+                }
+                api::VisionAvailability::ModelUnsupported => {
+                    view::VisionAvailabilityView::ModelUnsupported
+                }
+                api::VisionAvailability::ProviderUnavailable => {
+                    view::VisionAvailabilityView::ProviderUnavailable
+                }
+                api::VisionAvailability::ServiceUnavailable => {
+                    view::VisionAvailabilityView::ServiceUnavailable
+                }
+                api::VisionAvailability::Unspecified => view::VisionAvailabilityView::Unknown,
+            },
+            diagnostic: vision.diagnostic,
         },
         terminal_images: match api::TerminalImageMode::try_from(value.terminal_images)
             .map_err(invalid_enum)?

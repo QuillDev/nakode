@@ -391,6 +391,7 @@ impl NativeServerRuntime {
     }
 
     pub(crate) async fn run(mut self) {
+        self.refresh_builtin_tool_availability();
         let mut backend_open = true;
         let mut shell_open = true;
         let mut shutdown_open = true;
@@ -638,10 +639,14 @@ impl NativeServerRuntime {
     }
 
     fn refresh_builtin_tool_availability(&mut self) {
+        let vision_provider = self
+            .core
+            .configured_vision_model_provider()
+            .map(str::to_owned);
         let availability = self
             .effects
             .backends
-            .available_builtin_tools(self.core.provider_records());
+            .available_builtin_tools(self.core.provider_records(), vision_provider.as_deref());
         self.core.install_available_builtin_tools(&availability);
     }
 
@@ -1234,6 +1239,7 @@ impl NativeServerRuntime {
         if had_effects {
             self.refresh_catalogs();
         }
+        self.refresh_builtin_tool_availability();
         if !bridge_checkpoint_deferred {
             match self.core.resume_pending_bridge_prompt(&session_id) {
                 Ok(pending_effects) if !pending_effects.is_empty() => {
@@ -1815,6 +1821,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::ExternalTools,
             ServiceCapability::InitialSessionTools,
             ServiceCapability::BuiltinToolAllowlists,
+            ServiceCapability::VisionAvailability,
             ServiceCapability::SessionWorkingDirectories,
             ServiceCapability::InitialSessionModel,
             ServiceCapability::InitialSessionInstructions,
@@ -1933,6 +1940,7 @@ impl BackendRegistry {
     pub(crate) fn available_builtin_tools(
         &self,
         providers: &[ProviderRecord],
+        vision_provider: Option<&str>,
     ) -> HashMap<String, Vec<String>> {
         // Availability depends on the configured memory backend, not on a particular project's bank.
         // Provider execution replaces this catalogue-only service with the session access root's
@@ -1984,7 +1992,12 @@ impl BackendRegistry {
                     };
                     supported
                         .into_iter()
-                        .filter(|name| runtime_tools.contains(name.as_str()))
+                        .filter(|name| {
+                            runtime_tools.contains(name.as_str())
+                                && (name != "vision"
+                                    || vision_provider == Some(provider.provider.as_str())
+                                        && provider.provider == crate::backend::CODEX_PROVIDER)
+                        })
                         .collect()
                 };
                 (provider.provider.clone(), available)
@@ -2232,11 +2245,14 @@ impl BackendRegistry {
     pub(crate) fn set_provider_credential(&mut self, provider: &str, metadata: serde_json::Value) {
         self.provider_credentials
             .insert(provider.to_owned(), metadata.clone());
-        if provider == crate::backend::CODEX_PROVIDER
-            && let Ok(service) =
-                codex::vision_service(Some(metadata), Arc::clone(&self.vision_config))
-        {
-            self.vision_service = service;
+        if provider == crate::backend::CODEX_PROVIDER {
+            match codex::vision_service(Some(metadata), Arc::clone(&self.vision_config)) {
+                Ok(service) => self.vision_service = service,
+                Err(error) => {
+                    self.vision_service = None;
+                    self.failures.push((provider.to_owned(), error.to_string()));
+                }
+            }
         }
     }
 
@@ -2466,6 +2482,9 @@ impl BackendRegistry {
             self.stop_subagent(&run_id).await;
         }
         self.provider_credentials.remove(provider);
+        if provider == crate::backend::CODEX_PROVIDER {
+            self.vision_service = None;
+        }
         Ok(())
     }
 
@@ -3866,10 +3885,13 @@ mod tests {
         registry.vision_config.write().expect("vision config").model =
             Some("openai-codex/vision-test".to_owned());
 
-        let availability = registry.available_builtin_tools(&[
-            provider(CODEX_PROVIDER, true, true),
-            provider(DEVIN_PROVIDER, true, true),
-        ]);
+        let availability = registry.available_builtin_tools(
+            &[
+                provider(CODEX_PROVIDER, true, true),
+                provider(DEVIN_PROVIDER, true, true),
+            ],
+            Some(CODEX_PROVIDER),
+        );
         let codex = availability
             .get(CODEX_PROVIDER)
             .expect("Codex availability");
@@ -3885,7 +3907,8 @@ mod tests {
             .expect("memory config")
             .backend = crate::memory::MemoryBackend::Disabled;
         registry.vision_config.write().expect("vision config").model = None;
-        let disabled = registry.available_builtin_tools(&[provider(CODEX_PROVIDER, true, true)]);
+        let disabled =
+            registry.available_builtin_tools(&[provider(CODEX_PROVIDER, true, true)], None);
         let codex_disabled = disabled.get(CODEX_PROVIDER).expect("Codex availability");
         assert!(codex_disabled.iter().all(|name| name != "browser"));
         assert!(

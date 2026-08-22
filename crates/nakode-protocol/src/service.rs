@@ -18,6 +18,8 @@ pub enum ServiceCapability {
     InitialSessionTools,
     /// Session tool configuration supports canonical builtin allowlists and provider projection validation.
     BuiltinToolAllowlists,
+    /// Settings projects authoritative callable Vision readiness and its diagnostic.
+    VisionAvailability,
     /// Session creation persists a filesystem/provider root independent from logical workspace ownership.
     SessionWorkingDirectories,
     /// `CreateSession` can validate and apply an initial model/options before publication.

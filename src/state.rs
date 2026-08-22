@@ -1263,6 +1263,15 @@ impl DomainState {
         self.memory_config = config;
     }
 
+    #[must_use]
+    pub fn configured_vision_model_provider(&self) -> Option<&str> {
+        let configured = self.vision_config.model.as_deref()?;
+        self.models
+            .iter()
+            .find(|model| model.qualified_id() == configured)
+            .map(|model| model.provider.as_str())
+    }
+
     pub fn install_available_builtin_tools(&mut self, availability: HashMap<String, Vec<String>>) {
         self.available_builtin_tools = availability;
     }
