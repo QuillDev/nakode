@@ -133,11 +133,6 @@ pub enum NakodeCommand {
         )]
         lines: u32,
     },
-    /// Manage the frontend transports the service hosts.
-    Transport {
-        #[command(subcommand)]
-        action: TransportCommand,
-    },
     /// Print the private gRPC endpoint used by native frontends.
     #[command(hide = true)]
     Endpoint,
@@ -195,15 +190,6 @@ pub enum NakodeCommand {
 }
 
 #[derive(Clone, Debug, Subcommand)]
-pub enum TransportCommand {
-    /// Manage the Discord frontend attached to this workspace.
-    Discord {
-        #[command(subcommand)]
-        action: DiscordAction,
-    },
-}
-
-#[derive(Clone, Debug, Subcommand)]
 pub enum ServiceAction {
     /// Deprecated. Use `nakode run`.
     Run,
@@ -217,11 +203,6 @@ pub enum ServiceAction {
     Restart,
     /// Deprecated. Use `nakode stop`.
     Shutdown,
-    /// Deprecated. Use `nakode transport discord`.
-    Discord {
-        #[command(subcommand)]
-        action: DiscordAction,
-    },
     /// Deprecated. Use `nakode endpoint`.
     #[command(hide = true)]
     Endpoint,
@@ -236,7 +217,6 @@ impl ServiceAction {
             Self::Status { .. } => "nakode status",
             Self::Restart => "nakode restart",
             Self::Shutdown => "nakode stop",
-            Self::Discord { .. } => "nakode transport discord",
             Self::Endpoint => "nakode endpoint",
         }
     }
@@ -249,7 +229,6 @@ impl ServiceAction {
             Self::Status { .. } => "nakode service status",
             Self::Restart => "nakode service restart",
             Self::Shutdown => "nakode service shutdown",
-            Self::Discord { .. } => "nakode service discord",
             Self::Endpoint => "nakode service endpoint",
         }
     }
@@ -262,44 +241,9 @@ impl ServiceAction {
             Self::Status { json } => NakodeCommand::Status { json },
             Self::Restart => NakodeCommand::Restart,
             Self::Shutdown => NakodeCommand::Stop,
-            Self::Discord { action } => NakodeCommand::Transport {
-                action: TransportCommand::Discord { action },
-            },
             Self::Endpoint => NakodeCommand::Endpoint,
         }
     }
-}
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum DiscordAction {
-    /// Interactively configure the Discord bot and orchestrator parent channels.
-    Setup {
-        /// Chat Orchestrator parent-channel snowflake. If omitted, setup prompts for it.
-        #[arg(long)]
-        chat_channel_id: Option<String>,
-        /// Agent Orchestrator parent-channel snowflake. If omitted, setup prompts for it.
-        #[arg(long)]
-        agent_channel_id: Option<String>,
-        /// The sole Discord user snowflake authorized to continue bridged sessions.
-        #[arg(long)]
-        primary_user_id: Option<String>,
-    },
-    /// Show Discord configuration without revealing the bot token.
-    Status {
-        /// Emit machine-readable JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Enable Discord autostart. If the workspace service is running, also start Discord now.
-    Enable,
-    /// Disable Discord autostart. If the workspace service is running, also stop Discord now.
-    Disable,
-    /// Start Discord in the running workspace service without restarting the native service.
-    Start,
-    /// Stop Discord in the running workspace service without stopping the native service.
-    Stop,
-    /// Restart Discord in the running workspace service.
-    Restart,
 }
 
 #[derive(Debug, Error)]
@@ -470,10 +414,7 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ConfigError> {
 mod tests {
     use clap::Parser;
 
-    use super::{
-        Config, DiscordAction, NakodeCommand, OpenAiReasoningEffort, ServiceAction,
-        TransportCommand,
-    };
+    use super::{Config, NakodeCommand, OpenAiReasoningEffort, ServiceAction};
 
     /// Parses arguments and states the workspace the command would have run in.
     ///
@@ -595,21 +536,6 @@ mod tests {
     }
 
     #[test]
-    fn discord_is_managed_as_a_transport() {
-        let config = Config::try_parse_from(["nakode", "transport", "discord", "status", "--json"])
-            .expect("transport command");
-
-        assert!(matches!(
-            config.command,
-            Some(NakodeCommand::Transport {
-                action: TransportCommand::Discord {
-                    action: DiscordAction::Status { json: true }
-                }
-            })
-        ));
-    }
-
-    #[test]
     fn deprecated_service_actions_stay_visible_and_name_their_replacements() {
         use clap::CommandFactory;
 
@@ -619,7 +545,6 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(help.contains("Use `nakode stop`"));
-        assert!(help.contains("Use `nakode transport discord`"));
 
         for (action, deprecated, replacement) in [
             (ServiceAction::Run, "nakode service run", "nakode run"),
@@ -672,19 +597,6 @@ mod tests {
         assert_eq!(
             rewritten(ServiceAction::Endpoint),
             format!("{:?}", NakodeCommand::Endpoint)
-        );
-        assert_eq!(
-            rewritten(ServiceAction::Discord {
-                action: DiscordAction::Enable
-            }),
-            format!(
-                "{:?}",
-                NakodeCommand::Transport {
-                    action: TransportCommand::Discord {
-                        action: DiscordAction::Enable
-                    }
-                }
-            )
         );
     }
 
@@ -861,76 +773,6 @@ mod tests {
         assert!(Config::try_parse_from(["nakode", "agent", "explorer"]).is_err());
     }
 
-    #[test]
-    fn discord_service_commands_parse_nested_configuration_actions() {
-        let setup = Config::try_parse_from([
-            "nakode",
-            "service",
-            "discord",
-            "setup",
-            "--chat-channel-id",
-            "123",
-            "--agent-channel-id",
-            "456",
-            "--primary-user-id",
-            "789",
-        ])
-        .expect("Discord setup command");
-        assert!(matches!(
-            setup.command,
-            Some(NakodeCommand::Service {
-                action: ServiceAction::Discord {
-                    action: DiscordAction::Setup {
-                        chat_channel_id: Some(chat_channel_id),
-                        agent_channel_id: Some(agent_channel_id),
-                        primary_user_id: Some(primary_user_id),
-                    }
-                }
-            }) if chat_channel_id == "123" && agent_channel_id == "456" && primary_user_id == "789"
-        ));
-
-        let start = Config::try_parse_from(["nakode", "service", "discord", "start"])
-            .expect("Discord start command");
-        assert!(matches!(
-            start.command,
-            Some(NakodeCommand::Service {
-                action: ServiceAction::Discord {
-                    action: DiscordAction::Start
-                }
-            })
-        ));
-        let stop = Config::try_parse_from(["nakode", "service", "discord", "stop"])
-            .expect("Discord stop command");
-        assert!(matches!(
-            stop.command,
-            Some(NakodeCommand::Service {
-                action: ServiceAction::Discord {
-                    action: DiscordAction::Stop
-                }
-            })
-        ));
-        let restart = Config::try_parse_from(["nakode", "service", "discord", "restart"])
-            .expect("Discord restart command");
-        assert!(matches!(
-            restart.command,
-            Some(NakodeCommand::Service {
-                action: ServiceAction::Discord {
-                    action: DiscordAction::Restart
-                }
-            })
-        ));
-
-        let status = Config::try_parse_from(["nakode", "service", "discord", "status", "--json"])
-            .expect("Discord status command");
-        assert!(matches!(
-            status.command,
-            Some(NakodeCommand::Service {
-                action: ServiceAction::Discord {
-                    action: DiscordAction::Status { json: true }
-                }
-            })
-        ));
-    }
     #[test]
     fn hidden_service_endpoint_action_parses_for_native_connectors() {
         let config = Config::try_parse_from(["nakode", "service", "endpoint"])

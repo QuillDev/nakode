@@ -589,8 +589,11 @@ impl ServerCore {
         // Prompt submission is append-only owner intent. Its idempotency key, not a snapshot fence,
         // distinguishes a retry from another deliberate send; lifecycle and queue placement are
         // therefore evaluated against authoritative state when this command executes.
-        let revision_fenced = !matches!(&command, Command::SendPrompt { .. });
-        let prompt_identity = key.as_str().to_owned();
+        let append_prompt = matches!(
+            &command,
+            Command::SendPrompt { .. } | Command::EnqueuePrompt { .. }
+        );
+        let revision_fenced = !append_prompt;
         let (mut result, effects) = if revision_fenced
             && expected_revision.is_some_and(|revision| revision != command_revision)
         {
@@ -603,29 +606,8 @@ impl ServerCore {
                 Vec::new(),
             )
         } else {
-            match command {
-                Command::SendPrompt { session_id, prompt } => {
-                    let enqueue = self
-                        .engine_for(&session_id)
-                        .is_some_and(|engine| engine.state().is_busy());
-                    match self.prompt_command_with_id(
-                        &session_id,
-                        prompt,
-                        enqueue,
-                        &prompt_identity,
-                    ) {
-                        Ok((accepted, effects)) => (Ok(accepted), effects),
-                        Err(error) => (Err(domain_error(error)), Vec::new()),
-                    }
-                }
-                Command::EnqueuePrompt { session_id, prompt } => {
-                    match self.prompt_command_with_id(&session_id, prompt, true, &prompt_identity) {
-                        Ok((accepted, effects)) => (Ok(accepted), effects),
-                        Err(error) => (Err(domain_error(error)), Vec::new()),
-                    }
-                }
-                command => self.execute_command(command),
-            }
+            let prompt_id = append_prompt.then(|| key.as_str().to_owned());
+            self.execute_command(command, prompt_id.as_deref())
         };
         let effect_session = effect_session.or_else(|| {
             result
@@ -662,15 +644,25 @@ impl ServerCore {
     fn execute_command(
         &mut self,
         command: Command,
+        prompt_id: Option<&str>,
     ) -> (Result<CommandAccepted, ServiceError>, Vec<Effect>) {
-        match self.try_execute_command(command) {
+        match self.try_execute_command_with_prompt_id(command, prompt_id) {
             Ok((accepted, effects)) => (Ok(accepted), effects),
             Err(error) => (Err(domain_error(error)), Vec::new()),
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     fn try_execute_command(&mut self, command: Command) -> DomainCommandOutcome {
+        self.try_execute_command_with_prompt_id(command, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn try_execute_command_with_prompt_id(
+        &mut self,
+        command: Command,
+        prompt_id: Option<&str>,
+    ) -> DomainCommandOutcome {
         match command {
             Command::CreateSession {
                 workspace_id,
@@ -770,7 +762,13 @@ impl ServerCore {
                 session_id,
                 projection_kind,
                 turn_id,
-            } => self.finalize_bridge_delivery_command(&session_id, projection_kind, &turn_id),
+                clear_active_source_message_id,
+            } => self.finalize_bridge_delivery_command_with_source(
+                &session_id,
+                projection_kind,
+                &turn_id,
+                clear_active_source_message_id.as_deref(),
+            ),
             Command::SetBridgeLiveMessage {
                 session_id,
                 turn_id,
@@ -803,10 +801,10 @@ impl ServerCore {
                 let enqueue = self
                     .engine_for(&session_id)
                     .is_some_and(|engine| engine.state().is_busy());
-                self.prompt_command(&session_id, prompt, enqueue)
+                self.prompt_command(&session_id, prompt, enqueue, prompt_id)
             }
             Command::EnqueuePrompt { session_id, prompt } => {
-                self.prompt_command(&session_id, prompt, true)
+                self.prompt_command(&session_id, prompt, true, prompt_id)
             }
             Command::RemoveQueuedPrompt {
                 session_id,
@@ -1331,7 +1329,7 @@ impl ServerCore {
         if part_index < delivery.completed_parts {
             // The constant-size checkpoint can authenticate the most recently completed part. This
             // catches a lost-response retry that somehow resolved the deterministic nonce to a
-            // different Discord message instead of silently accepting a duplicate external send.
+            // different external-transport message instead of silently accepting a duplicate send.
             if part_index.saturating_add(1) == delivery.completed_parts
                 && delivery.last_external_message_id.as_deref() != Some(external_message_id)
             {
@@ -1353,12 +1351,31 @@ impl ServerCore {
         Ok(Self::accepted(Some(session_id.to_string()), vec![effect]))
     }
 
+    #[cfg(test)]
     fn finalize_bridge_delivery_command(
         &mut self,
         session_id: &SessionId,
         projection_kind: BridgeProjectionKind,
         turn_id: &TurnId,
     ) -> DomainCommandOutcome {
+        self.finalize_bridge_delivery_command_with_source(
+            session_id,
+            projection_kind,
+            turn_id,
+            None,
+        )
+    }
+
+    fn finalize_bridge_delivery_command_with_source(
+        &mut self,
+        session_id: &SessionId,
+        projection_kind: BridgeProjectionKind,
+        turn_id: &TurnId,
+        clear_active_source_message_id: Option<&str>,
+    ) -> DomainCommandOutcome {
+        if let Some(message_id) = clear_active_source_message_id {
+            validate_external_identity("active source message id", message_id, 128)?;
+        }
         let target = BridgeProjectionRecord {
             kind: projection_kind,
             turn_id: turn_id.to_string(),
@@ -1396,9 +1413,15 @@ impl ServerCore {
                 .retain(|origin| origin.turn_id != turn_id.as_str());
         }
         if projection_kind == BridgeProjectionKind::Assistant {
-            bridge.live_turn_id = None;
-            bridge.live_external_message_id = None;
-            bridge.active_source_message_id = None;
+            if bridge.live_turn_id.as_deref() == Some(turn_id.as_str()) {
+                bridge.live_turn_id = None;
+                bridge.live_external_message_id = None;
+            }
+            if clear_active_source_message_id.is_some()
+                && bridge.active_source_message_id.as_deref() == clear_active_source_message_id
+            {
+                bridge.active_source_message_id = None;
+            }
         }
         bump_bridge_revision(bridge);
         let effect = Effect::PersistSessionBridge(bridge.clone());
@@ -1963,48 +1986,22 @@ impl ServerCore {
         session_id: &SessionId,
         prompt: PromptInput,
         enqueue: bool,
-    ) -> DomainCommandOutcome {
-        self.prompt_command_inner(session_id, prompt, enqueue, None)
-    }
-
-    fn prompt_command_with_id(
-        &mut self,
-        session_id: &SessionId,
-        prompt: PromptInput,
-        enqueue: bool,
-        prompt_id: &str,
-    ) -> DomainCommandOutcome {
-        self.prompt_command_inner(session_id, prompt, enqueue, Some(prompt_id))
-    }
-
-    fn prompt_command_inner(
-        &mut self,
-        session_id: &SessionId,
-        prompt: PromptInput,
-        enqueue: bool,
         prompt_id: Option<&str>,
     ) -> DomainCommandOutcome {
         self.ensure_session(session_id)?;
         self.reload_agent_catalogue_for_session(session_id)?;
         let (text, attachments) = self.convert_prompt(session_id, prompt)?;
+        let accepted_prompt_id = prompt_id.map_or_else(
+            || format!("nakode-msg-{}", uuid::Uuid::now_v7()),
+            str::to_owned,
+        );
+        let state = self.session_engine_mut(session_id)?.state_mut();
         let effects = if enqueue {
-            let state = self.session_engine_mut(session_id)?.state_mut();
-            match prompt_id {
-                Some(prompt_id) => {
-                    state.enqueue_prompt_with_id(prompt_id.to_owned(), text, attachments)?
-                }
-                None => state.enqueue_prompt(text, attachments)?,
-            }
+            state.enqueue_prompt_with_id(accepted_prompt_id.clone(), text, attachments)?
         } else {
-            let state = self.session_engine_mut(session_id)?.state_mut();
-            match prompt_id {
-                Some(prompt_id) => {
-                    state.submit_prompt_with_id(prompt_id.to_owned(), text, attachments)?
-                }
-                None => state.submit_prompt(text, attachments)?,
-            }
+            state.submit_prompt_with_id(accepted_prompt_id.clone(), text, attachments)?
         };
-        Ok(Self::accepted(None, effects))
+        Ok(Self::accepted(Some(accepted_prompt_id), effects))
     }
 
     fn remove_queued_prompt_command(
@@ -2064,31 +2061,61 @@ impl ServerCore {
         Ok(Self::accepted(Some(session_id.to_string()), effects))
     }
 
-    /// Removes a logical session and everything persisted beneath it.
+    /// Resolves the canonical identity used by both live teardown and durable deletion.
     ///
-    /// Unlike every other session command this one does NOT `ensure_session`: requiring an attached
-    /// engine would mean loading a conversation into memory in order to throw it away.
+    /// Exact IDs win, matching repository lookup semantics. Otherwise every loaded engine, persisted
+    /// record, and retained bridge participates in unique-prefix resolution so no layer can delete a
+    /// different logical session from the one the runtime releases.
+    fn canonical_delete_session_id(
+        &self,
+        requested: &SessionId,
+    ) -> Result<SessionId, DomainCommandError> {
+        let requested_id = requested.as_str();
+        let has_exact = self.sessions_by_id.contains_key(requested)
+            || self.sessions.iter().any(|record| record.id == requested_id)
+            || self
+                .session_bridges
+                .iter()
+                .any(|bridge| bridge.session_id == requested_id);
+        if has_exact {
+            return Ok(requested.clone());
+        }
+        let mut matches = Vec::new();
+        for candidate in self
+            .sessions_by_id
+            .keys()
+            .map(SessionId::as_str)
+            .chain(self.sessions.iter().map(|record| record.id.as_str()))
+            .chain(
+                self.session_bridges
+                    .iter()
+                    .map(|bridge| bridge.session_id.as_str()),
+            )
+            .filter(|candidate| candidate.starts_with(requested_id))
+        {
+            if !matches.iter().any(|existing| existing == candidate) {
+                matches.push(candidate.to_owned());
+            }
+        }
+        match matches.as_slice() {
+            [canonical] => Ok(SessionId::from(canonical.clone())),
+            [_, ..] => Err(DomainCommandError::Conflict(format!(
+                "session prefix {requested} is ambiguous"
+            ))),
+            [] => Ok(requested.clone()),
+        }
+    }
+
+    /// Deletes one logical session and releases all runtime state attached to it.
     ///
-    /// **Deletion is authoritative, so an attached session is CLOSED here rather than refused.** This
-    /// command used to answer an attached session with "close it before deleting it", which named an
-    /// operation that does not exist: there is no `CloseSession` in the protocol, and nothing else
-    /// evicts an engine. Every session ever created or opened therefore stayed attached for the life
-    /// of the process and became permanently undeletable — the dead sessions that piled up in the
-    /// store. Doing the close internally is what makes the caller's request satisfiable at all.
-    ///
-    /// A session with live work is refused, which the proto documents and which
-    /// `CancelSessionWork` is the verb for — deleting mid-inference would drop the history a live
-    /// provider child is still writing. That test reads liveness as well as busyness on purpose: a
-    /// backend that died mid-turn can leave `is_busy` true forever (see `provider_is_live`), and the
-    /// old code refused those too, with a cancel that could never land.
-    ///
-    /// The initial-session identity is a LIVE control-plane role, not a historical property. While its
-    /// native provider session is live it remains protected. Once that resource is gone, deletion first
-    /// installs a fresh, unpersisted control-plane engine as the default and only then releases the old
-    /// engine. Every default-engine lookup therefore has a valid successor, while the former initial
-    /// session becomes ordinary persisted history.
+    /// Unlike other session commands, deletion does not require an attached engine; unattached and
+    /// already-missing IDs are accepted so retries can converge. Attached sessions are evicted here,
+    /// but live work remains a conflict that callers must first stop with `CancelSessionWork`.
+    /// A unique prefix is resolved before mutation so runtime teardown and durable deletion use the
+    /// same canonical identity. Deleting a closed default session installs its successor first.
     fn delete_session_command(&mut self, session_id: &SessionId) -> DomainCommandOutcome {
-        let lifecycle = self.sessions_by_id.get(session_id).map(|engine| {
+        let session_id = self.canonical_delete_session_id(session_id)?;
+        let lifecycle = self.sessions_by_id.get(&session_id).map(|engine| {
             let state = engine.state();
             (
                 state.is_busy() && state.provider_is_live(),
@@ -2102,16 +2129,16 @@ impl ServerCore {
                     "session {session_id} has work in flight; cancel it before deleting it"
                 )));
             }
-            if *session_id == self.default_session && owns_live_provider_session {
+            if session_id == self.default_session && owns_live_provider_session {
                 return Err(DomainCommandError::Conflict(format!(
                     "session {session_id} is this workspace's active initial session and cannot be deleted"
                 )));
             }
             effects.push(Effect::ReleaseSessionBackends(session_id.to_string()));
-            if *session_id == self.default_session {
+            if session_id == self.default_session {
                 self.replace_default_session()?;
             }
-            self.release_session(session_id);
+            self.release_session(&session_id);
         }
         if let Some(bridge) = self
             .session_bridges
@@ -2121,8 +2148,10 @@ impl ServerCore {
         {
             bridge.lifecycle = BridgeLifecycle::Archived;
             bump_bridge_revision(bridge);
-            effects.push(Effect::PersistSessionBridge(bridge.clone()));
         }
+        // Durable deletion archives the bridge and removes session-owned rows in one repository
+        // transaction. Keeping those writes together prevents a failed delete from leaving the
+        // canonical bridge archived while the live session is restored for retry.
         effects.push(Effect::DeleteSession(session_id.to_string()));
         Ok(Self::accepted(Some(session_id.to_string()), effects))
     }
@@ -4856,15 +4885,15 @@ mod tests {
             .expect("bridged session");
         let session_id = SessionId::from(accepted.resource_id.expect("session id"));
         let (_, bound) = core
-            .bind_session_bridge_thread_command(&session_id, "discord", "100", "101")
+            .bind_session_bridge_thread_command(&session_id, "thread-transport", "100", "101")
             .expect("bind");
         assert_eq!(bound.len(), 1);
         let (_, duplicate) = core
-            .bind_session_bridge_thread_command(&session_id, "discord", "100", "101")
+            .bind_session_bridge_thread_command(&session_id, "thread-transport", "100", "101")
             .expect("same binding is idempotent");
         assert!(duplicate.is_empty());
         assert!(
-            core.bind_session_bridge_thread_command(&session_id, "discord", "100", "102")
+            core.bind_session_bridge_thread_command(&session_id, "thread-transport", "100", "102")
                 .is_err()
         );
         let (other, _) = core
@@ -4886,8 +4915,13 @@ mod tests {
             .expect("second bridged session");
         let other_session_id = SessionId::from(other.resource_id.expect("other session id"));
         assert!(
-            core.bind_session_bridge_thread_command(&other_session_id, "discord", "100", "101",)
-                .is_err(),
+            core.bind_session_bridge_thread_command(
+                &other_session_id,
+                "thread-transport",
+                "100",
+                "101",
+            )
+            .is_err(),
             "one external thread cannot be cross-wired to concurrent logical sessions"
         );
         assert!(
@@ -4984,7 +5018,7 @@ mod tests {
             .is_err()
         );
 
-        core.clear_session_bridge_thread_command(&session_id, "discord", "101")
+        core.clear_session_bridge_thread_command(&session_id, "thread-transport", "101")
             .expect("clear missing thread binding");
         let reset = core
             .session_bridge(&session_id)
@@ -4994,7 +5028,7 @@ mod tests {
             .expect("delivery remains prepared for replacement thread");
         assert_eq!(reset.completed_parts, 0);
         assert!(reset.last_external_message_id.is_none());
-        core.bind_session_bridge_thread_command(&session_id, "discord", "100", "102")
+        core.bind_session_bridge_thread_command(&session_id, "thread-transport", "100", "102")
             .expect("bind replacement thread");
         core.complete_bridge_delivery_part_command(
             &session_id,
@@ -5012,12 +5046,31 @@ mod tests {
             "301",
         )
         .expect("second part");
-        core.finalize_bridge_delivery_command(
+        {
+            let bridge = core.session_bridge_mut(&session_id).expect("bridge");
+            bridge.live_turn_id = Some("turn-2".to_owned());
+            bridge.live_external_message_id = Some("newer-live-message".to_owned());
+            bridge.active_source_message_id = Some("newer-source-message".to_owned());
+        }
+        core.finalize_bridge_delivery_command_with_source(
             &session_id,
             BridgeProjectionKind::Assistant,
             &turn_id,
+            Some("turn-1-source-message"),
         )
         .expect("finalize");
+        {
+            let bridge = core.session_bridge(&session_id).expect("bridge");
+            assert_eq!(bridge.live_turn_id.as_deref(), Some("turn-2"));
+            assert_eq!(
+                bridge.live_external_message_id.as_deref(),
+                Some("newer-live-message")
+            );
+            assert_eq!(
+                bridge.active_source_message_id.as_deref(),
+                Some("newer-source-message")
+            );
+        }
         let (_, duplicate_finalize) = core
             .finalize_bridge_delivery_command(
                 &session_id,
@@ -5176,7 +5229,7 @@ mod tests {
             )
             .expect("bridged session");
         let session_id = SessionId::from(accepted.resource_id.expect("session id"));
-        core.bind_session_bridge_thread_command(&session_id, "discord", "100", "101")
+        core.bind_session_bridge_thread_command(&session_id, "thread-transport", "100", "101")
             .expect("bind");
         let prompt = PromptInput {
             text: "continue".to_owned(),
@@ -5185,7 +5238,7 @@ mod tests {
         let (overload_result, overload_effects) = core
             .continue_session_from_bridge_command(
                 &session_id,
-                "discord",
+                "thread-transport",
                 "101",
                 "event-overload",
                 "message-overload",
@@ -5214,7 +5267,7 @@ mod tests {
         let (continued, effects) = core
             .continue_session_from_bridge_command(
                 &session_id,
-                "discord",
+                "thread-transport",
                 "101",
                 "event-1",
                 "message-1",
@@ -5233,7 +5286,7 @@ mod tests {
         let (duplicate_result, duplicate) = core
             .continue_session_from_bridge_command(
                 &session_id,
-                "discord",
+                "thread-transport",
                 "101",
                 "event-1",
                 "message-1",
@@ -5254,7 +5307,7 @@ mod tests {
         let (busy_result, busy_effects) = core
             .continue_session_from_bridge_command(
                 &session_id,
-                "discord",
+                "thread-transport",
                 "101",
                 "event-2",
                 "message-2",
@@ -5273,7 +5326,7 @@ mod tests {
         let (busy_duplicate, duplicate_effects) = core
             .continue_session_from_bridge_command(
                 &session_id,
-                "discord",
+                "thread-transport",
                 "101",
                 "event-2",
                 "message-2",
@@ -5307,7 +5360,7 @@ mod tests {
             let (result, _) = core
                 .continue_session_from_bridge_command(
                     &session_id,
-                    "discord",
+                    "thread-transport",
                     "101",
                     &event_id,
                     &format!("later-message-{index}"),
@@ -5323,7 +5376,7 @@ mod tests {
         let (old_duplicate, effects) = core
             .continue_session_from_bridge_command(
                 &session_id,
-                "discord",
+                "thread-transport",
                 "101",
                 "event-1",
                 "message-1",
@@ -5368,13 +5421,13 @@ mod tests {
             inbound_turn_origins: Vec::new(),
             updated_at_ms: unix_timestamp_ms(),
         });
-        core.bind_session_bridge_thread_command(&session_id, "discord", "100", "101")
+        core.bind_session_bridge_thread_command(&session_id, "thread-transport", "100", "101")
             .expect("bind");
 
         let (_, initial_effects) = core
             .continue_session_from_bridge_command(
                 &session_id,
-                "discord",
+                "thread-transport",
                 "101",
                 "event-durable",
                 "message-durable",
@@ -5458,14 +5511,14 @@ mod tests {
             user.owner_turn_id.as_ref().map(TurnId::as_str),
             Some("provider-turn-42")
         );
-        assert_eq!(user.source_transport.as_deref(), Some("discord"));
+        assert_eq!(user.source_transport.as_deref(), Some("thread-transport"));
         assert_eq!(
             core.session_bridge(&session_id)
                 .expect("bridge")
                 .inbound_turn_origins,
             [BridgeInboundTurnOriginRecord {
                 turn_id: "provider-turn-42".to_owned(),
-                transport: "discord".to_owned(),
+                transport: "thread-transport".to_owned(),
             }]
         );
 
@@ -5479,7 +5532,7 @@ mod tests {
             empty_sha256,
             0,
         )
-        .expect("trusted Discord user is suppressed with a zero-message checkpoint");
+        .expect("trusted external transport user is suppressed with a zero-message checkpoint");
         core.finalize_bridge_delivery_command(
             &session_id,
             BridgeProjectionKind::User,
@@ -5552,12 +5605,12 @@ mod tests {
 
         {
             let bridge = core.session_bridge_mut(&session_id).expect("bridge");
-            bridge.active_source_message_id = Some("stale-discord-source".to_owned());
+            bridge.active_source_message_id = Some("stale-thread-transport-source".to_owned());
         }
         assert!(
             core.record_bridge_turn_origin(&session_id, "dashboard-origin-turn")
                 .is_some(),
-            "a source-neutral provider turn clears stale Discord reaction ownership"
+            "a source-neutral provider turn clears stale external transport reaction ownership"
         );
         assert!(
             core.session_bridge(&session_id)
@@ -6434,6 +6487,192 @@ mod tests {
     }
 
     #[test]
+    fn idle_prompt_receipt_identity_follows_the_active_turn_and_replays_without_duplication() {
+        let (mut core, session_id) = ready_codex_server();
+        let prompt = Command::SendPrompt {
+            session_id: session_id.clone(),
+            prompt: PromptInput {
+                text: "start once".to_owned(),
+                attachments: Vec::new(),
+            },
+        };
+        let key = IdempotencyKey::from("window-idle-start");
+        let (accepted, effects, effect_session, changed) =
+            core.execute_idempotent(key.clone(), None, false, prompt.clone());
+        let accepted = accepted.expect("idle prompt starts");
+        assert_eq!(accepted.resource_id.as_deref(), Some("window-idle-start"));
+        assert_eq!(effect_session.as_ref(), Some(&session_id));
+        assert!(changed);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::StartTurn { client_id, prompt, .. })
+                if client_id == "window-idle-start" && prompt.starts_with("start once")
+        )));
+
+        let (retry, retry_effects, retry_session, retry_changed) =
+            core.execute_idempotent(key.clone(), None, false, prompt);
+        assert_eq!(
+            retry.expect("retry replays receipt").resource_id,
+            accepted.resource_id
+        );
+        assert!(retry_effects.is_empty());
+        assert_eq!(retry_session, None);
+        assert!(!retry_changed);
+
+        let (conflict, conflict_effects, _, conflict_changed) = core.execute_idempotent(
+            key,
+            None,
+            false,
+            Command::SendPrompt {
+                session_id,
+                prompt: PromptInput {
+                    text: "different body".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+        assert!(matches!(conflict, Err(error) if error.code == ErrorCode::Conflict));
+        assert!(conflict_effects.is_empty());
+        assert!(!conflict_changed);
+    }
+
+    #[test]
+    fn prompt_identity_prevents_reexecution_after_idempotency_cache_eviction() {
+        let (mut core, session_id) = ready_codex_server();
+        let key = IdempotencyKey::from("evicted-prompt-operation");
+        let command = Command::SendPrompt {
+            session_id: session_id.clone(),
+            prompt: PromptInput {
+                text: "run this once".to_owned(),
+                attachments: Vec::new(),
+            },
+        };
+        core.execute_idempotent(key.clone(), None, false, command.clone())
+            .0
+            .expect("first prompt submission");
+        core.command_cache.remove(&key);
+        core.command_order.retain(|candidate| candidate != &key);
+
+        let (retry, effects, _, changed) =
+            core.execute_idempotent(key.clone(), None, false, command);
+        assert_eq!(
+            retry
+                .expect("stable transcript identity replays acceptance")
+                .resource_id,
+            Some(key.to_string())
+        );
+        assert!(effects.is_empty(), "the provider turn must not run twice");
+        assert!(changed, "the replay publishes a fresh receipt revision");
+
+        core.command_cache.remove(&key);
+        core.command_order.retain(|candidate| candidate != &key);
+        let conflict = core.execute_idempotent(
+            key,
+            None,
+            false,
+            Command::SendPrompt {
+                session_id,
+                prompt: PromptInput {
+                    text: "different content".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+        assert!(matches!(conflict.0, Err(error) if error.code == ErrorCode::Conflict));
+        assert!(conflict.1.is_empty());
+    }
+
+    #[test]
+    fn queued_prompt_identity_prevents_reexecution_after_idempotency_cache_eviction() {
+        let (mut core, session_id, observed_revision) =
+            busy_server_with_stale_revision("active-turn");
+        let key = IdempotencyKey::from("evicted-queued-prompt-operation");
+        let command = Command::EnqueuePrompt {
+            session_id: session_id.clone(),
+            prompt: PromptInput {
+                text: "queue this once".to_owned(),
+                attachments: Vec::new(),
+            },
+        };
+        let accepted = core
+            .execute_idempotent(key.clone(), Some(observed_revision), false, command.clone())
+            .0
+            .expect("first queued prompt submission");
+        assert_eq!(accepted.resource_id.as_deref(), Some(key.as_str()));
+        assert_eq!(
+            core.session_view(&session_id).expect("session").queue.len(),
+            1
+        );
+        core.command_cache.remove(&key);
+        core.command_order.retain(|candidate| candidate != &key);
+
+        let (retry, effects, _, changed) =
+            core.execute_idempotent(key.clone(), Some(observed_revision), false, command);
+        assert_eq!(
+            retry
+                .expect("stable queue identity replays acceptance")
+                .resource_id,
+            Some(key.to_string())
+        );
+        assert!(effects.is_empty());
+        assert!(changed, "the replay publishes a fresh receipt revision");
+        let queue = core.session_view(&session_id).expect("session").queue;
+        assert_eq!(queue.len(), 1, "retry must not append a second follow-up");
+        assert_eq!(queue[0].id.as_str(), key.as_str());
+    }
+
+    #[test]
+    fn local_file_prompt_identity_converges_after_idempotency_cache_eviction() {
+        let (mut core, session_id) = ready_codex_server();
+        let key = IdempotencyKey::from("evicted-local-file-prompt");
+        let command = Command::SendPrompt {
+            session_id: session_id.clone(),
+            prompt: PromptInput {
+                text: "inspect this file once".to_owned(),
+                attachments: vec![ProtocolPromptAttachment::LocalFile {
+                    label: "context".to_owned(),
+                    path: "src/context.rs".to_owned(),
+                }],
+            },
+        };
+        core.execute_idempotent(key.clone(), None, false, command.clone())
+            .0
+            .expect("first local-file prompt submission");
+        core.command_cache.remove(&key);
+        core.command_order.retain(|candidate| candidate != &key);
+
+        let (retry, effects, _, _) = core.execute_idempotent(key.clone(), None, false, command);
+        assert_eq!(
+            retry
+                .expect("identical local-file prompt replays acceptance")
+                .resource_id,
+            Some(key.to_string())
+        );
+        assert!(effects.is_empty(), "the provider turn must not run twice");
+
+        core.command_cache.remove(&key);
+        core.command_order.retain(|candidate| candidate != &key);
+        let conflict = core.execute_idempotent(
+            key,
+            None,
+            false,
+            Command::SendPrompt {
+                session_id,
+                prompt: PromptInput {
+                    text: "inspect this file once".to_owned(),
+                    attachments: vec![ProtocolPromptAttachment::LocalFile {
+                        label: "context".to_owned(),
+                        path: "src/different.rs".to_owned(),
+                    }],
+                },
+            },
+        );
+        assert!(matches!(conflict.0, Err(error) if error.code == ErrorCode::Conflict));
+        assert!(conflict.1.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn stale_prompt_send_queues_once_in_command_order() {
         let (mut core, session_id, observed_revision) =
             busy_server_with_stale_revision("active-turn");
@@ -6452,13 +6691,18 @@ mod tests {
             false,
             repeated.clone(),
         );
-        first.expect("stale prompt append is accepted");
-        assert!(effects.is_empty());
+        let first = first.expect("stale prompt append is accepted");
+        assert_eq!(first.resource_id.as_deref(), Some("window-a-repeat"));
+        assert!(
+            effects.is_empty(),
+            "a busy send queues without interrupting"
+        );
         assert!(changed);
 
         let (retry, retry_effects, retry_session, retry_changed) =
             core.execute_idempotent(first_key, Some(observed_revision), false, repeated.clone());
-        retry.expect("an ambiguous transport retry replays acceptance");
+        let retry = retry.expect("an ambiguous transport retry replays acceptance");
+        assert_eq!(retry.resource_id, first.resource_id);
         assert!(retry_effects.is_empty());
         assert_eq!(retry_session, None);
         assert!(!retry_changed, "a replay must not append a second copy");
@@ -6497,27 +6741,22 @@ mod tests {
         );
         let queued_ids = queued
             .iter()
-            .map(|prompt| prompt.id.to_string())
+            .map(|prompt| prompt.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
             queued_ids,
             ["window-a-repeat", "window-b-repeat", "window-c-next"],
-            "queued prompts retain their caller-owned mutation identities"
+            "queue identity is the stable mutation identity returned by the receipt"
         );
 
         for (completed_turn, next_turn, expected_prompt, expected_id) in [
-            ("active-turn", "queued-turn-1", "repeat me", &queued_ids[0]),
-            (
-                "queued-turn-1",
-                "queued-turn-2",
-                "repeat me",
-                &queued_ids[1],
-            ),
+            ("active-turn", "queued-turn-1", "repeat me", queued_ids[0]),
+            ("queued-turn-1", "queued-turn-2", "repeat me", queued_ids[1]),
             (
                 "queued-turn-2",
                 "queued-turn-3",
                 "after repeats",
-                &queued_ids[2],
+                queued_ids[2],
             ),
         ] {
             assert_queued_turn_starts(
@@ -6526,7 +6765,7 @@ mod tests {
                 completed_turn,
                 next_turn,
                 expected_prompt,
-                expected_id.as_str(),
+                expected_id,
             );
         }
         assert!(
@@ -7331,7 +7570,7 @@ first_message = "Starting review"
         let (mut core, session_id) = ready_codex_server();
 
         let (_, effects) = core
-            .prompt_command(&session_id, prompt_with_image_and_file(), false)
+            .prompt_command(&session_id, prompt_with_image_and_file(), false, None)
             .expect("initial prompt");
         assert!(
             effects.iter().any(|effect| matches!(
@@ -7391,6 +7630,7 @@ first_message = "Starting review"
                     attachments: recovery.attachments,
                 },
                 false,
+                None,
             )
             .expect("artifact-backed retry");
         let Some(attachments) = effects.iter().find_map(|effect| match effect {
@@ -8218,6 +8458,50 @@ first_message = "Starting review"
         );
     }
 
+    #[test]
+    fn deleting_an_attached_session_by_unique_prefix_uses_its_canonical_identity_everywhere() {
+        let (mut core, _) = ready_codex_server();
+        let attached = attached_session(&mut core);
+        core.engine_for_mut(&attached)
+            .expect("session runtime")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::Disconnected {
+                    reason: "provider exited".to_owned(),
+                },
+            );
+        let prefix_len = (1..attached.as_str().len())
+            .find(|length| {
+                let prefix = &attached.as_str()[..*length];
+                core.sessions_by_id
+                    .keys()
+                    .filter(|candidate| candidate.as_str().starts_with(prefix))
+                    .count()
+                    == 1
+            })
+            .expect("attached session has a unique proper prefix");
+        let prefix = SessionId::from(attached.as_str()[..prefix_len].to_owned());
+
+        let (result, effects, _, _) = core.execute_idempotent(
+            IdempotencyKey::from("delete-dead-prefix"),
+            None,
+            false,
+            Command::DeleteSession { session_id: prefix },
+        );
+
+        let accepted = result.expect("a uniquely prefixed dead session is deletable");
+        assert_eq!(accepted.resource_id.as_deref(), Some(attached.as_str()));
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                crate::state::Effect::ReleaseSessionBackends(released),
+                crate::state::Effect::DeleteSession(deleted),
+            ] if released == attached.as_str() && deleted == attached.as_str()
+        ));
+        assert!(core.engine_for(&attached).is_none());
+    }
+
     /// A legacy session with orphaned busy display state behind a dead backend is deletable too.
     ///
     /// Live disconnect handling now settles executable delegated runs. This guard remains for older
@@ -8597,6 +8881,26 @@ first_message = "Starting review"
                 .as_ref()
                 .is_some_and(|turn| turn.cancelling)
         );
+    }
+
+    #[test]
+    fn cancelling_idle_session_work_is_idempotently_accepted() {
+        let (mut core, session_id) = ready_codex_server();
+
+        for attempt in 0..2 {
+            let (result, effects, effect_session, _) = core.execute_idempotent(
+                IdempotencyKey::from(format!("cancel-idle-{attempt}")),
+                None,
+                false,
+                Command::CancelSessionWork {
+                    session_id: session_id.clone(),
+                },
+            );
+            let accepted = result.expect("idle cancellation is a successful no-op");
+            assert_eq!(accepted.resource_id.as_deref(), Some(session_id.as_str()));
+            assert_eq!(effect_session, Some(session_id.clone()));
+            assert!(effects.is_empty());
+        }
     }
 
     #[test]

@@ -47,8 +47,6 @@ pub enum ServiceCapability {
     McpManagement,
     /// Typed Chat/Agent external-thread intent, lifecycle, binding, and delivery checkpoints.
     OrchestratorThreadBridge,
-    /// Redacted Discord configuration/status plus write-only credential and transport controls.
-    DiscordManagement,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

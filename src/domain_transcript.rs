@@ -86,6 +86,7 @@ pub struct DomainTranscript {
     stream_state: StreamState,
     stream_label: String,
     images: HashMap<String, Vec<TranscriptImageArtifact>>,
+    local_files: HashMap<String, Vec<(String, String)>>,
     history_retention: HistoryRetention,
 }
 
@@ -99,6 +100,7 @@ impl DomainTranscript {
             stream_state: StreamState::Idle,
             stream_label: "Nakode".to_owned(),
             images: HashMap::new(),
+            local_files: HashMap::new(),
             history_retention: HistoryRetention::Complete,
         }
     }
@@ -163,6 +165,25 @@ impl DomainTranscript {
         );
     }
 
+    pub(crate) fn set_local_files(
+        &mut self,
+        key: impl Into<String>,
+        local_files: Vec<(String, String)>,
+    ) {
+        let key = key.into();
+        if local_files.is_empty() {
+            self.local_files.remove(&key);
+        } else {
+            self.local_files.insert(key, local_files);
+        }
+        self.enforce_limit();
+    }
+
+    #[must_use]
+    pub(crate) fn local_files(&self, key: &str) -> &[(String, String)] {
+        self.local_files.get(key).map_or(&[], Vec::as_slice)
+    }
+
     pub(crate) fn set_labeled_images(
         &mut self,
         key: impl Into<String>,
@@ -187,6 +208,7 @@ impl DomainTranscript {
         self.entries.clear();
         self.item_indices.clear();
         self.images.clear();
+        self.local_files.clear();
         self.stream_state = StreamState::Idle;
         self.history_retention = HistoryRetention::Complete;
     }
@@ -469,6 +491,8 @@ impl DomainTranscript {
             }
         }
         self.images
+            .retain(|key, _| self.item_indices.contains_key(key));
+        self.local_files
             .retain(|key, _| self.item_indices.contains_key(key));
     }
 }

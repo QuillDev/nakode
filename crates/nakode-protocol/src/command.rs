@@ -327,11 +327,13 @@ pub enum Command {
         part_index: u64,
         external_message_id: String,
     },
-    /// Advances the ordered bridge cursor and clears its constant-size progress checkpoint.
+    /// Advances the ordered bridge cursor and clears only live/source ownership still belonging to
+    /// this delivery. The source identity is a compare-and-clear fence against a newer continuation.
     FinalizeBridgeDelivery {
         session_id: SessionId,
         projection_kind: BridgeProjectionKind,
         turn_id: TurnId,
+        clear_active_source_message_id: Option<String>,
     },
     /// Records or clears the transport's one non-final/live status message. A terminal worker may
     /// also compare-and-clear the inbound source-message reaction owner without racing a newer turn.

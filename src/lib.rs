@@ -14,7 +14,6 @@ pub mod credential;
 pub mod cursor;
 pub mod devin;
 pub mod diagnostics;
-pub mod discord;
 pub mod domain_transcript;
 pub mod editor;
 pub mod glm;

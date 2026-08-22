@@ -7,7 +7,6 @@
 mod base64_bytes;
 mod command;
 mod diagnostics;
-mod discord;
 mod error;
 mod ids;
 mod invocation;
@@ -24,7 +23,6 @@ pub use diagnostics::{
     DiagnosticsDailyUsage, DiagnosticsReport, DiagnosticsSessionUsage, DiagnosticsToolUsage,
     DiagnosticsUsageTotals,
 };
-pub use discord::{DiscordIntegrationInput, DiscordIntegrationView, DiscordRuntimeState};
 pub use error::{ErrorCode, ServiceError};
 pub use ids::{
     AgentSessionId, ArtifactId, ClientId, EntryId, IdempotencyKey, InteractionId, ModelId,

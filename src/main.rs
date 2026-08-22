@@ -1,8 +1,8 @@
 use clap::CommandFactory;
 use nakode::{
     agent_cli, app,
-    config::{Config, NakodeCommand, TransportCommand},
-    diagnostics, discord, purge, service_cli, tui_eval, update,
+    config::{Config, NakodeCommand},
+    diagnostics, purge, service_cli, tui_eval, update,
 };
 
 #[tokio::main]
@@ -49,9 +49,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NakodeCommand::Status { json } => service_cli::status(&config, json).await?,
         NakodeCommand::Logs { follow, lines } => service_cli::logs(&config, follow, lines).await?,
         NakodeCommand::Endpoint => service_cli::endpoint(&config).await?,
-        NakodeCommand::Transport {
-            action: TransportCommand::Discord { action },
-        } => discord::run_command(&config, action).await?,
         NakodeCommand::Diagnostics {
             days,
             sessions,

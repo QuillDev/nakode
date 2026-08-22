@@ -125,28 +125,6 @@ macro_rules! typed_mutation {
     };
 }
 
-macro_rules! typed_response_mutation {
-    ($method:ident, $request:ty, $response:ty) => {
-        /// Executes this typed product mutation with an SDK-owned idempotency key and returns the
-        /// resulting redacted management view.
-        ///
-        /// # Errors
-        /// Returns a transport or server status error.
-        pub async fn $method(&self, mut request: $request) -> Result<$response, SdkError> {
-            if request.mutation.is_none() {
-                request.mutation = Some(mutation(None));
-            }
-            retry_transport(request, |request| {
-                let mut transport = self.transport.clone();
-                async move { transport.$method(request).await }
-            })
-            .await
-            .map(tonic::Response::into_inner)
-            .map_err(Into::into)
-        }
-    };
-}
-
 macro_rules! send_mutation {
     ($client:expr, $method:ident, $request:expr) => {{
         let request = $request;
@@ -905,21 +883,6 @@ impl NakodeClient {
         api::ClearMcpServerCredentialRequest
     );
     typed_mutation!(set_mcp_server_grants, api::SetMcpServerGrantsRequest);
-    typed_response_mutation!(
-        save_discord_integration,
-        api::SaveDiscordIntegrationRequest,
-        api::DiscordIntegration
-    );
-    typed_response_mutation!(
-        set_discord_integration_enabled,
-        api::SetDiscordIntegrationEnabledRequest,
-        api::DiscordIntegration
-    );
-    typed_response_mutation!(
-        restart_discord_integration,
-        api::RestartDiscordIntegrationRequest,
-        api::DiscordIntegration
-    );
     typed_mutation!(save_agent, api::SaveAgentRequest);
     typed_mutation!(delete_agent, api::DeleteAgentRequest);
     typed_mutation!(delete_session, api::DeleteSessionRequest);
@@ -1086,20 +1049,6 @@ impl NakodeClient {
             .get_mcp_management(api::GetMcpManagementRequest {
                 workspace_id: workspace_id.into(),
             })
-            .await?
-            .into_inner())
-    }
-
-    /// Returns redacted installation Discord configuration and this workspace service's runtime
-    /// transport state. The bot token is represented only by `token_configured`.
-    ///
-    /// # Errors
-    /// Returns a transport or server status error.
-    pub async fn get_discord_integration(&self) -> Result<api::DiscordIntegration, SdkError> {
-        Ok(self
-            .transport
-            .clone()
-            .get_discord_integration(api::GetDiscordIntegrationRequest {})
             .await?
             .into_inner())
     }
@@ -1611,7 +1560,7 @@ mod tests {
         api::ContinueSessionFromBridgeRequest {
             mutation: None,
             session_id: session_id.to_owned(),
-            transport: "discord".to_owned(),
+            transport: "thread-transport".to_owned(),
             external_thread_id: thread_id.to_owned(),
             external_event_id: event_id.to_owned(),
             source_message_id: event_id.to_owned(),
