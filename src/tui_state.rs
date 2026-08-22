@@ -365,7 +365,11 @@ mod tests {
                     configured: false,
                     available: false,
                 },
-                vision: VisionSettingsView { model_id: None },
+                vision: VisionSettingsView {
+                    model_id: None,
+                    availability: nakode_protocol::VisionAvailabilityView::Disabled,
+                    diagnostic: String::new(),
+                },
                 terminal_images: TerminalImageModeView::Auto,
                 invocation_telemetry_enabled: false,
             },
@@ -419,6 +423,7 @@ mod tests {
             external_tool_calls: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            last_owner_activity_at_ms: 0,
         }
     }
 

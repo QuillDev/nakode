@@ -62,7 +62,8 @@ async fn delegate_and_wait(
 fn terminal_run_result(run: &RunView) -> Result<Option<AgentCommandResult>, AgentCliError> {
     let (body, success) = match (run.status, run.outcome.as_ref()) {
         (RunStatus::Starting | RunStatus::Working, None) => return Ok(None),
-        (RunStatus::Completed, Some(RunOutcome::Completed { body })) => (body, true),
+        (RunStatus::Completed, Some(RunOutcome::Completed { body }))
+        | (RunStatus::Partial, Some(RunOutcome::Partial { body })) => (body, true),
         (RunStatus::Failed, Some(RunOutcome::Failed { reason }))
         | (RunStatus::Interrupted, Some(RunOutcome::Interrupted { reason })) => (reason, false),
         (RunStatus::Starting | RunStatus::Working, Some(_)) => {
@@ -71,7 +72,10 @@ fn terminal_run_result(run: &RunView) -> Result<Option<AgentCommandResult>, Agen
                 run.id
             )));
         }
-        (RunStatus::Completed | RunStatus::Interrupted | RunStatus::Failed, None) => {
+        (
+            RunStatus::Completed | RunStatus::Partial | RunStatus::Interrupted | RunStatus::Failed,
+            None,
+        ) => {
             return Err(AgentCliError::Protocol(format!(
                 "terminal run {} omitted its semantic outcome",
                 run.id
@@ -204,6 +208,12 @@ mod tests {
             objective_mismatch_handoff: None,
             policy: nakode_protocol::RunPolicyView::default(),
             tool_denials: Vec::new(),
+            salvage: None,
+            continued_from_run_id: None,
+            continued_by_run_id: None,
+            continuation_depth: 0,
+            additional_turns: None,
+            inherited_evidence: Vec::new(),
             tool_denials_retained_total: 0,
             native_session_id: None,
             usage: nakode_protocol::TokenUsageView {

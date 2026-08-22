@@ -2363,7 +2363,11 @@ mod tests {
                     configured: false,
                     available: false,
                 },
-                vision: VisionSettingsView { model_id: None },
+                vision: VisionSettingsView {
+                    model_id: None,
+                    availability: nakode_protocol::VisionAvailabilityView::Disabled,
+                    diagnostic: String::new(),
+                },
                 terminal_images: TerminalImageModeView::Auto,
                 invocation_telemetry_enabled: false,
             },
@@ -2404,6 +2408,7 @@ mod tests {
             external_tool_calls: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            last_owner_activity_at_ms: 0,
         }
     }
 
@@ -2481,6 +2486,12 @@ mod tests {
             objective_mismatch_handoff: None,
             policy: nakode_protocol::RunPolicyView::default(),
             tool_denials: Vec::new(),
+            salvage: None,
+            continued_from_run_id: None,
+            continued_by_run_id: None,
+            continuation_depth: 0,
+            additional_turns: None,
+            inherited_evidence: Vec::new(),
             tool_denials_retained_total: 0,
             native_session_id: None,
             usage: nakode_protocol::TokenUsageView {

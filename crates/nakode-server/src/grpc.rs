@@ -1393,6 +1393,16 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
 
+    command_rpc!(
+        continue_run,
+        api::ContinueRunRequest,
+        input,
+        protocol::Command::ContinueRun {
+            run_id: protocol::RunId::from(input.run_id),
+            additional_turns: input.additional_turns,
+        }
+    );
+
     async fn get_transcript_page(
         &self,
         request: tonic::Request<api::GetTranscriptPageRequest>,
@@ -2126,6 +2136,24 @@ fn settings(value: protocol::SettingsView) -> api::Settings {
         }),
         vision: Some(api::VisionSettings {
             model_id: value.vision.model_id.map(|id| id.to_string()),
+            availability: match value.vision.availability {
+                protocol::VisionAvailabilityView::Unknown => api::VisionAvailability::Unspecified,
+                protocol::VisionAvailabilityView::Disabled => api::VisionAvailability::Disabled,
+                protocol::VisionAvailabilityView::Ready => api::VisionAvailability::Ready,
+                protocol::VisionAvailabilityView::ModelUnavailable => {
+                    api::VisionAvailability::ModelUnavailable
+                }
+                protocol::VisionAvailabilityView::ModelUnsupported => {
+                    api::VisionAvailability::ModelUnsupported
+                }
+                protocol::VisionAvailabilityView::ProviderUnavailable => {
+                    api::VisionAvailability::ProviderUnavailable
+                }
+                protocol::VisionAvailabilityView::ServiceUnavailable => {
+                    api::VisionAvailability::ServiceUnavailable
+                }
+            } as i32,
+            diagnostic: value.vision.diagnostic,
         }),
         terminal_images: match value.terminal_images {
             protocol::TerminalImageModeView::Auto => api::TerminalImageMode::Auto as i32,
@@ -2164,6 +2192,7 @@ pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSu
         active_model_id: value.active_model_id.map(|id| id.to_string()),
         updated_at_ms: value.updated_at_ms,
         created_at_ms: value.created_at_ms,
+        last_owner_activity_at_ms: value.last_owner_activity_at_ms,
         owned_provider_sessions: value
             .owned_provider_sessions
             .into_iter()
@@ -2215,6 +2244,7 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
             .collect(),
         created_at_ms: value.created_at_ms,
         updated_at_ms: value.updated_at_ms,
+        last_owner_activity_at_ms: value.last_owner_activity_at_ms,
     }
 }
 
@@ -2518,6 +2548,16 @@ pub(crate) fn run(value: protocol::RunView) -> api::RunState {
             })
             .collect(),
         tool_denials_retained_total: value.tool_denials_retained_total,
+        salvage: value.salvage.map(run_salvage),
+        continued_from_run_id: value.continued_from_run_id.map(|id| id.to_string()),
+        continued_by_run_id: value.continued_by_run_id.map(|id| id.to_string()),
+        continuation_depth: value.continuation_depth,
+        additional_turns: value.additional_turns,
+        inherited_evidence: value
+            .inherited_evidence
+            .into_iter()
+            .map(salvaged_evidence)
+            .collect(),
         native_session_id: value.native_session_id,
         usage: Some(token_usage(&value.usage)),
         objective: value.objective,
@@ -2527,6 +2567,7 @@ pub(crate) fn run(value: protocol::RunView) -> api::RunState {
             protocol::RunStatus::Starting => api::RunStatus::Starting,
             protocol::RunStatus::Working => api::RunStatus::Working,
             protocol::RunStatus::Completed => api::RunStatus::Completed,
+            protocol::RunStatus::Partial => api::RunStatus::Partial,
             protocol::RunStatus::Interrupted => api::RunStatus::Interrupted,
             protocol::RunStatus::Failed => api::RunStatus::Failed,
         } as i32,
@@ -2543,11 +2584,51 @@ pub(crate) fn run(value: protocol::RunView) -> api::RunState {
     }
 }
 
+fn salvaged_evidence(value: protocol::SalvagedEvidenceView) -> api::SalvagedEvidence {
+    api::SalvagedEvidence {
+        entry_id: value.entry_id,
+        title: value.title,
+        body: value.body,
+        truncated: value.truncated,
+    }
+}
+
+fn run_salvage(value: protocol::RunSalvageView) -> api::RunSalvage {
+    api::RunSalvage {
+        terminal_reason: value.terminal_reason,
+        original_objective: value.original_objective,
+        completed_work: value.completed_work,
+        verified_evidence: value
+            .verified_evidence
+            .into_iter()
+            .map(salvaged_evidence)
+            .collect(),
+        last_successful_evidence: value.last_successful_evidence.map(salvaged_evidence),
+        unresolved_questions: value.unresolved_questions,
+        continuation: Some(api::ContinuationProposition {
+            verified_findings: value.continuation.verified_findings,
+            unresolved_boundary: value.continuation.unresolved_boundary,
+            why_it_matters: value.continuation.why_it_matters,
+            recommended_archetype: value.continuation.recommended_archetype,
+            follow_up_objective: value.continuation.follow_up_objective,
+            inherited_evidence: value.continuation.inherited_evidence,
+            can_proceed_independently: value.continuation.can_proceed_independently,
+        }),
+        can_resume: value.can_resume,
+        redacted: value.redacted,
+        truncated: value.truncated,
+    }
+}
+
 fn run_outcome(value: protocol::RunOutcome) -> api::RunOutcome {
     use api::run_outcome::Kind;
     match value {
         protocol::RunOutcome::Completed { body } => api::RunOutcome {
             kind: Kind::Completed as i32,
+            body,
+        },
+        protocol::RunOutcome::Partial { body } => api::RunOutcome {
+            kind: Kind::Partial as i32,
             body,
         },
         protocol::RunOutcome::Failed { reason } => api::RunOutcome {

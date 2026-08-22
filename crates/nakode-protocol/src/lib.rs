@@ -46,17 +46,18 @@ pub use service::{
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,
     BridgeDeliveryView, BridgeLifecycle, BridgeProjectionKind, BridgeProjectionView,
-    ConnectionView, ContextUsageView, ExternalToolCallView, InteractionKind, InteractionOptionView,
-    InteractionQuestionView, InteractionStatus, InteractionView, MemorySettingsView,
-    ModelConfigurationView, ModelView, NoticeLevel, NoticeView, OrchestratorKind,
-    OwnedProviderSessionView, ProviderAuthenticationView, ProviderCapabilities, ProviderCapability,
-    ProviderView, QueueItemView, RecoverablePromptView, RunMetadataView, RunOutcome, RunPage,
-    RunPolicyView, RunStatus, RunTextWindow, RunToolDenialView, RunView, SessionActivity,
-    SessionBridgeView, SessionMetadataView, SessionSummary, SessionView, SettingsView, SkillView,
+    ConnectionView, ContextUsageView, ContinuationPropositionView, ExternalToolCallView,
+    InteractionKind, InteractionOptionView, InteractionQuestionView, InteractionStatus,
+    InteractionView, MemorySettingsView, ModelConfigurationView, ModelView, NoticeLevel,
+    NoticeView, OrchestratorKind, OwnedProviderSessionView, ProviderAuthenticationView,
+    ProviderCapabilities, ProviderCapability, ProviderView, QueueItemView, RecoverablePromptView,
+    RunMetadataView, RunOutcome, RunPage, RunPolicyView, RunSalvageView, RunStatus, RunTextWindow,
+    RunToolDenialView, RunView, SalvagedEvidenceView, SessionActivity, SessionBridgeView,
+    SessionMetadataView, SessionSummary, SessionView, SettingsView, SkillView,
     TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TokenUsageView,
     TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView,
-    TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionSettingsView,
-    WebSettingsView,
+    TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionAvailabilityView,
+    VisionSettingsView, WebSettingsView,
 };
 
 /// Maximum encoded Protobuf request or response accepted by Nakode's API.

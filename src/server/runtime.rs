@@ -9,7 +9,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use tokio::sync::{Mutex, mpsc};
@@ -37,7 +37,7 @@ use crate::{
     },
     shell::{ShellEvent, ShellProcesses},
     skill::{SkillCatalog, SkillCatalogError},
-    state::{AgentBrowserStatus, DomainState, Effect, SubagentStatus},
+    state::{AgentBrowserStatus, DomainState, Effect},
 };
 
 use super::{BridgeStateCheckpoint, ServerCore};
@@ -391,6 +391,7 @@ impl NativeServerRuntime {
     }
 
     pub(crate) async fn run(mut self) {
+        self.refresh_builtin_tool_availability();
         let mut backend_open = true;
         let mut shell_open = true;
         let mut shutdown_open = true;
@@ -638,10 +639,14 @@ impl NativeServerRuntime {
     }
 
     fn refresh_builtin_tool_availability(&mut self) {
+        let vision_provider = self
+            .core
+            .configured_vision_model_provider()
+            .map(str::to_owned);
         let availability = self
             .effects
             .backends
-            .available_builtin_tools(self.core.provider_records());
+            .available_builtin_tools(self.core.provider_records(), vision_provider.as_deref());
         self.core.install_available_builtin_tools(&availability);
     }
 
@@ -1235,6 +1240,7 @@ impl NativeServerRuntime {
         if had_effects {
             self.refresh_catalogs();
         }
+        self.refresh_builtin_tool_availability();
         if !bridge_checkpoint_deferred {
             match self.core.resume_pending_bridge_prompt(&session_id) {
                 Ok(pending_effects) if !pending_effects.is_empty() => {
@@ -1821,6 +1827,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::ExternalTools,
             ServiceCapability::InitialSessionTools,
             ServiceCapability::BuiltinToolAllowlists,
+            ServiceCapability::VisionAvailability,
             ServiceCapability::SessionWorkingDirectories,
             ServiceCapability::InitialSessionModel,
             ServiceCapability::InitialSessionInstructions,
@@ -1939,6 +1946,7 @@ impl BackendRegistry {
     pub(crate) fn available_builtin_tools(
         &self,
         providers: &[ProviderRecord],
+        vision_provider: Option<&str>,
     ) -> HashMap<String, Vec<String>> {
         // Availability depends on the configured memory backend, not on a particular project's bank.
         // Provider execution replaces this catalogue-only service with the session access root's
@@ -1990,7 +1998,12 @@ impl BackendRegistry {
                     };
                     supported
                         .into_iter()
-                        .filter(|name| runtime_tools.contains(name.as_str()))
+                        .filter(|name| {
+                            runtime_tools.contains(name.as_str())
+                                && (name != "vision"
+                                    || vision_provider == Some(provider.provider.as_str())
+                                        && provider.provider == crate::backend::CODEX_PROVIDER)
+                        })
                         .collect()
                 };
                 (provider.provider.clone(), available)
@@ -2238,11 +2251,14 @@ impl BackendRegistry {
     pub(crate) fn set_provider_credential(&mut self, provider: &str, metadata: serde_json::Value) {
         self.provider_credentials
             .insert(provider.to_owned(), metadata.clone());
-        if provider == crate::backend::CODEX_PROVIDER
-            && let Ok(service) =
-                codex::vision_service(Some(metadata), Arc::clone(&self.vision_config))
-        {
-            self.vision_service = service;
+        if provider == crate::backend::CODEX_PROVIDER {
+            match codex::vision_service(Some(metadata), Arc::clone(&self.vision_config)) {
+                Ok(service) => self.vision_service = service,
+                Err(error) => {
+                    self.vision_service = None;
+                    self.failures.push((provider.to_owned(), error.to_string()));
+                }
+            }
         }
     }
 
@@ -2472,6 +2488,9 @@ impl BackendRegistry {
             self.stop_subagent(&run_id).await;
         }
         self.provider_credentials.remove(provider);
+        if provider == crate::backend::CODEX_PROVIDER {
+            self.vision_service = None;
+        }
         Ok(())
     }
 
@@ -2610,10 +2629,12 @@ impl EffectExecutor {
             | Effect::SetDefaultModel { .. }
             | Effect::SaveModelOptions { .. }
             | Effect::PersistSubagent(_)
+            | Effect::PersistSubagentContinuation(_)
             | Effect::LoadSubagents(_)
             | Effect::UpdateSessionModel { .. }
             | Effect::TransitionSessionPrimary { .. }
             | Effect::UpdateSessionLastTurn { .. }
+            | Effect::RecordOwnerActivity(_)
             | Effect::TouchSession(_)
             | Effect::DeleteSession(_)) => {
                 execute_persistence_effect(state, sessions, persistence_effect);
@@ -2834,6 +2855,9 @@ fn execute_persistence_effect(
             options,
         } => save_model_options(state, sessions, &provider, &model, &options),
         Effect::PersistSubagent(record) => persist_subagent(state, sessions, &record),
+        Effect::PersistSubagentContinuation(records) => {
+            persist_subagent_continuation(state, sessions, &records.0, &records.1);
+        }
         Effect::LoadSubagents(parent_session_id) => {
             load_subagents(state, sessions, &parent_session_id);
         }
@@ -2862,6 +2886,7 @@ fn execute_persistence_effect(
         Effect::UpdateSessionLastTurn { session_id, turn } => {
             update_session_last_turn(state, sessions, &session_id, &turn);
         }
+        Effect::RecordOwnerActivity(id) => record_owner_activity(state, sessions, &id),
         Effect::TouchSession(id) => touch_session(state, sessions, &id),
         Effect::PersistSessionBridge(bridge) => {
             if let Err(error) = sessions.save_session_bridge(&bridge) {
@@ -3220,6 +3245,12 @@ fn install_changed_agent_catalog(
     }
 }
 
+fn record_owner_activity(state: &mut DomainState, sessions: &dyn SessionRepository, id: &str) {
+    if let Err(error) = sessions.record_owner_activity(id) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
 fn touch_session(state: &mut DomainState, sessions: &dyn SessionRepository, id: &str) {
     if let Err(error) = sessions.touch(id) {
         state.session_store_failed(error.to_string());
@@ -3381,39 +3412,30 @@ fn persist_subagent(
     }
 }
 
+fn persist_subagent_continuation(
+    state: &mut DomainState,
+    sessions: &dyn SessionRepository,
+    source: &crate::session::SubagentRecord,
+    successor: &crate::session::SubagentRecord,
+) {
+    if let Err(error) = sessions.save_subagent_continuation(source, successor) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
 fn load_subagents(
     state: &mut DomainState,
     sessions: &dyn SessionRepository,
     parent_session_id: &str,
 ) {
     match sessions.list_subagents(parent_session_id) {
-        Ok(mut records) => {
-            let ended_at_ms = u64::try_from(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis(),
-            )
-            .unwrap_or(u64::MAX);
-            for record in &mut records {
-                if matches!(
-                    record.status,
-                    SubagentStatus::Starting | SubagentStatus::Working
-                ) {
-                    record.status = SubagentStatus::Interrupted;
-                    "Interrupted when the previous server stopped"
-                        .clone_into(&mut record.latest_activity);
-                    record.observability.ended_at_ms = Some(ended_at_ms);
-                    record.observability.termination_kind = Some("interrupted".to_owned());
-                    record.observability.termination_detail =
-                        Some("Interrupted when the previous server stopped".to_owned());
-                    if let Err(error) = sessions.save_subagent(record) {
-                        state.session_store_failed(error.to_string());
-                        return;
-                    }
+        Ok(records) => {
+            for corrected in state.install_subagents(records) {
+                if let Err(error) = sessions.save_subagent(&corrected) {
+                    state.session_store_failed(error.to_string());
+                    return;
                 }
             }
-            state.install_subagents(records);
         }
         Err(error) => state.session_store_failed(error.to_string()),
     }
@@ -3642,6 +3664,7 @@ mod tests {
         },
         config::{Config, OpenAiReasoningEffort},
         credential::{CredentialStore, SqliteCredentialStore},
+        domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         service::ServiceEngine,
         session::{
             BridgeInboundTurnOriginRecord, BridgePendingInboundRecord, InvocationRecord,
@@ -3791,6 +3814,81 @@ mod tests {
     }
 
     #[test]
+    fn restoring_active_subagents_durably_persists_verified_partial_salvage() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions = SqliteSessionRepository::open(workspace.path().join("sessions.sqlite3"))
+            .expect("session repository");
+        let parent = sessions
+            .create(
+                CODEX_PROVIDER,
+                "provider-parent",
+                workspace.path().to_str().expect("utf8 workspace"),
+                "Parent",
+                None,
+            )
+            .expect("parent session");
+        sessions
+            .save_subagent(&SubagentRecord {
+                parent_session_id: parent.id.clone(),
+                id: "run-active-evidence".to_owned(),
+                agent: "repo-explorer".to_owned(),
+                provider: CODEX_PROVIDER.to_owned(),
+                model: None,
+                provider_session_id: Some("provider-child".to_owned()),
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                objective: "Inspect restore salvage".to_owned(),
+                status: SubagentStatus::Working,
+                latest_activity: "Working".to_owned(),
+                transcript: vec![TranscriptEntry {
+                    id: "tool-evidence".to_owned(),
+                    key: None,
+                    kind: EntryKind::Tool,
+                    title: "read lifecycle".to_owned(),
+                    body: "authoritative retained evidence".to_owned(),
+                    status: EntryStatus::Complete,
+                    created_at_ms: Some(101),
+                    provider_id: Some(CODEX_PROVIDER.to_owned()),
+                    model_id: None,
+                    owner_turn_id: None,
+                    reasoning_effort: None,
+                    fast_mode: None,
+                    source_transport: None,
+                    tool_audit_json: None,
+                }],
+                observability: SubagentObservability {
+                    started_at_ms: 100,
+                    ..SubagentObservability::default()
+                },
+            })
+            .expect("active run");
+
+        let mut state = DomainState::new_unconfigured(
+            workspace.path().to_str().expect("utf8 workspace"),
+            None,
+            100,
+        );
+        load_subagents(&mut state, &sessions, &parent.id);
+
+        let restored = sessions
+            .list_subagents(&parent.id)
+            .expect("restored runs")
+            .pop()
+            .expect("run");
+        assert_eq!(restored.status, SubagentStatus::Partial);
+        let salvage = restored.observability.salvage.expect("persisted salvage");
+        assert_eq!(salvage.verified_evidence.len(), 1);
+        assert_eq!(
+            salvage.verified_evidence[0].body,
+            "authoritative retained evidence"
+        );
+        assert_eq!(state.subagents[0].status, SubagentStatus::Partial);
+        assert!(state.subagents[0].observability.salvage.is_some());
+    }
+
+    #[test]
     fn shared_provider_sync_detects_enablement_without_restarting_for_metadata() {
         let current = vec![
             provider("openai-codex", true, false),
@@ -3864,10 +3962,13 @@ mod tests {
         registry.vision_config.write().expect("vision config").model =
             Some("openai-codex/vision-test".to_owned());
 
-        let availability = registry.available_builtin_tools(&[
-            provider(CODEX_PROVIDER, true, true),
-            provider(DEVIN_PROVIDER, true, true),
-        ]);
+        let availability = registry.available_builtin_tools(
+            &[
+                provider(CODEX_PROVIDER, true, true),
+                provider(DEVIN_PROVIDER, true, true),
+            ],
+            Some(CODEX_PROVIDER),
+        );
         let codex = availability
             .get(CODEX_PROVIDER)
             .expect("Codex availability");
@@ -3883,7 +3984,8 @@ mod tests {
             .expect("memory config")
             .backend = crate::memory::MemoryBackend::Disabled;
         registry.vision_config.write().expect("vision config").model = None;
-        let disabled = registry.available_builtin_tools(&[provider(CODEX_PROVIDER, true, true)]);
+        let disabled =
+            registry.available_builtin_tools(&[provider(CODEX_PROVIDER, true, true)], None);
         let codex_disabled = disabled.get(CODEX_PROVIDER).expect("Codex availability");
         assert!(codex_disabled.iter().all(|name| name != "browser"));
         assert!(
@@ -4913,6 +5015,7 @@ mod tests {
                     replace_builtin_tools: false,
                     allowed_builtin_tools: None,
                     max_turns: None,
+                    finalization_reserve_turns: 0,
                     timeout_seconds: None,
                     owner_session_id: None,
                     parent_run_id: None,
@@ -4965,6 +5068,7 @@ mod tests {
                     replace_builtin_tools: false,
                     allowed_builtin_tools: None,
                     max_turns: None,
+                    finalization_reserve_turns: 0,
                     timeout_seconds: None,
                     owner_session_id: None,
                     parent_run_id: None,
@@ -4984,6 +5088,7 @@ mod tests {
                     replace_builtin_tools: false,
                     allowed_builtin_tools: None,
                     max_turns: None,
+                    finalization_reserve_turns: 0,
                     timeout_seconds: None,
                     owner_session_id: None,
                     parent_run_id: None,

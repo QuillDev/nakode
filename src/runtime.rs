@@ -257,6 +257,7 @@ struct ExternalToolConfiguration {
     replace_builtin_tools: bool,
     allowed_builtin_tools: Option<std::collections::HashSet<String>>,
     max_turns: Option<u32>,
+    finalization_reserve_turns: u32,
     timeout_seconds: Option<u32>,
 }
 
@@ -328,6 +329,7 @@ impl AgentRuntime {
     ///
     /// Returns an error when a tool name is empty or duplicated, a tool schema is not valid JSON,
     /// or the requested canonical builtin set is invalid for this adapter runtime.
+    #[allow(clippy::too_many_arguments)]
     pub async fn configure_external_tools(
         &self,
         session_id: &str,
@@ -335,6 +337,7 @@ impl AgentRuntime {
         replace_builtin_tools: bool,
         allowed_builtin_tools: Option<Vec<String>>,
         max_turns: Option<u32>,
+        finalization_reserve_turns: u32,
         timeout_seconds: Option<u32>,
     ) -> Result<(), String> {
         let mut definitions = Vec::with_capacity(tools.len());
@@ -369,6 +372,7 @@ impl AgentRuntime {
                 allowed_builtin_tools: allowed_builtin_tools
                     .map(|tools| tools.into_iter().collect()),
                 max_turns,
+                finalization_reserve_turns,
                 timeout_seconds,
             },
         );
@@ -554,6 +558,7 @@ impl AgentRuntime {
             backend_events,
             cancellation,
             policy.max_turns,
+            policy.finalization_reserve_turns,
         );
         let Some(timeout) = timeout else {
             return turn.await;
@@ -581,6 +586,7 @@ impl AgentRuntime {
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: CancellationToken,
         max_turns: Option<u32>,
+        finalization_reserve_turns: u32,
     ) -> Result<(), TurnError> {
         self.prepare_image_fallback(&mut prompt, &mut attachments, &cancellation)
             .await?;
@@ -598,6 +604,10 @@ impl AgentRuntime {
 
         let mut overflow_recovery_attempted = false;
         let mut inference_round = 0_u64;
+        let mut finalization_announced = false;
+        let soft_turn_limit = max_turns.map(|limit| {
+            limit.saturating_sub(finalization_reserve_turns.min(limit.saturating_sub(1)))
+        });
         let mut tool_failures = HashMap::<String, usize>::new();
         loop {
             if let Some(limit) = max_turns
@@ -609,6 +619,24 @@ impl AgentRuntime {
             }
             if cancellation.is_cancelled() {
                 return Err(TurnError::Interrupted);
+            }
+            let finalizing = finalization_reserve_turns > 0
+                && soft_turn_limit.is_some_and(|soft| inference_round >= u64::from(soft));
+            if finalizing && !finalization_announced {
+                finalization_announced = true;
+                let remaining =
+                    max_turns.map_or(0, |limit| u64::from(limit).saturating_sub(inference_round));
+                let warning = format!(
+                    "Protected finalization reserve started with {remaining} turn(s) remaining. New tools are disabled; produce the best final or partial report and a bounded continuation proposition now."
+                );
+                session.history.push(ConversationItem::User {
+                    text: warning.clone(),
+                    attachments: Vec::new(),
+                });
+                backend_events
+                    .send(BackendEvent::Warning(warning))
+                    .await
+                    .map_err(|_| "backend event receiver closed".to_owned())?;
             }
             if session.should_compact(self.compaction_threshold_percent) {
                 let compaction = self
@@ -635,6 +663,7 @@ impl AgentRuntime {
                     session,
                     turn_id,
                     inference_round,
+                    !finalizing,
                     backend_events,
                     &cancellation,
                 )
@@ -675,6 +704,27 @@ impl AgentRuntime {
             if output.tool_calls.is_empty() {
                 return Ok(());
             }
+            if finalizing {
+                let denied_calls = output.tool_calls;
+                for call in denied_calls {
+                    session.history.push(ConversationItem::ToolResult {
+                        call_id: call.id,
+                        name: Some(call.name),
+                        arguments: Some(call.arguments),
+                        audit_kind: Some("native".to_owned()),
+                        title: Some("Tool denied during finalization".to_owned()),
+                        output: "Protected finalization reserve denies new tool use. Synthesize from retained evidence.".to_owned(),
+                        model_output: None,
+                        failed: true,
+                        denied: true,
+                        denial_reason: Some(
+                            "protected finalization reserve denies new tool use".to_owned(),
+                        ),
+                        duration_ms: Some(0),
+                    });
+                }
+                continue;
+            }
             warn_about_long_turn(backend_events, inference_round).await;
             let failed_tools = self
                 .execute_tool_calls(
@@ -695,6 +745,7 @@ impl AgentRuntime {
         session: &mut RuntimeSession,
         turn_id: &str,
         inference_round: u64,
+        tools_allowed: bool,
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: &CancellationToken,
     ) -> Result<Result<InferenceOutput, String>, String> {
@@ -707,7 +758,11 @@ impl AgentRuntime {
             model: session.model.clone(),
             instructions: session.instructions.clone(),
             history: session.history.clone(),
-            tools: self.inference_tools(&session.id).await,
+            tools: if tools_allowed {
+                self.inference_tools(&session.id).await
+            } else {
+                Vec::new()
+            },
             reasoning_effort: session.reasoning_effort.clone(),
             fast_mode: session.fast_mode,
         };
@@ -2533,6 +2588,11 @@ mod tests {
         tool_rounds: usize,
     }
 
+    #[derive(Default)]
+    struct ReserveAwareProvider {
+        tool_counts: Mutex<Vec<usize>>,
+    }
+
     struct StreamingToolProvider {
         calls: AtomicUsize,
     }
@@ -2774,6 +2834,7 @@ mod tests {
                 false,
                 Some(vec!["read".to_owned()]),
                 None,
+                0,
                 None,
             )
             .await
@@ -2854,6 +2915,7 @@ mod tests {
                 false,
                 Some(vec!["read".to_owned()]),
                 None,
+                0,
                 None,
             )
             .await
@@ -2867,6 +2929,7 @@ mod tests {
                 false,
                 Some(vec!["memory_search".to_owned(), "memory_store".to_owned()]),
                 None,
+                0,
                 None,
             )
             .await
@@ -2893,6 +2956,7 @@ mod tests {
                 true,
                 None,
                 None,
+                0,
                 None,
             )
             .await
@@ -2928,6 +2992,7 @@ mod tests {
                 true,
                 None,
                 None,
+                0,
                 None,
             )
             .await
@@ -3319,6 +3384,80 @@ mod tests {
         );
     }
 
+    impl InferenceProvider for ReserveAwareProvider {
+        fn infer(
+            &self,
+            request: InferenceRequest,
+            _events: mpsc::Sender<super::InferenceEvent>,
+            _cancellation: CancellationToken,
+        ) -> InferenceFuture<'_> {
+            self.tool_counts
+                .lock()
+                .expect("tool counts")
+                .push(request.tools.len());
+            Box::pin(async move {
+                if request.tools.is_empty() {
+                    Ok(InferenceOutput {
+                        text: "partial synthesis from retained evidence".to_owned(),
+                        ..InferenceOutput::default()
+                    })
+                } else {
+                    Ok(InferenceOutput {
+                        tool_calls: vec![ToolCall {
+                            id: "call".to_owned(),
+                            name: "todo".to_owned(),
+                            arguments: json!({"op": "view"}),
+                        }],
+                        ..InferenceOutput::default()
+                    })
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_finalization_reserve_disables_tools_and_finishes_before_hard_limit() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(ReserveAwareProvider::default());
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider.clone());
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        runtime
+            .configure_external_tools(&session.id, Vec::new(), false, None, Some(6), 2, None)
+            .await
+            .expect("turn policy");
+        let (events, mut receiver) = mpsc::channel(128);
+
+        runtime
+            .run_turn(
+                &mut session,
+                "reserved-turn",
+                "Keep working.".to_owned(),
+                Vec::new(),
+                &events,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("reserve permits synthesis");
+
+        let tool_counts = provider.tool_counts.lock().expect("tool counts").clone();
+        assert_eq!(tool_counts.len(), 5);
+        assert!(tool_counts[..4].iter().all(|count| *count > 0));
+        assert_eq!(tool_counts[4], 0);
+        drop(events);
+        let mut warnings = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            if let BackendEvent::Warning(message) = event {
+                warnings.push(message);
+            }
+        }
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("Protected finalization reserve started with 2 turn(s) remaining")
+        }));
+        assert!(session.history.iter().any(|item| {
+            matches!(item, ConversationItem::Assistant { text, .. } if text == "partial synthesis from retained evidence")
+        }));
+    }
+
     #[tokio::test]
     async fn configured_max_turns_stops_native_agentic_rounds() {
         let directory = tempfile::tempdir().expect("workspace");
@@ -3329,7 +3468,7 @@ mod tests {
         let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider.clone());
         let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
         runtime
-            .configure_external_tools(&session.id, Vec::new(), false, None, Some(2), None)
+            .configure_external_tools(&session.id, Vec::new(), false, None, Some(2), 0, None)
             .await
             .expect("turn policy");
         let (events, _receiver) = mpsc::channel(128);
