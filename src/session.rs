@@ -4251,6 +4251,7 @@ mod tests {
             "Literal prefix",
             None,
             &ModelOptions::default(),
+            None,
         )?;
 
         assert_eq!(store.find("literal%")?, None);

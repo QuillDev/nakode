@@ -5159,6 +5159,7 @@ mod tests {
                 "Stalled delete test",
                 None,
                 &crate::backend::ModelOptions::default(),
+                None,
             )
             .expect("persist session before deletion");
 
@@ -5272,6 +5273,7 @@ mod tests {
                 "Terminal persistence delete test",
                 None,
                 &crate::backend::ModelOptions::default(),
+                None,
             )
             .expect("persist session before deletion");
         sessions
@@ -5449,6 +5451,7 @@ mod tests {
                 "Durable delete test",
                 None,
                 &crate::backend::ModelOptions::default(),
+                None,
             )
             .expect("persist session before deletion");
         let breaker = rusqlite::Connection::open(&database).expect("breaker connection");
