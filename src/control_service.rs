@@ -25,6 +25,9 @@ const SERVICE_START_ATTEMPTS: usize = 40;
 const SERVICE_STOP_ATTEMPTS: usize = 100;
 const ACTIVATION_LOCK_ATTEMPTS: usize = 120;
 const ACTIVATION_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+// Server-side quiescence fencing is bounded at three seconds. Leave enough time for that response
+// under load while ensuring endpoint discovery cannot consume the CLI's larger command deadline.
+const LIFECYCLE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(8);
 const SERVICE_START_RETRY: Duration = Duration::from_millis(50);
 const RESUME_ENVIRONMENT_KEYS: [&str; 2] = ["NAKODE_RESUME", "NAKO_AGENT_RESUME"];
 const SERVICE_EXECUTABLE_IDENTITY_ENVIRONMENT: &str = "NAKODE_SERVICE_EXECUTABLE_IDENTITY";
@@ -914,41 +917,64 @@ where
     Request: Serialize,
     Response: for<'de> Deserialize<'de>,
 {
+    exchange_with_timeout(path, request, LIFECYCLE_EXCHANGE_TIMEOUT).await
+}
+
+async fn exchange_with_timeout<Request, Response>(
+    path: &Path,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Response, ControlError>
+where
+    Request: Serialize,
+    Response: for<'de> Deserialize<'de>,
+{
     let display_path = path.display().to_string();
-    let stream = UnixStream::connect(path)
+    let request = async {
+        let stream = UnixStream::connect(path)
+            .await
+            .map_err(|source| ControlError::Io {
+                path: display_path.clone(),
+                source,
+            })?;
+        let (reader, mut writer) = stream.into_split();
+        let encoded = serde_json::to_string(request)?;
+        writer
+            .write_all(encoded.as_bytes())
+            .await
+            .map_err(|source| ControlError::Io {
+                path: display_path.clone(),
+                source,
+            })?;
+        writer
+            .write_all(b"\n")
+            .await
+            .map_err(|source| ControlError::Io {
+                path: display_path.clone(),
+                source,
+            })?;
+        let mut line = String::new();
+        BufReader::new(reader)
+            .read_line(&mut line)
+            .await
+            .map_err(|source| ControlError::Io {
+                path: display_path.clone(),
+                source,
+            })?;
+        if line.is_empty() {
+            return Err(ControlError::MissingResponse);
+        }
+        Ok(serde_json::from_str(&line)?)
+    };
+    tokio::time::timeout(timeout, request)
         .await
-        .map_err(|source| ControlError::Io {
-            path: display_path.clone(),
-            source,
-        })?;
-    let (reader, mut writer) = stream.into_split();
-    let encoded = serde_json::to_string(request)?;
-    writer
-        .write_all(encoded.as_bytes())
-        .await
-        .map_err(|source| ControlError::Io {
-            path: display_path.clone(),
-            source,
-        })?;
-    writer
-        .write_all(b"\n")
-        .await
-        .map_err(|source| ControlError::Io {
-            path: display_path.clone(),
-            source,
-        })?;
-    let mut line = String::new();
-    BufReader::new(reader)
-        .read_line(&mut line)
-        .await
-        .map_err(|source| ControlError::Io {
+        .map_err(|_| ControlError::Io {
             path: display_path,
-            source,
-        })?;
-    if line.is_empty() {
-        return Err(ControlError::MissingResponse);
-    }
-    Ok(serde_json::from_str(&line)?)
+            source: std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("lifecycle request exceeded {}ms", timeout.as_millis()),
+            ),
+        })?
 }
 
 async fn expect_ok(path: &Path, request: &LifecycleRequest) -> Result<(), ControlError> {
@@ -965,7 +991,15 @@ async fn expect_ok(path: &Path, request: &LifecycleRequest) -> Result<(), Contro
 }
 
 async fn ping_at(service_path: &Path, config: &Config) -> Result<(), ControlError> {
-    let configuration = running_configuration_at(service_path).await?;
+    ping_at_with_timeout(service_path, config, LIFECYCLE_EXCHANGE_TIMEOUT).await
+}
+
+async fn ping_at_with_timeout(
+    service_path: &Path,
+    config: &Config,
+    timeout: Duration,
+) -> Result<(), ControlError> {
+    let configuration = running_configuration_at_with_timeout(service_path, timeout).await?;
     if configuration == service_configuration_fingerprint(config) {
         Ok(())
     } else {
@@ -974,7 +1008,14 @@ async fn ping_at(service_path: &Path, config: &Config) -> Result<(), ControlErro
 }
 
 async fn running_configuration_at(service_path: &Path) -> Result<String, ControlError> {
-    match exchange(service_path, &LifecycleRequest::Ping).await? {
+    running_configuration_at_with_timeout(service_path, LIFECYCLE_EXCHANGE_TIMEOUT).await
+}
+
+async fn running_configuration_at_with_timeout(
+    service_path: &Path,
+    timeout: Duration,
+) -> Result<String, ControlError> {
+    match exchange_with_timeout(service_path, &LifecycleRequest::Ping, timeout).await? {
         LifecycleResponse::Ready { configuration } => Ok(configuration),
         LifecycleResponse::Ok => Err(ControlError::ServiceRejected(
             "unexpected lifecycle readiness response".to_owned(),
@@ -999,12 +1040,32 @@ async fn ensure_service_at(
     executable: &Path,
     config: &Config,
 ) -> Result<(), ControlError> {
-    match ping_at(service_path.lifecycle(), config).await {
+    ensure_service_at_with_timeout(service_path, executable, config, LIFECYCLE_EXCHANGE_TIMEOUT)
+        .await
+}
+
+async fn ensure_service_at_with_timeout(
+    service_path: &ServicePaths,
+    executable: &Path,
+    config: &Config,
+    timeout: Duration,
+) -> Result<(), ControlError> {
+    match ping_at_with_timeout(service_path.lifecycle(), config, timeout).await {
         Ok(()) => return Ok(()),
         Err(ControlError::ConfigurationMismatch) => {
             return Err(ControlError::ConfigurationMismatch);
         }
-        Err(_) => {}
+        Err(error) => {
+            if matches!(
+                &error,
+                ControlError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::TimedOut
+            ) {
+                // A connected lifecycle owner still owns startup authority. Propagate its stall
+                // instead of spawning a competing process and relying on socket binding to reject it.
+                return Err(error);
+            }
+        }
     }
 
     let mut command = service_command(executable, config);
@@ -1016,7 +1077,10 @@ async fn ensure_service_at(
 
     for _ in 0..SERVICE_START_ATTEMPTS {
         tokio::time::sleep(SERVICE_START_RETRY).await;
-        if ping_at(service_path.lifecycle(), config).await.is_ok() {
+        if ping_at_with_timeout(service_path.lifecycle(), config, timeout)
+            .await
+            .is_ok()
+        {
             return Ok(());
         }
     }
@@ -2442,12 +2506,12 @@ mod tests {
         RESUME_ENVIRONMENT_KEYS, ServicePaths, ServiceRuntimeRecord, StaleServiceRefreshOutcome,
         TransportAction, TransportController, TransportStatus, TransportSupervisor, UnixListener,
         activation_lock_owner_is_abandoned, bind_service_listener, detach_service_process,
-        ensure_service_at, exchange, executable_identity, expect_ok, frontend_api_endpoint_at,
-        ping_at, quiescence_refusal, refresh_stale_service, run_lifecycle_listener,
-        runtime_matches_cli, server_is_api_compatible, service_arguments, service_can_be_reused,
-        service_command, service_configuration_fingerprint, service_running_at,
-        session_has_live_work, shutdown_all_services_in, workspace_from_log,
-        workspace_runtime_directory_in,
+        ensure_service_at, ensure_service_at_with_timeout, exchange, exchange_with_timeout,
+        executable_identity, expect_ok, frontend_api_endpoint_at, ping_at, quiescence_refusal,
+        refresh_stale_service, run_lifecycle_listener, runtime_matches_cli,
+        server_is_api_compatible, service_arguments, service_can_be_reused, service_command,
+        service_configuration_fingerprint, service_running_at, session_has_live_work,
+        shutdown_all_services_in, workspace_from_log, workspace_runtime_directory_in,
     };
     use crate::config::{Config, OpenAiReasoningEffort};
 
@@ -2460,6 +2524,61 @@ mod tests {
             device: Some("7".to_owned()),
             inode: Some("11".to_owned()),
         }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_exchange_times_out_when_a_connected_owner_never_responds() {
+        let directory = tempfile::tempdir().expect("lifecycle directory");
+        let path = directory.path().join("hung.sock");
+        let listener = UnixListener::bind(&path).expect("hung lifecycle listener");
+        let hung_owner = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept lifecycle request");
+            std::future::pending::<()>().await;
+        });
+
+        let timeout = Duration::from_millis(50);
+        let started = tokio::time::Instant::now();
+        let result: Result<LifecycleResponse, ControlError> =
+            exchange_with_timeout(&path, &LifecycleRequest::Ping, timeout).await;
+
+        assert!(matches!(
+            result,
+            Err(ControlError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "hung lifecycle exchange exceeded its bounded timeout"
+        );
+        hung_owner.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_defers_to_a_connected_lifecycle_owner_that_never_responds() {
+        let directory = tempfile::tempdir().expect("lifecycle directory");
+        let config = config_for(directory.path());
+        let paths = ServicePaths::in_directory(directory.path());
+        let listener = UnixListener::bind(paths.lifecycle()).expect("hung lifecycle listener");
+        let hung_owner = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept lifecycle request");
+            std::future::pending::<()>().await;
+        });
+        let missing_executable = directory.path().join("must-not-be-spawned");
+
+        let result = ensure_service_at_with_timeout(
+            &paths,
+            &missing_executable,
+            &config,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::TimedOut
+        ));
+        hung_owner.abort();
     }
 
     #[test]
