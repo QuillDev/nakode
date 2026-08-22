@@ -1100,6 +1100,35 @@ pub struct DomainState {
 pub type AppState = DomainState;
 
 impl DomainState {
+    pub(crate) fn workspace_configuration_matches(&self, source: &Self) -> bool {
+        self.provider_contexts.len() == source.provider_contexts.len()
+            && self.provider_contexts.iter().all(|(provider, current)| {
+                source
+                    .provider_contexts
+                    .get(provider)
+                    .is_some_and(|candidate| {
+                        current.name == candidate.name
+                            && current.capabilities == candidate.capabilities
+                            && current.connection == candidate.connection
+                    })
+            })
+            && self.provider_authentication == source.provider_authentication
+            && self.models == source.models
+            && self.model_options == source.model_options
+            && self.default_model_options == source.default_model_options
+            && self.agents.definitions() == source.agents.definitions()
+            && self.skills.definitions() == source.skills.definitions()
+            && self.agent_directory == source.agent_directory
+            && self.nakode_executable == source.nakode_executable
+            && self.web_config == source.web_config
+            && self.memory_config == source.memory_config
+            && self.vision_config == source.vision_config
+            && self.terminal_image_mode == source.terminal_image_mode
+            && self.invocation_telemetry_enabled == source.invocation_telemetry_enabled
+            && self.agent_browser_status == source.agent_browser_status
+            && self.available_builtin_tools == source.available_builtin_tools
+    }
+
     pub(crate) fn synchronize_workspace_configuration(&mut self, source: &Self) {
         let mut local_contexts = std::mem::take(&mut self.provider_contexts);
         self.provider_contexts = source
@@ -11470,6 +11499,14 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
 
         target.synchronize_workspace_configuration(&source);
 
+        assert!(target.workspace_configuration_matches(&source));
+        target
+            .transcript
+            .append_delta("local-stream", EntryKind::Assistant, "Nakode", "delta");
+        assert!(
+            target.workspace_configuration_matches(&source),
+            "session-local transcript changes must not trigger workspace-wide synchronization"
+        );
         assert!(target.connection.is_ready());
         assert_eq!(target.backend_name, "codex-test");
         assert!(

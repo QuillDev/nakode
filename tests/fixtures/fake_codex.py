@@ -39,8 +39,11 @@ if "--init-gate" in sys.argv:
         sys.stderr.write(f"invalid initialization gate: {error}\n")
         sys.exit(2)
     init_gate = Path(candidate)
-thread_id = "thread-fixture"
-turn_id = "turn-fixture"
+unique_ids = os.environ.get("NAKODE_E2E_UNIQUE_CODEX_IDS") == "1"
+id_suffix = f"-{os.getpid()}" if unique_ids else ""
+thread_id = f"thread-fixture{id_suffix}"
+turn_id = f"turn-fixture{id_suffix}"
+item_id = f"assistant-fixture{id_suffix}"
 
 for raw_line in sys.stdin:
     try:
@@ -236,7 +239,7 @@ for raw_line in sys.stdin:
                         "startedAtMs": 1,
                         "item": {
                             "type": "agentMessage",
-                            "id": "assistant-fixture",
+                            "id": item_id,
                             "text": "",
                             "phase": None,
                             "memoryCitation": None,
@@ -251,7 +254,7 @@ for raw_line in sys.stdin:
                         "params": {
                             "threadId": thread_id,
                             "turnId": turn_id,
-                            "itemId": "assistant-fixture",
+                            "itemId": item_id,
                             "delta": delta,
                         },
                     }
@@ -266,7 +269,7 @@ for raw_line in sys.stdin:
                         "completedAtMs": 2,
                         "item": {
                             "type": "agentMessage",
-                            "id": "assistant-fixture",
+                            "id": item_id,
                             "text": "hello world",
                             "phase": None,
                             "memoryCitation": None,

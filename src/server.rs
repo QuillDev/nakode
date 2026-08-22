@@ -376,19 +376,47 @@ impl ServerCore {
         endpoint: &ServerEndpoint,
         session_id: &SessionId,
     ) {
-        let other_session_views = self
-            .sessions_by_id
-            .keys()
-            .filter(|candidate_id| *candidate_id != session_id)
-            .filter_map(|candidate_id| {
-                self.published_session(candidate_id)
-                    .map(|projection| (candidate_id.clone(), projection.view))
-            })
-            .collect::<Vec<_>>();
+        self.commit_and_publish_session_inner(endpoint, session_id, false);
+    }
+
+    pub(crate) fn commit_and_publish_backend_session(
+        &mut self,
+        endpoint: &ServerEndpoint,
+        session_id: &SessionId,
+    ) {
+        self.commit_and_publish_session_inner(endpoint, session_id, true);
+    }
+
+    fn commit_and_publish_session_inner(
+        &mut self,
+        endpoint: &ServerEndpoint,
+        session_id: &SessionId,
+        skip_unchanged_workspace: bool,
+    ) {
+        let workspace_configuration_changed =
+            self.sessions_by_id.get(session_id).is_some_and(|engine| {
+                !self
+                    .session_template
+                    .workspace_configuration_matches(engine.state())
+            });
+        let other_session_views = if workspace_configuration_changed {
+            self.sessions_by_id
+                .keys()
+                .filter(|candidate_id| *candidate_id != session_id)
+                .filter_map(|candidate_id| {
+                    self.published_session(candidate_id)
+                        .map(|projection| (candidate_id.clone(), projection.view))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if let Some(engine) = self.sessions_by_id.get_mut(session_id) {
             engine.note_state_change();
         }
-        self.synchronize_workspace_state_from(session_id);
+        if workspace_configuration_changed {
+            self.synchronize_workspace_state_from(session_id);
+        }
         let mut changed_sessions = other_session_views
             .into_iter()
             .filter_map(|(candidate_id, previous)| {
@@ -403,10 +431,58 @@ impl ServerCore {
                 engine.note_state_change();
             }
         }
-        self.publish_state(endpoint, session_id);
-        for changed_session in changed_sessions {
-            self.publish_state(endpoint, &changed_session);
+        let workspace_projection_changed = !skip_unchanged_workspace
+            || workspace_configuration_changed
+            || self.workspace_session_summary_changed(session_id)
+            || self.workspace_bridges_changed();
+        if workspace_projection_changed {
+            self.publish_state(endpoint, session_id);
+        } else {
+            self.publish_session_state(endpoint, session_id);
         }
+        for changed_session in changed_sessions {
+            self.publish_session_state(endpoint, &changed_session);
+        }
+    }
+
+    fn workspace_session_summary_changed(&self, session_id: &SessionId) -> bool {
+        let Some(engine) = self.sessions_by_id.get(session_id) else {
+            return false;
+        };
+        let Some(current) =
+            crate::state::projection::active_session_summary(engine.state(), &self.sessions)
+        else {
+            return true;
+        };
+        self.published_workspace.as_ref().is_none_or(|workspace| {
+            workspace
+                .sessions
+                .iter()
+                .find(|summary| summary.id == current.id)
+                != Some(&current)
+        })
+    }
+
+    fn workspace_bridges_changed(&self) -> bool {
+        let current = self
+            .session_bridges
+            .iter()
+            .map(session_bridge_view)
+            .collect::<Vec<_>>();
+        self.published_workspace
+            .as_ref()
+            .is_none_or(|workspace| workspace.session_bridges != current)
+    }
+
+    pub(crate) fn commit_and_publish_session_delta(
+        &mut self,
+        endpoint: &ServerEndpoint,
+        session_id: &SessionId,
+    ) {
+        if let Some(engine) = self.sessions_by_id.get_mut(session_id) {
+            engine.note_state_change();
+        }
+        self.publish_session_state(endpoint, session_id);
     }
 
     pub(crate) fn replace_provider_records(&mut self, providers: Vec<ProviderRecord>) {
@@ -2774,10 +2850,18 @@ impl ServerCore {
 
     fn publish_state(&mut self, endpoint: &ServerEndpoint, session_id: &SessionId) {
         let workspace = self.workspace_bootstrap();
-        let mut publications =
+        let publications =
             self.workspace_publications(self.published_workspace.as_ref(), &workspace);
         self.published_workspace = Some(workspace);
 
+        for publication in publications {
+            let _ = endpoint.publish(publication.scopes, publication.event);
+        }
+        self.publish_session_state(endpoint, session_id);
+    }
+
+    fn publish_session_state(&mut self, endpoint: &ServerEndpoint, session_id: &SessionId) {
+        let mut publications = Vec::new();
         if let Some(session) = self.published_session(session_id) {
             publications.extend(
                 self.session_publications(self.published_sessions.get(session_id), &session),
@@ -3165,55 +3249,61 @@ impl ServerCore {
             if *session_id == self.default_session && !initial_session_is_persisted {
                 continue;
             }
-            let Some(session) = engine
-                .bootstrap_view(&self.providers, &self.sessions)
-                .active_session
-            else {
-                continue;
+            let summary = if let Some(summary) =
+                crate::state::projection::active_session_summary(engine.state(), &self.sessions)
+            {
+                summary
+            } else {
+                let Some(session) = engine
+                    .bootstrap_view(&self.providers, &self.sessions)
+                    .active_session
+                else {
+                    continue;
+                };
+                let mut owned_provider_sessions = session
+                    .active_agent_session
+                    .as_ref()
+                    .and_then(|agent| {
+                        agent.native_session_id.as_ref().map(|native_session_id| {
+                            nakode_protocol::OwnedProviderSessionView {
+                                provider_id: agent.provider_id.clone(),
+                                native_session_id: native_session_id.clone(),
+                            }
+                        })
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                owned_provider_sessions.extend(session.runs.iter().filter_map(|run| {
+                    run.native_session_id.as_ref().map(|native_session_id| {
+                        nakode_protocol::OwnedProviderSessionView {
+                            provider_id: run.provider_id.clone(),
+                            native_session_id: native_session_id.clone(),
+                        }
+                    })
+                }));
+                nakode_protocol::SessionSummary {
+                    id: session.id,
+                    workspace_id: session.workspace_id,
+                    working_directory: session.working_directory,
+                    title: session.title,
+                    active_provider_id: session.selected_provider_id,
+                    active_model_id: session.selected_model_id,
+                    updated_at_ms: session.updated_at_ms,
+                    created_at_ms: session.created_at_ms,
+                    owned_provider_sessions,
+                    running: !matches!(session.activity, nakode_protocol::SessionActivity::Idle),
+                }
             };
             let position = bootstrap
                 .sessions
                 .iter()
-                .position(|summary| summary.id == session.id);
-            let updated_at_ms = position.map_or(0, |index| bootstrap.sessions[index].updated_at_ms);
-            let created_at_ms = position.map_or(0, |index| bootstrap.sessions[index].created_at_ms);
-            let mut owned_provider_sessions = session
-                .active_agent_session
-                .as_ref()
-                .and_then(|agent| {
-                    agent.native_session_id.as_ref().map(|native_session_id| {
-                        nakode_protocol::OwnedProviderSessionView {
-                            provider_id: agent.provider_id.clone(),
-                            native_session_id: native_session_id.clone(),
-                        }
-                    })
-                })
-                .into_iter()
-                .collect::<Vec<_>>();
-            owned_provider_sessions.extend(session.runs.iter().filter_map(|run| {
-                run.native_session_id.as_ref().map(|native_session_id| {
-                    nakode_protocol::OwnedProviderSessionView {
-                        provider_id: run.provider_id.clone(),
-                        native_session_id: native_session_id.clone(),
-                    }
-                })
-            }));
-            let summary = nakode_protocol::SessionSummary {
-                id: session.id,
-                workspace_id: session.workspace_id,
-                working_directory: session.working_directory,
-                title: session.title,
-                active_provider_id: session.selected_provider_id,
-                active_model_id: session.selected_model_id,
-                updated_at_ms,
-                created_at_ms,
-                owned_provider_sessions,
-                running: !matches!(session.activity, nakode_protocol::SessionActivity::Idle),
-            };
+                .position(|candidate| candidate.id == summary.id);
             if let Some(position) = position {
                 bootstrap.sessions[position] = summary;
             } else {
-                bootstrap.sessions.push(summary);
+                // Match projection::bootstrap's treatment of a live session that has not reached
+                // persistence yet: current process-owned work precedes the persisted recency list.
+                bootstrap.sessions.insert(0, summary);
             }
         }
         bootstrap.session_bridges = self
@@ -6673,22 +6763,36 @@ first_message = "Starting review"
         let (endpoint, _requests) =
             ServerEndpoint::channel("test", ServiceCapabilities::default(), 16);
         core.publish_state(&endpoint, &second_id);
+        core.commit_and_publish_backend_session(&endpoint, &second_id);
+        let expected_summary = crate::state::projection::active_session_summary(
+            core.engine_for(&second_id).expect("second session").state(),
+            &core.sessions,
+        )
+        .expect("session without subagents has a lightweight summary");
+        let workspace = core.workspace_bootstrap();
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .find(|summary| summary.id == second_id)
+                .expect("published second-session summary"),
+            &expected_summary,
+        );
         let mut publications = endpoint.subscribe_publications();
         let previous_revision = core
-            .engine_for(&second_id)
-            .expect("second session")
+            .engine_for(&first_id)
+            .expect("first session")
             .revision();
 
-        core.engine_for_mut(&first_id)
-            .expect("first session")
+        core.engine_for_mut(&second_id)
+            .expect("second session")
             .state_mut()
-            .transcript
-            .append_delta("turn-stream", EntryKind::Assistant, "Nakode", "working");
-        core.commit_and_publish_session(&endpoint, &first_id);
+            .set_status("session-local backend progress");
+        core.commit_and_publish_backend_session(&endpoint, &second_id);
 
         assert_eq!(
-            core.engine_for(&second_id)
-                .expect("second session")
+            core.engine_for(&first_id)
+                .expect("first session")
                 .revision(),
             previous_revision
         );
@@ -6697,9 +6801,17 @@ first_message = "Starting review"
             events
                 .iter()
                 .all(|event| !event.scopes.contains(&SubscriptionScope::Session {
-                    session_id: second_id.clone(),
+                    session_id: first_id.clone(),
                 })),
             "{events:#?}"
+        );
+        assert!(
+            events.iter().all(
+                |event| !event.scopes.contains(&SubscriptionScope::Workspace {
+                    workspace_id: workspace_id.clone(),
+                })
+            ),
+            "session-local backend updates must not invalidate the workspace: {events:#?}"
         );
     }
 
@@ -7368,9 +7480,19 @@ first_message = "Starting review"
             .state_mut()
             .transcript
             .append_delta("stream", EntryKind::Assistant, "Nakode", &delta);
-        core.commit_and_publish_session(&endpoint, &session_id);
+        core.commit_and_publish_session_delta(&endpoint, &session_id);
 
-        let events = drain_publications(&mut publications)
+        let all_events = drain_publications(&mut publications);
+        let workspace_scope = SubscriptionScope::Workspace {
+            workspace_id: crate::state::projection::workspace_id("/tmp/project"),
+        };
+        assert!(
+            all_events
+                .iter()
+                .all(|event| !event.scopes.contains(&workspace_scope)),
+            "streaming transcript deltas must not rebuild or invalidate the workspace projection"
+        );
+        let events = all_events
             .into_iter()
             .filter(|event| event.scopes.contains(&scope))
             .collect::<Vec<_>>();

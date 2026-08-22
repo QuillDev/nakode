@@ -1078,6 +1078,7 @@ impl NativeServerRuntime {
     // Provider-event correlation, durable bridge acknowledgement, and downstream effect ordering
     // intentionally share this dispatcher so persistence failure can stop every dependent effect.
     async fn handle_backend_event(&mut self, source: BackendSource, event: BackendEvent) {
+        let is_streaming_delta = matches!(&event, BackendEvent::ItemDelta { .. });
         if let BackendEvent::ExternalToolRequested(request) = &event
             && request.name.starts_with(nakode_protocol::MCP_TOOL_PREFIX)
         {
@@ -1253,8 +1254,13 @@ impl NativeServerRuntime {
                 Err(_) => eprintln!("nakode bridge: durable inbound replay deferred"),
             }
         }
-        self.core
-            .commit_and_publish_session(&self.endpoint, &session_id);
+        if is_streaming_delta {
+            self.core
+                .commit_and_publish_session_delta(&self.endpoint, &session_id);
+        } else {
+            self.core
+                .commit_and_publish_backend_session(&self.endpoint, &session_id);
+        }
     }
     #[allow(clippy::too_many_lines)]
     async fn handle_mcp_tool_request(

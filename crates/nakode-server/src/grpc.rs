@@ -1579,6 +1579,23 @@ impl api::nakode_service_server::NakodeService for GrpcService {
     }
 }
 
+fn drain_pending_publications(publications: &mut tokio::sync::broadcast::Receiver<PublishedEvent>) {
+    // A replacement snapshot supersedes every earlier invalidation. Drain only what is already
+    // queued so active streams do not replay stale intermediate text under provider fan-out, while
+    // preserving immediate delivery when the server is otherwise idle.
+    let mut drained = 0;
+    while drained < crate::DEFAULT_PUBLICATION_CAPACITY {
+        match publications.try_recv() {
+            Ok(_) => drained += 1,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => break,
+        }
+    }
+}
+
 fn spawn_workspace_watch(
     service: GrpcService,
     scope: protocol::SubscriptionScope,
@@ -1589,6 +1606,7 @@ fn spawn_workspace_watch(
         loop {
             match publications.recv().await {
                 Ok(publication) if publication.scopes.contains(&scope) => {
+                    drain_pending_publications(&mut publications);
                     let update = service
                         .subscription(scope.clone())
                         .await
@@ -1610,6 +1628,7 @@ fn spawn_workspace_watch(
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    drain_pending_publications(&mut publications);
                     let update = service
                         .subscription(scope.clone())
                         .await
@@ -1645,6 +1664,7 @@ fn spawn_session_watch(
         loop {
             match publications.recv().await {
                 Ok(publication) if publication.scopes.contains(&scope) => {
+                    drain_pending_publications(&mut publications);
                     let update = service
                         .subscription(scope.clone())
                         .await
@@ -1665,6 +1685,7 @@ fn spawn_session_watch(
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    drain_pending_publications(&mut publications);
                     let update = service
                         .subscription(scope.clone())
                         .await
@@ -1699,6 +1720,7 @@ fn spawn_run_watch(
         loop {
             match publications.recv().await {
                 Ok(publication) if publication.scopes.contains(&scope) => {
+                    drain_pending_publications(&mut publications);
                     let update = service
                         .subscription(scope.clone())
                         .await
@@ -1717,6 +1739,7 @@ fn spawn_run_watch(
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    drain_pending_publications(&mut publications);
                     let update = service
                         .subscription(scope.clone())
                         .await
@@ -2684,6 +2707,30 @@ fn diagnostics_totals(value: &protocol::DiagnosticsUsageTotals) -> api::Diagnost
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_watch_drain_discards_queued_intermediate_invalidations() {
+        let (endpoint, _requests) =
+            ServerEndpoint::channel("test", protocol::ServiceCapabilities::default(), 1);
+        let mut publications = endpoint.subscribe_publications();
+        for index in 0..(crate::DEFAULT_PUBLICATION_CAPACITY + 64) {
+            endpoint
+                .publish(
+                    Vec::new(),
+                    protocol::ViewEvent::SessionRemoved {
+                        session_id: protocol::SessionId::from(format!("session-{index}")),
+                    },
+                )
+                .expect("publish invalidation");
+        }
+
+        drain_pending_publications(&mut publications);
+
+        assert!(matches!(
+            publications.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
 
     #[test]
     fn provider_builtin_availability_preserves_known_empty_and_legacy_absence() {
