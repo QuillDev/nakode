@@ -3502,6 +3502,15 @@ impl DomainState {
         self.submit_prompt_with_id_and_source(prompt_id, text, attachments, None)
     }
 
+    fn validate_prompt_operation_id(prompt_id: &str) -> Result<(), DomainCommandError> {
+        if prompt_id.is_empty() || prompt_id.len() > 128 {
+            return Err(DomainCommandError::Invalid(
+                "prompt operation id must contain 1 to 128 bytes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Submits one transport-origin prompt while retaining its immutable source for transcript
     /// projection and same-transport echo suppression.
     pub(crate) fn submit_prompt_with_id_and_source(
@@ -3511,11 +3520,7 @@ impl DomainState {
         attachments: Vec<PromptAttachment>,
         source_transport: Option<String>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        if prompt_id.is_empty() || prompt_id.len() > 128 {
-            return Err(DomainCommandError::Invalid(
-                "prompt operation id must contain 1 to 128 bytes".to_owned(),
-            ));
-        }
+        Self::validate_prompt_operation_id(&prompt_id)?;
         self.validate_prompt(&text)?;
         if !self.connection.is_ready() {
             return Err(DomainCommandError::Conflict(
@@ -3571,14 +3576,24 @@ impl DomainState {
         text: String,
         attachments: Vec<PromptAttachment>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.enqueue_prompt_with_id(Self::next_id("msg"), text, attachments)
+    }
+
+    /// Enqueues one prompt under a stable caller-owned mutation identity.
+    pub(crate) fn enqueue_prompt_with_id(
+        &mut self,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        Self::validate_prompt_operation_id(&prompt_id)?;
         self.validate_prompt(&text)?;
         if !self.is_busy() {
-            return self.submit_prompt(text, attachments);
+            return self.submit_prompt_with_id(prompt_id, text, attachments);
         }
         self.recoverable_prompt = None;
-        let id = Self::next_id("msg");
         self.queue.push_back(QueuedPrompt {
-            id,
+            id: prompt_id,
             text,
             attachments,
             source_transport: None,
@@ -7537,17 +7552,41 @@ impl DomainState {
         task: &str,
         parent_run_id: Option<&str>,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
-        self.delegate_agent_attributed_for_request(agent_slug, task, parent_run_id, 0)
+        self.delegate_agent_attributed_for_request(agent_slug, task, parent_run_id, 0, None, None)
+    }
+
+    fn originating_owner_entry_id(&self, invocation_turn_id: Option<&str>) -> Option<String> {
+        // Prefer the exact provider turn. The fallback preserves attribution for legacy/restored
+        // entries without owner-turn metadata.
+        invocation_turn_id
+            .and_then(|turn_id| {
+                self.transcript.entries().iter().rev().find(|entry| {
+                    entry.kind == EntryKind::User && entry.owner_turn_id.as_deref() == Some(turn_id)
+                })
+            })
+            .or_else(|| {
+                self.transcript
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.kind == EntryKind::User)
+            })
+            .map(|entry| entry.id.clone())
     }
 
     /// Creates one delegated run whose terminal effect is correlated to a native runtime waiter.
     /// Existing UI/CLI delegations use request id zero and keep their historical projection path.
+    #[allow(clippy::too_many_lines)]
+    // Run creation intentionally keeps the accepted policy, attribution, launch command, and
+    // observable insertion in one atomic state transition.
     pub(crate) fn delegate_agent_attributed_for_request(
         &mut self,
         agent_slug: &str,
         task: &str,
         parent_run_id: Option<&str>,
         request_id: u64,
+        invocation_turn_id: Option<&str>,
+        invocation_call_id: Option<&str>,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
         self.validate_agent_request(agent_slug, task)?;
         let task = task.trim();
@@ -7558,6 +7597,7 @@ impl DomainState {
         };
         let (parent_run_id, remaining_delegation_depth) =
             self.delegation_context(parent_run_id, &definition)?;
+        let originating_owner_entry_id = self.originating_owner_entry_id(invocation_turn_id);
 
         let run_id = Self::next_id("agent");
         let model_targets = agent_model_targets(&definition, &self.backend_provider);
@@ -7574,6 +7614,9 @@ impl DomainState {
             latest_activity: "Starting provider…".to_owned(),
             observability: SubagentObservability {
                 parent_run_id: parent_run_id.clone(),
+                invocation_turn_id: invocation_turn_id.map(ToOwned::to_owned),
+                invocation_call_id: invocation_call_id.map(ToOwned::to_owned),
+                originating_owner_entry_id,
                 archetype_purpose: definition.description.clone(),
                 policy_json: serde_json::to_string(&definition).unwrap_or_else(|_| "{}".to_owned()),
                 remaining_delegation_depth,
@@ -7891,6 +7934,8 @@ impl DomainState {
             &request.task,
             None,
             request.id,
+            None,
+            None,
         ) {
             Ok((_, effects)) => effects,
             Err(error) => vec![Effect::CompleteAgentRequest {
@@ -14231,9 +14276,57 @@ tool_profile = "none"
     fn native_delegation_request_id_survives_to_terminal_effect() {
         let mut state = ready_state();
         state.install_agents(explorer_catalog());
+        state.transcript.restore(TranscriptEntry {
+            id: "owner-exact".to_owned(),
+            key: Some("owner-exact-key".to_owned()),
+            kind: EntryKind::User,
+            title: "YOU".to_owned(),
+            body: "Inspect native routing from this request".to_owned(),
+            status: EntryStatus::Complete,
+            created_at_ms: None,
+            provider_id: None,
+            model_id: None,
+            owner_turn_id: Some("turn-native".to_owned()),
+            reasoning_effort: None,
+            fast_mode: None,
+            source_transport: None,
+            tool_audit_json: None,
+        });
+        let owner_entry_id = "owner-exact".to_owned();
+        // A newer owner message must not steal attribution from the turn containing the call.
+        state.transcript.push(
+            EntryKind::User,
+            "YOU",
+            "A later queued request",
+            EntryStatus::Complete,
+        );
         let (run_id, launch) = state
-            .delegate_agent_attributed_for_request("explorer", "Inspect native routing", None, 77)
+            .delegate_agent_attributed_for_request(
+                "explorer",
+                "Inspect native routing",
+                None,
+                77,
+                Some("turn-native"),
+                Some("call-native"),
+            )
             .expect("native delegation");
+        let run = state
+            .subagents
+            .iter()
+            .find(|run| run.id == run_id)
+            .expect("attributed run");
+        assert_eq!(
+            run.observability.invocation_turn_id.as_deref(),
+            Some("turn-native")
+        );
+        assert_eq!(
+            run.observability.invocation_call_id.as_deref(),
+            Some("call-native")
+        );
+        assert_eq!(
+            run.observability.originating_owner_entry_id.as_deref(),
+            Some(owner_entry_id.as_str())
+        );
         assert!(
             launch
                 .iter()

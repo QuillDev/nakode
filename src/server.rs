@@ -590,6 +590,7 @@ impl ServerCore {
         // distinguishes a retry from another deliberate send; lifecycle and queue placement are
         // therefore evaluated against authoritative state when this command executes.
         let revision_fenced = !matches!(&command, Command::SendPrompt { .. });
+        let prompt_identity = key.as_str().to_owned();
         let (mut result, effects) = if revision_fenced
             && expected_revision.is_some_and(|revision| revision != command_revision)
         {
@@ -602,7 +603,29 @@ impl ServerCore {
                 Vec::new(),
             )
         } else {
-            self.execute_command(command)
+            match command {
+                Command::SendPrompt { session_id, prompt } => {
+                    let enqueue = self
+                        .engine_for(&session_id)
+                        .is_some_and(|engine| engine.state().is_busy());
+                    match self.prompt_command_with_id(
+                        &session_id,
+                        prompt,
+                        enqueue,
+                        &prompt_identity,
+                    ) {
+                        Ok((accepted, effects)) => (Ok(accepted), effects),
+                        Err(error) => (Err(domain_error(error)), Vec::new()),
+                    }
+                }
+                Command::EnqueuePrompt { session_id, prompt } => {
+                    match self.prompt_command_with_id(&session_id, prompt, true, &prompt_identity) {
+                        Ok((accepted, effects)) => (Ok(accepted), effects),
+                        Err(error) => (Err(domain_error(error)), Vec::new()),
+                    }
+                }
+                command => self.execute_command(command),
+            }
         };
         let effect_session = effect_session.or_else(|| {
             result
@@ -1941,17 +1964,45 @@ impl ServerCore {
         prompt: PromptInput,
         enqueue: bool,
     ) -> DomainCommandOutcome {
+        self.prompt_command_inner(session_id, prompt, enqueue, None)
+    }
+
+    fn prompt_command_with_id(
+        &mut self,
+        session_id: &SessionId,
+        prompt: PromptInput,
+        enqueue: bool,
+        prompt_id: &str,
+    ) -> DomainCommandOutcome {
+        self.prompt_command_inner(session_id, prompt, enqueue, Some(prompt_id))
+    }
+
+    fn prompt_command_inner(
+        &mut self,
+        session_id: &SessionId,
+        prompt: PromptInput,
+        enqueue: bool,
+        prompt_id: Option<&str>,
+    ) -> DomainCommandOutcome {
         self.ensure_session(session_id)?;
         self.reload_agent_catalogue_for_session(session_id)?;
         let (text, attachments) = self.convert_prompt(session_id, prompt)?;
         let effects = if enqueue {
-            self.session_engine_mut(session_id)?
-                .state_mut()
-                .enqueue_prompt(text, attachments)?
+            let state = self.session_engine_mut(session_id)?.state_mut();
+            match prompt_id {
+                Some(prompt_id) => {
+                    state.enqueue_prompt_with_id(prompt_id.to_owned(), text, attachments)?
+                }
+                None => state.enqueue_prompt(text, attachments)?,
+            }
         } else {
-            self.session_engine_mut(session_id)?
-                .state_mut()
-                .submit_prompt(text, attachments)?
+            let state = self.session_engine_mut(session_id)?.state_mut();
+            match prompt_id {
+                Some(prompt_id) => {
+                    state.submit_prompt_with_id(prompt_id.to_owned(), text, attachments)?
+                }
+                None => state.submit_prompt(text, attachments)?,
+            }
         };
         Ok(Self::accepted(None, effects))
     }
@@ -2129,6 +2180,9 @@ impl ServerCore {
         Ok(Self::accepted(None, effects))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    // This internal boundary keeps session, request, parent, and invocation identities explicit;
+    // collapsing them into UI-specific state would obscure the public server ownership contract.
     pub(crate) fn delegate_agent_attributed(
         &mut self,
         session_id: &SessionId,
@@ -2136,6 +2190,8 @@ impl ServerCore {
         task: &str,
         parent_run_id: Option<&str>,
         request_id: u64,
+        invocation_turn_id: Option<&str>,
+        invocation_call_id: Option<&str>,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
         self.ensure_session(session_id)?;
         if task.trim().is_empty() {
@@ -2146,7 +2202,14 @@ impl ServerCore {
         self.reload_agent_catalogue_for_session(session_id)?;
         self.session_engine_mut(session_id)?
             .state_mut()
-            .delegate_agent_attributed_for_request(agent_slug, task, parent_run_id, request_id)
+            .delegate_agent_attributed_for_request(
+                agent_slug,
+                task,
+                parent_run_id,
+                request_id,
+                invocation_turn_id,
+                invocation_call_id,
+            )
     }
 
     fn delegate_command(
@@ -6338,6 +6401,17 @@ mod tests {
             );
     }
 
+    fn assert_source_prompt_ids(core: &ServerCore, session_id: &SessionId, expected: &[&str]) {
+        let view = core.session_view(session_id).expect("session view");
+        let actual = view
+            .transcript
+            .entries
+            .iter()
+            .filter_map(|entry| entry.source_prompt_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
     fn busy_server_with_stale_revision(turn_id: &str) -> (ServerCore, SessionId, u64) {
         let (mut core, session_id) = ready_codex_server();
         core.engine_for_mut(&session_id)
@@ -6379,10 +6453,7 @@ mod tests {
             repeated.clone(),
         );
         first.expect("stale prompt append is accepted");
-        assert!(
-            effects.is_empty(),
-            "a busy send queues without interrupting"
-        );
+        assert!(effects.is_empty());
         assert!(changed);
 
         let (retry, retry_effects, retry_session, retry_changed) =
@@ -6426,8 +6497,13 @@ mod tests {
         );
         let queued_ids = queued
             .iter()
-            .map(|prompt| prompt.id.clone())
+            .map(|prompt| prompt.id.to_string())
             .collect::<Vec<_>>();
+        assert_eq!(
+            queued_ids,
+            ["window-a-repeat", "window-b-repeat", "window-c-next"],
+            "queued prompts retain their caller-owned mutation identities"
+        );
 
         for (completed_turn, next_turn, expected_prompt, expected_id) in [
             ("active-turn", "queued-turn-1", "repeat me", &queued_ids[0]),
@@ -6457,9 +6533,110 @@ mod tests {
             core.session_view(&session_id)
                 .expect("session view")
                 .queue
-                .is_empty(),
-            "every accepted follow-up leaves the authoritative queue exactly once"
+                .is_empty()
         );
+        assert_source_prompt_ids(
+            &core,
+            &session_id,
+            &["window-a-repeat", "window-b-repeat", "window-c-next"],
+        );
+    }
+
+    #[test]
+    fn busy_prompt_queue_rejects_oversized_caller_identity_without_mutation() {
+        let (mut core, session_id, _) = busy_server_with_stale_revision("active-turn");
+        let oversized_id = "x".repeat(129);
+        let (result, effects, _effect_session, changed) = core.execute_idempotent(
+            IdempotencyKey::from(oversized_id),
+            None,
+            false,
+            Command::EnqueuePrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "must not queue".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        let error = result.expect_err("oversized prompt identity must be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("1 to 128 bytes"));
+        assert!(effects.is_empty());
+        assert!(!changed);
+        assert!(
+            core.session_view(&session_id)
+                .expect("session view")
+                .queue
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_enqueued_prompt_retains_mutation_identity_after_promotion() {
+        let (mut core, session_id, _) = busy_server_with_stale_revision("active-turn");
+        core.execute_idempotent(
+            IdempotencyKey::from("explicit-queued-submission"),
+            None,
+            false,
+            Command::EnqueuePrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "queued owner message".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        )
+        .0
+        .expect("queue accepted");
+        assert_eq!(
+            core.session_view(&session_id).expect("session view").queue[0]
+                .id
+                .as_str(),
+            "explicit-queued-submission"
+        );
+
+        assert_queued_turn_starts(
+            &mut core,
+            &session_id,
+            "active-turn",
+            "queued-turn",
+            "queued owner message",
+            "explicit-queued-submission",
+        );
+        let view = core.session_view(&session_id).expect("session view");
+        assert!(view.transcript.entries.iter().any(|entry| {
+            entry.source_prompt_id.as_deref() == Some("explicit-queued-submission")
+                && entry.body == "queued owner message"
+        }));
+    }
+
+    #[test]
+    fn immediate_prompt_entry_uses_the_idempotency_key_as_source_identity() {
+        let (mut core, session_id) = ready_codex_server();
+        core.execute_idempotent(
+            IdempotencyKey::from("chat-submission-1"),
+            None,
+            false,
+            Command::SendPrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "one owner message".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        )
+        .0
+        .expect("prompt accepted");
+
+        let view = core.session_view(&session_id).expect("session view");
+        let owner = view
+            .transcript
+            .entries
+            .iter()
+            .find(|entry| entry.source_prompt_id.as_deref() == Some("chat-submission-1"))
+            .expect("owner entry with caller identity");
+        assert_eq!(owner.body, "one owner message");
     }
 
     #[test]

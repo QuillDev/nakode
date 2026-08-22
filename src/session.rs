@@ -249,6 +249,11 @@ pub struct SubagentSalvage {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SubagentObservability {
     pub parent_run_id: Option<String>,
+    /// Stable source invocation identity in the parent transcript.
+    pub invocation_turn_id: Option<String>,
+    pub invocation_call_id: Option<String>,
+    /// Owner transcript entry that originated the parent turn, when known.
+    pub originating_owner_entry_id: Option<String>,
     pub archetype_purpose: String,
     /// Exact delegated archetype definition used for this run, serialized at acceptance time.
     pub policy_json: String,
@@ -1009,6 +1014,9 @@ impl SqliteSessionRepository {
                status TEXT NOT NULL,
                latest_activity TEXT NOT NULL,
                parent_run_id TEXT,
+               invocation_turn_id TEXT,
+               invocation_call_id TEXT,
+               originating_owner_entry_id TEXT,
                archetype_purpose TEXT NOT NULL DEFAULT '',
                policy_json TEXT NOT NULL DEFAULT '{}',
                remaining_delegation_depth INTEGER NOT NULL DEFAULT 0,
@@ -1199,6 +1207,9 @@ impl SqliteSessionRepository {
             ("cached_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_write_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("parent_run_id", "TEXT"),
+            ("invocation_turn_id", "TEXT"),
+            ("invocation_call_id", "TEXT"),
+            ("originating_owner_entry_id", "TEXT"),
             ("archetype_purpose", "TEXT NOT NULL DEFAULT ''"),
             ("policy_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("remaining_delegation_depth", "INTEGER NOT NULL DEFAULT 0"),
@@ -1890,13 +1901,15 @@ fn save_subagent_transaction(
         "INSERT INTO orchestration_runs
            (parent_session_id, id, agent_slug, provider, model, provider_session_id,
             input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, objective,
-            status, latest_activity, parent_run_id, archetype_purpose, policy_json,
+            status, latest_activity, parent_run_id, invocation_turn_id, invocation_call_id,
+            originating_owner_entry_id, archetype_purpose, policy_json,
             remaining_delegation_depth, started_at_ms, ended_at_ms, termination_kind,
             termination_detail, objective_mismatch_handoff, salvage_json,
             continued_from_run_id, continued_by_run_id, continuation_depth, additional_turns,
             inherited_evidence_json, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?29)
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
+                 ?30, ?31, ?32, ?32)
          ON CONFLICT(parent_session_id, id) DO UPDATE SET
            agent_slug = excluded.agent_slug,
            provider = excluded.provider,
@@ -1910,6 +1923,9 @@ fn save_subagent_transaction(
            status = excluded.status,
            latest_activity = excluded.latest_activity,
            parent_run_id = excluded.parent_run_id,
+           invocation_turn_id = excluded.invocation_turn_id,
+           invocation_call_id = excluded.invocation_call_id,
+           originating_owner_entry_id = excluded.originating_owner_entry_id,
            archetype_purpose = excluded.archetype_purpose,
            policy_json = excluded.policy_json,
            remaining_delegation_depth = excluded.remaining_delegation_depth,
@@ -1940,6 +1956,9 @@ fn save_subagent_transaction(
             record.status.database_value(),
             record.latest_activity,
             record.observability.parent_run_id,
+            record.observability.invocation_turn_id,
+            record.observability.invocation_call_id,
+            record.observability.originating_owner_entry_id,
             record.observability.archetype_purpose,
             record.observability.policy_json,
             i64::from(record.observability.remaining_delegation_depth),
@@ -3119,7 +3138,8 @@ impl SessionRepository for SqliteSessionRepository {
         let mut statement = connection.prepare(
             "SELECT id, agent_slug, provider, model, provider_session_id,
                     input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
-                    objective, status, latest_activity, parent_run_id, archetype_purpose,
+                    objective, status, latest_activity, parent_run_id, invocation_turn_id,
+                    invocation_call_id, originating_owner_entry_id, archetype_purpose,
                     policy_json, remaining_delegation_depth, started_at_ms, ended_at_ms,
                     termination_kind, termination_detail, objective_mismatch_handoff,
                     salvage_json, continued_from_run_id, continued_by_run_id, continuation_depth,
@@ -3143,22 +3163,25 @@ impl SessionRepository for SqliteSessionRepository {
                 row.get::<_, String>(10)?,
                 row.get::<_, String>(11)?,
                 row.get::<_, Option<String>>(12)?,
-                row.get::<_, String>(13)?,
-                row.get::<_, String>(14)?,
-                u32::try_from(row.get::<_, i64>(15)?).unwrap_or_default(),
-                u64::try_from(row.get::<_, i64>(16)?).unwrap_or_default(),
-                row.get::<_, Option<i64>>(17)?
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, String>(16)?,
+                row.get::<_, String>(17)?,
+                u32::try_from(row.get::<_, i64>(18)?).unwrap_or_default(),
+                u64::try_from(row.get::<_, i64>(19)?).unwrap_or_default(),
+                row.get::<_, Option<i64>>(20)?
                     .map(|value| u64::try_from(value).unwrap_or_default()),
-                row.get::<_, Option<String>>(18)?,
-                row.get::<_, Option<String>>(19)?,
-                row.get::<_, Option<String>>(20)?,
                 row.get::<_, Option<String>>(21)?,
                 row.get::<_, Option<String>>(22)?,
                 row.get::<_, Option<String>>(23)?,
-                u32::try_from(row.get::<_, i64>(24)?).unwrap_or_default(),
-                row.get::<_, Option<i64>>(25)?
+                row.get::<_, Option<String>>(24)?,
+                row.get::<_, Option<String>>(25)?,
+                row.get::<_, Option<String>>(26)?,
+                u32::try_from(row.get::<_, i64>(27)?).unwrap_or_default(),
+                row.get::<_, Option<i64>>(28)?
                     .map(|value| u32::try_from(value).unwrap_or_default()),
-                row.get::<_, String>(26)?,
+                row.get::<_, String>(29)?,
             ))
         })?;
         let stored_runs = rows.collect::<Result<Vec<_>, _>>()?;
@@ -3177,6 +3200,9 @@ impl SessionRepository for SqliteSessionRepository {
             status,
             latest_activity,
             parent_run_id,
+            invocation_turn_id,
+            invocation_call_id,
+            originating_owner_entry_id,
             archetype_purpose,
             policy_json,
             remaining_delegation_depth,
@@ -3225,6 +3251,9 @@ impl SessionRepository for SqliteSessionRepository {
                 latest_activity,
                 observability: SubagentObservability {
                     parent_run_id,
+                    invocation_turn_id,
+                    invocation_call_id,
+                    originating_owner_entry_id,
                     archetype_purpose,
                     policy_json,
                     remaining_delegation_depth,
@@ -5090,6 +5119,9 @@ mod tests {
             ],
             observability: SubagentObservability {
                 parent_run_id: Some("agent-root".to_owned()),
+                invocation_turn_id: Some("turn-owner".to_owned()),
+                invocation_call_id: Some("call-delegate".to_owned()),
+                originating_owner_entry_id: Some("entry-owner".to_owned()),
                 archetype_purpose: "Read-only persistence scout".to_owned(),
                 policy_json: r#"{"slug":"explorer","description":"Read-only persistence scout","tool_profile":"read_only","allowed_capabilities":["filesystem_read"],"denied_capabilities":["filesystem_write"],"allowed_tools":["read","grep"],"denied_tools":["write"],"timeout_seconds":300,"max_turns":5,"require_parent_attribution":true}"#.to_owned(),
                 remaining_delegation_depth: 0,
@@ -5149,6 +5181,104 @@ mod tests {
         updated.transcript[1].body = "Updated persistence report".to_owned();
         store.save_subagent(&updated)?;
         assert_eq!(store.list_subagents(&parent.id)?, vec![updated]);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn legacy_orchestration_schema_migrates_delegation_attribution_round_trip()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("legacy-subagents.db");
+        let legacy = Connection::open(&database)?;
+        legacy.execute_batch(
+            "CREATE TABLE orchestration_runs (
+               parent_session_id TEXT NOT NULL,
+               id TEXT NOT NULL,
+               agent_slug TEXT NOT NULL,
+               provider TEXT NOT NULL,
+               model TEXT,
+               provider_session_id TEXT,
+               input_tokens INTEGER NOT NULL DEFAULT 0,
+               output_tokens INTEGER NOT NULL DEFAULT 0,
+               cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+               cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+               objective TEXT NOT NULL,
+               status TEXT NOT NULL,
+               latest_activity TEXT NOT NULL,
+               parent_run_id TEXT,
+               archetype_purpose TEXT NOT NULL DEFAULT '',
+               policy_json TEXT NOT NULL DEFAULT '{}',
+               remaining_delegation_depth INTEGER NOT NULL DEFAULT 0,
+               started_at_ms INTEGER NOT NULL DEFAULT 0,
+               ended_at_ms INTEGER,
+               termination_kind TEXT,
+               termination_detail TEXT,
+               objective_mismatch_handoff TEXT,
+               salvage_json TEXT,
+               continued_from_run_id TEXT,
+               continued_by_run_id TEXT,
+               continuation_depth INTEGER NOT NULL DEFAULT 0,
+               additional_turns INTEGER,
+               inherited_evidence_json TEXT NOT NULL DEFAULT '[]',
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(parent_session_id, id)
+             );",
+        )?;
+        drop(legacy);
+
+        let store = SqliteSessionRepository::open(&database)?;
+        let parent = store.create(
+            CODEX_PROVIDER,
+            "parent-provider-session",
+            "/tmp/project",
+            "Parent work",
+            Some("model-a"),
+        )?;
+        let record = SubagentRecord {
+            parent_session_id: parent.id.clone(),
+            id: "agent-migrated".to_owned(),
+            agent: "explorer".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            model: None,
+            provider_session_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            objective: "Verify migration".to_owned(),
+            status: SubagentStatus::Working,
+            latest_activity: "Migrated".to_owned(),
+            transcript: Vec::new(),
+            observability: SubagentObservability {
+                invocation_turn_id: Some("turn-migrated".to_owned()),
+                invocation_call_id: Some("call-migrated".to_owned()),
+                originating_owner_entry_id: Some("owner-migrated".to_owned()),
+                ..SubagentObservability::default()
+            },
+        };
+
+        store.save_subagent(&record)?;
+        let restored = store
+            .list_subagents(&parent.id)?
+            .pop()
+            .expect("migrated run");
+        assert_eq!(restored, record);
+        let columns = {
+            let connection = store.connection.lock().expect("database mutex");
+            let mut statement = connection.prepare("PRAGMA table_info(orchestration_runs)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for expected in [
+            "invocation_turn_id",
+            "invocation_call_id",
+            "originating_owner_entry_id",
+        ] {
+            assert!(columns.iter().any(|column| column == expected));
+        }
         Ok(())
     }
 

@@ -579,6 +579,8 @@ impl NativeServerRuntime {
             &request.task,
             request.parent_run_id.as_deref(),
             request_id,
+            Some(&request.invocation_turn_id),
+            Some(&request.invocation_call_id),
         );
         let (run_id, effects) = match delegated {
             Ok(delegated) => delegated,
