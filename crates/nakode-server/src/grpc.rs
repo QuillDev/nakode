@@ -1596,8 +1596,7 @@ fn drain_pending_publications(publications: &mut tokio::sync::broadcast::Receive
     let mut drained = 0;
     while drained < crate::DEFAULT_PUBLICATION_CAPACITY {
         match publications.try_recv() {
-            Ok(_) => drained += 1,
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => drained += 1,
             Err(
                 tokio::sync::broadcast::error::TryRecvError::Empty
                 | tokio::sync::broadcast::error::TryRecvError::Closed,
