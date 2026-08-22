@@ -5137,6 +5137,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn stalled_backend_teardown_fails_delete_boundedly_and_retry_converges() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (persistence, _credentials) = test_persistence(workspace.path());
