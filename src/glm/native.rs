@@ -422,6 +422,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             replace_builtin_tools,
             allowed_builtin_tools,
             max_turns,
+            finalization_reserve_turns,
             timeout_seconds,
             owner_session_id,
             parent_run_id,
@@ -435,6 +436,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                 replace_builtin_tools,
                 allowed_builtin_tools,
                 max_turns,
+                finalization_reserve_turns,
                 timeout_seconds,
                 context,
             )
@@ -457,6 +459,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                         replace_builtin_tools,
                         allowed_builtin_tools,
                         max_turns,
+                        0,
                         timeout_seconds,
                     )
                     .await
@@ -773,6 +776,7 @@ async fn start_session(
     replace_builtin_tools: bool,
     allowed_builtin_tools: Option<Vec<String>>,
     max_turns: Option<u32>,
+    finalization_reserve_turns: u32,
     timeout_seconds: Option<u32>,
     context: &mut CommandContext<'_>,
 ) {
@@ -817,6 +821,7 @@ async fn start_session(
                 replace_builtin_tools,
                 allowed_builtin_tools,
                 max_turns,
+                finalization_reserve_turns,
                 timeout_seconds,
             )
             .await

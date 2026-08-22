@@ -419,6 +419,10 @@ pub enum Command {
     CancelRun {
         run_id: RunId,
     },
+    ContinueRun {
+        run_id: RunId,
+        additional_turns: u32,
+    },
     RunShell {
         session_id: SessionId,
         command: String,
@@ -630,12 +634,15 @@ mod tests {
             initial_instructions: None,
             bridge: None,
             mcp_grant: None,
+            profile_id: None,
+            disabled_skill_ids: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(creation).expect("serialize configured session creation"),
             json!({
                 "type": "create_session",
                 "workspace_id": "workspace-1",
+                "working_directory": "/repo/project",
                 "title": "Dashboard assistant",
                 "model_id": "anthropic/claude-opus-5",
                 "options": {

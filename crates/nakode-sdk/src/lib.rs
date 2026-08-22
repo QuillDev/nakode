@@ -910,6 +910,7 @@ impl NakodeClient {
     typed_mutation!(update_settings, api::UpdateSettingsRequest);
     typed_mutation!(check_agent_browser, api::CheckAgentBrowserRequest);
     typed_mutation!(cancel_run, api::CancelRunRequest);
+    typed_mutation!(continue_run, api::ContinueRunRequest);
 
     /// Lists a server-paged run window.
     ///

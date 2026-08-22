@@ -277,6 +277,16 @@ impl AgentDefinition {
         {
             configured.push("read_skill".to_owned());
         }
+        if self.can_delegate
+            && self.max_delegation_depth > 0
+            && !configured.iter().any(|tool| tool == NAKODE_AGENT_TOOL_NAME)
+            && !self
+                .denied_tools
+                .iter()
+                .any(|tool| tool == NAKODE_AGENT_TOOL_NAME)
+        {
+            configured.push(NAKODE_AGENT_TOOL_NAME.to_owned());
+        }
         Some(
             configured
                 .into_iter()
@@ -357,13 +367,37 @@ impl AgentDefinition {
                 self.max_delegation_depth
             ));
             if effective.is_some() && !effective_delegation {
-                warnings.push(
+                warnings.push(if self
+                    .denied_tools
+                    .iter()
+                    .any(|tool| tool == NAKODE_AGENT_TOOL_NAME)
+                {
+                    "Recursive delegation is configured, but nakode_agent is explicitly denied; this child cannot invoke it."
+                        .to_owned()
+                } else {
                     "Recursive delegation is configured, but nakode_agent is absent from the effective tool boundary; this child cannot invoke it."
-                        .to_owned(),
-                );
+                        .to_owned()
+                });
             }
         }
         warnings
+    }
+
+    /// Turns protected for tool-free synthesis on analytical runs. Exact command runners, bounded
+    /// watchers, and tool-free roles retain their configured hard budget without a reserve.
+    #[must_use]
+    pub fn finalization_reserve_turns(&self) -> u32 {
+        let Some(max_turns) = self.max_turns else {
+            return 0;
+        };
+        if !matches!(
+            self.tool_profile,
+            AgentToolProfile::ReadOnly | AgentToolProfile::Custom
+        ) || max_turns < 8
+        {
+            return 0;
+        }
+        4.min(max_turns.saturating_sub(1))
     }
 
     /// Whether this definition needs provider-side enforcement beyond ordinary unrestricted turns.
@@ -511,12 +545,13 @@ impl AgentCatalog {
                     path: display_path.clone(),
                     source,
                 })?;
-            let definition = toml::from_str::<AgentDefinition>(&source).map_err(|source| {
+            let mut definition = toml::from_str::<AgentDefinition>(&source).map_err(|source| {
                 AgentCatalogError::ParseDefinition {
                     path: display_path.clone(),
                     source,
                 }
             })?;
+            calibrate_legacy_analytical_budget(&mut definition);
             validate(&definition, &display_path)?;
             if !slugs.insert(definition.slug.clone()) {
                 return Err(AgentCatalogError::DuplicateSlug {
@@ -700,6 +735,17 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
     }
 }
 
+fn calibrate_legacy_analytical_budget(definition: &mut AgentDefinition) {
+    if definition.ownership != AgentOwnership::BuiltIn {
+        return;
+    }
+    definition.max_turns = match (definition.slug.as_str(), definition.max_turns) {
+        ("failure-triager", Some(20)) => Some(45),
+        ("change-reviewer", Some(24)) => Some(40),
+        (_, configured) => configured,
+    };
+}
+
 #[allow(clippy::items_after_statements, clippy::too_many_lines)]
 // Validation deliberately reports one policy-specific error at a time from this persisted shape;
 // splitting the ordered checks would obscure the single authoritative validation boundary.
@@ -793,6 +839,27 @@ fn validate(definition: &AgentDefinition, path: &str) -> Result<(), AgentCatalog
             detail:
                 "can_delegate and max_delegation_depth must enable or disable recursion together"
                     .to_owned(),
+        });
+    }
+    if definition.can_delegate
+        && (!definition
+            .allowed_capabilities
+            .iter()
+            .any(|capability| capability == "delegation")
+            || definition
+                .denied_capabilities
+                .iter()
+                .any(|capability| capability == "delegation")
+            || definition
+                .denied_tools
+                .iter()
+                .any(|tool| tool == NAKODE_AGENT_TOOL_NAME)
+            || definition.tool_profile == AgentToolProfile::None)
+    {
+        return Err(AgentCatalogError::ContradictoryPolicy {
+            slug: definition.slug.clone(),
+            detail: "recursive delegation requires the delegation capability and a tool profile that permits Nakode to project nakode_agent"
+                .to_owned(),
         });
     }
     if !definition.require_parent_attribution {
@@ -990,6 +1057,7 @@ mod tests {
 
     use super::{
         AgentCatalog, AgentCatalogError, AgentDefinition, AgentOwnership, AgentToolProfile,
+        calibrate_legacy_analytical_budget,
     };
 
     #[test]
@@ -1303,31 +1371,80 @@ description = "Research the requested topic and report concrete findings"
     }
 
     #[test]
-    fn policy_warnings_expose_inert_recursive_delegation_configuration() {
-        let missing_tool = AgentDefinition {
+    fn legacy_analytical_budgets_are_calibrated_selectively() {
+        let mut failure_triager = AgentDefinition {
+            slug: "failure-triager".to_owned(),
+            ownership: AgentOwnership::BuiltIn,
+            max_turns: Some(20),
+            ..AgentDefinition::default()
+        };
+        let mut change_reviewer = AgentDefinition {
+            slug: "change-reviewer".to_owned(),
+            ownership: AgentOwnership::BuiltIn,
+            max_turns: Some(24),
+            ..AgentDefinition::default()
+        };
+        let mut runner = AgentDefinition {
+            slug: "test-runner".to_owned(),
+            max_turns: Some(20),
+            tool_profile: AgentToolProfile::CommandRunner,
+            ..AgentDefinition::default()
+        };
+        let mut broad_reviewer = AgentDefinition {
+            slug: "code-reviewer".to_owned(),
+            max_turns: Some(100),
+            ..AgentDefinition::default()
+        };
+
+        for definition in [
+            &mut failure_triager,
+            &mut change_reviewer,
+            &mut runner,
+            &mut broad_reviewer,
+        ] {
+            calibrate_legacy_analytical_budget(definition);
+        }
+
+        assert_eq!(failure_triager.max_turns, Some(45));
+        assert_eq!(change_reviewer.max_turns, Some(40));
+        assert_eq!(runner.max_turns, Some(20));
+        assert_eq!(broad_reviewer.max_turns, Some(100));
+    }
+
+    #[test]
+    fn recursive_delegation_configuration_projects_the_supervised_tool() {
+        let configured = AgentDefinition {
             tool_profile: AgentToolProfile::Custom,
-            allowed_capabilities: vec!["delegation".to_owned()],
+            allowed_capabilities: vec!["delegation".to_owned(), "filesystem_read".to_owned()],
             allowed_tools: vec!["read".to_owned()],
             can_delegate: true,
             max_delegation_depth: 1,
             ..AgentDefinition::default()
         };
-        assert!(
-            missing_tool
-                .policy_warnings()
-                .iter()
-                .any(|warning| warning.contains("nakode_agent is absent"))
+        assert_eq!(
+            configured.builtin_tool_allowlist(),
+            Some(vec![
+                "read".to_owned(),
+                "read_skill".to_owned(),
+                "nakode_agent".to_owned(),
+            ])
         );
-
-        let runnable = AgentDefinition {
-            allowed_tools: vec!["read".to_owned(), "nakode_agent".to_owned()],
-            ..missing_tool
-        };
         assert!(
-            !runnable
+            !configured
                 .policy_warnings()
                 .iter()
                 .any(|warning| warning.contains("absent from the effective tool boundary"))
+        );
+
+        let explicitly_denied = AgentDefinition {
+            denied_tools: vec!["nakode_agent".to_owned()],
+            ..configured
+        };
+        assert!(
+            explicitly_denied
+                .policy_warnings()
+                .iter()
+                .any(|warning| warning.contains("explicitly denied"))
         );
     }
 

@@ -9,7 +9,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use tokio::sync::{Mutex, mpsc};
@@ -37,7 +37,7 @@ use crate::{
     },
     shell::{ShellEvent, ShellProcesses},
     skill::{SkillCatalog, SkillCatalogError},
-    state::{AgentBrowserStatus, DomainState, Effect, SubagentStatus},
+    state::{AgentBrowserStatus, DomainState, Effect},
 };
 
 use super::{BridgeStateCheckpoint, ServerCore};
@@ -2604,6 +2604,7 @@ impl EffectExecutor {
             | Effect::SetDefaultModel { .. }
             | Effect::SaveModelOptions { .. }
             | Effect::PersistSubagent(_)
+            | Effect::PersistSubagentContinuation(_)
             | Effect::LoadSubagents(_)
             | Effect::UpdateSessionModel { .. }
             | Effect::TransitionSessionPrimary { .. }
@@ -2828,6 +2829,9 @@ fn execute_persistence_effect(
             options,
         } => save_model_options(state, sessions, &provider, &model, &options),
         Effect::PersistSubagent(record) => persist_subagent(state, sessions, &record),
+        Effect::PersistSubagentContinuation(records) => {
+            persist_subagent_continuation(state, sessions, &records.0, &records.1);
+        }
         Effect::LoadSubagents(parent_session_id) => {
             load_subagents(state, sessions, &parent_session_id);
         }
@@ -3375,39 +3379,30 @@ fn persist_subagent(
     }
 }
 
+fn persist_subagent_continuation(
+    state: &mut DomainState,
+    sessions: &dyn SessionRepository,
+    source: &crate::session::SubagentRecord,
+    successor: &crate::session::SubagentRecord,
+) {
+    if let Err(error) = sessions.save_subagent_continuation(source, successor) {
+        state.session_store_failed(error.to_string());
+    }
+}
+
 fn load_subagents(
     state: &mut DomainState,
     sessions: &dyn SessionRepository,
     parent_session_id: &str,
 ) {
     match sessions.list_subagents(parent_session_id) {
-        Ok(mut records) => {
-            let ended_at_ms = u64::try_from(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis(),
-            )
-            .unwrap_or(u64::MAX);
-            for record in &mut records {
-                if matches!(
-                    record.status,
-                    SubagentStatus::Starting | SubagentStatus::Working
-                ) {
-                    record.status = SubagentStatus::Interrupted;
-                    "Interrupted when the previous server stopped"
-                        .clone_into(&mut record.latest_activity);
-                    record.observability.ended_at_ms = Some(ended_at_ms);
-                    record.observability.termination_kind = Some("interrupted".to_owned());
-                    record.observability.termination_detail =
-                        Some("Interrupted when the previous server stopped".to_owned());
-                    if let Err(error) = sessions.save_subagent(record) {
-                        state.session_store_failed(error.to_string());
-                        return;
-                    }
+        Ok(records) => {
+            for corrected in state.install_subagents(records) {
+                if let Err(error) = sessions.save_subagent(&corrected) {
+                    state.session_store_failed(error.to_string());
+                    return;
                 }
             }
-            state.install_subagents(records);
         }
         Err(error) => state.session_store_failed(error.to_string()),
     }
@@ -3636,6 +3631,7 @@ mod tests {
         },
         config::{Config, OpenAiReasoningEffort},
         credential::{CredentialStore, SqliteCredentialStore},
+        domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         service::ServiceEngine,
         session::{
             BridgeInboundTurnOriginRecord, BridgePendingInboundRecord, InvocationRecord,
@@ -3782,6 +3778,81 @@ mod tests {
         );
         assert!(restored.observability.ended_at_ms.is_some());
         assert_eq!(state.subagents[0].status, SubagentStatus::Interrupted);
+    }
+
+    #[test]
+    fn restoring_active_subagents_durably_persists_verified_partial_salvage() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions = SqliteSessionRepository::open(workspace.path().join("sessions.sqlite3"))
+            .expect("session repository");
+        let parent = sessions
+            .create(
+                CODEX_PROVIDER,
+                "provider-parent",
+                workspace.path().to_str().expect("utf8 workspace"),
+                "Parent",
+                None,
+            )
+            .expect("parent session");
+        sessions
+            .save_subagent(&SubagentRecord {
+                parent_session_id: parent.id.clone(),
+                id: "run-active-evidence".to_owned(),
+                agent: "repo-explorer".to_owned(),
+                provider: CODEX_PROVIDER.to_owned(),
+                model: None,
+                provider_session_id: Some("provider-child".to_owned()),
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                objective: "Inspect restore salvage".to_owned(),
+                status: SubagentStatus::Working,
+                latest_activity: "Working".to_owned(),
+                transcript: vec![TranscriptEntry {
+                    id: "tool-evidence".to_owned(),
+                    key: None,
+                    kind: EntryKind::Tool,
+                    title: "read lifecycle".to_owned(),
+                    body: "authoritative retained evidence".to_owned(),
+                    status: EntryStatus::Complete,
+                    created_at_ms: Some(101),
+                    provider_id: Some(CODEX_PROVIDER.to_owned()),
+                    model_id: None,
+                    owner_turn_id: None,
+                    reasoning_effort: None,
+                    fast_mode: None,
+                    source_transport: None,
+                    tool_audit_json: None,
+                }],
+                observability: SubagentObservability {
+                    started_at_ms: 100,
+                    ..SubagentObservability::default()
+                },
+            })
+            .expect("active run");
+
+        let mut state = DomainState::new_unconfigured(
+            workspace.path().to_str().expect("utf8 workspace"),
+            None,
+            100,
+        );
+        load_subagents(&mut state, &sessions, &parent.id);
+
+        let restored = sessions
+            .list_subagents(&parent.id)
+            .expect("restored runs")
+            .pop()
+            .expect("run");
+        assert_eq!(restored.status, SubagentStatus::Partial);
+        let salvage = restored.observability.salvage.expect("persisted salvage");
+        assert_eq!(salvage.verified_evidence.len(), 1);
+        assert_eq!(
+            salvage.verified_evidence[0].body,
+            "authoritative retained evidence"
+        );
+        assert_eq!(state.subagents[0].status, SubagentStatus::Partial);
+        assert!(state.subagents[0].observability.salvage.is_some());
     }
 
     #[test]
@@ -4907,6 +4978,7 @@ mod tests {
                     replace_builtin_tools: false,
                     allowed_builtin_tools: None,
                     max_turns: None,
+                    finalization_reserve_turns: 0,
                     timeout_seconds: None,
                     owner_session_id: None,
                     parent_run_id: None,
@@ -4959,6 +5031,7 @@ mod tests {
                     replace_builtin_tools: false,
                     allowed_builtin_tools: None,
                     max_turns: None,
+                    finalization_reserve_turns: 0,
                     timeout_seconds: None,
                     owner_session_id: None,
                     parent_run_id: None,
@@ -4978,6 +5051,7 @@ mod tests {
                     replace_builtin_tools: false,
                     allowed_builtin_tools: None,
                     max_turns: None,
+                    finalization_reserve_turns: 0,
                     timeout_seconds: None,
                     owner_session_id: None,
                     parent_run_id: None,

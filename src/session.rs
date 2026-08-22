@@ -7,7 +7,7 @@ use std::{
 };
 
 use directories::ProjectDirs;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -175,6 +175,7 @@ pub enum SubagentStatus {
     Starting,
     Working,
     Completed,
+    Partial,
     Interrupted,
     Failed,
 }
@@ -185,6 +186,7 @@ impl SubagentStatus {
             Self::Starting => "starting",
             Self::Working => "working",
             Self::Completed => "completed",
+            Self::Partial => "partial",
             Self::Interrupted => "interrupted",
             Self::Failed => "failed",
         }
@@ -195,6 +197,7 @@ impl SubagentStatus {
             "starting" => Ok(Self::Starting),
             "working" => Ok(Self::Working),
             "completed" => Ok(Self::Completed),
+            "partial" => Ok(Self::Partial),
             "interrupted" => Ok(Self::Interrupted),
             "failed" => Ok(Self::Failed),
             _ => Err(SessionError::InvalidStoredValue {
@@ -203,6 +206,39 @@ impl SubagentStatus {
             }),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SalvagedEvidence {
+    pub entry_id: String,
+    pub title: String,
+    pub body: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContinuationProposition {
+    pub verified_findings: Vec<String>,
+    pub unresolved_boundary: String,
+    pub why_it_matters: String,
+    pub recommended_archetype: String,
+    pub follow_up_objective: String,
+    pub inherited_evidence: Vec<String>,
+    pub can_proceed_independently: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubagentSalvage {
+    pub terminal_reason: String,
+    pub original_objective: String,
+    pub completed_work: Vec<String>,
+    pub verified_evidence: Vec<SalvagedEvidence>,
+    pub last_successful_evidence: Option<SalvagedEvidence>,
+    pub unresolved_questions: Vec<String>,
+    pub continuation: ContinuationProposition,
+    pub can_resume: bool,
+    pub redacted: bool,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -217,6 +253,12 @@ pub struct SubagentObservability {
     pub termination_kind: Option<String>,
     pub termination_detail: Option<String>,
     pub objective_mismatch_handoff: Option<String>,
+    pub salvage: Option<SubagentSalvage>,
+    pub continued_from_run_id: Option<String>,
+    pub continued_by_run_id: Option<String>,
+    pub continuation_depth: u32,
+    pub additional_turns: Option<u32>,
+    pub inherited_evidence: Vec<SalvagedEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -553,6 +595,15 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when the transaction cannot be committed.
     fn save_subagent(&self, record: &SubagentRecord) -> Result<(), SessionError>;
+    /// Atomically saves the linked source and successor of one authorized continuation.
+    ///
+    /// # Errors
+    /// Returns an error when either record cannot be persisted in the shared transaction.
+    fn save_subagent_continuation(
+        &self,
+        source: &SubagentRecord,
+        successor: &SubagentRecord,
+    ) -> Result<(), SessionError>;
     /// Lists the sub-agent runs associated with a logical parent session.
     ///
     /// # Errors
@@ -905,6 +956,12 @@ impl SqliteSessionRepository {
                termination_kind TEXT,
                termination_detail TEXT,
                objective_mismatch_handoff TEXT,
+               salvage_json TEXT,
+               continued_from_run_id TEXT,
+               continued_by_run_id TEXT,
+               continuation_depth INTEGER NOT NULL DEFAULT 0,
+               additional_turns INTEGER,
+               inherited_evidence_json TEXT NOT NULL DEFAULT '[]',
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL,
                PRIMARY KEY(parent_session_id, id)
@@ -1087,6 +1144,12 @@ impl SqliteSessionRepository {
             ("termination_kind", "TEXT"),
             ("termination_detail", "TEXT"),
             ("objective_mismatch_handoff", "TEXT"),
+            ("salvage_json", "TEXT"),
+            ("continued_from_run_id", "TEXT"),
+            ("continued_by_run_id", "TEXT"),
+            ("continuation_depth", "INTEGER NOT NULL DEFAULT 0"),
+            ("additional_turns", "INTEGER"),
+            ("inherited_evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
         ] {
             if !orchestration_columns
                 .iter()
@@ -1735,6 +1798,124 @@ fn seed_provider_catalog(connection: &Connection) -> Result<(), SessionError> {
            AND provider NOT IN (SELECT provider FROM provider_credentials)",
         [],
     )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn save_subagent_transaction(
+    transaction: &Transaction<'_>,
+    record: &SubagentRecord,
+    now: i64,
+) -> Result<(), SessionError> {
+    transaction.execute(
+        "INSERT INTO orchestration_runs
+           (parent_session_id, id, agent_slug, provider, model, provider_session_id,
+            input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, objective,
+            status, latest_activity, parent_run_id, archetype_purpose, policy_json,
+            remaining_delegation_depth, started_at_ms, ended_at_ms, termination_kind,
+            termination_detail, objective_mismatch_handoff, salvage_json,
+            continued_from_run_id, continued_by_run_id, continuation_depth, additional_turns,
+            inherited_evidence_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?29)
+         ON CONFLICT(parent_session_id, id) DO UPDATE SET
+           agent_slug = excluded.agent_slug,
+           provider = excluded.provider,
+           model = excluded.model,
+           provider_session_id = excluded.provider_session_id,
+           input_tokens = excluded.input_tokens,
+           output_tokens = excluded.output_tokens,
+           cached_input_tokens = excluded.cached_input_tokens,
+           cache_write_tokens = excluded.cache_write_tokens,
+           objective = excluded.objective,
+           status = excluded.status,
+           latest_activity = excluded.latest_activity,
+           parent_run_id = excluded.parent_run_id,
+           archetype_purpose = excluded.archetype_purpose,
+           policy_json = excluded.policy_json,
+           remaining_delegation_depth = excluded.remaining_delegation_depth,
+           started_at_ms = excluded.started_at_ms,
+           ended_at_ms = excluded.ended_at_ms,
+           termination_kind = excluded.termination_kind,
+           termination_detail = excluded.termination_detail,
+           objective_mismatch_handoff = excluded.objective_mismatch_handoff,
+           salvage_json = excluded.salvage_json,
+           continued_from_run_id = excluded.continued_from_run_id,
+           continued_by_run_id = excluded.continued_by_run_id,
+           continuation_depth = excluded.continuation_depth,
+           additional_turns = excluded.additional_turns,
+           inherited_evidence_json = excluded.inherited_evidence_json,
+           updated_at = excluded.updated_at",
+        params![
+            record.parent_session_id,
+            record.id,
+            record.agent,
+            record.provider,
+            record.model,
+            record.provider_session_id,
+            i64::try_from(record.input_tokens).unwrap_or(i64::MAX),
+            i64::try_from(record.output_tokens).unwrap_or(i64::MAX),
+            i64::try_from(record.cached_input_tokens).unwrap_or(i64::MAX),
+            i64::try_from(record.cache_write_tokens).unwrap_or(i64::MAX),
+            record.objective,
+            record.status.database_value(),
+            record.latest_activity,
+            record.observability.parent_run_id,
+            record.observability.archetype_purpose,
+            record.observability.policy_json,
+            i64::from(record.observability.remaining_delegation_depth),
+            i64::try_from(record.observability.started_at_ms).unwrap_or(i64::MAX),
+            record
+                .observability
+                .ended_at_ms
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+            record.observability.termination_kind,
+            record.observability.termination_detail,
+            record.observability.objective_mismatch_handoff,
+            record
+                .observability
+                .salvage
+                .as_ref()
+                .map(|salvage| serde_json::to_string(salvage).expect("salvage serializes")),
+            record.observability.continued_from_run_id,
+            record.observability.continued_by_run_id,
+            i64::from(record.observability.continuation_depth),
+            record.observability.additional_turns.map(i64::from),
+            serde_json::to_string(&record.observability.inherited_evidence)
+                .expect("inherited evidence serializes"),
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM agent_turns WHERE parent_session_id = ?1 AND run_id = ?2",
+        params![record.parent_session_id, record.id],
+    )?;
+    let mut statement = transaction.prepare(
+        "INSERT INTO agent_turns
+           (parent_session_id, run_id, sequence, entry_id, item_key, kind, title, body, status,
+            provider_id, model_id, tool_audit_json, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+    )?;
+    for (sequence, entry) in record.transcript.iter().enumerate() {
+        let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
+        statement.execute(params![
+            record.parent_session_id,
+            record.id,
+            sequence,
+            entry.id,
+            entry.key,
+            entry_kind_value(entry.kind),
+            entry.title,
+            entry.body,
+            entry_status_value(entry.status),
+            entry.provider_id,
+            entry.model_id,
+            entry.tool_audit_json,
+            entry
+                .created_at_ms
+                .and_then(|value| i64::try_from(value).ok()),
+        ])?;
+    }
     Ok(())
 }
 
@@ -2692,103 +2873,29 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let transaction = connection.transaction()?;
-        let now = unix_timestamp();
-        transaction.execute(
-            "INSERT INTO orchestration_runs
-               (parent_session_id, id, agent_slug, provider, model, provider_session_id,
-                input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, objective,
-                status, latest_activity, parent_run_id, archetype_purpose, policy_json,
-                remaining_delegation_depth, started_at_ms, ended_at_ms, termination_kind,
-                termination_detail, objective_mismatch_handoff, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23)
-             ON CONFLICT(parent_session_id, id) DO UPDATE SET
-               agent_slug = excluded.agent_slug,
-               provider = excluded.provider,
-               model = excluded.model,
-               provider_session_id = excluded.provider_session_id,
-               input_tokens = excluded.input_tokens,
-               output_tokens = excluded.output_tokens,
-               cached_input_tokens = excluded.cached_input_tokens,
-               cache_write_tokens = excluded.cache_write_tokens,
-               objective = excluded.objective,
-               status = excluded.status,
-               latest_activity = excluded.latest_activity,
-               parent_run_id = excluded.parent_run_id,
-               archetype_purpose = excluded.archetype_purpose,
-               policy_json = excluded.policy_json,
-               remaining_delegation_depth = excluded.remaining_delegation_depth,
-               started_at_ms = excluded.started_at_ms,
-               ended_at_ms = excluded.ended_at_ms,
-               termination_kind = excluded.termination_kind,
-               termination_detail = excluded.termination_detail,
-               objective_mismatch_handoff = excluded.objective_mismatch_handoff,
-               updated_at = excluded.updated_at",
-            params![
-                record.parent_session_id,
-                record.id,
-                record.agent,
-                record.provider,
-                record.model,
-                record.provider_session_id,
-                i64::try_from(record.input_tokens).unwrap_or(i64::MAX),
-                i64::try_from(record.output_tokens).unwrap_or(i64::MAX),
-                i64::try_from(record.cached_input_tokens).unwrap_or(i64::MAX),
-                i64::try_from(record.cache_write_tokens).unwrap_or(i64::MAX),
-                record.objective,
-                record.status.database_value(),
-                record.latest_activity,
-                record.observability.parent_run_id,
-                record.observability.archetype_purpose,
-                record.observability.policy_json,
-                i64::from(record.observability.remaining_delegation_depth),
-                i64::try_from(record.observability.started_at_ms).unwrap_or(i64::MAX),
-                record
-                    .observability
-                    .ended_at_ms
-                    .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
-                record.observability.termination_kind,
-                record.observability.termination_detail,
-                record.observability.objective_mismatch_handoff,
-                now,
-            ],
-        )?;
-        transaction.execute(
-            "DELETE FROM agent_turns WHERE parent_session_id = ?1 AND run_id = ?2",
-            params![record.parent_session_id, record.id],
-        )?;
-        {
-            let mut statement = transaction.prepare(
-                "INSERT INTO agent_turns
-                   (parent_session_id, run_id, sequence, entry_id, item_key, kind, title, body, status,
-                    provider_id, model_id, tool_audit_json, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            )?;
-            for (sequence, entry) in record.transcript.iter().enumerate() {
-                let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
-                statement.execute(params![
-                    record.parent_session_id,
-                    record.id,
-                    sequence,
-                    entry.id,
-                    entry.key,
-                    entry_kind_value(entry.kind),
-                    entry.title,
-                    entry.body,
-                    entry_status_value(entry.status),
-                    entry.provider_id,
-                    entry.model_id,
-                    entry.tool_audit_json,
-                    entry
-                        .created_at_ms
-                        .and_then(|value| i64::try_from(value).ok()),
-                ])?;
-            }
-        }
+        save_subagent_transaction(&transaction, record, unix_timestamp())?;
         transaction.commit()?;
         Ok(())
     }
 
+    fn save_subagent_continuation(
+        &self,
+        source: &SubagentRecord,
+        successor: &SubagentRecord,
+    ) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let now = unix_timestamp();
+        save_subagent_transaction(&transaction, source, now)?;
+        save_subagent_transaction(&transaction, successor, now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn list_subagents(&self, parent_session_id: &str) -> Result<Vec<SubagentRecord>, SessionError> {
         let connection = self
             .connection
@@ -2799,7 +2906,9 @@ impl SessionRepository for SqliteSessionRepository {
                     input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
                     objective, status, latest_activity, parent_run_id, archetype_purpose,
                     policy_json, remaining_delegation_depth, started_at_ms, ended_at_ms,
-                    termination_kind, termination_detail, objective_mismatch_handoff
+                    termination_kind, termination_detail, objective_mismatch_handoff,
+                    salvage_json, continued_from_run_id, continued_by_run_id, continuation_depth,
+                    additional_turns, inherited_evidence_json
              FROM orchestration_runs
              WHERE parent_session_id = ?1
              ORDER BY started_at_ms, id",
@@ -2828,6 +2937,13 @@ impl SessionRepository for SqliteSessionRepository {
                 row.get::<_, Option<String>>(18)?,
                 row.get::<_, Option<String>>(19)?,
                 row.get::<_, Option<String>>(20)?,
+                row.get::<_, Option<String>>(21)?,
+                row.get::<_, Option<String>>(22)?,
+                row.get::<_, Option<String>>(23)?,
+                u32::try_from(row.get::<_, i64>(24)?).unwrap_or_default(),
+                row.get::<_, Option<i64>>(25)?
+                    .map(|value| u32::try_from(value).unwrap_or_default()),
+                row.get::<_, String>(26)?,
             ))
         })?;
         let stored_runs = rows.collect::<Result<Vec<_>, _>>()?;
@@ -2854,8 +2970,29 @@ impl SessionRepository for SqliteSessionRepository {
             termination_kind,
             termination_detail,
             objective_mismatch_handoff,
+            salvage_json,
+            continued_from_run_id,
+            continued_by_run_id,
+            continuation_depth,
+            additional_turns,
+            inherited_evidence_json,
         ) in stored_runs
         {
+            let salvage = salvage_json
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|source| SessionError::InvalidStoredJson {
+                        field: "orchestration_runs.salvage_json",
+                        source,
+                    })
+                })
+                .transpose()?;
+            let inherited_evidence =
+                serde_json::from_str(&inherited_evidence_json).map_err(|source| {
+                    SessionError::InvalidStoredJson {
+                        field: "orchestration_runs.inherited_evidence_json",
+                        source,
+                    }
+                })?;
             let transcript = load_subagent_transcript(&connection, parent_session_id, &id)?;
             records.push(SubagentRecord {
                 parent_session_id: parent_session_id.to_owned(),
@@ -2881,6 +3018,12 @@ impl SessionRepository for SqliteSessionRepository {
                     termination_kind,
                     termination_detail,
                     objective_mismatch_handoff,
+                    salvage,
+                    continued_from_run_id,
+                    continued_by_run_id,
+                    continuation_depth,
+                    additional_turns,
+                    inherited_evidence,
                 },
                 transcript,
             });
@@ -4494,6 +4637,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn persists_subagent_run_and_transcript_projection() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteSessionRepository::open(directory.path().join("subagents.db"))?;
@@ -4516,8 +4660,8 @@ mod tests {
             cached_input_tokens: 0,
             cache_write_tokens: 0,
             objective: "Map persistence".to_owned(),
-            status: SubagentStatus::Completed,
-            latest_activity: "Completed".to_owned(),
+            status: SubagentStatus::Partial,
+            latest_activity: "Partial result preserved".to_owned(),
             transcript: vec![
                 TranscriptEntry {
                     id: "entry-1".to_owned(),
@@ -4561,9 +4705,49 @@ mod tests {
                 remaining_delegation_depth: 0,
                 started_at_ms: 1_000,
                 ended_at_ms: Some(1_250),
-                termination_kind: Some("completed".to_owned()),
-                termination_detail: None,
+                termination_kind: Some("hard_turn_limit".to_owned()),
+                termination_detail: Some("maximum reached".to_owned()),
                 objective_mismatch_handoff: None,
+                salvage: Some(SubagentSalvage {
+                    terminal_reason: "hard_turn_limit: maximum reached".to_owned(),
+                    original_objective: "Map persistence".to_owned(),
+                    completed_work: vec!["[entry-2] read persistence".to_owned()],
+                    verified_evidence: vec![SalvagedEvidence {
+                        entry_id: "entry-2".to_owned(),
+                        title: "read persistence".to_owned(),
+                        body: "Persistence report".to_owned(),
+                        truncated: false,
+                    }],
+                    last_successful_evidence: Some(SalvagedEvidence {
+                        entry_id: "entry-2".to_owned(),
+                        title: "read persistence".to_owned(),
+                        body: "Persistence report".to_owned(),
+                        truncated: false,
+                    }),
+                    unresolved_questions: vec!["Complete synthesis".to_owned()],
+                    continuation: ContinuationProposition {
+                        verified_findings: vec!["Evidence retained at entry-2".to_owned()],
+                        unresolved_boundary: "Complete synthesis".to_owned(),
+                        why_it_matters: "Objective remains incomplete".to_owned(),
+                        recommended_archetype: "explorer".to_owned(),
+                        follow_up_objective: "Finish the persistence map".to_owned(),
+                        inherited_evidence: vec!["[entry-2] read persistence".to_owned()],
+                        can_proceed_independently: false,
+                    },
+                    can_resume: false,
+                    redacted: false,
+                    truncated: false,
+                }),
+                continued_from_run_id: Some("agent-0".to_owned()),
+                continued_by_run_id: Some("agent-2".to_owned()),
+                continuation_depth: 1,
+                additional_turns: Some(12),
+                inherited_evidence: vec![SalvagedEvidence {
+                    entry_id: "entry-0".to_owned(),
+                    title: "source evidence".to_owned(),
+                    body: "retained source output".to_owned(),
+                    truncated: false,
+                }],
             },
         };
 
@@ -4575,6 +4759,59 @@ mod tests {
         updated.transcript[1].body = "Updated persistence report".to_owned();
         store.save_subagent(&updated)?;
         assert_eq!(store.list_subagents(&parent.id)?, vec![updated]);
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_source_and_successor_persist_atomically() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("continuation.db"))?;
+        let parent = store.create(
+            CODEX_PROVIDER,
+            "parent-provider-session",
+            "/tmp/project",
+            "Parent work",
+            Some("model-a"),
+        )?;
+        let source = SubagentRecord {
+            parent_session_id: parent.id.clone(),
+            id: "source".to_owned(),
+            agent: "explorer".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            model: None,
+            provider_session_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            objective: "Inspect".to_owned(),
+            status: SubagentStatus::Partial,
+            latest_activity: "Partial".to_owned(),
+            transcript: Vec::new(),
+            observability: SubagentObservability::default(),
+        };
+        store.save_subagent(&source)?;
+
+        let mut linked_source = source.clone();
+        linked_source.observability.continued_by_run_id = Some("successor".to_owned());
+        let mut invalid_successor = source.clone();
+        invalid_successor.parent_session_id = "missing-parent".to_owned();
+        invalid_successor.id = "successor".to_owned();
+        invalid_successor.observability.continued_from_run_id = Some("source".to_owned());
+        assert!(
+            store
+                .save_subagent_continuation(&linked_source, &invalid_successor)
+                .is_err()
+        );
+        assert_eq!(store.list_subagents(&parent.id)?, vec![source.clone()]);
+
+        let mut successor = invalid_successor;
+        successor.parent_session_id = parent.id.clone();
+        store.save_subagent_continuation(&linked_source, &successor)?;
+        assert_eq!(
+            store.list_subagents(&parent.id)?,
+            vec![linked_source, successor]
+        );
         Ok(())
     }
 

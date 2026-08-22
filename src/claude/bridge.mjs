@@ -477,6 +477,12 @@ async function createSession(command, resumed) {
       : (structuredAllowed ?? policy?.allowedTools ?? null),
     deniedTools: policy?.deniedTools ?? [],
     maxTurns: command.maxTurns || null,
+    finalizationReserveTurns: Math.max(
+      0,
+      Math.min(command.finalizationReserveTurns || 0, command.maxTurns || 0),
+    ),
+    inferenceTurns: 0,
+    finalizing: false,
     timeoutSeconds: command.timeoutSeconds || null,
     externalTools: Array.isArray(command.externalTools)
       ? command.externalTools
@@ -667,6 +673,11 @@ function permissionHandler(turnId, session, mode, allowedTools) {
       });
       return { behavior: "deny", message, toolUseID: options.toolUseID };
     };
+    if (session.finalizing) {
+      return deny(
+        "Protected finalization reserve denies new tool use; synthesize the best final or partial report from retained evidence.",
+      );
+    }
     const immediate = immediateProviderToolDecision(
       session.deniedTools,
       allowedTools,
@@ -844,12 +855,30 @@ function emitUserToolResults(turnId, message) {
   }
 }
 
-function emitStreamEvent(turnId, message) {
+function emitStreamEvent(turnId, message, session) {
   // A Claude turn contains several API messages around tool results. The SDK gives every partial
   // wrapper a fresh UUID, so content deltas must instead inherit the API message id announced by
   // message_start. Otherwise every streamed chunk becomes a separate transcript row.
   const event = message.event;
   if (event?.type === "message_start") {
+    if (event.message?.role === "assistant") {
+      session.inferenceTurns += 1;
+      const softTurnLimit = session.maxTurns
+        ? Math.max(1, session.maxTurns - session.finalizationReserveTurns)
+        : null;
+      if (
+        !session.finalizing &&
+        session.finalizationReserveTurns > 0 &&
+        softTurnLimit !== null &&
+        session.inferenceTurns >= softTurnLimit
+      ) {
+        session.finalizing = true;
+        write({
+          event: "warning",
+          message: `Protected finalization reserve started with ${session.maxTurns - session.inferenceTurns} turn(s) remaining. New tools are disabled; produce the best final or partial report and a bounded continuation proposition now.`,
+        });
+      }
+    }
     streamMessageIds.set(
       turnId,
       event.message?.id || message.uuid || `${turnId}:message`,
@@ -905,6 +934,8 @@ async function sendTurn(command) {
   if (!session)
     throw new Error(`Claude session ${command.sessionId} is not attached`);
 
+  session.inferenceTurns = 0;
+  session.finalizing = false;
   const abortController = new AbortController();
   runs.set(command.turnId, abortController);
 
@@ -992,7 +1023,7 @@ async function sendTurn(command) {
     write({ event: "turn_started", turnId: command.turnId });
     for await (const message of stream) {
       if (message.type === "stream_event")
-        emitStreamEvent(command.turnId, message);
+        emitStreamEvent(command.turnId, message, session);
       else if (message.type === "assistant")
         emitContent(command.turnId, message);
       else if (message.type === "user")

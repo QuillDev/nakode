@@ -659,6 +659,8 @@ pub enum BackendCommand {
         allowed_builtin_tools: Option<Vec<String>>,
         /// Maximum provider/tool inference rounds and wall-clock lifetime for delegated runs.
         max_turns: Option<u32>,
+        /// Final inference rounds protected from new tool use. Zero preserves ordinary behavior.
+        finalization_reserve_turns: u32,
         timeout_seconds: Option<u32>,
     },
     ResumeSession {

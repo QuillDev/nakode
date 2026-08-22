@@ -2,21 +2,22 @@ use std::{collections::BTreeSet, path::Component};
 
 use nakode_protocol::{
     AgentBrowserView, AgentDefinitionView, AgentSessionId, AgentSessionView, ArtifactId,
-    ArtifactView, BootstrapView, ConnectionView, ContextUsageView, EntryId, ExternalToolCallView,
-    InteractionId, InteractionKind, InteractionOptionView, InteractionStatus, InteractionView,
-    MAX_ARTIFACT_BYTES, MAX_RUN_POLICY_ITEMS, MAX_RUN_POLICY_TEXT_BYTES, MAX_RUN_TEXT_BYTES,
-    MAX_RUN_TOOL_DENIAL_TEXT_BYTES, MAX_RUN_TOOL_DENIALS, MAX_SESSION_RUNS, MAX_SESSION_RUNS_BYTES,
+    ArtifactView, BootstrapView, ConnectionView, ContextUsageView, ContinuationPropositionView,
+    EntryId, ExternalToolCallView, InteractionId, InteractionKind, InteractionOptionView,
+    InteractionStatus, InteractionView, MAX_ARTIFACT_BYTES, MAX_RUN_POLICY_ITEMS,
+    MAX_RUN_POLICY_TEXT_BYTES, MAX_RUN_TEXT_BYTES, MAX_RUN_TOOL_DENIAL_TEXT_BYTES,
+    MAX_RUN_TOOL_DENIALS, MAX_SESSION_RUNS, MAX_SESSION_RUNS_BYTES,
     MAX_TRANSCRIPT_ENTRY_BODY_BYTES, MAX_TRANSCRIPT_PAGE_BODY_BYTES, MAX_TRANSCRIPT_PAGE_ENTRIES,
     MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES, MAX_TRANSCRIPT_SNAPSHOT_ENTRIES, MemorySettingsView,
     ModelConfigurationView, ModelId, ModelOptions as ProtocolModelOptions, ModelView, NoticeLevel,
     NoticeView, PromptAttachment as ProtocolPromptAttachment, PromptId, ProviderAuthenticationView,
     ProviderCapabilities, ProviderCapability, ProviderId, ProviderView, QueueItemView,
-    RecoverablePromptView, RunId, RunOutcome, RunPage, RunPolicyView, RunStatus, RunTextField,
-    RunTextWindow, RunToolDenialView, RunView, SessionActivity, SessionId, SessionSummary,
-    SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView, TodoPhaseView,
-    TodoStatusView, TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus,
-    TranscriptEntryView, TranscriptPage, TurnId, TurnStatus, TurnView, VisionSettingsView,
-    WebSettingsView, WorkspaceId,
+    RecoverablePromptView, RunId, RunOutcome, RunPage, RunPolicyView, RunSalvageView, RunStatus,
+    RunTextField, RunTextWindow, RunToolDenialView, RunView, SalvagedEvidenceView, SessionActivity,
+    SessionId, SessionSummary, SessionView, SettingsView, SkillView, TerminalImageModeView,
+    TodoItemView, TodoPhaseView, TodoStatusView, TranscriptBodyWindow, TranscriptEntryKind,
+    TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TurnId, TurnStatus, TurnView,
+    VisionSettingsView, WebSettingsView, WorkspaceId,
 };
 
 use super::{
@@ -622,9 +623,13 @@ fn run_text<'a>(
         RunTextField::Objective => Some(&run.objective),
         RunTextField::LatestActivity => Some(&run.latest_activity),
         RunTextField::Outcome => run_outcome_text(state, run),
-        RunTextField::Result if run_status(run.status) == RunStatus::Completed => {
-            latest_run_transcript_body(state, run, |entry| entry.kind == EntryKind::Assistant)
-                .or(Some(&run.latest_activity))
+        RunTextField::Result
+            if matches!(
+                run_status(run.status),
+                RunStatus::Completed | RunStatus::Partial
+            ) =>
+        {
+            run_outcome_text(state, run)
         }
         RunTextField::Result => None,
     }
@@ -637,6 +642,11 @@ fn run_outcome_text<'a>(state: &'a DomainState, run: &'a SubagentRun) -> Option<
             latest_run_transcript_body(state, run, |entry| entry.kind == EntryKind::Assistant)
                 .or(Some(&run.latest_activity))
         }
+        RunStatus::Partial => latest_run_transcript_body(state, run, |entry| {
+            entry.kind == EntryKind::Assistant
+                || (entry.kind == EntryKind::System && entry.title == "SALVAGED PARTIAL RESULT")
+        })
+        .or(Some(&run.latest_activity)),
         RunStatus::Failed => {
             latest_run_transcript_body(state, run, |entry| entry.kind == EntryKind::Error)
                 .or(Some(&run.latest_activity))
@@ -724,13 +734,15 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
         .iter()
         .rev()
         .find(|entry| entry.kind == TranscriptEntryKind::Assistant);
-    let result = (status == RunStatus::Completed).then(|| {
-        result_entry.map_or_else(
+    let (outcome, outcome_window) = run_outcome_projection(status, &latest_activity, &transcript);
+    let result = match status {
+        RunStatus::Completed => Some(result_entry.map_or_else(
             || latest_activity.clone(),
             BoundedText::from_transcript_entry,
-        )
-    });
-    let (outcome, outcome_window) = run_outcome_projection(status, &latest_activity, &transcript);
+        )),
+        RunStatus::Partial => Some(outcome_window.clone()),
+        _ => None,
+    };
     let (policy, reasoning_effort, fast_mode) = run_policy(run);
     let (tool_denials, tool_denials_retained_total) = projected_tool_denials(state, run);
     let ended_at_ms = run.observability.ended_at_ms;
@@ -751,6 +763,25 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
         objective_mismatch_handoff: run.observability.objective_mismatch_handoff.clone(),
         policy,
         tool_denials,
+        salvage: run.observability.salvage.as_ref().map(project_salvage),
+        continued_from_run_id: run
+            .observability
+            .continued_from_run_id
+            .clone()
+            .map(RunId::from),
+        continued_by_run_id: run
+            .observability
+            .continued_by_run_id
+            .clone()
+            .map(RunId::from),
+        continuation_depth: run.observability.continuation_depth,
+        additional_turns: run.observability.additional_turns,
+        inherited_evidence: run
+            .observability
+            .inherited_evidence
+            .iter()
+            .map(project_salvaged_evidence)
+            .collect(),
         tool_denials_retained_total,
         native_session_id: run.provider_session_id.clone(),
         usage: token_usage_view(run.usage),
@@ -768,6 +799,58 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
         result_start_byte: result.as_ref().map_or(0, |window| window.start_byte),
         result_total_bytes: result.as_ref().map_or(0, |window| window.total_bytes),
         transcript,
+    }
+}
+
+fn project_salvaged_evidence(evidence: &crate::session::SalvagedEvidence) -> SalvagedEvidenceView {
+    SalvagedEvidenceView {
+        entry_id: evidence.entry_id.clone(),
+        title: bounded_text(&evidence.title).value,
+        body: bounded_text(&evidence.body).value,
+        truncated: evidence.truncated || evidence.body.len() > MAX_RUN_TEXT_BYTES,
+    }
+}
+
+fn project_salvage(salvage: &crate::session::SubagentSalvage) -> RunSalvageView {
+    RunSalvageView {
+        terminal_reason: salvage.terminal_reason.clone(),
+        original_objective: bounded_text(&salvage.original_objective).value,
+        completed_work: salvage
+            .completed_work
+            .iter()
+            .map(|value| bounded_text(value).value)
+            .collect(),
+        verified_evidence: salvage
+            .verified_evidence
+            .iter()
+            .map(project_salvaged_evidence)
+            .collect(),
+        last_successful_evidence: salvage
+            .last_successful_evidence
+            .as_ref()
+            .map(project_salvaged_evidence),
+        unresolved_questions: salvage
+            .unresolved_questions
+            .iter()
+            .map(|value| bounded_text(value).value)
+            .collect(),
+        continuation: ContinuationPropositionView {
+            verified_findings: salvage
+                .continuation
+                .verified_findings
+                .iter()
+                .map(|value| bounded_text(value).value)
+                .collect(),
+            unresolved_boundary: bounded_text(&salvage.continuation.unresolved_boundary).value,
+            why_it_matters: bounded_text(&salvage.continuation.why_it_matters).value,
+            recommended_archetype: salvage.continuation.recommended_archetype.clone(),
+            follow_up_objective: bounded_text(&salvage.continuation.follow_up_objective).value,
+            inherited_evidence: salvage.continuation.inherited_evidence.clone(),
+            can_proceed_independently: salvage.continuation.can_proceed_independently,
+        },
+        can_resume: salvage.can_resume,
+        redacted: salvage.redacted,
+        truncated: salvage.truncated,
     }
 }
 
@@ -965,6 +1048,23 @@ fn run_outcome_projection(
             );
             (
                 Some(RunOutcome::Completed {
+                    body: window.value.clone(),
+                }),
+                window,
+            )
+        }
+        RunStatus::Partial => {
+            let window = latest_run_entry(transcript, |entry| {
+                entry.kind == TranscriptEntryKind::Assistant
+                    || (entry.kind == TranscriptEntryKind::System
+                        && entry.title == "SALVAGED PARTIAL RESULT")
+            })
+            .map_or_else(
+                || latest_activity.clone(),
+                BoundedText::from_transcript_entry,
+            );
+            (
+                Some(RunOutcome::Partial {
                     body: window.value.clone(),
                 }),
                 window,
@@ -1828,6 +1928,7 @@ const fn run_status(status: SubagentStatus) -> RunStatus {
         SubagentStatus::Starting => RunStatus::Starting,
         SubagentStatus::Working => RunStatus::Working,
         SubagentStatus::Completed => RunStatus::Completed,
+        SubagentStatus::Partial => RunStatus::Partial,
         SubagentStatus::Interrupted => RunStatus::Interrupted,
         SubagentStatus::Failed => RunStatus::Failed,
     }
@@ -2330,7 +2431,7 @@ mod tests {
         for count in [0, 7, MAX_SESSION_RUNS, MAX_SESSION_RUNS + 17] {
             let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
             let parent_session_id = state.nakode_session_id.clone();
-            state.install_subagents(subagent_records(&parent_session_id, count));
+            let _ = state.install_subagents(subagent_records(&parent_session_id, count));
 
             let session = bootstrap(&state, 2, &[], &[])
                 .active_session
@@ -2363,7 +2464,7 @@ mod tests {
     fn omitted_runs_are_discoverable_through_complete_cursor_pagination() {
         let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
         let parent_session_id = state.nakode_session_id.clone();
-        state.install_subagents(subagent_records(&parent_session_id, 150));
+        let _ = state.install_subagents(subagent_records(&parent_session_id, 150));
 
         let session = bootstrap(&state, 2, &[], &[])
             .active_session
@@ -2412,7 +2513,7 @@ mod tests {
             "require_parent_attribution": true,
         })
         .to_string();
-        state.install_subagents(vec![SubagentRecord {
+        let _ = state.install_subagents(vec![SubagentRecord {
             parent_session_id: state.nakode_session_id.clone(),
             id: "run-large".to_owned(),
             agent: "reviewer".to_owned(),

@@ -2481,6 +2481,12 @@ mod tests {
             objective_mismatch_handoff: None,
             policy: nakode_protocol::RunPolicyView::default(),
             tool_denials: Vec::new(),
+            salvage: None,
+            continued_from_run_id: None,
+            continued_by_run_id: None,
+            continuation_depth: 0,
+            additional_turns: None,
+            inherited_evidence: Vec::new(),
             tool_denials_retained_total: 0,
             native_session_id: None,
             usage: nakode_protocol::TokenUsageView {
