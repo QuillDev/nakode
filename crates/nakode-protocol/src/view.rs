@@ -335,6 +335,9 @@ pub struct TranscriptEntryView {
     /// External transport that originated this user turn. Absent for dashboard/SDK-origin input.
     #[serde(default)]
     pub source_transport: Option<String>,
+    /// Caller-owned prompt/mutation identity for user entries, absent for legacy/imported history.
+    #[serde(default)]
+    pub source_prompt_id: Option<String>,
     /// Versioned, bounded tool audit JSON. Clients must render it as inert data.
     #[serde(default)]
     pub tool_audit_json: Option<String>,
@@ -634,6 +637,14 @@ pub struct RunView {
     pub result_start_byte: u64,
     #[serde(default)]
     pub result_total_bytes: u64,
+    /// Stable source tool invocation in the parent transcript, absent for direct commands.
+    #[serde(default)]
+    pub invocation_turn_id: Option<String>,
+    #[serde(default)]
+    pub invocation_call_id: Option<String>,
+    /// Parent owner message that caused this delegation, distinct from the child prompt.
+    #[serde(default)]
+    pub originating_owner_entry: Option<TranscriptEntryView>,
     pub transcript: TranscriptPage,
 }
 
@@ -1230,6 +1241,7 @@ mod tests {
             resolved_reasoning_effort: None,
             resolved_fast_mode: None,
             source_transport: None,
+            source_prompt_id: None,
             tool_audit_json: None,
         };
         let value = serde_json::to_value(entry).expect("serialize transcript entry");

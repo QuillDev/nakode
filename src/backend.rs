@@ -632,6 +632,10 @@ pub struct NativeDelegationRequest {
     pub owner_session_id: String,
     /// Active delegated run when this is recursive; absent for a primary session.
     pub parent_run_id: Option<String>,
+    /// Provider-neutral owner turn containing the invocation.
+    pub invocation_turn_id: String,
+    /// Stable provider tool-call identity shared with the parent audit envelope.
+    pub invocation_call_id: String,
     pub agent: String,
     pub task: String,
     /// Provider turn cancellation, observed by the server before and after child creation.
@@ -651,6 +655,9 @@ pub enum BackendCommand {
         owner_session_id: Option<String>,
         /// Active delegated run that owns this provider session, absent for primary sessions.
         parent_run_id: Option<String>,
+        /// Stable identities authorized by Nakode's logical-session skill snapshot. Explicit even
+        /// when empty so native tools never infer authority from installed files.
+        enabled_skill_ids: Vec<String>,
         external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
         /// Exact provider-call identities allowed for this provider session. `None` keeps the
@@ -667,6 +674,9 @@ pub enum BackendCommand {
         provider_session_id: String,
         /// Logical Nakode owner bound by the control plane, never provider/model input.
         owner_session_id: Option<String>,
+        /// Stable identities authorized by Nakode's logical-session skill snapshot. This replaces
+        /// any stale or absent provider-runtime copy during resume.
+        enabled_skill_ids: Vec<String>,
         /// Client-owned tools installed before provider restoration.
         external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
@@ -685,6 +695,8 @@ pub enum BackendCommand {
         prompt: String,
         attachments: Vec<PromptAttachment>,
         model: Option<String>,
+        /// Current Nakode-cached effective catalogue for the logical session's profile.
+        skill_catalogue: crate::skill::SkillCatalog,
     },
     SteerTurn {
         provider_session_id: String,

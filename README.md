@@ -218,7 +218,10 @@ A definition names the archetype (`slug`, `description`), what it is told (`syst
 `reasoning_effort`. Effort belongs to the model that runs at it, so `reasoning_effort` is refused
 without a `model` and refused when that model does not offer the level named. Omit it and the
 delegated run uses the model's own default level, which is what every definition written before the
-field means — nothing on disk needs editing.
+field means — nothing on disk needs editing. `fast_mode = true` is an affirmative request available
+only when the discovered model advertises it. `false` does not request a slow tier; it leaves ordinary
+provider behaviour unchanged. An inherited or fallback model is checked after it resolves, before
+Nakode projects options onto the delegated session.
 
 Owner-defined definitions additionally carry ownership and availability, canonical capability/tool
 allow and deny lists, a tool profile (`none`, `read_only`, `command_runner`, `bounded_watcher`, or

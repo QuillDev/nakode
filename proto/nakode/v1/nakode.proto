@@ -288,6 +288,8 @@ message OpenSessionRequest {
   string session_id = 2;
   optional SessionToolConfiguration tools = 3;
   optional McpSessionGrant mcp_grant = 4;
+  // Rebinds legacy sessions and confirms the authoritative profile for restored sessions.
+  optional string profile_id = 5;
 }
 message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // Removes a logical session and its persisted history. Deletion is AUTHORITATIVE: a
@@ -500,7 +502,7 @@ message ModelTarget {
 message SelectModelRequest { MutationOptions mutation = 1; ModelTarget target = 2; string model_id = 3; ModelOptions options = 4; }
 message SetProviderEnabledRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; }
 message SetProviderModelFilterRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; repeated string selected_model_ids = 4; }
-message ListSkillsRequest { string workspace_id = 1; string profile_id = 2; }
+message ListSkillsRequest { string workspace_id = 1; string profile_id = 2; bool refresh = 3; }
 message SetSkillEnabledRequest {
   MutationOptions mutation = 1;
   string workspace_id = 2;
@@ -856,6 +858,8 @@ message TranscriptEntry {
   optional bool resolved_fast_mode = 15;
   // External transport that originated this user turn. Absent for dashboard/SDK-origin input.
   optional string source_transport = 16;
+  // Stable caller-owned prompt/mutation identity. Absent for legacy/imported owner entries.
+  optional string source_prompt_id = 17;
 }
 message TranscriptPage {
   repeated TranscriptEntry entries = 1;
@@ -987,6 +991,9 @@ message RunState {
   uint32 continuation_depth = 37;
   optional uint32 additional_turns = 38;
   repeated SalvagedEvidence inherited_evidence = 39;
+  optional string invocation_turn_id = 40;
+  optional string invocation_call_id = 41;
+  optional TranscriptEntry originating_owner_entry = 42;
 }
 message RunTextWindow { string run_id = 1; RunTextField field = 2; string text = 3; uint64 start_byte = 4; uint64 total_bytes = 5; bool has_earlier = 6; }
 message Artifact { string id = 1; string label = 2; string media_type = 3; uint64 byte_length = 4; bytes data = 5; }

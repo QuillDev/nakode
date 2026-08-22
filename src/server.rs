@@ -188,6 +188,49 @@ impl ServerCore {
         self.published_workspace = Some(self.workspace_bootstrap());
     }
 
+    pub(crate) fn install_skill_authority(
+        &mut self,
+        catalogue: &SkillCatalog,
+        preferences: &HashMap<String, Vec<crate::skill::SkillPreference>>,
+    ) {
+        let installed_ids = catalogue.stable_ids();
+        self.engine_mut()
+            .state_mut()
+            .install_skill_snapshot(catalogue.clone(), Some(&installed_ids));
+        self.session_template
+            .install_skill_snapshot(catalogue.clone(), Some(&installed_ids));
+        for engine in self.sessions_by_id.values_mut() {
+            let Some(profile_id) = engine.state().skill_profile_id().map(str::to_owned) else {
+                continue;
+            };
+            let effective = catalogue.enabled_for(
+                preferences
+                    .get(&profile_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                &profile_id,
+            );
+            let ids = effective.stable_ids();
+            engine
+                .state_mut()
+                .install_skill_snapshot(effective, Some(&ids));
+        }
+    }
+
+    pub(crate) fn install_profile_skill_catalogue(
+        &mut self,
+        profile_id: &str,
+        catalogue: &SkillCatalog,
+    ) {
+        for engine in self.sessions_by_id.values_mut() {
+            if engine.state().skill_profile_id() == Some(profile_id) {
+                engine
+                    .state_mut()
+                    .install_skill_snapshot(catalogue.clone(), Some(&catalogue.stable_ids()));
+            }
+        }
+    }
+
     pub(crate) fn install_available_builtin_tools(
         &mut self,
         availability: &HashMap<String, Vec<String>>,
@@ -547,6 +590,7 @@ impl ServerCore {
         // distinguishes a retry from another deliberate send; lifecycle and queue placement are
         // therefore evaluated against authoritative state when this command executes.
         let revision_fenced = !matches!(&command, Command::SendPrompt { .. });
+        let prompt_identity = key.as_str().to_owned();
         let (mut result, effects) = if revision_fenced
             && expected_revision.is_some_and(|revision| revision != command_revision)
         {
@@ -559,7 +603,29 @@ impl ServerCore {
                 Vec::new(),
             )
         } else {
-            self.execute_command(command)
+            match command {
+                Command::SendPrompt { session_id, prompt } => {
+                    let enqueue = self
+                        .engine_for(&session_id)
+                        .is_some_and(|engine| engine.state().is_busy());
+                    match self.prompt_command_with_id(
+                        &session_id,
+                        prompt,
+                        enqueue,
+                        &prompt_identity,
+                    ) {
+                        Ok((accepted, effects)) => (Ok(accepted), effects),
+                        Err(error) => (Err(domain_error(error)), Vec::new()),
+                    }
+                }
+                Command::EnqueuePrompt { session_id, prompt } => {
+                    match self.prompt_command_with_id(&session_id, prompt, true, &prompt_identity) {
+                        Ok((accepted, effects)) => (Ok(accepted), effects),
+                        Err(error) => (Err(domain_error(error)), Vec::new()),
+                    }
+                }
+                command => self.execute_command(command),
+            }
         };
         let effect_session = effect_session.or_else(|| {
             result
@@ -616,7 +682,7 @@ impl ServerCore {
                 initial_instructions,
                 bridge,
                 mcp_grant,
-                profile_id: _,
+                profile_id,
                 disabled_skill_ids,
             } => self.create_session_command_with_mcp_and_skills(
                 &workspace_id,
@@ -628,13 +694,22 @@ impl ServerCore {
                 initial_instructions.as_deref(),
                 bridge,
                 mcp_grant.as_ref(),
+                profile_id,
                 &disabled_skill_ids,
             ),
             Command::OpenSession {
                 session_id,
                 tools,
                 mcp_grant,
-            } => self.open_session_command_with_mcp(&session_id, tools, mcp_grant.as_ref()),
+                profile_id,
+                enabled_skill_ids,
+            } => self.open_session_command_with_mcp_and_profile(
+                &session_id,
+                tools,
+                mcp_grant.as_ref(),
+                profile_id,
+                &enabled_skill_ids,
+            ),
             Command::SetSessionBridgeLifecycle {
                 session_id,
                 lifecycle,
@@ -927,6 +1002,7 @@ impl ServerCore {
             initial_instructions,
             bridge,
             mcp_grant,
+            None,
             &[],
         )
     }
@@ -945,6 +1021,7 @@ impl ServerCore {
         initial_instructions: Option<&str>,
         bridge: Option<SessionBridgeIntent>,
         mcp_grant: Option<&McpSessionGrant>,
+        profile_id: Option<String>,
         disabled_skill_ids: &[String],
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
@@ -965,7 +1042,8 @@ impl ServerCore {
             })?;
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
-        engine.state_mut().install_skills(skills);
+        engine.state_mut().set_skill_profile(profile_id);
+        engine.state_mut().install_skill_snapshot(skills, None);
         engine
             .state_mut()
             .set_initial_client_instructions(initial_instructions)?;
@@ -1658,11 +1736,24 @@ impl ServerCore {
         self.open_session_command_with_mcp(session_id, tools, None)
     }
 
+    #[cfg(test)]
     fn open_session_command_with_mcp(
         &mut self,
         session_id: &SessionId,
         tools: Option<nakode_protocol::SessionToolConfiguration>,
         mcp_grant: Option<&McpSessionGrant>,
+    ) -> DomainCommandOutcome {
+        self.open_session_command_with_mcp_and_profile(session_id, tools, mcp_grant, None, &[])
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_session_command_with_mcp_and_profile(
+        &mut self,
+        session_id: &SessionId,
+        tools: Option<nakode_protocol::SessionToolConfiguration>,
+        mcp_grant: Option<&McpSessionGrant>,
+        profile_id: Option<String>,
+        enabled_skill_ids: &[String],
     ) -> DomainCommandOutcome {
         let loaded = self
             .sessions_by_id
@@ -1703,7 +1794,13 @@ impl ServerCore {
                             tools.allowed_builtin_tools.as_deref(),
                         )?;
                 }
-                // Opening an attached session is a reattachment, not a reconfiguration. The
+                if let Some(profile_id) = profile_id {
+                    let state = self.session_engine_mut(loaded)?.state_mut();
+                    let skills = state.skill_catalogue().only_ids(enabled_skill_ids);
+                    state.set_skill_profile(Some(profile_id));
+                    state.install_skill_snapshot(skills, Some(enabled_skill_ids));
+                }
+                // Opening an attached session is a reattachment, not a tool reconfiguration. The
                 // runtime already owns its installed MCP tools, so a caller's current grant must
                 // not make an otherwise valid reattach fail or mutate the active session.
                 return Ok(Self::accepted(Some(loaded.to_string()), Vec::new()));
@@ -1733,14 +1830,20 @@ impl ServerCore {
         let working_directory =
             canonical_working_directory(Some(&session.working_directory), &session.workspace)?;
         self.refresh_session_template_addenda()?;
-        let skills = SkillCatalog::load(Path::new(&working_directory)).map_err(|error| {
-            DomainCommandError::Invalid(format!(
-                "failed to load skills for {working_directory}: {error}"
-            ))
-        })?;
+        let authoritative_ids = profile_id
+            .as_ref()
+            .map(|_| enabled_skill_ids)
+            .or(session.enabled_skill_ids.as_deref());
+        let skills = authoritative_ids.map_or_else(
+            || self.session_template.skill_catalogue(),
+            |ids| self.session_template.skill_catalogue().only_ids(ids),
+        );
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
-        engine.state_mut().install_skills(skills);
+        engine.state_mut().set_skill_profile(profile_id);
+        engine
+            .state_mut()
+            .install_skill_snapshot(skills, authoritative_ids);
         // The workspace template may still carry the bootstrap provider/session identity. Reset that
         // clone before installing client-owned tools; restoration begins only after validation.
         let _discarded_template_effects = engine.state_mut().create_logical_session()?;
@@ -1762,10 +1865,42 @@ impl ServerCore {
                 .state_mut()
                 .configure_mcp_archetype_grants(archetype_grants);
         }
-        let effects = engine.state_mut().begin_resume(session.clone());
+        let mut effects = engine.state_mut().begin_resume(session.clone());
+        Self::prepend_resume_hydration_effects(&session, &engine, &mut effects);
         let loaded_id = SessionId::from(session.id.clone());
         self.sessions_by_id.insert(loaded_id.clone(), engine);
         Ok(Self::accepted(Some(session.id), effects))
+    }
+
+    fn prepend_resume_hydration_effects(
+        session: &SessionRecord,
+        engine: &ServiceEngine,
+        effects: &mut Vec<Effect>,
+    ) {
+        if effects.is_empty() {
+            return;
+        }
+        // Hydrate persisted children as soon as an accepted resume begins so clients can inspect
+        // terminal evidence without waiting for the provider handshake. A rejected resume must
+        // not install child state into an engine that has no logical session identity.
+        effects.insert(0, Effect::LoadSubagents(session.id.clone()));
+        Self::persist_legacy_skill_snapshot(session, engine, effects);
+    }
+
+    fn persist_legacy_skill_snapshot(
+        session: &SessionRecord,
+        engine: &ServiceEngine,
+        effects: &mut Vec<Effect>,
+    ) {
+        if session.enabled_skill_ids.is_none() {
+            effects.insert(
+                0,
+                Effect::PersistSessionSkillSnapshot {
+                    session_id: session.id.clone(),
+                    enabled_skill_ids: engine.state().enabled_skill_ids(),
+                },
+            );
+        }
     }
 
     fn validate_provider_tool_projection(
@@ -1829,17 +1964,45 @@ impl ServerCore {
         prompt: PromptInput,
         enqueue: bool,
     ) -> DomainCommandOutcome {
+        self.prompt_command_inner(session_id, prompt, enqueue, None)
+    }
+
+    fn prompt_command_with_id(
+        &mut self,
+        session_id: &SessionId,
+        prompt: PromptInput,
+        enqueue: bool,
+        prompt_id: &str,
+    ) -> DomainCommandOutcome {
+        self.prompt_command_inner(session_id, prompt, enqueue, Some(prompt_id))
+    }
+
+    fn prompt_command_inner(
+        &mut self,
+        session_id: &SessionId,
+        prompt: PromptInput,
+        enqueue: bool,
+        prompt_id: Option<&str>,
+    ) -> DomainCommandOutcome {
         self.ensure_session(session_id)?;
         self.reload_agent_catalogue_for_session(session_id)?;
         let (text, attachments) = self.convert_prompt(session_id, prompt)?;
         let effects = if enqueue {
-            self.session_engine_mut(session_id)?
-                .state_mut()
-                .enqueue_prompt(text, attachments)?
+            let state = self.session_engine_mut(session_id)?.state_mut();
+            match prompt_id {
+                Some(prompt_id) => {
+                    state.enqueue_prompt_with_id(prompt_id.to_owned(), text, attachments)?
+                }
+                None => state.enqueue_prompt(text, attachments)?,
+            }
         } else {
-            self.session_engine_mut(session_id)?
-                .state_mut()
-                .submit_prompt(text, attachments)?
+            let state = self.session_engine_mut(session_id)?.state_mut();
+            match prompt_id {
+                Some(prompt_id) => {
+                    state.submit_prompt_with_id(prompt_id.to_owned(), text, attachments)?
+                }
+                None => state.submit_prompt(text, attachments)?,
+            }
         };
         Ok(Self::accepted(None, effects))
     }
@@ -2017,6 +2180,9 @@ impl ServerCore {
         Ok(Self::accepted(None, effects))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    // This internal boundary keeps session, request, parent, and invocation identities explicit;
+    // collapsing them into UI-specific state would obscure the public server ownership contract.
     pub(crate) fn delegate_agent_attributed(
         &mut self,
         session_id: &SessionId,
@@ -2024,6 +2190,8 @@ impl ServerCore {
         task: &str,
         parent_run_id: Option<&str>,
         request_id: u64,
+        invocation_turn_id: Option<&str>,
+        invocation_call_id: Option<&str>,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
         self.ensure_session(session_id)?;
         if task.trim().is_empty() {
@@ -2034,7 +2202,14 @@ impl ServerCore {
         self.reload_agent_catalogue_for_session(session_id)?;
         self.session_engine_mut(session_id)?
             .state_mut()
-            .delegate_agent_attributed_for_request(agent_slug, task, parent_run_id, request_id)
+            .delegate_agent_attributed_for_request(
+                agent_slug,
+                task,
+                parent_run_id,
+                request_id,
+                invocation_turn_id,
+                invocation_call_id,
+            )
     }
 
     fn delegate_command(
@@ -4552,11 +4727,16 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
 
-        core.open_session_command(&restored_id, None)
+        let (_, effects) = core
+            .open_session_command(&restored_id, None)
             .expect("persisted cwd restores");
+        assert!(effects.iter().any(
+            |effect| matches!(effect, crate::state::Effect::LoadSubagents(parent) if parent == restored_id.as_str())
+        ));
         assert_eq!(
             core.engine_for(&restored_id)
                 .expect("restored engine")
@@ -4569,6 +4749,48 @@ mod tests {
             .open_session_command(&restored_id, None)
             .expect_err("deleted cwd must not fall back to workspace");
         assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[test]
+    fn rejected_restored_open_does_not_load_subagents() {
+        let (mut core, _) = ready_codex_server();
+        let directory = tempfile::tempdir().expect("persisted cwd");
+        let restored_id = SessionId::from("resume-unsupported-session");
+        core.replace_session_records(vec![SessionRecord {
+            id: restored_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-resume-unsupported".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            working_directory: directory
+                .path()
+                .canonicalize()
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            title: "Resume unsupported".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            last_owner_activity_at: None,
+            enabled_skill_ids: None,
+            owned_provider_sessions: Vec::new(),
+        }]);
+
+        let (_, effects) = core
+            .open_session_command(&restored_id, None)
+            .expect("open reports the resume rejection in session state");
+
+        assert!(effects.is_empty());
+        assert!(
+            core.engine_for(&restored_id)
+                .expect("restored engine")
+                .state()
+                .status_message
+                .contains("does not support session resume")
+        );
     }
 
     #[test]
@@ -5681,6 +5903,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let mut tools = dashboard_tools("DashboardRead", false);
@@ -5690,6 +5913,16 @@ mod tests {
         let (_, effects) = core
             .open_session_command(&restored_id, Some(tools.clone()))
             .expect("atomic restored open");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::state::Effect::PersistSessionSkillSnapshot {
+                    session_id,
+                    ..
+                } if session_id == restored_id.as_str()
+            )),
+            "legacy rows must be bound to an explicit snapshot on first resume: {effects:#?}"
+        );
         assert!(
             effects.iter().any(|effect| matches!(
                 effect,
@@ -5726,6 +5959,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: Some(Vec::new()),
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
@@ -5743,10 +5977,12 @@ mod tests {
         assert!(effects.iter().any(|effect| matches!(
             effect,
             crate::state::Effect::Backend(BackendCommand::ResumeSession {
+                enabled_skill_ids,
                 replace_builtin_tools: false,
                 allowed_builtin_tools: Some(allowed),
                 ..
-            }) if allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
+            }) if enabled_skill_ids.is_empty()
+                && allowed == &["memory_search".to_owned(), "memory_store".to_owned()]
         )));
     }
 
@@ -5781,6 +6017,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
@@ -5910,6 +6147,7 @@ mod tests {
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let loaded_before_open = core.sessions_by_id.len();
@@ -5939,6 +6177,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
 
@@ -6162,6 +6401,17 @@ mod tests {
             );
     }
 
+    fn assert_source_prompt_ids(core: &ServerCore, session_id: &SessionId, expected: &[&str]) {
+        let view = core.session_view(session_id).expect("session view");
+        let actual = view
+            .transcript
+            .entries
+            .iter()
+            .filter_map(|entry| entry.source_prompt_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
     fn busy_server_with_stale_revision(turn_id: &str) -> (ServerCore, SessionId, u64) {
         let (mut core, session_id) = ready_codex_server();
         core.engine_for_mut(&session_id)
@@ -6203,10 +6453,7 @@ mod tests {
             repeated.clone(),
         );
         first.expect("stale prompt append is accepted");
-        assert!(
-            effects.is_empty(),
-            "a busy send queues without interrupting"
-        );
+        assert!(effects.is_empty());
         assert!(changed);
 
         let (retry, retry_effects, retry_session, retry_changed) =
@@ -6250,8 +6497,13 @@ mod tests {
         );
         let queued_ids = queued
             .iter()
-            .map(|prompt| prompt.id.clone())
+            .map(|prompt| prompt.id.to_string())
             .collect::<Vec<_>>();
+        assert_eq!(
+            queued_ids,
+            ["window-a-repeat", "window-b-repeat", "window-c-next"],
+            "queued prompts retain their caller-owned mutation identities"
+        );
 
         for (completed_turn, next_turn, expected_prompt, expected_id) in [
             ("active-turn", "queued-turn-1", "repeat me", &queued_ids[0]),
@@ -6281,9 +6533,110 @@ mod tests {
             core.session_view(&session_id)
                 .expect("session view")
                 .queue
-                .is_empty(),
-            "every accepted follow-up leaves the authoritative queue exactly once"
+                .is_empty()
         );
+        assert_source_prompt_ids(
+            &core,
+            &session_id,
+            &["window-a-repeat", "window-b-repeat", "window-c-next"],
+        );
+    }
+
+    #[test]
+    fn busy_prompt_queue_rejects_oversized_caller_identity_without_mutation() {
+        let (mut core, session_id, _) = busy_server_with_stale_revision("active-turn");
+        let oversized_id = "x".repeat(129);
+        let (result, effects, _effect_session, changed) = core.execute_idempotent(
+            IdempotencyKey::from(oversized_id),
+            None,
+            false,
+            Command::EnqueuePrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "must not queue".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+
+        let error = result.expect_err("oversized prompt identity must be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("1 to 128 bytes"));
+        assert!(effects.is_empty());
+        assert!(!changed);
+        assert!(
+            core.session_view(&session_id)
+                .expect("session view")
+                .queue
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_enqueued_prompt_retains_mutation_identity_after_promotion() {
+        let (mut core, session_id, _) = busy_server_with_stale_revision("active-turn");
+        core.execute_idempotent(
+            IdempotencyKey::from("explicit-queued-submission"),
+            None,
+            false,
+            Command::EnqueuePrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "queued owner message".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        )
+        .0
+        .expect("queue accepted");
+        assert_eq!(
+            core.session_view(&session_id).expect("session view").queue[0]
+                .id
+                .as_str(),
+            "explicit-queued-submission"
+        );
+
+        assert_queued_turn_starts(
+            &mut core,
+            &session_id,
+            "active-turn",
+            "queued-turn",
+            "queued owner message",
+            "explicit-queued-submission",
+        );
+        let view = core.session_view(&session_id).expect("session view");
+        assert!(view.transcript.entries.iter().any(|entry| {
+            entry.source_prompt_id.as_deref() == Some("explicit-queued-submission")
+                && entry.body == "queued owner message"
+        }));
+    }
+
+    #[test]
+    fn immediate_prompt_entry_uses_the_idempotency_key_as_source_identity() {
+        let (mut core, session_id) = ready_codex_server();
+        core.execute_idempotent(
+            IdempotencyKey::from("chat-submission-1"),
+            None,
+            false,
+            Command::SendPrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "one owner message".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        )
+        .0
+        .expect("prompt accepted");
+
+        let view = core.session_view(&session_id).expect("session view");
+        let owner = view
+            .transcript
+            .entries
+            .iter()
+            .find(|entry| entry.source_prompt_id.as_deref() == Some("chat-submission-1"))
+            .expect("owner entry with caller identity");
+        assert_eq!(owner.body, "one owner message");
     }
 
     #[test]
@@ -7865,11 +8218,10 @@ first_message = "Starting review"
         );
     }
 
-    /// A session stuck busy behind a dead backend is deletable too.
+    /// A legacy session with orphaned busy display state behind a dead backend is deletable too.
     ///
-    /// `handle_disconnected` drops the turn but never marks a running subagent stopped, so `is_busy`
-    /// stays true for good. Refusing this one for "work in flight" asked the caller to cancel work
-    /// that nothing was doing, which is the second way a dead session became permanently stuck.
+    /// Live disconnect handling now settles executable delegated runs. This guard remains for older
+    /// or otherwise inconsistent in-memory projections that have no execution left to cancel.
     #[test]
     fn a_session_stuck_busy_behind_a_dead_backend_is_deletable() {
         let (mut core, _) = ready_codex_server();
@@ -8056,6 +8408,7 @@ first_message = "Starting review"
             created_at: 0,
             updated_at: 0,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
 

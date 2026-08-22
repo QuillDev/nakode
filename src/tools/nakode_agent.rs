@@ -79,6 +79,8 @@ impl Tool for NakodeAgentTool {
             let request = NativeDelegationRequest {
                 owner_session_id,
                 parent_run_id: context.session.parent_run_id.clone(),
+                invocation_turn_id: context.turn_id.to_owned(),
+                invocation_call_id: context.call_id.to_owned(),
                 agent: arguments.agent,
                 task: arguments.task,
                 cancellation: cancellation.clone(),

@@ -1078,6 +1078,10 @@ pub enum Effect {
         model: Option<String>,
         options: ModelOptions,
     },
+    PersistSessionSkillSnapshot {
+        session_id: String,
+        enabled_skill_ids: Vec<String>,
+    },
     PersistModels {
         provider: String,
         models: Vec<ModelInfo>,
@@ -1222,6 +1226,10 @@ pub struct DomainState {
     initial_model: Option<String>,
     agents: AgentCatalog,
     skills: SkillCatalog,
+    /// Persisted client profile whose current Nakode skill preferences govern this session.
+    skill_profile_id: Option<String>,
+    /// Current stable identities enabled by that profile. Updated by Nakode profile mutations.
+    enabled_skill_ids: Option<Vec<String>>,
     prompt_addenda: PromptAddenda,
     initial_client_instructions: Option<String>,
     agent_directory: PathBuf,
@@ -1346,7 +1354,7 @@ impl DomainState {
         self.default_model_options
             .clone_from(&source.default_model_options);
         self.agents.clone_from(&source.agents);
-        self.skills.clone_from(&source.skills);
+        self.install_skills(source.skills.clone());
         // Prompt addenda are a logical-session instruction snapshot. Never propagate a
         // workspace reload into sessions that have already started: later delegated
         // provider sessions must retain their owner's original instructions too.
@@ -1973,6 +1981,8 @@ impl DomainState {
             initial_model,
             agents: AgentCatalog::default(),
             skills: SkillCatalog::default(),
+            skill_profile_id: None,
+            enabled_skill_ids: None,
             prompt_addenda: PromptAddenda::default(),
             initial_client_instructions: None,
             agent_directory: PathBuf::from(".nakode/agents"),
@@ -2027,8 +2037,43 @@ impl DomainState {
         Ok(())
     }
 
+    pub fn set_skill_profile(&mut self, profile_id: Option<String>) {
+        self.skill_profile_id = profile_id;
+    }
+
+    #[must_use]
+    pub fn skill_profile_id(&self) -> Option<&str> {
+        self.skill_profile_id.as_deref()
+    }
+
     pub fn install_skills(&mut self, skills: SkillCatalog) {
-        self.skills = skills;
+        self.skills = match &self.enabled_skill_ids {
+            Some(enabled) => skills.into_only_ids(enabled),
+            None => skills,
+        };
+    }
+
+    /// Installs the immutable skill authority for one logical session. A missing legacy snapshot
+    /// defaults to all currently installed skills exactly once; the caller durably records the
+    /// resulting IDs so later resumes and restarts cannot silently expand authority.
+    pub fn install_skill_snapshot(
+        &mut self,
+        skills: SkillCatalog,
+        enabled_skill_ids: Option<&[String]>,
+    ) {
+        let enabled = enabled_skill_ids.map_or_else(|| skills.stable_ids(), <[String]>::to_vec);
+        self.skills = skills.into_only_ids(&enabled);
+        self.enabled_skill_ids = Some(enabled);
+    }
+
+    #[must_use]
+    pub fn skill_catalogue(&self) -> SkillCatalog {
+        self.skills.clone()
+    }
+
+    #[must_use]
+    pub fn enabled_skill_ids(&self) -> Vec<String> {
+        self.enabled_skill_ids.clone().unwrap_or_default()
     }
 
     pub fn configuration_reloaded(
@@ -2741,8 +2786,7 @@ impl DomainState {
                 let salvage_body = render_salvage(&salvage);
                 run.observability.salvage = Some(salvage);
                 if useful_partial {
-                    run.status = SubagentStatus::Partial;
-                    "Partial result preserved after restoration"
+                    "Partial evidence preserved after interruption"
                         .clone_into(&mut run.latest_activity);
                 }
                 if let Some(chat) = self.subagent_chats.get_mut(&run.id) {
@@ -2751,7 +2795,7 @@ impl DomainState {
                         "SALVAGED PARTIAL RESULT",
                         salvage_body,
                         if useful_partial {
-                            EntryStatus::Complete
+                            EntryStatus::Interrupted
                         } else {
                             EntryStatus::Failed
                         },
@@ -3265,6 +3309,7 @@ impl DomainState {
         effects.push(Effect::Backend(BackendCommand::ResumeSession {
             provider_session_id: session.provider_session_id,
             owner_session_id: Some(self.nakode_session_id.clone()),
+            enabled_skill_ids: self.enabled_skill_ids(),
             external_tools: self.provider_external_tools(),
             replace_builtin_tools: self.replace_builtin_tools,
             allowed_builtin_tools: self.allowed_builtin_tools.clone(),
@@ -3340,10 +3385,9 @@ impl DomainState {
     /// Whether a provider backend is still behind this session.
     ///
     /// `is_busy` says what the session was DOING; this says whether anything is left to do it, and
-    /// the two must be read together before refusing an operation for work in flight. A backend that
-    /// dies mid-turn leaves state behind that nothing ever clears: `handle_disconnected` drops the
-    /// turn but never marks a running subagent stopped, so `is_busy` can stay true forever. Asking
-    /// such a session to cancel its work first is asking it to do something it cannot.
+    /// the two must be read together before refusing an operation for work in flight. A legacy or
+    /// partially restored snapshot can retain busy display state after its backend is gone, so an
+    /// authoritative delete must distinguish that orphaned state from executable work.
     #[must_use]
     pub fn provider_is_live(&self) -> bool {
         matches!(
@@ -3458,6 +3502,15 @@ impl DomainState {
         self.submit_prompt_with_id_and_source(prompt_id, text, attachments, None)
     }
 
+    fn validate_prompt_operation_id(prompt_id: &str) -> Result<(), DomainCommandError> {
+        if prompt_id.is_empty() || prompt_id.len() > 128 {
+            return Err(DomainCommandError::Invalid(
+                "prompt operation id must contain 1 to 128 bytes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Submits one transport-origin prompt while retaining its immutable source for transcript
     /// projection and same-transport echo suppression.
     pub(crate) fn submit_prompt_with_id_and_source(
@@ -3467,11 +3520,7 @@ impl DomainState {
         attachments: Vec<PromptAttachment>,
         source_transport: Option<String>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        if prompt_id.is_empty() || prompt_id.len() > 128 {
-            return Err(DomainCommandError::Invalid(
-                "prompt operation id must contain 1 to 128 bytes".to_owned(),
-            ));
-        }
+        Self::validate_prompt_operation_id(&prompt_id)?;
         self.validate_prompt(&text)?;
         if !self.connection.is_ready() {
             return Err(DomainCommandError::Conflict(
@@ -3527,14 +3576,24 @@ impl DomainState {
         text: String,
         attachments: Vec<PromptAttachment>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.enqueue_prompt_with_id(Self::next_id("msg"), text, attachments)
+    }
+
+    /// Enqueues one prompt under a stable caller-owned mutation identity.
+    pub(crate) fn enqueue_prompt_with_id(
+        &mut self,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        Self::validate_prompt_operation_id(&prompt_id)?;
         self.validate_prompt(&text)?;
         if !self.is_busy() {
-            return self.submit_prompt(text, attachments);
+            return self.submit_prompt_with_id(prompt_id, text, attachments);
         }
         self.recoverable_prompt = None;
-        let id = Self::next_id("msg");
         self.queue.push_back(QueuedPrompt {
-            id,
+            id: prompt_id,
             text,
             attachments,
             source_transport: None,
@@ -4836,6 +4895,16 @@ impl DomainState {
             })
     }
 
+    /// Whether this exact discovered model advertises Nakode's affirmative fast-mode request.
+    fn model_offers_fast_mode(&self, provider: &str, model: &str) -> bool {
+        self.models
+            .iter()
+            .find(|candidate| candidate.provider == provider && candidate.id == model)
+            .is_some_and(|candidate| {
+                projection::model_configuration(candidate, false).fast_mode_configurable
+            })
+    }
+
     fn model_options_for_qualified(&self, qualified: &str) -> ModelOptions {
         self.model_options
             .get(qualified)
@@ -4846,6 +4915,13 @@ impl DomainState {
             })
             .cloned()
             .unwrap_or_else(|| self.default_model_options.clone())
+    }
+
+    fn model_options_for_discovered(&self, provider: &str, model: &str) -> ModelOptions {
+        self.models
+            .iter()
+            .find(|candidate| candidate.provider == provider && candidate.id == model)
+            .map_or_else(ModelOptions::default, |model| self.model_options_for(model))
     }
 
     fn model_options_for(&self, model: &ModelInfo) -> ModelOptions {
@@ -6020,7 +6096,7 @@ impl DomainState {
             BackendEvent::SessionClosed {
                 provider_session_id,
             } => self.handle_session_closed(&provider_session_id),
-            BackendEvent::Disconnected { reason } => self.handle_disconnected(reason),
+            BackendEvent::Disconnected { reason } => return self.handle_disconnected(reason),
         }
         Vec::new()
     }
@@ -6602,7 +6678,7 @@ impl DomainState {
         }
     }
 
-    fn handle_disconnected(&mut self, reason: String) {
+    fn handle_disconnected(&mut self, reason: String) -> Vec<Effect> {
         let pending_prompt = self
             .pending_session_prompt
             .take()
@@ -6633,6 +6709,8 @@ impl DomainState {
         {
             self.restore_failed_prompt(&prompt);
         }
+        let (_, effects) = self.interrupt_subagents();
+        effects
     }
 
     #[cfg(test)]
@@ -6764,6 +6842,7 @@ impl DomainState {
                 instructions: Some(self.nakode_system_instructions()),
                 owner_session_id: Some(self.nakode_session_id.clone()),
                 parent_run_id: None,
+                enabled_skill_ids: self.enabled_skill_ids(),
                 external_tools: self.provider_external_tools(),
                 replace_builtin_tools: self.replace_builtin_tools,
                 allowed_builtin_tools: self.allowed_builtin_tools.clone(),
@@ -6788,6 +6867,7 @@ impl DomainState {
             prompt: wire_text,
             attachments: prompt.attachments,
             model: prompt.model,
+            skill_catalogue: self.skill_catalogue(),
         })]
     }
 
@@ -7310,6 +7390,21 @@ impl DomainState {
                 )));
             }
         }
+        // `false` is ordinary provider behaviour, not an explicit slow tier. Only an affirmative
+        // request needs a capability, and a definition with no pinned model remains valid because the
+        // resolved parent model is checked when the delegated run starts.
+        if definition.fast_mode
+            && let Some(model) = definition.model.as_deref()
+        {
+            let offered = model
+                .split_once('/')
+                .is_some_and(|(provider, model)| self.model_offers_fast_mode(provider, model));
+            if !offered {
+                return Err(DomainCommandError::Invalid(format!(
+                    "model {model} does not advertise fast-mode selection"
+                )));
+            }
+        }
         if self.agents.definitions().iter().any(|existing| {
             existing.slug == definition.slug
                 && previous_slug.is_none_or(|previous| previous != existing.slug)
@@ -7457,17 +7552,41 @@ impl DomainState {
         task: &str,
         parent_run_id: Option<&str>,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
-        self.delegate_agent_attributed_for_request(agent_slug, task, parent_run_id, 0)
+        self.delegate_agent_attributed_for_request(agent_slug, task, parent_run_id, 0, None, None)
+    }
+
+    fn originating_owner_entry_id(&self, invocation_turn_id: Option<&str>) -> Option<String> {
+        // Prefer the exact provider turn. The fallback preserves attribution for legacy/restored
+        // entries without owner-turn metadata.
+        invocation_turn_id
+            .and_then(|turn_id| {
+                self.transcript.entries().iter().rev().find(|entry| {
+                    entry.kind == EntryKind::User && entry.owner_turn_id.as_deref() == Some(turn_id)
+                })
+            })
+            .or_else(|| {
+                self.transcript
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.kind == EntryKind::User)
+            })
+            .map(|entry| entry.id.clone())
     }
 
     /// Creates one delegated run whose terminal effect is correlated to a native runtime waiter.
     /// Existing UI/CLI delegations use request id zero and keep their historical projection path.
+    #[allow(clippy::too_many_lines)]
+    // Run creation intentionally keeps the accepted policy, attribution, launch command, and
+    // observable insertion in one atomic state transition.
     pub(crate) fn delegate_agent_attributed_for_request(
         &mut self,
         agent_slug: &str,
         task: &str,
         parent_run_id: Option<&str>,
         request_id: u64,
+        invocation_turn_id: Option<&str>,
+        invocation_call_id: Option<&str>,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
         self.validate_agent_request(agent_slug, task)?;
         let task = task.trim();
@@ -7478,6 +7597,7 @@ impl DomainState {
         };
         let (parent_run_id, remaining_delegation_depth) =
             self.delegation_context(parent_run_id, &definition)?;
+        let originating_owner_entry_id = self.originating_owner_entry_id(invocation_turn_id);
 
         let run_id = Self::next_id("agent");
         let model_targets = agent_model_targets(&definition, &self.backend_provider);
@@ -7494,6 +7614,9 @@ impl DomainState {
             latest_activity: "Starting provider…".to_owned(),
             observability: SubagentObservability {
                 parent_run_id: parent_run_id.clone(),
+                invocation_turn_id: invocation_turn_id.map(ToOwned::to_owned),
+                invocation_call_id: invocation_call_id.map(ToOwned::to_owned),
+                originating_owner_entry_id,
                 archetype_purpose: definition.description.clone(),
                 policy_json: serde_json::to_string(&definition).unwrap_or_else(|_| "{}".to_owned()),
                 remaining_delegation_depth,
@@ -7811,6 +7934,8 @@ impl DomainState {
             &request.task,
             None,
             request.id,
+            None,
+            None,
         ) {
             Ok((_, effects)) => effects,
             Err(error) => vec![Effect::CompleteAgentRequest {
@@ -8341,6 +8466,7 @@ impl DomainState {
                 instructions,
                 owner_session_id: Some(self.nakode_session_id.clone()),
                 parent_run_id: Some(run_id.to_owned()),
+                enabled_skill_ids: self.enabled_skill_ids(),
                 external_tools,
                 replace_builtin_tools,
                 allowed_builtin_tools,
@@ -8369,13 +8495,32 @@ impl DomainState {
             return Vec::new();
         };
         let model = target.model.clone();
-        let options_model = model
-            .as_deref()
-            .or((!reported_model.is_empty()).then_some(reported_model));
+        let options_model = (!reported_model.is_empty())
+            .then_some(reported_model)
+            .or(model.as_deref());
         let mut options = options_model
-            .map(|model| self.model_options_for_qualified(&format!("{}/{model}", target.provider)))
+            .map(|model| self.model_options_for_discovered(&target.provider, model))
             .unwrap_or_default();
-        options.fast_mode |= agent_fast_mode;
+        let defined_fast_mode_applied = agent_fast_mode
+            && options_model
+                .is_some_and(|model| self.model_offers_fast_mode(&target.provider, model));
+        if defined_fast_mode_applied {
+            options.fast_mode = true;
+        } else if agent_fast_mode {
+            // A model inherited at delegation time or reached through fallback can differ from the
+            // definition's primary model. Never send an affirmative request that the actual model
+            // does not advertise.
+            options.fast_mode = false;
+            self.record_subagent_message(
+                run_id,
+                EntryKind::Warning,
+                "MODEL",
+                &format!(
+                    "fast mode is not available on {}; running with ordinary provider behaviour",
+                    options_model.unwrap_or(&target.provider)
+                ),
+            );
+        }
         // The archetype's own level beats whatever the workspace has saved for this model — that is
         // what defining one on the definition means. `None` changes nothing, so a definition written
         // before the field existed runs exactly as it did: at the model's own default.
@@ -8420,14 +8565,11 @@ impl DomainState {
         let prompt = execution.definition.initial_prompt(&execution.task);
         self.sync_subagent(run_id);
         let mut effects = Vec::new();
-        // Cursor as before, plus the one new case: an archetype that DEFINES a level has to have it
-        // delivered, and this command is how a level reaches a session.
-        //
-        // Deliberately not widened past that. Every other provider's delegated runs have never been
-        // sent these options — the workspace's own saved level and fast mode are still computed above
-        // and still dropped for them — and starting to send them is a change to how existing runs
-        // behave, which is not this change's business.
-        if defined_effort_applied || target.provider == CURSOR_PROVIDER {
+        // Cursor as before, plus either performance option explicitly defined by this archetype.
+        // Workspace model defaults alone retain their existing provider path; this branch projects
+        // only the archetype contract onto the delegated session before its first turn.
+        if defined_effort_applied || defined_fast_mode_applied || target.provider == CURSOR_PROVIDER
+        {
             effects.push(Effect::SubagentBackend {
                 run_id: run_id.to_owned(),
                 command: BackendCommand::SetSessionOptions {
@@ -8444,6 +8586,7 @@ impl DomainState {
                 prompt,
                 attachments: Vec::new(),
                 model,
+                skill_catalogue: self.skill_catalogue(),
             },
         });
         effects
@@ -8580,7 +8723,6 @@ impl DomainState {
         self.sync_inline_subagent(&run);
     }
 
-    #[cfg(test)]
     fn interrupt_subagents(&mut self) -> (usize, Vec<Effect>) {
         let run_ids = self
             .subagent_executions
@@ -8736,10 +8878,11 @@ impl DomainState {
             let useful_partial =
                 !salvage.verified_evidence.is_empty() || !salvage.completed_work.is_empty();
             let salvage_body = render_salvage(&salvage);
-            execution.run.status = if useful_partial {
-                SubagentStatus::Partial
-            } else if termination_kind == "interrupted" {
+            let interrupted = termination_kind == "interrupted";
+            execution.run.status = if interrupted {
                 SubagentStatus::Interrupted
+            } else if useful_partial {
+                SubagentStatus::Partial
             } else {
                 SubagentStatus::Failed
             };
@@ -8765,7 +8908,9 @@ impl DomainState {
                     EntryKind::System,
                     "SALVAGED PARTIAL RESULT",
                     salvage_body.clone(),
-                    if useful_partial {
+                    if interrupted {
+                        EntryStatus::Interrupted
+                    } else if useful_partial {
                         EntryStatus::Complete
                     } else {
                         EntryStatus::Failed
@@ -8778,7 +8923,7 @@ impl DomainState {
                         EntryStatus::Failed
                     });
             }
-            (useful_partial, salvage_body)
+            (useful_partial && !interrupted, salvage_body)
         } else if let Some((continuation, continuation_truncated)) =
             parse_continuation_proposition(execution.response.trim())
         {
@@ -9430,6 +9575,49 @@ mod tests {
     }
 
     #[test]
+    fn session_skill_snapshot_drives_catalogue_start_projection_and_reload() {
+        let workspace = tempdir().expect("skill workspace");
+        for (directory_name, id, description) in [
+            ("review", "stable.review", "Review code"),
+            ("testing", "stable.testing", "Run tests"),
+        ] {
+            let directory = workspace.path().join(".agents/skills").join(directory_name);
+            fs::create_dir_all(&directory).expect("skill directory");
+            fs::write(
+                directory.join("SKILL.md"),
+                format!(
+                    "---\nid: {id}\nname: {directory_name}\ndescription: {description}\n---\n\nFull instructions.\n"
+                ),
+            )
+            .expect("skill definition");
+        }
+        let catalogue = SkillCatalog::load(workspace.path()).expect("skill catalogue");
+        let mut state = ready_state();
+        state.install_skill_snapshot(catalogue.clone(), Some(&["stable.review".to_owned()]));
+
+        let rendered = state.rendered_skill_catalogue();
+        assert!(rendered.contains("read_skill({\"name\":\"review\"})"));
+        assert!(!rendered.contains("read_skill({\"name\":\"testing\"})"));
+
+        // A workspace/service reload discovers all installed skills but must retain the logical
+        // session's immutable stable-ID authority rather than re-advertising disabled entries.
+        state.install_skills(catalogue);
+        assert_eq!(state.enabled_skill_ids(), ["stable.review"]);
+        assert!(!state.rendered_skill_catalogue().contains("testing"));
+
+        let effects = state
+            .submit_prompt("inspect".to_owned(), Vec::new())
+            .expect("first prompt");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(BackendCommand::StartSession {
+                enabled_skill_ids,
+                ..
+            })] if enabled_skill_ids == &["stable.review".to_owned()]
+        ));
+    }
+
+    #[test]
     fn primary_system_instructions_include_model_personality_and_soul() {
         let directory = tempdir().expect("config directory");
         let personalities = directory.path().join("personalities.toml");
@@ -9664,6 +9852,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         };
 
@@ -12366,6 +12555,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         };
         assert!(matches!(
@@ -13117,6 +13307,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         };
         state.begin_resume(session.clone());
@@ -13479,6 +13670,101 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    fn archetype_fast_mode_validation_uses_the_discovered_model_capability() {
+        let mut state = ready_state();
+        let supported = AgentDefinition {
+            slug: "fast-reviewer".to_owned(),
+            description: "Reviews quickly".to_owned(),
+            model: Some(format!("{CODEX_PROVIDER}/model-a")),
+            fast_mode: true,
+            ..AgentDefinition::default()
+        };
+        state
+            .validate_agent_definition(&supported, None)
+            .expect("Codex advertises fast mode");
+
+        state.models.push(ModelInfo {
+            provider: "zai-coding".to_owned(),
+            id: "model-standard".to_owned(),
+            is_default: true,
+            capabilities: ModelCapabilities::default(),
+        });
+        let unsupported = AgentDefinition {
+            slug: "standard-reviewer".to_owned(),
+            description: "Reviews ordinarily".to_owned(),
+            model: Some("zai-coding/model-standard".to_owned()),
+            fast_mode: true,
+            ..AgentDefinition::default()
+        };
+        let error = state
+            .validate_agent_definition(&unsupported, None)
+            .expect_err("a model without the advertised capability must reject fast mode");
+        assert!(
+            error
+                .to_string()
+                .contains("does not advertise fast-mode selection")
+        );
+
+        state
+            .validate_agent_definition(
+                &AgentDefinition {
+                    slug: "inherited-reviewer".to_owned(),
+                    description: "Uses the delegating model".to_owned(),
+                    fast_mode: true,
+                    ..AgentDefinition::default()
+                },
+                None,
+            )
+            .expect("an inherited model is validated once it resolves at delegation time");
+    }
+
+    #[test]
+    fn codex_subagent_applies_saved_fast_mode_before_its_first_turn() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("fast-thinker.toml"),
+            format!(
+                r#"
+slug = "fast-thinker"
+description = "Thinks on the priority tier"
+system_prompt = "Think quickly."
+first_message = "Inspect the delegated question."
+model = "{CODEX_PROVIDER}/model-a"
+fast_mode = true
+"#
+            ),
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let run_id = launch_codex_subagent(&mut state, "fast-thinker");
+
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "codex-fast-child".to_owned(),
+                model: "model-a".to_owned(),
+            },
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::SubagentBackend {
+                    command: BackendCommand::SetSessionOptions {
+                        provider_session_id,
+                        options,
+                    },
+                    ..
+                },
+                Effect::SubagentBackend {
+                    command: BackendCommand::StartTurn { .. },
+                    ..
+                }
+            ] if provider_session_id == "codex-fast-child" && options.fast_mode
+        ));
+    }
+
+    #[test]
     fn cursor_subagent_applies_saved_fast_mode_before_its_first_turn() {
         let directory = tempdir().expect("agent directory");
         fs::write(
@@ -13494,6 +13780,12 @@ fast_mode = true
         )
         .expect("agent definition");
         let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CURSOR_PROVIDER.to_owned(),
+            id: "composer-2.5".to_owned(),
+            is_default: true,
+            capabilities: ModelCapabilities::default(),
+        });
         state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
         let effects = state.invoke_agent(&AgentRequest {
             id: 42,
@@ -13545,6 +13837,147 @@ fast_mode = true
             ] if provider_session_id == "cursor-child"
                 && options.fast_mode
                 && model == "composer-2.5"
+        ));
+    }
+
+    #[test]
+    fn cursor_subagent_drops_defined_fast_mode_when_reported_model_is_incapable() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("cursor-fast.toml"),
+            r#"
+slug = "cursor-fast"
+description = "Requests fast Cursor behavior"
+system_prompt = "Explore carefully."
+first_message = "Inspect the delegated question."
+model = "cursor-sdk/composer-2.5"
+fast_mode = true
+"#,
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        for id in ["composer-2.5", "basic"] {
+            state.models.push(ModelInfo {
+                provider: CURSOR_PROVIDER.to_owned(),
+                id: id.to_owned(),
+                is_default: id == "composer-2.5",
+                capabilities: ModelCapabilities::default(),
+            });
+        }
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 42,
+            agent: "cursor-fast".to_owned(),
+            task: "Map auth".to_owned(),
+        });
+        let (run_id, provider) = spawned_subagent(&effects);
+        assert_eq!(provider, CURSOR_PROVIDER);
+        let run_id = run_id.to_owned();
+
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CURSOR_PROVIDER.to_owned(),
+                display_name: "Cursor".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "cursor-fallback-child".to_owned(),
+                model: "basic".to_owned(),
+            },
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::SubagentBackend {
+                    command: BackendCommand::SetSessionOptions { options, .. },
+                    ..
+                },
+                Effect::SubagentBackend {
+                    command: BackendCommand::StartTurn { .. },
+                    ..
+                }
+            ] if !options.fast_mode
+        ));
+        assert_eq!(
+            state
+                .subagent_executions
+                .get(&run_id)
+                .and_then(|execution| execution.run.model.as_deref()),
+            Some("basic")
+        );
+    }
+
+    #[test]
+    fn cursor_subagent_drops_cached_options_the_discovered_model_does_not_advertise() {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("cursor-basic.toml"),
+            r#"
+slug = "cursor-basic"
+description = "Uses ordinary Cursor behavior"
+system_prompt = "Explore carefully."
+first_message = "Inspect the delegated question."
+model = "cursor-sdk/basic"
+"#,
+        )
+        .expect("agent definition");
+        let mut state = ready_state();
+        state.models.push(ModelInfo {
+            provider: CURSOR_PROVIDER.to_owned(),
+            id: "basic".to_owned(),
+            is_default: true,
+            capabilities: ModelCapabilities::default(),
+        });
+        state.model_options.insert(
+            format!("{CURSOR_PROVIDER}/basic"),
+            ModelOptions {
+                reasoning_effort: Some("xhigh".to_owned()),
+                fast_mode: true,
+            },
+        );
+        state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
+        let effects = state.invoke_agent(&AgentRequest {
+            id: 42,
+            agent: "cursor-basic".to_owned(),
+            task: "Map auth".to_owned(),
+        });
+        let (run_id, provider) = spawned_subagent(&effects);
+        assert_eq!(provider, CURSOR_PROVIDER);
+        let run_id = run_id.to_owned();
+
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CURSOR_PROVIDER.to_owned(),
+                display_name: "Cursor".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::SessionCreated {
+                provider_session_id: "cursor-basic-child".to_owned(),
+                model: "basic".to_owned(),
+            },
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::SubagentBackend {
+                    command: BackendCommand::SetSessionOptions { options, .. },
+                    ..
+                },
+                Effect::SubagentBackend {
+                    command: BackendCommand::StartTurn { .. },
+                    ..
+                }
+            ] if !options.fast_mode && options.reasoning_effort.is_none()
         ));
     }
 
@@ -13843,9 +14276,57 @@ tool_profile = "none"
     fn native_delegation_request_id_survives_to_terminal_effect() {
         let mut state = ready_state();
         state.install_agents(explorer_catalog());
+        state.transcript.restore(TranscriptEntry {
+            id: "owner-exact".to_owned(),
+            key: Some("owner-exact-key".to_owned()),
+            kind: EntryKind::User,
+            title: "YOU".to_owned(),
+            body: "Inspect native routing from this request".to_owned(),
+            status: EntryStatus::Complete,
+            created_at_ms: None,
+            provider_id: None,
+            model_id: None,
+            owner_turn_id: Some("turn-native".to_owned()),
+            reasoning_effort: None,
+            fast_mode: None,
+            source_transport: None,
+            tool_audit_json: None,
+        });
+        let owner_entry_id = "owner-exact".to_owned();
+        // A newer owner message must not steal attribution from the turn containing the call.
+        state.transcript.push(
+            EntryKind::User,
+            "YOU",
+            "A later queued request",
+            EntryStatus::Complete,
+        );
         let (run_id, launch) = state
-            .delegate_agent_attributed_for_request("explorer", "Inspect native routing", None, 77)
+            .delegate_agent_attributed_for_request(
+                "explorer",
+                "Inspect native routing",
+                None,
+                77,
+                Some("turn-native"),
+                Some("call-native"),
+            )
             .expect("native delegation");
+        let run = state
+            .subagents
+            .iter()
+            .find(|run| run.id == run_id)
+            .expect("attributed run");
+        assert_eq!(
+            run.observability.invocation_turn_id.as_deref(),
+            Some("turn-native")
+        );
+        assert_eq!(
+            run.observability.invocation_call_id.as_deref(),
+            Some("call-native")
+        );
+        assert_eq!(
+            run.observability.originating_owner_entry_id.as_deref(),
+            Some(owner_entry_id.as_str())
+        );
         assert!(
             launch
                 .iter()
@@ -14430,24 +14911,36 @@ model = "claude-agent/sonnet"
     #[test]
     fn abnormal_terminal_reasons_salvage_retained_evidence_without_fabricating_completion() {
         let cases = [
-            (TurnOutcome::Completed, None, "empty_response"),
+            (
+                TurnOutcome::Completed,
+                None,
+                "empty_response",
+                SubagentStatus::Partial,
+                true,
+            ),
             (
                 TurnOutcome::Failed,
                 Some("archetype runtime exceeded its configured timeout of 30 second(s)"),
                 "timed_out",
+                SubagentStatus::Partial,
+                true,
             ),
             (
                 TurnOutcome::Interrupted,
                 Some("Subagent turn was interrupted."),
                 "interrupted",
+                SubagentStatus::Interrupted,
+                false,
             ),
             (
                 TurnOutcome::Failed,
                 Some("provider process crashed"),
                 "failed",
+                SubagentStatus::Partial,
+                true,
             ),
         ];
-        for (outcome, error, expected_reason) in cases {
+        for (outcome, error, expected_reason, expected_status, expected_success) in cases {
             let mut state = ready_state();
             state.install_agents(explorer_catalog());
             let run_id = begin_mocked_subagent(&mut state);
@@ -14474,15 +14967,32 @@ model = "claude-agent/sonnet"
                 },
             );
             assert!(effects.iter().any(|effect| {
-                matches!(effect, Effect::CompleteAgentRequest { success: true, result, .. }
-                    if result.contains("retained authoritative output"))
+                matches!(effect, Effect::CompleteAgentRequest { success, result, .. }
+                    if *success == expected_success && result.contains("retained authoritative output"))
             }));
             let run = state
                 .subagents
                 .iter()
                 .find(|run| run.id == run_id)
                 .expect("terminal run");
-            assert_eq!(run.status, SubagentStatus::Partial);
+            assert_eq!(run.status, expected_status);
+            let salvage_entry = state
+                .subagent_chats
+                .get(&run_id)
+                .expect("child chat")
+                .transcript
+                .entries()
+                .iter()
+                .find(|entry| entry.title == "SALVAGED PARTIAL RESULT")
+                .expect("salvage transcript entry");
+            assert_eq!(
+                salvage_entry.status,
+                if outcome == TurnOutcome::Interrupted {
+                    EntryStatus::Interrupted
+                } else {
+                    EntryStatus::Complete
+                }
+            );
             let salvage = run.observability.salvage.as_ref().expect("salvage");
             assert!(salvage.terminal_reason.starts_with(expected_reason));
             assert!(
@@ -14666,6 +15176,82 @@ model = "claude-agent/sonnet"
             global.continue_subagent(&source_id, 12),
             Err(DomainCommandError::Conflict(message)) if message.contains("concurrent")
         ));
+    }
+
+    #[test]
+    fn parent_disconnect_destroys_active_subagent_and_preserves_partial_evidence() {
+        let mut state = ready_state();
+        state.session_id = Some("parent-session".to_owned());
+        state.install_agents(explorer_catalog());
+        let run_id = begin_mocked_subagent(&mut state);
+        state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::ItemCompleted {
+                turn_id: "child-turn".to_owned(),
+                item: NormalizedItem {
+                    id: "retained-evidence".to_owned(),
+                    kind: ItemKind::Tool,
+                    title: "read lifecycle".to_owned(),
+                    body: "authoritative partial evidence".to_owned(),
+                    status: ItemStatus::Complete,
+                    tool_audit_json: None,
+                },
+            },
+        );
+
+        let effects = state.handle_backend(BackendEvent::Disconnected {
+            reason: "parent provider exited".to_owned(),
+        });
+
+        let run = state
+            .subagents
+            .iter()
+            .find(|run| run.id == run_id)
+            .expect("destroyed run remains inspectable");
+        assert_eq!(run.status, SubagentStatus::Interrupted);
+        assert_eq!(
+            run.observability.termination_kind.as_deref(),
+            Some("interrupted")
+        );
+        assert!(run.observability.ended_at_ms.is_some());
+        assert!(!state.has_running_subagents());
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::CompleteAgentRequest { result, success: false, .. }
+                if result.contains("authoritative partial evidence"))
+        }));
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, Effect::StopSubagent(stopped) if stopped == &run_id)
+            )
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::PersistSubagent(record)
+                if record.id == run_id && record.status == SubagentStatus::Interrupted)
+        }));
+    }
+
+    #[test]
+    fn parent_disconnect_destroys_active_subagent_before_any_result() {
+        let mut state = ready_state();
+        state.session_id = Some("parent-session".to_owned());
+        state.install_agents(explorer_catalog());
+        let run_id = begin_mocked_subagent(&mut state);
+
+        let effects = state.handle_backend(BackendEvent::Disconnected {
+            reason: "parent provider exited".to_owned(),
+        });
+
+        assert_eq!(state.subagents[0].status, SubagentStatus::Interrupted);
+        assert!(!state.has_running_subagents());
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, Effect::StopSubagent(stopped) if stopped == &run_id)
+            )
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::PersistSubagent(record)
+                if record.id == run_id && record.status == SubagentStatus::Interrupted)
+        }));
     }
 
     #[test]

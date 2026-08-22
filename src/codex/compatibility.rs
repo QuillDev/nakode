@@ -471,6 +471,7 @@ fn command_request(
             prompt,
             attachments,
             model,
+            skill_catalogue: _,
         } => (
             BackendOperation::StartTurn,
             "turn/start",

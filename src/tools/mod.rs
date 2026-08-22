@@ -46,6 +46,8 @@ pub struct ToolContext<'a> {
     pub session: &'a mut RuntimeSession,
     pub backend_events: &'a mpsc::Sender<BackendEvent>,
     pub turn_id: &'a str,
+    /// Stable provider-neutral call identity for correlation with delegated runs.
+    pub call_id: &'a str,
     pub questions: &'a QuestionBroker,
     pub delegation: Option<&'a mpsc::Sender<NativeDelegationRequest>>,
 }
@@ -734,6 +736,19 @@ mod tests {
         )));
     }
 
+    fn assert_loaded_policy_component(component: &ToolResult) {
+        assert!(!component.failed, "{}", component.output);
+        let payload: Value = serde_json::from_str(&component.output).expect("component JSON");
+        assert_eq!(payload["name"], "review");
+        assert_eq!(payload["file_path"], "policy.md");
+        assert_eq!(payload["component_name"], "policy");
+        assert_eq!(payload["component_content"], "COMPLETE POLICY\n");
+        assert_eq!(
+            component.invocation_identity.as_deref(),
+            Some("fragile.review.v1")
+        );
+    }
+
     #[tokio::test]
     async fn installed_skills_load_by_catalogue_name_through_the_registry() {
         let directory = tempfile::tempdir().expect("workspace");
@@ -756,6 +771,11 @@ mod tests {
             questions: QuestionBroker::default(),
             cancellation: CancellationToken::new(),
         };
+
+        let enabled_catalogue =
+            crate::skill::SkillCatalog::load(directory.path()).expect("effective skill catalogue");
+        harness.session.skill_catalogue = enabled_catalogue.clone();
+        harness.session.enabled_skill_ids = Some(enabled_catalogue.stable_ids());
 
         let result = harness
             .execute("read_skill", json!({"name": "review"}))
@@ -790,17 +810,7 @@ mod tests {
                 json!({"name": "review", "component_name": "policy"}),
             )
             .await;
-        assert!(!component.failed, "{}", component.output);
-        let component_payload: Value =
-            serde_json::from_str(&component.output).expect("component JSON");
-        assert_eq!(component_payload["name"], "review");
-        assert_eq!(component_payload["file_path"], "policy.md");
-        assert_eq!(component_payload["component_name"], "policy");
-        assert_eq!(component_payload["component_content"], "COMPLETE POLICY\n");
-        assert_eq!(
-            component.invocation_identity.as_deref(),
-            Some("fragile.review.v1")
-        );
+        assert_loaded_policy_component(&component);
 
         let unknown_component = harness
             .execute(
@@ -811,13 +821,14 @@ mod tests {
         assert!(unknown_component.failed);
         assert!(unknown_component.output.contains("was not advertised"));
 
-        harness.session.instructions =
-            "[Nakode Available Skills]\n[/Nakode Available Skills]".to_owned();
+        // Current profile authority wins over stale prompt/session projections. Literal invocation
+        // cannot override a disabled skill, even when old instructions still advertise its name.
+        harness.session.skill_catalogue = crate::skill::SkillCatalog::default();
         let disabled = harness
             .execute("read_skill", json!({"name": "review"}))
             .await;
         assert!(disabled.failed);
-        assert!(disabled.output.contains("disabled or was not available"));
+        assert!(disabled.output.contains("disabled or unavailable"));
         assert!(disabled.invocation_identity.is_none());
         let disabled_component = harness
             .execute(
@@ -829,15 +840,22 @@ mod tests {
         assert!(
             disabled_component
                 .output
-                .contains("disabled or was not available")
+                .contains("disabled or unavailable")
         );
         assert!(disabled_component.invocation_identity.is_none());
+
+        // An acknowledged profile enablement takes effect on the next turn/runtime projection.
+        harness.session.skill_catalogue = enabled_catalogue;
+        let reenabled = harness
+            .execute("read_skill", json!({"name": "review"}))
+            .await;
+        assert!(!reenabled.failed, "{}", reenabled.output);
 
         let missing = harness
             .execute("read_skill", json!({"name": "missing"}))
             .await;
         assert!(missing.failed);
-        assert!(missing.output.contains("disabled or was not available"));
+        assert!(missing.output.contains("disabled or unavailable"));
         assert!(missing.invocation_identity.is_none());
     }
 
@@ -866,6 +884,9 @@ mod tests {
             questions: QuestionBroker::default(),
             cancellation: CancellationToken::new(),
         };
+        let full_catalogue =
+            crate::skill::SkillCatalog::load(directory.path()).expect("effective skill catalogue");
+        harness.session.skill_catalogue = full_catalogue.only_ids(&["review".to_owned()]);
 
         let denied = harness
             .execute(
@@ -880,7 +901,7 @@ mod tests {
                 .contains("belongs to disabled or unavailable skill")
         );
 
-        harness.session.instructions = "[Nakode Available Skills]\n- review: Review\n  Load: read_skill({\"name\":\"review\"})\n- shared: Shared\n  Load: read_skill({\"name\":\"shared\"})\n[/Nakode Available Skills]".to_owned();
+        harness.session.skill_catalogue = full_catalogue;
         let allowed = harness
             .execute(
                 "read_skill_component",
@@ -1108,6 +1129,7 @@ mod tests {
                 session: &mut session,
                 backend_events: &events,
                 turn_id: "turn-native",
+                call_id: "call-native",
                 questions: &questions,
                 delegation: Some(&requests),
             },
@@ -1118,6 +1140,8 @@ mod tests {
             let request = receiver.recv().await.expect("server request");
             assert_eq!(request.owner_session_id, "logical-session");
             assert_eq!(request.parent_run_id.as_deref(), Some("parent-run"));
+            assert_eq!(request.invocation_turn_id, "turn-native");
+            assert_eq!(request.invocation_call_id, "call-native");
             assert_eq!(request.agent, "repo-explorer");
             assert_eq!(request.task, "Inspect routing");
             request
@@ -1154,6 +1178,7 @@ mod tests {
                     session: &mut self.session,
                     backend_events: &self.events,
                     turn_id: "turn-1",
+                    call_id: "call-harness",
                     questions: &self.questions,
                     delegation: None,
                 },

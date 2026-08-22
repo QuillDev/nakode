@@ -718,6 +718,23 @@ fn projected_run_page(
     })
 }
 
+fn originating_owner_entry(state: &DomainState, run: &SubagentRun) -> Option<TranscriptEntryView> {
+    run.observability
+        .originating_owner_entry_id
+        .as_deref()
+        .and_then(|entry_id| {
+            state
+                .transcript
+                .entries()
+                .iter()
+                .find(|entry| entry.id == entry_id)
+        })
+        .map(|entry| {
+            let body = bounded_text(&entry.body).value;
+            transcript_entry_view(&state.transcript, entry, &body, false)
+        })
+}
+
 fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> RunView {
     let transcript = state
         .subagent_chats
@@ -751,6 +768,7 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
     let (policy, reasoning_effort, fast_mode) = run_policy(run);
     let (tool_denials, tool_denials_retained_total) = projected_tool_denials(state, run);
     let ended_at_ms = run.observability.ended_at_ms;
+    let originating_owner_entry = originating_owner_entry(state, run);
     RunView {
         id: RunId::from(run.id.clone()),
         parent_run_id: run.observability.parent_run_id.clone().map(RunId::from),
@@ -803,6 +821,9 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
         result: result.as_ref().map(|window| window.value.clone()),
         result_start_byte: result.as_ref().map_or(0, |window| window.start_byte),
         result_total_bytes: result.as_ref().map_or(0, |window| window.total_bytes),
+        invocation_turn_id: run.observability.invocation_turn_id.clone(),
+        invocation_call_id: run.observability.invocation_call_id.clone(),
+        originating_owner_entry,
         transcript,
     }
 }
@@ -1725,6 +1746,15 @@ fn transcript_entry_view(
         resolved_reasoning_effort: entry.reasoning_effort.clone(),
         resolved_fast_mode: entry.fast_mode,
         source_transport: entry.source_transport.clone(),
+        source_prompt_id: (entry.kind == EntryKind::User)
+            .then(|| {
+                entry
+                    .key
+                    .as_deref()
+                    .and_then(|key| key.strip_prefix("user:"))
+                    .map(str::to_owned)
+            })
+            .flatten(),
         tool_audit_json: include_audit
             .then(|| entry.tool_audit_json.clone())
             .flatten(),
@@ -3020,6 +3050,7 @@ mod tests {
             resolved_reasoning_effort: None,
             resolved_fast_mode: None,
             source_transport: None,
+            source_prompt_id: None,
             tool_audit_json: None,
         }
     }

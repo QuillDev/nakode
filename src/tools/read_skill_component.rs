@@ -2,10 +2,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolConcurrency, ToolContext, ToolFuture, ToolResult, required_string};
-use crate::{
-    runtime::ToolDefinition,
-    skill::{SkillCatalog, skill_is_advertised},
-};
+use crate::runtime::ToolDefinition;
 
 pub struct ReadSkillComponentTool;
 
@@ -57,15 +54,8 @@ impl Tool for ReadSkillComponentTool {
             let result = (|| {
                 let name = required_string(&arguments, "name")?;
                 let component_name = required_string(&arguments, "component_name")?;
-                if !skill_is_advertised(&context.session.instructions, name) {
-                    return Err(format!(
-                        "skill {name:?} is disabled or was not available when this session started"
-                    ));
-                }
-                let catalogue = SkillCatalog::load(context.workspace)
-                    .map_err(|error| format!("could not load installed skills: {error}"))?;
-                let skill = catalogue.find(name).ok_or_else(|| {
-                    format!("skill {name:?} is not installed in the current Nakode workspace")
+                let skill = context.session.skill_catalogue.find(name).ok_or_else(|| {
+                    format!("skill {name:?} is disabled or unavailable for the current profile")
                 })?;
                 let component = skill.component(component_name).ok_or_else(|| {
                     format!(
@@ -73,7 +63,11 @@ impl Tool for ReadSkillComponentTool {
                     )
                 })?;
                 if component.owner_skill() != name
-                    && !skill_is_advertised(&context.session.instructions, component.owner_skill())
+                    && context
+                        .session
+                        .skill_catalogue
+                        .find(component.owner_skill())
+                        .is_none()
                 {
                     return Err(format!(
                         "component {component_name:?} belongs to disabled or unavailable skill {:?}",

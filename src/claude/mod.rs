@@ -522,6 +522,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             instructions,
             owner_session_id,
             parent_run_id,
+            enabled_skill_ids: _,
             external_tools,
             replace_builtin_tools,
             allowed_builtin_tools,
@@ -535,6 +536,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         BackendCommand::ResumeSession {
             provider_session_id,
             owner_session_id,
+            enabled_skill_ids: _,
             external_tools,
             replace_builtin_tools,
             allowed_builtin_tools,
@@ -553,6 +555,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             prompt,
             attachments: _,
             model,
+            skill_catalogue: _,
         } => (
             "send",
             json!({"sessionId":provider_session_id,"turnId":client_id,"prompt":prompt,"model":model}),
@@ -631,6 +634,7 @@ async fn augment_image_attachments(
         mut prompt,
         mut attachments,
         model,
+        skill_catalogue,
     } = command
     else {
         return Ok(command);
@@ -650,6 +654,7 @@ async fn augment_image_attachments(
             prompt,
             attachments,
             model,
+            skill_catalogue,
         });
     }
     let service = config.vision_service.as_ref().ok_or_else(|| {
@@ -674,6 +679,7 @@ async fn augment_image_attachments(
         prompt,
         attachments,
         model,
+        skill_catalogue,
     })
 }
 
@@ -996,6 +1002,7 @@ fn resume_after_create(command: BackendCommand, message: &Value) -> BackendComma
     match command {
         BackendCommand::StartSession {
             owner_session_id,
+            enabled_skill_ids,
             external_tools,
             replace_builtin_tools,
             allowed_builtin_tools,
@@ -1005,6 +1012,7 @@ fn resume_after_create(command: BackendCommand, message: &Value) -> BackendComma
         } => BackendCommand::ResumeSession {
             provider_session_id: string(message, "sessionId"),
             owner_session_id,
+            enabled_skill_ids,
             external_tools,
             replace_builtin_tools,
             allowed_builtin_tools,
@@ -1216,19 +1224,32 @@ mod tests {
         );
     }
 
+    fn ticket_stage_tools() -> Vec<nakode_protocol::ExternalToolDefinition> {
+        vec![
+            nakode_protocol::ExternalToolDefinition {
+                name: "ListAssociatedTicketStages".to_owned(),
+                description: "List exact stage identities for the attached ticket".to_owned(),
+                input_schema_json: r#"{"type":"object","properties":{},"additionalProperties":false}"#
+                    .to_owned(),
+            },
+            nakode_protocol::ExternalToolDefinition {
+                name: "MoveAssociatedTicketToStage".to_owned(),
+                description: "Move the attached ticket by exact stage id".to_owned(),
+                input_schema_json: r#"{"type":"object","properties":{"stageId":{"type":"string","format":"uuid"}},"required":["stageId"],"additionalProperties":false}"#.to_owned(),
+            },
+        ]
+    }
+
     #[test]
     fn claude_external_tools_cross_the_mcp_bridge() {
-        let tool = nakode_protocol::ExternalToolDefinition {
-            name: "ReadAssociatedTicket".to_owned(),
-            description: "Read the attached ticket".to_owned(),
-            input_schema_json: r#"{"type":"object","properties":{}}"#.to_owned(),
-        };
+        let tools = ticket_stage_tools();
         let create = bridge_request(BackendCommand::StartSession {
             model: Some("opus".to_owned()),
             instructions: None,
             owner_session_id: Some("owner".to_owned()),
             parent_run_id: Some("parent-run".to_owned()),
-            external_tools: vec![tool],
+            enabled_skill_ids: Vec::new(),
+            external_tools: tools.clone(),
             replace_builtin_tools: false,
             allowed_builtin_tools: None,
             max_turns: None,
@@ -1239,17 +1260,44 @@ mod tests {
         .expect("bridge request");
         assert_eq!(
             create.payload["externalTools"][0]["name"],
-            "ReadAssociatedTicket"
+            "ListAssociatedTicketStages"
+        );
+        assert_eq!(
+            create.payload["externalTools"][1]["name"],
+            "MoveAssociatedTicketToStage"
+        );
+        assert_eq!(
+            create.payload["externalTools"][1]["input_schema_json"],
+            tools[1].input_schema_json
         );
         assert_eq!(create.payload["replaceBuiltinTools"], false);
         assert_eq!(create.payload["parentRunId"], "parent-run");
         assert!(create.payload["allowedBuiltinTools"].is_null());
+
+        let resume = bridge_request(BackendCommand::ResumeSession {
+            provider_session_id: "provider-session".to_owned(),
+            owner_session_id: Some("owner".to_owned()),
+            enabled_skill_ids: Vec::new(),
+            external_tools: tools,
+            replace_builtin_tools: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
+        })
+        .expect("Claude supports resumed session tools")
+        .expect("resume bridge request");
+        assert_eq!(resume.method, "resume");
+        assert_eq!(
+            resume.payload["externalTools"][1]["name"],
+            "MoveAssociatedTicketToStage"
+        );
 
         let restricted = bridge_request(BackendCommand::StartSession {
             model: None,
             instructions: None,
             owner_session_id: Some("owner".to_owned()),
             parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: false,
             allowed_builtin_tools: Some(vec!["Read".to_owned(), "Glob".to_owned()]),
@@ -1269,6 +1317,7 @@ mod tests {
             instructions: None,
             owner_session_id: Some("owner".to_owned()),
             parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: false,
             allowed_builtin_tools: Some(Vec::new()),
@@ -1294,14 +1343,20 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("event: \"external_tool_request\""));
         assert!(BRIDGE_SOURCE.contains("case \"resolve_external_tool\""));
         assert!(BRIDGE_SOURCE.contains("mcp__nakode_external__"));
+    }
+
+    #[test]
+    fn claude_stage_tool_request_preserves_exact_identity_and_arguments() {
         assert!(matches!(
             external_tool_request_event(&json!({
                 "id": "external-1",
-                "name": "ReadAssociatedTicket",
-                "argumentsJson": "{}"
+                "name": "MoveAssociatedTicketToStage",
+                "argumentsJson": r#"{"stageId":"33333333-3333-4333-8333-333333333333"}"#
             })),
             BackendEvent::ExternalToolRequested(ExternalToolRequest { id, name, arguments_json })
-                if id == "external-1" && name == "ReadAssociatedTicket" && arguments_json == "{}"
+                if id == "external-1"
+                    && name == "MoveAssociatedTicketToStage"
+                    && arguments_json == r#"{"stageId":"33333333-3333-4333-8333-333333333333"}"#
         ));
     }
 
@@ -1625,6 +1680,7 @@ assert.equal(streamMessageIds.size, 0);
             prompt: "retry".to_owned(),
             attachments: Vec::new(),
             model: None,
+            skill_catalogue: crate::skill::SkillCatalog::default(),
         };
         let reload = BackendCommand::Reload {
             provider_session_id: Some("session".to_owned()),
@@ -1653,6 +1709,7 @@ assert.equal(streamMessageIds.size, 0);
             instructions: Some("briefing".to_owned()),
             owner_session_id: Some("owner".to_owned()),
             parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: true,
             allowed_builtin_tools: Some(vec!["Read".to_owned()]),
@@ -1700,6 +1757,7 @@ assert.equal(streamMessageIds.size, 0);
                 prompt: "retry".to_owned(),
                 attachments: Vec::new(),
                 model: None,
+                skill_catalogue: crate::skill::SkillCatalog::default(),
             }),
             BackendOperation::StartTurn
         );

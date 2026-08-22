@@ -10,9 +10,13 @@ Installed skills are returned with current metadata. A saved identity that is no
 
 ## Session lifecycle
 
-Availability is snapshotted when a logical session is created. Disabled skills are removed before the initial instructions and provider prompt are published. Tool authorization checks the immutable skill catalogue advertised in those instructions, so an explicit `read_skill` request for a disabled, newly installed, or otherwise unadvertised skill is refused rather than substituted. `read_skill_component` uses the same snapshot and accepts only a component name returned by its parent skill; an explicitly shared cross-package component additionally requires its owning skill to be advertised.
+A profile-managed logical session is durably associated with its profile. Nakode resolves the profile's current effective catalogue when the session is created or opened and again at each owner turn. Profile preference changes and explicit installed-skill refreshes update loaded sessions, so open and future sessions converge on the same service-owned authority without waiting for provider-owned context to be rewritten mid-turn.
 
-An already-running session keeps its original catalogue. Resuming that same logical session keeps its persisted original instructions and therefore the same authorization. Changes apply to subsequently created sessions. This avoids changing tool authority in the middle of a provider-owned context.
+The turn catalogue is copied into native provider runtimes before prompt construction and tool execution. `read_skill` and `read_skill_component` read only that in-process catalogue: neither rescans the filesystem and a literal `/skill:name` cannot override disabled or unavailable state. `read_skill_component` accepts only a component advertised by its parent skill; a cross-package component additionally requires its owning skill in that same catalogue. A changed catalogue is therefore visible on the next turn; a turn already executing retains the catalogue with which it started.
+
+The durable profile association preserves profile isolation across service restart and reconnect. A client may supply the same profile when reopening, but cannot rebind an existing session to another profile. Older sessions without an association remain supported; the first profile-aware open binds them durably.
+
+The legacy `enabled_skill_ids` session snapshot remains a compatibility projection for clients and sessions that have no profile association. It is not an authority for profile-managed sessions and cannot override current profile preferences.
 
 ## Client surfaces
 
