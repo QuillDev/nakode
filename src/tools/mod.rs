@@ -749,6 +749,11 @@ mod tests {
             cancellation: CancellationToken::new(),
         };
 
+        let enabled_catalogue =
+            crate::skill::SkillCatalog::load(directory.path()).expect("effective skill catalogue");
+        harness.session.skill_catalogue = enabled_catalogue.clone();
+        harness.session.enabled_skill_ids = Some(enabled_catalogue.stable_ids());
+
         let result = harness
             .execute("read_skill", json!({"name": "review"}))
             .await;
@@ -759,55 +764,28 @@ mod tests {
             Some("fragile.review.v1")
         );
 
-        // Reproduces the owner contradiction: the provider-runtime instructions can predate skill
-        // catalogues, while Nakode's authoritative session snapshot advertises and authorizes the
-        // stable identity. Authorization must use the snapshot rather than stale prompt text.
-        harness.session.instructions.clear();
-        harness.session.enabled_skill_ids = Some(vec!["fragile.review.v1".to_owned()]);
-        let snapshotted = harness
-            .execute("read_skill", json!({"name": "review"}))
-            .await;
-        assert!(!snapshotted.failed, "{}", snapshotted.output);
-
-        // An installed or even stale-advertised skill remains confined when its stable identity is
-        // absent. An explicit empty snapshot is deny-all, not legacy/default-enabled state.
-        harness.session.instructions =
-            "[Nakode Available Skills]\n- review: stale\n  Load: read_skill({\"name\":\"review\"})\n[/Nakode Available Skills]".to_owned();
-        harness.session.enabled_skill_ids = Some(Vec::new());
+        // Current profile authority wins over stale prompt/session projections. Literal invocation
+        // cannot override a disabled skill, even when old instructions still advertise its name.
+        harness.session.skill_catalogue = crate::skill::SkillCatalog::default();
         let disabled = harness
             .execute("read_skill", json!({"name": "review"}))
             .await;
         assert!(disabled.failed);
-        assert!(disabled.output.contains("disabled or was not available"));
+        assert!(disabled.output.contains("disabled or unavailable"));
         assert!(disabled.invocation_identity.is_none());
 
-        harness.session.enabled_skill_ids = Some(vec!["unrelated.skill.v1".to_owned()]);
-        let unrelated = harness
+        // An acknowledged profile enablement takes effect on the next turn/runtime projection.
+        harness.session.skill_catalogue = enabled_catalogue;
+        let reenabled = harness
             .execute("read_skill", json!({"name": "review"}))
             .await;
-        assert!(unrelated.failed);
-
-        // Legacy provider-runtime rows without an explicit identity snapshot retain the original
-        // prompt-bound guard until authoritative resume reconciliation upgrades them.
-        harness.session.enabled_skill_ids = None;
-        harness.session.instructions =
-            "[Nakode Available Skills]\n[/Nakode Available Skills]".to_owned();
-        let legacy_disabled = harness
-            .execute("read_skill", json!({"name": "review"}))
-            .await;
-        assert!(legacy_disabled.failed);
-        assert!(
-            legacy_disabled
-                .output
-                .contains("disabled or was not available")
-        );
-        assert!(legacy_disabled.invocation_identity.is_none());
+        assert!(!reenabled.failed, "{}", reenabled.output);
 
         let missing = harness
             .execute("read_skill", json!({"name": "missing"}))
             .await;
         assert!(missing.failed);
-        assert!(missing.output.contains("disabled or was not available"));
+        assert!(missing.output.contains("disabled or unavailable"));
         assert!(missing.invocation_identity.is_none());
     }
 

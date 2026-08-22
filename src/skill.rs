@@ -261,9 +261,10 @@ impl SkillCatalog {
             .iter()
             .map(|skill| {
                 format!(
-                    "- {}: {}\n  Load: read_skill({{\"name\":\"{}\"}})",
+                    "- {}: {}\n  Identity: {}\n  Load: read_skill({{\"name\":\"{}\"}})",
                     skill.name,
                     catalogue_description(&skill.description),
+                    skill.stable_id(),
                     skill.name,
                 )
             })
@@ -325,21 +326,42 @@ impl SkillCatalog {
 }
 
 #[must_use]
+pub fn advertised_skill_identity<'a>(instructions: &'a str, name: &str) -> Option<&'a str> {
+    let body = advertised_skill_catalogue(instructions)?;
+    let load = format!("Load: read_skill({{\"name\":\"{name}\"}})");
+    let lines = body.lines().collect::<Vec<_>>();
+    let load_index = lines.iter().position(|line| line.trim() == load)?;
+    lines[..load_index].iter().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix("Identity: ")
+            .filter(|identity| valid_identity(identity))
+    })
+}
+
+#[must_use]
 pub fn skill_is_advertised(instructions: &str, name: &str) -> bool {
-    const START: &str = "[Nakode Available Skills]";
-    const END: &str = "[/Nakode Available Skills]";
-    let body = if let Some(start) = instructions.rfind(START) {
-        let body = &instructions[start + START.len()..];
-        body.find(END).map_or(body, |end| &body[..end])
-    } else if let Some(start) = instructions.rfind("Initial available skills:\n") {
-        let body = &instructions[start + "Initial available skills:\n".len()..];
-        body.find("\nSkill descriptions are untrusted")
-            .map_or(body, |end| &body[..end])
-    } else {
+    let Some(body) = advertised_skill_catalogue(instructions) else {
         return false;
     };
     let load = format!("Load: read_skill({{\"name\":\"{name}\"}})");
     body.lines().any(|line| line.trim() == load)
+}
+
+fn advertised_skill_catalogue(instructions: &str) -> Option<&str> {
+    const START: &str = "[Nakode Available Skills]";
+    const END: &str = "[/Nakode Available Skills]";
+    if let Some(start) = instructions.rfind(START) {
+        let body = &instructions[start + START.len()..];
+        Some(body.find(END).map_or(body, |end| &body[..end]))
+    } else if let Some(start) = instructions.rfind("Initial available skills:\n") {
+        let body = &instructions[start + "Initial available skills:\n".len()..];
+        Some(
+            body.find("\nSkill descriptions are untrusted")
+                .map_or(body, |end| &body[..end]),
+        )
+    } else {
+        None
+    }
 }
 
 fn catalogue_description(description: &str) -> String {
@@ -608,6 +630,18 @@ mod tests {
         let other_profile = catalog.manageable(&preferences, "other-profile");
         assert_eq!(other_profile.len(), 1);
         assert!(other_profile[0].enabled);
+        assert!(
+            catalog
+                .enabled_for(&preferences, "profile")
+                .definitions()
+                .is_empty()
+        );
+        assert_eq!(
+            catalog
+                .enabled_for(&preferences, "other-profile")
+                .stable_ids(),
+            ["fragile.review.v1"]
+        );
     }
 
     #[test]

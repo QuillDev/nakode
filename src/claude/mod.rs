@@ -555,6 +555,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             prompt,
             attachments: _,
             model,
+            skill_catalogue: _,
         } => (
             "send",
             json!({"sessionId":provider_session_id,"turnId":client_id,"prompt":prompt,"model":model}),
@@ -633,6 +634,7 @@ async fn augment_image_attachments(
         mut prompt,
         mut attachments,
         model,
+        skill_catalogue,
     } = command
     else {
         return Ok(command);
@@ -652,6 +654,7 @@ async fn augment_image_attachments(
             prompt,
             attachments,
             model,
+            skill_catalogue,
         });
     }
     let service = config.vision_service.as_ref().ok_or_else(|| {
@@ -676,6 +679,7 @@ async fn augment_image_attachments(
         prompt,
         attachments,
         model,
+        skill_catalogue,
     })
 }
 
@@ -1676,6 +1680,7 @@ assert.equal(streamMessageIds.size, 0);
             prompt: "retry".to_owned(),
             attachments: Vec::new(),
             model: None,
+            skill_catalogue: crate::skill::SkillCatalog::default(),
         };
         let reload = BackendCommand::Reload {
             provider_session_id: Some("session".to_owned()),
@@ -1752,6 +1757,7 @@ assert.equal(streamMessageIds.size, 0);
                 prompt: "retry".to_owned(),
                 attachments: Vec::new(),
                 model: None,
+                skill_catalogue: crate::skill::SkillCatalog::default(),
             }),
             BackendOperation::StartTurn
         );

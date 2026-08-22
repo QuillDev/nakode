@@ -280,6 +280,12 @@ pub enum Command {
         /// Explicit MCP grant used only when restoring a closed session.
         #[serde(default)]
         mcp_grant: Option<McpSessionGrant>,
+        /// Stable client profile selecting current authoritative skill availability.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        /// Runtime-resolved enabled identities. Clients cannot set this through gRPC.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        enabled_skill_ids: Vec<String>,
     },
     /// Sets one session's desired external-thread lifecycle. Idempotent when already in that state.
     SetSessionBridgeLifecycle {
@@ -533,6 +539,9 @@ pub enum Query {
     ListSkills {
         workspace_id: WorkspaceId,
         profile_id: String,
+        /// Forces service-owned installed-skill rediscovery before returning replacement state.
+        #[serde(default)]
+        refresh: bool,
     },
     GetSoul {
         workspace_id: WorkspaceId,

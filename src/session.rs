@@ -335,11 +335,39 @@ pub trait SessionRepository: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Returns all persisted profile skill choices for service-start cache hydration.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried or decoded.
+    fn list_all_skill_preferences(&self) -> Result<Vec<SkillPreference>, SessionError> {
+        Ok(Vec::new())
+    }
+
     /// Upserts one stable skill identity for one client profile.
     ///
     /// # Errors
     /// Returns an error when persistence cannot be updated.
     fn set_skill_preference(&self, _preference: &SkillPreference) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    /// Returns the durable profile governing one logical session, when profile-managed.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried.
+    fn session_skill_profile(&self, _session_id: &str) -> Result<Option<String>, SessionError> {
+        Ok(None)
+    }
+
+    /// Durably associates one logical session with its governing profile.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated or an existing association differs.
+    fn bind_session_skill_profile(
+        &self,
+        _session_id: &str,
+        _profile_id: &str,
+    ) -> Result<(), SessionError> {
         Ok(())
     }
 
@@ -479,6 +507,7 @@ pub trait SessionRepository: Send + Sync {
     ) -> Result<(), SessionError> {
         Ok(())
     }
+
     /// Atomically replaces one logical session's primary provider-native resource while retaining
     /// the previous primary as owned history for restart cleanup and deletion.
     ///
@@ -845,6 +874,12 @@ impl SqliteSessionRepository {
              );
              CREATE INDEX IF NOT EXISTS skill_preferences_profile_name
                ON skill_preferences(profile_id, last_name COLLATE NOCASE);
+             CREATE TABLE IF NOT EXISTS session_skill_profiles (
+               session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+               profile_id TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS session_skill_profiles_profile
+               ON session_skill_profiles(profile_id);
              CREATE TABLE IF NOT EXISTS provider_models (
                provider TEXT NOT NULL,
                model_id TEXT NOT NULL,
@@ -1964,6 +1999,50 @@ fn save_subagent_transaction(
 }
 
 impl SessionRepository for SqliteSessionRepository {
+    fn session_skill_profile(&self, session_id: &str) -> Result<Option<String>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection
+            .query_row(
+                "SELECT profile_id FROM session_skill_profiles WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn bind_session_skill_profile(
+        &self,
+        session_id: &str,
+        profile_id: &str,
+    ) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "INSERT INTO session_skill_profiles (session_id, profile_id) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET profile_id = excluded.profile_id
+             WHERE session_skill_profiles.profile_id = excluded.profile_id",
+            params![session_id, profile_id],
+        )?;
+        let persisted = connection.query_row(
+            "SELECT profile_id FROM session_skill_profiles WHERE session_id = ?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        if persisted != profile_id {
+            return Err(SessionError::InvalidStoredValue {
+                field: "session_skill_profiles.profile_id",
+                value: persisted,
+            });
+        }
+        Ok(())
+    }
+
     fn list_skill_preferences(
         &self,
         profile_id: &str,
@@ -1975,6 +2054,25 @@ impl SessionRepository for SqliteSessionRepository {
              ORDER BY last_name COLLATE NOCASE, skill_id",
         )?;
         let rows = statement.query_map(params![profile_id], |row| {
+            Ok(SkillPreference {
+                profile_id: row.get(0)?,
+                skill_id: row.get(1)?,
+                last_name: row.get(2)?,
+                last_description: row.get(3)?,
+                enabled: row.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(SessionError::from)
+    }
+
+    fn list_all_skill_preferences(&self) -> Result<Vec<SkillPreference>, SessionError> {
+        let connection = self.connection.lock().expect("session database lock");
+        let mut statement = connection.prepare(
+            "SELECT profile_id, skill_id, last_name, last_description, enabled
+             FROM skill_preferences ORDER BY profile_id, last_name COLLATE NOCASE, skill_id",
+        )?;
+        let rows = statement.query_map([], |row| {
             Ok(SkillPreference {
                 profile_id: row.get(0)?,
                 skill_id: row.get(1)?,
@@ -4648,6 +4746,8 @@ mod tests {
             last_description: "Reviews changes".to_owned(),
             enabled: true,
         })?;
+        let session = store.create("codex", "provider-session", "/workspace", "Session", None)?;
+        store.bind_session_skill_profile(&session.id, "profile-a")?;
         drop(store);
 
         let restored = SqliteSessionRepository::open(path)?;
@@ -4668,6 +4768,23 @@ mod tests {
         );
         assert_eq!(profile_b.len(), 1);
         assert!(profile_b[0].enabled);
+        assert_eq!(
+            restored.session_skill_profile(&session.id)?.as_deref(),
+            Some("profile-a")
+        );
+        assert!(
+            restored
+                .bind_session_skill_profile(&session.id, "profile-b")
+                .is_err()
+        );
+        let all = restored.list_all_skill_preferences()?;
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all.iter()
+                .filter(|preference| preference.profile_id == "profile-a")
+                .count(),
+            2
+        );
         assert!(
             restored
                 .list_skill_preferences("legacy-profile")?
