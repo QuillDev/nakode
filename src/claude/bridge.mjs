@@ -307,6 +307,23 @@ function providerProcessLifecycle() {
   };
 }
 
+function nativeAgentHistoryId(agentId, message, index, blockIndex) {
+  return message.uuid
+    ? `native:${agentId}:${message.uuid}${blockIndex === 0 ? "" : `:${blockIndex}`}`
+    : `native:${agentId}:${index}:${blockIndex}`;
+}
+
+function nativeAgentBlockText(block) {
+  if (block.type === "text" && typeof block.text === "string") return block.text;
+  if (block.type === "tool_use") {
+    return JSON.stringify({ toolUseId: block.id, tool: block.name, input: block.input });
+  }
+  if (block.type === "tool_result") {
+    return JSON.stringify({ toolUseId: block.tool_use_id, output: block.content });
+  }
+  return null;
+}
+
 async function nativeAgentHistory(workspace, sessionId) {
   if (!workspace || !sessionId) return [];
   const root = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
@@ -345,21 +362,11 @@ async function nativeAgentHistory(workspace, sessionId) {
       if (!Array.isArray(blocks)) continue;
       const agentId = message.agentId || fallbackAgentId;
       for (const [blockIndex, block] of blocks.entries()) {
-        const text =
-          block.type === "text"
-            ? block.text
-            : block.type === "tool_use"
-              ? JSON.stringify({ tool: block.name, input: block.input })
-              : block.type === "tool_result"
-                ? JSON.stringify({
-                    toolUseId: block.tool_use_id,
-                    output: block.content,
-                  })
-                : null;
+        const text = nativeAgentBlockText(block);
         if (text === null) continue;
         history.push({
           turnId: message.promptId || `${sessionId}:native:${agentId}`,
-          id: `native:${agentId}:${message.uuid || `${index}:${blockIndex}`}`,
+          id: nativeAgentHistoryId(agentId, message, index, blockIndex),
           kind: "tool",
           title: `NativeAgent:${agentId}`,
           body: JSON.stringify({
