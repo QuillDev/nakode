@@ -4327,6 +4327,7 @@ mod tests {
                     started_at_ms: 100,
                     ..SubagentObservability::default()
                 },
+                transcript_has_earlier: false,
             })
             .expect("active run");
 
@@ -4400,6 +4401,7 @@ mod tests {
                     started_at_ms: 100,
                     ..SubagentObservability::default()
                 },
+                transcript_has_earlier: false,
             })
             .expect("active run");
 
@@ -5421,6 +5423,7 @@ mod tests {
                 latest_activity: "Working".to_owned(),
                 transcript: Vec::new(),
                 observability: SubagentObservability::default(),
+                transcript_has_earlier: false,
             })
             .expect("persist owned subagent");
 

@@ -8087,6 +8087,7 @@ first_message = "Starting review"
                     latest_activity: "Completed".to_owned(),
                     transcript: Vec::new(),
                     observability: SubagentObservability::default(),
+                    transcript_has_earlier: false,
                 })
                 .collect(),
         );
@@ -8159,6 +8160,7 @@ first_message = "Starting review"
                 tool_audit_json: None,
             }],
             observability: SubagentObservability::default(),
+            transcript_has_earlier: false,
         }]);
         let core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
         let run_id = RunId::from("run-long-text");
@@ -8218,6 +8220,7 @@ first_message = "Starting review"
                 })
                 .collect(),
             observability: SubagentObservability::default(),
+            transcript_has_earlier: false,
         }]);
         let core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
         let run_id = RunId::from("run-history");
@@ -8461,6 +8464,7 @@ first_message = "Starting review"
                 tool_audit_json: None,
             }],
             observability: SubagentObservability::default(),
+            transcript_has_earlier: false,
         }]);
         state.client.subagent_modal = Some("run-stream".to_owned());
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
