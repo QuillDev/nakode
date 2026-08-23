@@ -869,7 +869,7 @@ impl NakodeClient {
         limit: usize,
     ) -> Result<HydratedSession, SdkError> {
         let state = self.get_session(session_id).await?;
-        self.hydrate_session(state, limit).await
+        self.hydrate_session_with_refresh(state, limit).await
     }
 
     /// Sends work using the server-owned start-versus-queue policy.
@@ -1604,7 +1604,7 @@ impl NakodeClient {
         let task = tokio::spawn(async move {
             while let Some(update) = source.next().await {
                 let hydrated = match update {
-                    Ok(state) => client.hydrate_session(state, limit).await,
+                    Ok(state) => client.hydrate_session_with_refresh(state, limit).await,
                     Err(error) => Err(error),
                 };
                 if sender.send(hydrated).await.is_err() {
@@ -1630,7 +1630,7 @@ impl NakodeClient {
         let task = tokio::spawn(async move {
             while let Some(update) = source.next().await {
                 let hydrated = match update {
-                    Ok(state) => client.hydrate_session(state, limit).await,
+                    Ok(state) => client.hydrate_session_with_refresh(state, limit).await,
                     Err(error) => Err(error),
                 };
                 if sender.send(hydrated).await.is_err() {
@@ -1698,6 +1698,21 @@ impl NakodeClient {
         managed_watch(receiver, task)
     }
 
+    async fn hydrate_session_with_refresh(
+        &self,
+        state: api::SessionState,
+        limit: usize,
+    ) -> Result<HydratedSession, SdkError> {
+        let session_id = state.id.clone();
+        match self.hydrate_session(state, limit).await {
+            Err(SdkError::InvalidProjection(_)) => {
+                let fresh = self.get_session(session_id).await?;
+                self.hydrate_session(fresh, limit).await
+            }
+            result => result,
+        }
+    }
+
     async fn hydrate_session(
         &self,
         mut state: api::SessionState,
@@ -1705,6 +1720,11 @@ impl NakodeClient {
     ) -> Result<HydratedSession, SdkError> {
         let limit = limit.max(1);
         let session_id = state.id.clone();
+        if state.runs.len() > limit {
+            let remove_count = state.runs.len() - limit;
+            state.runs.drain(..remove_count);
+            state.runs_has_earlier = true;
+        }
         let transcript = state
             .transcript
             .take()
@@ -1732,21 +1752,28 @@ impl NakodeClient {
                 .await?;
             let previous_len = state.runs.len();
             prepend_runs(&mut state.runs, page.runs, limit);
-            state.runs_has_earlier = page.has_earlier || state.runs.len() == limit;
+            state.runs_has_earlier = page.has_earlier;
             if state.runs.len() == previous_len {
                 break;
             }
         }
 
+        let session_transcript = state
+            .transcript
+            .clone()
+            .ok_or(SdkError::MissingState("session transcript"))?;
+        let session_entries = session_transcript
+            .entries
+            .iter()
+            .chain(session_transcript.current_owner_entry.iter())
+            .map(|entry| (entry.id.clone(), entry.clone()))
+            .collect::<HashMap<_, _>>();
+        if let Some(active_agent_session) = state.active_agent_session.as_mut() {
+            active_agent_session.transcript = Some(session_transcript);
+        }
+
         for run in &mut state.runs {
-            let transcript = run
-                .transcript
-                .take()
-                .ok_or(SdkError::MissingState("run transcript"))?;
-            run.transcript = Some(
-                self.hydrate_transcript(api::TranscriptOwnerKind::Run, &run.id, transcript, limit)
-                    .await?,
-            );
+            self.hydrate_run(run, limit, &session_entries).await?;
         }
 
         let artifact_ids = session_artifact_ids(&state);
@@ -1763,6 +1790,117 @@ impl NakodeClient {
         Ok(HydratedSession { state, artifacts })
     }
 
+    async fn hydrate_run(
+        &self,
+        run: &mut api::RunState,
+        limit: usize,
+        session_entries: &HashMap<String, api::TranscriptEntry>,
+    ) -> Result<(), SdkError> {
+        run.objective = self
+            .hydrate_run_text(
+                &run.id,
+                api::RunTextField::Objective,
+                std::mem::take(&mut run.objective),
+                run.objective_start_byte,
+                run.objective_total_bytes,
+            )
+            .await?;
+        run.objective_start_byte = 0;
+        run.latest_activity = self
+            .hydrate_run_text(
+                &run.id,
+                api::RunTextField::LatestActivity,
+                std::mem::take(&mut run.latest_activity),
+                run.latest_activity_start_byte,
+                run.latest_activity_total_bytes,
+            )
+            .await?;
+        run.latest_activity_start_byte = 0;
+        if let Some(outcome) = run.outcome.as_mut() {
+            outcome.body = self
+                .hydrate_run_text(
+                    &run.id,
+                    api::RunTextField::Outcome,
+                    std::mem::take(&mut outcome.body),
+                    run.outcome_start_byte,
+                    run.outcome_total_bytes,
+                )
+                .await?;
+            run.outcome_start_byte = 0;
+        }
+        if let Some(result) = run.result.as_mut() {
+            *result = self
+                .hydrate_run_text(
+                    &run.id,
+                    api::RunTextField::Result,
+                    std::mem::take(result),
+                    run.result_start_byte,
+                    run.result_total_bytes,
+                )
+                .await?;
+            run.result_start_byte = 0;
+        }
+        if let Some(originating_owner) = run.originating_owner_entry.as_mut()
+            && let Some(hydrated) = session_entries.get(&originating_owner.id)
+        {
+            *originating_owner = hydrated.clone();
+        }
+        let transcript = run
+            .transcript
+            .take()
+            .ok_or(SdkError::MissingState("run transcript"))?;
+        run.transcript = Some(
+            self.hydrate_transcript(api::TranscriptOwnerKind::Run, &run.id, transcript, limit)
+                .await?,
+        );
+        Ok(())
+    }
+
+    async fn hydrate_run_text(
+        &self,
+        run_id: &str,
+        field: api::RunTextField,
+        mut text: String,
+        mut start_byte: u64,
+        total_bytes: u64,
+    ) -> Result<String, SdkError> {
+        while start_byte > 0 {
+            let expected_end = start_byte;
+            let window = self
+                .get_run_text_window(api::GetRunTextWindowRequest {
+                    run_id: run_id.to_owned(),
+                    field: field as i32,
+                    before_byte: Some(expected_end),
+                    limit_bytes: 256 * 1024,
+                })
+                .await?;
+            let returned_end = window
+                .start_byte
+                .saturating_add(u64::try_from(window.text.len()).unwrap_or(u64::MAX));
+            if window.run_id != run_id
+                || window.field != field as i32
+                || window.total_bytes != total_bytes
+                || returned_end != expected_end
+                || window.start_byte >= expected_end
+                || window.has_earlier != (window.start_byte > 0)
+            {
+                return Err(SdkError::InvalidProjection(format!(
+                    "run text for {run_id} field {} is not contiguous",
+                    field as i32
+                )));
+            }
+            text.insert_str(0, &window.text);
+            start_byte = window.start_byte;
+        }
+        if u64::try_from(text.len()).unwrap_or(u64::MAX) != total_bytes {
+            return Err(SdkError::InvalidProjection(format!(
+                "run text for {run_id} field {} ended early",
+                field as i32
+            )));
+        }
+        Ok(text)
+    }
+
     async fn hydrate_transcript(
         &self,
         owner_kind: api::TranscriptOwnerKind,
@@ -1770,6 +1908,37 @@ impl NakodeClient {
         mut transcript: api::TranscriptPage,
         limit: usize,
     ) -> Result<api::TranscriptPage, SdkError> {
+        let initial_entry_ids = transcript
+            .entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<HashSet<_>>();
+        let current_owner_turn_id = transcript
+            .current_owner_entry
+            .as_ref()
+            .and_then(|entry| entry.owner_turn_id.clone());
+        let mut client_omitted_owner_tool_calls = 0_u64;
+        if transcript.entries.len() > limit {
+            let remove_count = transcript.entries.len() - limit;
+            if let Some(owner_turn_id) = current_owner_turn_id.as_ref() {
+                client_omitted_owner_tool_calls = u64::try_from(
+                    transcript.entries[..remove_count]
+                        .iter()
+                        .filter(|entry| {
+                            entry.owner_turn_id.as_ref() == Some(owner_turn_id)
+                                && matches!(
+                                    api::TranscriptEntryKind::try_from(entry.kind),
+                                    Ok(api::TranscriptEntryKind::Tool
+                                        | api::TranscriptEntryKind::Diff)
+                                )
+                        })
+                        .count(),
+                )
+                .unwrap_or(u64::MAX);
+            }
+            transcript.entries.drain(..remove_count);
+            transcript.has_earlier = true;
+        }
         while transcript.has_earlier && transcript.entries.len() < limit {
             let Some(before_entry_id) = transcript.entries.first().map(|entry| entry.id.clone())
             else {
@@ -1786,7 +1955,7 @@ impl NakodeClient {
             let previous_len = transcript.entries.len();
             let has_earlier = page.has_earlier;
             prepend_entries(&mut transcript.entries, page.entries, limit);
-            transcript.has_earlier = has_earlier || transcript.entries.len() == limit;
+            transcript.has_earlier = has_earlier;
             if transcript.entries.len() == previous_len {
                 break;
             }
@@ -1794,6 +1963,31 @@ impl NakodeClient {
         for entry in &mut transcript.entries {
             self.hydrate_transcript_entry(owner_kind, owner_id, entry)
                 .await?;
+        }
+        if let Some(current_owner) = transcript.current_owner_entry.as_mut() {
+            self.hydrate_transcript_entry(owner_kind, owner_id, current_owner)
+                .await?;
+        }
+        if let Some(owner_turn_id) = current_owner_turn_id {
+            let restored_tool_calls = transcript
+                .entries
+                .iter()
+                .filter(|entry| {
+                    !initial_entry_ids.contains(&entry.id)
+                        && entry.owner_turn_id.as_ref() == Some(&owner_turn_id)
+                        && matches!(
+                            api::TranscriptEntryKind::try_from(entry.kind),
+                            Ok(api::TranscriptEntryKind::Tool | api::TranscriptEntryKind::Diff)
+                        )
+                })
+                .count();
+            transcript.current_owner_omitted_tool_calls = transcript
+                .current_owner_omitted_tool_calls
+                .saturating_add(client_omitted_owner_tool_calls)
+                .saturating_sub(u64::try_from(restored_tool_calls).unwrap_or(u64::MAX));
+        }
+        if !transcript.has_earlier {
+            transcript.current_owner_omitted_tool_calls = 0;
         }
         Ok(transcript)
     }
@@ -1841,6 +2035,12 @@ impl NakodeClient {
                     entry.id
                 )));
             }
+        }
+        if u64::try_from(entry.body.len()).unwrap_or(u64::MAX) != entry.body_total_bytes {
+            return Err(SdkError::InvalidProjection(format!(
+                "transcript body for {} ended early",
+                entry.id
+            )));
         }
         Ok(())
     }
@@ -2040,16 +2240,36 @@ fn prepend_runs(current: &mut Vec<api::RunState>, older: Vec<api::RunState>, lim
 }
 
 fn session_artifact_ids(session: &api::SessionState) -> HashSet<String> {
-    let session_entries = session
-        .transcript
+    let session_entries = session.transcript.iter().flat_map(|transcript| {
+        transcript
+            .entries
+            .iter()
+            .chain(transcript.current_owner_entry.iter())
+    });
+    let active_agent_entries = session
+        .active_agent_session
         .iter()
-        .flat_map(|transcript| &transcript.entries);
+        .flat_map(|agent_session| {
+            agent_session.transcript.iter().flat_map(|transcript| {
+                transcript
+                    .entries
+                    .iter()
+                    .chain(transcript.current_owner_entry.iter())
+            })
+        });
     let run_entries = session.runs.iter().flat_map(|run| {
         run.transcript
             .iter()
-            .flat_map(|transcript| &transcript.entries)
+            .flat_map(|transcript| {
+                transcript
+                    .entries
+                    .iter()
+                    .chain(transcript.current_owner_entry.iter())
+            })
+            .chain(run.originating_owner_entry.iter())
     });
     session_entries
+        .chain(active_agent_entries)
         .chain(run_entries)
         .flat_map(|entry| entry.artifact_ids.iter().cloned())
         .collect()

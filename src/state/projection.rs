@@ -751,18 +751,14 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
     let status = run_status(run.status);
     let objective = bounded_text(&run.objective);
     let latest_activity = bounded_text(&run.latest_activity);
-    let result_entry = transcript
-        .entries
-        .iter()
-        .rev()
-        .find(|entry| entry.kind == TranscriptEntryKind::Assistant);
-    let (outcome, outcome_window) = run_outcome_projection(status, &latest_activity, &transcript);
+    let (outcome, outcome_window) = run_outcome_projection(
+        status,
+        &latest_activity,
+        &transcript,
+        canonical_run_outcome_window(state, run, status),
+    );
     let result = match status {
-        RunStatus::Completed => Some(result_entry.map_or_else(
-            || latest_activity.clone(),
-            BoundedText::from_transcript_entry,
-        )),
-        RunStatus::Partial => Some(outcome_window.clone()),
+        RunStatus::Completed | RunStatus::Partial => Some(outcome_window.clone()),
         _ => None,
     };
     let (policy, reasoning_effort, fast_mode) = run_policy(run);
@@ -1054,24 +1050,27 @@ fn run_outcome(
     latest_activity: &str,
     transcript: &TranscriptPage,
 ) -> Option<RunOutcome> {
-    run_outcome_projection(status, &bounded_text(latest_activity), transcript).0
+    run_outcome_projection(status, &bounded_text(latest_activity), transcript, None).0
 }
 
 fn run_outcome_projection(
     status: RunStatus,
     latest_activity: &BoundedText,
     transcript: &TranscriptPage,
+    canonical_window: Option<BoundedText>,
 ) -> (Option<RunOutcome>, BoundedText) {
     match status {
         RunStatus::Starting | RunStatus::Working => (None, BoundedText::default()),
         RunStatus::Completed => {
-            let window = latest_run_entry(transcript, |entry| {
-                entry.kind == TranscriptEntryKind::Assistant
-            })
-            .map_or_else(
-                || latest_activity.clone(),
-                BoundedText::from_transcript_entry,
-            );
+            let window = canonical_window.unwrap_or_else(|| {
+                latest_run_entry(transcript, |entry| {
+                    entry.kind == TranscriptEntryKind::Assistant
+                })
+                .map_or_else(
+                    || latest_activity.clone(),
+                    BoundedText::from_transcript_entry,
+                )
+            });
             (
                 Some(RunOutcome::Completed {
                     body: window.value.clone(),
@@ -1080,15 +1079,17 @@ fn run_outcome_projection(
             )
         }
         RunStatus::Partial => {
-            let window = latest_run_entry(transcript, |entry| {
-                entry.kind == TranscriptEntryKind::Assistant
-                    || (entry.kind == TranscriptEntryKind::System
-                        && entry.title == "SALVAGED PARTIAL RESULT")
-            })
-            .map_or_else(
-                || latest_activity.clone(),
-                BoundedText::from_transcript_entry,
-            );
+            let window = canonical_window.unwrap_or_else(|| {
+                latest_run_entry(transcript, |entry| {
+                    entry.kind == TranscriptEntryKind::Assistant
+                        || (entry.kind == TranscriptEntryKind::System
+                            && entry.title == "SALVAGED PARTIAL RESULT")
+                })
+                .map_or_else(
+                    || latest_activity.clone(),
+                    BoundedText::from_transcript_entry,
+                )
+            });
             (
                 Some(RunOutcome::Partial {
                     body: window.value.clone(),
@@ -1097,12 +1098,13 @@ fn run_outcome_projection(
             )
         }
         RunStatus::Failed => {
-            let window =
+            let window = canonical_window.unwrap_or_else(|| {
                 latest_run_entry(transcript, |entry| entry.kind == TranscriptEntryKind::Error)
                     .map_or_else(
                         || latest_activity.clone(),
                         BoundedText::from_transcript_entry,
-                    );
+                    )
+            });
             (
                 Some(RunOutcome::Failed {
                     reason: window.value.clone(),
@@ -1111,19 +1113,21 @@ fn run_outcome_projection(
             )
         }
         RunStatus::Interrupted => {
-            let window = latest_run_entry(transcript, |entry| {
-                entry.status == TranscriptEntryStatus::Interrupted
-                    && matches!(
-                        entry.kind,
-                        TranscriptEntryKind::System
-                            | TranscriptEntryKind::Warning
-                            | TranscriptEntryKind::Error
-                    )
-            })
-            .map_or_else(
-                || latest_activity.clone(),
-                BoundedText::from_transcript_entry,
-            );
+            let window = canonical_window.unwrap_or_else(|| {
+                latest_run_entry(transcript, |entry| {
+                    entry.status == TranscriptEntryStatus::Interrupted
+                        && matches!(
+                            entry.kind,
+                            TranscriptEntryKind::System
+                                | TranscriptEntryKind::Warning
+                                | TranscriptEntryKind::Error
+                        )
+                })
+                .map_or_else(
+                    || latest_activity.clone(),
+                    BoundedText::from_transcript_entry,
+                )
+            });
             (
                 Some(RunOutcome::Interrupted {
                     reason: window.value.clone(),
@@ -1132,6 +1136,35 @@ fn run_outcome_projection(
             )
         }
     }
+}
+
+fn canonical_run_outcome_window(
+    state: &DomainState,
+    run: &SubagentRun,
+    status: RunStatus,
+) -> Option<BoundedText> {
+    let transcript = &state.subagent_chats.get(&run.id)?.transcript;
+    transcript
+        .entries()
+        .iter()
+        .rev()
+        .find(|entry| match status {
+            RunStatus::Completed => entry.kind == EntryKind::Assistant,
+            RunStatus::Partial => {
+                entry.kind == EntryKind::Assistant
+                    || (entry.kind == EntryKind::System && entry.title == "SALVAGED PARTIAL RESULT")
+            }
+            RunStatus::Failed => entry.kind == EntryKind::Error,
+            RunStatus::Interrupted => {
+                entry.status == EntryStatus::Interrupted
+                    && matches!(
+                        entry.kind,
+                        EntryKind::System | EntryKind::Warning | EntryKind::Error
+                    )
+            }
+            RunStatus::Starting | RunStatus::Working => false,
+        })
+        .map(|entry| bounded_text(&entry.body))
 }
 
 fn latest_run_entry(
@@ -1648,34 +1681,36 @@ fn projected_transcript_page(
     } else {
         None
     };
-    let current_owner_body = current_owner.map(|entry| {
-        utf8_tail(
-            &entry.body,
-            body_budget.min(MAX_TRANSCRIPT_ENTRY_BODY_BYTES),
-        )
+    let row_window_start = end.saturating_sub(limit);
+    let current_owner_outside_row_window = current_owner.is_some_and(|owner| {
+        entries[..end]
+            .iter()
+            .position(|entry| entry.id == owner.id)
+            .is_some_and(|index| index < row_window_start)
     });
-    let current_owner_truncated = current_owner
-        .zip(current_owner_body)
-        .is_some_and(|(entry, body)| body.len() < entry.body.len());
+    let reserved_owner_body = current_owner
+        .filter(|_| current_owner_outside_row_window)
+        .map(|entry| {
+            utf8_tail(
+                &entry.body,
+                body_budget.min(MAX_TRANSCRIPT_ENTRY_BODY_BYTES),
+            )
+        });
     let mut remaining_body_bytes =
-        body_budget.saturating_sub(current_owner_body.map_or(0, str::len));
+        body_budget.saturating_sub(reserved_owner_body.map_or(0, str::len));
     let mut projected = Vec::with_capacity(limit.min(entries.len()));
-    let mut truncated_body = false;
     for entry in entries[..end].iter().rev().take(limit) {
         // Tool audit envelopes share the same IPC/memory budget as transcript bodies. Providers bound
         // each payload field before it reaches here; the page keeps an envelope whole so a client is
         // never handed valid-looking partial JSON.
         let audit_bytes = entry.tool_audit_json.as_ref().map_or(0, String::len);
-        let include_audit = audit_bytes <= remaining_body_bytes;
+        let include_audit =
+            delegated_invocation_entry(entry) || audit_bytes <= remaining_body_bytes;
         if include_audit {
             remaining_body_bytes = remaining_body_bytes.saturating_sub(audit_bytes);
         }
         let body_limit = remaining_body_bytes.min(MAX_TRANSCRIPT_ENTRY_BODY_BYTES);
-        if body_limit == 0 && !entry.body.is_empty() {
-            break;
-        }
         let body = utf8_tail(&entry.body, body_limit);
-        truncated_body |= body.len() < entry.body.len();
         remaining_body_bytes = remaining_body_bytes.saturating_sub(body.len());
         projected.push(transcript_entry_view(
             transcript,
@@ -1690,9 +1725,8 @@ fn projected_transcript_page(
         .iter()
         .map(|entry| entry.id.as_str())
         .collect::<BTreeSet<_>>();
-    let current_owner_entry = current_owner
-        .zip(current_owner_body)
-        .map(|(entry, body)| transcript_entry_view(transcript, entry, body, false));
+    let current_owner_entry =
+        projected_current_owner(transcript, current_owner, &projected, reserved_owner_body);
     let current_owner_omitted_tool_calls = current_owner
         .and_then(|entry| entry.owner_turn_id.as_deref())
         .map_or(0, |turn_id| {
@@ -1707,16 +1741,54 @@ fn projected_transcript_page(
         });
     Some(TranscriptPage {
         entries: projected,
-        has_earlier: transcript.has_earlier_entries()
-            || omitted_entries
-            || truncated_body
-            || current_owner_truncated,
+        has_earlier: transcript.has_earlier_entries() || omitted_entries,
         stream_active: before.is_none() && transcript.stream_active(),
         stream_label: transcript.stream_label().to_owned(),
         current_owner_entry,
         current_owner_omitted_tool_calls: u64::try_from(current_owner_omitted_tool_calls)
             .unwrap_or(u64::MAX),
     })
+}
+
+fn projected_current_owner(
+    transcript: &DomainTranscript,
+    current_owner: Option<&TranscriptEntry>,
+    projected: &[TranscriptEntryView],
+    reserved_owner_body: Option<&str>,
+) -> Option<TranscriptEntryView> {
+    current_owner.map(|entry| {
+        projected
+            .iter()
+            .find(|projected| projected.id.as_str() == entry.id)
+            .cloned()
+            .map_or_else(
+                || {
+                    transcript_entry_view(
+                        transcript,
+                        entry,
+                        reserved_owner_body.unwrap_or(""),
+                        false,
+                    )
+                },
+                |mut projected| {
+                    projected.body.clear();
+                    projected.body_start_byte = projected.body_total_bytes;
+                    projected
+                },
+            )
+    })
+}
+
+fn delegated_invocation_entry(entry: &TranscriptEntry) -> bool {
+    entry.kind == EntryKind::Tool
+        && (["nakode_agent", "mcp__nakode__delegate"]
+            .iter()
+            .any(|name| entry.title.starts_with(name))
+            || entry.tool_audit_json.as_deref().is_some_and(|audit| {
+                ["nakode_agent", "mcp__nakode__delegate"]
+                    .iter()
+                    .any(|name| audit.contains(&format!("\"name\":\"{name}\"")))
+            }))
 }
 
 fn transcript_entry_view(
@@ -2523,7 +2595,7 @@ mod tests {
     }
 
     #[test]
-    fn current_owner_tool_omission_count_includes_body_budget_eviction() {
+    fn current_owner_body_is_not_double_charged_against_the_page_budget() {
         let mut transcript = DomainTranscript::new(100);
         transcript.upsert(
             "owner",
@@ -2557,9 +2629,9 @@ mod tests {
                 .iter()
                 .map(|entry| entry.title.as_str())
                 .collect::<Vec<_>>(),
-            ["Nakode"]
+            ["YOU", "read", "Nakode"]
         );
-        assert!(page.has_earlier);
+        assert!(!page.has_earlier);
         let projected_body_bytes = page
             .entries
             .iter()
@@ -2570,12 +2642,14 @@ mod tests {
                 .as_ref()
                 .map_or(0, |entry| entry.body.len());
         assert!(projected_body_bytes <= 30);
-        assert_eq!(page.current_owner_omitted_tool_calls, 1);
+        assert_eq!(page.current_owner_omitted_tool_calls, 0);
         assert_eq!(
-            page.current_owner_entry
-                .as_ref()
-                .map(|entry| entry.body.as_str()),
-            Some("Keep this turn visible")
+            page.current_owner_entry.as_ref().map(|entry| (
+                entry.body.as_str(),
+                entry.body_start_byte,
+                entry.body_total_bytes
+            )),
+            Some(("", 22, 22))
         );
     }
 
@@ -2605,6 +2679,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn delegated_invocation_audit_identity_survives_a_zero_body_budget() {
+        let mut transcript = DomainTranscript::new(100);
+        transcript.upsert(
+            "delegate-1",
+            EntryKind::Tool,
+            "nakode_agent · reviewer",
+            "",
+            EntryStatus::Complete,
+        );
+        transcript.set_tool_audit(
+            "delegate-1",
+            Some(r#"{"callId":"call-1","name":"nakode_agent"}"#.to_owned()),
+        );
+
+        let page = super::projected_transcript_page(&transcript, None, 10, 0)
+            .expect("delegated audit projection");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(
+            page.entries[0].tool_audit_json.as_deref(),
+            Some(r#"{"callId":"call-1","name":"nakode_agent"}"#)
+        );
+    }
+
+    #[test]
+    fn current_owner_budget_exhaustion_still_emits_newer_cursor_rows() {
+        let mut transcript = DomainTranscript::new(100);
+        transcript.upsert(
+            "owner-1",
+            EntryKind::User,
+            "YOU",
+            "o".repeat(64),
+            EntryStatus::Complete,
+        );
+        transcript.upsert(
+            "assistant-1",
+            EntryKind::Assistant,
+            "Assistant",
+            "newer response",
+            EntryStatus::Complete,
+        );
+
+        let page = super::projected_transcript_page(&transcript, None, 1, 8)
+            .expect("cursor-bearing transcript page");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].title, "Assistant");
+        assert_eq!(page.entries[0].body, "");
+        assert_eq!(page.entries[0].body_start_byte, 14);
+    }
+
     fn subagent_records(parent_session_id: &str, count: usize) -> Vec<SubagentRecord> {
         (0..count)
             .rev()
@@ -2629,6 +2753,7 @@ mod tests {
                     parent_run_id: (index % 2 == 1).then(|| format!("run-{:03}", index - 1)),
                     ..SubagentObservability::default()
                 },
+                transcript_has_earlier: false,
             })
             .collect()
     }
@@ -2768,6 +2893,7 @@ mod tests {
                 termination_kind: Some("completed".to_owned()),
                 ..SubagentObservability::default()
             },
+            transcript_has_earlier: false,
         }]);
 
         let run = super::run_view(&state, &RunId::from("run-large")).expect("run projection");

@@ -29,6 +29,7 @@ const PROVIDER_CATALOG_PATH: &str = "config/providers.toml";
 const PROVIDER_CATALOG: &str = include_str!("../config/providers.toml");
 const MAX_BRIDGE_REPLAY_EVENTS_PER_SESSION: usize = 4 * 1_024;
 const INVOCATION_TELEMETRY_MIGRATION_VERSION: i64 = 1;
+const SUBAGENT_TRANSCRIPT_BOUNDARY_MIGRATION_VERSION: i64 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvocationRecord {
@@ -288,6 +289,7 @@ pub struct SubagentRecord {
     pub latest_activity: String,
     pub observability: SubagentObservability,
     pub transcript: Vec<TranscriptEntry>,
+    pub transcript_has_earlier: bool,
 }
 
 #[derive(Debug, Error)]
@@ -1035,6 +1037,7 @@ impl SqliteSessionRepository {
                continuation_depth INTEGER NOT NULL DEFAULT 0,
                additional_turns INTEGER,
                inherited_evidence_json TEXT NOT NULL DEFAULT '[]',
+               transcript_has_earlier INTEGER NOT NULL DEFAULT 0,
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL,
                PRIMARY KEY(parent_session_id, id)
@@ -1055,6 +1058,10 @@ impl SqliteSessionRepository {
                model_id TEXT,
                tool_audit_json TEXT,
                created_at_ms INTEGER,
+               owner_turn_id TEXT,
+               reasoning_effort TEXT,
+               fast_mode INTEGER,
+               source_transport TEXT,
                PRIMARY KEY(parent_session_id, run_id, sequence),
                FOREIGN KEY(parent_session_id, run_id)
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
@@ -1228,6 +1235,7 @@ impl SqliteSessionRepository {
             ("continuation_depth", "INTEGER NOT NULL DEFAULT 0"),
             ("additional_turns", "INTEGER"),
             ("inherited_evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("transcript_has_earlier", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             if !orchestration_columns
                 .iter()
@@ -1242,13 +1250,23 @@ impl SqliteSessionRepository {
         }
         orchestration_migration.push_str("COMMIT;");
         execute_batch_with_busy_retry(&connection, &orchestration_migration)?;
+        apply_subagent_transcript_boundary_migration(&mut connection)?;
         let agent_turn_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(agent_turns)")?;
             statement
                 .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        if !agent_turn_columns.iter().any(|column| column == "entry_id") {
+        if agent_turn_columns.iter().any(|column| column == "entry_id") {
+            execute_batch_with_busy_retry(
+                &connection,
+                "BEGIN IMMEDIATE;
+                 UPDATE agent_turns
+                 SET entry_id = parent_session_id || ':' || run_id || ':' || sequence
+                 WHERE entry_id IS NULL;
+                 COMMIT;",
+            )?;
+        } else {
             execute_batch_with_busy_retry(
                 &connection,
                 "BEGIN IMMEDIATE;
@@ -1259,11 +1277,19 @@ impl SqliteSessionRepository {
                  COMMIT;",
             )?;
         }
-        for column in ["provider_id", "model_id", "tool_audit_json"] {
+        for (column, definition) in [
+            ("provider_id", "TEXT"),
+            ("model_id", "TEXT"),
+            ("tool_audit_json", "TEXT"),
+            ("owner_turn_id", "TEXT"),
+            ("reasoning_effort", "TEXT"),
+            ("fast_mode", "INTEGER"),
+            ("source_transport", "TEXT"),
+        ] {
             if !agent_turn_columns.iter().any(|existing| existing == column) {
                 execute_batch_with_busy_retry(
                     &connection,
-                    &format!("ALTER TABLE agent_turns ADD COLUMN {column} TEXT;"),
+                    &format!("ALTER TABLE agent_turns ADD COLUMN {column} {definition};"),
                 )?;
             }
         }
@@ -1783,6 +1809,36 @@ fn apply_invocation_telemetry_migration(connection: &mut Connection) -> Result<(
     Ok(())
 }
 
+fn apply_subagent_transcript_boundary_migration(
+    connection: &mut Connection,
+) -> Result<(), SessionError> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM nakode_schema_migrations WHERE version = ?1",
+            [SUBAGENT_TRANSCRIPT_BOUNDARY_MIGRATION_VERSION],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Runs written before the boundary bit was introduced may already contain only a retained
+    // suffix. Mark every pre-migration row conservatively; new rows persist their exact flag.
+    transaction.execute(
+        "UPDATE orchestration_runs SET transcript_has_earlier = 1",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT INTO nakode_schema_migrations (version, name, applied_at)
+         VALUES (?1, 'subagent transcript completeness boundary', unixepoch())",
+        [SUBAGENT_TRANSCRIPT_BOUNDARY_MIGRATION_VERSION],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     connection.busy_timeout(Duration::from_secs(5))?;
     execute_batch_with_busy_retry(connection, "PRAGMA journal_mode = WAL;")
@@ -1910,10 +1966,10 @@ fn save_subagent_transaction(
             remaining_delegation_depth, started_at_ms, ended_at_ms, termination_kind,
             termination_detail, objective_mismatch_handoff, salvage_json,
             continued_from_run_id, continued_by_run_id, continuation_depth, additional_turns,
-            inherited_evidence_json, created_at, updated_at)
+            inherited_evidence_json, transcript_has_earlier, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                 ?30, ?31, ?32, ?32)
+                 ?30, ?31, ?32, ?33, ?33)
          ON CONFLICT(parent_session_id, id) DO UPDATE SET
            agent_slug = excluded.agent_slug,
            provider = excluded.provider,
@@ -1944,6 +2000,7 @@ fn save_subagent_transaction(
            continuation_depth = excluded.continuation_depth,
            additional_turns = excluded.additional_turns,
            inherited_evidence_json = excluded.inherited_evidence_json,
+           transcript_has_earlier = excluded.transcript_has_earlier,
            updated_at = excluded.updated_at",
         params![
             record.parent_session_id,
@@ -1985,6 +2042,7 @@ fn save_subagent_transaction(
             record.observability.additional_turns.map(i64::from),
             serde_json::to_string(&record.observability.inherited_evidence)
                 .expect("inherited evidence serializes"),
+            i64::from(record.transcript_has_earlier),
             now,
         ],
     )?;
@@ -1995,8 +2053,10 @@ fn save_subagent_transaction(
     let mut statement = transaction.prepare(
         "INSERT INTO agent_turns
            (parent_session_id, run_id, sequence, entry_id, item_key, kind, title, body, status,
-            provider_id, model_id, tool_audit_json, created_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            provider_id, model_id, tool_audit_json, created_at_ms, owner_turn_id, reasoning_effort,
+            fast_mode, source_transport)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 ?16, ?17)",
     )?;
     for (sequence, entry) in record.transcript.iter().enumerate() {
         let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
@@ -2016,6 +2076,10 @@ fn save_subagent_transaction(
             entry
                 .created_at_ms
                 .and_then(|value| i64::try_from(value).ok()),
+            entry.owner_turn_id,
+            entry.reasoning_effort,
+            entry.fast_mode.map(i64::from),
+            entry.source_transport,
         ])?;
     }
     Ok(())
@@ -3156,7 +3220,7 @@ impl SessionRepository for SqliteSessionRepository {
                     policy_json, remaining_delegation_depth, started_at_ms, ended_at_ms,
                     termination_kind, termination_detail, objective_mismatch_handoff,
                     salvage_json, continued_from_run_id, continued_by_run_id, continuation_depth,
-                    additional_turns, inherited_evidence_json
+                    additional_turns, inherited_evidence_json, transcript_has_earlier
              FROM orchestration_runs
              WHERE parent_session_id = ?1
              ORDER BY started_at_ms, id",
@@ -3195,6 +3259,7 @@ impl SessionRepository for SqliteSessionRepository {
                 row.get::<_, Option<i64>>(28)?
                     .map(|value| u32::try_from(value).unwrap_or_default()),
                 row.get::<_, String>(29)?,
+                row.get::<_, i64>(30)? != 0,
             ))
         })?;
         let stored_runs = rows.collect::<Result<Vec<_>, _>>()?;
@@ -3230,6 +3295,7 @@ impl SessionRepository for SqliteSessionRepository {
             continuation_depth,
             additional_turns,
             inherited_evidence_json,
+            transcript_has_earlier,
         ) in stored_runs
         {
             let salvage = salvage_json
@@ -3283,6 +3349,7 @@ impl SessionRepository for SqliteSessionRepository {
                     inherited_evidence,
                 },
                 transcript,
+                transcript_has_earlier,
             });
         }
         Ok(records)
@@ -3682,7 +3749,8 @@ fn load_subagent_transcript(
 ) -> Result<Vec<TranscriptEntry>, SessionError> {
     let mut statement = connection.prepare(
         "SELECT entry_id, item_key, kind, title, body, status, provider_id, model_id,
-                tool_audit_json, created_at_ms
+                tool_audit_json, created_at_ms, owner_turn_id, reasoning_effort, fast_mode,
+                source_transport
          FROM agent_turns
          WHERE parent_session_id = ?1 AND run_id = ?2
          ORDER BY sequence",
@@ -3699,6 +3767,10 @@ fn load_subagent_transcript(
             row.get::<_, Option<String>>(7)?,
             row.get::<_, Option<String>>(8)?,
             row.get::<_, Option<i64>>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<i64>>(12)?,
+            row.get::<_, Option<String>>(13)?,
         ))
     })?;
     rows.map(|row| {
@@ -3713,6 +3785,10 @@ fn load_subagent_transcript(
             model_id,
             tool_audit_json,
             created_at_ms,
+            owner_turn_id,
+            reasoning_effort,
+            fast_mode,
+            source_transport,
         ) = row?;
         Ok(TranscriptEntry {
             id,
@@ -3724,10 +3800,10 @@ fn load_subagent_transcript(
             created_at_ms: created_at_ms.and_then(|value| u64::try_from(value).ok()),
             provider_id,
             model_id,
-            owner_turn_id: None,
-            reasoning_effort: None,
-            fast_mode: None,
-            source_transport: None,
+            owner_turn_id,
+            reasoning_effort,
+            fast_mode: fast_mode.map(|value| value != 0),
+            source_transport,
             tool_audit_json,
         })
     })
@@ -5051,6 +5127,7 @@ mod tests {
                 tool_audit_json: None,
             }],
             observability: SubagentObservability::default(),
+            transcript_has_earlier: false,
         })?;
         let native_rows = |provider_session_id: &str| -> Result<i64, SessionError> {
             let connection = store
@@ -5150,10 +5227,10 @@ mod tests {
                     created_at_ms: Some(1_100),
                     provider_id: Some(CODEX_PROVIDER.to_owned()),
                     model_id: Some("openai-codex/gpt-5.4".to_owned()),
-                    owner_turn_id: None,
-                    reasoning_effort: None,
-                    fast_mode: None,
-                    source_transport: None,
+                    owner_turn_id: Some("turn-child-1".to_owned()),
+                    reasoning_effort: Some("high".to_owned()),
+                    fast_mode: Some(true),
+                    source_transport: Some("dashboard".to_owned()),
                     tool_audit_json: Some(
                         r#"{"version":1,"callId":"call-1","kind":"native"}"#.to_owned(),
                     ),
@@ -5213,6 +5290,7 @@ mod tests {
                     truncated: false,
                 }],
             },
+        transcript_has_earlier: true,
         };
 
         store.save_subagent(&record)?;
@@ -5263,14 +5341,37 @@ mod tests {
                continuation_depth INTEGER NOT NULL DEFAULT 0,
                additional_turns INTEGER,
                inherited_evidence_json TEXT NOT NULL DEFAULT '[]',
+               transcript_has_earlier INTEGER NOT NULL DEFAULT 0,
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL,
                PRIMARY KEY(parent_session_id, id)
              );",
         )?;
+        legacy.execute(
+            "INSERT INTO orchestration_runs
+             (parent_session_id, id, agent_slug, provider, objective, status, latest_activity,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                "legacy-parent",
+                "legacy-bounded-run",
+                "explorer",
+                CODEX_PROVIDER,
+                "Legacy bounded history",
+                "working",
+                "Retained suffix",
+                1_i64,
+                1_i64,
+            ],
+        )?;
         drop(legacy);
 
         let store = SqliteSessionRepository::open(&database)?;
+        let restored_legacy = store
+            .list_subagents("legacy-parent")?
+            .pop()
+            .expect("legacy run");
+        assert!(restored_legacy.transcript_has_earlier);
         let parent = store.create(
             CODEX_PROVIDER,
             "parent-provider-session",
@@ -5299,6 +5400,7 @@ mod tests {
                 originating_owner_entry_id: Some("owner-migrated".to_owned()),
                 ..SubagentObservability::default()
             },
+            transcript_has_earlier: false,
         };
 
         store.save_subagent(&record)?;
@@ -5351,6 +5453,7 @@ mod tests {
             latest_activity: "Partial".to_owned(),
             transcript: Vec::new(),
             observability: SubagentObservability::default(),
+            transcript_has_earlier: false,
         };
         store.save_subagent(&source)?;
 
@@ -5468,6 +5571,7 @@ mod tests {
                 tool_audit_json: None,
             }],
             observability: SubagentObservability::default(),
+            transcript_has_earlier: false,
         })?;
         let connection = store.connection.lock().expect("database mutex");
         for (provider, session_id) in [

@@ -82,7 +82,6 @@ enum HistoryRetention {
 pub struct DomainTranscript {
     entries: Vec<TranscriptEntry>,
     item_indices: HashMap<String, usize>,
-    limit: usize,
     stream_state: StreamState,
     stream_label: String,
     images: HashMap<String, Vec<TranscriptImageArtifact>>,
@@ -92,11 +91,10 @@ pub struct DomainTranscript {
 
 impl DomainTranscript {
     #[must_use]
-    pub fn new(limit: usize) -> Self {
+    pub fn new(_limit: usize) -> Self {
         Self {
             entries: Vec::new(),
             item_indices: HashMap::new(),
-            limit: limit.max(100),
             stream_state: StreamState::Idle,
             stream_label: "Nakode".to_owned(),
             images: HashMap::new(),
@@ -113,6 +111,10 @@ impl DomainTranscript {
     #[must_use]
     pub const fn has_earlier_entries(&self) -> bool {
         matches!(self.history_retention, HistoryRetention::Truncated)
+    }
+
+    pub fn mark_history_truncated(&mut self) {
+        self.history_retention = HistoryRetention::Truncated;
     }
 
     #[must_use]
@@ -176,7 +178,6 @@ impl DomainTranscript {
         } else {
             self.local_files.insert(key, local_files);
         }
-        self.enforce_limit();
     }
 
     #[must_use]
@@ -201,7 +202,6 @@ impl DomainTranscript {
                     .collect(),
             );
         }
-        self.enforce_limit();
     }
 
     pub fn clear(&mut self) {
@@ -239,7 +239,6 @@ impl DomainTranscript {
             }
             self.entries.push(entry);
         }
-        self.enforce_limit();
     }
 
     pub fn push(
@@ -265,7 +264,6 @@ impl DomainTranscript {
             source_transport: None,
             tool_audit_json: None,
         });
-        self.enforce_limit();
     }
 
     pub fn upsert(
@@ -303,7 +301,6 @@ impl DomainTranscript {
             });
             self.item_indices.insert(key, index);
         }
-        self.enforce_limit();
     }
 
     pub fn append_delta(
@@ -338,7 +335,6 @@ impl DomainTranscript {
             });
             self.item_indices.insert(key, index);
         }
-        self.enforce_limit();
     }
 
     pub fn set_created_at_ms(&mut self, key: &str, created_at_ms: Option<u64>) {
@@ -474,15 +470,6 @@ impl DomainTranscript {
         self.stream_state = StreamState::Idle;
     }
 
-    fn enforce_limit(&mut self) {
-        if self.entries.len() > self.limit {
-            let remove_count = self.entries.len() - self.limit;
-            self.entries.drain(..remove_count);
-            self.history_retention = HistoryRetention::Truncated;
-            self.reindex();
-        }
-    }
-
     fn reindex(&mut self) {
         self.item_indices.clear();
         for (index, entry) in self.entries.iter().enumerate() {
@@ -503,4 +490,91 @@ fn unix_time_ms() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DomainTranscript, EntryKind, EntryStatus};
+
+    #[test]
+    fn canonical_history_never_drops_semantic_tool_or_delegated_rows() {
+        let mut transcript = DomainTranscript::new(100);
+        for index in 0..60 {
+            transcript.upsert(
+                format!("user-{index}"),
+                EntryKind::User,
+                "YOU",
+                format!("Prompt {index}"),
+                EntryStatus::Complete,
+            );
+            transcript.upsert(
+                format!("assistant-{index}"),
+                EntryKind::Assistant,
+                "Nakode",
+                format!("Response {index}"),
+                EntryStatus::Complete,
+            );
+        }
+        for index in 0..20 {
+            transcript.upsert(
+                format!("tool-{index}"),
+                EntryKind::Tool,
+                "read",
+                "README.md",
+                EntryStatus::Complete,
+            );
+        }
+        transcript.upsert(
+            "delegated-call",
+            EntryKind::Tool,
+            "nakode_agent · reviewer",
+            "review",
+            EntryStatus::Complete,
+        );
+
+        assert_eq!(transcript.entries().len(), 141);
+        assert_eq!(
+            transcript
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::Tool)
+                .count(),
+            21
+        );
+        assert!(!transcript.has_earlier_entries());
+    }
+
+    #[test]
+    fn terminalizing_a_running_tool_preserves_the_same_canonical_entry() {
+        let mut transcript = DomainTranscript::new(100);
+        for index in 0..100 {
+            transcript.upsert(
+                format!("user-{index}"),
+                EntryKind::User,
+                "YOU",
+                format!("Prompt {index}"),
+                EntryStatus::Complete,
+            );
+        }
+        transcript.upsert(
+            "running-tool",
+            EntryKind::Tool,
+            "read",
+            "README.md",
+            EntryStatus::Running,
+        );
+
+        transcript.set_status("running-tool", EntryStatus::Complete);
+
+        assert_eq!(transcript.entries().len(), 101);
+        assert_eq!(
+            transcript
+                .entries()
+                .iter()
+                .find(|entry| entry.key.as_deref() == Some("running-tool"))
+                .map(|entry| entry.status),
+            Some(EntryStatus::Complete)
+        );
+        assert!(!transcript.has_earlier_entries());
+    }
 }

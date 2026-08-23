@@ -2748,8 +2748,12 @@ impl DomainState {
             }
             let mut transcript = DomainTranscript::new(self.transcript_limit);
             transcript.set_stream_label(record.agent.clone());
+            let transcript_has_earlier = record.transcript_has_earlier;
             for entry in record.transcript {
                 transcript.restore(entry);
+            }
+            if transcript_has_earlier {
+                transcript.mark_history_truncated();
             }
             if status == SubagentStatus::Interrupted {
                 transcript.finish_running(EntryStatus::Interrupted);
@@ -7231,6 +7235,9 @@ impl DomainState {
                 EntryStatus::Complete,
             );
         }
+        // Provider resume history has no completeness bit. Preserve that authoritative uncertainty
+        // instead of advertising a partial or empty replay as the known beginning of the session.
+        self.transcript.mark_history_truncated();
     }
 
     pub(crate) fn user_source_transport_for_turn(&self, turn_id: &str) -> Option<&str> {
@@ -9129,6 +9136,7 @@ impl DomainState {
             latest_activity: run.latest_activity.clone(),
             observability: run.observability.clone(),
             transcript: chat.transcript.entries().to_vec(),
+            transcript_has_earlier: chat.transcript.has_earlier_entries(),
         })
     }
 
@@ -10928,6 +10936,36 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .active_turn
                 .as_ref()
                 .is_some_and(|turn| !turn.cancelling)
+        );
+    }
+
+    #[test]
+    fn removing_a_queued_prompt_does_not_create_transcript_history() {
+        let mut state = ready_state();
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
+            cancelling: false,
+        });
+        state
+            .enqueue_prompt("cancel before execution".to_owned(), Vec::new())
+            .expect("queue follow-up");
+        let queued_id = state.queue[0].id.clone();
+        let transcript_before = state.transcript.entries().to_vec();
+
+        state
+            .remove_queued_prompt(&queued_id)
+            .expect("remove queued follow-up");
+
+        assert!(state.queue.is_empty());
+        assert_eq!(state.transcript.entries(), transcript_before);
+        assert!(
+            state
+                .transcript
+                .entries()
+                .iter()
+                .all(|entry| entry.body != "cancel before execution")
         );
     }
 
@@ -12808,6 +12846,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert_eq!(state.session_id.as_deref(), Some(session.id.as_str()));
         assert_eq!(state.provider_session_id.as_deref(), Some("thread-resumed"));
         assert_eq!(state.transcript.entries()[0].body, "hello");
+        assert!(state.transcript.has_earlier_entries());
         let restored_entry = &state.transcript.entries()[0];
         assert_eq!(restored_entry.owner_turn_id.as_deref(), Some("turn-1"));
         assert_eq!(
@@ -12892,6 +12931,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 }],
                 ..SubagentObservability::default()
             },
+            transcript_has_earlier: true,
         }]);
 
         assert_eq!(state.subagents.len(), 1);
@@ -12917,6 +12957,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             .selected_subagent_transcript_mut()
             .expect("restored subagent chat");
         assert_eq!(*scroll, 0);
+        assert!(transcript.has_earlier_entries());
         assert_eq!(
             transcript.entries()[0].body,
             "The session store owns orchestration metadata."
