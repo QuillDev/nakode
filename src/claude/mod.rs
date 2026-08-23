@@ -1561,6 +1561,59 @@ await eval(`(async () => {
     }
 
     #[test]
+    fn claude_native_agent_history_ids_and_correlates_content_blocks() {
+        let directory = tempfile::tempdir().expect("temporary native history test directory");
+        let bridge = directory.path().join("bridge.mjs");
+        let test = directory.path().join("native-history-test.mjs");
+        std::fs::write(&bridge, BRIDGE_SOURCE).expect("bridge fixture");
+        std::fs::write(
+            &test,
+            r#"
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const source = readFileSync(process.argv[2], "utf8");
+const start = source.indexOf("function nativeAgentHistoryId");
+const end = source.indexOf("async function nativeAgentHistory", start);
+assert.notEqual(start, -1);
+assert.notEqual(end, -1);
+const { nativeAgentHistoryId, nativeAgentBlockText } = new Function(
+  `${source.slice(start, end)}\nreturn { nativeAgentHistoryId, nativeAgentBlockText };`,
+)();
+
+assert.equal(nativeAgentHistoryId("agent", { uuid: "message" }, 7, 0), "native:agent:message");
+assert.equal(nativeAgentHistoryId("agent", { uuid: "message" }, 7, 1), "native:agent:message:1");
+assert.equal(nativeAgentHistoryId("agent", {}, 7, 0), "native:agent:7:0");
+const ids = [0, 1, 2].map((blockIndex) =>
+  nativeAgentHistoryId("agent", { uuid: "message" }, 7, blockIndex),
+);
+assert.equal(new Set(ids).size, ids.length);
+
+assert.deepEqual(
+  JSON.parse(nativeAgentBlockText({ type: "tool_use", id: "call-1", name: "Read", input: { path: "src" } })),
+  { toolUseId: "call-1", tool: "Read", input: { path: "src" } },
+);
+assert.deepEqual(
+  JSON.parse(nativeAgentBlockText({ type: "tool_result", tool_use_id: "call-1", content: "result" })),
+  { toolUseId: "call-1", output: "result" },
+);
+"#,
+        )
+        .expect("native history test script");
+
+        let output = std::process::Command::new("node")
+            .arg(&test)
+            .arg(&bridge)
+            .output()
+            .expect("run native history test with Node");
+        assert!(
+            output.status.success(),
+            "native history test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn claude_partial_wrapper_uuids_do_not_split_one_content_block() {
         let directory = tempfile::tempdir().expect("temporary stream identity test directory");
         let bridge = directory.path().join("bridge.mjs");
