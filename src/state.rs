@@ -45,7 +45,6 @@ const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 const MAX_CONTINUATION_DEPTH: u32 = 3;
 const MAX_SALVAGED_EVIDENCE: usize = 8;
 const MAX_SALVAGED_EVIDENCE_BYTES: usize = 4 * 1024;
-const MAX_INLINE_SUBAGENT_AUDIT_PAYLOAD_BYTES: usize = 1024;
 
 fn bounded_salvage_text(value: &str) -> (String, bool) {
     if value.len() <= MAX_SALVAGED_EVIDENCE_BYTES {
@@ -66,22 +65,6 @@ fn bounded_salvage_text(value: &str) -> (String, bool) {
 fn contains_redaction_marker(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("[redacted]") || lower.contains("<redacted>")
-}
-
-fn deduplicate_subagent_records(records: Vec<SubagentRecord>) -> Vec<SubagentRecord> {
-    let mut records = records
-        .into_iter()
-        .map(|record| (record.id.clone(), record))
-        .collect::<HashMap<_, _>>()
-        .into_values()
-        .collect::<Vec<_>>();
-    records.sort_by(|left, right| {
-        left.observability
-            .started_at_ms
-            .cmp(&right.observability.started_at_ms)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    records
 }
 
 fn json_contains_redaction(value: &serde_json::Value) -> bool {
@@ -2736,12 +2719,15 @@ impl DomainState {
 
     /// Installs persisted delegated runs and returns any records whose abnormal terminal state was
     /// authoritatively salvaged during restoration so the server can persist the corrected snapshot.
-    pub fn install_subagents(&mut self, records: Vec<SubagentRecord>) -> Vec<SubagentRecord> {
-        // Replacement inputs reconcile by durable run id before chronology is rebuilt. Persistence
-        // normally guarantees uniqueness; this also keeps replay/import snapshots idempotent.
-        let records = deduplicate_subagent_records(records);
+    pub fn install_subagents(&mut self, mut records: Vec<SubagentRecord>) -> Vec<SubagentRecord> {
         // This is the authoritative run boundary for both restoration and embedded/paged projection:
         // oldest first by immutable start time, with stable run identity breaking timestamp ties.
+        records.sort_by(|left, right| {
+            left.observability
+                .started_at_ms
+                .cmp(&right.observability.started_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         self.subagents.clear();
         self.subagent_executions.clear();
         self.subagent_chats.clear();
@@ -6859,34 +6845,19 @@ impl DomainState {
             self.queue.push_front(prompt);
             return Vec::new();
         }
-        let skill_wire_text = self
+        let mut wire_text = self
             .skills
             .render_prompt(&prompt.text)
             .unwrap_or_else(|_| prompt.text.clone());
-        let skill_metadata = skill_wire_text
-            .strip_prefix(&prompt.text)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let mut metadata = Vec::new();
         // Provider sessions retain their original system instructions. Repeat the live catalogues on
         // later turns so agents and skills added or removed after session creation are represented
         // accurately; the current blocks explicitly supersede the initial snapshots.
         if self.provider_session_id.is_some() {
-            metadata.push(self.nakode_current_agent_catalogue());
-            metadata.push(self.nakode_current_skill_catalogue());
+            wire_text.push_str("\n\n");
+            wire_text.push_str(&self.nakode_current_agent_catalogue());
+            wire_text.push_str("\n\n");
+            wire_text.push_str(&self.nakode_current_skill_catalogue());
         }
-        if let Some(skill_metadata) = skill_metadata {
-            metadata.push(skill_metadata.to_owned());
-        }
-        let wire_text = if metadata.is_empty() {
-            prompt.text.clone()
-        } else {
-            format!(
-                "{}\n\n## Owner message\n\n{}",
-                metadata.join("\n\n"),
-                prompt.text
-            )
-        };
         let resolved_options = self.selected_model_options();
         let prompt = OutgoingPrompt {
             id: prompt.id,
@@ -9176,66 +9147,21 @@ impl DomainState {
     }
 
     fn sync_inline_subagent(&mut self, run: &SubagentRun) {
-        let (entry_status, audit_status) = match run.status {
-            SubagentStatus::Starting | SubagentStatus::Working => (EntryStatus::Running, "running"),
-            SubagentStatus::Completed => (EntryStatus::Complete, "succeeded"),
-            SubagentStatus::Partial | SubagentStatus::Interrupted => {
-                (EntryStatus::Interrupted, "interrupted")
-            }
-            SubagentStatus::Failed => (EntryStatus::Failed, "failed"),
-        };
-        let bounded_payload = |value: &str| {
-            let mut end = value.len().min(MAX_INLINE_SUBAGENT_AUDIT_PAYLOAD_BYTES);
-            while !value.is_char_boundary(end) {
-                end = end.saturating_sub(1);
-            }
-            serde_json::json!({
-                "format": "text",
-                "value": &value[..end],
-                "bytes": value.len(),
-                "truncated": end < value.len(),
-                "redacted": contains_redaction_marker(value),
-            })
-        };
-        let call_id = run
-            .observability
-            .invocation_call_id
-            .as_deref()
-            .unwrap_or(&run.id);
-        let mut audit = serde_json::json!({
-            "version": 1,
-            "callId": call_id,
-            "kind": "native",
-            "name": "nakode_agent",
-            "providerType": "nakodeDelegatedRun",
-            "status": audit_status,
-            "authoritative": "Nakode delegated run",
-            "input": bounded_payload(&run.objective),
-            "durationMs": run.observability.ended_at_ms.map(|ended| ended.saturating_sub(run.observability.started_at_ms)),
-            "denied": false,
-            "denialReason": serde_json::Value::Null,
-        });
-        if !matches!(
+        let running = matches!(
             run.status,
             SubagentStatus::Starting | SubagentStatus::Working
-        ) {
-            audit[if run.status == SubagentStatus::Completed {
-                "output"
-            } else {
-                "error"
-            }] = bounded_payload(&run.latest_activity);
-        }
-        let item_id = format!("subagent:{}", run.id);
-        self.transcript.upsert_with_id(
-            item_id.clone(),
-            item_id.clone(),
-            EntryKind::Tool,
-            format!("nakode_agent · {}", run.agent),
-            run.latest_activity.clone(),
-            entry_status,
         );
-        self.transcript
-            .set_tool_audit(&item_id, serde_json::to_string(&audit).ok());
+        self.transcript.upsert(
+            format!("subagent:{}", run.id),
+            EntryKind::System,
+            if running { "pending" } else { "completed" },
+            run.objective.clone(),
+            if running {
+                EntryStatus::Running
+            } else {
+                EntryStatus::Complete
+            },
+        );
     }
 
     fn selected_model_for_active_provider(&self) -> Option<String> {
@@ -9670,10 +9596,10 @@ mod tests {
 
     use super::{
         AgentEditorField, AgentRequest, AppState, ApprovalDecision, DomainCommandError, Effect,
-        MAX_CONCURRENT_SUBAGENTS, MAX_CONTINUATION_DEPTH, MAX_INLINE_SUBAGENT_AUDIT_PAYLOAD_BYTES,
-        MAX_SALVAGED_EVIDENCE, MAX_SALVAGED_EVIDENCE_BYTES, SubagentStatus,
-        append_archetype_policy_instructions, model_supports_options, objective_mismatch_handoff,
-        parse_continuation_proposition, sanitize_client_instructions,
+        MAX_CONCURRENT_SUBAGENTS, MAX_CONTINUATION_DEPTH, MAX_SALVAGED_EVIDENCE,
+        MAX_SALVAGED_EVIDENCE_BYTES, SubagentStatus, append_archetype_policy_instructions,
+        model_supports_options, objective_mismatch_handoff, parse_continuation_proposition,
+        sanitize_client_instructions,
     };
 
     #[test]
@@ -10355,7 +10281,6 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         };
         assert!(prompt.contains("# Nakode attached skills"));
         assert!(prompt.contains("Check correctness and tests."));
-        assert!(prompt.ends_with("## Owner message\n\nPlease use /skill:review"));
         assert_eq!(
             state.transcript.entries().last().unwrap().body,
             "Please use /skill:review"
@@ -10872,7 +10797,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert!(effects.iter().any(|effect| matches!(
             effect,
             Effect::Backend(BackendCommand::StartTurn { client_id, prompt, .. })
-                if client_id == &selected_id && prompt.ends_with("## Owner message\n\nredirect me")
+                if client_id == &selected_id && prompt.starts_with("redirect me")
         )));
         assert!(state.pending_redirect.is_none());
         assert_eq!(
@@ -12955,55 +12880,6 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert!(state.todo_phases.is_empty());
     }
 
-    fn assert_inline_subagent_audit(state: &AppState) {
-        let inline = state
-            .transcript
-            .entries()
-            .iter()
-            .find(|entry| entry.id == "subagent:agent-1")
-            .expect("durable inline delegated-run audit");
-        assert_eq!(inline.kind, EntryKind::Tool);
-        assert_eq!(inline.status, EntryStatus::Complete);
-        assert_eq!(inline.title, "nakode_agent · explorer");
-        let inline_audit: serde_json::Value = serde_json::from_str(
-            inline
-                .tool_audit_json
-                .as_deref()
-                .expect("delegated-run tool audit"),
-        )
-        .expect("delegated-run audit json");
-        assert_eq!(inline_audit["callId"], "delegate-call-1");
-        assert_eq!(inline_audit["name"], "nakode_agent");
-        assert_eq!(inline_audit["status"], "succeeded");
-        assert_eq!(inline_audit["input"]["value"], "Map persistence");
-    }
-
-    fn assert_inline_subagent_payload_bounds(state: &mut AppState) {
-        let mut oversized = state.subagents[0].clone();
-        oversized.objective = "é".repeat(MAX_INLINE_SUBAGENT_AUDIT_PAYLOAD_BYTES);
-        oversized.latest_activity = "x".repeat(MAX_INLINE_SUBAGENT_AUDIT_PAYLOAD_BYTES * 2);
-        state.sync_inline_subagent(&oversized);
-        let bounded_audit: serde_json::Value = serde_json::from_str(
-            state
-                .transcript
-                .entries()
-                .iter()
-                .find(|entry| entry.id == "subagent:agent-1")
-                .and_then(|entry| entry.tool_audit_json.as_deref())
-                .expect("bounded delegated-run audit"),
-        )
-        .expect("bounded delegated-run audit json");
-        assert_eq!(bounded_audit["input"]["bytes"], 2048);
-        assert_eq!(bounded_audit["input"]["truncated"], true);
-        assert!(
-            bounded_audit["input"]["value"]
-                .as_str()
-                .is_some_and(|value| value.len() <= MAX_INLINE_SUBAGENT_AUDIT_PAYLOAD_BYTES)
-        );
-        assert_eq!(bounded_audit["output"]["bytes"], 2048);
-        assert_eq!(bounded_audit["output"]["truncated"], true);
-    }
-
     #[test]
     fn persisted_subagents_restore_their_clickable_chat_projection() {
         let mut state = ready_state();
@@ -13044,7 +12920,6 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 started_at_ms: 100,
                 ended_at_ms: Some(180),
                 termination_kind: Some("completed".to_owned()),
-                invocation_call_id: Some("delegate-call-1".to_owned()),
                 continued_from_run_id: Some("agent-0".to_owned()),
                 continuation_depth: 1,
                 additional_turns: Some(12),
@@ -13073,8 +12948,6 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             Some("agent-0")
         );
         assert_eq!(state.subagents[0].observability.additional_turns, Some(12));
-        assert_inline_subagent_audit(&state);
-        assert_inline_subagent_payload_bounds(&mut state);
         assert_eq!(
             state.subagents[0].observability.inherited_evidence[0].body,
             "retained source evidence"
@@ -14861,7 +14734,6 @@ tool_profile = "none"
         assert!(prompt.contains(
             "Callable: nakode_agent({\"agent\":\"explorer\",\"task\":\"<bounded task>\"})"
         ));
-        assert!(prompt.ends_with("## Owner message\n\nUse a sub-agent to inspect auth"));
     }
 
     #[test]

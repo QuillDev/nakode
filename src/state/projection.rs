@@ -38,7 +38,6 @@ use crate::{
 };
 
 const ID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0xf3dc_a1f0_948e_5fa3_8f0e_5c26_c07c_42be);
-const MAX_TRANSCRIPT_ENTRY_TITLE_BYTES: usize = 4 * 1024;
 
 #[must_use]
 pub fn workspace_id(workspace: &str) -> WorkspaceId {
@@ -555,9 +554,7 @@ pub(crate) fn run_view(state: &DomainState, run_id: &RunId) -> Option<RunView> {
         .subagents
         .iter()
         .find(|run| run.id == run_id.as_str())?;
-    let projection = bounded_run_projection(state, run, MAX_TRANSCRIPT_PAGE_BODY_BYTES);
-    (serde_json::to_vec(&projection).is_ok_and(|value| value.len() <= MAX_SESSION_RUNS_BYTES))
-        .then_some(projection)
+    Some(project_run(state, run, MAX_TRANSCRIPT_PAGE_BODY_BYTES))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -703,59 +700,22 @@ fn projected_run_page(
     }
 
     let mut runs = Vec::with_capacity(limit.min(end));
+    let mut remaining_bytes = MAX_SESSION_RUNS_BYTES;
     for run in state.subagents[..end].iter().rev().take(limit) {
-        let projection = bounded_run_projection(state, run, MAX_TRANSCRIPT_PAGE_BODY_BYTES / 16);
-        runs.push(projection);
-        let encoded_bytes = serde_json::to_vec(&runs).map_or(usize::MAX, |value| value.len());
-        if encoded_bytes > MAX_SESSION_RUNS_BYTES {
-            runs.pop();
+        let projection = project_run(state, run, MAX_TRANSCRIPT_PAGE_BODY_BYTES / 16);
+        let encoded_bytes =
+            serde_json::to_vec(&projection).map_or(remaining_bytes, |value| value.len());
+        if encoded_bytes > remaining_bytes && !runs.is_empty() {
             break;
         }
+        remaining_bytes = remaining_bytes.saturating_sub(encoded_bytes);
+        runs.push(projection);
     }
     runs.reverse();
     Some(RunPage {
         has_earlier: runs.len() < end,
         runs,
     })
-}
-
-fn bounded_run_projection(state: &DomainState, run: &SubagentRun, body_budget: usize) -> RunView {
-    let mut projection = project_run(state, run, body_budget);
-    let oversized =
-        serde_json::to_vec(&projection).map_or(true, |value| value.len() > MAX_SESSION_RUNS_BYTES);
-    if oversized {
-        compact_run_projection(&mut projection);
-    }
-    projection
-}
-
-fn compact_run_projection(run: &mut RunView) {
-    const MAX_COMPACT_METADATA_BYTES: usize = 4 * 1024;
-
-    run.agent_slug = bounded_text_to(&run.agent_slug, MAX_COMPACT_METADATA_BYTES).value;
-    run.provider_id = ProviderId::from(
-        bounded_text_to(run.provider_id.as_str(), MAX_COMPACT_METADATA_BYTES).value,
-    );
-    run.model_id = run.model_id.as_ref().map(|model| {
-        ModelId::from(bounded_text_to(model.as_str(), MAX_COMPACT_METADATA_BYTES).value)
-    });
-    run.reasoning_effort = run
-        .reasoning_effort
-        .as_deref()
-        .map(|effort| bounded_text_to(effort, MAX_COMPACT_METADATA_BYTES).value);
-    run.termination_kind = run
-        .termination_kind
-        .as_deref()
-        .map(|kind| bounded_text_to(kind, MAX_COMPACT_METADATA_BYTES).value);
-    run.archetype_purpose.clear();
-    run.termination_detail = None;
-    run.objective_mismatch_handoff = None;
-    run.policy = RunPolicyView::default();
-    run.tool_denials.clear();
-    run.salvage = None;
-    run.inherited_evidence.clear();
-    run.originating_owner_entry = None;
-    run.transcript = empty_transcript_page();
 }
 
 fn originating_owner_entry(state: &DomainState, run: &SubagentRun) -> Option<TranscriptEntryView> {
@@ -1699,7 +1659,7 @@ fn projected_transcript_page(
             !entry
                 .key
                 .as_deref()
-                .is_some_and(|key| key.starts_with("subagent:") && entry.kind != EntryKind::Tool)
+                .is_some_and(|key| key.starts_with("subagent:"))
         })
         .collect::<Vec<_>>();
     let end = before.map_or(entries.len(), |before| {
@@ -1744,7 +1704,8 @@ fn projected_transcript_page(
         // each payload field before it reaches here; the page keeps an envelope whole so a client is
         // never handed valid-looking partial JSON.
         let audit_bytes = entry.tool_audit_json.as_ref().map_or(0, String::len);
-        let include_audit = audit_bytes <= remaining_body_bytes;
+        let include_audit =
+            delegated_invocation_entry(entry) || audit_bytes <= remaining_body_bytes;
         if include_audit {
             remaining_body_bytes = remaining_body_bytes.saturating_sub(audit_bytes);
         }
@@ -1818,6 +1779,18 @@ fn projected_current_owner(
     })
 }
 
+fn delegated_invocation_entry(entry: &TranscriptEntry) -> bool {
+    entry.kind == EntryKind::Tool
+        && (["nakode_agent", "mcp__nakode__delegate"]
+            .iter()
+            .any(|name| entry.title.starts_with(name))
+            || entry.tool_audit_json.as_deref().is_some_and(|audit| {
+                ["nakode_agent", "mcp__nakode__delegate"]
+                    .iter()
+                    .any(|name| audit.contains(&format!("\"name\":\"{name}\"")))
+            }))
+}
+
 fn transcript_entry_view(
     transcript: &DomainTranscript,
     entry: &TranscriptEntry,
@@ -1827,7 +1800,7 @@ fn transcript_entry_view(
     TranscriptEntryView {
         id: EntryId::from(entry.id.clone()),
         kind: entry_kind(entry.kind),
-        title: utf8_head(&entry.title, MAX_TRANSCRIPT_ENTRY_TITLE_BYTES).to_owned(),
+        title: entry.title.clone(),
         body: body.to_owned(),
         body_start_byte: u64::try_from(entry.body.len().saturating_sub(body.len()))
             .unwrap_or(u64::MAX),
@@ -1858,17 +1831,6 @@ fn transcript_entry_view(
             .then(|| entry.tool_audit_json.clone())
             .flatten(),
     }
-}
-
-fn utf8_head(value: &str, maximum_bytes: usize) -> &str {
-    if value.len() <= maximum_bytes {
-        return value;
-    }
-    let mut end = maximum_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
 }
 
 fn utf8_tail(value: &str, maximum_bytes: usize) -> &str {
@@ -2200,15 +2162,15 @@ mod tests {
     use nakode_protocol::{
         EntryId, MAX_API_MESSAGE_BYTES, MAX_ARTIFACT_BYTES, MAX_RUN_POLICY_ITEMS,
         MAX_RUN_POLICY_TEXT_BYTES, MAX_RUN_TEXT_BYTES, MAX_RUN_TOOL_DENIAL_TEXT_BYTES,
-        MAX_RUN_TOOL_DENIALS, MAX_SESSION_RUNS, MAX_SESSION_RUNS_BYTES,
-        MAX_TRANSCRIPT_ENTRY_BODY_BYTES, MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES,
-        MAX_TRANSCRIPT_SNAPSHOT_ENTRIES, RunId, RunOutcome, RunStatus, TranscriptEntryKind,
-        TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, VisionAvailabilityView,
+        MAX_RUN_TOOL_DENIALS, MAX_SESSION_RUNS, MAX_TRANSCRIPT_ENTRY_BODY_BYTES,
+        MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES, MAX_TRANSCRIPT_SNAPSHOT_ENTRIES, RunId, RunOutcome,
+        RunStatus, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
+        VisionAvailabilityView,
     };
 
     use super::{
-        MAX_TRANSCRIPT_ENTRY_TITLE_BYTES, artifact_view, bootstrap, capabilities_view,
-        model_configuration, run_outcome, vision_settings_view,
+        artifact_view, bootstrap, capabilities_view, model_configuration, run_outcome,
+        vision_settings_view,
     };
     use crate::{
         backend::{
@@ -2216,7 +2178,7 @@ mod tests {
             CURSOR_PROVIDER, CapabilitySupport, ModelInfo, PromptImage,
         },
         domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
-        session::{ProviderRecord, SalvagedEvidence, SubagentObservability, SubagentRecord},
+        session::{ProviderRecord, SubagentObservability, SubagentRecord},
         state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
     };
 
@@ -2482,21 +2444,13 @@ mod tests {
     }
 
     #[test]
-    fn session_transcript_omits_legacy_inline_subagent_rows_but_keeps_tool_audits() {
+    fn session_transcript_omits_legacy_inline_subagent_rows() {
         let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
         state.transcript.upsert(
             "subagent:run-1",
             EntryKind::Assistant,
             "reviewer",
             "legacy duplicate",
-            EntryStatus::Complete,
-        );
-        state.transcript.upsert_with_id(
-            "subagent:run-2",
-            "subagent:run-2",
-            EntryKind::Tool,
-            "nakode_agent · reviewer",
-            "Completed",
             EntryStatus::Complete,
         );
         state.transcript.upsert(
@@ -2509,10 +2463,8 @@ mod tests {
 
         let view = bootstrap(&state, 1, &[], &[]);
         let transcript = &view.active_session.expect("active session").transcript;
-        assert_eq!(transcript.entries.len(), 2);
-        assert_eq!(transcript.entries[0].id, EntryId::from("subagent:run-2"));
-        assert_eq!(transcript.entries[0].kind, TranscriptEntryKind::Tool);
-        assert_eq!(transcript.entries[1].body, "primary response");
+        assert_eq!(transcript.entries.len(), 1);
+        assert_eq!(transcript.entries[0].body, "primary response");
     }
 
     #[test]
@@ -2728,7 +2680,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_invocation_audit_respects_the_page_budget_and_remains_explicitly_inspectable() {
+    fn delegated_invocation_audit_identity_survives_a_zero_body_budget() {
         let mut transcript = DomainTranscript::new(100);
         transcript.upsert(
             "delegate-1",
@@ -2743,39 +2695,11 @@ mod tests {
         );
 
         let page = super::projected_transcript_page(&transcript, None, 10, 0)
-            .expect("zero-budget delegated row projection");
+            .expect("delegated audit projection");
         assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].tool_audit_json, None);
-
-        let page = super::projected_transcript_page(&transcript, None, 1, 128)
-            .expect("explicit delegated audit projection");
         assert_eq!(
             page.entries[0].tool_audit_json.as_deref(),
             Some(r#"{"callId":"call-1","name":"nakode_agent"}"#)
-        );
-    }
-
-    #[test]
-    fn transcript_titles_are_utf8_safe_and_bounded() {
-        let mut transcript = DomainTranscript::new(100);
-        transcript.upsert(
-            "large-title",
-            EntryKind::System,
-            "é".repeat(MAX_TRANSCRIPT_ENTRY_TITLE_BYTES),
-            "body",
-            EntryStatus::Complete,
-        );
-
-        let page =
-            super::projected_transcript_page(&transcript, None, 1, 64).expect("bounded title page");
-        assert_eq!(
-            page.entries[0].title.len(),
-            MAX_TRANSCRIPT_ENTRY_TITLE_BYTES
-        );
-        assert!(
-            page.entries[0]
-                .title
-                .is_char_boundary(page.entries[0].title.len())
         );
     }
 
@@ -2869,147 +2793,16 @@ mod tests {
     }
 
     #[test]
-    fn oversized_latest_run_is_compacted_without_crossing_the_aggregate_byte_ceiling() {
-        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
-        let parent_session_id = state.nakode_session_id.clone();
-        let mut records = subagent_records(&parent_session_id, 1);
-        records[0].observability.inherited_evidence = (0..100)
-            .map(|index| SalvagedEvidence {
-                entry_id: format!("evidence-{index}"),
-                title: "oversized evidence".to_owned(),
-                body: "x".repeat(MAX_RUN_TEXT_BYTES * 2),
-                truncated: false,
-            })
-            .collect();
-        records[0].observability.parent_run_id = Some("parent-run".to_owned());
-        records[0].observability.invocation_turn_id = Some("turn-parent".to_owned());
-        records[0].observability.invocation_call_id = Some("call-delegate".to_owned());
-        records[0].observability.started_at_ms = 100;
-        records[0].observability.ended_at_ms = Some(250);
-        records[0].observability.termination_kind = Some("completed".to_owned());
-        records[0].provider_session_id = Some("native-session-9".to_owned());
-        let _ = state.install_subagents(records);
-
-        let page = super::run_page(&state, None, 1).expect("latest run page");
-        assert_eq!(
-            page.runs.len(),
-            1,
-            "latest run identity and lifecycle remain visible"
-        );
-        assert_eq!(page.runs[0].id.as_str(), "run-000");
-        assert_eq!(
-            page.runs[0].parent_run_id.as_ref().map(RunId::as_str),
-            Some("parent-run")
-        );
-        assert_eq!(
-            page.runs[0].invocation_turn_id.as_deref(),
-            Some("turn-parent")
-        );
-        assert_eq!(
-            page.runs[0].invocation_call_id.as_deref(),
-            Some("call-delegate")
-        );
-        assert_eq!(page.runs[0].status, RunStatus::Completed);
-        assert_eq!(page.runs[0].started_at_ms, 100);
-        assert_eq!(page.runs[0].ended_at_ms, Some(250));
-        assert_eq!(page.runs[0].duration_ms, Some(150));
-        assert_eq!(page.runs[0].termination_kind.as_deref(), Some("completed"));
-        assert_eq!(
-            page.runs[0].native_session_id.as_deref(),
-            Some("native-session-9")
-        );
-        assert!(page.runs[0].inherited_evidence.is_empty());
-        assert!(
-            serde_json::to_vec(&page.runs)
-                .expect("encode run page")
-                .len()
-                <= MAX_SESSION_RUNS_BYTES
-        );
-
-        let direct = super::run_view(&state, &RunId::from("run-000"))
-            .expect("direct run inspection remains available");
-        assert!(direct.inherited_evidence.is_empty());
-        assert_eq!(
-            direct.parent_run_id.as_ref().map(RunId::as_str),
-            Some("parent-run")
-        );
-        assert_eq!(direct.started_at_ms, 100);
-        assert_eq!(direct.ended_at_ms, Some(250));
-        assert_eq!(direct.termination_kind.as_deref(), Some("completed"));
-        assert_eq!(
-            direct.native_session_id.as_deref(),
-            Some("native-session-9")
-        );
-        assert!(
-            serde_json::to_vec(&direct)
-                .expect("encode direct run")
-                .len()
-                <= MAX_SESSION_RUNS_BYTES
-        );
-
-        let session = bootstrap(&state, 2, &[], &[])
-            .active_session
-            .expect("ordinary session projection");
-        assert_eq!(session.runs.len(), 1);
-        assert_eq!(session.runs[0].id.as_str(), "run-000");
-        assert_eq!(session.runs[0].status, RunStatus::Completed);
-        assert_eq!(
-            session.runs[0].native_session_id.as_deref(),
-            Some("native-session-9")
-        );
-        assert!(
-            serde_json::to_vec(&session.runs)
-                .expect("encode ordinary embedded runs")
-                .len()
-                <= MAX_SESSION_RUNS_BYTES
-        );
-    }
-
-    #[test]
-    fn aggregate_run_page_accounts_for_json_array_framing_at_the_byte_ceiling() {
-        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
-        let parent_session_id = state.nakode_session_id.clone();
-        let mut records = subagent_records(&parent_session_id, MAX_SESSION_RUNS);
-        for (index, record) in records.iter_mut().enumerate() {
-            record.observability.inherited_evidence = vec![SalvagedEvidence {
-                entry_id: format!("evidence-{index}"),
-                title: "aggregate boundary".to_owned(),
-                body: "x".repeat(MAX_RUN_TEXT_BYTES),
-                truncated: false,
-            }];
-        }
-        let _ = state.install_subagents(records);
-
-        let page = super::run_page(&state, None, MAX_SESSION_RUNS).expect("bounded run page");
-        assert!(page.has_earlier);
-        assert!(page.runs.len() < MAX_SESSION_RUNS);
-        assert!(
-            serde_json::to_vec(&page.runs)
-                .expect("encode aggregate run page")
-                .len()
-                <= MAX_SESSION_RUNS_BYTES
-        );
-    }
-
-    #[test]
     fn omitted_runs_are_discoverable_through_complete_cursor_pagination() {
         let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
         let parent_session_id = state.nakode_session_id.clone();
-        let mut records = subagent_records(&parent_session_id, 257);
-        let mut repeated = records.first().expect("fixture run").clone();
-        repeated.latest_activity = "Authoritative replacement".to_owned();
-        records.push(repeated);
-        let _ = state.install_subagents(records);
+        let _ = state.install_subagents(subagent_records(&parent_session_id, 150));
 
         let session = bootstrap(&state, 2, &[], &[])
             .active_session
             .expect("active session");
         assert_eq!(session.runs.len(), MAX_SESSION_RUNS);
-        assert_eq!(session.runs_total, Some(257));
-        assert_eq!(
-            session.runs.last().map(|run| run.latest_activity.as_str()),
-            Some("Authoritative replacement")
-        );
+        assert_eq!(session.runs_total, Some(150));
         assert!(session.runs_has_earlier);
 
         let mut before = None;
@@ -3028,9 +2821,9 @@ mod tests {
         }
         run_ids.sort();
         run_ids.dedup();
-        assert_eq!(run_ids.len(), 257);
+        assert_eq!(run_ids.len(), 150);
         assert_eq!(run_ids.first(), Some(&RunId::from("run-000")));
-        assert_eq!(run_ids.last(), Some(&RunId::from("run-256")));
+        assert_eq!(run_ids.last(), Some(&RunId::from("run-149")));
     }
 
     #[test]
