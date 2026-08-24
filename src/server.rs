@@ -6675,6 +6675,13 @@ mod tests {
         );
     }
 
+    fn owner_prompt_text(prompt: &str) -> &str {
+        const OWNER_MARKER: &str = "\n\n## Owner message\n\n";
+        prompt
+            .split_once(OWNER_MARKER)
+            .map_or(prompt, |(_, owner)| owner)
+    }
+
     fn assert_queued_turn_starts(
         core: &mut ServerCore,
         session_id: &SessionId,
@@ -6709,7 +6716,7 @@ mod tests {
         assert!(effects.iter().any(|effect| matches!(
             effect,
             crate::state::Effect::Backend(BackendCommand::StartTurn { client_id, prompt, .. })
-                if client_id == expected_id && prompt.starts_with(expected_prompt)
+                if client_id == expected_id && owner_prompt_text(prompt).starts_with(expected_prompt)
         )));
         core.engine_for_mut(session_id)
             .expect("session engine")
@@ -6774,7 +6781,7 @@ mod tests {
         assert!(effects.iter().any(|effect| matches!(
             effect,
             crate::state::Effect::Backend(BackendCommand::StartTurn { client_id, prompt, .. })
-                if client_id == "window-idle-start" && prompt.starts_with("start once")
+                if client_id == "window-idle-start" && owner_prompt_text(prompt).starts_with("start once")
         )));
 
         let (retry, retry_effects, retry_session, retry_changed) =
@@ -7224,7 +7231,7 @@ mod tests {
             effects.iter().any(|effect| matches!(
                 effect,
                 crate::state::Effect::Backend(BackendCommand::StartTurn { prompt, .. })
-                    if prompt.starts_with("run against current state")
+                    if owner_prompt_text(prompt).starts_with("run against current state")
             )),
             "execution-time idle send did not start a turn: {effects:?}"
         );
