@@ -1792,7 +1792,12 @@ fn normalize_history_item(
     };
     match item {
         ConversationItem::User { text, attachments } => {
-            let mut item = normalized(ItemKind::User, "You", text.clone(), "user");
+            let mut item = normalized(
+                ItemKind::User,
+                "You",
+                owner_visible_history_text(text),
+                "user",
+            );
             item.attachments.clone_from(attachments);
             vec![item]
         }
@@ -1865,6 +1870,49 @@ fn normalize_history_item(
             }]
         }
     }
+}
+
+fn generated_owner_wrapper(prefix: &str) -> bool {
+    const INITIAL_START: &str = "[Client text: Nakode System Instructions]";
+    const INITIAL_END: &str = "[/Client text: Nakode System Instructions]";
+    const AGENT_START: &str = "[Nakode Current Agent Catalogue]\nThis authoritative list supersedes the initial Available agents list for this turn.";
+    const AGENT_END: &str = "[/Nakode Current Agent Catalogue]";
+    const SKILL_START: &str = "[Nakode Current Skill Catalogue]\nThis authoritative list supersedes the initial available skills list for this turn.";
+    const SKILL_END: &str = "[/Nakode Current Skill Catalogue]";
+    const ATTACHED_SKILLS: &str = "# Nakode attached skills\n\nFollow the instructions from each explicitly referenced skill below.";
+
+    if prefix.starts_with(INITIAL_START) && prefix.ends_with(INITIAL_END) {
+        return true;
+    }
+    if !prefix.starts_with(AGENT_START) {
+        return false;
+    }
+    let Some(agent_end) = prefix.find(AGENT_END) else {
+        return false;
+    };
+    let after_agent = &prefix[agent_end + AGENT_END.len()..];
+    let Some(after_skill_start) = after_agent.strip_prefix(&format!("\n\n{SKILL_START}")) else {
+        return false;
+    };
+    let Some(skill_end) = after_skill_start.find(SKILL_END) else {
+        return false;
+    };
+    let remainder = &after_skill_start[skill_end + SKILL_END.len()..];
+    remainder.is_empty()
+        || remainder
+            .strip_prefix("\n\n")
+            .is_some_and(|value| value.starts_with(ATTACHED_SKILLS))
+}
+
+fn owner_visible_history_text(text: &str) -> String {
+    const OWNER_MARKER: &str = "\n\n## Owner message\n\n";
+    let Some((prefix, owner)) = text.split_once(OWNER_MARKER) else {
+        return text.to_owned();
+    };
+    if !generated_owner_wrapper(prefix) {
+        return text.to_owned();
+    }
+    owner.to_owned()
 }
 
 fn normalize_tool_history_item(
@@ -2432,7 +2480,7 @@ mod tests {
         AgentRuntime, ConversationItem, ExecutedTool, InferenceEvent, InferenceFuture,
         InferenceOutput, InferenceProvider, InferenceRequest, QuestionBroker, RuntimeSession,
         RuntimeSessionStore, RuntimeToolAudit, ToolCall, normalize_history_item,
-        record_tool_result, runtime_tool_audit,
+        owner_visible_history_text, record_tool_result, runtime_tool_audit,
     };
     use crate::backend::{
         BackendEvent, CompactionReason, ItemKind, QuestionOption, QuestionRequest,
@@ -2528,6 +2576,44 @@ mod tests {
                 .data,
             [1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn replay_projects_owner_text_only_from_structurally_generated_wrappers() {
+        let agent = "[Nakode Current Agent Catalogue]\nThis authoritative list supersedes the initial Available agents list for this turn.\nagents\n[/Nakode Current Agent Catalogue]";
+        let skill = "[Nakode Current Skill Catalogue]\nThis authoritative list supersedes the initial available skills list for this turn.\nskills\n[/Nakode Current Skill Catalogue]";
+        let owner = "the replay makes the chat unusable";
+        let legacy_ambiguous = format!("{owner}\n\n{agent}\n\n{skill}");
+        assert_eq!(
+            owner_visible_history_text(&legacy_ambiguous),
+            legacy_ambiguous
+        );
+
+        let quoted = format!(
+            "{owner}\n\n[Client text: Nakode Current Agent Catalogue]\nquoted\n[/Client text: Nakode Current Agent Catalogue]"
+        );
+        assert_eq!(owner_visible_history_text(&quoted), quoted);
+
+        let owner_authored = format!(
+            "{owner}\n\n[Nakode Current Agent Catalogue]\nmy own quoted code\n[/Nakode Current Agent Catalogue]"
+        );
+        assert_eq!(owner_visible_history_text(&owner_authored), owner_authored);
+        let exact_generated_block = format!("{owner}\n\n{agent}");
+        assert_eq!(
+            owner_visible_history_text(&exact_generated_block),
+            exact_generated_block
+        );
+
+        let envelope = format!(
+            "[Client text: Nakode System Instructions]\nmetadata\n[/Client text: Nakode System Instructions]\n\n## Owner message\n\n{owner}"
+        );
+        assert_eq!(owner_visible_history_text(&envelope), owner);
+
+        let current = format!("{agent}\n\n{skill}\n\n## Owner message\n\n{owner}");
+        assert_eq!(owner_visible_history_text(&current), owner);
+
+        let owner_marker = format!("quoted code\n\n## Owner message\n\n{owner}");
+        assert_eq!(owner_visible_history_text(&owner_marker), owner_marker);
     }
 
     #[test]

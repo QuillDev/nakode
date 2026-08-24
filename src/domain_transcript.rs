@@ -303,6 +303,46 @@ impl DomainTranscript {
         }
     }
 
+    /// Upserts a synthetic row whose identity is part of an authoritative projection contract.
+    /// Existing rows keep their original id; newly restored rows use the supplied stable id.
+    pub fn upsert_with_id(
+        &mut self,
+        id: impl Into<String>,
+        key: impl Into<String>,
+        kind: EntryKind,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        status: EntryStatus,
+    ) {
+        let key = key.into();
+        if let Some(index) = self.item_indices.get(&key).copied() {
+            let entry = &mut self.entries[index];
+            entry.kind = kind;
+            entry.title = title.into();
+            entry.body = body.into();
+            entry.status = status;
+        } else {
+            let index = self.entries.len();
+            self.entries.push(TranscriptEntry {
+                id: id.into(),
+                key: Some(key.clone()),
+                kind,
+                title: title.into(),
+                body: body.into(),
+                status,
+                created_at_ms: Some(unix_time_ms()),
+                provider_id: None,
+                model_id: None,
+                owner_turn_id: None,
+                reasoning_effort: None,
+                fast_mode: None,
+                source_transport: None,
+                tool_audit_json: None,
+            });
+            self.item_indices.insert(key, index);
+        }
+    }
+
     pub fn append_delta(
         &mut self,
         key: impl Into<String>,
