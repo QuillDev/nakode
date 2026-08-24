@@ -849,6 +849,26 @@ mod tests {
     }
 
     #[test]
+    fn skill_loader_support_is_explicit_across_provider_adapters() {
+        let loader = ["read_skill", "read_skill_component"]
+            .map(str::to_owned)
+            .to_vec();
+        for provider in [CODEX_PROVIDER, DEVIN_PROVIDER, KIMI_PROVIDER, GLM_PROVIDER] {
+            let projection = project_provider_tools(provider, Some(&loader));
+            assert_eq!(projection.allowed_tools, Some(loader.clone()), "{provider}");
+            assert!(
+                projection.unsupported_canonical_tools.is_empty(),
+                "{provider}"
+            );
+        }
+        for provider in [CLAUDE_PROVIDER, CURSOR_PROVIDER] {
+            let projection = project_provider_tools(provider, Some(&loader));
+            assert_eq!(projection.allowed_tools, Some(Vec::new()), "{provider}");
+            assert_eq!(projection.unsupported_canonical_tools, loader, "{provider}");
+        }
+    }
+
+    #[test]
     fn provider_tool_projection_is_explicit_case_sensitive_and_fail_closed() {
         let canonical = vec![
             "read".to_owned(),

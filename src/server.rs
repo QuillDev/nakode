@@ -6308,6 +6308,48 @@ mod tests {
     }
 
     #[test]
+    fn fresh_session_refuses_to_publish_an_unprojectable_skill_loader() {
+        let mut state =
+            AppState::new_for_backend(project_workspace(), None, 100, CLAUDE_PROVIDER, "Claude");
+        state.handle_provider_backend(
+            CLAUDE_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CLAUDE_PROVIDER.to_owned(),
+                display_name: "Claude".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities {
+                    external_tools: CapabilitySupport::Supported,
+                    resume: CapabilitySupport::Supported,
+                    ..BackendCapabilities::default()
+                },
+            }),
+        );
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let session_count = core.sessions_by_id.len();
+        let tools = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            allowed_builtin_tools: Some(
+                ["read_skill", "read_skill_component"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            ),
+        };
+
+        let error = core
+            .create_session_command(&workspace_id, None, &ModelOptions::default(), Some(tools))
+            .expect_err("unsupported skill loader must fail before publication");
+        assert!(error.to_string().contains("provider Claude"));
+        assert!(
+            error
+                .to_string()
+                .contains("read_skill, read_skill_component")
+        );
+        assert_eq!(core.sessions_by_id.len(), session_count);
+    }
+
+    #[test]
     fn persisted_session_surfaces_unsupported_provider_tool_error() {
         let (mut core, _) = ready_external_tools_server();
         core.session_template.handle_provider_backend(
@@ -6344,17 +6386,22 @@ mod tests {
         let tools = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: false,
-            allowed_builtin_tools: Some(vec![
-                "memory_search".to_owned(),
-                "memory_store".to_owned(),
-            ]),
+            allowed_builtin_tools: Some(
+                ["read_skill", "read_skill_component"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            ),
         };
 
         let error = core
             .open_session_command(&restored_id, Some(tools))
-            .expect_err("unsupported enabled tools must return a provider-specific error");
+            .expect_err("unsupported resumed skill loader must return a provider-specific error");
         assert!(error.to_string().contains("provider claude-agent"));
-        assert!(error.to_string().contains("memory_search, memory_store"));
+        assert!(
+            error
+                .to_string()
+                .contains("read_skill, read_skill_component")
+        );
     }
 
     #[test]
