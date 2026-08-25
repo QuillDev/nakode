@@ -7128,14 +7128,17 @@ impl DomainState {
             .map(|(item_id, _)| item_id.clone())
             .collect::<Vec<_>>();
         for item_id in item_ids {
-            self.transcript.set_status(&item_id, final_item_status);
+            // A turn outcome settles only provider items that never received their own terminal
+            // lifecycle. Completed, failed, and interrupted item events remain authoritative.
+            self.transcript
+                .finish_running_entry(&item_id, final_item_status);
             self.subagent_result_items.remove(&item_id);
         }
         self.reasoning_summaries.remove_turn(turn_id);
         self.transcript
-            .set_status(&format!("turn:{turn_id}:diff"), final_item_status);
+            .finish_running_entry(&format!("turn:{turn_id}:diff"), final_item_status);
         self.transcript
-            .set_status(&format!("turn:{turn_id}:plan"), final_item_status);
+            .finish_running_entry(&format!("turn:{turn_id}:plan"), final_item_status);
         self.item_turns
             .retain(|_, item_turn_id| item_turn_id != turn_id);
 
@@ -12341,6 +12344,68 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             .find(|entry| entry.key.as_deref() == Some("item-1"))
             .expect("tool transcript entry");
         assert_eq!(item.status, EntryStatus::Complete);
+    }
+
+    #[test]
+    fn turn_outcome_preserves_settled_item_lifecycle_and_only_finalizes_running_items() {
+        for (outcome, running_status) in [
+            (TurnOutcome::Completed, EntryStatus::Complete),
+            (TurnOutcome::Failed, EntryStatus::Failed),
+            (TurnOutcome::Interrupted, EntryStatus::Interrupted),
+        ] {
+            let mut state = ready_state();
+            state.provider_session_id = Some("thread-1".to_owned());
+            state.active_turn = Some(super::ActiveTurn {
+                id: "turn-1".to_owned(),
+                model: Some("model-a".to_owned()),
+                options: ModelOptions::default(),
+                cancelling: false,
+            });
+            for (id, item_status, body) in [
+                ("successful-tool", ItemStatus::Complete, "tests passed"),
+                ("failed-tool", ItemStatus::Failed, "command exited 1"),
+                ("running-tool", ItemStatus::Running, "partial output"),
+            ] {
+                let event = NormalizedItem {
+                    id: id.to_owned(),
+                    kind: ItemKind::Tool,
+                    title: "bash".to_owned(),
+                    body: body.to_owned(),
+                    status: item_status,
+                    tool_audit_json: None,
+                };
+                state.handle_backend(if item_status == ItemStatus::Running {
+                    BackendEvent::ItemStarted {
+                        turn_id: "turn-1".to_owned(),
+                        item: event,
+                    }
+                } else {
+                    BackendEvent::ItemCompleted {
+                        turn_id: "turn-1".to_owned(),
+                        item: event,
+                    }
+                });
+            }
+
+            state.handle_backend(BackendEvent::TurnCompleted {
+                turn_id: "turn-1".to_owned(),
+                outcome,
+                error: (outcome == TurnOutcome::Failed).then(|| "provider failed later".to_owned()),
+            });
+
+            let status = |id: &str| {
+                state
+                    .transcript
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.key.as_deref() == Some(id))
+                    .map(|entry| entry.status)
+                    .expect("tool transcript entry")
+            };
+            assert_eq!(status("successful-tool"), EntryStatus::Complete);
+            assert_eq!(status("failed-tool"), EntryStatus::Failed);
+            assert_eq!(status("running-tool"), running_status);
+        }
     }
 
     #[test]

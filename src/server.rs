@@ -4691,8 +4691,8 @@ mod tests {
         agent::{AgentCatalog, AgentDefinition},
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendIdentity, BackendOperation,
-            CLAUDE_PROVIDER, CODEX_PROVIDER, CapabilitySupport, ModelCapabilities, ModelInfo,
-            PromptImage, TurnOutcome,
+            CLAUDE_PROVIDER, CODEX_PROVIDER, CapabilitySupport, ItemKind, ItemStatus,
+            ModelCapabilities, ModelInfo, NormalizedItem, PromptImage, TurnOutcome,
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         personality::PromptAddenda,
@@ -7646,6 +7646,134 @@ first_message = "Starting review"
             .expect("second subscription"),
             SubscriptionView::Session(second),
         );
+    }
+
+    fn observe_test_tool(
+        core: &mut ServerCore,
+        session_id: &SessionId,
+        turn_id: &str,
+        item_id: &str,
+        body: &str,
+        status: ItemStatus,
+    ) {
+        let item = NormalizedItem {
+            id: item_id.to_owned(),
+            kind: ItemKind::Tool,
+            title: item_id.to_owned(),
+            body: body.to_owned(),
+            status,
+            tool_audit_json: None,
+        };
+        let event = if status == ItemStatus::Running {
+            BackendEvent::ItemStarted {
+                turn_id: turn_id.to_owned(),
+                item,
+            }
+        } else {
+            BackendEvent::ItemCompleted {
+                turn_id: turn_id.to_owned(),
+                item,
+            }
+        };
+        core.engine_for_mut(session_id)
+            .expect("session runtime")
+            .state_mut()
+            .handle_provider_backend(CODEX_PROVIDER, event);
+    }
+
+    #[test]
+    fn alternating_active_session_subscriptions_preserve_independent_tool_lifecycle() {
+        let (mut core, first_id) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let (created, _) =
+            create_default_session(&mut core, &workspace_id).expect("create second session");
+        let second_id = SessionId::from(created.resource_id.expect("created session id"));
+
+        for (session_id, turn_id) in [(&first_id, "turn-first"), (&second_id, "turn-second")] {
+            core.engine_for_mut(session_id)
+                .expect("session runtime")
+                .state_mut()
+                .handle_provider_backend(
+                    CODEX_PROVIDER,
+                    BackendEvent::TurnStarted {
+                        turn_id: turn_id.to_owned(),
+                    },
+                );
+        }
+        observe_test_tool(
+            &mut core,
+            &first_id,
+            "turn-first",
+            "successful-tool",
+            "12 tests passed",
+            ItemStatus::Complete,
+        );
+        observe_test_tool(
+            &mut core,
+            &first_id,
+            "turn-first",
+            "unfinished-tool",
+            "partial",
+            ItemStatus::Running,
+        );
+        observe_test_tool(
+            &mut core,
+            &second_id,
+            "turn-second",
+            "second-running-tool",
+            "searching",
+            ItemStatus::Running,
+        );
+
+        for session_id in [&first_id, &second_id, &first_id, &second_id] {
+            let SubscriptionView::Session(view) = core
+                .subscription_view(&SubscriptionScope::Session {
+                    session_id: session_id.clone(),
+                })
+                .expect("active session subscription")
+            else {
+                panic!("session subscription view")
+            };
+            assert_eq!(&view.id, session_id);
+            assert!(view.active_turn.is_some());
+        }
+
+        core.engine_for_mut(&first_id)
+            .expect("first runtime")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::TurnCompleted {
+                    turn_id: "turn-first".to_owned(),
+                    outcome: TurnOutcome::Failed,
+                    error: Some("provider failed after the completed tool".to_owned()),
+                },
+            );
+        let first = core.session_view(&first_id).expect("first session");
+        let status = |id: &str| {
+            first
+                .transcript
+                .entries
+                .iter()
+                .find(|entry| entry.body == id)
+                .map(|entry| entry.status)
+                .expect("tool entry")
+        };
+        assert_eq!(
+            status("12 tests passed"),
+            nakode_protocol::TranscriptEntryStatus::Complete
+        );
+        assert_eq!(
+            status("partial"),
+            nakode_protocol::TranscriptEntryStatus::Failed
+        );
+
+        let second = core.session_view(&second_id).expect("second session");
+        assert!(second.active_turn.is_some());
+        assert!(second.transcript.entries.iter().any(|entry| {
+            entry.body == "searching"
+                && entry.status == nakode_protocol::TranscriptEntryStatus::Running
+        }));
     }
 
     #[tokio::test]
