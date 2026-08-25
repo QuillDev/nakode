@@ -455,6 +455,13 @@ Skill publishers should include a bounded immutable `id` in YAML frontmatter
 a skill when its directory/load name changes. Legacy skills without an `id`
 remain compatible and use their exact catalogue name as historical identity.
 
+A package published through FStack's community store additionally requires a
+canonical SemVer release scalar such as `version: 1.2.0`. Nakode treats store
+provenance and version metadata as inert package metadata: it discovers the
+package only after FStack explicitly materializes it under the normal
+`~/.agents/skills` root. Nakode does not read PostgreSQL, a store cache, or a
+registry root, and store availability never gates local discovery or startup.
+
 ## Herdr integration
 
 Run Nakode inside a [Herdr](https://herdr.dev/) pane to expose its lifecycle in

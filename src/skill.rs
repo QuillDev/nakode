@@ -1113,6 +1113,51 @@ mod tests {
     }
 
     #[test]
+    fn store_materialization_uses_only_the_normal_machine_local_root() {
+        let user = tempdir().expect("user root");
+        let unrelated_store_cache = tempdir().expect("store cache");
+        let installed = user.path().join("community-review");
+        fs::create_dir_all(installed.join("references")).unwrap();
+        fs::write(
+            installed.join(SKILL_FILE),
+            "---\nid: community.review\nname: community-review\nversion: 2.1.0\ndescription: Community review\ncomponents:\n  - references/checklist.md\n---\n\nReview carefully.\n",
+        )
+        .unwrap();
+        fs::write(
+            installed.join("references/checklist.md"),
+            "# Checklist\n\nReview correctness and safety.\n",
+        )
+        .unwrap();
+        fs::write(installed.join("verify.sh"), "echo inert package asset\n").unwrap();
+        fs::write(
+            installed.join(".fstack-skill-store.json"),
+            r#"{"schemaVersion":2,"slug":"community-review","version":"2.1.0","files":[]}"#,
+        )
+        .unwrap();
+        write_skill(
+            unrelated_store_cache.path(),
+            "cache-only",
+            "not installed",
+            "Must not be discovered.",
+        );
+
+        let catalog = SkillCatalog::load_from_roots(Some(user.path()), None).unwrap();
+
+        assert_eq!(catalog.definitions().len(), 1);
+        let skill = catalog.find("community-review").unwrap();
+        assert_eq!(skill.stable_id(), "community.review");
+        assert_eq!(skill.components.len(), 1);
+        assert_eq!(skill.components[0].component_name, "references/checklist");
+        assert_eq!(skill.components[0].file_path, "references/checklist.md");
+        assert!(
+            skill.components[0]
+                .contents
+                .contains("correctness and safety")
+        );
+        assert!(catalog.find("cache-only").is_none());
+    }
+
+    #[test]
     fn catalogue_lists_triggers_without_eagerly_loading_skill_bodies() {
         let root = tempdir().expect("user root");
         write_skill(
