@@ -1113,6 +1113,39 @@ mod tests {
     }
 
     #[test]
+    fn store_materialization_uses_only_the_normal_machine_local_root() {
+        let user = tempdir().expect("user root");
+        let unrelated_store_cache = tempdir().expect("store cache");
+        let installed = user.path().join("community-review");
+        fs::create_dir(&installed).unwrap();
+        fs::write(
+            installed.join(SKILL_FILE),
+            "---\nid: community.review\nname: community-review\nversion: 2.1.0\ndescription: Community review\n---\n\nReview carefully.\n",
+        )
+        .unwrap();
+        fs::write(
+            installed.join(".fstack-skill-store.json"),
+            r#"{"schemaVersion":1,"slug":"community-review","version":"2.1.0"}"#,
+        )
+        .unwrap();
+        write_skill(
+            unrelated_store_cache.path(),
+            "cache-only",
+            "not installed",
+            "Must not be discovered.",
+        );
+
+        let catalog = SkillCatalog::load_from_roots(Some(user.path()), None).unwrap();
+
+        assert_eq!(catalog.definitions().len(), 1);
+        assert_eq!(
+            catalog.find("community-review").unwrap().stable_id(),
+            "community.review"
+        );
+        assert!(catalog.find("cache-only").is_none());
+    }
+
+    #[test]
     fn catalogue_lists_triggers_without_eagerly_loading_skill_bodies() {
         let root = tempdir().expect("user root");
         write_skill(
