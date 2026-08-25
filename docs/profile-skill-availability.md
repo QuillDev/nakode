@@ -10,7 +10,7 @@ Installed skills are returned with current metadata. A saved identity that is no
 
 ## Session lifecycle
 
-A profile-managed logical session is durably associated with its profile. Nakode resolves the profile's current effective catalogue when the session is created or opened and again at each owner turn. Profile preference changes and explicit installed-skill refreshes update loaded sessions, so open and future sessions converge on the same service-owned authority without waiting for provider-owned context to be rewritten mid-turn.
+A profile-managed logical session is durably associated with its profile. Nakode refreshes installed-skill discovery, then resolves the profile's current effective catalogue when the session is created or opened and again at each owner turn. This session-start refresh is required because clients may install or update skill packages while the long-running service remains active. Profile preference changes and explicit installed-skill refreshes update loaded sessions, so open and future sessions converge on the same service-owned authority without waiting for provider-owned context to be rewritten mid-turn.
 
 The turn catalogue is copied into native provider runtimes before prompt construction and tool execution. `read_skill` and `read_skill_component` read only that in-process catalogue: neither rescans the filesystem and a literal `/skill:name` cannot override disabled or unavailable state. `read_skill_component` accepts only a component advertised by its parent skill; a cross-package component additionally requires its owning skill in that same catalogue. A changed catalogue is therefore visible on the next turn; a turn already executing retains the catalogue with which it started.
 
