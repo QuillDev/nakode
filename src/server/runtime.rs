@@ -745,6 +745,14 @@ impl NativeServerRuntime {
         )
     }
 
+    fn refresh_skill_catalogue(&mut self) -> Result<(), crate::skill::SkillCatalogError> {
+        self.skill_catalogue =
+            SkillCatalog::load(Path::new(&self.core.engine().state().workspace))?;
+        self.core
+            .install_skill_authority(&self.skill_catalogue, &self.skill_preferences);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     // The request dispatcher keeps fencing, typed routing, persistence rollback, and response
     // completion in one exhaustive match so a newly added public request cannot bypass a guard.
@@ -767,6 +775,31 @@ impl NativeServerRuntime {
             }
         };
         let mut request = request;
+        let starts_profile_session = matches!(
+            &request,
+            nakode_server::ServerRequest::Command {
+                command: Command::CreateSession {
+                    profile_id: Some(_),
+                    ..
+                } | Command::OpenSession {
+                    profile_id: Some(_),
+                    ..
+                },
+                ..
+            }
+        );
+        if starts_profile_session && let Err(error) = self.refresh_skill_catalogue() {
+            if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                let _ = respond.send(Err(ServiceError {
+                    code: ErrorCode::Internal,
+                    message: format!(
+                        "failed to refresh the installed skill catalogue before opening the session: {error}"
+                    ),
+                    retryable: true,
+                }));
+            }
+            return;
+        }
         let skill_profile_error = match &mut request {
             nakode_server::ServerRequest::Command {
                 command:
@@ -886,24 +919,13 @@ impl NativeServerRuntime {
                     }));
                     return;
                 }
-                if refresh {
-                    match SkillCatalog::load(Path::new(&self.core.engine().state().workspace)) {
-                        Ok(catalogue) => {
-                            self.skill_catalogue = catalogue;
-                            self.core.install_skill_authority(
-                                &self.skill_catalogue,
-                                &self.skill_preferences,
-                            );
-                        }
-                        Err(error) => {
-                            let _ = respond.send(Err(ServiceError {
-                                code: ErrorCode::Internal,
-                                message: error.to_string(),
-                                retryable: true,
-                            }));
-                            return;
-                        }
-                    }
+                if refresh && let Err(error) = self.refresh_skill_catalogue() {
+                    let _ = respond.send(Err(ServiceError {
+                        code: ErrorCode::Internal,
+                        message: error.to_string(),
+                        retryable: true,
+                    }));
+                    return;
                 }
                 let preferences = self
                     .skill_preferences
@@ -4183,8 +4205,8 @@ mod tests {
     use nakode_protocol::{
         BridgeContinuationDisposition, BridgeLifecycle, ClientId, Command, CredentialInput,
         ErrorCode, IdempotencyKey, InvocationKind, InvocationSummary, InvocationUsage,
-        McpGrantPolicy, OrchestratorKind, PromptInput, Query, QueryResult, ServiceCapability,
-        SessionId, TranscriptEntryStatus,
+        McpGrantPolicy, ModelOptions, OrchestratorKind, PromptInput, Query, QueryResult,
+        ServiceCapability, SessionId, SessionToolConfiguration, TranscriptEntryStatus,
     };
     use tokio::sync::mpsc;
 
@@ -4209,6 +4231,7 @@ mod tests {
             SessionBridgeRecord, SessionRepository, SqliteSessionRepository, SubagentObservability,
             SubagentRecord,
         },
+        skill::{SkillCatalog, SkillPreference},
         state::{DomainState, Effect, SubagentStatus},
     };
 
@@ -4656,6 +4679,159 @@ mod tests {
             },
             credentials,
         )
+    }
+
+    fn profile_session_command(
+        workspace_id: &nakode_protocol::WorkspaceId,
+        workspace: &Path,
+        profile_id: &str,
+        allow_loaders: bool,
+    ) -> Command {
+        Command::CreateSession {
+            workspace_id: workspace_id.clone(),
+            working_directory: Some(workspace.to_string_lossy().into_owned()),
+            title: Some(format!("{profile_id} session")),
+            model_id: None,
+            options: ModelOptions::default(),
+            tools: Some(SessionToolConfiguration {
+                tools: Vec::new(),
+                replace_builtin_tools: false,
+                allowed_builtin_tools: Some(if allow_loaders {
+                    ["read_skill", "read_skill_component"]
+                        .map(str::to_owned)
+                        .to_vec()
+                } else {
+                    vec!["read".to_owned()]
+                }),
+            }),
+            initial_instructions: None,
+            bridge: None,
+            mcp_grant: None,
+            profile_id: Some(profile_id.to_owned()),
+            disabled_skill_ids: Vec::new(),
+        }
+    }
+
+    async fn profile_skill_enabled(
+        endpoint: &nakode_server::ServerEndpoint,
+        workspace_id: nakode_protocol::WorkspaceId,
+        profile_id: String,
+    ) -> bool {
+        let QueryResult::Skills(catalogue) = endpoint
+            .execute_query(
+                ClientId::from("skill-start-test"),
+                Query::ListSkills {
+                    workspace_id,
+                    profile_id,
+                    refresh: false,
+                },
+            )
+            .await
+            .expect("catalogue after session start")
+            .value
+        else {
+            panic!("skill catalogue result");
+        };
+        catalogue
+            .skills
+            .into_iter()
+            .find(|skill| skill.id == "test.publication.v1" && skill.available)
+            .expect("publication skill")
+            .enabled
+    }
+
+    #[tokio::test]
+    async fn profile_session_start_refreshes_skill_discovery_and_preserves_disabled_absence() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        let workspace_id = crate::state::projection::workspace_id(&state.workspace);
+        let disabled_profile = "profile-disabled".to_owned();
+        let preferences = HashMap::from([(
+            disabled_profile.clone(),
+            vec![SkillPreference {
+                profile_id: disabled_profile.clone(),
+                skill_id: "test.publication.v1".to_owned(),
+                last_name: "publication".to_owned(),
+                last_description: "Guarded publication".to_owned(),
+                enabled: false,
+            }],
+        )]);
+        let (runtime, handle) = NativeServerRuntime::from_parts_with_skill_authority(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+            SkillCatalog::default(),
+            preferences,
+        );
+
+        let skill = workspace.path().join(".agents/skills/publication");
+        std::fs::create_dir_all(&skill).expect("skill directory");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nid: test.publication.v1\nname: publication\ndescription: Guarded publication\n---\n\n# Publication\n",
+        )
+        .expect("skill definition installed after runtime startup");
+
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+
+        let enabled = endpoint
+            .execute_command(
+                ClientId::from("skill-start-test"),
+                IdempotencyKey::from("enabled-profile"),
+                None,
+                false,
+                profile_session_command(&workspace_id, workspace.path(), "profile-enabled", true),
+            )
+            .await
+            .expect("configured profile session starts");
+        enabled.resource_id.expect("enabled session id");
+        assert!(
+            profile_skill_enabled(
+                &endpoint,
+                workspace_id.clone(),
+                "profile-enabled".to_owned()
+            )
+            .await
+        );
+
+        let disabled = endpoint
+            .execute_command(
+                ClientId::from("skill-start-test"),
+                IdempotencyKey::from("disabled-profile"),
+                None,
+                false,
+                profile_session_command(&workspace_id, workspace.path(), &disabled_profile, false),
+            )
+            .await
+            .expect("disabled profile session starts without loaders");
+        disabled.resource_id.expect("disabled session id");
+        assert!(
+            !profile_skill_enabled(&endpoint, workspace_id, disabled_profile).await,
+            "disabled publication must remain unavailable"
+        );
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
     }
 
     #[tokio::test]
