@@ -431,6 +431,14 @@ impl DomainTranscript {
         }
     }
 
+    pub fn finish_running_entry(&mut self, key: &str, status: EntryStatus) {
+        if let Some(index) = self.item_indices.get(key).copied()
+            && self.entries[index].status == EntryStatus::Running
+        {
+            self.entries[index].status = status;
+        }
+    }
+
     pub fn replace_body(&mut self, key: &str, body: &str, status: EntryStatus) {
         if let Some(index) = self.item_indices.get(key).copied() {
             body.clone_into(&mut self.entries[index].body);

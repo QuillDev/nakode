@@ -273,7 +273,56 @@ for raw_line in sys.stdin:
             except OSError as error:
                 sys.stderr.write(f"failed to wait on turn gate: {error}\n")
                 sys.exit(2)
-        if prompt in ("hello fixture", "idle fixture"):
+        if prompt == "tool succeeds before turn failure":
+            command_id = f"command-fixture{id_suffix}"
+            command = {
+                "type": "commandExecution",
+                "id": command_id,
+                "command": "cargo test",
+                "cwd": "/tmp",
+                "status": "inProgress",
+                "aggregatedOutput": "",
+            }
+            send(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "startedAtMs": 1,
+                        "item": command,
+                    },
+                }
+            )
+            command["status"] = "completed"
+            command["aggregatedOutput"] = "12 tests passed"
+            send(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "completedAtMs": 2,
+                        "item": command,
+                    },
+                }
+            )
+            time.sleep(0.1)
+            send(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turn": {
+                            "id": turn_id,
+                            "status": "failed",
+                            "items": [],
+                            "error": {"message": "provider failed after the completed tool"},
+                        },
+                    },
+                }
+            )
+        elif prompt in ("hello fixture", "idle fixture"):
             send(
                 {
                     "method": "item/started",
