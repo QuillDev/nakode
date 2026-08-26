@@ -8150,6 +8150,7 @@ impl DomainState {
             .agents
             .definitions()
             .iter()
+            .filter(|agent| agent.enabled)
             .map(|agent| {
                 format!(
                     "- {}: {}\n  Callable: {}({{\"agent\":\"{}\",\"task\":\"<bounded task>\"}})",
@@ -9896,6 +9897,36 @@ model = "openai-codex/model-a"
 "#,
         )
         .expect("agent definition");
+        AgentCatalog::load(directory.path()).expect("agent catalog")
+    }
+
+    fn agent_catalogue_with_designer(designer_enabled: bool) -> AgentCatalog {
+        let directory = tempdir().expect("agent directory");
+        fs::write(
+            directory.path().join("explorer.toml"),
+            r#"
+slug = "explorer"
+description = "Explores code context"
+system_prompt = "Explore carefully and report concrete context."
+first_message = "Inspect the delegated question."
+model = "openai-codex/model-a"
+"#,
+        )
+        .expect("agent definition");
+        fs::write(
+            directory.path().join("designer.toml"),
+            format!(
+                r#"
+slug = "designer"
+description = "Designs polished interfaces"
+system_prompt = "Design carefully."
+first_message = "Inspect the delegated design question."
+model = "openai-codex/model-a"
+enabled = {designer_enabled}
+"#
+            ),
+        )
+        .expect("designer definition");
         AgentCatalog::load(directory.path()).expect("agent catalog")
     }
 
@@ -14849,7 +14880,7 @@ tool_profile = "none"
     #[test]
     fn new_session_receives_nakode_identity_and_agent_instructions() {
         let mut state = ready_state();
-        state.install_agents(explorer_catalog());
+        state.install_agents(agent_catalogue_with_designer(false));
         state.set_nakode_executable(Path::new("/opt/nakode/bin/nakode"));
         state.selected_model = Some("openai-codex/model-a".to_owned());
         state.client.editor.set_text("Start work");
@@ -14873,6 +14904,7 @@ tool_profile = "none"
         assert!(instructions.contains(
             "Callable: nakode_agent({\"agent\":\"explorer\",\"task\":\"<bounded task>\"})"
         ));
+        assert!(!instructions.contains("designer"));
         assert!(instructions.contains("not provider-native collaboration or a shell subprocess"));
         assert!(instructions.contains("Up to 4 subagents may run concurrently"));
         assert!(instructions.contains("launch one Nakode delegation per task concurrently"));
@@ -14884,7 +14916,7 @@ tool_profile = "none"
     fn existing_session_turn_receives_the_current_agent_catalogue() {
         let mut state = ready_state();
         state.provider_session_id = Some("existing-provider-session".to_owned());
-        state.install_agents(explorer_catalog());
+        state.install_agents(agent_catalogue_with_designer(false));
         state.set_nakode_executable(Path::new("/opt/nakode/bin/nakode"));
         state
             .client
@@ -14906,6 +14938,29 @@ tool_profile = "none"
         assert!(prompt.contains(
             "Callable: nakode_agent({\"agent\":\"explorer\",\"task\":\"<bounded task>\"})"
         ));
+        assert!(!prompt.contains("designer"));
+    }
+
+    #[test]
+    fn disabled_agent_is_refused_until_reenabled_and_restored_to_callable_choices() {
+        let mut state = ready_state();
+        state.install_agents(agent_catalogue_with_designer(false));
+
+        let disabled_catalogue = state.rendered_agent_catalogue();
+        assert!(disabled_catalogue.contains("agent\":\"explorer"));
+        assert!(!disabled_catalogue.contains("designer"));
+        let error = state
+            .validate_agent_request("designer", "Review the interface")
+            .expect_err("stale direct request must be refused");
+        assert!(error.to_string().contains("is disabled"));
+
+        state.install_agents(agent_catalogue_with_designer(true));
+
+        let enabled_catalogue = state.rendered_agent_catalogue();
+        assert!(enabled_catalogue.contains("agent\":\"designer"));
+        state
+            .validate_agent_request("designer", "Review the interface")
+            .expect("re-enabled designer is callable");
     }
 
     #[test]
@@ -14917,6 +14972,7 @@ tool_profile = "none"
             let catalogue = state.rendered_agent_catalogue();
             assert!(catalogue.contains("no callable Nakode delegation tool"));
             assert!(!catalogue.contains("Callable: nakode_agent"));
+            assert!(!catalogue.contains("explorer"));
         }
     }
 

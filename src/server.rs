@@ -7480,26 +7480,52 @@ mod tests {
     }
 
     #[test]
-    fn delegation_reloads_the_global_agent_catalogue_at_invocation() {
+    fn delegation_reloads_enablement_at_each_invocation() {
         let directory = tempfile::tempdir().expect("global agents");
+        let definition_path = directory.path().join("designer.toml");
         std::fs::write(
-            directory.path().join("reviewer.toml"),
-            r#"slug = "reviewer"
-description = "Review changes"
-system_prompt = "Review carefully"
-first_message = "Starting review"
+            &definition_path,
+            r#"slug = "designer"
+description = "Design polished interfaces"
+system_prompt = "Design carefully"
+first_message = "Starting design review"
 model = "openai-codex/gpt-5"
+enabled = false
 "#,
         )
-        .expect("agent definition");
+        .expect("disabled agent definition");
         let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
         state.set_agent_directory(directory.path().to_path_buf());
         let session_id = SessionId::from(state.nakode_session_id.clone());
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
 
+        let error = core
+            .delegate_command(&session_id, "designer", "Inspect the interface", None)
+            .expect_err("stale direct invocation must honor disabled state");
+        assert!(error.to_string().contains("is disabled"));
+        assert!(
+            core.engine_for(&session_id)
+                .expect("session runtime")
+                .state()
+                .subagents
+                .is_empty()
+        );
+
+        std::fs::write(
+            definition_path,
+            r#"slug = "designer"
+description = "Design polished interfaces"
+system_prompt = "Design carefully"
+first_message = "Starting design review"
+model = "openai-codex/gpt-5"
+enabled = true
+"#,
+        )
+        .expect("re-enabled agent definition");
+
         let (accepted, effects) = core
-            .delegate_command(&session_id, "reviewer", "Inspect authentication", None)
-            .expect("fresh global agent is available");
+            .delegate_command(&session_id, "designer", "Inspect the interface", None)
+            .expect("re-enabled global agent is available");
 
         assert!(accepted.resource_id.is_some());
         assert!(!effects.is_empty());
@@ -7509,14 +7535,15 @@ model = "openai-codex/gpt-5"
     fn global_agent_catalogue_reload_updates_workspace_projection() {
         let directory = tempfile::tempdir().expect("global agents");
         std::fs::write(
-            directory.path().join("reviewer.toml"),
-            r#"slug = "reviewer"
-description = "Review changes"
-system_prompt = "Review carefully"
-first_message = "Starting review"
+            directory.path().join("designer.toml"),
+            r#"slug = "designer"
+description = "Design polished interfaces"
+system_prompt = "Design carefully"
+first_message = "Starting design review"
+enabled = false
 "#,
         )
-        .expect("agent definition");
+        .expect("disabled agent definition");
         let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
         state.set_agent_directory(directory.path().to_path_buf());
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
@@ -7524,7 +7551,10 @@ first_message = "Starting review"
         core.reload_global_agent_catalogue()
             .expect("global catalogue reload");
 
-        assert_eq!(core.workspace_bootstrap().agents[0].slug, "reviewer");
+        let agents = &core.workspace_bootstrap().agents;
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].slug, "designer");
+        assert!(!agents[0].enabled);
     }
 
     #[test]
