@@ -326,6 +326,7 @@ async fn run_supervisor(
                     break;
                 }
                 let mut context = CommandContext {
+                    config: &config,
                     api_key: api_key.as_deref(),
                     runtime: runtime.as_ref(),
                     sessions: &mut sessions,
@@ -385,6 +386,7 @@ struct CompletedTurn {
 }
 
 struct CommandContext<'a> {
+    config: &'a BackendConfig,
     api_key: Option<&'a str>,
     runtime: Option<&'a AgentRuntime>,
     sessions: &'a mut HashMap<String, RuntimeSession>,
@@ -399,13 +401,15 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
     match command {
         BackendCommand::BeginAuthentication => api_key_auth_required(context.events).await,
         BackendCommand::Reload { .. } => match context.api_key {
-            Some(_) => {
-                let models = discover_models();
-                let _ = context
-                    .events
-                    .send(BackendEvent::Models(model_infos(models)))
-                    .await;
-            }
+            Some(api_key) => match discover_models(context.config, api_key).await {
+                Ok(models) => {
+                    let _ = context
+                        .events
+                        .send(BackendEvent::Models(model_infos(models)))
+                        .await;
+                }
+                Err(error) => request_failed(context.events, BackendOperation::Reload, error).await,
+            },
             None => {
                 request_failed(
                     context.events,
@@ -492,7 +496,16 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             provider_session_id,
             model,
         } => {
-            if let Err(error) = set_session_model(
+            let validation = match context.api_key {
+                Some(api_key) => {
+                    validate_account_model(context.config, api_key, &model, "set session model")
+                        .await
+                }
+                None => Err("GLM is not authenticated".to_owned()),
+            };
+            if let Err(error) = validation {
+                request_failed(context.events, BackendOperation::SetSessionModel, error).await;
+            } else if let Err(error) = set_session_model(
                 context.sessions,
                 context.session_store,
                 &provider_session_id,
@@ -578,6 +591,15 @@ async fn resume_session(
     enabled_skill_ids: Vec<String>,
     context: &mut CommandContext<'_>,
 ) {
+    let Some(api_key) = context.api_key else {
+        request_failed(
+            context.events,
+            BackendOperation::ResumeSession,
+            "GLM is not authenticated",
+        )
+        .await;
+        return;
+    };
     let persisted = context
         .session_store
         .map(|store| store.load(&provider_session_id))
@@ -595,11 +617,18 @@ async fn resume_session(
         .cloned()
         .or(persisted)
     {
+        if let Err(error) =
+            validate_account_model(context.config, api_key, &session.model, "resume session").await
+        {
+            request_failed(context.events, BackendOperation::ResumeSession, error).await;
+            return;
+        }
         session.owner_session_id = owner_session_id;
         session.parent_run_id = None;
         session.enabled_skill_ids = Some(enabled_skill_ids);
-        if session.context_window.is_none() && context.api_key.is_some() {
-            session.context_window = discover_context_window(&session.model);
+        if session.context_window.is_none() {
+            session.context_window =
+                discover_context_window(context.config, api_key, &session.model).await;
         }
         if let Some(store) = context.session_store
             && let Err(error) = store.save(&session)
@@ -724,6 +753,10 @@ async fn start_turn(
         .await;
         return;
     }
+    if let Err(error) = validate_turn_model(session_id.as_str(), model.as_deref(), context).await {
+        request_failed(context.events, BackendOperation::StartTurn, error).await;
+        return;
+    }
     let Some(mut session) = context.sessions.remove(&session_id) else {
         request_failed(
             context.events,
@@ -742,7 +775,14 @@ async fn start_turn(
         session.model = model;
     }
     if session.context_window.is_none() {
-        session.context_window = discover_context_window(&session.model);
+        session.context_window = discover_context_window(
+            context.config,
+            context
+                .api_key
+                .expect("authenticated runtime has an API key"),
+            &session.model,
+        )
+        .await;
     }
     let cancellation = CancellationToken::new();
     *context.active = Some(ActiveTurn {
@@ -797,7 +837,7 @@ async fn start_session(
     timeout_seconds: Option<u32>,
     context: &mut CommandContext<'_>,
 ) {
-    let Some(_api_key) = context.api_key else {
+    let Some(api_key) = context.api_key else {
         request_failed(
             context.events,
             BackendOperation::StartSession,
@@ -806,15 +846,36 @@ async fn start_session(
         .await;
         return;
     };
-    let models = discover_models();
-    let selected = model
-        .and_then(|requested| {
-            models
+    let models = match discover_models(context.config, api_key).await {
+        Ok(models) => models,
+        Err(error) => {
+            request_failed(context.events, BackendOperation::StartSession, error).await;
+            return;
+        }
+    };
+    let selected = match model.as_deref() {
+        Some(requested) => {
+            let Some(selected) = models
                 .iter()
                 .find(|candidate| candidate.info.id == requested)
-        })
-        .or_else(|| models.iter().find(|model| model.info.is_default))
-        .or_else(|| models.first());
+            else {
+                request_failed(
+                    context.events,
+                    BackendOperation::StartSession,
+                    format!(
+                        "GLM Coding Plan model {requested:?} is not available for this API key"
+                    ),
+                )
+                .await;
+                return;
+            };
+            Some(selected)
+        }
+        None => models
+            .iter()
+            .find(|model| model.info.is_default)
+            .or_else(|| models.first()),
+    };
     let Some(selected) = selected else {
         request_failed(
             context.events,
@@ -894,43 +955,142 @@ fn native_capabilities() -> BackendCapabilities {
     }
 }
 
-fn discover_models() -> Vec<DiscoveredModel> {
-    // Coding Plan exposes a deliberately limited model set. Keep this catalog
-    // independent of the general z.ai model endpoint so a Coding Plan key never
-    // accidentally selects a model billed outside the subscription.
-    ["glm-5.2", "glm-5-turbo", "glm-4.7"]
-        .into_iter()
-        .map(|id| DiscoveredModel {
-            info: ModelInfo {
-                provider: GLM_PROVIDER.to_owned(),
-                id: id.to_owned(),
-                is_default: id == "glm-5.2",
-                capabilities: crate::backend::ModelCapabilities::default(),
-            },
-            context_window: context_window_for_model(id),
+async fn discover_models(
+    config: &BackendConfig,
+    api_key: &str,
+) -> Result<Vec<DiscoveredModel>, String> {
+    // Query the Coding Plan base URL with the user's key. This keeps availability account-scoped
+    // and avoids maintaining a stale Nakode allowlist or exposing general API-billed models.
+    let response = config
+        .client
+        .get(format!("{}/models", config.base_url.trim_end_matches('/')))
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|error| format!("GLM Coding Plan model discovery failed: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "GLM Coding Plan model discovery returned {status}: {detail}"
+        ));
+    }
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("invalid GLM Coding Plan model catalog: {error}"))?;
+    let entries = payload
+        .get("data")
+        .or_else(|| payload.get("models"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "GLM Coding Plan returned an invalid model catalog".to_owned())?;
+    let mut models = entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry
+                .get("id")
+                .or_else(|| entry.get("slug"))
+                .and_then(Value::as_str)?
+                .trim();
+            if id.is_empty() {
+                return None;
+            }
+            let context_window = entry
+                .get("context_window")
+                .and_then(Value::as_u64)
+                .and_then(|window| usize::try_from(window).ok())
+                .or_else(|| context_window_for_model(id));
+            Some(DiscoveredModel {
+                info: ModelInfo {
+                    provider: GLM_PROVIDER.to_owned(),
+                    id: id.to_owned(),
+                    is_default: entry
+                        .get("is_default")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    capabilities: crate::backend::ModelCapabilities::default(),
+                },
+                context_window,
+            })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err("GLM Coding Plan returned no usable models for this API key".to_owned());
+    }
+    if !models.iter().any(|model| model.info.is_default)
+        && let Some(first) = models.first_mut()
+    {
+        first.info.is_default = true;
+    }
+    Ok(models)
+}
+
+async fn validate_turn_model(
+    session_id: &str,
+    requested: Option<&str>,
+    context: &CommandContext<'_>,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    if context
+        .sessions
+        .get(session_id)
+        .is_none_or(|session| session.model == requested)
+    {
+        return Ok(());
+    }
+    let api_key = context
+        .api_key
+        .ok_or_else(|| "GLM is not authenticated".to_owned())?;
+    validate_account_model(context.config, api_key, requested, "start turn").await
+}
+
+async fn validate_account_model(
+    config: &BackendConfig,
+    api_key: &str,
+    model: &str,
+    operation: &str,
+) -> Result<(), String> {
+    let models = discover_models(config, api_key).await?;
+    if models.iter().any(|candidate| candidate.info.id == model) {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot {operation}: GLM Coding Plan model {model:?} is not available for this API key"
+        ))
+    }
 }
 
 fn model_infos(models: Vec<DiscoveredModel>) -> Vec<ModelInfo> {
     models.into_iter().map(|model| model.info).collect()
 }
 
-fn discover_context_window(model: &str) -> Option<usize> {
-    context_window_for_model(model)
+async fn discover_context_window(
+    config: &BackendConfig,
+    api_key: &str,
+    model: &str,
+) -> Option<usize> {
+    discover_models(config, api_key)
+        .await
+        .ok()
+        .and_then(|models| {
+            models
+                .into_iter()
+                .find(|candidate| candidate.info.id == model)
+                .and_then(|candidate| candidate.context_window)
+        })
+        .or_else(|| context_window_for_model(model))
 }
 
 fn context_window_for_model(model: &str) -> Option<usize> {
     if model.eq_ignore_ascii_case("glm-5.2[1m]") {
         return Some(1_000_000);
     }
-    is_coding_plan_model(model).then_some(DEFAULT_CONTEXT_WINDOW)
-}
-
-fn is_coding_plan_model(model: &str) -> bool {
-    ["glm-5.2", "glm-5-turbo", "glm-4.7"]
-        .iter()
-        .any(|candidate| model.eq_ignore_ascii_case(candidate))
+    model
+        .to_ascii_lowercase()
+        .starts_with("glm-")
+        .then_some(DEFAULT_CONTEXT_WINDOW)
 }
 
 fn glm_request_body(request: &InferenceRequest) -> Value {
@@ -1188,6 +1348,8 @@ async fn apply_glm_event(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use serde_json::json;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1197,11 +1359,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        GlmProvider, ToolCallAccumulator, apply_glm_event, context_window_for_model,
-        discover_models, glm_reasoning_effort, glm_request_body,
+        BackendConfig, GlmProvider, ToolCallAccumulator, apply_glm_event, context_window_for_model,
+        discover_context_window, glm_reasoning_effort, glm_request_body, spawn,
     };
-    use crate::runtime::{
-        ConversationItem, InferenceOutput, InferenceProvider, InferenceRequest, ToolCall,
+    use crate::{
+        backend::{BackendCommand, BackendEvent},
+        runtime::{
+            ConversationItem, InferenceOutput, InferenceProvider, InferenceRequest, ToolCall,
+        },
     };
 
     fn request() -> InferenceRequest {
@@ -1355,24 +1520,242 @@ mod tests {
         );
     }
 
-    #[test]
-    fn coding_plan_catalog_only_advertises_supported_models() {
-        let models = discover_models();
+    #[tokio::test]
+    async fn reload_requeries_the_account_catalog_without_filtering_new_model_ids() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let address = listener.local_addr().expect("server address");
+        let server = tokio::spawn(async move {
+            for payload in [
+                json!({"data": [{"id": "glm-5-turbo"}, {"id": "glm-4.7"}]}),
+                json!({"data": [
+                    {"id": "glm-5.3", "is_default": true, "context_window": 202_752},
+                    {"id": "glm-5.3-flash", "context_window": 202_752}
+                ]}),
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).await.expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..read]);
+                    if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request_bytes).expect("UTF-8 request");
+                assert!(request.starts_with("GET /models HTTP/1.1"));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer secret")
+                );
+                let payload = payload.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+        let mut config = BackendConfig::native(PathBuf::from("."))
+            .with_credential(Some(json!({"api_key": "secret"})));
+        config.base_url = format!("http://{address}");
+        let mut handle = spawn(config).await.expect("spawn GLM backend");
+        assert!(matches!(
+            handle.events.recv().await,
+            Some(BackendEvent::Ready(_))
+        ));
+
+        handle
+            .commands
+            .send(BackendCommand::Reload {
+                provider_session_id: None,
+            })
+            .await
+            .expect("first reload");
+        let Some(BackendEvent::Models(first)) = handle.events.recv().await else {
+            panic!("first reload should return models");
+        };
         assert_eq!(
-            models
+            first
                 .iter()
-                .map(|model| model.info.id.as_str())
+                .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            ["glm-5.2", "glm-5-turbo", "glm-4.7"]
+            ["glm-5-turbo", "glm-4.7"]
         );
-        assert!(models[0].info.is_default);
-        assert!(models[1..].iter().all(|model| !model.info.is_default));
+
+        handle
+            .commands
+            .send(BackendCommand::Reload {
+                provider_session_id: None,
+            })
+            .await
+            .expect("second reload");
+        let Some(BackendEvent::Models(second)) = handle.events.recv().await else {
+            panic!("second reload should return models");
+        };
+        assert_eq!(
+            second
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["glm-5.3", "glm-5.3-flash"]
+        );
+        assert!(second[0].is_default);
+        assert!(!second[1].is_default);
+
+        handle
+            .commands
+            .send(BackendCommand::Shutdown)
+            .await
+            .expect("shutdown");
+        server.await.expect("server task");
+        handle.join().await.expect("backend task");
+    }
+
+    #[tokio::test]
+    async fn reload_failure_surfaces_the_upstream_account_diagnostic() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let address = listener.local_addr().expect("server address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).await.expect("read request");
+            let detail = r#"{"error":{"message":"model catalog unavailable for this plan"}}"#;
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                detail.len(),
+                detail
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        let mut config = BackendConfig::native(PathBuf::from("."))
+            .with_credential(Some(json!({"api_key": "secret"})));
+        config.base_url = format!("http://{address}");
+        let mut handle = spawn(config).await.expect("spawn GLM backend");
+        assert!(matches!(
+            handle.events.recv().await,
+            Some(BackendEvent::Ready(_))
+        ));
+        handle
+            .commands
+            .send(BackendCommand::Reload {
+                provider_session_id: None,
+            })
+            .await
+            .expect("reload");
+        let Some(BackendEvent::RequestFailed {
+            operation, message, ..
+        }) = handle.events.recv().await
+        else {
+            panic!("failed discovery should return a diagnostic");
+        };
+        assert_eq!(operation, crate::backend::BackendOperation::Reload);
+        assert!(message.contains("403 Forbidden"));
+        assert!(message.contains("model catalog unavailable for this plan"));
+
+        handle
+            .commands
+            .send(BackendCommand::Shutdown)
+            .await
+            .expect("shutdown");
+        server.await.expect("server task");
+        handle.join().await.expect("backend task");
+    }
+
+    #[tokio::test]
+    async fn session_creation_rejects_a_model_missing_from_the_fresh_account_catalog() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let address = listener.local_addr().expect("server address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).await.expect("read request");
+            let payload = json!({"data": [{"id": "glm-5.3", "is_default": true}]}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        let mut config = BackendConfig::native(PathBuf::from("."))
+            .with_credential(Some(json!({"api_key": "secret"})));
+        config.base_url = format!("http://{address}");
+        let mut handle = spawn(config).await.expect("spawn GLM backend");
+        assert!(matches!(
+            handle.events.recv().await,
+            Some(BackendEvent::Ready(_))
+        ));
+        handle
+            .commands
+            .send(BackendCommand::StartSession {
+                model: Some("glm-stale".to_owned()),
+                instructions: None,
+                owner_session_id: None,
+                parent_run_id: None,
+                enabled_skill_ids: Vec::new(),
+                external_tools: Vec::new(),
+                replace_builtin_tools: false,
+                allowed_builtin_tools: None,
+                max_turns: None,
+                finalization_reserve_turns: 0,
+                timeout_seconds: None,
+            })
+            .await
+            .expect("start session");
+        let Some(BackendEvent::RequestFailed {
+            operation, message, ..
+        }) = handle.events.recv().await
+        else {
+            panic!("stale model should be rejected");
+        };
+        assert_eq!(operation, crate::backend::BackendOperation::StartSession);
+        assert!(message.contains("glm-stale"));
+        assert!(message.contains("not available for this API key"));
+
+        handle
+            .commands
+            .send(BackendCommand::Shutdown)
+            .await
+            .expect("shutdown");
+        server.await.expect("server task");
+        handle.join().await.expect("backend task");
+    }
+
+    #[tokio::test]
+    async fn known_context_window_fallback_survives_catalog_request_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let address = listener.local_addr().expect("server address");
+        drop(listener);
+        let mut config = BackendConfig::native(PathBuf::from("."));
+        config.base_url = format!("http://{address}");
+
+        assert_eq!(
+            discover_context_window(&config, "secret", "glm-5.3-flash").await,
+            Some(204_800)
+        );
     }
 
     #[test]
     fn known_context_windows_are_used_when_catalog_omits_metadata() {
+        assert_eq!(context_window_for_model("glm-5.3-flash"), Some(204_800));
         assert_eq!(context_window_for_model("glm-5-turbo"), Some(204_800));
         assert_eq!(context_window_for_model("glm-5.2"), Some(204_800));
         assert_eq!(context_window_for_model("glm-5.2[1m]"), Some(1_000_000));
+        assert_eq!(context_window_for_model("unrelated-model"), None);
     }
 }
