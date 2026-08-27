@@ -1193,6 +1193,7 @@ async fn parse_kimi_sse(
             } else {
                 call.id
             },
+            parent_call_id: None,
             name: call.name,
             arguments: serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({})),
         })
@@ -1305,6 +1306,7 @@ mod tests {
                     reasoning: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "call-1".to_owned(),
+                        parent_call_id: None,
                         name: "read".to_owned(),
                         arguments: json!({"path":"README.md"}),
                     }],

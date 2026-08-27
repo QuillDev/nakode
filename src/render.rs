@@ -2615,6 +2615,7 @@ mod tests {
                     source_prompt_id: None,
                     tool_audit_json: None,
                     created_at_ms: None,
+                    parent_tool_entry_id: None,
                 }],
                 has_earlier: false,
                 stream_active: matches!(status, RunStatus::Starting | RunStatus::Working),

@@ -1588,6 +1588,7 @@ async fn apply_codex_event(
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
+                    parent_call_id: None,
                     name: item
                         .get("name")
                         .and_then(Value::as_str)

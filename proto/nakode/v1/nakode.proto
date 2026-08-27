@@ -1051,6 +1051,8 @@ message TranscriptEntry {
   optional string source_transport = 16;
   // Stable caller-owned prompt/mutation identity. Absent for legacy/imported owner entries.
   optional string source_prompt_id = 17;
+  // Parent tool transcript entry for one server-attributed nested invocation.
+  optional string parent_tool_entry_id = 18;
 }
 message TranscriptPage {
   repeated TranscriptEntry entries = 1;

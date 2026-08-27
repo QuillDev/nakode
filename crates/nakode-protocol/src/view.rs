@@ -413,6 +413,9 @@ pub struct TranscriptEntryView {
     /// Versioned, bounded tool audit JSON. Clients must render it as inert data.
     #[serde(default)]
     pub tool_audit_json: Option<String>,
+    /// Parent tool transcript entry for a server-attributed nested invocation.
+    #[serde(default)]
+    pub parent_tool_entry_id: Option<EntryId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1322,6 +1325,7 @@ mod tests {
             source_transport: None,
             source_prompt_id: None,
             tool_audit_json: None,
+            parent_tool_entry_id: None,
         };
         let value = serde_json::to_value(entry).expect("serialize transcript entry");
         assert_eq!(value["body_start_byte"], 96);

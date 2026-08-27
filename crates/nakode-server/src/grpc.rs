@@ -2486,6 +2486,7 @@ fn transcript_entry(value: protocol::TranscriptEntryView) -> api::TranscriptEntr
         owner_turn_id: value.owner_turn_id.map(|id| id.to_string()),
         resolved_reasoning_effort: value.resolved_reasoning_effort,
         resolved_fast_mode: value.resolved_fast_mode,
+        parent_tool_entry_id: value.parent_tool_entry_id.map(|id| id.to_string()),
     }
 }
 
