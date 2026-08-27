@@ -1084,6 +1084,46 @@ pub enum Effect {
         enabled: bool,
     },
     AuthenticateProvider(String),
+    AddProviderAccount {
+        provider: String,
+        label: String,
+    },
+    AuthenticateProviderAccount {
+        provider: String,
+        account_id: String,
+    },
+    SetProviderAccountLabel {
+        provider: String,
+        account_id: String,
+        label: String,
+    },
+    SetProviderAccountEnabled {
+        provider: String,
+        account_id: String,
+        enabled: bool,
+    },
+    SetProviderAccountDefault {
+        provider: String,
+        account_id: String,
+    },
+    RemoveProviderAccount {
+        provider: String,
+        account_id: String,
+    },
+    SaveProviderAccountCredential {
+        provider: String,
+        account_id: String,
+        kind: String,
+        metadata: serde_json::Value,
+    },
+    ClearProviderAccountCredential {
+        provider: String,
+        account_id: String,
+    },
+    ReloadProviderAccount {
+        provider: String,
+        account_id: String,
+    },
     SaveProviderCredential {
         provider: String,
         kind: String,
@@ -1129,6 +1169,7 @@ pub enum Effect {
     ResolveSession(String),
     PersistSession {
         provider: String,
+        account_id: Option<String>,
         provider_session_id: String,
         workspace: String,
         working_directory: String,
@@ -1164,6 +1205,7 @@ pub enum Effect {
     TransitionSessionPrimary {
         session_id: String,
         provider: String,
+        account_id: Option<String>,
         provider_session_id: String,
         model: Option<String>,
         options: ModelOptions,
@@ -1230,10 +1272,17 @@ pub struct DomainState {
     /// Filesystem and provider process root for this logical session.
     pub working_directory: String,
     pub backend_provider: String,
+    /// Stable credential account selected for the current provider-native session.
+    pub provider_account_id: Option<String>,
+    pub provider_account_routing: Option<nakode_protocol::ProviderAccountRoutingDiagnosticView>,
+    /// Ephemeral, redacted account health learned during this process lifetime.
+    pub provider_account_health:
+        HashMap<(String, String), nakode_protocol::ProviderAccountHealthView>,
     pub backend_name: String,
     pub backend_capabilities: BackendCapabilities,
     provider_contexts: HashMap<String, ProviderContext>,
     provider_authentication: HashMap<String, ProviderAuthenticationState>,
+    provider_account_authentication: HashMap<(String, String), ProviderAuthenticationState>,
     pub provider_session_id: Option<String>,
     pub session_id: Option<String>,
     pub active_turn: Option<ActiveTurn>,
@@ -1322,6 +1371,7 @@ impl DomainState {
                     })
             })
             && self.provider_authentication == source.provider_authentication
+            && self.provider_account_authentication == source.provider_account_authentication
             && self.models == source.models
             && self.model_options == source.model_options
             && self.default_model_options == source.default_model_options
@@ -1407,6 +1457,8 @@ impl DomainState {
         }
         self.provider_authentication
             .clone_from(&source.provider_authentication);
+        self.provider_account_authentication
+            .clone_from(&source.provider_account_authentication);
         self.models.clone_from(&source.models);
         self.model_options.clone_from(&source.model_options);
         self.default_model_options
@@ -1984,10 +2036,14 @@ impl DomainState {
             working_directory: workspace.clone(),
             workspace,
             backend_provider: provider,
+            provider_account_id: None,
+            provider_account_routing: None,
+            provider_account_health: HashMap::new(),
             backend_name: backend_name.clone(),
             backend_capabilities: BackendCapabilities::default(),
             provider_contexts,
             provider_authentication: HashMap::new(),
+            provider_account_authentication: HashMap::new(),
             provider_session_id: None,
             session_id: None,
             active_turn: None,
@@ -3169,6 +3225,36 @@ impl DomainState {
         vec![Effect::AuthenticateProvider(provider.to_owned())]
     }
 
+    pub fn begin_provider_account_authentication(
+        &mut self,
+        provider: &str,
+        account_id: &str,
+        display_name: &str,
+    ) -> Vec<Effect> {
+        self.provider_account_authentication.insert(
+            (provider.to_owned(), account_id.to_owned()),
+            ProviderAuthenticationState::Starting,
+        );
+        self.set_status(&format!("Starting {display_name} account authentication…"));
+        vec![Effect::AuthenticateProviderAccount {
+            provider: provider.to_owned(),
+            account_id: account_id.to_owned(),
+        }]
+    }
+
+    pub fn provider_account_authentication_failed(
+        &mut self,
+        provider: &str,
+        account_id: &str,
+        message: &str,
+    ) {
+        self.provider_account_authentication
+            .remove(&(provider.to_owned(), account_id.to_owned()));
+        self.set_status(&format!(
+            "Authentication failed for {provider} account {account_id}: {message}"
+        ));
+    }
+
     pub fn provider_logged_out(&mut self, provider: &str) {
         let display_name = self.provider_display_name(provider);
         self.provider_disabled(provider);
@@ -3336,6 +3422,15 @@ impl DomainState {
             );
             return Vec::new();
         }
+        self.provider_account_id.clone_from(&session.account_id);
+        self.provider_account_routing = session.account_id.as_ref().map(|account_id| {
+            nakode_protocol::ProviderAccountRoutingDiagnosticView {
+                account_id: Some(account_id.clone()),
+                account_label: None,
+                reason: "persisted session affinity".to_owned(),
+                cooldown_until_ms: None,
+            }
+        });
         self.pending_handoff = None;
         self.working_directory
             .clone_from(&session.working_directory);
@@ -3442,6 +3537,17 @@ impl DomainState {
             || self.active_turn.is_some()
             || self.context_compaction.is_some()
             || self.has_running_subagents()
+    }
+
+    /// Returns the logical session whose provider account affinity must be durable before backend work.
+    /// During legacy resume the record is held separately until the provider confirms restoration.
+    #[must_use]
+    pub(crate) fn durable_session_id_for_backend(&self) -> Option<&str> {
+        self.session_id.as_deref().or_else(|| {
+            self.resuming_session
+                .as_ref()
+                .map(|session| session.id.as_str())
+        })
     }
 
     /// Whether a provider backend is still behind this session.
@@ -4290,6 +4396,8 @@ impl DomainState {
         let previous = self.provider_session_id.take();
         self.nakode_session_id = uuid::Uuid::now_v7().to_string();
         self.session_id = None;
+        self.provider_account_id = None;
+        self.provider_account_routing = None;
         self.session_model_override = false;
         self.session_model_options_override = None;
         self.selected_model = self.default_model();
@@ -4343,6 +4451,19 @@ impl DomainState {
             ));
         }
         Ok(self.new_session())
+    }
+
+    pub fn set_provider_account_override(&mut self, account_id: Option<String>) {
+        self.provider_account_id.clone_from(&account_id);
+        self.provider_account_routing =
+            account_id.map(
+                |account_id| nakode_protocol::ProviderAccountRoutingDiagnosticView {
+                    account_id: Some(account_id),
+                    account_label: None,
+                    reason: "explicit override".to_owned(),
+                    cooldown_until_ms: None,
+                },
+            );
     }
 
     /// Applies one canonical model selection without relying on a client picker.
@@ -5919,6 +6040,54 @@ impl DomainState {
         })])
     }
 
+    pub fn handle_provider_account_backend(
+        &mut self,
+        provider: &str,
+        account_id: &str,
+        event: BackendEvent,
+    ) -> Vec<Effect> {
+        let key = (provider.to_owned(), account_id.to_owned());
+        match &event {
+            BackendEvent::AuthenticationChallenge {
+                verification_url,
+                user_code,
+                ..
+            } => {
+                self.provider_account_authentication.insert(
+                    key,
+                    ProviderAuthenticationState::Challenge {
+                        verification_url: verification_url.clone(),
+                        user_code: user_code.clone(),
+                    },
+                );
+                self.set_status("Complete the account authentication in your browser.");
+                Vec::new()
+            }
+            BackendEvent::AuthenticationCompleted { kind, metadata } => {
+                self.provider_account_authentication.remove(&key);
+                self.set_status("Provider account authentication completed.");
+                vec![Effect::SaveProviderAccountCredential {
+                    provider: provider.to_owned(),
+                    account_id: account_id.to_owned(),
+                    kind: kind.clone(),
+                    metadata: metadata.clone(),
+                }]
+            }
+            BackendEvent::RequestFailed {
+                operation: BackendOperation::Authenticate,
+                message,
+                ..
+            } => {
+                self.provider_account_authentication.remove(&key);
+                self.set_status(&format!(
+                    "Authentication failed for {provider} account {account_id}: {message}"
+                ));
+                Vec::new()
+            }
+            _ => self.handle_provider_backend(provider, event),
+        }
+    }
+
     pub fn handle_provider_backend(&mut self, provider: &str, event: BackendEvent) -> Vec<Effect> {
         if let Some(effects) = self.handle_provider_authentication(provider, &event) {
             return effects;
@@ -6106,6 +6275,8 @@ impl DomainState {
             return false;
         };
         provider.clone_into(&mut self.backend_provider);
+        self.provider_account_id = None;
+        self.provider_account_routing = None;
         self.backend_name = context.name;
         self.backend_capabilities = context.capabilities;
         self.connection = context.connection;
@@ -6165,7 +6336,8 @@ impl DomainState {
             | BackendEvent::ContextCompactionCompleted { .. }
             | BackendEvent::ContextCompactionFailed { .. }
             | BackendEvent::SessionUnsubscribed
-            | BackendEvent::SkillInvoked { .. } => {}
+            | BackendEvent::SkillInvoked { .. }
+            | BackendEvent::ProviderFailure { .. } => {}
             BackendEvent::SessionObserved {
                 provider_session_id,
             } => self.observe_session(provider_session_id),
@@ -6420,6 +6592,7 @@ impl DomainState {
         let persistence = self.session_id.clone().map_or_else(
             || Effect::PersistSession {
                 provider: self.backend_provider.clone(),
+                account_id: self.provider_account_id.clone(),
                 provider_session_id: provider_session_id.clone(),
                 workspace: self.workspace.clone(),
                 working_directory: self.working_directory.clone(),
@@ -6430,6 +6603,7 @@ impl DomainState {
             |session_id| Effect::TransitionSessionPrimary {
                 session_id,
                 provider: self.backend_provider.clone(),
+                account_id: self.provider_account_id.clone(),
                 provider_session_id: provider_session_id.clone(),
                 model: self.selected_model.clone(),
                 options: prompt.options.clone(),
@@ -6938,6 +7112,7 @@ impl DomainState {
         if let Some(provider_session_id) = self.provider_session_id.clone() {
             let persist = self.session_id.is_none().then(|| Effect::PersistSession {
                 provider: self.backend_provider.clone(),
+                account_id: self.provider_account_id.clone(),
                 provider_session_id: provider_session_id.clone(),
                 workspace: self.workspace.clone(),
                 working_directory: self.working_directory.clone(),
@@ -8397,6 +8572,7 @@ impl DomainState {
             | BackendEvent::TurnDiff { .. }
             | BackendEvent::TurnPlan { .. }
             | BackendEvent::SkillInvoked { .. }
+            | BackendEvent::ProviderFailure { .. }
             | BackendEvent::ExternalToolRequested(_)
             | BackendEvent::ApprovalResolved { .. }
             | BackendEvent::SteerAccepted { .. }
@@ -9675,6 +9851,34 @@ mod tests {
     };
 
     #[test]
+    fn provider_handoff_does_not_carry_old_account_override() {
+        let workspace = tempdir().expect("workspace");
+        let mut state = super::DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        state.provider_account_id = Some("old-provider-account".to_owned());
+        state.provider_contexts.insert(
+            CLAUDE_PROVIDER.to_owned(),
+            super::ProviderContext {
+                name: "Claude".to_owned(),
+                capabilities: BackendCapabilities::default(),
+                connection: super::ConnectionState::Starting,
+                provider_session_id: None,
+                session_id: None,
+                context_usage: None,
+            },
+        );
+
+        assert!(state.activate_provider(CLAUDE_PROVIDER));
+        assert_eq!(state.backend_provider, CLAUDE_PROVIDER);
+        assert_eq!(state.provider_account_id, None);
+        assert_eq!(state.provider_account_routing, None);
+    }
+    #[test]
     fn analytical_archetype_prompt_exposes_convergence_and_protected_reserve() {
         let policy = AgentDefinition {
             slug: "failure-triager".to_owned(),
@@ -10079,6 +10283,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             id: "01950000-0000-7000-8000-000000000001".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-with-mcp".to_owned(),
+            account_id: None,
             workspace: state.workspace.clone(),
             working_directory: state.workspace.clone(),
             title: "Diagram work".to_owned(),
@@ -12959,6 +13164,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             id: "01950000-0000-7000-8000-000000000000".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-resumed".to_owned(),
+            account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: "/tmp/project".to_owned(),
             title: "Previous work".to_owned(),
@@ -13706,6 +13912,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             id: "logical-restored".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "codex-restored".to_owned(),
+            account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: "/tmp/project".to_owned(),
             title: "Restored transition".to_owned(),
@@ -15758,11 +15965,13 @@ model = "claude-agent/sonnet"
             enabled: true,
             credential: Some(crate::credential::CredentialMetadata {
                 provider: CODEX_PROVIDER.to_owned(),
+                account_id: String::new(),
                 kind: "chatgpt_device_code".to_owned(),
                 updated_at: 1,
             }),
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         }]);
 
         state.open_provider_details();
@@ -15799,6 +16008,7 @@ model = "claude-agent/sonnet"
             credential: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         }]);
         state.open_provider_details();
 
@@ -15830,6 +16040,7 @@ model = "claude-agent/sonnet"
             credential: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         }]);
         state.open_provider_details();
 
@@ -15858,6 +16069,7 @@ model = "claude-agent/sonnet"
             credential: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         }]);
         state.open_provider_details();
 
@@ -15886,6 +16098,7 @@ model = "claude-agent/sonnet"
             credential: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         }]);
         state.open_provider_details();
         let _ = state.toggle_provider();
@@ -15902,6 +16115,57 @@ model = "claude-agent/sonnet"
     }
 
     #[test]
+    fn provider_account_authentication_is_scoped_per_account() {
+        let mut state = ready_state();
+        let _ = state.begin_provider_account_authentication(CODEX_PROVIDER, "account-a", "Codex");
+        let _ = state.begin_provider_account_authentication(CODEX_PROVIDER, "account-b", "Codex");
+
+        let _ = state.handle_provider_account_backend(
+            CODEX_PROVIDER,
+            "account-a",
+            BackendEvent::AuthenticationChallenge {
+                login_id: "login-a".to_owned(),
+                verification_url: "https://example.test/a".to_owned(),
+                user_code: "CODE-A".to_owned(),
+            },
+        );
+        let _ = state.handle_provider_account_backend(
+            CODEX_PROVIDER,
+            "account-b",
+            BackendEvent::AuthenticationChallenge {
+                login_id: "login-b".to_owned(),
+                verification_url: "https://example.test/b".to_owned(),
+                user_code: "CODE-B".to_owned(),
+            },
+        );
+        let effects = state.handle_provider_account_backend(
+            CODEX_PROVIDER,
+            "account-a",
+            BackendEvent::AuthenticationCompleted {
+                kind: "chatgpt_oauth".to_owned(),
+                metadata: serde_json::json!({"access_token": "not-projected"}),
+            },
+        );
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SaveProviderAccountCredential { account_id, .. }] if account_id == "account-a"
+        ));
+        assert!(
+            !state
+                .provider_account_authentication
+                .contains_key(&(CODEX_PROVIDER.to_owned(), "account-a".to_owned()))
+        );
+        assert!(matches!(
+            state
+                .provider_account_authentication
+                .get(&(CODEX_PROVIDER.to_owned(), "account-b".to_owned())),
+            Some(super::ProviderAuthenticationState::Challenge { user_code, .. })
+                if user_code == "CODE-B"
+        ));
+    }
+
+    #[test]
     fn unconfigured_provider_starts_authentication_before_enablement() {
         let mut state = ready_state();
         state.client.editor.set_text("/providers");
@@ -15913,6 +16177,7 @@ model = "claude-agent/sonnet"
             credential: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         }]);
         state.open_provider_details();
 

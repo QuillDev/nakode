@@ -1547,6 +1547,7 @@ fn render_provider_details(
         ]),
     ];
     append_provider_filter(&mut lines, provider);
+    append_provider_accounts(&mut lines, provider);
     append_provider_capabilities(&mut lines, state, provider);
     let mut api_key_input_line = None;
     let authentication_url_line = if let Some(authentication) = &picker.authentication {
@@ -1584,6 +1585,65 @@ fn render_provider_details(
         provider_dashboard_url(provider),
     );
     register_api_key_input(output, popup, api_key_input_line);
+}
+
+fn append_provider_accounts(lines: &mut Vec<Line<'_>>, provider: &nakode_protocol::ProviderView) {
+    if provider.accounts.is_empty() {
+        return;
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("Accounts ({})", provider.accounts.len()),
+        Style::default().fg(TEXT).bold(),
+    )));
+    for account in provider.accounts.iter().take(5) {
+        let status = if !account.enabled {
+            "disabled"
+        } else if !account.credential_configured {
+            "authentication required"
+        } else if let Some(health) = &account.health {
+            match health.state {
+                nakode_protocol::ProviderAccountHealthState::Healthy => "healthy",
+                nakode_protocol::ProviderAccountHealthState::AuthenticationRequired => {
+                    "authentication required"
+                }
+                nakode_protocol::ProviderAccountHealthState::QuotaExceeded => "quota exceeded",
+                nakode_protocol::ProviderAccountHealthState::RateLimited => "rate limited",
+                nakode_protocol::ProviderAccountHealthState::TransientFailure => {
+                    "temporarily unavailable"
+                }
+                nakode_protocol::ProviderAccountHealthState::Unknown => "unknown",
+            }
+        } else {
+            "configured"
+        };
+        let markers = match (account.is_default, account.routing_mode) {
+            (true, nakode_protocol::ProviderAccountRoutingMode::Automatic) => "default, auto",
+            (true, nakode_protocol::ProviderAccountRoutingMode::ExplicitOnly) => {
+                "default, explicit"
+            }
+            (false, nakode_protocol::ProviderAccountRoutingMode::Automatic) => "auto",
+            (false, nakode_protocol::ProviderAccountRoutingMode::ExplicitOnly) => "explicit",
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  • ", Style::default().fg(MUTED)),
+            Span::styled(account.label.clone(), Style::default().fg(TEXT).bold()),
+            Span::styled(
+                format!("  {status} · {markers} · {}", account.account_id),
+                Style::default().fg(if account.enabled && account.credential_configured {
+                    MUTED
+                } else {
+                    WARNING
+                }),
+            ),
+        ]));
+    }
+    if provider.accounts.len() > 5 {
+        lines.push(Line::from(Span::styled(
+            format!("  … and {} more", provider.accounts.len() - 5),
+            Style::default().fg(MUTED),
+        )));
+    }
 }
 
 fn append_provider_filter(lines: &mut Vec<Line<'_>>, provider: &nakode_protocol::ProviderView) {
@@ -2388,6 +2448,8 @@ mod tests {
             diagnostic_count: 0,
             activity: SessionActivity::Idle,
             selected_provider_id: None,
+            selected_account_id: None,
+            routing_diagnostic: None,
             selected_model_id: None,
             selected_model_options: nakode_protocol::ModelOptions::default(),
             active_agent_session: None,
@@ -2462,6 +2524,7 @@ mod tests {
             authentication: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
             model_candidates: Vec::new(),
             supported_builtin_tools: Some(Vec::new()),
             available_builtin_tools: Some(Vec::new()),

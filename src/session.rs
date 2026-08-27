@@ -65,6 +65,8 @@ pub struct PersistedTurnConfiguration {
 pub struct SessionRecord {
     pub id: String,
     pub provider: String,
+    /// Stable credential account pinned to this provider-native session.
+    pub account_id: Option<String>,
     pub provider_session_id: String,
     /// Logical workspace/service ownership path.
     pub workspace: String,
@@ -167,11 +169,26 @@ pub struct SessionPurgeReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAccountRecord {
+    pub account_id: String,
+    pub provider: String,
+    pub label: String,
+    pub enabled: bool,
+    pub is_default: bool,
+    pub identity: Option<String>,
+    pub credential: Option<CredentialMetadata>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub routing_mode: nakode_protocol::ProviderAccountRoutingMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderRecord {
     pub provider: String,
     pub display_name: String,
     pub enabled: bool,
     pub credential: Option<CredentialMetadata>,
+    pub accounts: Vec<ProviderAccountRecord>,
     pub model_filter_enabled: bool,
     pub selected_model_ids: Vec<String>,
 }
@@ -320,6 +337,18 @@ pub enum SessionError {
     InvalidStoredJson {
         field: &'static str,
         source: serde_json::Error,
+    },
+    #[error("provider account {account_id} was not found for {provider}")]
+    ProviderAccountNotFound {
+        provider: String,
+        account_id: String,
+    },
+    #[error("provider account {account_id} is pinned to persisted sessions")]
+    ProviderAccountInUse { account_id: String },
+    #[error("session {session_id} is already pinned to provider account {account_id}")]
+    ProviderAccountAffinityConflict {
+        session_id: String,
+        account_id: String,
     },
     #[error("provider {0} has no configured credentials")]
     MissingProviderCredential(String),
@@ -503,6 +532,52 @@ pub trait SessionRepository: Send + Sync {
         enabled_skill_ids: Option<&[String]>,
     ) -> Result<SessionRecord, SessionError>;
 
+    /// Creates a session with its credential affinity in the same durable write.
+    ///
+    /// # Errors
+    /// Returns an error when the account is invalid or the session cannot be persisted.
+    #[allow(clippy::too_many_arguments)]
+    fn create_with_account_id(
+        &self,
+        id: &str,
+        provider: &str,
+        account_id: Option<&str>,
+        provider_session_id: &str,
+        workspace: &str,
+        working_directory: &str,
+        title: &str,
+        model: Option<&str>,
+        options: &ModelOptions,
+        enabled_skill_ids: Option<&[String]>,
+    ) -> Result<SessionRecord, SessionError> {
+        let mut record = self.create_with_id(
+            id,
+            provider,
+            provider_session_id,
+            workspace,
+            working_directory,
+            title,
+            model,
+            options,
+            enabled_skill_ids,
+        )?;
+        self.set_session_account(id, account_id)?;
+        record.account_id = account_id.map(str::to_owned);
+        Ok(record)
+    }
+
+    /// Binds or validates the account used by one persisted session.
+    ///
+    /// # Errors
+    /// Returns an error when the session is absent, already bound differently, or cannot be updated.
+    fn set_session_account(
+        &self,
+        _id: &str,
+        _account_id: Option<&str>,
+    ) -> Result<(), SessionError> {
+        Ok(())
+    }
+
     /// Binds a legacy logical session to the stable skill identities resolved at first open.
     ///
     /// # Errors
@@ -529,6 +604,24 @@ pub trait SessionRepository: Send + Sync {
         model: Option<&str>,
         options: &ModelOptions,
     ) -> Result<(), SessionError>;
+
+    #[allow(clippy::too_many_arguments)]
+    /// Atomically transitions provider-native identity while preserving account affinity.
+    ///
+    /// # Errors
+    /// Returns an error when the account conflicts with durable affinity or persistence fails.
+    fn transition_primary_with_account(
+        &self,
+        id: &str,
+        provider: &str,
+        account_id: Option<&str>,
+        provider_session_id: &str,
+        model: Option<&str>,
+        options: &ModelOptions,
+    ) -> Result<(), SessionError> {
+        self.transition_primary(id, provider, provider_session_id, model, options)?;
+        self.set_session_account(id, account_id)
+    }
     /// Marks a session as recently used.
     ///
     /// # Errors
@@ -639,6 +732,60 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when persistence cannot be queried.
     fn list_providers(&self) -> Result<Vec<ProviderRecord>, SessionError>;
+    /// Creates one credential account and returns its stable identity.
+    ///
+    /// # Errors
+    /// Returns an error when the provider is absent, the label conflicts, or persistence fails.
+    fn add_provider_account(
+        &self,
+        provider: &str,
+        label: &str,
+    ) -> Result<ProviderAccountRecord, SessionError>;
+    /// Updates safe durable account metadata.
+    ///
+    /// # Errors
+    /// Returns an error when the account is absent, the label conflicts, or persistence fails.
+    fn set_provider_account_label(
+        &self,
+        provider: &str,
+        account_id: &str,
+        label: &str,
+    ) -> Result<(), SessionError>;
+    /// Enables or disables an account for new work.
+    ///
+    /// # Errors
+    /// Returns an error when the account is absent or persistence fails.
+    fn set_provider_account_enabled(
+        &self,
+        provider: &str,
+        account_id: &str,
+        enabled: bool,
+    ) -> Result<(), SessionError>;
+    /// Makes one account the provider default.
+    ///
+    /// # Errors
+    /// Returns an error when the account is absent or persistence fails.
+    fn set_provider_account_default(
+        &self,
+        provider: &str,
+        account_id: &str,
+    ) -> Result<(), SessionError>;
+    /// Stores a safe, non-secret display identity for an account.
+    ///
+    /// # Errors
+    /// Returns an error when the account is absent or persistence fails.
+    fn set_provider_account_identity(
+        &self,
+        provider: &str,
+        account_id: &str,
+        identity: Option<&str>,
+    ) -> Result<(), SessionError>;
+    /// Removes unused account metadata and its cascading secret.
+    ///
+    /// # Errors
+    /// Returns an error when the account is absent, pinned to a session, or persistence fails.
+    fn remove_provider_account(&self, provider: &str, account_id: &str)
+    -> Result<(), SessionError>;
     /// Changes whether a provider accepts new work.
     ///
     /// # Errors
@@ -820,6 +967,7 @@ impl SqliteSessionRepository {
              CREATE TABLE IF NOT EXISTS sessions (
                id TEXT PRIMARY KEY,
                provider TEXT NOT NULL,
+               account_id TEXT,
                provider_session_id TEXT NOT NULL,
                workspace TEXT NOT NULL,
                working_directory TEXT,
@@ -923,6 +1071,28 @@ impl SqliteSessionRepository {
              );
              CREATE TABLE IF NOT EXISTS provider_credentials (
                provider TEXT PRIMARY KEY REFERENCES providers(provider) ON DELETE CASCADE,
+               credential_kind TEXT NOT NULL,
+               credential_json TEXT NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS provider_accounts (
+               account_id TEXT PRIMARY KEY,
+               provider TEXT NOT NULL REFERENCES providers(provider) ON DELETE CASCADE,
+               label TEXT NOT NULL,
+               enabled INTEGER NOT NULL DEFAULT 1,
+               is_default INTEGER NOT NULL DEFAULT 0,
+               safe_identity TEXT,
+               routing_mode TEXT NOT NULL DEFAULT 'explicit_only',
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               UNIQUE(provider, label)
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS provider_accounts_one_default
+               ON provider_accounts(provider) WHERE is_default = 1;
+             CREATE INDEX IF NOT EXISTS provider_accounts_provider
+               ON provider_accounts(provider, enabled, account_id);
+             CREATE TABLE IF NOT EXISTS provider_account_credentials (
+               account_id TEXT PRIMARY KEY REFERENCES provider_accounts(account_id) ON DELETE CASCADE,
                credential_kind TEXT NOT NULL,
                credential_json TEXT NOT NULL,
                updated_at INTEGER NOT NULL
@@ -1190,6 +1360,7 @@ impl SqliteSessionRepository {
             ("working_directory", "TEXT"),
             ("last_owner_activity_at", "INTEGER"),
             ("enabled_skill_ids_json", "TEXT"),
+            ("account_id", "TEXT"),
         ] {
             if !session_columns.iter().any(|existing| existing == column) {
                 writeln!(
@@ -1201,6 +1372,30 @@ impl SqliteSessionRepository {
         }
         session_migration.push_str("COMMIT;");
         execute_batch_with_busy_retry(&connection, &session_migration)?;
+        execute_batch_with_busy_retry(
+            &connection,
+            "BEGIN IMMEDIATE;
+             INSERT OR IGNORE INTO provider_accounts
+               (account_id, provider, label, enabled, is_default, routing_mode, created_at, updated_at)
+             SELECT 'legacy-' || provider, provider, 'Default', 1, 1,
+                    CASE WHEN provider = 'openai-codex' THEN 'automatic' ELSE 'explicit_only' END,
+                    updated_at, updated_at
+             FROM provider_credentials;
+             INSERT OR IGNORE INTO provider_account_credentials
+               (account_id, credential_kind, credential_json, updated_at)
+             SELECT 'legacy-' || provider, credential_kind, credential_json, updated_at
+             FROM provider_credentials;
+             UPDATE sessions
+             SET account_id = 'legacy-' || provider
+             WHERE account_id IS NULL
+               AND EXISTS (
+                 SELECT 1 FROM provider_accounts a
+                 WHERE a.provider = sessions.provider
+                   AND a.account_id = 'legacy-' || sessions.provider
+               );
+             CREATE INDEX IF NOT EXISTS sessions_account ON sessions(account_id);
+             COMMIT;",
+        )?;
         let orchestration_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(orchestration_runs)")?;
             statement
@@ -1494,6 +1689,7 @@ impl SqliteSessionRepository {
         Ok(SessionRecord {
             id: row.get(0)?,
             provider: row.get(1)?,
+            account_id: row.get(18)?,
             provider_session_id: row.get(2)?,
             workspace: row.get(3)?,
             working_directory: row.get(15)?,
@@ -2355,7 +2551,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
@@ -2375,7 +2571,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let rows = statement.query_map([], Self::row)?;
@@ -2395,7 +2591,7 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json
+                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id
                  FROM sessions WHERE id = ?1",
                 [id],
                 Self::row,
@@ -2407,7 +2603,7 @@ impl SessionRepository for SqliteSessionRepository {
             return Ok(Some(exact));
         }
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id
              FROM sessions
              WHERE substr(id, 1, length(?1)) = ?1
              ORDER BY updated_at DESC LIMIT 2",
@@ -2490,11 +2686,146 @@ impl SessionRepository for SqliteSessionRepository {
             ],
         )?;
         connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
         ).map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_with_account_id(
+        &self,
+        id: &str,
+        provider: &str,
+        account_id: Option<&str>,
+        provider_session_id: &str,
+        workspace: &str,
+        working_directory: &str,
+        title: &str,
+        model: Option<&str>,
+        options: &ModelOptions,
+        enabled_skill_ids: Option<&[String]>,
+    ) -> Result<SessionRecord, SessionError> {
+        let now = unix_timestamp();
+        let title = title.lines().next().unwrap_or("New session").trim();
+        let title = if title.is_empty() {
+            "New session"
+        } else {
+            title
+        };
+        let enabled_skill_ids_json = enabled_skill_ids
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|source| SessionError::InvalidStoredJson {
+                field: "sessions.enabled_skill_ids_json",
+                source,
+            })?;
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        if let Some(account_id) = account_id {
+            let valid = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_accounts
+                 WHERE account_id = ?1 AND provider = ?2)",
+                params![account_id, provider],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !valid {
+                return Err(SessionError::ProviderAccountNotFound {
+                    provider: provider.to_owned(),
+                    account_id: account_id.to_owned(),
+                });
+            }
+        }
+        transaction.execute(
+            "INSERT INTO sessions
+             (id, provider, account_id, provider_session_id, workspace, working_directory,
+              title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at,
+              last_owner_activity_at, enabled_skill_ids_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11, ?12)
+             ON CONFLICT(provider, provider_session_id) DO UPDATE SET
+               account_id = COALESCE(sessions.account_id, excluded.account_id),
+               model = excluded.model,
+               model_reasoning_effort = excluded.model_reasoning_effort,
+               model_fast_mode = excluded.model_fast_mode,
+               enabled_skill_ids_json = COALESCE(
+                 sessions.enabled_skill_ids_json,
+                 excluded.enabled_skill_ids_json
+               ),
+               updated_at = excluded.updated_at,
+               last_owner_activity_at = MAX(
+                 COALESCE(sessions.last_owner_activity_at, 0),
+                 excluded.last_owner_activity_at
+               )
+             WHERE sessions.account_id IS NULL OR excluded.account_id IS NULL
+                OR sessions.account_id = excluded.account_id",
+            params![
+                id,
+                provider,
+                account_id,
+                provider_session_id,
+                workspace,
+                working_directory,
+                title,
+                model,
+                options.reasoning_effort,
+                i64::from(options.fast_mode),
+                now,
+                enabled_skill_ids_json,
+            ],
+        )?;
+        let record = transaction.query_row(
+            "SELECT id, provider, provider_session_id, workspace, title, model,
+                    model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model,
+                    last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome,
+                    created_at, updated_at, COALESCE(working_directory, workspace),
+                    last_owner_activity_at, enabled_skill_ids_json, account_id
+             FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
+            params![provider, provider_session_id],
+            Self::row,
+        )?;
+        if let (Some(requested), Some(persisted)) = (account_id, record.account_id.as_deref())
+            && requested != persisted
+        {
+            return Err(SessionError::ProviderAccountAffinityConflict {
+                session_id: record.id,
+                account_id: persisted.to_owned(),
+            });
+        }
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    fn set_session_account(&self, id: &str, account_id: Option<&str>) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let updated = connection.execute(
+            "UPDATE sessions SET account_id = ?2 WHERE id = ?1
+             AND (account_id IS NULL OR account_id = ?2)",
+            params![id, account_id],
+        )?;
+        if updated == 0 {
+            let persisted = connection
+                .query_row(
+                    "SELECT account_id FROM sessions WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            return match persisted {
+                Some(Some(account_id)) => Err(SessionError::ProviderAccountAffinityConflict {
+                    session_id: id.to_owned(),
+                    account_id,
+                }),
+                None | Some(None) => Err(SessionError::SessionNotFound(id.to_owned())),
+            };
+        }
+        Ok(())
     }
 
     fn set_session_skill_snapshot(
@@ -2569,6 +2900,88 @@ impl SessionRepository for SqliteSessionRepository {
              WHERE id = ?7",
             params![
                 provider,
+                provider_session_id,
+                model,
+                options.reasoning_effort,
+                i64::from(options.fast_mode),
+                unix_timestamp(),
+                id
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn transition_primary_with_account(
+        &self,
+        id: &str,
+        provider: &str,
+        account_id: Option<&str>,
+        provider_session_id: &str,
+        model: Option<&str>,
+        options: &ModelOptions,
+    ) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        if let Some(account_id) = account_id {
+            let valid = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_accounts
+                 WHERE account_id = ?1 AND provider = ?2)",
+                params![account_id, provider],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !valid {
+                return Err(SessionError::ProviderAccountNotFound {
+                    provider: provider.to_owned(),
+                    account_id: account_id.to_owned(),
+                });
+            }
+        }
+        let current = transaction
+            .query_row(
+                "SELECT provider, provider_session_id, account_id FROM sessions WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| SessionError::SessionNotFound(id.to_owned()))?;
+        if let (Some(requested), Some(persisted)) = (account_id, current.2.as_deref())
+            && requested != persisted
+        {
+            return Err(SessionError::ProviderAccountAffinityConflict {
+                session_id: id.to_owned(),
+                account_id: persisted.to_owned(),
+            });
+        }
+        transaction.execute(
+            "DELETE FROM session_native_history
+             WHERE parent_session_id = ?1 AND provider = ?2 AND provider_session_id = ?3",
+            params![id, provider, provider_session_id],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO session_native_history
+             (parent_session_id, provider, provider_session_id)
+             VALUES (?1, ?2, ?3)",
+            params![id, current.0, current.1],
+        )?;
+        transaction.execute(
+            "UPDATE sessions
+             SET provider = ?1, account_id = COALESCE(account_id, ?2),
+                 provider_session_id = ?3, model = ?4,
+                 model_reasoning_effort = ?5, model_fast_mode = ?6, updated_at = ?7
+             WHERE id = ?8",
+            params![
+                provider,
+                account_id,
                 provider_session_id,
                 model,
                 options.reasoning_effort,
@@ -3110,35 +3523,219 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT p.provider, p.display_name, p.enabled,
-                    c.credential_kind, c.updated_at,
                     COALESCE(f.enabled, 0), COALESCE(f.selected_model_ids, '[]')
              FROM providers p
-             LEFT JOIN provider_credentials c ON c.provider = p.provider
              LEFT JOIN provider_model_filters f ON f.provider = p.provider
              ORDER BY p.display_name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
-            let provider = row.get::<_, String>(0)?;
-            let credential_kind = row.get::<_, Option<String>>(3)?;
-            let credential_updated_at = row.get::<_, Option<i64>>(4)?;
             let selected_model_ids =
-                serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default();
+                serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default();
             Ok(ProviderRecord {
-                provider: provider.clone(),
+                provider: row.get(0)?,
                 display_name: row.get(1)?,
                 enabled: row.get::<_, i64>(2)? != 0,
-                credential: credential_kind
-                    .zip(credential_updated_at)
-                    .map(|(kind, updated_at)| CredentialMetadata {
-                        provider,
-                        kind,
-                        updated_at,
-                    }),
-                model_filter_enabled: row.get::<_, i64>(5)? != 0,
+                credential: None,
+                accounts: Vec::new(),
+                model_filter_enabled: row.get::<_, i64>(3)? != 0,
                 selected_model_ids,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut providers = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut account_statement = connection.prepare(
+            "SELECT a.account_id, a.provider, a.label, a.enabled, a.is_default,
+                    a.safe_identity, a.created_at, a.updated_at, a.routing_mode,
+                    c.credential_kind, c.updated_at
+             FROM provider_accounts a
+             LEFT JOIN provider_account_credentials c ON c.account_id = a.account_id
+             ORDER BY a.provider, a.label COLLATE NOCASE, a.account_id",
+        )?;
+        let accounts = account_statement.query_map([], provider_account_from_row)?;
+        for account in accounts {
+            let account = account?;
+            if let Some(provider) = providers
+                .iter_mut()
+                .find(|provider| provider.provider == account.provider)
+            {
+                if account.is_default {
+                    provider.credential.clone_from(&account.credential);
+                }
+                provider.accounts.push(account);
+            }
+        }
+        Ok(providers)
+    }
+
+    fn add_provider_account(
+        &self,
+        provider: &str,
+        label: &str,
+    ) -> Result<ProviderAccountRecord, SessionError> {
+        let account_id = Uuid::now_v7().to_string();
+        let now = unix_timestamp();
+        let routing_mode = if provider == crate::backend::CODEX_PROVIDER {
+            "automatic"
+        } else {
+            "explicit_only"
+        };
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let default = connection.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM provider_accounts WHERE provider = ?1)",
+            [provider],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let inserted = connection.execute(
+            "INSERT INTO provider_accounts
+               (account_id, provider, label, enabled, is_default, routing_mode, created_at, updated_at)
+             SELECT ?1, provider, ?3, 1, ?4, ?5, ?6, ?6 FROM providers WHERE provider = ?2",
+            params![account_id, provider, label, i64::from(default), routing_mode, now],
+        )?;
+        if inserted == 0 {
+            return Err(SessionError::ProviderNotFound(provider.to_owned()));
+        }
+        Ok(ProviderAccountRecord {
+            account_id,
+            provider: provider.to_owned(),
+            label: label.to_owned(),
+            enabled: true,
+            is_default: default,
+            identity: None,
+            credential: None,
+            created_at: now,
+            updated_at: now,
+            routing_mode: parse_account_routing_mode(routing_mode),
+        })
+    }
+
+    fn set_provider_account_label(
+        &self,
+        provider: &str,
+        account_id: &str,
+        label: &str,
+    ) -> Result<(), SessionError> {
+        let updated = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned")
+            .execute(
+                "UPDATE provider_accounts SET label = ?3, updated_at = ?4
+                 WHERE provider = ?1 AND account_id = ?2",
+                params![provider, account_id, label, unix_timestamp()],
+            )?;
+        ensure_provider_account_updated(updated, provider, account_id)
+    }
+
+    fn set_provider_account_enabled(
+        &self,
+        provider: &str,
+        account_id: &str,
+        enabled: bool,
+    ) -> Result<(), SessionError> {
+        let updated = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned")
+            .execute(
+                "UPDATE provider_accounts SET enabled = ?3, updated_at = ?4
+                 WHERE provider = ?1 AND account_id = ?2",
+                params![provider, account_id, i64::from(enabled), unix_timestamp()],
+            )?;
+        ensure_provider_account_updated(updated, provider, account_id)
+    }
+
+    fn set_provider_account_default(
+        &self,
+        provider: &str,
+        account_id: &str,
+    ) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provider_accounts
+             WHERE provider = ?1 AND account_id = ?2)",
+            params![provider, account_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(provider_account_not_found(provider, account_id));
+        }
+        transaction.execute(
+            "UPDATE provider_accounts SET is_default = 0, updated_at = ?2 WHERE provider = ?1",
+            params![provider, unix_timestamp()],
+        )?;
+        transaction.execute(
+            "UPDATE provider_accounts SET is_default = 1, enabled = 1, updated_at = ?3
+             WHERE provider = ?1 AND account_id = ?2",
+            params![provider, account_id, unix_timestamp()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn set_provider_account_identity(
+        &self,
+        provider: &str,
+        account_id: &str,
+        identity: Option<&str>,
+    ) -> Result<(), SessionError> {
+        let updated = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned")
+            .execute(
+                "UPDATE provider_accounts SET safe_identity = ?3, updated_at = ?4
+                 WHERE provider = ?1 AND account_id = ?2",
+                params![provider, account_id, identity, unix_timestamp()],
+            )?;
+        ensure_provider_account_updated(updated, provider, account_id)
+    }
+
+    fn remove_provider_account(
+        &self,
+        provider: &str,
+        account_id: &str,
+    ) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let in_use = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE account_id = ?1)",
+            [account_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if in_use {
+            return Err(SessionError::ProviderAccountInUse {
+                account_id: account_id.to_owned(),
+            });
+        }
+        let removed = transaction.execute(
+            "DELETE FROM provider_accounts WHERE provider = ?1 AND account_id = ?2",
+            params![provider, account_id],
+        )?;
+        if removed == 0 {
+            return Err(provider_account_not_found(provider, account_id));
+        }
+        transaction.execute(
+            "UPDATE provider_accounts SET is_default = 1, updated_at = ?2
+             WHERE account_id = (
+               SELECT account_id FROM provider_accounts WHERE provider = ?1
+               ORDER BY enabled DESC, account_id LIMIT 1
+             ) AND NOT EXISTS(
+               SELECT 1 FROM provider_accounts WHERE provider = ?1 AND is_default = 1
+             )",
+            params![provider, unix_timestamp()],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn set_provider_enabled(&self, provider: &str, enabled: bool) -> Result<(), SessionError> {
@@ -3861,6 +4458,59 @@ fn entry_status_from_value(value: &str) -> Result<EntryStatus, SessionError> {
             field: "agent_turns.status",
             value: value.to_owned(),
         }),
+    }
+}
+
+fn provider_account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderAccountRecord> {
+    let account_id = row.get::<_, String>(0)?;
+    let provider = row.get::<_, String>(1)?;
+    let credential_kind = row.get::<_, Option<String>>(9)?;
+    let credential_updated_at = row.get::<_, Option<i64>>(10)?;
+    Ok(ProviderAccountRecord {
+        account_id: account_id.clone(),
+        provider: provider.clone(),
+        label: row.get(2)?,
+        enabled: row.get::<_, i64>(3)? != 0,
+        is_default: row.get::<_, i64>(4)? != 0,
+        identity: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        routing_mode: parse_account_routing_mode(&row.get::<_, String>(8)?),
+        credential: credential_kind
+            .zip(credential_updated_at)
+            .map(|(kind, updated_at)| CredentialMetadata {
+                provider,
+                account_id,
+                kind,
+                updated_at,
+            }),
+    })
+}
+
+fn parse_account_routing_mode(value: &str) -> nakode_protocol::ProviderAccountRoutingMode {
+    if value == "automatic" {
+        nakode_protocol::ProviderAccountRoutingMode::Automatic
+    } else {
+        nakode_protocol::ProviderAccountRoutingMode::ExplicitOnly
+    }
+}
+
+fn provider_account_not_found(provider: &str, account_id: &str) -> SessionError {
+    SessionError::ProviderAccountNotFound {
+        provider: provider.to_owned(),
+        account_id: account_id.to_owned(),
+    }
+}
+
+fn ensure_provider_account_updated(
+    updated: usize,
+    provider: &str,
+    account_id: &str,
+) -> Result<(), SessionError> {
+    if updated == 0 {
+        Err(provider_account_not_found(provider, account_id))
+    } else {
+        Ok(())
     }
 }
 
@@ -5692,6 +6342,226 @@ mod tests {
         assert_eq!(
             histories, 1,
             "the failed transaction restores runtime history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_single_account_migration_is_idempotent_and_preserves_session_affinity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("legacy.db");
+        let provider = crate::backend::CODEX_PROVIDER;
+        let repository = SqliteSessionRepository::open(&database)?;
+        repository.create_with_id(
+            "legacy-session",
+            provider,
+            "native-session",
+            "/workspace",
+            "/workspace",
+            "Legacy",
+            None,
+            &ModelOptions::default(),
+            None,
+        )?;
+        {
+            let connection = repository.connection.lock().expect("database mutex");
+            connection.execute(
+                "INSERT INTO provider_credentials
+                 (provider, credential_kind, credential_json, updated_at)
+                 VALUES (?1, 'oauth', ?2, 42)",
+                params![
+                    provider,
+                    serde_json::json!({"access_token": "legacy-secret"}).to_string()
+                ],
+            )?;
+        }
+        drop(repository);
+
+        for _ in 0..2 {
+            let reopened = SqliteSessionRepository::open(&database)?;
+            let record = reopened.find("legacy-session")?.expect("legacy session");
+            assert_eq!(record.account_id.as_deref(), Some("legacy-openai-codex"));
+            let provider_record = reopened
+                .list_providers()?
+                .into_iter()
+                .find(|candidate| candidate.provider == provider)
+                .expect("provider");
+            let accounts = provider_record
+                .accounts
+                .iter()
+                .filter(|account| account.account_id == "legacy-openai-codex")
+                .collect::<Vec<_>>();
+            assert_eq!(accounts.len(), 1);
+            assert!(accounts[0].is_default);
+            assert_eq!(
+                accounts[0]
+                    .credential
+                    .as_ref()
+                    .map(|value| value.kind.as_str()),
+                Some("oauth")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_accounts_are_redacted_and_survive_restart() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("accounts.db");
+        let provider = crate::backend::CODEX_PROVIDER;
+        let repository = SqliteSessionRepository::open(&database)?;
+        let account = repository.add_provider_account(provider, "Work")?;
+        repository.set_provider_account_identity(
+            provider,
+            &account.account_id,
+            Some("w***@example"),
+        )?;
+        let credentials = crate::credential::SqliteCredentialStore::open(&database)?;
+        credentials.put_account(
+            provider,
+            &account.account_id,
+            &Credential {
+                kind: "oauth".to_owned(),
+                secret: SecretValue::new(serde_json::json!({"access_token": "never-print"})),
+            },
+        )?;
+        drop(repository);
+        drop(credentials);
+
+        let restarted = SqliteSessionRepository::open(&database)?;
+        let restored = restarted
+            .list_providers()?
+            .into_iter()
+            .find(|record| record.provider == provider)
+            .and_then(|record| {
+                record
+                    .accounts
+                    .into_iter()
+                    .find(|candidate| candidate.account_id == account.account_id)
+            })
+            .expect("account survives restart");
+        assert_eq!(restored.label, "Work");
+        assert_eq!(restored.identity.as_deref(), Some("w***@example"));
+        assert_eq!(
+            restored
+                .credential
+                .as_ref()
+                .map(|value| value.kind.as_str()),
+            Some("oauth")
+        );
+        let diagnostic = format!("{restored:?}");
+        assert!(!diagnostic.contains("never-print"));
+        assert!(!diagnostic.contains("access_token"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_account_affinity_is_atomic_and_cannot_be_switched() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repository = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let provider = crate::backend::CODEX_PROVIDER;
+        let first = repository.add_provider_account(provider, "First")?;
+        let second = repository.add_provider_account(provider, "Second")?;
+        let options = ModelOptions::default();
+        let created = repository.create_with_account_id(
+            "logical-session",
+            provider,
+            Some(&first.account_id),
+            "native-session",
+            "/workspace",
+            "/workspace",
+            "Pinned",
+            Some("model"),
+            &options,
+            None,
+        )?;
+        assert_eq!(
+            created.account_id.as_deref(),
+            Some(first.account_id.as_str())
+        );
+        let error = repository
+            .create_with_account_id(
+                "duplicate-request",
+                provider,
+                Some(&second.account_id),
+                "native-session",
+                "/workspace",
+                "/workspace",
+                "Pinned",
+                Some("model"),
+                &options,
+                None,
+            )
+            .expect_err("native identity cannot change account affinity");
+        assert!(matches!(
+            error,
+            SessionError::ProviderAccountAffinityConflict { .. }
+        ));
+        let restored = repository
+            .find("logical-session")?
+            .expect("persisted session");
+        assert_eq!(
+            restored.account_id.as_deref(),
+            Some(first.account_id.as_str())
+        );
+        assert!(matches!(
+            repository.remove_provider_account(provider, &first.account_id),
+            Err(SessionError::ProviderAccountInUse { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_account_binding_accepts_only_one_affinity() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("concurrent-affinity.db");
+        let repository = SqliteSessionRepository::open(&database)?;
+        let provider = crate::backend::CODEX_PROVIDER;
+        let first = repository.add_provider_account(provider, "First")?;
+        let second = repository.add_provider_account(provider, "Second")?;
+        repository.create_with_account_id(
+            "logical-session",
+            provider,
+            None,
+            "native-session",
+            "/workspace",
+            "/workspace",
+            "Concurrent",
+            None,
+            &ModelOptions::default(),
+            None,
+        )?;
+        drop(repository);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles = [first.account_id, second.account_id]
+            .into_iter()
+            .map(|account_id| {
+                let database = database.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let repository = SqliteSessionRepository::open(database).expect("repository");
+                    barrier.wait();
+                    repository.set_session_account("logical-session", Some(&account_id))
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("binding thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(SessionError::ProviderAccountAffinityConflict { .. })
+                ))
+                .count(),
+            1
         );
         Ok(())
     }

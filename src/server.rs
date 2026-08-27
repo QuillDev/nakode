@@ -676,6 +676,7 @@ impl ServerCore {
                 mcp_grant,
                 profile_id,
                 disabled_skill_ids,
+                account_id,
             } => self.create_session_command_with_mcp_and_skills(
                 &workspace_id,
                 working_directory.as_deref(),
@@ -688,6 +689,7 @@ impl ServerCore {
                 mcp_grant.as_ref(),
                 profile_id,
                 &disabled_skill_ids,
+                account_id,
             ),
             Command::OpenSession {
                 session_id,
@@ -695,12 +697,14 @@ impl ServerCore {
                 mcp_grant,
                 profile_id,
                 enabled_skill_ids,
+                account_id,
             } => self.open_session_command_with_mcp_and_profile(
                 &session_id,
                 tools,
                 mcp_grant.as_ref(),
                 profile_id,
                 &enabled_skill_ids,
+                account_id.as_deref(),
             ),
             Command::SetSessionBridgeLifecycle {
                 session_id,
@@ -896,6 +900,139 @@ impl ServerCore {
                 self.clear_provider_credential_command(&provider_id)
             }
             Command::ReloadProvider { provider_id } => self.reload_provider_command(&provider_id),
+            Command::AddProviderAccount { provider_id, label } => {
+                self.ensure_provider(&provider_id)?;
+                Ok(Self::accepted(
+                    Some(provider_id.to_string()),
+                    vec![Effect::AddProviderAccount {
+                        provider: provider_id.to_string(),
+                        label,
+                    }],
+                ))
+            }
+            Command::BeginProviderAccountAuthentication {
+                provider_id,
+                account_id,
+            } => {
+                self.ensure_provider(&provider_id)?;
+                let display_name = self
+                    .providers
+                    .iter()
+                    .find(|provider| provider.provider == provider_id.as_str())
+                    .map_or_else(
+                        || provider_id.to_string(),
+                        |provider| provider.display_name.clone(),
+                    );
+                let session_id = self.default_session.clone();
+                let effects = self
+                    .session_engine_mut(&session_id)?
+                    .state_mut()
+                    .begin_provider_account_authentication(
+                        provider_id.as_str(),
+                        &account_id,
+                        &display_name,
+                    );
+                Ok(Self::accepted(Some(account_id), effects))
+            }
+            Command::SetProviderAccountCredential {
+                provider_id,
+                account_id,
+                kind,
+                credential,
+            } => {
+                self.ensure_provider(&provider_id)?;
+                Ok(Self::accepted(
+                    Some(account_id.clone()),
+                    vec![Effect::SaveProviderAccountCredential {
+                        provider: provider_id.to_string(),
+                        account_id,
+                        kind,
+                        metadata: serde_json::json!({ "api_key": credential.0 }),
+                    }],
+                ))
+            }
+            Command::ClearProviderAccountCredential {
+                provider_id,
+                account_id,
+            } => {
+                self.ensure_provider(&provider_id)?;
+                Ok(Self::accepted(
+                    Some(account_id.clone()),
+                    vec![Effect::ClearProviderAccountCredential {
+                        provider: provider_id.to_string(),
+                        account_id,
+                    }],
+                ))
+            }
+            Command::ReloadProviderAccount {
+                provider_id,
+                account_id,
+            } => {
+                self.ensure_provider(&provider_id)?;
+                Ok(Self::accepted(
+                    Some(account_id.clone()),
+                    vec![Effect::ReloadProviderAccount {
+                        provider: provider_id.to_string(),
+                        account_id,
+                    }],
+                ))
+            }
+            Command::SetProviderAccountLabel {
+                provider_id,
+                account_id,
+                label,
+            } => {
+                self.ensure_provider(&provider_id)?;
+                Ok(Self::accepted(
+                    Some(account_id.clone()),
+                    vec![Effect::SetProviderAccountLabel {
+                        provider: provider_id.to_string(),
+                        account_id,
+                        label,
+                    }],
+                ))
+            }
+            Command::SetProviderAccountEnabled {
+                provider_id,
+                account_id,
+                enabled,
+            } => {
+                self.ensure_provider(&provider_id)?;
+                Ok(Self::accepted(
+                    Some(account_id.clone()),
+                    vec![Effect::SetProviderAccountEnabled {
+                        provider: provider_id.to_string(),
+                        account_id,
+                        enabled,
+                    }],
+                ))
+            }
+            Command::SetProviderAccountDefault {
+                provider_id,
+                account_id,
+            } => {
+                self.ensure_provider(&provider_id)?;
+                Ok(Self::accepted(
+                    Some(account_id.clone()),
+                    vec![Effect::SetProviderAccountDefault {
+                        provider: provider_id.to_string(),
+                        account_id,
+                    }],
+                ))
+            }
+            Command::RemoveProviderAccount {
+                provider_id,
+                account_id,
+            } => {
+                self.ensure_provider(&provider_id)?;
+                Ok(Self::accepted(
+                    Some(account_id.clone()),
+                    vec![Effect::RemoveProviderAccount {
+                        provider: provider_id.to_string(),
+                        account_id,
+                    }],
+                ))
+            }
             Command::SaveMcpServer {
                 workspace_id,
                 server,
@@ -1002,6 +1139,7 @@ impl ServerCore {
             mcp_grant,
             None,
             &[],
+            None,
         )
     }
 
@@ -1021,6 +1159,7 @@ impl ServerCore {
         mcp_grant: Option<&McpSessionGrant>,
         profile_id: Option<String>,
         disabled_skill_ids: &[String],
+        account_id: Option<String>,
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
         let working_directory =
@@ -1046,6 +1185,7 @@ impl ServerCore {
             .state_mut()
             .set_initial_client_instructions(initial_instructions)?;
         let mut effects = engine.state_mut().create_logical_session()?;
+        engine.state_mut().set_provider_account_override(account_id);
         let session_id = SessionId::from(engine.state().nakode_session_id.clone());
         if let Some(model_id) = model_id {
             effects.extend(engine.state_mut().select_model_intent(
@@ -1766,7 +1906,14 @@ impl ServerCore {
         tools: Option<nakode_protocol::SessionToolConfiguration>,
         mcp_grant: Option<&McpSessionGrant>,
     ) -> DomainCommandOutcome {
-        self.open_session_command_with_mcp_and_profile(session_id, tools, mcp_grant, None, &[])
+        self.open_session_command_with_mcp_and_profile(
+            session_id,
+            tools,
+            mcp_grant,
+            None,
+            &[],
+            None,
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1777,6 +1924,7 @@ impl ServerCore {
         mcp_grant: Option<&McpSessionGrant>,
         profile_id: Option<String>,
         enabled_skill_ids: &[String],
+        account_id: Option<&str>,
     ) -> DomainCommandOutcome {
         let loaded = self
             .sessions_by_id
@@ -1786,10 +1934,22 @@ impl ServerCore {
             .collect::<Vec<_>>();
         match loaded.as_slice() {
             [loaded] => {
-                let (loaded_workspace, loaded_working_directory) = {
+                let (loaded_workspace, loaded_working_directory, loaded_account_id) = {
                     let state = self.session_engine_mut(loaded)?.state();
-                    (state.workspace.clone(), state.working_directory.clone())
+                    (
+                        state.workspace.clone(),
+                        state.working_directory.clone(),
+                        state.provider_account_id.clone(),
+                    )
                 };
+                if account_id
+                    .is_some_and(|requested| Some(requested) != loaded_account_id.as_deref())
+                {
+                    return Err(DomainCommandError::Conflict(
+                        "an established session cannot switch provider accounts; start a new session"
+                            .to_owned(),
+                    ));
+                }
                 canonical_working_directory(Some(&loaded_working_directory), &loaded_workspace)?;
                 if *loaded == self.default_session
                     && !self
@@ -1841,7 +2001,7 @@ impl ServerCore {
             .filter(|session| session.id.starts_with(session_id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        let session = match matches.as_slice() {
+        let mut session = match matches.as_slice() {
             [session] => session.clone(),
             [] => return Err(DomainCommandError::NotFound(session_id.to_string())),
             _ => {
@@ -1850,6 +2010,21 @@ impl ServerCore {
                 )));
             }
         };
+        if let Some(requested) = account_id {
+            if session
+                .account_id
+                .as_deref()
+                .is_some_and(|persisted| persisted != requested)
+            {
+                return Err(DomainCommandError::Conflict(
+                    "the persisted session is pinned to another provider account; start a new session"
+                        .to_owned(),
+                ));
+            }
+            if session.account_id.is_none() {
+                session.account_id = Some(requested.to_owned());
+            }
+        }
         let working_directory =
             canonical_working_directory(Some(&session.working_directory), &session.workspace)?;
         self.refresh_session_template_addenda()?;
@@ -3524,6 +3699,8 @@ impl ServerCore {
                     last_owner_activity_at_ms: session.last_owner_activity_at_ms,
                     owned_provider_sessions,
                     running: !matches!(session.activity, nakode_protocol::SessionActivity::Idle),
+                    selected_account_id: session.selected_account_id,
+                    routing_diagnostic: None,
                 }
             };
             let position = bootstrap
@@ -3783,6 +3960,15 @@ impl ServerCore {
             | Command::SetProviderCredential { .. }
             | Command::ClearProviderCredential { .. }
             | Command::ReloadProvider { .. }
+            | Command::AddProviderAccount { .. }
+            | Command::BeginProviderAccountAuthentication { .. }
+            | Command::SetProviderAccountCredential { .. }
+            | Command::ClearProviderAccountCredential { .. }
+            | Command::ReloadProviderAccount { .. }
+            | Command::SetProviderAccountLabel { .. }
+            | Command::SetProviderAccountEnabled { .. }
+            | Command::SetProviderAccountDefault { .. }
+            | Command::RemoveProviderAccount { .. }
             | Command::SaveMcpServer { .. }
             | Command::DeleteMcpServer { .. }
             | Command::SetMcpServerEnabled { .. }
@@ -5014,6 +5200,7 @@ mod tests {
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-restored-cwd".to_owned(),
+            account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: canonical.to_string_lossy().into_owned(),
             title: "Restored cwd".to_owned(),
@@ -5057,6 +5244,7 @@ mod tests {
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-resume-unsupported".to_owned(),
+            account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: directory
                 .path()
@@ -6214,6 +6402,7 @@ mod tests {
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-restored".to_owned(),
+            account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: "/tmp/project".to_owned(),
             title: "Old dashboard prompt".to_owned(),
@@ -6270,6 +6459,7 @@ mod tests {
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-unavailable-memory".to_owned(),
+            account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: "/tmp/project".to_owned(),
             title: "Memory backend unavailable".to_owned(),
@@ -6370,6 +6560,7 @@ mod tests {
             id: restored_id.to_string(),
             provider: CLAUDE_PROVIDER.to_owned(),
             provider_session_id: "claude-thread".to_owned(),
+            account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: "/tmp/project".to_owned(),
             title: "Historical Claude session".to_owned(),
@@ -6505,6 +6696,7 @@ mod tests {
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-old".to_owned(),
+            account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: "/tmp/project".to_owned(),
             title: "Old".to_owned(),
@@ -6535,6 +6727,7 @@ mod tests {
             id: initial_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-1".to_owned(),
+            account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: "/tmp/project".to_owned(),
             title: "Direct terminal session".to_owned(),
@@ -7382,6 +7575,7 @@ mod tests {
             credential: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         };
         let mut core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
 
@@ -7418,6 +7612,7 @@ mod tests {
             credential: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         };
         let core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
 
@@ -7441,6 +7636,7 @@ mod tests {
             credential: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         };
         let core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
 
@@ -9129,6 +9325,7 @@ first_message = "Starting review"
             id: former_initial.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "stale-thread".to_owned(),
+            account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: "/tmp/project".to_owned(),
             title: "New session".to_owned(),

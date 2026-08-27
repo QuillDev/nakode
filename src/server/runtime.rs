@@ -23,7 +23,10 @@ use thiserror::Error;
 
 use crate::{
     agent::{AgentCatalog, AgentCatalogError},
-    backend::{BackendCommand, BackendError, BackendEvent, BackendHandle, NativeDelegationRequest},
+    backend::{
+        BackendCommand, BackendError, BackendEvent, BackendHandle, NativeDelegationRequest,
+        ProviderFailureClassification,
+    },
     claude, codex,
     config::Config,
     credential::{
@@ -33,7 +36,8 @@ use crate::{
     personality::{PromptAddenda, PromptAddendaError},
     service::ServiceEngine,
     session::{
-        ProviderRecord, SessionError, SessionRecord, SessionRepository, SqliteSessionRepository,
+        ProviderAccountRecord, ProviderRecord, SessionError, SessionRecord, SessionRepository,
+        SqliteSessionRepository,
     },
     shell::{ShellEvent, ShellProcesses},
     skill::{SkillCatalog, SkillCatalogError},
@@ -76,9 +80,14 @@ pub(crate) enum SessionBackendError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BackendSource {
     ProviderControl(String),
+    ProviderAccountControl {
+        provider: String,
+        account_id: String,
+    },
     Primary {
         session_id: nakode_protocol::SessionId,
         provider: String,
+        account_id: String,
     },
     Subagent(String),
 }
@@ -282,7 +291,7 @@ pub(crate) async fn prepare_runtime(
     let credential_store = Arc::new(SqliteCredentialStore::open(&session_database)?);
     let mut providers = session_repository.list_providers()?;
     enable_e2e_fixture_provider(&mut providers);
-    let (provider_credentials, credential_failures) =
+    let (provider_credentials, provider_account_credentials, credential_failures) =
         load_provider_credentials(&providers, credential_store.as_ref());
     let (delegation_tx, delegation_requests) = mpsc::channel(128);
     let mut backends = BackendRegistry::spawn(
@@ -291,6 +300,11 @@ pub(crate) async fn prepare_runtime(
         BackendRegistrySpawn {
             session_database: session_database.clone(),
             provider_credentials,
+            provider_account_credentials,
+            provider_accounts: providers
+                .iter()
+                .map(|provider| (provider.provider.clone(), provider.accounts.clone()))
+                .collect(),
             web_config: shared_web_config(session_repository.as_ref())?,
             memory_config: shared_memory_config(session_repository.as_ref())?,
             vision_config: shared_vision_config(session_repository.as_ref())?,
@@ -1196,9 +1210,19 @@ impl NativeServerRuntime {
             });
         let mut effects = std::mem::take(&mut outcome.effects);
         let had_effects = !effects.is_empty();
-        let updates_provider_model_filter = effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::SetProviderModelFilter { .. }));
+        let updates_provider_records = effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::SetProviderModelFilter { .. }
+                    | Effect::AddProviderAccount { .. }
+                    | Effect::SetProviderAccountLabel { .. }
+                    | Effect::SetProviderAccountEnabled { .. }
+                    | Effect::SetProviderAccountDefault { .. }
+                    | Effect::RemoveProviderAccount { .. }
+                    | Effect::SaveProviderAccountCredential { .. }
+                    | Effect::ClearProviderAccountCredential { .. }
+            )
+        });
         let session_id = outcome
             .effect_session
             .clone()
@@ -1291,7 +1315,7 @@ impl NativeServerRuntime {
         self.register_effect_owners(&session_id, &effects);
         self.execute_effects(&session_id, effects, EffectOrigin::ClientCommand)
             .await;
-        if updates_provider_model_filter {
+        if updates_provider_records {
             self.synchronize_shared_providers().await;
         }
         self.refresh_builtin_tool_availability();
@@ -1324,6 +1348,7 @@ impl NativeServerRuntime {
 
         let enablement_changes =
             provider_enablement_changes(self.core.provider_records(), &providers);
+        self.effects.backends.update_provider_accounts(&providers);
         let session_id = self.core.default_session_id().clone();
         for (provider, enabled) in enablement_changes {
             if let Some(engine) = self.core.engine_for_mut(&session_id) {
@@ -1376,7 +1401,9 @@ impl NativeServerRuntime {
             return;
         }
         let event_session_id = match &source {
-            BackendSource::ProviderControl(_) => Some(self.core.default_session_id().clone()),
+            BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {
+                Some(self.core.default_session_id().clone())
+            }
             BackendSource::Primary { session_id, .. } => Some(session_id.clone()),
             BackendSource::Subagent(_) => None,
         };
@@ -1401,13 +1428,28 @@ impl NativeServerRuntime {
                 })
         });
         let origin = match &source {
-            BackendSource::ProviderControl(_) => EffectOrigin::ProviderControl,
+            BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {
+                EffectOrigin::ProviderControl
+            }
             BackendSource::Primary { .. } => EffectOrigin::PrimarySession,
             BackendSource::Subagent(_) => EffectOrigin::Subagent,
         };
-        self.effects
+        let account_health_update = self
+            .effects
             .backends
             .observe_provider_event(&source, &event);
+        let account_control = match &source {
+            BackendSource::ProviderAccountControl {
+                provider,
+                account_id,
+            }
+            | BackendSource::Primary {
+                provider,
+                account_id,
+                ..
+            } => Some((provider.clone(), account_id.clone())),
+            _ => None,
+        };
         let (session_id, mut effects) = match source {
             BackendSource::ProviderControl(provider) => {
                 let session_id = self.core.default_session_id().clone();
@@ -1419,16 +1461,38 @@ impl NativeServerRuntime {
                     });
                 (session_id, effects)
             }
+            BackendSource::ProviderAccountControl {
+                provider,
+                account_id,
+            } => {
+                let session_id = self.core.default_session_id().clone();
+                let effects =
+                    self.core
+                        .engine_for_mut(&session_id)
+                        .map_or_else(Vec::new, |engine| {
+                            engine.state_mut().handle_provider_account_backend(
+                                &provider,
+                                &account_id,
+                                event,
+                            )
+                        });
+                (session_id, effects)
+            }
             BackendSource::Primary {
                 session_id,
                 provider,
+                account_id,
             } => {
-                let effects = self
-                    .core
-                    .engine_for_mut(&session_id)
-                    .map_or_else(Vec::new, |engine| {
-                        engine.state_mut().handle_provider_backend(&provider, event)
-                    });
+                let effects =
+                    self.core
+                        .engine_for_mut(&session_id)
+                        .map_or_else(Vec::new, |engine| {
+                            engine.state_mut().handle_provider_account_backend(
+                                &provider,
+                                &account_id,
+                                event,
+                            )
+                        });
                 (session_id, effects)
             }
             BackendSource::Subagent(run_id) => {
@@ -1445,6 +1509,32 @@ impl NativeServerRuntime {
                 (session_id, effects)
             }
         };
+        if let Some((provider, account_id)) = account_control {
+            for effect in &mut effects {
+                if let Effect::SaveProviderCredential {
+                    provider: effect_provider,
+                    kind,
+                    metadata,
+                } = effect
+                    && *effect_provider == provider
+                {
+                    *effect = Effect::SaveProviderAccountCredential {
+                        provider: provider.clone(),
+                        account_id: account_id.clone(),
+                        kind: std::mem::take(kind),
+                        metadata: std::mem::take(metadata),
+                    };
+                }
+            }
+        }
+        if let Some((provider, account_id, health)) = account_health_update
+            && let Some(engine) = self.core.engine_for_mut(&session_id)
+        {
+            engine
+                .state_mut()
+                .provider_account_health
+                .insert((provider, account_id), health);
+        }
         if history_was_rebuilt {
             self.core.reapply_bridge_turn_origins(&session_id);
         }
@@ -1556,7 +1646,9 @@ impl NativeServerRuntime {
                     .unwrap_or_else(|| self.core.default_session_id().clone()),
                 Some(run_id.clone()),
             ),
-            BackendSource::ProviderControl(_) => return,
+            BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {
+                return;
+            }
         };
         let currently_granted = self.core.engine_for(&session_id).is_some_and(|engine| {
             if let BackendSource::Subagent(run_id) = &source {
@@ -1701,6 +1793,7 @@ impl NativeServerRuntime {
             BackendSource::Primary {
                 session_id,
                 provider,
+                ..
             } => {
                 let working_directory = self.core.engine_for(session_id).map_or_else(
                     || self.effects.backends.config.workspace.clone(),
@@ -1709,13 +1802,21 @@ impl NativeServerRuntime {
                 let _ = self
                     .effects
                     .backends
-                    .send_session(session_id, provider, &working_directory, command)
+                    .send_session(
+                        session_id,
+                        provider,
+                        // `account_id` belongs to the originating backend. Let this route use the
+                        // target provider's affinity instead of forwarding an old-provider override.
+                        None,
+                        &working_directory,
+                        command,
+                    )
                     .await;
             }
             BackendSource::Subagent(run_id) => {
                 let _ = self.effects.backends.send_subagent(run_id, command).await;
             }
-            BackendSource::ProviderControl(_) => {}
+            BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {}
         }
     }
 
@@ -2223,6 +2324,8 @@ impl NativeServerHandle {
 pub(crate) struct BackendRegistrySpawn {
     pub(crate) session_database: PathBuf,
     pub(crate) provider_credentials: HashMap<String, serde_json::Value>,
+    pub(crate) provider_account_credentials: HashMap<(String, String), serde_json::Value>,
+    pub(crate) provider_accounts: HashMap<String, Vec<ProviderAccountRecord>>,
     pub(crate) web_config: Arc<RwLock<crate::web::WebConfig>>,
     pub(crate) memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
     pub(crate) vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
@@ -2237,10 +2340,13 @@ struct SessionBackendTasks {
 pub(crate) struct BackendRegistry {
     /// Provider-scoped handles own authentication, readiness, and model catalogs.
     pub(crate) commands: HashMap<String, mpsc::Sender<BackendCommand>>,
+    /// Account-scoped control handles isolate OAuth and refresh lifecycle.
+    pub(crate) account_commands: HashMap<(String, String), mpsc::Sender<BackendCommand>>,
     /// Session-scoped handles own native sessions and turns. A provider adapter
     /// may supervise only the logical session named by this key.
     pub(crate) session_commands:
         HashMap<(nakode_protocol::SessionId, String), mpsc::Sender<BackendCommand>>,
+    session_accounts: HashMap<(nakode_protocol::SessionId, String), String>,
     /// Backend and event-forwarding tasks retained by canonical session/provider identity so a
     /// destructive delete can await provider termination before removing durable history.
     session_tasks: HashMap<(nakode_protocol::SessionId, String), Vec<SessionBackendTasks>>,
@@ -2255,7 +2361,9 @@ pub(crate) struct BackendRegistry {
     pub(crate) config: Config,
     pub(crate) session_database: PathBuf,
     pub(crate) provider_credentials: HashMap<String, serde_json::Value>,
-    pub(crate) provider_cooldowns: HashMap<String, ProviderCooldown>,
+    pub(crate) provider_account_credentials: HashMap<(String, String), serde_json::Value>,
+    pub(crate) provider_accounts: HashMap<String, Vec<ProviderAccountRecord>>,
+    pub(crate) provider_cooldowns: HashMap<(String, String), ProviderCooldown>,
     pub(crate) web_config: Arc<RwLock<crate::web::WebConfig>>,
     pub(crate) memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
     pub(crate) memory_services: Mutex<HashMap<String, crate::memory::SharedMemoryService>>,
@@ -2269,7 +2377,14 @@ pub(crate) struct ProviderCooldown {
     pub(crate) reason: String,
 }
 
-const PROVIDER_FATAL_ERROR_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AccountSelection {
+    pub(crate) account_id: String,
+    pub(crate) label: String,
+    pub(crate) reason: String,
+}
+
+const PROVIDER_ACCOUNT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 const SHARED_PROVIDER_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 
 #[cfg(feature = "e2e-fixture-provider")]
@@ -2381,6 +2496,8 @@ impl BackendRegistry {
         let BackendRegistrySpawn {
             session_database,
             provider_credentials,
+            provider_account_credentials,
+            provider_accounts,
             web_config,
             memory_config,
             vision_config,
@@ -2402,7 +2519,9 @@ impl BackendRegistry {
         };
         let mut registry = Self {
             commands: HashMap::new(),
+            account_commands: HashMap::new(),
             session_commands: HashMap::new(),
+            session_accounts: HashMap::new(),
             session_tasks: HashMap::new(),
             subagent_commands: HashMap::new(),
             subagent_providers: HashMap::new(),
@@ -2415,6 +2534,8 @@ impl BackendRegistry {
             config: config.clone(),
             session_database,
             provider_credentials,
+            provider_account_credentials,
+            provider_accounts,
             provider_cooldowns: HashMap::new(),
             web_config,
             memory_config: Arc::clone(&memory_config),
@@ -2450,7 +2571,25 @@ impl BackendRegistry {
         provider: &str,
         working_directory: &Path,
     ) -> Result<BackendHandle, BackendError> {
-        let credential = self.provider_credentials.get(provider).cloned();
+        self.spawn_provider_handle_for_account(provider, None, working_directory)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn spawn_provider_handle_for_account(
+        &self,
+        provider: &str,
+        account_id: Option<&str>,
+        working_directory: &Path,
+    ) -> Result<BackendHandle, BackendError> {
+        let credential = account_id.map_or_else(
+            || self.provider_credentials.get(provider).cloned(),
+            |account_id| {
+                self.provider_account_credentials
+                    .get(&(provider.to_owned(), account_id.to_owned()))
+                    .cloned()
+            },
+        );
         let memory_service = self.memory_service_for(working_directory).await;
         let handle = match provider {
             crate::backend::CODEX_PROVIDER => {
@@ -2563,6 +2702,61 @@ impl BackendRegistry {
         }))
     }
 
+    pub(crate) async fn start_provider_account(
+        &mut self,
+        provider: &str,
+        account_id: &str,
+    ) -> Result<(), BackendError> {
+        let key = (provider.to_owned(), account_id.to_owned());
+        if self.account_commands.contains_key(&key) {
+            return Ok(());
+        }
+        let handle = self
+            .spawn_provider_handle_for_account(provider, Some(account_id), &self.config.workspace)
+            .await?;
+        let (commands, mut events, task) = handle.into_parts();
+        self.account_commands.insert(key, commands);
+        self.tasks.push(task);
+        let event_tx = self.event_tx.clone();
+        let provider = provider.to_owned();
+        let account_id = account_id.to_owned();
+        self.tasks.push(tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if event_tx
+                    .send((
+                        BackendSource::ProviderAccountControl {
+                            provider: provider.clone(),
+                            account_id: account_id.clone(),
+                        },
+                        event,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+        Ok(())
+    }
+
+    pub(crate) async fn send_account(
+        &mut self,
+        provider: &str,
+        account_id: &str,
+        command: BackendCommand,
+    ) -> bool {
+        let key = (provider.to_owned(), account_id.to_owned());
+        let Some(commands) = self.account_commands.get(&key) else {
+            return false;
+        };
+        if commands.send(command).await.is_err() {
+            self.account_commands.remove(&key);
+            return false;
+        }
+        true
+    }
+
     pub(crate) async fn stop_provider(&mut self, provider: &str) {
         self.stop_provider_control(provider).await;
         let mut session_keys = self
@@ -2587,6 +2781,15 @@ impl BackendRegistry {
 
     async fn stop_provider_control(&mut self, provider: &str) {
         if let Some(commands) = self.commands.remove(provider) {
+            let _ = commands.send(BackendCommand::Shutdown).await;
+        }
+    }
+
+    async fn stop_provider_account_control(&mut self, provider: &str, account_id: &str) {
+        if let Some(commands) = self
+            .account_commands
+            .remove(&(provider.to_owned(), account_id.to_owned()))
+        {
             let _ = commands.send(BackendCommand::Shutdown).await;
         }
     }
@@ -2649,6 +2852,7 @@ impl BackendRegistry {
                 }
             }
         }
+        self.session_accounts.remove(&key);
         let Some(task_sets) = self.session_tasks.remove(&key) else {
             return Ok(());
         };
@@ -2681,6 +2885,93 @@ impl BackendRegistry {
     /// `stop_session`, so destructive deletion can await them rather than merely reaping them later.
     fn reap_finished_tasks(&mut self) {
         self.tasks.retain(|task| !task.is_finished());
+    }
+
+    pub(crate) fn update_provider_accounts(&mut self, providers: &[ProviderRecord]) {
+        self.provider_accounts = providers
+            .iter()
+            .map(|provider| (provider.provider.clone(), provider.accounts.clone()))
+            .collect();
+        for provider in providers {
+            if let Some(account_id) = self.default_account_id(&provider.provider) {
+                if let Some(secret) = self
+                    .provider_account_credentials
+                    .get(&(provider.provider.clone(), account_id))
+                    .cloned()
+                {
+                    self.provider_credentials
+                        .insert(provider.provider.clone(), secret);
+                } else {
+                    self.provider_credentials.remove(&provider.provider);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_provider_account_credential(
+        &mut self,
+        provider: &str,
+        account_id: &str,
+        metadata: serde_json::Value,
+    ) {
+        self.provider_account_credentials.insert(
+            (provider.to_owned(), account_id.to_owned()),
+            metadata.clone(),
+        );
+        if self
+            .provider_accounts
+            .get(provider)
+            .and_then(|accounts| {
+                accounts
+                    .iter()
+                    .find(|account| account.account_id == account_id)
+            })
+            .is_some_and(|account| account.is_default)
+        {
+            self.set_provider_credential(provider, metadata);
+        }
+    }
+
+    pub(crate) async fn clear_provider_account_credential(
+        &mut self,
+        provider: &str,
+        account_id: &str,
+    ) {
+        if let Some(commands) = self
+            .account_commands
+            .remove(&(provider.to_owned(), account_id.to_owned()))
+        {
+            let _ = commands.send(BackendCommand::Shutdown).await;
+        }
+        let session_ids = self
+            .session_accounts
+            .iter()
+            .filter(|((_, session_provider), selected_account)| {
+                session_provider == provider && selected_account.as_str() == account_id
+            })
+            .map(|((session_id, _), _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            let _ = self
+                .stop_session_backend((session_id, provider.to_owned()))
+                .await;
+        }
+        self.provider_account_credentials
+            .remove(&(provider.to_owned(), account_id.to_owned()));
+        if self
+            .provider_accounts
+            .get(provider)
+            .and_then(|accounts| {
+                accounts
+                    .iter()
+                    .find(|account| account.account_id == account_id)
+            })
+            .is_some_and(|account| account.is_default)
+        {
+            self.provider_credentials.remove(provider);
+        }
+        self.provider_cooldowns
+            .remove(&(provider.to_owned(), account_id.to_owned()));
     }
 
     pub(crate) fn set_provider_credential(&mut self, provider: &str, metadata: serde_json::Value) {
@@ -2720,10 +3011,13 @@ impl BackendRegistry {
         &mut self,
         session_id: nakode_protocol::SessionId,
         provider: String,
+        account_id: String,
         handle: BackendHandle,
     ) {
         let (commands, mut events, task) = handle.into_parts();
         let key = (session_id.clone(), provider.clone());
+        self.session_accounts
+            .insert(key.clone(), account_id.clone());
         self.session_commands.insert(key.clone(), commands);
         let event_tx = self.event_tx.clone();
         let event_forwarder = tokio::spawn(async move {
@@ -2733,6 +3027,7 @@ impl BackendRegistry {
                         BackendSource::Primary {
                             session_id: session_id.clone(),
                             provider: provider.clone(),
+                            account_id: account_id.clone(),
                         },
                         event,
                     ))
@@ -2759,7 +3054,9 @@ impl BackendRegistry {
         provider: &str,
         working_directory: &Path,
     ) -> Result<(), BackendError> {
-        if let Some(cooldown) = self.active_cooldown(provider) {
+        if let Some(account_id) = self.default_account_id(provider)
+            && let Some(cooldown) = self.active_cooldown(provider, &account_id)
+        {
             return Err(BackendError::ProviderCoolingDown {
                 provider: provider.to_owned(),
                 remaining_seconds: cooldown.0,
@@ -2803,12 +3100,164 @@ impl BackendRegistry {
         Ok(())
     }
 
-    pub(crate) fn observe_provider_event(&mut self, source: &BackendSource, event: &BackendEvent) {
-        let provider = match source {
-            BackendSource::ProviderControl(provider) | BackendSource::Primary { provider, .. } => {
-                Some(provider.clone())
+    pub(crate) fn select_account(
+        &mut self,
+        provider: &str,
+        explicit_account_id: Option<&str>,
+    ) -> Result<AccountSelection, BackendError> {
+        let accounts = self
+            .provider_accounts
+            .get(provider)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(account_id) = explicit_account_id {
+            let account = accounts
+                .iter()
+                .find(|account| account.account_id == account_id)
+                .ok_or_else(|| BackendError::InvalidCredential {
+                    provider: provider.to_owned(),
+                    detail: format!("account {account_id} does not exist"),
+                })?;
+            self.ensure_account_eligible(provider, account)?;
+            return Ok(AccountSelection {
+                account_id: account.account_id.clone(),
+                label: account.label.clone(),
+                reason: "explicit override".to_owned(),
+            });
+        }
+
+        let mut eligible = Vec::new();
+        let mut reasons = Vec::new();
+        for account in &accounts {
+            match self.ensure_account_eligible(provider, account) {
+                Ok(()) => eligible.push(account.clone()),
+                Err(error) => reasons.push(format!("{}: {error}", account.label)),
             }
-            BackendSource::Subagent(run_id) => self.subagent_providers.get(run_id).cloned(),
+        }
+        if eligible.len() > 1 {
+            eligible.retain(|account| {
+                account.routing_mode == nakode_protocol::ProviderAccountRoutingMode::Automatic
+            });
+            if eligible.is_empty() {
+                return Err(BackendError::InvalidCredential {
+                    provider: provider.to_owned(),
+                    detail: "multiple eligible accounts require explicit selection because this adapter does not support automatic routing".to_owned(),
+                });
+            }
+        }
+        eligible.sort_by(|left, right| {
+            let left_load = self
+                .session_accounts
+                .values()
+                .filter(|selected| *selected == &left.account_id)
+                .count();
+            let right_load = self
+                .session_accounts
+                .values()
+                .filter(|selected| *selected == &right.account_id)
+                .count();
+            left_load
+                .cmp(&right_load)
+                .then_with(|| right.is_default.cmp(&left.is_default))
+                .then_with(|| left.account_id.cmp(&right.account_id))
+        });
+        let Some(account) = eligible.into_iter().next() else {
+            return Err(BackendError::InvalidCredential {
+                provider: provider.to_owned(),
+                detail: if reasons.is_empty() {
+                    "no configured provider accounts are available".to_owned()
+                } else {
+                    format!(
+                        "all provider accounts are unavailable ({})",
+                        reasons.join("; ")
+                    )
+                },
+            });
+        };
+        let load = self
+            .session_accounts
+            .values()
+            .filter(|selected| *selected == &account.account_id)
+            .count();
+        Ok(AccountSelection {
+            account_id: account.account_id,
+            label: account.label,
+            reason: if accounts.len() == 1 {
+                "only eligible account".to_owned()
+            } else if account.is_default && load == 0 {
+                "preferred account tie-break".to_owned()
+            } else {
+                "least loaded".to_owned()
+            },
+        })
+    }
+
+    fn ensure_account_eligible(
+        &mut self,
+        provider: &str,
+        account: &ProviderAccountRecord,
+    ) -> Result<(), BackendError> {
+        if !account.enabled {
+            return Err(BackendError::InvalidCredential {
+                provider: provider.to_owned(),
+                detail: format!("account {} is disabled", account.account_id),
+            });
+        }
+        if !self
+            .provider_account_credentials
+            .contains_key(&(provider.to_owned(), account.account_id.clone()))
+        {
+            return Err(BackendError::InvalidCredential {
+                provider: provider.to_owned(),
+                detail: format!("account {} requires authentication", account.account_id),
+            });
+        }
+        if let Some((remaining_seconds, reason)) =
+            self.active_cooldown(provider, &account.account_id)
+        {
+            return Err(BackendError::ProviderCoolingDown {
+                provider: format!("{provider} account {}", account.account_id),
+                remaining_seconds,
+                reason,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn default_account_id(&self, provider: &str) -> Option<String> {
+        self.provider_accounts.get(provider).and_then(|accounts| {
+            accounts
+                .iter()
+                .find(|account| account.is_default)
+                .map(|account| account.account_id.clone())
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn observe_provider_event(
+        &mut self,
+        source: &BackendSource,
+        event: &BackendEvent,
+    ) -> Option<(String, String, nakode_protocol::ProviderAccountHealthView)> {
+        let provider_account = match source {
+            BackendSource::ProviderControl(provider) => self
+                .default_account_id(provider)
+                .map(|account_id| (provider.clone(), account_id)),
+            BackendSource::ProviderAccountControl {
+                provider,
+                account_id,
+            }
+            | BackendSource::Primary {
+                provider,
+                account_id,
+                ..
+            } => Some((provider.clone(), account_id.clone())),
+            BackendSource::Subagent(run_id) => {
+                self.subagent_providers.get(run_id).and_then(|provider| {
+                    self.default_account_id(provider)
+                        .map(|account_id| (provider.clone(), account_id))
+                })
+            }
         };
         if matches!(
             event,
@@ -2817,46 +3266,111 @@ impl BackendRegistry {
                 ..
             }
         ) {
-            if let Some(provider) = provider {
-                self.provider_cooldowns.remove(&provider);
+            if let Some(provider_account) = provider_account {
+                self.provider_cooldowns.remove(&provider_account);
+                return Some((
+                    provider_account.0,
+                    provider_account.1,
+                    nakode_protocol::ProviderAccountHealthView {
+                        state: nakode_protocol::ProviderAccountHealthState::Healthy,
+                        safe_reason: None,
+                        cooldown_until_ms: None,
+                    },
+                ));
             }
-            return;
+            return None;
         }
-        let (BackendEvent::TurnCompleted {
-            outcome: crate::backend::TurnOutcome::Failed,
-            error: Some(message),
-            ..
-        }
-        | BackendEvent::RequestFailed { message, .. }
-        | BackendEvent::Disconnected { reason: message }) = event
+        let BackendEvent::ProviderFailure {
+            classification,
+            retry_after,
+            message,
+        } = event
         else {
-            return;
+            return None;
         };
-        if !is_fatal_provider_error(message) {
-            return;
+        if !matches!(
+            classification,
+            ProviderFailureClassification::Authentication
+                | ProviderFailureClassification::Quota
+                | ProviderFailureClassification::RateLimit
+        ) {
+            // Model and provider failures can affect every account. Keep them out of the
+            // account-local breaker so routing can still try another account when appropriate.
+            return None;
         }
-        if let Some(provider) = provider {
-            self.provider_cooldowns.insert(
-                provider,
-                ProviderCooldown {
-                    until: Instant::now() + PROVIDER_FATAL_ERROR_COOLDOWN,
-                    reason: summarize_provider_error(message),
+        let provider_account = provider_account?;
+        let duration = retry_after
+            .unwrap_or(PROVIDER_ACCOUNT_COOLDOWN)
+            .min(PROVIDER_ACCOUNT_COOLDOWN);
+        if duration.is_zero() {
+            self.provider_cooldowns.remove(&provider_account);
+            return Some((
+                provider_account.0,
+                provider_account.1,
+                nakode_protocol::ProviderAccountHealthView {
+                    state: nakode_protocol::ProviderAccountHealthState::Healthy,
+                    safe_reason: None,
+                    cooldown_until_ms: None,
                 },
-            );
+            ));
         }
+        let safe_reason = summarize_provider_error(message);
+        self.provider_cooldowns.insert(
+            provider_account.clone(),
+            ProviderCooldown {
+                until: Instant::now() + duration,
+                reason: safe_reason.clone(),
+            },
+        );
+        let state = match classification {
+            ProviderFailureClassification::Authentication => {
+                nakode_protocol::ProviderAccountHealthState::AuthenticationRequired
+            }
+            ProviderFailureClassification::Quota => {
+                nakode_protocol::ProviderAccountHealthState::QuotaExceeded
+            }
+            ProviderFailureClassification::RateLimit => {
+                nakode_protocol::ProviderAccountHealthState::RateLimited
+            }
+            ProviderFailureClassification::Transient
+            | ProviderFailureClassification::Provider
+            | ProviderFailureClassification::Model => unreachable!("filtered above"),
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        Some((
+            provider_account.0,
+            provider_account.1,
+            nakode_protocol::ProviderAccountHealthView {
+                state,
+                safe_reason: Some(safe_reason),
+                cooldown_until_ms: Some(
+                    now_ms.saturating_add(duration.as_millis().try_into().unwrap_or(u64::MAX)),
+                ),
+            },
+        ))
     }
 
-    pub(crate) fn active_cooldown(&mut self, provider: &str) -> Option<(u64, String)> {
+    pub(crate) fn active_cooldown(
+        &mut self,
+        provider: &str,
+        account_id: &str,
+    ) -> Option<(u64, String)> {
+        let key = (provider.to_owned(), account_id.to_owned());
         let now = Instant::now();
         if self
             .provider_cooldowns
-            .get(provider)
+            .get(&key)
             .is_some_and(|cooldown| cooldown.until <= now)
         {
-            self.provider_cooldowns.remove(provider);
+            self.provider_cooldowns.remove(&key);
             return None;
         }
-        self.provider_cooldowns.get(provider).map(|cooldown| {
+        self.provider_cooldowns.get(&key).map(|cooldown| {
             (
                 cooldown.until.saturating_duration_since(now).as_secs(),
                 cooldown.reason.clone(),
@@ -2875,13 +3389,12 @@ impl BackendRegistry {
         true
     }
 
-    pub(crate) async fn send_session(
+    pub(crate) fn select_session_account(
         &mut self,
         session_id: &nakode_protocol::SessionId,
         provider: &str,
-        working_directory: &Path,
-        command: BackendCommand,
-    ) -> Result<(), SessionBackendError> {
+        account_id: Option<&str>,
+    ) -> Result<AccountSelection, SessionBackendError> {
         if !self.commands.contains_key(provider) {
             return Err(BackendError::ProviderUnavailable {
                 provider: provider.to_owned(),
@@ -2889,28 +3402,76 @@ impl BackendRegistry {
             .into());
         }
         let key = (session_id.clone(), provider.to_owned());
+        if let Some(selected) = self.session_accounts.get(&key).cloned() {
+            if account_id.is_some_and(|requested| requested != selected) {
+                return Err(BackendError::InvalidCredential {
+                    provider: provider.to_owned(),
+                    detail: "an established session cannot switch provider accounts; start a new session"
+                        .to_owned(),
+                }
+                .into());
+            }
+            let label = self
+                .provider_accounts
+                .get(provider)
+                .and_then(|accounts| {
+                    accounts
+                        .iter()
+                        .find(|account| account.account_id == selected)
+                })
+                .map_or_else(|| selected.clone(), |account| account.label.clone());
+            Ok(AccountSelection {
+                account_id: selected,
+                label,
+                reason: "persisted session affinity".to_owned(),
+            })
+        } else {
+            self.select_account(provider, account_id)
+                .map_err(Into::into)
+        }
+    }
+
+    pub(crate) async fn send_session(
+        &mut self,
+        session_id: &nakode_protocol::SessionId,
+        provider: &str,
+        account_id: Option<&str>,
+        working_directory: &Path,
+        command: BackendCommand,
+    ) -> Result<AccountSelection, SessionBackendError> {
+        let key = (session_id.clone(), provider.to_owned());
+        let selection = self.select_session_account(session_id, provider, account_id)?;
         if !self.session_commands.contains_key(&key) {
             let handle = self
-                .spawn_provider_handle(provider, working_directory)
+                .spawn_provider_handle_for_account(
+                    provider,
+                    Some(&selection.account_id),
+                    working_directory,
+                )
                 .await?;
-            self.insert_session(session_id.clone(), provider.to_owned(), handle);
+            self.insert_session(
+                session_id.clone(),
+                provider.to_owned(),
+                selection.account_id.clone(),
+                handle,
+            );
         }
-        let Some(commands) = self.session_commands.get(&key) else {
-            return Err(BackendError::ProviderUnavailable {
-                provider: provider.to_owned(),
-            }
-            .into());
+        let command_failed = match self.session_commands.get(&key) {
+            Some(commands) => commands.send(command).await.is_err(),
+            None => true,
         };
-        if commands.send(command).await.is_err() {
-            self.session_commands.remove(&key);
+        if command_failed {
+            // A failed first send can leave both the command channel and its task alive. Stop the
+            // whole backend rather than only dropping the sender: otherwise its account remains in
+            // session_accounts and skews least-loaded routing forever.
+            let _ = self.stop_session_backend(key).await;
             return Err(SessionBackendError::CommandChannelClosed {
                 session_id: session_id.clone(),
                 provider: provider.to_owned(),
             });
         }
-        Ok(())
+        Ok(selection)
     }
-
     pub(crate) async fn send_subagent(&self, run_id: &str, command: BackendCommand) -> bool {
         let Some(commands) = self.subagent_commands.get(run_id) else {
             return false;
@@ -2970,6 +3531,10 @@ impl BackendRegistry {
             let _ = self.stop_subagent(&run_id).await;
         }
         self.provider_credentials.remove(provider);
+        if let Some(account_id) = self.default_account_id(provider) {
+            self.provider_account_credentials
+                .remove(&(provider.to_owned(), account_id));
+        }
         if provider == crate::backend::CODEX_PROVIDER {
             self.vision_service = None;
         }
@@ -3063,7 +3628,8 @@ impl EffectExecutor {
         let sessions = self.persistence.sessions.as_ref();
         match effect {
             Effect::Backend(command) => {
-                send_backend_command(session_id, state, &mut self.backends, command).await;
+                send_backend_command(session_id, state, &mut self.backends, sessions, command)
+                    .await;
             }
             Effect::RunShell { id, command } => {
                 self.shell_processes
@@ -3110,6 +3676,124 @@ impl EffectExecutor {
             }
             Effect::AuthenticateProvider(provider) => {
                 authenticate_provider(state, &mut self.backends, &provider).await;
+            }
+            Effect::AddProviderAccount { provider, label } => {
+                if label.trim().is_empty() {
+                    state.session_store_failed("provider account label cannot be empty".to_owned());
+                } else if let Err(error) = sessions.add_provider_account(&provider, label.trim()) {
+                    state.session_store_failed(error.to_string());
+                }
+            }
+            Effect::SetProviderAccountLabel {
+                provider,
+                account_id,
+                label,
+            } => {
+                if let Err(error) =
+                    sessions.set_provider_account_label(&provider, &account_id, label.trim())
+                {
+                    state.session_store_failed(error.to_string());
+                }
+            }
+            Effect::SetProviderAccountEnabled {
+                provider,
+                account_id,
+                enabled,
+            } => {
+                if let Err(error) =
+                    sessions.set_provider_account_enabled(&provider, &account_id, enabled)
+                {
+                    state.session_store_failed(error.to_string());
+                } else {
+                    match sessions.list_providers() {
+                        Ok(providers) => self.backends.update_provider_accounts(&providers),
+                        Err(error) => state.session_store_failed(error.to_string()),
+                    }
+                    if !enabled {
+                        self.backends
+                            .stop_provider_account_control(&provider, &account_id)
+                            .await;
+                    }
+                }
+            }
+            Effect::SetProviderAccountDefault {
+                provider,
+                account_id,
+            } => {
+                if let Err(error) = sessions.set_provider_account_default(&provider, &account_id) {
+                    state.session_store_failed(error.to_string());
+                } else {
+                    match sessions.list_providers() {
+                        Ok(providers) => self.backends.update_provider_accounts(&providers),
+                        Err(error) => state.session_store_failed(error.to_string()),
+                    }
+                    // Legacy provider-control handles are built from the default credential. Drop
+                    // only that catalog/auth handle so established session backends stay pinned.
+                    self.backends.stop_provider_control(&provider).await;
+                }
+            }
+            Effect::RemoveProviderAccount {
+                provider,
+                account_id,
+            } => {
+                if let Err(error) = sessions.remove_provider_account(&provider, &account_id) {
+                    state.session_store_failed(error.to_string());
+                } else {
+                    self.backends
+                        .clear_provider_account_credential(&provider, &account_id)
+                        .await;
+                }
+            }
+            Effect::SaveProviderAccountCredential {
+                provider,
+                account_id,
+                kind,
+                metadata,
+            } => {
+                let credential = Credential {
+                    kind,
+                    secret: SecretValue::new(metadata.clone()),
+                };
+                if let Err(error) =
+                    self.persistence
+                        .credentials
+                        .put_account(&provider, &account_id, &credential)
+                {
+                    state.session_store_failed(error.to_string());
+                } else {
+                    self.backends
+                        .set_provider_account_credential(&provider, &account_id, metadata);
+                }
+            }
+            Effect::ClearProviderAccountCredential {
+                provider,
+                account_id,
+            } => {
+                if let Err(error) = self
+                    .persistence
+                    .credentials
+                    .delete_account(&provider, &account_id)
+                {
+                    state.session_store_failed(error.to_string());
+                } else {
+                    self.backends
+                        .clear_provider_account_credential(&provider, &account_id)
+                        .await;
+                }
+            }
+            Effect::AuthenticateProviderAccount {
+                provider,
+                account_id,
+            } => {
+                self.authenticate_provider_account(state, &provider, &account_id)
+                    .await;
+            }
+            Effect::ReloadProviderAccount {
+                provider,
+                account_id,
+            } => {
+                self.reload_provider_account(state, &provider, &account_id)
+                    .await;
             }
             Effect::SaveProviderCredential {
                 provider,
@@ -3238,6 +3922,66 @@ impl EffectExecutor {
         .await;
     }
 
+    async fn authenticate_provider_account(
+        &mut self,
+        state: &mut DomainState,
+        provider: &str,
+        account_id: &str,
+    ) {
+        if let Err(error) = self
+            .backends
+            .start_provider_account(provider, account_id)
+            .await
+        {
+            state.provider_account_authentication_failed(provider, account_id, &error.to_string());
+            return;
+        }
+        if !self
+            .backends
+            .send_account(provider, account_id, BackendCommand::BeginAuthentication)
+            .await
+        {
+            state.provider_account_authentication_failed(
+                provider,
+                account_id,
+                "provider account authentication channel closed",
+            );
+        }
+    }
+
+    async fn reload_provider_account(
+        &mut self,
+        state: &mut DomainState,
+        provider: &str,
+        account_id: &str,
+    ) {
+        if let Err(error) = self
+            .backends
+            .start_provider_account(provider, account_id)
+            .await
+        {
+            state.provider_account_authentication_failed(provider, account_id, &error.to_string());
+            return;
+        }
+        if !self
+            .backends
+            .send_account(
+                provider,
+                account_id,
+                BackendCommand::Reload {
+                    provider_session_id: None,
+                },
+            )
+            .await
+        {
+            state.provider_account_authentication_failed(
+                provider,
+                account_id,
+                "provider account refresh channel closed",
+            );
+        }
+    }
+
     async fn reload_provider(&mut self, state: &mut DomainState, provider: &str) {
         if let Err(error) = self.backends.start_provider(provider).await {
             state.provider_authentication_failed(provider, &error.to_string());
@@ -3349,6 +4093,7 @@ fn execute_persistence_effect(
     match effect {
         Effect::PersistSession {
             provider,
+            account_id,
             provider_session_id,
             workspace,
             working_directory,
@@ -3359,6 +4104,7 @@ fn execute_persistence_effect(
             state,
             sessions,
             &provider,
+            account_id.as_deref(),
             &provider_session_id,
             &workspace,
             &working_directory,
@@ -3403,6 +4149,7 @@ fn execute_persistence_effect(
         Effect::TransitionSessionPrimary {
             session_id,
             provider,
+            account_id,
             provider_session_id,
             model,
             options,
@@ -3411,6 +4158,7 @@ fn execute_persistence_effect(
             sessions,
             &session_id,
             &provider,
+            account_id.as_deref(),
             &provider_session_id,
             model.as_deref(),
             &options,
@@ -3434,6 +4182,7 @@ fn persist_session(
     state: &mut DomainState,
     sessions: &dyn SessionRepository,
     provider: &str,
+    account_id: Option<&str>,
     provider_session_id: &str,
     workspace: &str,
     working_directory: &str,
@@ -3442,9 +4191,10 @@ fn persist_session(
     options: &crate::backend::ModelOptions,
 ) {
     let enabled_skill_ids = state.enabled_skill_ids();
-    match sessions.create_with_id(
+    match sessions.create_with_account_id(
         &state.nakode_session_id,
         provider,
+        account_id,
         provider_session_id,
         workspace,
         working_directory,
@@ -3509,24 +4259,105 @@ async fn send_backend_command(
     session_id: &nakode_protocol::SessionId,
     state: &mut DomainState,
     backends: &mut BackendRegistry,
+    sessions: &dyn SessionRepository,
     command: BackendCommand,
 ) {
     let provider = state.backend_provider.clone();
-    if let Err(error) = backends
+    let requested_account = state.provider_account_id.clone();
+    let durable_session_id = state
+        .durable_session_id_for_backend()
+        .map(ToOwned::to_owned);
+    let unbound_durable_session = if let Some(durable_session_id) = durable_session_id.as_deref() {
+        match sessions.find(durable_session_id) {
+            Ok(Some(record)) => record.account_id.is_none(),
+            Ok(None) => false,
+            Err(error) => {
+                state.handle_provider_backend(
+                    &provider,
+                    BackendEvent::Disconnected {
+                        reason: format!("could not read provider account affinity: {error}"),
+                    },
+                );
+                return;
+            }
+        }
+    } else {
+        false
+    };
+    if unbound_durable_session && requested_account.is_none() {
+        state.handle_provider_backend(
+            &provider,
+            BackendEvent::Disconnected {
+                reason: "this historical session predates provider account affinity; restart it as a new session with an explicit original-account selection"
+                    .to_owned(),
+            },
+        );
+        return;
+    }
+    let selection = match backends.select_session_account(
+        session_id,
+        &provider,
+        requested_account.as_deref(),
+    ) {
+        Ok(selection) => selection,
+        Err(error) => {
+            state.handle_provider_backend(
+                &provider,
+                BackendEvent::Disconnected {
+                    reason: error.to_string(),
+                },
+            );
+            return;
+        }
+    };
+
+    // A historical durable session can be safely bound only when the caller explicitly identifies
+    // its original account. Never guess from the current least-loaded account: the provider-native
+    // conversation may not be portable across credentials.
+    let needs_affinity = unbound_durable_session;
+    if needs_affinity && let Some(durable_session_id) = durable_session_id.as_deref() {
+        if let Err(error) =
+            sessions.set_session_account(durable_session_id, Some(&selection.account_id))
+        {
+            state.handle_provider_backend(
+                &provider,
+                BackendEvent::Disconnected {
+                    reason: format!("could not persist provider account affinity: {error}"),
+                },
+            );
+            return;
+        }
+        // Keep the in-memory request pinned even if backend startup fails after the durable bind.
+        state.provider_account_id = Some(selection.account_id.clone());
+    }
+    match backends
         .send_session(
             session_id,
             &provider,
+            Some(&selection.account_id),
             Path::new(&state.working_directory),
             command,
         )
         .await
     {
-        state.handle_provider_backend(
-            &provider,
-            BackendEvent::Disconnected {
-                reason: error.to_string(),
-            },
-        );
+        Ok(selection) => {
+            state.provider_account_id = Some(selection.account_id.clone());
+            state.provider_account_routing =
+                Some(nakode_protocol::ProviderAccountRoutingDiagnosticView {
+                    account_id: Some(selection.account_id),
+                    account_label: Some(selection.label),
+                    reason: selection.reason,
+                    cooldown_until_ms: None,
+                });
+        }
+        Err(error) => {
+            state.handle_provider_backend(
+                &provider,
+                BackendEvent::Disconnected {
+                    reason: error.to_string(),
+                },
+            );
+        }
     }
 }
 
@@ -3585,6 +4416,28 @@ struct ProviderCredentialInput {
     metadata: serde_json::Value,
 }
 
+fn ensure_default_provider_account(
+    sessions: &dyn SessionRepository,
+    provider: &str,
+) -> Result<String, SessionError> {
+    let providers = sessions.list_providers()?;
+    let record = providers
+        .iter()
+        .find(|record| record.provider == provider)
+        .ok_or_else(|| SessionError::ProviderNotFound(provider.to_owned()))?;
+    if let Some(account) = record.accounts.iter().find(|account| account.is_default) {
+        return Ok(account.account_id.clone());
+    }
+    if let Some(account) = record.accounts.first() {
+        let account_id = account.account_id.clone();
+        sessions.set_provider_account_default(provider, &account_id)?;
+        return Ok(account_id);
+    }
+    Ok(sessions
+        .add_provider_account(provider, "Default")?
+        .account_id)
+}
+
 async fn save_provider_credential(
     state: &mut DomainState,
     backends: &mut BackendRegistry,
@@ -3597,11 +4450,37 @@ async fn save_provider_credential(
         kind: credential.kind,
         secret: SecretValue::new(credential.metadata.clone()),
     };
-    if let Err(error) = persistence.credentials.put(&credential.provider, &stored) {
+    let account_id = match ensure_default_provider_account(
+        persistence.sessions.as_ref(),
+        &credential.provider,
+    ) {
+        Ok(account_id) => account_id,
+        Err(error) => {
+            state.session_store_failed(error.to_string());
+            return;
+        }
+    };
+    if let Err(error) =
+        persistence
+            .credentials
+            .put_account(&credential.provider, &account_id, &stored)
+    {
         state.session_store_failed(error.to_string());
         return;
     }
-    backends.set_provider_credential(&credential.provider, credential.metadata);
+    let providers = match persistence.sessions.list_providers() {
+        Ok(providers) => providers,
+        Err(error) => {
+            state.session_store_failed(error.to_string());
+            return;
+        }
+    };
+    backends.update_provider_accounts(&providers);
+    backends.set_provider_account_credential(
+        &credential.provider,
+        &account_id,
+        credential.metadata,
+    );
     match origin {
         EffectOrigin::ClientCommand => backends.stop_provider(&credential.provider).await,
         EffectOrigin::ProviderControl | EffectOrigin::PrimarySession | EffectOrigin::Subagent => {
@@ -3839,13 +4718,19 @@ fn transition_session_primary(
     sessions: &dyn SessionRepository,
     id: &str,
     provider: &str,
+    account_id: Option<&str>,
     provider_session_id: &str,
     model: Option<&str>,
     options: &crate::backend::ModelOptions,
 ) {
-    if let Err(error) =
-        sessions.transition_primary(id, provider, provider_session_id, model, options)
-    {
+    if let Err(error) = sessions.transition_primary_with_account(
+        id,
+        provider,
+        account_id,
+        provider_session_id,
+        model,
+        options,
+    ) {
         state.session_store_failed(error.to_string());
     }
 }
@@ -4116,26 +5001,45 @@ async fn load_cached_provider_configuration(
     }
 }
 
+type LoadedProviderCredentials = (
+    HashMap<String, serde_json::Value>,
+    HashMap<(String, String), serde_json::Value>,
+    Vec<(String, String)>,
+);
+
 fn load_provider_credentials(
     providers: &[ProviderRecord],
     credentials: &dyn CredentialStore,
-) -> (HashMap<String, serde_json::Value>, Vec<(String, String)>) {
+) -> LoadedProviderCredentials {
     let mut failures = Vec::new();
-    let loaded = providers
-        .iter()
-        .filter(|provider| provider.credential.is_some())
-        .filter_map(|provider| match credentials.get(&provider.provider) {
-            Ok(Some(credential)) => {
-                Some((provider.provider.clone(), credential.secret.into_inner()))
+    let mut defaults = HashMap::new();
+    let mut accounts = HashMap::new();
+    for provider in providers {
+        for account in provider
+            .accounts
+            .iter()
+            .filter(|account| account.credential.is_some())
+        {
+            match credentials.get_account(&provider.provider, &account.account_id) {
+                Ok(Some(credential)) => {
+                    let secret = credential.secret.into_inner();
+                    accounts.insert(
+                        (provider.provider.clone(), account.account_id.clone()),
+                        secret.clone(),
+                    );
+                    if account.is_default {
+                        defaults.insert(provider.provider.clone(), secret);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => failures.push((
+                    format!("{} account {}", provider.provider, account.account_id),
+                    error.to_string(),
+                )),
             }
-            Ok(None) => None,
-            Err(error) => {
-                failures.push((provider.provider.clone(), error.to_string()));
-                None
-            }
-        })
-        .collect();
-    (loaded, failures)
+        }
+    }
+    (defaults, accounts, failures)
 }
 
 fn shared_web_config(
@@ -4166,21 +5070,6 @@ fn read_shared_config<T: Clone + Default>(shared: &RwLock<T>) -> T {
     shared
         .read()
         .map_or_else(|_| T::default(), |config| config.clone())
-}
-
-fn is_fatal_provider_error(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "quota has been exhausted",
-        "usage quota",
-        "resource_exhausted",
-        "invalid api key",
-        "invalid credential",
-        "authentication failed",
-        "unauthenticated",
-    ]
-    .iter()
-    .any(|pattern| message.contains(pattern))
 }
 
 fn summarize_provider_error(message: &str) -> String {
@@ -4220,7 +5109,7 @@ mod tests {
     use crate::{
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendHandle, BackendIdentity,
-            CODEX_PROVIDER, DEVIN_PROVIDER, ModelInfo,
+            CODEX_PROVIDER, DEVIN_PROVIDER, ModelInfo, ProviderFailureClassification,
         },
         config::{Config, OpenAiReasoningEffort},
         credential::{CredentialStore, SqliteCredentialStore},
@@ -4228,12 +5117,15 @@ mod tests {
         service::ServiceEngine,
         session::{
             BridgeInboundTurnOriginRecord, BridgePendingInboundRecord, InvocationRecord,
-            SessionBridgeRecord, SessionRepository, SqliteSessionRepository, SubagentObservability,
-            SubagentRecord,
+            ProviderAccountRecord, SessionBridgeRecord, SessionRepository, SqliteSessionRepository,
+            SubagentObservability, SubagentRecord,
         },
         skill::{SkillCatalog, SkillPreference},
         state::{DomainState, Effect, SubagentStatus},
     };
+
+    const CODEX_TEST_ACCOUNT_ID: &str = "codex-test-account";
+    const CLAUDE_TEST_ACCOUNT_ID: &str = "claude-test-account";
 
     fn provider(provider: &str, enabled: bool, credential: bool) -> crate::session::ProviderRecord {
         crate::session::ProviderRecord {
@@ -4242,9 +5134,11 @@ mod tests {
             enabled,
             credential: credential.then(|| crate::credential::CredentialMetadata {
                 provider: provider.to_owned(),
+                account_id: format!("{provider}-test-account"),
                 kind: "api-key".to_owned(),
                 updated_at: 1,
             }),
+            accounts: Vec::new(),
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
         }
@@ -4496,6 +5390,8 @@ mod tests {
             super::BackendRegistrySpawn {
                 session_database: workspace.join("sessions.sqlite3"),
                 provider_credentials: HashMap::new(),
+                provider_account_credentials: HashMap::new(),
+                provider_accounts: HashMap::new(),
                 web_config,
                 memory_config,
                 vision_config,
@@ -4505,6 +5401,171 @@ mod tests {
         .await
     }
 
+    fn routing_account(
+        provider: &str,
+        account_id: &str,
+        label: &str,
+        enabled: bool,
+        is_default: bool,
+        routing_mode: nakode_protocol::ProviderAccountRoutingMode,
+    ) -> ProviderAccountRecord {
+        ProviderAccountRecord {
+            account_id: account_id.to_owned(),
+            provider: provider.to_owned(),
+            label: label.to_owned(),
+            enabled,
+            is_default,
+            identity: None,
+            credential: None,
+            created_at: 1,
+            updated_at: 1,
+            routing_mode,
+        }
+    }
+
+    #[tokio::test]
+    async fn account_routing_is_deterministic_sticky_and_filters_ineligible_accounts() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let automatic = nakode_protocol::ProviderAccountRoutingMode::Automatic;
+        let accounts = vec![
+            routing_account(CODEX_PROVIDER, "account-a", "A", true, true, automatic),
+            routing_account(CODEX_PROVIDER, "account-b", "B", true, false, automatic),
+            routing_account(
+                CODEX_PROVIDER,
+                "disabled",
+                "Disabled",
+                false,
+                false,
+                automatic,
+            ),
+        ];
+        registry
+            .provider_accounts
+            .insert(CODEX_PROVIDER.to_owned(), accounts);
+        for account_id in ["account-a", "account-b", "disabled"] {
+            registry.provider_account_credentials.insert(
+                (CODEX_PROVIDER.to_owned(), account_id.to_owned()),
+                serde_json::json!({"fixture": account_id}),
+            );
+        }
+
+        let first = registry
+            .select_account(CODEX_PROVIDER, None)
+            .expect("first selection");
+        assert_eq!(first.account_id, "account-a");
+        assert_eq!(first.reason, "preferred account tie-break");
+        registry.session_accounts.insert(
+            (SessionId::from("session-one"), CODEX_PROVIDER.to_owned()),
+            first.account_id,
+        );
+        let second = registry
+            .select_account(CODEX_PROVIDER, None)
+            .expect("balanced selection");
+        assert_eq!(second.account_id, "account-b");
+        registry.session_accounts.insert(
+            (SessionId::from("session-two"), CODEX_PROVIDER.to_owned()),
+            second.account_id,
+        );
+        let stable_tie = registry
+            .select_account(CODEX_PROVIDER, None)
+            .expect("stable tie");
+        assert_eq!(stable_tie.account_id, "account-a");
+        let explicit = registry
+            .select_account(CODEX_PROVIDER, Some("account-b"))
+            .expect("explicit selection");
+        assert_eq!(explicit.account_id, "account-b");
+        assert_eq!(explicit.reason, "explicit override");
+        assert!(
+            registry
+                .select_account(CODEX_PROVIDER, Some("disabled"))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_local_cooldown_does_not_disable_peer_account() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let automatic = nakode_protocol::ProviderAccountRoutingMode::Automatic;
+        registry.provider_accounts.insert(
+            CODEX_PROVIDER.to_owned(),
+            vec![
+                routing_account(CODEX_PROVIDER, "cooling", "Cooling", true, true, automatic),
+                routing_account(CODEX_PROVIDER, "healthy", "Healthy", true, false, automatic),
+            ],
+        );
+        for account_id in ["cooling", "healthy"] {
+            registry.provider_account_credentials.insert(
+                (CODEX_PROVIDER.to_owned(), account_id.to_owned()),
+                serde_json::json!({"fixture": account_id}),
+            );
+        }
+        registry.provider_cooldowns.insert(
+            (CODEX_PROVIDER.to_owned(), "cooling".to_owned()),
+            super::ProviderCooldown {
+                until: Instant::now() + Duration::from_secs(60),
+                reason: "rate limited; retry later".to_owned(),
+            },
+        );
+        let selected = registry
+            .select_account(CODEX_PROVIDER, None)
+            .expect("healthy peer");
+        assert_eq!(selected.account_id, "healthy");
+        assert!(
+            registry
+                .select_account(CODEX_PROVIDER, Some("cooling"))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_failure_cooldown_is_account_local_and_bounded() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let source = BackendSource::Primary {
+            session_id: SessionId::from("session-one"),
+            provider: CODEX_PROVIDER.to_owned(),
+            account_id: "cooling".to_owned(),
+        };
+
+        let cooling_health = registry.observe_provider_event(
+            &source,
+            &BackendEvent::ProviderFailure {
+                classification: ProviderFailureClassification::RateLimit,
+                retry_after: Some(Duration::from_secs(60 * 60)),
+                message: "rate limited".to_owned(),
+            },
+        );
+        let cooldown = registry
+            .active_cooldown(CODEX_PROVIDER, "cooling")
+            .expect("account is cooling");
+        assert!(cooldown.0 <= 15 * 60);
+        assert_eq!(
+            cooling_health.expect("health projection").2.state,
+            nakode_protocol::ProviderAccountHealthState::RateLimited
+        );
+
+        let healthy_source = BackendSource::Primary {
+            session_id: SessionId::from("session-two"),
+            provider: CODEX_PROVIDER.to_owned(),
+            account_id: "healthy".to_owned(),
+        };
+        let provider_health = registry.observe_provider_event(
+            &healthy_source,
+            &BackendEvent::ProviderFailure {
+                classification: ProviderFailureClassification::Model,
+                retry_after: Some(Duration::from_secs(60)),
+                message: "model not found".to_owned(),
+            },
+        );
+        assert!(provider_health.is_none());
+        assert!(
+            registry
+                .active_cooldown(CODEX_PROVIDER, "healthy")
+                .is_none()
+        );
+    }
     #[tokio::test]
     async fn builtin_availability_requires_addon_enablement_and_runtime_readiness() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -4582,6 +5643,147 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn failed_initial_session_send_removes_backend_and_account_reservation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let (provider_commands, _provider_events) = mpsc::channel(1);
+        registry
+            .commands
+            .insert(CODEX_PROVIDER.to_owned(), provider_commands);
+
+        let session_id = SessionId::from("failed-initial-send");
+        let (backend, command_rx, _event_tx) = fake_backend();
+        drop(command_rx);
+        registry.insert_session(
+            session_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            backend,
+        );
+
+        let error = registry
+            .send_session(
+                &session_id,
+                CODEX_PROVIDER,
+                None,
+                Path::new("/tmp"),
+                BackendCommand::Shutdown,
+            )
+            .await
+            .expect_err("closed initial backend channel must fail");
+        assert!(matches!(
+            error,
+            super::SessionBackendError::CommandChannelClosed { .. }
+        ));
+        let key = (session_id, CODEX_PROVIDER.to_owned());
+        assert!(!registry.session_commands.contains_key(&key));
+        assert!(!registry.session_accounts.contains_key(&key));
+        assert!(!registry.session_tasks.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn historical_session_is_not_routed_until_its_account_is_explicitly_identified() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let record = persistence
+            .sessions
+            .create(
+                CODEX_PROVIDER,
+                "provider-session-legacy",
+                workspace.path().to_str().expect("utf8 workspace"),
+                "Legacy session",
+                None,
+            )
+            .expect("legacy session");
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        state.session_id = Some(record.id.clone());
+
+        let mut registry = empty_registry(workspace.path()).await;
+        registry.provider_accounts.insert(
+            CODEX_PROVIDER.to_owned(),
+            vec![routing_account(
+                CODEX_PROVIDER,
+                CODEX_TEST_ACCOUNT_ID,
+                "Codex test",
+                true,
+                true,
+                nakode_protocol::ProviderAccountRoutingMode::Automatic,
+            )],
+        );
+        registry.provider_account_credentials.insert(
+            (CODEX_PROVIDER.to_owned(), CODEX_TEST_ACCOUNT_ID.to_owned()),
+            serde_json::json!({"fixture": "legacy"}),
+        );
+        let (provider_commands, _provider_events) = mpsc::channel(1);
+        registry
+            .commands
+            .insert(CODEX_PROVIDER.to_owned(), provider_commands);
+        let (backend_commands, mut received) = mpsc::channel(1);
+        registry.session_commands.insert(
+            (
+                SessionId::from(record.id.clone()),
+                CODEX_PROVIDER.to_owned(),
+            ),
+            backend_commands,
+        );
+
+        super::send_backend_command(
+            &SessionId::from(record.id.clone()),
+            &mut state,
+            &mut registry,
+            persistence.sessions.as_ref(),
+            BackendCommand::Shutdown,
+        )
+        .await;
+
+        assert_eq!(
+            persistence
+                .sessions
+                .find(&record.id)
+                .expect("read session")
+                .expect("session")
+                .account_id,
+            None
+        );
+        assert!(received.try_recv().is_err());
+        assert!(
+            state
+                .status_message
+                .contains("predates provider account affinity")
+        );
+
+        state.set_provider_account_override(Some(CODEX_TEST_ACCOUNT_ID.to_owned()));
+        super::send_backend_command(
+            &SessionId::from(record.id.clone()),
+            &mut state,
+            &mut registry,
+            persistence.sessions.as_ref(),
+            BackendCommand::Shutdown,
+        )
+        .await;
+
+        assert_eq!(
+            persistence
+                .sessions
+                .find(&record.id)
+                .expect("read session")
+                .expect("session")
+                .account_id
+                .as_deref(),
+            Some(CODEX_TEST_ACCOUNT_ID)
+        );
+        assert!(matches!(
+            received.recv().await,
+            Some(BackendCommand::Shutdown)
+        ));
+    }
     #[tokio::test]
     async fn running_workspace_synchronizes_shared_provider_enablement() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -4709,6 +5911,7 @@ mod tests {
             mcp_grant: None,
             profile_id: Some(profile_id.to_owned()),
             disabled_skill_ids: Vec::new(),
+            account_id: None,
         }
     }
 
@@ -5348,6 +6551,7 @@ mod tests {
                     mcp_grant: None,
                     profile_id: None,
                     disabled_skill_ids: Vec::new(),
+                    account_id: None,
                 },
             )
             .await
@@ -5386,6 +6590,7 @@ mod tests {
                 source: BackendSource::Primary {
                     session_id: session_id.clone(),
                     provider: CODEX_PROVIDER.to_owned(),
+                    account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
                 },
                 session_id: session_id.clone(),
                 run_id: None,
@@ -5411,6 +6616,7 @@ mod tests {
                 source: BackendSource::Primary {
                     session_id: deleted_id.clone(),
                     provider: CODEX_PROVIDER.to_owned(),
+                    account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
                 },
                 session_id: deleted_id.clone(),
                 run_id: None,
@@ -5483,6 +6689,7 @@ mod tests {
         registry.insert_session(
             session_id.clone(),
             CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
             BackendHandle::new(commands, events, stalled_task),
         );
         let effects = EffectExecutor::new(registry, persistence);
@@ -5627,6 +6834,7 @@ mod tests {
         registry.insert_session(
             session_id.clone(),
             CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
             BackendHandle::new(commands, events, terminal_task),
         );
         let (subagent_commands, mut subagent_command_rx) = mpsc::channel(8);
@@ -6078,6 +7286,7 @@ mod tests {
                 BackendSource::Primary {
                     session_id: session_id.clone(),
                     provider: CODEX_PROVIDER.to_owned(),
+                    account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
                 },
                 BackendEvent::TurnStarted {
                     turn_id: "provider-generated-turn".to_owned(),
@@ -6112,6 +7321,7 @@ mod tests {
                 BackendSource::Primary {
                     session_id: session_id.clone(),
                     provider: CODEX_PROVIDER.to_owned(),
+                    account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
                 },
                 BackendEvent::TurnCompleted {
                     turn_id: "provider-generated-turn".to_owned(),
@@ -6311,6 +7521,7 @@ mod tests {
             .send_session(
                 session_id,
                 CODEX_PROVIDER,
+                None,
                 Path::new("/tmp"),
                 BackendCommand::StartSession {
                     model: Some(model.to_owned()),
@@ -6345,6 +7556,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn same_provider_session_handles_dispatch_and_attribute_independently() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -6358,13 +7570,24 @@ mod tests {
         let second_id = SessionId::from("session-second");
         let (first, mut first_commands, first_events) = fake_backend();
         let (second, mut second_commands, second_events) = fake_backend();
-        registry.insert_session(first_id.clone(), CODEX_PROVIDER.to_owned(), first);
-        registry.insert_session(second_id.clone(), CODEX_PROVIDER.to_owned(), second);
+        registry.insert_session(
+            first_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            first,
+        );
+        registry.insert_session(
+            second_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            second,
+        );
 
         registry
             .send_session(
                 &first_id,
                 CODEX_PROVIDER,
+                None,
                 Path::new("/tmp/first"),
                 BackendCommand::StartSession {
                     model: Some("model-first".to_owned()),
@@ -6386,6 +7609,7 @@ mod tests {
             .send_session(
                 &second_id,
                 CODEX_PROVIDER,
+                None,
                 Path::new("/tmp/second"),
                 BackendCommand::StartSession {
                     model: Some("model-second".to_owned()),
@@ -6444,6 +7668,7 @@ mod tests {
             let BackendSource::Primary {
                 session_id,
                 provider,
+                ..
             } = source
             else {
                 panic!("session adapters must emit primary events");
@@ -6466,8 +7691,18 @@ mod tests {
         let second_id = SessionId::from("session-second");
         let (first, mut first_commands, _first_events) = fake_backend();
         let (second, mut second_commands, _second_events) = fake_backend();
-        registry.insert_session(first_id, CODEX_PROVIDER.to_owned(), first);
-        registry.insert_session(second_id, CODEX_PROVIDER.to_owned(), second);
+        registry.insert_session(
+            first_id,
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            first,
+        );
+        registry.insert_session(
+            second_id,
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            second,
+        );
 
         registry.stop_provider(CODEX_PROVIDER).await;
 
@@ -6516,13 +7751,24 @@ mod tests {
         let (codex, mut codex_commands, _codex_events) = fake_backend();
         let (claude, mut claude_commands, _claude_events) = fake_backend();
         let (kept, mut kept_commands, _kept_events) = fake_backend();
-        registry.insert_session(doomed.clone(), CODEX_PROVIDER.to_owned(), codex);
+        registry.insert_session(
+            doomed.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            codex,
+        );
         registry.insert_session(
             doomed.clone(),
             crate::backend::CLAUDE_PROVIDER.to_owned(),
+            CLAUDE_TEST_ACCOUNT_ID.to_owned(),
             claude,
         );
-        registry.insert_session(survivor.clone(), CODEX_PROVIDER.to_owned(), kept);
+        registry.insert_session(
+            survivor.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            kept,
+        );
 
         registry
             .stop_session(&doomed)
@@ -6565,7 +7811,12 @@ mod tests {
         let mut registry = empty_registry(workspace.path()).await;
         let absent = SessionId::from("deleted-before-effects");
         let (backend, mut commands, _events) = fake_backend();
-        registry.insert_session(absent.clone(), CODEX_PROVIDER.to_owned(), backend);
+        registry.insert_session(
+            absent.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            backend,
+        );
         let effects = EffectExecutor::new(registry, persistence);
         let state = DomainState::new_for_backend(
             workspace.path().to_string_lossy(),
@@ -6637,7 +7888,12 @@ mod tests {
         for cycle in 0..12 {
             let session_id = SessionId::from(format!("session-{cycle}"));
             let (handle, commands, events) = fake_backend();
-            registry.insert_session(session_id.clone(), CODEX_PROVIDER.to_owned(), handle);
+            registry.insert_session(
+                session_id.clone(),
+                CODEX_PROVIDER.to_owned(),
+                CODEX_TEST_ACCOUNT_ID.to_owned(),
+                handle,
+            );
             registry
                 .stop_session(&session_id)
                 .await
@@ -6652,6 +7908,7 @@ mod tests {
         registry.insert_session(
             SessionId::from("session-last"),
             CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
             handle,
         );
 
@@ -6660,6 +7917,96 @@ mod tests {
             "supervisor handles accumulated across session churn: {} handles",
             registry.tasks.len()
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_provider_credential_save_creates_a_durable_default_account() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, credentials) = test_persistence(workspace.path());
+        let mut registry = empty_registry(workspace.path()).await;
+        let provider = crate::backend::CLAUDE_PROVIDER;
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            provider,
+            "Claude",
+        );
+        let mut pending = VecDeque::new();
+
+        save_provider_credential(
+            &mut state,
+            &mut registry,
+            &persistence,
+            &mut pending,
+            ProviderCredentialInput {
+                provider: provider.to_owned(),
+                kind: "api_key".to_owned(),
+                metadata: serde_json::json!({"api_key": "fresh-provider-secret"}),
+            },
+            EffectOrigin::ProviderControl,
+        )
+        .await;
+
+        let provider_record = persistence
+            .sessions
+            .list_providers()
+            .expect("list providers")
+            .into_iter()
+            .find(|record| record.provider == provider)
+            .expect("provider");
+        assert_eq!(provider_record.accounts.len(), 1);
+        let account = &provider_record.accounts[0];
+        assert!(account.is_default);
+        assert_eq!(account.label, "Default");
+        assert_eq!(
+            account.credential.as_ref().map(|value| value.kind.as_str()),
+            Some("api_key")
+        );
+        let saved = credentials
+            .get(provider)
+            .expect("load default credential")
+            .expect("default credential");
+        assert_eq!(
+            saved.secret.expose(),
+            &serde_json::json!({"api_key": "fresh-provider-secret"})
+        );
+        assert!(matches!(
+            pending.front(),
+            Some(Effect::SetProviderEnabled { provider: saved_provider, enabled: true })
+                if saved_provider == provider
+        ));
+    }
+
+    #[tokio::test]
+    async fn changing_default_rebinds_control_without_stopping_sticky_sessions() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        registry
+            .commands
+            .insert(CODEX_PROVIDER.to_owned(), control_tx);
+        let session_id = SessionId::from("session-sticky");
+        let (handle, mut session_commands, _events) = fake_backend();
+        registry.insert_session(
+            session_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            handle,
+        );
+
+        registry.stop_provider_control(CODEX_PROVIDER).await;
+
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(BackendCommand::Shutdown)
+        ));
+        assert!(
+            registry
+                .session_commands
+                .contains_key(&(session_id, CODEX_PROVIDER.to_owned()))
+        );
+        assert!(session_commands.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -6675,8 +8022,18 @@ mod tests {
         let second_id = SessionId::from("session-second");
         let (first, mut first_commands, _first_events) = fake_backend();
         let (second, mut second_commands, _second_events) = fake_backend();
-        registry.insert_session(first_id.clone(), CODEX_PROVIDER.to_owned(), first);
-        registry.insert_session(second_id.clone(), CODEX_PROVIDER.to_owned(), second);
+        registry.insert_session(
+            first_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            first,
+        );
+        registry.insert_session(
+            second_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            second,
+        );
         let mut state = DomainState::new_for_backend(
             workspace.path().to_string_lossy(),
             None,
@@ -6812,6 +8169,7 @@ mod tests {
                 BackendSource::Primary {
                     session_id: first_id.clone(),
                     provider: CODEX_PROVIDER.to_owned(),
+                    account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
                 },
                 BackendEvent::Warning("first-only warning".to_owned()),
             )
@@ -6821,6 +8179,7 @@ mod tests {
                 BackendSource::Primary {
                     session_id: second_id.clone(),
                     provider: CODEX_PROVIDER.to_owned(),
+                    account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
                 },
                 BackendEvent::Warning("second-only warning".to_owned()),
             )

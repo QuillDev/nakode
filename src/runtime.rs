@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::backend::{
     BackendEvent, CompactionReason, DeltaKind, ItemKind, ItemStatus, NormalizedItem,
-    PromptAttachment, SessionHistoryItem, TodoPhase,
+    PromptAttachment, ProviderFailureClassification, SessionHistoryItem, TodoPhase,
 };
 use crate::tools::{ToolConcurrency, ToolRegistry, model_facing_output, prepare_and_validate};
 
@@ -182,6 +182,8 @@ pub struct InferenceOutput {
 pub struct InferenceFailure {
     pub message: String,
     pub retry_count: usize,
+    pub classification: Option<ProviderFailureClassification>,
+    pub retry_after: Option<Duration>,
 }
 
 #[derive(Debug, Error)]
@@ -204,7 +206,20 @@ impl InferenceFailure {
         Self {
             message: message.into(),
             retry_count,
+            classification: None,
+            retry_after: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_provider_failure(
+        mut self,
+        classification: ProviderFailureClassification,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        self.classification = Some(classification);
+        self.retry_after = retry_after;
+        self
     }
 }
 
@@ -805,6 +820,7 @@ impl AgentRuntime {
         let result = inference
             .await
             .map_err(|error| format!("inference task failed: {error}"))?;
+        report_provider_failure(backend_events, &result).await?;
         let (output_bytes, tool_call_count, retry_count, usage, response_id, error) = match &result
         {
             Ok(output) => (
@@ -887,7 +903,9 @@ impl AgentRuntime {
             .await
             .map_err(|_| "backend event receiver closed".to_owned())?;
 
-        let result = self.compact_history(session, cancellation).await;
+        let result = self
+            .compact_history(session, cancellation, backend_events)
+            .await;
         let estimated_tokens_after = result
             .as_ref()
             .ok()
@@ -925,6 +943,7 @@ impl AgentRuntime {
         &self,
         session: &mut RuntimeSession,
         cancellation: &CancellationToken,
+        backend_events: &mpsc::Sender<BackendEvent>,
     ) -> Result<(), String> {
         let Some(cut_index) = compaction_cut_index(&session.history) else {
             return Err("not enough completed context is available to compact".to_owned());
@@ -955,6 +974,7 @@ impl AgentRuntime {
             .provider
             .infer(request, events, cancellation.clone())
             .await;
+        report_provider_failure(backend_events, &result).await?;
         drain
             .await
             .map_err(|error| format!("compaction event task failed: {error}"))?;
@@ -2027,6 +2047,24 @@ fn crossed_failure_warning_threshold(previous: usize, current: usize) -> bool {
             && previous / TOOL_FAILURE_WARNING_INTERVAL < current / TOOL_FAILURE_WARNING_INTERVAL)
 }
 
+async fn report_provider_failure(
+    backend_events: &mpsc::Sender<BackendEvent>,
+    result: &Result<InferenceOutput, InferenceFailure>,
+) -> Result<(), String> {
+    let Err(error) = result else { return Ok(()) };
+    let Some(classification) = error.classification else {
+        return Ok(());
+    };
+    backend_events
+        .send(BackendEvent::ProviderFailure {
+            classification,
+            retry_after: error.retry_after,
+            message: error.message.clone(),
+        })
+        .await
+        .map_err(|_| "backend event receiver closed".to_owned())
+}
+
 async fn send_context_usage(
     session: &RuntimeSession,
     backend_events: &mpsc::Sender<BackendEvent>,
@@ -2421,21 +2459,25 @@ impl RuntimeSessionStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use serde_json::{Value, json};
 
     use super::{
-        AgentRuntime, ConversationItem, ExecutedTool, InferenceEvent, InferenceFuture,
-        InferenceOutput, InferenceProvider, InferenceRequest, QuestionBroker, RuntimeSession,
-        RuntimeSessionStore, RuntimeToolAudit, ToolCall, normalize_history_item,
+        AgentRuntime, ConversationItem, ExecutedTool, InferenceEvent, InferenceFailure,
+        InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest, QuestionBroker,
+        RuntimeSession, RuntimeSessionStore, RuntimeToolAudit, ToolCall, normalize_history_item,
         record_tool_result, runtime_tool_audit,
     };
     use crate::backend::{
-        BackendEvent, CompactionReason, ItemKind, QuestionOption, QuestionRequest,
+        BackendEvent, CompactionReason, ItemKind, ProviderFailureClassification, QuestionOption,
+        QuestionRequest,
     };
     use crate::session::SqliteSessionRepository;
     use crate::tools::{
@@ -2638,6 +2680,7 @@ mod tests {
     }
 
     struct AlwaysFailTool;
+    struct ClassifiedFailureProvider;
 
     impl Tool for AlwaysFailTool {
         fn definition(&self) -> super::ToolDefinition {
@@ -2780,6 +2823,23 @@ mod tests {
         }
     }
 
+    impl InferenceProvider for ClassifiedFailureProvider {
+        fn infer(
+            &self,
+            _request: InferenceRequest,
+            _events: mpsc::Sender<InferenceEvent>,
+            _cancellation: CancellationToken,
+        ) -> InferenceFuture<'_> {
+            Box::pin(async {
+                Err(
+                    InferenceFailure::new("quota exhausted", 0).with_provider_failure(
+                        ProviderFailureClassification::Quota,
+                        Some(Duration::from_secs(60)),
+                    ),
+                )
+            })
+        }
+    }
     impl InferenceProvider for FailedCompactionProvider {
         fn infer(
             &self,
@@ -3526,6 +3586,45 @@ mod tests {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
+    #[tokio::test]
+    async fn runtime_emits_normalized_provider_failure_metadata() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let runtime = AgentRuntime::new(
+            directory.path().to_path_buf(),
+            Arc::new(ClassifiedFailureProvider),
+        );
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        let (events, mut receiver) = mpsc::channel(16);
+
+        let error = runtime
+            .run_turn(
+                &mut session,
+                "classified-turn",
+                "Try inference.".to_owned(),
+                Vec::new(),
+                &events,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("provider failure");
+        assert_eq!(error.to_string(), "quota exhausted");
+        drop(events);
+        let mut provider_failure = None;
+        while let Some(event) = receiver.recv().await {
+            if let BackendEvent::ProviderFailure { .. } = event {
+                provider_failure = Some(event);
+                break;
+            }
+        }
+        assert!(matches!(
+            provider_failure,
+            Some(BackendEvent::ProviderFailure {
+                classification: ProviderFailureClassification::Quota,
+                retry_after: Some(duration),
+                ..
+            }) if duration == Duration::from_secs(60)
+        ));
+    }
     #[tokio::test]
     async fn repeated_tool_failures_warn_without_stopping_the_turn() {
         let directory = tempfile::tempdir().expect("workspace");

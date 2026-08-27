@@ -32,7 +32,7 @@ use crate::{
     },
     domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
     memory::MemoryBackend,
-    session::{ProviderRecord, SessionRecord},
+    session::{ProviderAccountRecord, ProviderRecord, SessionRecord},
     settings::TerminalImageMode,
     web::WebBackend,
 };
@@ -78,6 +78,8 @@ pub fn bootstrap(
                 last_owner_activity_at_ms: 0,
                 owned_provider_sessions: owned_provider_sessions(state),
                 running: state.is_busy(),
+                selected_account_id: state.provider_account_id.clone(),
+                routing_diagnostic: state.provider_account_routing.clone(),
             },
         );
     }
@@ -238,6 +240,8 @@ fn session_view(
         diagnostic_count: u64::try_from(state.diagnostic_count).unwrap_or(u64::MAX),
         activity: activity(state),
         selected_provider_id: provider,
+        selected_account_id: state.provider_account_id.clone(),
+        routing_diagnostic: state.provider_account_routing.clone(),
         selected_model_id: state.selected_model.clone().map(ModelId::from),
         selected_model_options: ProtocolModelOptions {
             reasoning_effort: selected_options.reasoning_effort,
@@ -355,6 +359,7 @@ fn agent_session_view(
             &format!("{}:{}:primary", session_id.as_str(), provider_id.as_str()),
         )),
         provider_id: provider_id.clone(),
+        account_id: state.provider_account_id.clone(),
         model_id: state.selected_model.clone().map(ModelId::from),
         role: "primary".to_owned(),
         capabilities: capabilities_view(&state.backend_capabilities),
@@ -1274,6 +1279,62 @@ fn supported_builtin_tools(provider: &str) -> Vec<String> {
         .collect()
 }
 
+fn provider_account_view(
+    state: &DomainState,
+    account: &ProviderAccountRecord,
+) -> nakode_protocol::ProviderAccountView {
+    nakode_protocol::ProviderAccountView {
+        account_id: account.account_id.clone(),
+        label: account.label.clone(),
+        enabled: account.enabled,
+        is_default: account.is_default,
+        identity: account.identity.clone(),
+        credential_configured: account.credential.is_some(),
+        credential_kind: account
+            .credential
+            .as_ref()
+            .map(|credential| credential.kind.clone()),
+        created_at_ms: u64::try_from(account.created_at)
+            .unwrap_or_default()
+            .saturating_mul(1_000),
+        updated_at_ms: u64::try_from(account.updated_at)
+            .unwrap_or_default()
+            .saturating_mul(1_000),
+        routing_mode: account.routing_mode,
+        health: state
+            .provider_account_health
+            .get(&(account.provider.clone(), account.account_id.clone()))
+            .cloned()
+            .or_else(|| {
+                Some(nakode_protocol::ProviderAccountHealthView {
+                    state: if account.credential.is_some() {
+                        nakode_protocol::ProviderAccountHealthState::Unknown
+                    } else {
+                        nakode_protocol::ProviderAccountHealthState::AuthenticationRequired
+                    },
+                    safe_reason: account
+                        .credential
+                        .is_none()
+                        .then(|| "authentication is required".to_owned()),
+                    cooldown_until_ms: None,
+                })
+            }),
+        authentication: state
+            .provider_account_authentication
+            .get(&(account.provider.clone(), account.account_id.clone()))
+            .map(authentication_view)
+            .or_else(|| {
+                (account.credential.is_none())
+                    .then(|| crate::backend::api_key_provider_setup(&account.provider))
+                    .flatten()
+                    .map(|setup| ProviderAuthenticationView::ApiKeyRequired {
+                        dashboard_url: setup.dashboard_url.to_owned(),
+                        credential_kind: setup.credential_kind.to_owned(),
+                    })
+            }),
+    }
+}
+
 fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView {
     let connection = state.provider_connection(&provider.provider).map_or_else(
         || {
@@ -1329,6 +1390,11 @@ fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView
         available_builtin_tools: state
             .available_builtin_tools(&provider.provider)
             .map(<[String]>::to_vec),
+        accounts: provider
+            .accounts
+            .iter()
+            .map(|account| provider_account_view(state, account))
+            .collect(),
     }
 }
 
@@ -1943,6 +2009,8 @@ pub(crate) fn active_session_summary(
             .map_or(0, unix_seconds_to_milliseconds),
         owned_provider_sessions: owned_provider_sessions(state),
         running: activity(state) != SessionActivity::Idle,
+        selected_account_id: state.provider_account_id.clone(),
+        routing_diagnostic: state.provider_account_routing.clone(),
     })
 }
 
@@ -1971,6 +2039,15 @@ fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> Sessi
         ))
         .collect(),
         running: false,
+        selected_account_id: session.account_id.clone(),
+        routing_diagnostic: session.account_id.as_ref().map(|account_id| {
+            nakode_protocol::ProviderAccountRoutingDiagnosticView {
+                account_id: Some(account_id.clone()),
+                account_label: None,
+                reason: "persisted session affinity".to_owned(),
+                cooldown_until_ms: None,
+            }
+        }),
     }
 }
 
@@ -2208,6 +2285,7 @@ mod tests {
             credential: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         };
         let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
         state.install_vision_config(crate::vision::VisionConfig {
@@ -2230,6 +2308,7 @@ mod tests {
             credential: None,
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
+            accounts: Vec::new(),
         };
         assert_eq!(
             vision_settings_view(&state, &[cursor_provider]).availability,
@@ -2338,6 +2417,7 @@ mod tests {
                     format!("{CODEX_PROVIDER}/visible"),
                     format!("{CODEX_PROVIDER}/stale"),
                 ],
+                accounts: Vec::new(),
             },
             ProviderRecord {
                 provider: CLAUDE_PROVIDER.to_owned(),
@@ -2346,6 +2426,7 @@ mod tests {
                 credential: None,
                 model_filter_enabled: false,
                 selected_model_ids: Vec::new(),
+                accounts: Vec::new(),
             },
         ];
 
@@ -2389,6 +2470,7 @@ mod tests {
                 credential: None,
                 model_filter_enabled: true,
                 selected_model_ids,
+                accounts: Vec::new(),
             }];
             let view = bootstrap(&state, 1, &providers, &[]);
             assert_eq!(
