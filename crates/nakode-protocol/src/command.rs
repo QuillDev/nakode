@@ -168,6 +168,10 @@ pub struct ExternalToolDefinition {
 pub struct SessionToolConfiguration {
     pub tools: Vec<ExternalToolDefinition>,
     pub replace_builtin_tools: bool,
+    /// When true, the model sees only the synthesized `codemode` tool. Nested operations still use
+    /// this canonical tool boundary.
+    #[serde(default)]
+    pub code_mode: bool,
     /// Non-empty canonical Nakode builtin names allowed for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_builtin_tools: Option<Vec<String>>,
@@ -419,6 +423,11 @@ pub enum Command {
         session_id: SessionId,
         tools: Vec<ExternalToolDefinition>,
         replace_builtin_tools: bool,
+    },
+    /// Changes the model-facing tool surface at an idle turn boundary.
+    SetSessionCodeMode {
+        session_id: SessionId,
+        enabled: bool,
     },
     SubmitExternalToolResult {
         session_id: SessionId,

@@ -630,6 +630,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             instructions,
             external_tools,
             replace_builtin_tools,
+            code_mode,
             allowed_builtin_tools,
             max_turns,
             finalization_reserve_turns,
@@ -646,6 +647,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                 enabled_skill_ids,
                 external_tools,
                 replace_builtin_tools,
+                code_mode,
                 allowed_builtin_tools,
                 max_turns,
                 finalization_reserve_turns,
@@ -660,6 +662,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
             enabled_skill_ids,
             external_tools,
             replace_builtin_tools,
+            code_mode,
             allowed_builtin_tools,
             max_turns,
             timeout_seconds,
@@ -670,6 +673,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                         &provider_session_id,
                         external_tools,
                         replace_builtin_tools,
+                        code_mode,
                         allowed_builtin_tools,
                         max_turns,
                         0,
@@ -709,6 +713,16 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                 model,
             ) {
                 request_failed(context.events, BackendOperation::SetSessionModel, error).await;
+            }
+        }
+        BackendCommand::SetSessionCodeMode {
+            provider_session_id,
+            enabled,
+        } => {
+            if let Some(runtime) = context.runtime
+                && let Err(error) = runtime.set_code_mode(&provider_session_id, enabled).await
+            {
+                request_failed(context.events, BackendOperation::SetSessionCodeMode, error).await;
             }
         }
         BackendCommand::SetSessionOptions {
@@ -968,6 +982,7 @@ async fn start_session(
     enabled_skill_ids: Vec<String>,
     external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
     replace_builtin_tools: bool,
+    code_mode: bool,
     allowed_builtin_tools: Option<Vec<String>>,
     max_turns: Option<u32>,
     finalization_reserve_turns: u32,
@@ -1021,6 +1036,7 @@ async fn start_session(
                 &session_id,
                 external_tools,
                 replace_builtin_tools,
+                code_mode,
                 allowed_builtin_tools,
                 max_turns,
                 finalization_reserve_turns,

@@ -185,6 +185,9 @@ pub enum NakodeCommand {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Run the internal confined JavaScript worker used by optional Code Mode sessions.
+    #[command(hide = true)]
+    CodemodeWorker,
     /// Run the deterministic, headless TUI evaluation protocol.
     #[command(hide = true)]
     TuiEval {

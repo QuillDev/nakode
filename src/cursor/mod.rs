@@ -457,6 +457,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             });
         }
         BackendCommand::ResolveApproval { .. }
+        | BackendCommand::SetSessionCodeMode { .. }
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::ResolveExternalTool { .. }
         | BackendCommand::BeginAuthentication

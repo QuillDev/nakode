@@ -1223,6 +1223,12 @@ impl NativeServerRuntime {
                     | Effect::ClearProviderAccountCredential { .. }
             )
         });
+        let cancels_provider_turn = effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Backend(BackendCommand::InterruptTurn { .. })
+            )
+        });
         let session_id = outcome
             .effect_session
             .clone()
@@ -1250,6 +1256,9 @@ impl NativeServerRuntime {
                 retryable: true,
             });
             return;
+        }
+        if cancels_provider_turn {
+            self.cancel_session_mcp_calls(&session_id);
         }
         if let Some(delete_session_id) = take_delete_session_effect(&mut effects) {
             let canonical_id = nakode_protocol::SessionId::from(delete_session_id.clone());
@@ -1622,7 +1631,32 @@ impl NativeServerRuntime {
         source: BackendSource,
         request: crate::backend::ExternalToolRequest,
     ) {
+        let (session_id, run_id) = match &source {
+            BackendSource::Primary { session_id, .. } => (session_id.clone(), None),
+            BackendSource::Subagent(run_id) => (
+                self.core
+                    .session_for_run_id(run_id)
+                    .unwrap_or_else(|| self.core.default_session_id().clone()),
+                Some(run_id.clone()),
+            ),
+            BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {
+                return;
+            }
+        };
+        let Some(engine) = self.core.engine_for(&session_id) else {
+            self.resolve_mcp_tool(
+                &source,
+                &request.id,
+                "MCP tool owner session is no longer available".to_owned(),
+                true,
+            )
+            .await;
+            return;
+        };
+        let workspace =
+            crate::state::projection::workspace_id(&engine.state().workspace).to_string();
         let Some((server, remote_name)) = self.core.mcp_servers().iter().find_map(|server| {
+            (server.workspace == workspace).then_some(())?;
             server
                 .tools
                 .iter()
@@ -1637,18 +1671,6 @@ impl NativeServerRuntime {
             )
             .await;
             return;
-        };
-        let (session_id, run_id) = match &source {
-            BackendSource::Primary { session_id, .. } => (session_id.clone(), None),
-            BackendSource::Subagent(run_id) => (
-                self.core
-                    .session_for_run_id(run_id)
-                    .unwrap_or_else(|| self.core.default_session_id().clone()),
-                Some(run_id.clone()),
-            ),
-            BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {
-                return;
-            }
         };
         let currently_granted = self.core.engine_for(&session_id).is_some_and(|engine| {
             if let BackendSource::Subagent(run_id) = &source {
@@ -1832,7 +1854,7 @@ impl NativeServerRuntime {
         for effect in effects {
             match effect {
                 Effect::SaveMcpServer(server) => {
-                    self.cancel_mcp_server_work(&server.id);
+                    self.cancel_mcp_server_work(&server.id).await;
                     if self
                         .effects
                         .persistence
@@ -1847,7 +1869,7 @@ impl NativeServerRuntime {
                     workspace,
                     server_id,
                 } => {
-                    self.cancel_mcp_server_work(&server_id);
+                    self.cancel_mcp_server_work(&server_id).await;
                     let _ = self
                         .effects
                         .persistence
@@ -1869,7 +1891,7 @@ impl NativeServerRuntime {
                     kind,
                     secret,
                 } => {
-                    self.cancel_mcp_server_work(&server_id);
+                    self.cancel_mcp_server_work(&server_id).await;
                     let credential = crate::credential::Credential {
                         kind: kind.clone(),
                         secret: crate::credential::SecretValue::new(
@@ -1900,7 +1922,7 @@ impl NativeServerRuntime {
                     workspace,
                     server_id,
                 } => {
-                    self.cancel_mcp_server_work(&server_id);
+                    self.cancel_mcp_server_work(&server_id).await;
                     let _ = self
                         .effects
                         .persistence
@@ -2105,7 +2127,7 @@ impl NativeServerRuntime {
         }
     }
 
-    fn cancel_mcp_server_work(&mut self, server_id: &str) {
+    async fn cancel_mcp_server_work(&mut self, server_id: &str) {
         self.cancel_mcp_discovery(server_id);
         let call_ids = self
             .pending_mcp_calls
@@ -2116,6 +2138,13 @@ impl NativeServerRuntime {
         for call_id in call_ids {
             if let Some(pending) = self.pending_mcp_calls.remove(&call_id) {
                 pending.cancellation.cancel();
+                self.resolve_mcp_tool(
+                    &pending.source,
+                    &call_id,
+                    "MCP server configuration changed while the tool was running".to_owned(),
+                    true,
+                )
+                .await;
             }
         }
     }
@@ -2267,6 +2296,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::ExternalTools,
             ServiceCapability::InitialSessionTools,
             ServiceCapability::BuiltinToolAllowlists,
+            ServiceCapability::CodeMode,
             ServiceCapability::VisionAvailability,
             ServiceCapability::SessionWorkingDirectories,
             ServiceCapability::InitialSessionModel,
@@ -3829,6 +3859,7 @@ impl EffectExecutor {
             Effect::ResolveSession(id) => resolve_session(state, sessions, pending, &id),
             effect @ (Effect::PersistSession { .. }
             | Effect::PersistSessionSkillSnapshot { .. }
+            | Effect::PersistSessionCodeMode { .. }
             | Effect::PersistSessionBridge(_)
             | Effect::PersistModels { .. }
             | Effect::SetDefaultModel { .. }
@@ -4121,6 +4152,14 @@ fn execute_persistence_effect(
                 state.session_store_failed(error.to_string());
             }
         }
+        Effect::PersistSessionCodeMode {
+            session_id,
+            enabled,
+        } => {
+            if let Err(error) = sessions.set_session_code_mode(&session_id, enabled) {
+                state.session_store_failed(error.to_string());
+            }
+        }
         Effect::PersistModels { provider, models } => {
             persist_models(state, sessions, &provider, &models);
         }
@@ -4203,7 +4242,12 @@ fn persist_session(
         options,
         Some(&enabled_skill_ids),
     ) {
-        Ok(record) => {
+        Ok(mut record) => {
+            if let Err(error) = sessions.set_session_code_mode(&record.id, state.code_mode()) {
+                state.session_store_failed(error.to_string());
+                return;
+            }
+            record.code_mode = state.code_mode();
             if let Some(profile_id) = state.skill_profile_id().map(str::to_owned)
                 && let Err(error) = sessions.bind_session_skill_profile(&record.id, &profile_id)
             {
@@ -5094,8 +5138,8 @@ mod tests {
     use nakode_protocol::{
         BridgeContinuationDisposition, BridgeLifecycle, ClientId, Command, CredentialInput,
         ErrorCode, IdempotencyKey, InvocationKind, InvocationSummary, InvocationUsage,
-        McpGrantPolicy, ModelOptions, OrchestratorKind, PromptInput, Query, QueryResult,
-        ServiceCapability, SessionId, SessionToolConfiguration, TranscriptEntryStatus,
+        McpGrantPolicy, McpToolView, ModelOptions, OrchestratorKind, PromptInput, Query,
+        QueryResult, ServiceCapability, SessionId, SessionToolConfiguration, TranscriptEntryStatus,
     };
     use tokio::sync::mpsc;
 
@@ -5109,7 +5153,8 @@ mod tests {
     use crate::{
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendHandle, BackendIdentity,
-            CODEX_PROVIDER, DEVIN_PROVIDER, ModelInfo, ProviderFailureClassification,
+            CODEX_PROVIDER, DEVIN_PROVIDER, ExternalToolRequest, ModelInfo,
+            ProviderFailureClassification,
         },
         config::{Config, OpenAiReasoningEffort},
         credential::{CredentialStore, SqliteCredentialStore},
@@ -5898,6 +5943,7 @@ mod tests {
             tools: Some(SessionToolConfiguration {
                 tools: Vec::new(),
                 replace_builtin_tools: false,
+                code_mode: false,
                 allowed_builtin_tools: Some(if allow_loaders {
                     ["read_skill", "read_skill_component"]
                         .map(str::to_owned)
@@ -6035,6 +6081,225 @@ mod tests {
 
         handle.shutdown().await;
         runtime.await.expect("runtime task");
+    }
+
+    fn runtime_mcp_server(workspace: &Path) -> crate::mcp::McpServerRecord {
+        crate::mcp::McpServerRecord {
+            id: "catalogue".to_owned(),
+            workspace: crate::state::projection::workspace_id(workspace.to_string_lossy().as_ref())
+                .to_string(),
+            display_name: "Test catalogue".to_owned(),
+            endpoint: "https://192.0.2.1/mcp".to_owned(),
+            transport: "streamable-http".to_owned(),
+            enabled: true,
+            auth_kind: "none".to_owned(),
+            credential_required: false,
+            protocol_version: crate::mcp::DEFAULT_PROTOCOL_VERSION.to_owned(),
+            provenance_url: "https://example.invalid/test".to_owned(),
+            provenance_version: "test".to_owned(),
+            provenance_commit: "test".to_owned(),
+            provenance_sha256: "test".to_owned(),
+            license_evidence: "test fixture".to_owned(),
+            timeout_ms: 20_000,
+            max_response_bytes: 1_048_576,
+            artifact_semantics: String::new(),
+            template_id: None,
+            health: "connected".to_owned(),
+            server_name: Some("fixture".to_owned()),
+            server_version: Some("1".to_owned()),
+            last_error: None,
+            last_connected_at_ms: Some(1),
+            updated_at_ms: 1,
+            credential_kind: None,
+            tools: vec![McpToolView {
+                remote_name: "lookup".to_owned(),
+                exposed_name: "mcp__catalogue__lookup".to_owned(),
+                description: "Lookup catalogue".to_owned(),
+                input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                app_only: false,
+            }],
+            grants: McpGrantPolicy {
+                coding_agent: true,
+                ..McpGrantPolicy::default()
+            },
+        }
+    }
+
+    async fn mcp_request_runtime(
+        workspace: &Path,
+        granted: bool,
+    ) -> (
+        NativeServerRuntime,
+        mpsc::Receiver<BackendCommand>,
+        SessionId,
+    ) {
+        let (persistence, _credentials) = test_persistence(workspace);
+        let mut state = DomainState::new_for_backend(
+            workspace.to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        if granted {
+            state
+                .configure_mcp_tools(vec![
+                    runtime_mcp_server(workspace).tools[0].external_definition(),
+                ])
+                .expect("grant MCP tool to the logical session");
+        }
+        let registry = empty_registry(workspace).await;
+        let (backend, commands, _events) = fake_backend();
+        let (provider_control, _control_commands, _control_events) = fake_backend();
+        let effects = EffectExecutor::new(registry, persistence);
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let session_id = runtime.core.default_session_id().clone();
+        runtime
+            .core
+            .install_mcp_servers(vec![runtime_mcp_server(workspace)]);
+        runtime
+            .effects
+            .backends
+            .insert_provider_control(CODEX_PROVIDER.to_owned(), provider_control);
+        runtime.effects.backends.insert_session(
+            session_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            "test-account".to_owned(),
+            backend,
+        );
+        (runtime, commands, session_id)
+    }
+
+    #[tokio::test]
+    async fn server_runtime_executes_a_granted_mcp_request_and_returns_its_completion() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (mut runtime, mut commands, session_id) =
+            mcp_request_runtime(workspace.path(), true).await;
+        let source = BackendSource::Primary {
+            session_id,
+            provider: CODEX_PROVIDER.to_owned(),
+            account_id: "test-account".to_owned(),
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.handle_mcp_tool_request(
+                source,
+                ExternalToolRequest {
+                    id: "outer/3".to_owned(),
+                    name: "mcp__catalogue__lookup".to_owned(),
+                    arguments_json: r#"{"query":"mcp"}"#.to_owned(),
+                },
+            ),
+        )
+        .await
+        .expect("MCP request handler deadline");
+        assert!(runtime.pending_mcp_calls.contains_key("outer/3"));
+        runtime
+            .pending_mcp_calls
+            .get("outer/3")
+            .expect("registered MCP call")
+            .cancellation
+            .cancel();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.complete_mcp_call(McpCallCompletion {
+                call_id: "outer/3".to_owned(),
+                result: Ok("real-mcp-result".to_owned()),
+            }),
+        )
+        .await
+        .expect("MCP completion deadline");
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), commands.recv())
+                .await
+                .expect("backend callback deadline"),
+            Some(BackendCommand::ResolveExternalTool { id, output, failed: false })
+                if id == "outer/3" && output == "real-mcp-result"
+        ));
+        assert!(runtime.pending_mcp_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn changing_an_mcp_server_cancels_and_settles_its_pending_callback() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (mut runtime, mut commands, session_id) =
+            mcp_request_runtime(workspace.path(), true).await;
+
+        runtime
+            .handle_mcp_tool_request(
+                BackendSource::Primary {
+                    session_id,
+                    provider: CODEX_PROVIDER.to_owned(),
+                    account_id: "test-account".to_owned(),
+                },
+                ExternalToolRequest {
+                    id: "outer/reconfigured".to_owned(),
+                    name: "mcp__catalogue__lookup".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                },
+            )
+            .await;
+        let cancellation = runtime
+            .pending_mcp_calls
+            .get("outer/reconfigured")
+            .expect("pending MCP call")
+            .cancellation
+            .clone();
+
+        runtime.cancel_mcp_server_work("catalogue").await;
+
+        assert!(cancellation.is_cancelled());
+        assert!(runtime.pending_mcp_calls.is_empty());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), commands.recv())
+                .await
+                .expect("reconfiguration callback deadline"),
+            Some(BackendCommand::ResolveExternalTool { id, output, failed: true })
+                if id == "outer/reconfigured" && output.contains("configuration changed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn server_runtime_denies_an_ungranted_mcp_request_before_transport() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (mut runtime, mut commands, session_id) =
+            mcp_request_runtime(workspace.path(), false).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.handle_mcp_tool_request(
+                BackendSource::Primary {
+                    session_id,
+                    provider: CODEX_PROVIDER.to_owned(),
+                    account_id: "test-account".to_owned(),
+                },
+                ExternalToolRequest {
+                    id: "outer/denied".to_owned(),
+                    name: "mcp__catalogue__lookup".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                },
+            ),
+        )
+        .await
+        .expect("ungranted MCP request deadline");
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), commands.recv())
+                .await
+                .expect("denial callback deadline"),
+            Some(BackendCommand::ResolveExternalTool { id, output, failed: true })
+                if id == "outer/denied" && output.contains("no longer granted")
+        ));
+        assert!(runtime.pending_mcp_calls.is_empty());
     }
 
     #[tokio::test]
@@ -7528,6 +7793,7 @@ mod tests {
                     instructions: None,
                     external_tools: Vec::new(),
                     replace_builtin_tools: false,
+                    code_mode: false,
                     allowed_builtin_tools: None,
                     max_turns: None,
                     finalization_reserve_turns: 0,
@@ -7556,8 +7822,8 @@ mod tests {
         );
     }
 
-    #[allow(clippy::too_many_lines)]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn same_provider_session_handles_dispatch_and_attribute_independently() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut registry = empty_registry(workspace.path()).await;
@@ -7594,6 +7860,7 @@ mod tests {
                     instructions: None,
                     external_tools: Vec::new(),
                     replace_builtin_tools: false,
+                    code_mode: false,
                     allowed_builtin_tools: None,
                     max_turns: None,
                     finalization_reserve_turns: 0,
@@ -7616,6 +7883,7 @@ mod tests {
                     instructions: None,
                     external_tools: Vec::new(),
                     replace_builtin_tools: false,
+                    code_mode: false,
                     allowed_builtin_tools: None,
                     max_turns: None,
                     finalization_reserve_turns: 0,

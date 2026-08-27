@@ -446,6 +446,7 @@ pub enum BackendOperation {
     ModelList,
     Reload,
     SetSessionModel,
+    SetSessionCodeMode,
     StartSession,
     ResumeSession,
     UnsubscribeSession,
@@ -464,6 +465,7 @@ impl BackendOperation {
             Self::ModelList => "list models",
             Self::Reload => "reload backend metadata",
             Self::SetSessionModel => "set session model",
+            Self::SetSessionCodeMode => "set session Code Mode",
             Self::StartSession => "start session",
             Self::ResumeSession => "resume session",
             Self::UnsubscribeSession => "close session",
@@ -681,6 +683,8 @@ pub enum BackendCommand {
         enabled_skill_ids: Vec<String>,
         external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
+        /// Opt-in synthesized-tool mode. False preserves the ordinary provider tool surface.
+        code_mode: bool,
         /// Exact provider-call identities allowed for this provider session. `None` keeps the
         /// ordinary full registry; `Some` is authoritative even when empty. Canonical archetype
         /// names are projected before crossing the adapter boundary.
@@ -701,6 +705,8 @@ pub enum BackendCommand {
         /// Client-owned tools installed before provider restoration.
         external_tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
+        /// Restored opt-in synthesized-tool mode.
+        code_mode: bool,
         /// Provider identities and bounds to apply if this resume is scoped. Active delegated runs
         /// are restored as interrupted, while ordinary primary resumes intentionally pass `None`.
         allowed_builtin_tools: Option<Vec<String>>,
@@ -736,6 +742,10 @@ pub enum BackendCommand {
     SetSessionModel {
         provider_session_id: String,
         model: String,
+    },
+    SetSessionCodeMode {
+        provider_session_id: String,
+        enabled: bool,
     },
     SetSessionOptions {
         provider_session_id: String,

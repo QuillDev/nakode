@@ -236,6 +236,7 @@ fn session_view(
         workspace_id: workspace_id.clone(),
         working_directory: state.working_directory.clone(),
         title: session_title(state, sessions),
+        code_mode: state.code_mode(),
         status_message: state.status_message.clone(),
         diagnostic_count: u64::try_from(state.diagnostic_count).unwrap_or(u64::MAX),
         activity: activity(state),

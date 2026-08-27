@@ -307,10 +307,20 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         || ("No model selected".to_owned(), Style::default().fg(MUTED)),
         |model| (model, Style::default().fg(ACCENT_BRIGHT).bold()),
     );
-    let mut spans = vec![
+    let mut spans = Vec::new();
+    if state.code_mode {
+        spans.extend([
+            Span::styled(
+                "CODE MODE",
+                Style::default().fg(BACKGROUND).bg(ACCENT).bold(),
+            ),
+            Span::raw("  "),
+        ]);
+    }
+    spans.extend([
         Span::styled("MODEL ", Style::default().fg(MUTED)),
         Span::styled(model, model_style),
-    ];
+    ]);
     if state.selected_model_uses_fast_mode() {
         spans.push(Span::styled(" ⚡", Style::default().fg(ACCENT).bold()));
     }
@@ -2063,7 +2073,12 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         "↑/↓ select · Enter resume · Esc cancel",
         Style::default().fg(MUTED),
     ));
-    let block = overlay_block(" Resume session ", ACCENT);
+    let title = if picker.code_mode {
+        " Resume session · CODE MODE "
+    } else {
+        " Resume session "
+    };
+    let block = overlay_block(title, ACCENT);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -2444,6 +2459,7 @@ mod tests {
             workspace_id: WorkspaceId::from("workspace"),
             working_directory: "/tmp/project".to_owned(),
             title: "Session".to_owned(),
+            code_mode: false,
             status_message: String::new(),
             diagnostic_count: 0,
             activity: SessionActivity::Idle,
@@ -2850,6 +2866,31 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("MODEL No model selected"));
+    }
+
+    #[test]
+    fn header_marks_only_code_mode_sessions() {
+        let backend = TestBackend::new(50, 1);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut view = bootstrap();
+        view.active_session
+            .as_mut()
+            .expect("active session")
+            .code_mode = true;
+        let state = TuiState::from_bootstrap(&view, 100);
+
+        terminal
+            .draw(|frame| super::render_header(frame, frame.area(), &state))
+            .expect("render Nakode header");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("CODE MODE"));
     }
 
     #[test]

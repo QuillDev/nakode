@@ -14,6 +14,18 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // The confined worker must start under `env_clear()` without loading config, credentials,
+    // agents, persistence, or any service endpoint. Its internal launcher always uses this exact
+    // two-argument process shape.
+    let mut arguments = std::env::args_os();
+    let _executable = arguments.next();
+    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("codemode-worker"))
+        && arguments.next().is_none()
+    {
+        nakode::codemode_worker::run()?;
+        return Ok(());
+    }
+
     let config = Config::load()?;
     if config.update || matches!(config.command.as_ref(), Some(NakodeCommand::Update)) {
         update::run()?;
@@ -83,6 +95,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("agent invocation failed".into());
             }
         }
+        NakodeCommand::CodemodeWorker => nakode::codemode_worker::run()?,
         NakodeCommand::TuiEval {
             scenario,
             width,
