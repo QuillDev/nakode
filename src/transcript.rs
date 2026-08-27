@@ -49,6 +49,7 @@ pub struct TranscriptEntry {
     pub title: String,
     pub body: String,
     pub status: EntryStatus,
+    pub parent_tool_entry_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,6 +280,7 @@ impl Transcript {
                 title: entry.title.clone(),
                 body: entry.body.clone(),
                 status: projection_entry_status(entry.status),
+                parent_tool_entry_id: entry.parent_tool_entry_id.as_ref().map(ToString::to_string),
             })
             .collect();
         self.item_indices = self
@@ -351,6 +353,7 @@ impl Transcript {
             title: title.into(),
             body: body.into(),
             status,
+            parent_tool_entry_id: None,
         });
         self.changed();
     }
@@ -379,6 +382,7 @@ impl Transcript {
                 title: title.into(),
                 body: body.into(),
                 status,
+                parent_tool_entry_id: None,
             });
             self.item_indices.insert(key, index);
         }
@@ -406,6 +410,7 @@ impl Transcript {
                 title: title.into(),
                 body: delta.to_owned(),
                 status: EntryStatus::Running,
+                parent_tool_entry_id: None,
             });
             self.item_indices.insert(key, index);
         }
@@ -531,15 +536,9 @@ impl Transcript {
             .filter(|entry| entry.kind == EntryKind::Tool)
             .count();
         let hidden_tool_count = tool_count.saturating_sub(RECENT_TOOL_CALL_LIMIT);
-        let recent_tools_start = (hidden_tool_count > 0).then(|| {
-            self.entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.kind == EntryKind::Tool)
-                .nth(hidden_tool_count)
-                .map(|(index, _)| index)
-                .expect("a hidden tool count implies a retained tool")
-        });
+        let (recent_tools_start, visible_parent_ids, first_visible_tool_index, hidden_tool_count) =
+            collapsed_tool_visibility(&self.entries, hidden_tool_count);
+        let available_entry_ids = entry_ids(&self.entries);
         let mut projected = Vec::new();
         let mut stream_header_shown = false;
         for (index, entry) in self.entries.iter().enumerate() {
@@ -548,7 +547,8 @@ impl Transcript {
             }
             let hidden_tool = !self.show_all_tools
                 && entry.kind == EntryKind::Tool
-                && recent_tools_start.is_some_and(|start| index < start);
+                && recent_tools_start.is_some_and(|start| index < start)
+                && !visible_parent_ids.contains(&entry.id);
             if hidden_tool {
                 continue;
             }
@@ -565,7 +565,7 @@ impl Transcript {
             }
 
             let line_count = projected.len();
-            if recent_tools_start == Some(index) {
+            if first_visible_tool_index == Some(index) {
                 project_tool_history_toggle(
                     hidden_tool_count,
                     self.show_all_tools,
@@ -577,7 +577,11 @@ impl Transcript {
                 .key
                 .as_ref()
                 .is_some_and(|key| self.expanded_tools.contains(key));
-            project_entry(entry, width, expanded, &mut projected);
+            let nested = entry
+                .parent_tool_entry_id
+                .as_deref()
+                .is_some_and(|parent| available_entry_ids.contains(parent));
+            project_entry(entry, width, expanded, nested, &mut projected);
             project_entry_images(
                 (self.image_previews_enabled, &self.images),
                 entry,
@@ -733,14 +737,68 @@ fn is_agent_stream(entry: &TranscriptEntry) -> bool {
         )
 }
 
+fn entry_ids(entries: &[TranscriptEntry]) -> HashSet<&str> {
+    entries.iter().map(|entry| entry.id.as_str()).collect()
+}
+
+fn collapsed_tool_visibility(
+    entries: &[TranscriptEntry],
+    hidden_tool_count: usize,
+) -> (Option<usize>, HashSet<String>, Option<usize>, usize) {
+    let recent_start = (hidden_tool_count > 0).then(|| {
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.kind == EntryKind::Tool)
+            .nth(hidden_tool_count)
+            .map(|(index, _)| index)
+            .expect("a hidden tool count implies a retained tool")
+    });
+    let visible_parents = recent_start.map_or_else(HashSet::new, |start| {
+        entries[start..]
+            .iter()
+            .filter_map(|entry| entry.parent_tool_entry_id.clone())
+            .collect()
+    });
+    let first_visible = recent_start.and_then(|start| {
+        entries.iter().enumerate().find_map(|(index, entry)| {
+            (entry.kind == EntryKind::Tool
+                && (index >= start || visible_parents.contains(&entry.id)))
+            .then_some(index)
+        })
+    });
+    let hidden_count = recent_start.map_or(0, |start| {
+        entries[..start]
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Tool && !visible_parents.contains(&entry.id))
+            .count()
+    });
+    (recent_start, visible_parents, first_visible, hidden_count)
+}
+
 fn project_entry(
     entry: &TranscriptEntry,
     width: usize,
     expanded: bool,
+    nested: bool,
     output: &mut Vec<ProjectedLine>,
 ) {
     if is_subagent(entry) {
         project_subagent(entry, width, output);
+        return;
+    }
+    if nested {
+        let start = output.len();
+        let nested_width = width.saturating_sub(4).max(1);
+        project_header(entry, nested_width, expanded, output);
+        project_body(entry, nested_width, expanded, output);
+        for (offset, line) in output[start..].iter_mut().enumerate() {
+            line.text = if offset == 0 {
+                format!("  ↳ {}", line.text)
+            } else {
+                format!("    {}", line.text)
+            };
+        }
         return;
     }
     project_header(entry, width, expanded, output);
@@ -1076,10 +1134,173 @@ fn display_width(character: char) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use nakode_protocol::{
+        EntryId, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
+    };
+
     use super::{
         EntryKind, EntryStatus, IMAGE_PREVIEW_MARKER, IMAGE_PREVIEW_ROWS, LineTone,
         MarkdownModifier, MarkdownTone, TOOL_HISTORY_TOGGLE_KEY, Transcript,
     };
+
+    fn projected_tool(
+        id: &str,
+        title: &str,
+        status: TranscriptEntryStatus,
+        parent: Option<&str>,
+    ) -> TranscriptEntryView {
+        TranscriptEntryView {
+            id: EntryId::from(id.to_owned()),
+            kind: TranscriptEntryKind::Tool,
+            title: title.to_owned(),
+            body: "child output".to_owned(),
+            body_start_byte: 0,
+            body_total_bytes: 12,
+            status,
+            artifacts: Vec::new(),
+            created_at_ms: None,
+            provider_id: None,
+            model_id: None,
+            owner_turn_id: None,
+            resolved_reasoning_effort: None,
+            resolved_fast_mode: None,
+            source_transport: None,
+            source_prompt_id: None,
+            tool_audit_json: None,
+            parent_tool_entry_id: parent.map(|id| EntryId::from(id.to_owned())),
+        }
+    }
+
+    #[test]
+    fn code_mode_children_remain_nested_after_projection_reinstall() {
+        let page = TranscriptPage {
+            entries: vec![
+                projected_tool(
+                    "parent",
+                    "codemode · confined JavaScript",
+                    TranscriptEntryStatus::Complete,
+                    None,
+                ),
+                projected_tool(
+                    "child-running",
+                    "read · src/runtime.rs",
+                    TranscriptEntryStatus::Running,
+                    Some("parent"),
+                ),
+                projected_tool(
+                    "child-complete",
+                    "grep · parentCallId",
+                    TranscriptEntryStatus::Complete,
+                    Some("parent"),
+                ),
+                projected_tool(
+                    "direct",
+                    "bash · cargo check",
+                    TranscriptEntryStatus::Complete,
+                    None,
+                ),
+            ],
+            has_earlier: false,
+            stream_active: true,
+            stream_label: "working".to_owned(),
+            current_owner_entry: None,
+            current_owner_omitted_tool_calls: 0,
+        };
+        let mut transcript = Transcript::new(100);
+        transcript.install_projection(&page);
+
+        let rendered = transcript
+            .visible(100, 30, 0)
+            .lines
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.starts_with("  ↳ ") && line.contains("read src/runtime.rs"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| { line.starts_with("  ↳ ") && line.contains("grep parentCallId") })
+        );
+        assert!(rendered.iter().any(|line| line == "▸ bash cargo check"));
+        assert!(rendered.iter().all(|line| !line.starts_with("  ↳ ▸ bash")));
+
+        assert_eq!(transcript.toggle_tool_output("child-complete"), Some(true));
+        assert!(
+            transcript
+                .visible(100, 30, 0)
+                .lines
+                .iter()
+                .any(|line| line.text == "      child output")
+        );
+    }
+
+    #[test]
+    fn child_without_its_projected_parent_is_not_indented_as_an_orphan() {
+        let page = TranscriptPage {
+            entries: vec![projected_tool(
+                "child",
+                "read · src/runtime.rs",
+                TranscriptEntryStatus::Complete,
+                Some("omitted-parent"),
+            )],
+            has_earlier: true,
+            stream_active: false,
+            stream_label: String::new(),
+            current_owner_entry: None,
+            current_owner_omitted_tool_calls: 0,
+        };
+        let mut transcript = Transcript::new(100);
+        transcript.install_projection(&page);
+
+        let rendered = transcript
+            .visible(100, 10, 0)
+            .lines
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        assert!(rendered.iter().any(|line| line == "▸ read src/runtime.rs"));
+        assert!(rendered.iter().all(|line| !line.starts_with("  ↳ ")));
+    }
+
+    #[test]
+    fn retained_code_mode_child_keeps_its_parent_visible() {
+        let mut transcript = Transcript::new(100);
+        transcript.upsert(
+            "parent",
+            EntryKind::Tool,
+            "codemode · confined JavaScript",
+            "",
+            EntryStatus::Complete,
+        );
+        let parent_id = transcript.entries()[0].id.clone();
+        for index in 1..=6 {
+            transcript.upsert(
+                format!("child-{index}"),
+                EntryKind::Tool,
+                format!("read · file-{index}"),
+                "output",
+                EntryStatus::Complete,
+            );
+            transcript.entries.last_mut().unwrap().parent_tool_entry_id = Some(parent_id.clone());
+        }
+
+        let rendered = transcript
+            .visible(100, 30, 0)
+            .lines
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("codemode"));
+        assert!(!rendered.contains("file-1"));
+        for index in 2..=6 {
+            assert!(rendered.contains(&format!("file-{index}")));
+        }
+    }
 
     #[test]
     fn attached_images_reserve_stable_transcript_rows() {

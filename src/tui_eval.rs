@@ -1049,6 +1049,7 @@ fn install_created_session_view(
                 source_prompt_id: None,
                 tool_audit_json: None,
                 created_at_ms: None,
+                parent_tool_entry_id: None,
             });
     }
     session.activity = nakode_protocol::SessionActivity::StartingTurn;
@@ -1128,6 +1129,7 @@ fn install_item_view(
         source_prompt_id: None,
         tool_audit_json: None,
         created_at_ms: None,
+        parent_tool_entry_id: None,
     };
     if let Some(existing) = session
         .transcript

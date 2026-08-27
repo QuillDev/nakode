@@ -1858,6 +1858,36 @@ fn delegated_invocation_entry(entry: &TranscriptEntry) -> bool {
             }))
 }
 
+fn tool_audit_identity(entry: &TranscriptEntry, field: &str) -> Option<String> {
+    entry
+        .tool_audit_json
+        .as_deref()
+        .and_then(|audit| serde_json::from_str::<serde_json::Value>(audit).ok())
+        .and_then(|audit| {
+            audit
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn parent_tool_entry_id(transcript: &DomainTranscript, entry: &TranscriptEntry) -> Option<EntryId> {
+    let parent_item_id = tool_audit_identity(entry, "parentItemId")?;
+    transcript
+        .entries()
+        .iter()
+        .find(|candidate| {
+            candidate.kind == EntryKind::Tool
+                && candidate.id == parent_item_id
+                && candidate.tool_audit_json.as_deref().is_some_and(|audit| {
+                    serde_json::from_str::<serde_json::Value>(audit).is_ok_and(|audit| {
+                        audit.get("name").and_then(serde_json::Value::as_str) == Some("codemode")
+                    })
+                })
+        })
+        .map(|parent| EntryId::from(parent.id.clone()))
+}
+
 fn transcript_entry_view(
     transcript: &DomainTranscript,
     entry: &TranscriptEntry,
@@ -1897,6 +1927,7 @@ fn transcript_entry_view(
         tool_audit_json: include_audit
             .then(|| entry.tool_audit_json.clone())
             .flatten(),
+        parent_tool_entry_id: parent_tool_entry_id(transcript, entry),
     }
 }
 
@@ -2248,7 +2279,7 @@ mod tests {
 
     use super::{
         artifact_view, bootstrap, capabilities_view, model_configuration, run_outcome,
-        vision_settings_view,
+        transcript_page, vision_settings_view,
     };
     use crate::{
         backend::{
@@ -2259,6 +2290,91 @@ mod tests {
         session::{ProviderRecord, SubagentObservability, SubagentRecord},
         state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
     };
+
+    #[test]
+    fn nested_runtime_audit_projects_the_code_mode_parent_entry() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        let entry = |id: &str,
+                     call_id: &str,
+                     name: &str,
+                     parent_call_id: Option<&str>,
+                     parent_item_id: Option<&str>,
+                     turn: &str| {
+            TranscriptEntry {
+                id: id.to_owned(),
+                key: Some(format!("tool:{call_id}")),
+                kind: EntryKind::Tool,
+                title: name.to_owned(),
+                body: String::new(),
+                status: EntryStatus::Complete,
+                created_at_ms: None,
+                provider_id: None,
+                model_id: None,
+                owner_turn_id: Some(turn.to_owned()),
+                reasoning_effort: None,
+                fast_mode: None,
+                source_transport: None,
+                tool_audit_json: Some(
+                    serde_json::json!({
+                        "callId": call_id,
+                        "parentCallId": parent_call_id,
+                        "parentItemId": parent_item_id,
+                        "name": name,
+                    })
+                    .to_string(),
+                ),
+            }
+        };
+        state.transcript.restore(entry(
+            "earlier-parent",
+            "outer",
+            "codemode",
+            None,
+            None,
+            "turn-1",
+        ));
+        state.transcript.restore(entry(
+            "parent-entry",
+            "outer",
+            "codemode",
+            None,
+            None,
+            "turn-2",
+        ));
+        state.transcript.restore(entry(
+            "child-entry",
+            "outer/1",
+            "read",
+            Some("outer"),
+            Some("parent-entry"),
+            "turn-2",
+        ));
+        state.transcript.restore(entry(
+            "direct-entry",
+            "direct",
+            "bash",
+            None,
+            None,
+            "turn-2",
+        ));
+
+        let page = transcript_page(&state.transcript);
+        let child = page
+            .entries
+            .iter()
+            .find(|entry| entry.id.as_str() == "child-entry")
+            .unwrap();
+        let direct = page
+            .entries
+            .iter()
+            .find(|entry| entry.id.as_str() == "direct-entry")
+            .unwrap();
+        assert_eq!(
+            child.parent_tool_entry_id.as_ref().map(EntryId::as_str),
+            Some("parent-entry")
+        );
+        assert_eq!(direct.parent_tool_entry_id, None);
+    }
 
     #[test]
     fn provider_configuration_reports_external_tool_support() {
@@ -3261,6 +3377,7 @@ mod tests {
             source_transport: None,
             source_prompt_id: None,
             tool_audit_json: None,
+            parent_tool_entry_id: None,
         }
     }
 

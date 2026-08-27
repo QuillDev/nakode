@@ -155,6 +155,8 @@ pub struct RuntimeTelemetry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_call_id: Option<String>,
     pub name: String,
     pub arguments: Value,
 }
@@ -1266,6 +1268,7 @@ impl AgentRuntime {
         send_tool_started(
             turn_id,
             &tool_call.id,
+            tool_call.parent_call_id.as_deref(),
             &tool_call.name,
             &title,
             &tool_call.arguments,
@@ -1319,6 +1322,7 @@ impl AgentRuntime {
         send_tool_started(
             turn_id,
             &tool_call.id,
+            tool_call.parent_call_id.as_deref(),
             &tool_call.name,
             &title,
             &tool_call.arguments,
@@ -1462,6 +1466,7 @@ impl AgentRuntime {
                         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
                     let nested = ToolCall {
                         id: format!("{}/{sequence}", tool_call.id),
+                        parent_call_id: Some(tool_call.id.clone()),
                         name: name.to_owned(),
                         arguments,
                     };
@@ -1584,6 +1589,7 @@ impl AgentRuntime {
         send_tool_started(
             turn_id,
             &tool_call.id,
+            tool_call.parent_call_id.as_deref(),
             &tool_call.name,
             &title,
             &tool_call.arguments,
@@ -1652,6 +1658,7 @@ impl AgentRuntime {
         send_tool_started(
             turn_id,
             &tool_call.id,
+            tool_call.parent_call_id.as_deref(),
             &tool_call.name,
             &title,
             &tool_call.arguments,
@@ -1700,6 +1707,7 @@ impl AgentRuntime {
 
 struct ExecutedTool {
     call_id: String,
+    parent_call_id: Option<String>,
     name: String,
     arguments: Value,
     audit_kind: &'static str,
@@ -1727,6 +1735,7 @@ impl ExecutedTool {
         let model_output = model_facing_output(&result.output);
         Self {
             item_id: String::new(),
+            parent_call_id: tool_call.parent_call_id,
             call_id: tool_call.id,
             name: tool_call.name,
             arguments: tool_call.arguments,
@@ -1805,6 +1814,8 @@ fn runtime_tool_kind(name: &str, external: bool) -> &'static str {
 #[derive(Clone, Copy)]
 struct RuntimeToolAudit<'a> {
     call_id: &'a str,
+    parent_call_id: Option<&'a str>,
+    parent_item_id: Option<&'a str>,
     name: &'a str,
     arguments: &'a Value,
     kind: &'a str,
@@ -1820,6 +1831,8 @@ fn runtime_tool_audit(details: RuntimeToolAudit<'_>) -> String {
     const MAX_FIELD_BYTES: usize = 64 * 1024;
     let RuntimeToolAudit {
         call_id,
+        parent_call_id,
+        parent_item_id,
         name,
         arguments,
         kind,
@@ -1860,6 +1873,8 @@ fn runtime_tool_audit(details: RuntimeToolAudit<'_>) -> String {
     let mut audit = serde_json::json!({
         "version": 1,
         "callId": call_id,
+        "parentCallId": parent_call_id,
+        "parentItemId": parent_item_id,
         "kind": kind,
         "name": name,
         "providerType": "nakodeRuntimeTool",
@@ -1892,17 +1907,22 @@ fn runtime_tool_audit(details: RuntimeToolAudit<'_>) -> String {
         .unwrap_or_else(|_| "{\"version\":1,\"kind\":\"unknown\",\"status\":\"failed\"}".to_owned())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_tool_started(
     turn_id: &str,
     call_id: &str,
+    parent_call_id: Option<&str>,
     name: &str,
     title: &str,
     arguments: &Value,
     external: bool,
     events: &mpsc::Sender<BackendEvent>,
 ) -> Result<(), String> {
+    let parent_item_id = parent_call_id.map(|parent| format!("{turn_id}:tool:{parent}"));
     let audit = runtime_tool_audit(RuntimeToolAudit {
         call_id,
+        parent_call_id,
+        parent_item_id: parent_item_id.as_deref(),
         name,
         arguments,
         kind: runtime_tool_kind(name, external),
@@ -1973,6 +1993,12 @@ async fn finish_tool_result(
                 tool_audit_json: Some(
                     runtime_tool_audit(RuntimeToolAudit {
                         call_id: &executed.call_id,
+                        parent_call_id: executed.parent_call_id.as_deref(),
+                        parent_item_id: executed
+                            .parent_call_id
+                            .as_ref()
+                            .map(|parent| format!("{turn_id}:tool:{parent}"))
+                            .as_deref(),
                         name: &executed.name,
                         arguments: &executed.arguments,
                         kind: executed.audit_kind,
@@ -2357,6 +2383,8 @@ fn normalize_tool_history_item(
             tool_audit_json: name.as_ref().map(|name| {
                 runtime_tool_audit(RuntimeToolAudit {
                     call_id,
+                    parent_call_id: None,
+                    parent_item_id: None,
                     name,
                     arguments: arguments.as_ref().unwrap_or(&Value::Null),
                     kind: audit_kind
@@ -2928,6 +2956,7 @@ mod tests {
             "native",
             ToolCall {
                 id: "call-1".to_owned(),
+                parent_call_id: None,
                 name: "read_skill".to_owned(),
                 arguments: json!({"name": "review"}),
             },
@@ -2958,6 +2987,7 @@ mod tests {
             "native",
             ToolCall {
                 id: "call-2".to_owned(),
+                parent_call_id: None,
                 name: "read_skill".to_owned(),
                 arguments: json!({"name": "missing"}),
             },
@@ -3010,6 +3040,8 @@ mod tests {
         let audit: serde_json::Value =
             serde_json::from_str(&runtime_tool_audit(RuntimeToolAudit {
                 call_id: "read-7",
+                parent_call_id: None,
+                parent_item_id: None,
                 name: "read",
                 arguments: &arguments,
                 kind: "native",
@@ -3060,6 +3092,8 @@ mod tests {
         let audit: serde_json::Value =
             serde_json::from_str(&runtime_tool_audit(RuntimeToolAudit {
                 call_id: "shell-1",
+                parent_call_id: None,
+                parent_item_id: None,
                 name: "bash",
                 arguments: &json!({"command": command, "cwd": "/workspace"}),
                 kind: "shell",
@@ -3192,11 +3226,13 @@ mod tests {
                         tool_calls: vec![
                             ToolCall {
                                 id: "probe-1".to_owned(),
+                                parent_call_id: None,
                                 name: "parallel_probe".to_owned(),
                                 arguments: json!({}),
                             },
                             ToolCall {
                                 id: "probe-2".to_owned(),
+                                parent_call_id: None,
                                 name: "parallel_probe".to_owned(),
                                 arguments: json!({}),
                             },
@@ -3237,6 +3273,7 @@ mod tests {
                     return Ok(InferenceOutput {
                         tool_calls: vec![ToolCall {
                             id: "provider-call".to_owned(),
+                            parent_call_id: None,
                             name: "MoveAssociatedTicketToStage".to_owned(),
                             arguments: json!({"stageId": "33333333-3333-4333-8333-333333333333"}),
                         }],
@@ -3324,6 +3361,7 @@ mod tests {
                         retry_count: 2,
                         tool_calls: vec![ToolCall {
                             id: "call-0".to_owned(),
+                            parent_call_id: None,
                             name: "todo".to_owned(),
                             arguments: json!({"op": "view"}),
                         }],
@@ -3428,6 +3466,7 @@ mod tests {
                 "turn-1",
                 ToolCall {
                     id: "hidden-read".to_owned(),
+                    parent_call_id: None,
                     name: "read".to_owned(),
                     arguments: json!({"path": "Cargo.toml"}),
                 },
@@ -3589,6 +3628,7 @@ mod tests {
                 "turn-1",
                 ToolCall {
                     id: "outer/1".to_owned(),
+                    parent_call_id: None,
                     name: "read".to_owned(),
                     arguments: json!({"path": "sample.txt"}),
                 },
@@ -3609,6 +3649,7 @@ mod tests {
                 "turn-1",
                 ToolCall {
                     id: format!("outer/{}", sequence + 2),
+                    parent_call_id: None,
                     name: name.to_owned(),
                     arguments: json!({"query": name}),
                 },
@@ -3681,6 +3722,7 @@ mod tests {
                 "turn-1",
                 ToolCall {
                     id: "bash-call".to_owned(),
+                    parent_call_id: None,
                     name: "bash".to_owned(),
                     arguments: json!({"command": "echo bypass"}),
                 },
@@ -3996,6 +4038,7 @@ mod tests {
             "turn-native-delegation",
             ToolCall {
                 id: "delegate-1".to_owned(),
+                parent_call_id: None,
                 name: crate::tools::NAKODE_AGENT_TOOL_NAME.to_owned(),
                 arguments: json!({
                     "agent": "repo-explorer",
@@ -4107,6 +4150,7 @@ mod tests {
                     text: "summary text".to_owned(),
                     tool_calls: vec![ToolCall {
                         id: "unexpected-call".to_owned(),
+                        parent_call_id: None,
                         name: "read".to_owned(),
                         arguments: json!({"path": "src/runtime.rs"}),
                     }],
@@ -4154,6 +4198,7 @@ mod tests {
                     Ok(InferenceOutput {
                         tool_calls: vec![ToolCall {
                             id: format!("call-{call}"),
+                            parent_call_id: None,
                             name: "todo".to_owned(),
                             arguments: json!({"op": "view"}),
                         }],
@@ -4242,6 +4287,7 @@ mod tests {
                     Ok(InferenceOutput {
                         tool_calls: vec![ToolCall {
                             id: "call".to_owned(),
+                            parent_call_id: None,
                             name: "todo".to_owned(),
                             arguments: json!({"op": "view"}),
                         }],
@@ -4536,16 +4582,19 @@ mod tests {
             tool_calls: vec![
                 ToolCall {
                     id: "read-1".to_owned(),
+                    parent_call_id: None,
                     name: "read".to_owned(),
                     arguments: json!({"path": "current-read.rs"}),
                 },
                 ToolCall {
                     id: "edit-1".to_owned(),
+                    parent_call_id: None,
                     name: "edit".to_owned(),
                     arguments: json!({"path": "later-edited.rs"}),
                 },
                 ToolCall {
                     id: "write-1".to_owned(),
+                    parent_call_id: None,
                     name: "write".to_owned(),
                     arguments: json!({"path": "current-write.rs"}),
                 },
@@ -4588,6 +4637,7 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![ToolCall {
                     id: "large-read".to_owned(),
+                    parent_call_id: None,
                     name: "read".to_owned(),
                     arguments: json!({"path": "large.txt"}),
                 }],

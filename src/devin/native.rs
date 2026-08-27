@@ -1268,6 +1268,7 @@ impl ToolCallAccumulator {
                 ToolCall {
                     name: self.names.remove(&id).unwrap_or_default(),
                     id,
+                    parent_call_id: None,
                     arguments: serde_json::from_str(&arguments).unwrap_or_else(|_| json!({})),
                 }
             })

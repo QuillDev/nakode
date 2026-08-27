@@ -33,6 +33,7 @@ impl InferenceProvider for CodeModeProvider {
                 return Ok(InferenceOutput {
                     tool_calls: vec![ToolCall {
                         id: "outer-call".to_owned(),
+                        parent_call_id: None,
                         name: "codemode".to_owned(),
                         arguments: json!({
                             "code": concat!(
@@ -83,6 +84,7 @@ impl InferenceProvider for CancellationProvider {
             Ok(InferenceOutput {
                 tool_calls: vec![ToolCall {
                     id: "cancelled-outer".to_owned(),
+                    parent_call_id: None,
                     name: "codemode".to_owned(),
                     arguments: json!({
                         "code": "return await tools.mcp__catalogue__lookup({query:'wait'});"
@@ -216,28 +218,48 @@ async fn code_mode_worker_composes_native_mutation_client_and_mcp_callbacks() {
     });
 
     let mut callbacks = 0;
+    let mut nested_started = Vec::new();
     while callbacks < 2 {
         let event = tokio::time::timeout(std::time::Duration::from_secs(10), event_rx.recv())
             .await
             .expect("external callback deadline")
             .expect("runtime event");
-        if let BackendEvent::ExternalToolRequested(request) = event {
-            let output = match request.name.as_str() {
-                "client_lookup" => "client-result",
-                "mcp__catalogue__lookup" => "mcp-result",
-                name => panic!("unexpected external tool request: {name}"),
-            };
-            assert!(
-                runtime
-                    .resolve_external_tool(&request.id, ToolResult::success(output))
-                    .await
-            );
-            callbacks += 1;
+        match event {
+            BackendEvent::ItemStarted { item, .. }
+                if item.kind == nakode::backend::ItemKind::Tool =>
+            {
+                let audit: serde_json::Value = serde_json::from_str(
+                    item.tool_audit_json.as_deref().expect("runtime tool audit"),
+                )
+                .expect("valid runtime tool audit");
+                if audit["parentCallId"] == "outer-call" {
+                    assert_eq!(audit["parentItemId"], "turn-1:tool:outer-call");
+                    nested_started.push(audit["name"].as_str().unwrap().to_owned());
+                }
+            }
+            BackendEvent::ExternalToolRequested(request) => {
+                let output = match request.name.as_str() {
+                    "client_lookup" => "client-result",
+                    "mcp__catalogue__lookup" => "mcp-result",
+                    name => panic!("unexpected external tool request: {name}"),
+                };
+                assert!(
+                    runtime
+                        .resolve_external_tool(&request.id, ToolResult::success(output))
+                        .await
+                );
+                callbacks += 1;
+            }
+            _ => {}
         }
     }
 
     let (session, result) = turn.await.expect("turn task");
     result.expect("Code Mode turn completes");
+    assert_eq!(
+        nested_started,
+        ["write", "client_lookup", "mcp__catalogue__lookup"]
+    );
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("created.txt"))
             .expect("native mutation output"),
