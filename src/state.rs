@@ -1181,6 +1181,10 @@ pub enum Effect {
         session_id: String,
         enabled_skill_ids: Vec<String>,
     },
+    PersistSessionCodeMode {
+        session_id: String,
+        enabled: bool,
+    },
     PersistModels {
         provider: String,
         models: Vec<ModelInfo>,
@@ -1307,6 +1311,7 @@ pub struct DomainState {
     mcp_tools: Vec<nakode_protocol::ExternalToolDefinition>,
     mcp_archetype_grants: HashMap<String, HashSet<String>>,
     replace_builtin_tools: bool,
+    code_mode: bool,
     allowed_builtin_tools: Option<Vec<String>>,
     pub todo_phases: Vec<TodoPhase>,
     pub status_message: String,
@@ -2071,6 +2076,7 @@ impl DomainState {
             mcp_tools: Vec::new(),
             mcp_archetype_grants: HashMap::new(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: None,
             todo_phases: Vec::new(),
             status_message: format!("Connecting to {backend_name}…"),
@@ -3432,6 +3438,7 @@ impl DomainState {
             }
         });
         self.pending_handoff = None;
+        self.code_mode = session.code_mode;
         self.working_directory
             .clone_from(&session.working_directory);
         self.selected_model.clone_from(&session.model);
@@ -3469,6 +3476,7 @@ impl DomainState {
             enabled_skill_ids: self.enabled_skill_ids(),
             external_tools: self.provider_external_tools(),
             replace_builtin_tools: self.replace_builtin_tools,
+            code_mode: self.code_mode,
             allowed_builtin_tools: self.allowed_builtin_tools.clone(),
             max_turns: None,
             timeout_seconds: None,
@@ -4228,6 +4236,11 @@ impl DomainState {
                     self.open_settings();
                     return Vec::new();
                 }
+                ParsedPromptCommand::CodeMode(_) => {
+                    self.client.editor.clear();
+                    self.set_status("Code Mode sessions are created through the Nakode service.");
+                    return Vec::new();
+                }
                 ParsedPromptCommand::Compress => {
                     self.client.editor.clear();
                     return self.compress_session_context();
@@ -4273,6 +4286,11 @@ impl DomainState {
                     });
                     self.set_status("Loading sessions…");
                     return vec![Effect::ListSessions];
+                }
+                ParsedPromptCommand::ResumeCode(_) => {
+                    self.client.editor.clear();
+                    self.set_status("Code Mode sessions are resumed through the Nakode service.");
+                    return Vec::new();
                 }
                 ParsedPromptCommand::Switch => {
                     self.client.editor.clear();
@@ -5817,7 +5835,7 @@ impl DomainState {
                 "session tools must be configured before the first prompt".to_owned(),
             ));
         }
-        self.configure_session_tools(tools, replace_builtin_tools, None)
+        self.configure_session_tools(tools, replace_builtin_tools, false, None)
     }
 
     /// Configures the complete client-owned and canonical builtin session tool boundary.
@@ -5830,6 +5848,7 @@ impl DomainState {
         &mut self,
         tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
+        code_mode: bool,
         allowed_builtin_tools: Option<Vec<String>>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
         if self.is_busy() || self.provider_session_id.is_some() {
@@ -5840,6 +5859,7 @@ impl DomainState {
         self.validate_and_install_external_tools(
             tools,
             replace_builtin_tools,
+            code_mode,
             allowed_builtin_tools,
         )
     }
@@ -5853,10 +5873,12 @@ impl DomainState {
         &mut self,
         tools: &[nakode_protocol::ExternalToolDefinition],
         replace_builtin_tools: bool,
+        code_mode: bool,
         allowed_builtin_tools: Option<&[String]>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
         if self.external_tools == tools
             && self.replace_builtin_tools == replace_builtin_tools
+            && self.code_mode == code_mode
             && self.allowed_builtin_tools.as_deref() == allowed_builtin_tools
         {
             return Ok(Vec::new());
@@ -5870,9 +5892,28 @@ impl DomainState {
         &mut self,
         tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
+        code_mode: bool,
         allowed_builtin_tools: Option<Vec<String>>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        if tools.is_empty() && allowed_builtin_tools.is_none() && !replace_builtin_tools {
+        if code_mode
+            && !matches!(
+                self.backend_provider.as_str(),
+                crate::backend::CODEX_PROVIDER
+                    | crate::backend::DEVIN_PROVIDER
+                    | crate::backend::GLM_PROVIDER
+                    | crate::backend::KIMI_PROVIDER
+            )
+        {
+            return Err(DomainCommandError::Invalid(format!(
+                "provider {} does not support Nakode Code Mode",
+                self.backend_provider
+            )));
+        }
+        if tools.is_empty()
+            && allowed_builtin_tools.is_none()
+            && !replace_builtin_tools
+            && !code_mode
+        {
             return Err(DomainCommandError::Invalid(
                 "at least one external tool, builtin allowlist, or explicit empty replacement is required"
                     .to_owned(),
@@ -5912,6 +5953,17 @@ impl DomainState {
             }
         }
         for tool in &tools {
+            if tool.name.starts_with(nakode_protocol::MCP_TOOL_PREFIX) {
+                return Err(DomainCommandError::Invalid(format!(
+                    "external tool name uses Nakode's reserved MCP namespace: {}",
+                    tool.name
+                )));
+            }
+            if tool.name == "codemode" {
+                return Err(DomainCommandError::Invalid(
+                    "external tool name codemode is reserved by Nakode Code Mode".to_owned(),
+                ));
+            }
             if tool.name.trim().is_empty() || !names.insert(tool.name.as_str()) {
                 return Err(DomainCommandError::Invalid(
                     "external tool names must be non-empty and unique".to_owned(),
@@ -5936,8 +5988,89 @@ impl DomainState {
         }
         self.external_tools = tools;
         self.replace_builtin_tools = replace_builtin_tools;
+        self.code_mode = code_mode;
         self.allowed_builtin_tools = allowed_builtin_tools;
         Ok(Vec::new())
+    }
+
+    #[must_use]
+    pub const fn code_mode(&self) -> bool {
+        self.code_mode
+    }
+
+    /// Changes the model-facing tool surface only at a clean owner-turn boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when work is pending or the selected provider cannot expose the required
+    /// external-tool boundary.
+    pub fn set_code_mode(&mut self, enabled: bool) -> Result<Vec<Effect>, DomainCommandError> {
+        if self.is_busy()
+            || self.resuming_session.is_some()
+            || !self.active_shells.is_empty()
+            || !self.queue.is_empty()
+        {
+            return Err(DomainCommandError::Conflict(
+                "Code Mode can only be changed between turns when no session work is pending"
+                    .to_owned(),
+            ));
+        }
+        if enabled && !self.backend_capabilities.external_tools.is_supported() {
+            return Err(DomainCommandError::Invalid(format!(
+                "provider {} does not support Nakode Code Mode",
+                self.backend_provider
+            )));
+        }
+        if enabled
+            && !matches!(
+                self.backend_provider.as_str(),
+                crate::backend::CODEX_PROVIDER
+                    | crate::backend::DEVIN_PROVIDER
+                    | crate::backend::GLM_PROVIDER
+                    | crate::backend::KIMI_PROVIDER
+            )
+        {
+            return Err(DomainCommandError::Invalid(format!(
+                "provider {} does not support Nakode Code Mode",
+                self.backend_provider
+            )));
+        }
+        if self.code_mode == enabled {
+            self.status_message = if enabled {
+                "Code Mode is already enabled.".to_owned()
+            } else {
+                "Code Mode is already disabled.".to_owned()
+            };
+            return Ok(Vec::new());
+        }
+
+        self.code_mode = enabled;
+        let message = if enabled {
+            "Code Mode enabled for the next turn."
+        } else {
+            "Code Mode disabled for the next turn."
+        };
+        message.clone_into(&mut self.status_message);
+        self.transcript.push(
+            EntryKind::System,
+            "CODE MODE",
+            message,
+            EntryStatus::Complete,
+        );
+        let mut effects = Vec::new();
+        if let Some(session_id) = self.session_id.clone() {
+            effects.push(Effect::PersistSessionCodeMode {
+                session_id,
+                enabled,
+            });
+        }
+        if let Some(provider_session_id) = self.provider_session_id.clone() {
+            effects.push(Effect::Backend(BackendCommand::SetSessionCodeMode {
+                provider_session_id,
+                enabled,
+            }));
+        }
+        Ok(effects)
     }
 
     /// Installs the exact Nakode-owned MCP tool table before provider start.
@@ -7140,6 +7273,7 @@ impl DomainState {
                 enabled_skill_ids: self.enabled_skill_ids(),
                 external_tools: self.provider_external_tools(),
                 replace_builtin_tools: self.replace_builtin_tools,
+                code_mode: self.code_mode,
                 allowed_builtin_tools: self.allowed_builtin_tools.clone(),
                 max_turns: None,
                 finalization_reserve_turns: 0,
@@ -7615,6 +7749,7 @@ impl DomainState {
             BackendOperation::Authenticate
             | BackendOperation::ModelList
             | BackendOperation::SetSessionModel
+            | BackendOperation::SetSessionCodeMode
             | BackendOperation::UnsubscribeSession => {}
             BackendOperation::CompactSession => {
                 if let Some(compaction) = self.context_compaction.take() {
@@ -8844,6 +8979,7 @@ impl DomainState {
                 enabled_skill_ids: self.enabled_skill_ids(),
                 external_tools,
                 replace_builtin_tools,
+                code_mode: false,
                 allowed_builtin_tools,
                 max_turns,
                 finalization_reserve_turns,
@@ -10227,6 +10363,100 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    fn code_mode_toggle_is_idle_only_and_emits_durable_runtime_reconfiguration() {
+        let mut state = ready_state();
+        state.session_id = Some("logical-session".to_owned());
+        state.provider_session_id = Some("provider-session".to_owned());
+
+        let effects = state.set_code_mode(true).expect("enable between turns");
+        assert!(state.code_mode());
+        assert_eq!(state.status_message, "Code Mode enabled for the next turn.");
+        assert!(state.transcript.entries().iter().any(|entry| {
+            entry.kind == EntryKind::System
+                && entry.title == "CODE MODE"
+                && entry.body == "Code Mode enabled for the next turn."
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::PersistSessionCodeMode { session_id, enabled: true },
+                Effect::Backend(BackendCommand::SetSessionCodeMode {
+                    provider_session_id,
+                    enabled: true
+                })
+            ] if session_id == "logical-session" && provider_session_id == "provider-session"
+        ));
+
+        let effects = state.set_code_mode(false).expect("disable between turns");
+        assert!(!state.code_mode());
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::PersistSessionCodeMode { enabled: false, .. },
+                Effect::Backend(BackendCommand::SetSessionCodeMode { enabled: false, .. })
+            ]
+        ));
+
+        state
+            .run_shell_command("pwd".to_owned())
+            .expect("start supervised shell");
+        assert!(matches!(
+            state.set_code_mode(true),
+            Err(DomainCommandError::Conflict(message))
+                if message.contains("only be changed between turns")
+        ));
+        assert!(!state.code_mode());
+    }
+
+    #[test]
+    fn code_mode_toggle_rejects_a_queued_next_turn() {
+        let mut state = ready_state();
+        state
+            .enqueue_prompt("queued next turn".to_owned(), Vec::new())
+            .expect("queue prompt");
+
+        assert!(matches!(
+            state.set_code_mode(true),
+            Err(DomainCommandError::Conflict(message))
+                if message.contains("no session work is pending")
+        ));
+    }
+
+    #[test]
+    fn code_mode_toggle_rejects_a_resume_in_flight() {
+        let mut state = ready_state();
+        let effects = state.begin_resume(SessionRecord {
+            id: "resume-in-flight".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            account_id: None,
+            provider_session_id: "thread-resume-in-flight".to_owned(),
+            workspace: state.workspace.clone(),
+            working_directory: state.workspace.clone(),
+            title: "Resume in flight".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            created_at: 1,
+            updated_at: 2,
+            last_owner_activity_at: None,
+            code_mode: false,
+            enabled_skill_ids: None,
+            owned_provider_sessions: Vec::new(),
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::ResumeSession { .. })
+        )));
+
+        assert!(matches!(
+            state.set_code_mode(true),
+            Err(DomainCommandError::Conflict(message))
+                if message.contains("no session work is pending")
+        ));
+    }
+
+    #[test]
     fn external_tools_reject_a_provider_that_cannot_execute_them() {
         let mut state = ready_state();
         state
@@ -10246,6 +10476,42 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             .expect_err("unsupported providers must reject external tool sessions");
 
         assert!(error.to_string().contains("native Nakode provider"));
+    }
+
+    #[test]
+    fn client_owned_tools_cannot_use_the_reserved_mcp_namespace() {
+        let mut state = ready_state();
+
+        let error = state
+            .configure_external_tools(
+                vec![nakode_protocol::ExternalToolDefinition {
+                    name: "mcp__client__spoofed".to_owned(),
+                    description: "Must not be routed as an MCP tool".to_owned(),
+                    input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                }],
+                false,
+            )
+            .expect_err("the MCP prefix belongs only to Nakode-projected MCP grants");
+
+        assert!(error.to_string().contains("reserved MCP namespace"));
+    }
+
+    #[test]
+    fn client_owned_tools_cannot_use_the_reserved_code_mode_name() {
+        let mut state = ready_state();
+
+        let error = state
+            .configure_external_tools(
+                vec![nakode_protocol::ExternalToolDefinition {
+                    name: "codemode".to_owned(),
+                    description: "Must not collide after a later mode toggle".to_owned(),
+                    input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                }],
+                false,
+            )
+            .expect_err("the synthesized Code Mode tool name is always reserved");
+
+        assert!(error.to_string().contains("reserved by Nakode Code Mode"));
     }
 
     #[test]
@@ -10325,6 +10591,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
+            code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         };
@@ -13214,12 +13481,16 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            code_mode: true,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         };
         assert!(matches!(
             state.begin_resume(session.clone()).as_slice(),
-            [Effect::Backend(BackendCommand::ResumeSession { .. })]
+            [Effect::Backend(BackendCommand::ResumeSession {
+                code_mode: true,
+                ..
+            })]
         ));
 
         let effects = state.handle_backend(BackendEvent::SessionResumed {
@@ -13970,6 +14241,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         };

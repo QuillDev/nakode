@@ -59,6 +59,7 @@ service NakodeService {
   rpc CompactContext(CompactContextRequest) returns (MutationResult);
   rpc ResolveInteraction(ResolveInteractionRequest) returns (MutationResult);
   rpc ConfigureSessionTools(ConfigureSessionToolsRequest) returns (MutationResult);
+  rpc SetSessionCodeMode(SetSessionCodeModeRequest) returns (MutationResult);
   rpc SubmitExternalToolResult(SubmitExternalToolResultRequest) returns (MutationResult);
   rpc RunShell(RunShellRequest) returns (MutationResult);
 
@@ -303,6 +304,9 @@ message SessionToolConfiguration {
   // Non-empty canonical Nakode builtin names allowed for this session.
   // Omission keeps the runtime default; use replace_builtin_tools to deny every builtin.
   repeated string allowed_builtin_tools = 3;
+  // When enabled, providers receive only Nakode's synthesized codemode tool. Its nested calls are
+  // still constrained by tools, replace_builtin_tools, allowed_builtin_tools, and the MCP grant.
+  bool code_mode = 4;
 }
 
 // A fresh session may carry its provider-qualified model, options, and client-owned tool surface in
@@ -521,6 +525,11 @@ message ConfigureSessionToolsRequest {
   string session_id = 2;
   repeated ExternalToolDefinition tools = 3;
   bool replace_builtin_tools = 4;
+}
+message SetSessionCodeModeRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  bool enabled = 3;
 }
 message SubmitExternalToolResultRequest {
   MutationOptions mutation = 1;
@@ -1013,6 +1022,8 @@ message SessionState {
   int64 last_owner_activity_at_ms = 30;
   optional string selected_account_id = 31;
   optional ProviderAccountRoutingDiagnostic routing_diagnostic = 32;
+  // True only when this session exposes the synthesized Code Mode tool to its model.
+  bool code_mode = 33;
 }
 message ProviderAccountRoutingDiagnostic {
   optional string account_id = 1;

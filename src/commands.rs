@@ -7,12 +7,14 @@ use crate::controls::{SlashAction, slash_controls};
 pub enum ParsedPromptCommand<'a> {
     Agents,
     Settings,
+    CodeMode(Option<bool>),
     Compress,
     Models,
     New,
     Providers,
     Reload,
     Resume(Option<&'a str>),
+    ResumeCode(Option<&'a str>),
     Switch,
 }
 
@@ -41,15 +43,31 @@ pub fn parse_prompt_command(input: &str) -> Option<ParsedPromptCommand<'_>> {
         return match control.action {
             SlashAction::Agents => Some(ParsedPromptCommand::Agents),
             SlashAction::Settings => Some(ParsedPromptCommand::Settings),
+            SlashAction::CodeMode => Some(ParsedPromptCommand::CodeMode(None)),
             SlashAction::Compress => Some(ParsedPromptCommand::Compress),
             SlashAction::Models => Some(ParsedPromptCommand::Models),
             SlashAction::New => Some(ParsedPromptCommand::New),
             SlashAction::Providers => Some(ParsedPromptCommand::Providers),
             SlashAction::Reload => Some(ParsedPromptCommand::Reload),
             SlashAction::Resume => Some(ParsedPromptCommand::Resume(None)),
+            SlashAction::ResumeCode => Some(ParsedPromptCommand::ResumeCode(None)),
             SlashAction::Switch => Some(ParsedPromptCommand::Switch),
             SlashAction::Skill => None,
         };
+    }
+    if let Some(value) = command.strip_prefix("/code-mode ").map(str::trim) {
+        return match value {
+            "on" => Some(ParsedPromptCommand::CodeMode(Some(true))),
+            "off" => Some(ParsedPromptCommand::CodeMode(Some(false))),
+            _ => None,
+        };
+    }
+    if let Some(session) = command
+        .strip_prefix("/resume-code ")
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+    {
+        return Some(ParsedPromptCommand::ResumeCode(Some(session)));
     }
     command
         .strip_prefix("/resume ")
@@ -112,6 +130,19 @@ mod tests {
             Some(ParsedPromptCommand::Agents)
         );
         assert_eq!(
+            super::parse_prompt_command("/code-mode"),
+            Some(ParsedPromptCommand::CodeMode(None))
+        );
+        assert_eq!(
+            super::parse_prompt_command("/code-mode on"),
+            Some(ParsedPromptCommand::CodeMode(Some(true)))
+        );
+        assert_eq!(
+            super::parse_prompt_command("/code-mode off"),
+            Some(ParsedPromptCommand::CodeMode(Some(false)))
+        );
+        assert_eq!(super::parse_prompt_command("/code-mode maybe"), None);
+        assert_eq!(
             super::parse_prompt_command("/compress"),
             Some(ParsedPromptCommand::Compress)
         );
@@ -126,6 +157,10 @@ mod tests {
         assert_eq!(
             super::parse_prompt_command("/switch"),
             Some(ParsedPromptCommand::Switch)
+        );
+        assert_eq!(
+            super::parse_prompt_command("/resume-code session-2"),
+            Some(ParsedPromptCommand::ResumeCode(Some("session-2")))
         );
         assert_eq!(
             super::parse_prompt_command("/resume session-1"),

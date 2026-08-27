@@ -1436,6 +1436,7 @@ const fn command_name(command: &crate::api_projection::TuiAction) -> &'static st
     match command {
         TuiAction::CreateSession { .. } => "create_session",
         TuiAction::OpenSession { .. } => "open_session",
+        TuiAction::SetSessionCodeMode { .. } => "set_session_code_mode",
         TuiAction::SendPrompt { .. } => "send_prompt",
         TuiAction::EnqueuePrompt { .. } => "enqueue_prompt",
         TuiAction::RemoveQueuedPrompt { .. } => "remove_queued_prompt",

@@ -11,7 +11,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    sync::mpsc,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -266,10 +270,61 @@ impl From<ToolDefinition> for DynamicToolDefinition {
     }
 }
 
+fn code_mode_definition(tools: &[DynamicToolDefinition]) -> DynamicToolDefinition {
+    let catalogue = tools
+        .iter()
+        .map(|tool| {
+            format!(
+                "- tools[{name}]({parameters}) — {description}",
+                name =
+                    serde_json::to_string(&tool.name).unwrap_or_else(|_| "\"unknown\"".to_owned()),
+                parameters =
+                    serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_owned()),
+                description = tool.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    DynamicToolDefinition {
+        name: "codemode".to_owned(),
+        description: format!(
+            "Run one confined JavaScript program that composes Nakode tools. This is the only model-facing tool in this session. Use `await tools[\"tool_name\"](arguments)` (or dot notation for identifier-safe names), filter intermediate results in code, and return one JSON-compatible final value. Calls execute eagerly and currently settle in source order. No filesystem, network, process, environment, timers, modules, or credentials are available except through the listed tools. Every nested call is independently policy-checked and audited.\n\nAvailable tools:\n{catalogue}"
+        ),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "maxLength": crate::codemode_worker::MAX_SOURCE_BYTES,
+                    "description": "JavaScript function body. Return one JSON-compatible value."
+                }
+            },
+            "required": ["code"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn encode_code_mode_host_response(output: String, failed: bool) -> Result<Vec<u8>, String> {
+    let value = serde_json::from_str::<Value>(&output).unwrap_or(Value::String(output));
+    let response = serde_json::json!({"value": value, "failed": failed});
+    let encoded = serde_json::to_vec(&response)
+        .map_err(|error| format!("could not encode codemode tool result: {error}"))?;
+    if encoded.len() < crate::codemode_worker::MAX_FRAME_BYTES {
+        return Ok(encoded);
+    }
+    serde_json::to_vec(&serde_json::json!({
+        "value": "codemode nested tool result exceeded the 1 MiB frame limit",
+        "failed": true
+    }))
+    .map_err(|error| format!("could not encode codemode overflow result: {error}"))
+}
+
 #[derive(Clone, Debug, Default)]
 struct ExternalToolConfiguration {
     tools: Vec<DynamicToolDefinition>,
     replace_builtin_tools: bool,
+    code_mode: bool,
     allowed_builtin_tools: Option<std::collections::HashSet<String>>,
     max_turns: Option<u32>,
     finalization_reserve_turns: u32,
@@ -308,6 +363,7 @@ pub struct AgentRuntime {
     direct_image_input: bool,
     external_tools: Arc<ExternalToolBroker>,
     native_delegation: Option<mpsc::Sender<crate::backend::NativeDelegationRequest>>,
+    code_mode_worker_executable: Option<PathBuf>,
 }
 
 impl AgentRuntime {
@@ -324,7 +380,19 @@ impl AgentRuntime {
             direct_image_input: true,
             external_tools: Arc::new(ExternalToolBroker::default()),
             native_delegation: None,
+            code_mode_worker_executable: None,
         }
+    }
+
+    /// Overrides the trusted Nakode executable used for the isolated Code Mode worker.
+    ///
+    /// Production runtimes use the current executable. This seam lets embedders and integration
+    /// tests select the matching trusted binary without granting model-authored code any process
+    /// authority.
+    #[must_use]
+    pub fn with_code_mode_worker_executable(mut self, executable: PathBuf) -> Self {
+        self.code_mode_worker_executable = Some(executable);
+        self
     }
 
     /// Installs the server-owned native delegation route and its matching callable schema.
@@ -350,6 +418,7 @@ impl AgentRuntime {
         session_id: &str,
         tools: Vec<nakode_protocol::ExternalToolDefinition>,
         replace_builtin_tools: bool,
+        code_mode: bool,
         allowed_builtin_tools: Option<Vec<String>>,
         max_turns: Option<u32>,
         finalization_reserve_turns: u32,
@@ -384,6 +453,7 @@ impl AgentRuntime {
             ExternalToolConfiguration {
                 tools: definitions,
                 replace_builtin_tools,
+                code_mode,
                 allowed_builtin_tools: allowed_builtin_tools
                     .map(|tools| tools.into_iter().collect()),
                 max_turns,
@@ -391,6 +461,20 @@ impl AgentRuntime {
                 timeout_seconds,
             },
         );
+        Ok(())
+    }
+
+    /// Changes only the synthesized-tool projection for an already configured idle session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime session has no installed canonical tool surface.
+    pub async fn set_code_mode(&self, session_id: &str, enabled: bool) -> Result<(), String> {
+        let mut sessions = self.external_tools.sessions.lock().await;
+        let configuration = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("runtime session {session_id} has no installed tool surface"))?;
+        configuration.code_mode = enabled;
         Ok(())
     }
 
@@ -412,6 +496,15 @@ impl AgentRuntime {
             .get(session_id)
             .cloned()
             .unwrap_or_default();
+        let tools = self.underlying_tools(&external);
+        if external.code_mode {
+            vec![code_mode_definition(&tools)]
+        } else {
+            tools
+        }
+    }
+
+    fn underlying_tools(&self, external: &ExternalToolConfiguration) -> Vec<DynamicToolDefinition> {
         let mut tools = if external.replace_builtin_tools {
             Vec::new()
         } else {
@@ -427,8 +520,19 @@ impl AgentRuntime {
                 .map(DynamicToolDefinition::from)
                 .collect()
         };
-        tools.extend(external.tools);
+        tools.extend(external.tools.clone());
         tools
+    }
+
+    async fn code_mode_catalogue(&self, session_id: &str) -> Option<Vec<DynamicToolDefinition>> {
+        let external = self
+            .external_tools
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()?;
+        external.code_mode.then(|| self.underlying_tools(&external))
     }
 
     async fn is_external_tool(&self, session_id: &str, name: &str) -> bool {
@@ -1043,9 +1147,11 @@ impl AgentRuntime {
         cancellation: &CancellationToken,
     ) -> Result<HashMap<String, usize>, String> {
         let mut failures = HashMap::<String, usize>::new();
+        let code_mode = self.code_mode_catalogue(&session.id).await.is_some();
         let mut pending = tool_calls.into_iter().peekable();
         while let Some(tool_call) = pending.next() {
-            let is_read_only = !self.is_external_tool(&session.id, &tool_call.name).await
+            let is_read_only = !code_mode
+                && !self.is_external_tool(&session.id, &tool_call.name).await
                 && self
                     .tools
                     .find(&tool_call.name)
@@ -1097,6 +1203,39 @@ impl AgentRuntime {
     }
 
     async fn execute_exclusive_tool(
+        &self,
+        session: &mut RuntimeSession,
+        turn_id: &str,
+        tool_call: ToolCall,
+        backend_events: &mpsc::Sender<BackendEvent>,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutedTool, String> {
+        if let Some(catalogue) = self.code_mode_catalogue(&session.id).await {
+            if tool_call.name == "codemode" {
+                return self
+                    .execute_code_mode(
+                        session,
+                        turn_id,
+                        tool_call,
+                        catalogue,
+                        backend_events,
+                        cancellation,
+                    )
+                    .await;
+            }
+            return Ok(ExecutedTool::denied(turn_id, tool_call));
+        }
+        self.execute_underlying_exclusive_tool(
+            session,
+            turn_id,
+            tool_call,
+            backend_events,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn execute_underlying_exclusive_tool(
         &self,
         session: &mut RuntimeSession,
         turn_id: &str,
@@ -1161,6 +1300,273 @@ impl AgentRuntime {
             tool_call,
             title,
             result,
+            started_at_ms,
+            duration_ms(started.elapsed()),
+        ))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_code_mode(
+        &self,
+        session: &mut RuntimeSession,
+        turn_id: &str,
+        tool_call: ToolCall,
+        catalogue: Vec<DynamicToolDefinition>,
+        backend_events: &mpsc::Sender<BackendEvent>,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutedTool, String> {
+        let title = "codemode · confined JavaScript".to_owned();
+        send_tool_started(
+            turn_id,
+            &tool_call.id,
+            &tool_call.name,
+            &title,
+            &tool_call.arguments,
+            false,
+            backend_events,
+        )
+        .await?;
+        let started_at_ms = unix_time_ms();
+        let started = Instant::now();
+        let source = match tool_call.arguments.as_object() {
+            Some(arguments)
+                if arguments.len() == 1 && arguments.get("code").is_some_and(Value::is_string) =>
+            {
+                arguments["code"].as_str().expect("checked string")
+            }
+            _ => {
+                return Ok(ExecutedTool::new(
+                    "codemode",
+                    tool_call,
+                    title,
+                    crate::tools::ToolResult::failure(
+                        "codemode requires exactly one string argument named code",
+                    ),
+                    started_at_ms,
+                    duration_ms(started.elapsed()),
+                ));
+            }
+        };
+        if source.len() > crate::codemode_worker::MAX_SOURCE_BYTES {
+            return Ok(ExecutedTool::new(
+                "codemode",
+                tool_call,
+                title,
+                crate::tools::ToolResult::failure("codemode source exceeds the 32 KiB limit"),
+                started_at_ms,
+                duration_ms(started.elapsed()),
+            ));
+        }
+        let allowed = catalogue
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let request = serde_json::json!({
+            "source": source,
+            "tools": catalogue.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>()
+        });
+        let executable = match &self.code_mode_worker_executable {
+            Some(executable) => executable.clone(),
+            None => std::env::current_exe()
+                .map_err(|error| format!("could not locate codemode worker executable: {error}"))?,
+        };
+        let worker_directory = tempfile::tempdir()
+            .map_err(|error| format!("could not create isolated codemode directory: {error}"))?;
+        let mut child = Command::new(executable)
+            .arg("codemode-worker")
+            .env_clear()
+            .current_dir(worker_directory.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| format!("could not start codemode worker: {error}"))?;
+        let mut child_input = child
+            .stdin
+            .take()
+            .ok_or_else(|| "codemode worker stdin was not captured".to_owned())?;
+        let child_output = child
+            .stdout
+            .take()
+            .ok_or_else(|| "codemode worker stdout was not captured".to_owned())?;
+        child_input
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&request)
+                        .map_err(|error| format!("could not encode codemode request: {error}"))?
+                )
+                .as_bytes(),
+            )
+            .await
+            .map_err(|error| format!("could not write codemode request: {error}"))?;
+        child_input
+            .flush()
+            .await
+            .map_err(|error| format!("could not flush codemode request: {error}"))?;
+
+        let execution_cancellation = cancellation.child_token();
+        let mut output = BufReader::new(child_output);
+        let mut frame = String::new();
+        let deadline = tokio::time::Instant::now() + crate::codemode_worker::EXECUTION_TIMEOUT;
+        let mut sequence = 0_usize;
+        let final_result = loop {
+            frame.clear();
+            let mut limited_output =
+                (&mut output).take((crate::codemode_worker::MAX_FRAME_BYTES + 1) as u64);
+            let read = tokio::select! {
+                read = limited_output.read_line(&mut frame) => read
+                    .map_err(|error| format!("codemode worker output failed: {error}"))?,
+                () = cancellation.cancelled() => {
+                    let _ = child.start_kill();
+                    break crate::tools::ToolResult::failure("codemode execution interrupted");
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    let _ = child.start_kill();
+                    break crate::tools::ToolResult::failure("codemode execution timed out");
+                }
+            };
+            if read == 0 {
+                let status = child
+                    .wait()
+                    .await
+                    .map_err(|error| format!("could not wait for codemode worker: {error}"))?;
+                break crate::tools::ToolResult::failure(format!(
+                    "codemode worker exited before completing ({status})"
+                ));
+            }
+            if frame.len() > crate::codemode_worker::MAX_FRAME_BYTES {
+                let _ = child.start_kill();
+                break crate::tools::ToolResult::failure("codemode worker frame exceeded 1 MiB");
+            }
+            let message: Value = match serde_json::from_str(frame.trim_end()) {
+                Ok(message) => message,
+                Err(error) => {
+                    let _ = child.start_kill();
+                    break crate::tools::ToolResult::failure(format!(
+                        "codemode worker sent invalid JSON: {error}"
+                    ));
+                }
+            };
+            match message.get("type").and_then(Value::as_str) {
+                Some("invoke") => {
+                    sequence += 1;
+                    let name = message
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let arguments = message
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                    let nested = ToolCall {
+                        id: format!("{}/{sequence}", tool_call.id),
+                        name: name.to_owned(),
+                        arguments,
+                    };
+                    let execution = async {
+                        if sequence > crate::codemode_worker::MAX_TOOL_CALLS {
+                            Ok(ExecutedTool::denied_with_reason(
+                                turn_id,
+                                nested,
+                                "codemode exceeded the 64-call limit".to_owned(),
+                            ))
+                        } else if !allowed.contains(name) || name == "codemode" {
+                            Ok(ExecutedTool::denied_with_reason(
+                                turn_id,
+                                nested,
+                                format!("tool {name} is not available in this codemode session"),
+                            ))
+                        } else {
+                            let read_only = !self.is_external_tool(&session.id, name).await
+                                && self
+                                    .tools
+                                    .find(name)
+                                    .filter(|tool| tool.available())
+                                    .is_some_and(|tool| {
+                                        tool.concurrency() == ToolConcurrency::ReadOnly
+                                    });
+                            if read_only {
+                                self.execute_read_only_tool(
+                                    session,
+                                    turn_id,
+                                    nested,
+                                    backend_events,
+                                    &execution_cancellation,
+                                )
+                                .await
+                            } else {
+                                self.execute_underlying_exclusive_tool(
+                                    session,
+                                    turn_id,
+                                    nested,
+                                    backend_events,
+                                    &execution_cancellation,
+                                )
+                                .await
+                            }
+                        }
+                    };
+                    let executed = tokio::select! {
+                        result = execution => result?,
+                        () = cancellation.cancelled() => {
+                            execution_cancellation.cancel();
+                            let _ = child.start_kill();
+                            break crate::tools::ToolResult::failure("codemode execution interrupted");
+                        }
+                        () = tokio::time::sleep_until(deadline) => {
+                            execution_cancellation.cancel();
+                            let _ = child.start_kill();
+                            break crate::tools::ToolResult::failure("codemode execution timed out");
+                        }
+                    };
+                    let result = crate::tools::ToolResult {
+                        output: executed.output.clone(),
+                        failed: executed.failed,
+                        invocation_identity: executed.invocation_identity.clone(),
+                    };
+                    record_nested_tool_result(session, executed, turn_id, backend_events).await?;
+                    let encoded = encode_code_mode_host_response(result.output, result.failed)?;
+                    child_input.write_all(&encoded).await.map_err(|error| {
+                        format!("could not return codemode tool result: {error}")
+                    })?;
+                    child_input.write_all(b"\n").await.map_err(|error| {
+                        format!("could not terminate codemode tool result: {error}")
+                    })?;
+                    child_input.flush().await.map_err(|error| {
+                        format!("could not flush codemode tool result: {error}")
+                    })?;
+                }
+                Some("complete") => {
+                    let value = message.get("value").cloned().unwrap_or(Value::Null);
+                    break crate::tools::ToolResult::success(
+                        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_owned()),
+                    );
+                }
+                Some("failed") => {
+                    break crate::tools::ToolResult::failure(
+                        message
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("codemode execution failed"),
+                    );
+                }
+                _ => {
+                    let _ = child.start_kill();
+                    break crate::tools::ToolResult::failure(
+                        "codemode worker sent an unknown message",
+                    );
+                }
+            }
+        };
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        Ok(ExecutedTool::new(
+            "codemode",
+            tool_call,
+            title,
+            final_result,
             started_at_ms,
             duration_ms(started.elapsed()),
         ))
@@ -1342,6 +1748,10 @@ impl ExecutedTool {
             "provider tool {} is not allowed by the launch policy",
             tool_call.name
         );
+        Self::denied_with_reason(turn_id, tool_call, reason)
+    }
+
+    fn denied_with_reason(turn_id: &str, tool_call: ToolCall, reason: String) -> Self {
         let mut executed = Self::new(
             runtime_tool_kind(&tool_call.name, false),
             tool_call,
@@ -1521,9 +1931,28 @@ async fn send_tool_started(
 
 async fn record_tool_result(
     session: &mut RuntimeSession,
+    executed: ExecutedTool,
+    turn_id: &str,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), String> {
+    finish_tool_result(session, executed, turn_id, events, true).await
+}
+
+async fn record_nested_tool_result(
+    session: &mut RuntimeSession,
+    executed: ExecutedTool,
+    turn_id: &str,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), String> {
+    finish_tool_result(session, executed, turn_id, events, false).await
+}
+
+async fn finish_tool_result(
+    session: &mut RuntimeSession,
     mut executed: ExecutedTool,
     turn_id: &str,
     events: &mpsc::Sender<BackendEvent>,
+    add_to_model_history: bool,
 ) -> Result<(), String> {
     if executed.item_id.is_empty() {
         executed.item_id = format!("{turn_id}:tool:{}", executed.call_id);
@@ -1589,19 +2018,21 @@ async fn record_tool_result(
         model_output_bytes: executed.model_output.len(),
         failed: executed.failed,
     });
-    session.history.push(ConversationItem::ToolResult {
-        call_id: executed.call_id,
-        name: Some(executed.name),
-        arguments: Some(executed.arguments),
-        audit_kind: Some(executed.audit_kind.to_owned()),
-        title: Some(executed.title),
-        output: executed.output,
-        model_output: Some(executed.model_output),
-        failed: executed.failed,
-        denied: executed.denied,
-        denial_reason: executed.denial_reason,
-        duration_ms: Some(executed.duration_ms),
-    });
+    if add_to_model_history {
+        session.history.push(ConversationItem::ToolResult {
+            call_id: executed.call_id,
+            name: Some(executed.name),
+            arguments: Some(executed.arguments),
+            audit_kind: Some(executed.audit_kind.to_owned()),
+            title: Some(executed.title),
+            output: executed.output,
+            model_output: Some(executed.model_output),
+            failed: executed.failed,
+            denied: executed.denied,
+            denial_reason: executed.denial_reason,
+            duration_ms: Some(executed.duration_ms),
+        });
+    }
     Ok(())
 }
 
@@ -2472,8 +2903,9 @@ mod tests {
     use super::{
         AgentRuntime, ConversationItem, ExecutedTool, InferenceEvent, InferenceFailure,
         InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest, QuestionBroker,
-        RuntimeSession, RuntimeSessionStore, RuntimeToolAudit, ToolCall, normalize_history_item,
-        record_tool_result, runtime_tool_audit,
+        RuntimeSession, RuntimeSessionStore, RuntimeToolAudit, ToolCall,
+        encode_code_mode_host_response, normalize_history_item, record_tool_result,
+        runtime_tool_audit,
     };
     use crate::backend::{
         BackendEvent, CompactionReason, ItemKind, ProviderFailureClassification, QuestionOption,
@@ -2908,6 +3340,308 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn code_mode_is_opt_in_and_replaces_only_the_model_facing_surface() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider);
+
+        runtime
+            .configure_external_tools(
+                "ordinary-session",
+                Vec::new(),
+                false,
+                false,
+                Some(vec!["read".to_owned()]),
+                None,
+                0,
+                None,
+            )
+            .await
+            .expect("ordinary tool configuration");
+        let ordinary = runtime.inference_tools("ordinary-session").await;
+        assert_eq!(
+            ordinary
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read"]
+        );
+
+        runtime
+            .configure_external_tools(
+                "codemode-session",
+                Vec::new(),
+                false,
+                true,
+                Some(vec!["read".to_owned()]),
+                None,
+                0,
+                None,
+            )
+            .await
+            .expect("codemode tool configuration");
+        let projected = runtime.inference_tools("codemode-session").await;
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].name, "codemode");
+        assert!(projected[0].description.contains("tools[\"read\"]"));
+        runtime
+            .set_code_mode("codemode-session", false)
+            .await
+            .expect("disable Code Mode between turns");
+        assert_eq!(
+            runtime
+                .inference_tools("codemode-session")
+                .await
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read"]
+        );
+        assert_eq!(
+            runtime
+                .inference_tools("ordinary-session")
+                .await
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read"]
+        );
+        runtime
+            .set_code_mode("codemode-session", true)
+            .await
+            .expect("re-enable Code Mode between turns");
+        assert!(!runtime.is_external_tool("codemode-session", "read").await);
+        assert!(
+            runtime
+                .builtin_tool_allowed("codemode-session", "read")
+                .await
+        );
+
+        let (events, _receiver) = mpsc::channel(1);
+        let mut session = RuntimeSession::new("model".to_owned(), String::new());
+        session.id = "codemode-session".to_owned();
+        let hidden_direct_call = runtime
+            .execute_exclusive_tool(
+                &mut session,
+                "turn-1",
+                ToolCall {
+                    id: "hidden-read".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({"path": "Cargo.toml"}),
+                },
+                &events,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("hidden tool denial");
+        assert!(hidden_direct_call.denied);
+        assert!(hidden_direct_call.failed);
+    }
+
+    #[tokio::test]
+    async fn code_mode_catalogue_contains_every_authorized_tool_class_without_cross_session_changes()
+     {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider);
+        let external_tools = vec![
+            nakode_protocol::ExternalToolDefinition {
+                name: "client_lookup".to_owned(),
+                description: "Client-owned lookup".to_owned(),
+                input_schema_json: r#"{"type":"object"}"#.to_owned(),
+            },
+            nakode_protocol::ExternalToolDefinition {
+                name: "mcp__catalogue__lookup".to_owned(),
+                description: "Granted MCP lookup".to_owned(),
+                input_schema_json: r#"{"type":"object"}"#.to_owned(),
+            },
+        ];
+
+        runtime
+            .configure_external_tools(
+                "ordinary-session",
+                external_tools.clone(),
+                false,
+                false,
+                None,
+                None,
+                0,
+                None,
+            )
+            .await
+            .expect("ordinary full tool configuration");
+        let ordinary_before = runtime.inference_tools("ordinary-session").await;
+
+        runtime
+            .configure_external_tools(
+                "codemode-session",
+                external_tools,
+                false,
+                true,
+                None,
+                None,
+                0,
+                None,
+            )
+            .await
+            .expect("Code Mode full tool configuration");
+        let catalogue = runtime
+            .code_mode_catalogue("codemode-session")
+            .await
+            .expect("Code Mode catalogue");
+        let ordinary_names = ordinary_before
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let catalogue_names = catalogue
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(catalogue_names, ordinary_names);
+        assert!(catalogue_names.contains("read"));
+        assert!(catalogue_names.contains("bash"));
+        assert!(catalogue_names.contains("client_lookup"));
+        assert!(catalogue_names.contains("mcp__catalogue__lookup"));
+        assert_eq!(
+            runtime
+                .inference_tools("codemode-session")
+                .await
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codemode"]
+        );
+        assert_eq!(
+            runtime
+                .inference_tools("ordinary-session")
+                .await
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ordinary_names
+        );
+    }
+
+    #[test]
+    fn code_mode_bounds_nested_results_before_worker_ipc() {
+        let encoded = encode_code_mode_host_response(
+            "x".repeat(crate::codemode_worker::MAX_FRAME_BYTES * 2),
+            false,
+        )
+        .expect("encode bounded overflow response");
+        let response: Value = serde_json::from_slice(&encoded).expect("overflow response JSON");
+
+        assert!(encoded.len() < crate::codemode_worker::MAX_FRAME_BYTES);
+        assert_eq!(response["failed"], true);
+        assert!(
+            response["value"]
+                .as_str()
+                .is_some_and(|value| value.contains("1 MiB"))
+        );
+    }
+
+    #[tokio::test]
+    async fn code_mode_nested_dispatch_uses_native_client_and_mcp_callback_boundaries() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(directory.path().join("sample.txt"), "native-result")
+            .expect("write native fixture");
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider);
+        runtime
+            .configure_external_tools(
+                "codemode-session",
+                vec![
+                    nakode_protocol::ExternalToolDefinition {
+                        name: "client_lookup".to_owned(),
+                        description: "Client lookup".to_owned(),
+                        input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                    },
+                    nakode_protocol::ExternalToolDefinition {
+                        name: "mcp__catalogue__lookup".to_owned(),
+                        description: "MCP lookup".to_owned(),
+                        input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                    },
+                ],
+                false,
+                true,
+                None,
+                None,
+                0,
+                None,
+            )
+            .await
+            .expect("Code Mode tool configuration");
+        let (events, mut receiver) = mpsc::channel(16);
+        let mut session = RuntimeSession::new("model".to_owned(), String::new());
+        session.id = "codemode-session".to_owned();
+        let cancellation = CancellationToken::new();
+
+        let native = runtime
+            .execute_underlying_exclusive_tool(
+                &mut session,
+                "turn-1",
+                ToolCall {
+                    id: "outer/1".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({"path": "sample.txt"}),
+                },
+                &events,
+                &cancellation,
+            )
+            .await
+            .expect("canonical native execution");
+        assert!(!native.failed);
+        assert!(native.output.contains("native-result"));
+
+        for (sequence, name) in ["client_lookup", "mcp__catalogue__lookup"]
+            .into_iter()
+            .enumerate()
+        {
+            let execution = runtime.execute_underlying_exclusive_tool(
+                &mut session,
+                "turn-1",
+                ToolCall {
+                    id: format!("outer/{}", sequence + 2),
+                    name: name.to_owned(),
+                    arguments: json!({"query": name}),
+                },
+                &events,
+                &cancellation,
+            );
+            let resolution = async {
+                loop {
+                    if let BackendEvent::ExternalToolRequested(request) =
+                        receiver.recv().await.expect("external callback event")
+                    {
+                        assert_eq!(request.name, name);
+                        assert!(request.arguments_json.contains(name));
+                        assert!(
+                            runtime
+                                .resolve_external_tool(
+                                    &request.id,
+                                    crate::tools::ToolResult::success(format!("{name}-result")),
+                                )
+                                .await
+                        );
+                        break;
+                    }
+                }
+            };
+            let (executed, ()) = tokio::join!(execution, resolution);
+            let executed = executed.expect("canonical external execution");
+            assert!(!executed.failed);
+            assert_eq!(executed.output, format!("{name}-result"));
+        }
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn builtin_tool_allowlist_is_authoritative_for_native_inference() {
         let directory = tempfile::tempdir().expect("workspace");
@@ -2919,6 +3653,7 @@ mod tests {
             .configure_external_tools(
                 "restricted-session",
                 Vec::new(),
+                false,
                 false,
                 Some(vec!["read".to_owned()]),
                 None,
@@ -3001,6 +3736,7 @@ mod tests {
                     input_schema_json: r#"{"type":"object"}"#.to_owned(),
                 }],
                 false,
+                false,
                 Some(vec!["read".to_owned()]),
                 None,
                 0,
@@ -3014,6 +3750,7 @@ mod tests {
             .configure_external_tools(
                 "memory-session",
                 Vec::new(),
+                false,
                 false,
                 Some(vec!["memory_search".to_owned(), "memory_store".to_owned()]),
                 None,
@@ -3042,6 +3779,7 @@ mod tests {
                     input_schema_json: r#"{"type":"object"}"#.to_owned(),
                 }],
                 true,
+                false,
                 None,
                 None,
                 0,
@@ -3085,6 +3823,7 @@ mod tests {
                     .to_string(),
                 }],
                 true,
+                false,
                 None,
                 None,
                 0,
@@ -3520,7 +4259,16 @@ mod tests {
         let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider.clone());
         let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
         runtime
-            .configure_external_tools(&session.id, Vec::new(), false, None, Some(6), 2, None)
+            .configure_external_tools(
+                &session.id,
+                Vec::new(),
+                false,
+                false,
+                None,
+                Some(6),
+                2,
+                None,
+            )
             .await
             .expect("turn policy");
         let (events, mut receiver) = mpsc::channel(128);
@@ -3566,7 +4314,16 @@ mod tests {
         let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider.clone());
         let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
         runtime
-            .configure_external_tools(&session.id, Vec::new(), false, None, Some(2), 0, None)
+            .configure_external_tools(
+                &session.id,
+                Vec::new(),
+                false,
+                false,
+                None,
+                Some(2),
+                0,
+                None,
+            )
             .await
             .expect("turn policy");
         let (events, _receiver) = mpsc::channel(128);

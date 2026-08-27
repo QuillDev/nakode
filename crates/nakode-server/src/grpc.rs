@@ -224,6 +224,7 @@ fn session_tools(
             })
             .collect(),
         replace_builtin_tools: value.replace_builtin_tools,
+        code_mode: value.code_mode,
         allowed_builtin_tools: (!value.allowed_builtin_tools.is_empty())
             .then_some(value.allowed_builtin_tools),
     })
@@ -1081,6 +1082,16 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         )
         .await
     }
+
+    command_rpc!(
+        set_session_code_mode,
+        api::SetSessionCodeModeRequest,
+        input,
+        protocol::Command::SetSessionCodeMode {
+            session_id: protocol::SessionId::from(input.session_id),
+            enabled: input.enabled
+        }
+    );
 
     command_rpc!(
         submit_external_tool_result,
@@ -2314,6 +2325,7 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         workspace_id: value.workspace_id.to_string(),
         working_directory: value.working_directory,
         title: value.title,
+        code_mode: value.code_mode,
         status_message: value.status_message,
         diagnostic_count: value.diagnostic_count,
         activity: session_activity(value.activity),

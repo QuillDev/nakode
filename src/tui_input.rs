@@ -507,6 +507,7 @@ fn local_prompt_command(
             state.open_settings();
             InputOutcome::default()
         }
+        ParsedPromptCommand::CodeMode(requested) => code_mode_outcome(state, bootstrap, requested),
         ParsedPromptCommand::Compress => {
             let Some(agent_session_id) = bootstrap
                 .active_session
@@ -532,6 +533,7 @@ fn local_prompt_command(
             commands: vec![CommandIntent::selecting(Command::CreateSession {
                 workspace_id: bootstrap.workspace_id.clone(),
                 title: None,
+                code_mode: false,
             })],
             ..InputOutcome::default()
         },
@@ -559,11 +561,23 @@ fn local_prompt_command(
         ParsedPromptCommand::Resume(Some(session_id)) => InputOutcome {
             commands: vec![CommandIntent::selecting(Command::OpenSession {
                 session_id: SessionId::from(session_id.to_owned()),
+                code_mode: false,
             })],
             ..InputOutcome::default()
         },
         ParsedPromptCommand::Resume(None) => {
-            state.open_session_picker();
+            state.open_session_picker(false);
+            InputOutcome::default()
+        }
+        ParsedPromptCommand::ResumeCode(Some(session_id)) => InputOutcome {
+            commands: vec![CommandIntent::selecting(Command::OpenSession {
+                session_id: SessionId::from(session_id.to_owned()),
+                code_mode: true,
+            })],
+            ..InputOutcome::default()
+        },
+        ParsedPromptCommand::ResumeCode(None) => {
+            state.open_session_picker(true);
             InputOutcome::default()
         }
         ParsedPromptCommand::Switch => {
@@ -571,6 +585,26 @@ fn local_prompt_command(
             InputOutcome::default()
         }
     })
+}
+
+fn code_mode_outcome(
+    state: &mut TuiState,
+    bootstrap: &BootstrapView,
+    requested: Option<bool>,
+) -> InputOutcome {
+    let Some(session) = bootstrap.active_session.as_ref() else {
+        state.set_status("No Nakode session is selected.");
+        return InputOutcome::default();
+    };
+    let enabled = requested.unwrap_or(!session.code_mode);
+    InputOutcome {
+        commands: vec![CommandIntent::new(Command::SetSessionCodeMode {
+            session_id: session.id.clone(),
+            enabled,
+            expected_revision: session.revision,
+        })],
+        ..InputOutcome::default()
+    }
 }
 
 fn protocol_prompt(draft: &ComposerDraft) -> PromptInput {
@@ -829,11 +863,11 @@ fn handle_session_picker_key(
         Some(ControlAction::Previous) => state.session_picker_move(-1),
         Some(ControlAction::Next) => state.session_picker_move(1),
         Some(ControlAction::Select) => {
-            let selected = state
+            let (selected, code_mode) = state
                 .client
                 .session_picker
                 .as_ref()
-                .map_or(0, |picker| picker.selected);
+                .map_or((0, false), |picker| (picker.selected, picker.code_mode));
             let Some(session) = bootstrap.sessions.get(selected) else {
                 state.set_status("No session is selected.");
                 return InputOutcome::default();
@@ -842,6 +876,7 @@ fn handle_session_picker_key(
             return InputOutcome {
                 commands: vec![CommandIntent::selecting(Command::OpenSession {
                     session_id: session.id.clone(),
+                    code_mode,
                 })],
                 ..InputOutcome::default()
             };
@@ -1943,8 +1978,11 @@ mod tests {
 
         assert!(matches!(
             &outcome.commands[0].command,
-            Command::CreateSession { workspace_id, .. }
-                if workspace_id.as_str() == "workspace-1"
+            Command::CreateSession {
+                workspace_id,
+                code_mode: false,
+                ..
+            } if workspace_id.as_str() == "workspace-1"
         ));
         assert_eq!(
             state
@@ -1953,6 +1991,67 @@ mod tests {
                 .map(nakode_protocol::SessionId::as_str),
             Some("session-1")
         );
+    }
+
+    #[test]
+    fn code_mode_command_toggles_the_current_session_at_its_revision() {
+        let view = bootstrap();
+        let mut tui = state(&view);
+        tui.client.editor.insert_str("/code-mode");
+
+        let outcome = handle_terminal(
+            &mut tui,
+            &view,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert!(matches!(
+            &outcome.commands[0].command,
+            Command::SetSessionCodeMode {
+                session_id,
+                enabled: true,
+                expected_revision: 1,
+            } if session_id.as_str() == "session-1"
+        ));
+        assert_eq!(outcome.commands.len(), 1);
+
+        let mut view = view;
+        view.active_session
+            .as_mut()
+            .expect("active session")
+            .code_mode = true;
+        let mut tui = state(&view);
+        tui.client.editor.insert_str("/code-mode off");
+        let outcome = handle_terminal(
+            &mut tui,
+            &view,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(matches!(
+            &outcome.commands[0].command,
+            Command::SetSessionCodeMode { enabled: false, .. }
+        ));
+    }
+
+    #[test]
+    fn resume_code_mode_command_reattaches_with_explicit_code_mode_configuration() {
+        let view = bootstrap();
+        let mut state = state(&view);
+        state.client.editor.insert_str("/resume-code session-2");
+
+        let outcome = handle_terminal(
+            &mut state,
+            &view,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert!(matches!(
+            &outcome.commands[0].command,
+            Command::OpenSession {
+                session_id,
+                code_mode: true,
+            } if session_id.as_str() == "session-2"
+        ));
     }
 
     #[test]

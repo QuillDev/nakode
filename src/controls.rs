@@ -525,12 +525,14 @@ pub enum CommandPlacement {
 pub enum SlashAction {
     Agents,
     Settings,
+    CodeMode,
     Compress,
     Models,
     New,
     Providers,
     Reload,
     Resume,
+    ResumeCode,
     Switch,
     Skill,
 }
@@ -556,6 +558,12 @@ const SLASH_CONTROLS: &[SlashControl] = &[
         action: SlashAction::Settings,
         invocation: "/settings",
         description: "search and manage Nakode settings",
+        placement: CommandPlacement::PromptStart,
+    },
+    SlashControl {
+        action: SlashAction::CodeMode,
+        invocation: "/code-mode",
+        description: "toggle Code Mode for the next turn (/code-mode on|off)",
         placement: CommandPlacement::PromptStart,
     },
     SlashControl {
@@ -592,6 +600,12 @@ const SLASH_CONTROLS: &[SlashControl] = &[
         action: SlashAction::Resume,
         invocation: "/resume",
         description: "choose or name a session to resume",
+        placement: CommandPlacement::PromptStart,
+    },
+    SlashControl {
+        action: SlashAction::ResumeCode,
+        invocation: "/resume-code",
+        description: "resume a session with Code Mode enabled",
         placement: CommandPlacement::PromptStart,
     },
     SlashControl {

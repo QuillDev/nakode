@@ -61,6 +61,7 @@ ratatui-image = { version = "11.0.6", default-features = false, features = ["cro
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 regex = "1"
 rpassword = "7"
+rquickjs = "0.12.2"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -86,6 +87,7 @@ tokio = { version = "1.52", features = [
 ] }
 tokio-util = "0.7"
 tokio-stream = { version = "0.1", features = ["net"] }
+tempfile = "3"
 toml = "0.9"
 tonic = { version = "0.14.6", features = ["tls-ring"] }
 unicode-width = "0.2"
@@ -98,4 +100,3 @@ nix = { version = "0.30", features = ["process", "signal"] }
 
 [dev-dependencies]
 libc = "0.2"
-tempfile = "3"

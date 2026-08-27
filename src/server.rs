@@ -848,6 +848,17 @@ impl ServerCore {
                     .configure_external_tools(tools, replace_builtin_tools)?;
                 Ok(Self::accepted(Some(session_id.to_string()), effects))
             }
+            Command::SetSessionCodeMode {
+                session_id,
+                enabled,
+            } => {
+                self.ensure_session(&session_id)?;
+                let effects = self
+                    .session_engine_mut(&session_id)?
+                    .state_mut()
+                    .set_code_mode(enabled)?;
+                Ok(Self::accepted(Some(session_id.to_string()), effects))
+            }
             Command::SubmitExternalToolResult {
                 session_id,
                 call_id,
@@ -1204,11 +1215,13 @@ impl ServerCore {
             effects.extend(engine.state_mut().configure_session_tools(
                 tools.tools,
                 tools.replace_builtin_tools,
+                tools.code_mode,
                 tools.allowed_builtin_tools,
             )?);
         }
         if let Some(grant) = mcp_grant {
-            let (mcp_tools, archetype_grants) = self.mcp_tools_for_grant(grant)?;
+            let (mcp_tools, archetype_grants) =
+                self.mcp_tools_for_grant(grant, &engine.state().workspace)?;
             effects.extend(engine.state_mut().configure_mcp_tools(mcp_tools)?);
             engine
                 .state_mut()
@@ -1974,6 +1987,7 @@ impl ServerCore {
                         .configure_or_validate_external_tools(
                             &tools.tools,
                             tools.replace_builtin_tools,
+                            tools.code_mode,
                             tools.allowed_builtin_tools.as_deref(),
                         )?;
                 }
@@ -2001,6 +2015,7 @@ impl ServerCore {
             .filter(|session| session.id.starts_with(session_id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
+        let requested_code_mode = tools.as_ref().map(|tools| tools.code_mode);
         let mut session = match matches.as_slice() {
             [session] => session.clone(),
             [] => return Err(DomainCommandError::NotFound(session_id.to_string())),
@@ -2025,6 +2040,11 @@ impl ServerCore {
                 session.account_id = Some(requested.to_owned());
             }
         }
+        let persisted_code_mode = session.code_mode;
+        if let Some(code_mode) = requested_code_mode {
+            session.code_mode = code_mode;
+        }
+        let code_mode_changed = session.code_mode != persisted_code_mode;
         let working_directory =
             canonical_working_directory(Some(&session.working_directory), &session.workspace)?;
         self.refresh_session_template_addenda()?;
@@ -2053,17 +2073,35 @@ impl ServerCore {
             engine.state_mut().configure_session_tools(
                 tools.tools,
                 tools.replace_builtin_tools,
+                tools.code_mode,
                 tools.allowed_builtin_tools,
             )?;
         }
         if let Some(grant) = mcp_grant {
-            let (mcp_tools, archetype_grants) = self.mcp_tools_for_grant(grant)?;
+            let (mcp_tools, archetype_grants) =
+                self.mcp_tools_for_grant(grant, &session.workspace)?;
             engine.state_mut().configure_mcp_tools(mcp_tools)?;
             engine
                 .state_mut()
                 .configure_mcp_archetype_grants(archetype_grants);
         }
         let mut effects = engine.state_mut().begin_resume(session.clone());
+        if code_mode_changed {
+            effects.insert(
+                0,
+                Effect::PersistSessionCodeMode {
+                    session_id: session.id.clone(),
+                    enabled: session.code_mode,
+                },
+            );
+            if let Some(stored) = self
+                .sessions
+                .iter_mut()
+                .find(|stored| stored.id == session.id)
+            {
+                stored.code_mode = session.code_mode;
+            }
+        }
         Self::prepend_resume_hydration_effects(&session, &engine, &mut effects);
         let loaded_id = SessionId::from(session.id.clone());
         self.sessions_by_id.insert(loaded_id.clone(), engine);
@@ -2105,6 +2143,19 @@ impl ServerCore {
         provider: &str,
         tools: &nakode_protocol::SessionToolConfiguration,
     ) -> Result<(), DomainCommandError> {
+        if tools.code_mode
+            && !matches!(
+                provider,
+                crate::backend::CODEX_PROVIDER
+                    | crate::backend::DEVIN_PROVIDER
+                    | crate::backend::GLM_PROVIDER
+                    | crate::backend::KIMI_PROVIDER
+            )
+        {
+            return Err(DomainCommandError::Invalid(format!(
+                "provider {provider} does not support Nakode Code Mode"
+            )));
+        }
         let Some(allowed) = tools.allowed_builtin_tools.as_deref() else {
             return Ok(());
         };
@@ -2493,8 +2544,16 @@ impl ServerCore {
     fn mcp_tools_for_grant(
         &self,
         grant: &McpSessionGrant,
+        workspace: &str,
     ) -> Result<McpInstalledGrant, DomainCommandError> {
-        crate::mcp::validate_grant(grant, &self.mcp_servers)
+        let workspace = crate::state::projection::workspace_id(workspace).to_string();
+        let servers = self
+            .mcp_servers
+            .iter()
+            .filter(|server| server.workspace == workspace)
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::mcp::validate_grant(grant, &servers)
             .map(|servers| {
                 let mut archetype_grants = HashMap::new();
                 let tools = servers
@@ -3923,6 +3982,7 @@ impl ServerCore {
             | Command::RunShell { session_id, .. }
             | Command::ReloadWorkspace { session_id, .. }
             | Command::ConfigureSessionTools { session_id, .. }
+            | Command::SetSessionCodeMode { session_id, .. }
             | Command::SubmitExternalToolResult { session_id, .. }
             | Command::SelectModel {
                 target: ModelTarget::Session { session_id },
@@ -4906,6 +4966,7 @@ mod tests {
                 input_schema_json: r#"{"type":"object","properties":{}}"#.to_owned(),
             }],
             replace_builtin_tools,
+            code_mode: false,
             allowed_builtin_tools: None,
         }
     }
@@ -5211,6 +5272,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
@@ -5260,6 +5322,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
@@ -6245,6 +6308,7 @@ mod tests {
                 crate::state::Effect::Backend(BackendCommand::StartSession {
                     external_tools,
                     replace_builtin_tools: true,
+                    code_mode: false,
                     ..
                 }) if external_tools == &tools.tools
             )),
@@ -6253,20 +6317,28 @@ mod tests {
     }
 
     #[test]
-    fn fresh_session_builtin_allowlist_is_carried_to_provider_start() {
+    fn fresh_session_code_mode_and_builtin_allowlist_are_carried_to_provider_start() {
         let (mut core, _) = ready_external_tools_server();
         let workspace_id = core.workspace_bootstrap().workspace_id;
         let tools = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: false,
+            code_mode: true,
             allowed_builtin_tools: Some(vec!["read".to_owned(), "grep".to_owned()]),
         };
         let (created, _) = core
             .create_session_command(&workspace_id, None, &ModelOptions::default(), Some(tools))
             .expect("builtin allowlist without external tools");
+        let session_id = SessionId::from(created.resource_id.expect("session id"));
+        assert!(
+            core.engine_for(&session_id)
+                .expect("created session")
+                .state()
+                .code_mode()
+        );
         let (_, effects) = core
             .try_execute_command(Command::SendPrompt {
-                session_id: SessionId::from(created.resource_id.expect("session id")),
+                session_id,
                 prompt: PromptInput {
                     text: "inspect".to_owned(),
                     attachments: Vec::new(),
@@ -6276,10 +6348,183 @@ mod tests {
         assert!(effects.iter().any(|effect| matches!(
             effect,
             crate::state::Effect::Backend(BackendCommand::StartSession {
+                code_mode: true,
                 allowed_builtin_tools: Some(allowed),
                 ..
             }) if allowed == &["read".to_owned(), "grep".to_owned()]
         )));
+    }
+
+    #[test]
+    fn code_mode_can_toggle_at_an_idle_boundary_and_is_rejected_during_start() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let (created, _) = core
+            .create_session_command(&workspace_id, None, &ModelOptions::default(), None)
+            .expect("ordinary session");
+        let session_id = SessionId::from(created.resource_id.expect("session id"));
+
+        core.try_execute_command(Command::SetSessionCodeMode {
+            session_id: session_id.clone(),
+            enabled: true,
+        })
+        .expect("idle Code Mode toggle");
+        assert!(
+            core.engine_for(&session_id)
+                .expect("session")
+                .state()
+                .code_mode()
+        );
+
+        let (_, effects) = core
+            .try_execute_command(Command::SendPrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "test Code Mode".to_owned(),
+                    attachments: Vec::new(),
+                },
+            })
+            .expect("start first turn");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::StartSession {
+                code_mode: true,
+                ..
+            })
+        )));
+
+        assert!(matches!(
+            core.try_execute_command(Command::SetSessionCodeMode {
+                session_id,
+                enabled: false,
+            }),
+            Err(DomainCommandError::Conflict(message))
+                if message.contains("only be changed between turns")
+        ));
+    }
+
+    #[test]
+    fn code_mode_provider_start_contains_all_native_client_and_granted_mcp_tools() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let mut server = crate::mcp::input_record(
+            &workspace_id,
+            crate::mcp::excalidraw_input(),
+            nakode_protocol::McpGrantPolicy {
+                chat: false,
+                coding_agent: true,
+                archetype_slugs: Vec::new(),
+            },
+        );
+        server.health = "connected".to_owned();
+        server.credential_kind = Some("bearer".to_owned());
+        server.tools = vec![nakode_protocol::McpToolView {
+            remote_name: "create_view".to_owned(),
+            exposed_name: "mcp__excalidraw__create_view".to_owned(),
+            description: "Create a view".to_owned(),
+            input_schema_json: r#"{"type":"object"}"#.to_owned(),
+            app_only: false,
+        }];
+        let server_id = server.id.clone();
+        core.install_mcp_servers(vec![server]);
+        let client_tool = nakode_protocol::ExternalToolDefinition {
+            name: "client_lookup".to_owned(),
+            description: "Client lookup".to_owned(),
+            input_schema_json: r#"{"type":"object"}"#.to_owned(),
+        };
+        let tools = SessionToolConfiguration {
+            tools: vec![client_tool],
+            replace_builtin_tools: false,
+            code_mode: true,
+            allowed_builtin_tools: None,
+        };
+        let grant = nakode_protocol::McpSessionGrant {
+            surface: Some(nakode_protocol::McpSessionSurface::CodingAgent),
+            server_ids: vec![server_id],
+        };
+        let (created, _) = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                None,
+                None,
+                None,
+                &ModelOptions::default(),
+                Some(tools),
+                None,
+                None,
+                Some(&grant),
+            )
+            .expect("Code Mode session with client and MCP tools");
+        let (_, effects) = core
+            .try_execute_command(Command::SendPrompt {
+                session_id: SessionId::from(created.resource_id.expect("session id")),
+                prompt: PromptInput {
+                    text: "compose tools".to_owned(),
+                    attachments: Vec::new(),
+                },
+            })
+            .expect("first prompt");
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::state::Effect::Backend(BackendCommand::StartSession {
+                    external_tools,
+                    replace_builtin_tools: false,
+                    code_mode: true,
+                    allowed_builtin_tools: None,
+                    ..
+                }) if external_tools.iter().any(|tool| tool.name == "client_lookup")
+                    && external_tools.iter().any(|tool| tool.name == "mcp__excalidraw__create_view")
+            )),
+            "{effects:#?}"
+        );
+    }
+
+    #[test]
+    fn mcp_grants_cannot_select_a_server_from_another_workspace() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let other_workspace = nakode_protocol::WorkspaceId::from("other-workspace");
+        let mut server = crate::mcp::input_record(
+            &other_workspace,
+            crate::mcp::excalidraw_input(),
+            nakode_protocol::McpGrantPolicy {
+                coding_agent: true,
+                ..nakode_protocol::McpGrantPolicy::default()
+            },
+        );
+        server.health = "connected".to_owned();
+        server.credential_kind = Some("bearer".to_owned());
+        server.tools = vec![nakode_protocol::McpToolView {
+            remote_name: "create_view".to_owned(),
+            exposed_name: "mcp__excalidraw__create_view".to_owned(),
+            description: "Create a view".to_owned(),
+            input_schema_json: r#"{"type":"object"}"#.to_owned(),
+            app_only: false,
+        }];
+        let server_id = server.id.clone();
+        core.install_mcp_servers(vec![server]);
+        let grant = nakode_protocol::McpSessionGrant {
+            surface: Some(nakode_protocol::McpSessionSurface::CodingAgent),
+            server_ids: vec![server_id],
+        };
+
+        let error = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                None,
+                None,
+                None,
+                &ModelOptions::default(),
+                None,
+                None,
+                None,
+                Some(&grant),
+            )
+            .expect_err("cross-workspace MCP grant must be rejected");
+
+        assert!(error.to_string().contains("unknown MCP server"));
     }
 
     #[test]
@@ -6290,6 +6535,7 @@ mod tests {
         let tools = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: Some(vec![
                 "memory_search".to_owned(),
                 "memory_store".to_owned(),
@@ -6312,6 +6558,7 @@ mod tests {
             crate::state::Effect::Backend(BackendCommand::StartSession {
                 external_tools,
                 replace_builtin_tools: false,
+                code_mode: false,
                 allowed_builtin_tools: Some(allowed),
                 ..
             }) if external_tools.is_empty()
@@ -6326,6 +6573,7 @@ mod tests {
         let configured = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: Some(vec!["read".to_owned()]),
         };
         let (created, _) = core
@@ -6360,6 +6608,7 @@ mod tests {
         let requested = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: Some(vec!["memory_search".to_owned()]),
         };
         assert_eq!(
@@ -6387,6 +6636,7 @@ mod tests {
             Some(SessionToolConfiguration {
                 tools: Vec::new(),
                 replace_builtin_tools: false,
+                code_mode: false,
                 allowed_builtin_tools: Some(vec!["memory_store".to_owned()]),
             }),
         )
@@ -6394,7 +6644,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_tools_remain_authorized_during_persisted_session_resume() {
+    fn disabled_tools_and_code_mode_are_preserved_during_persisted_session_resume() {
         let (mut core, _) = ready_external_tools_server();
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-tools-session");
@@ -6413,10 +6663,12 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let mut tools = dashboard_tools("DashboardRead", false);
+        tools.code_mode = true;
         tools.allowed_builtin_tools =
             Some(vec!["memory_search".to_owned(), "memory_store".to_owned()]);
 
@@ -6436,10 +6688,27 @@ mod tests {
         assert!(
             effects.iter().any(|effect| matches!(
                 effect,
+                crate::state::Effect::PersistSessionCodeMode {
+                    session_id,
+                    enabled: true,
+                } if session_id == restored_id.as_str()
+            )),
+            "an explicit attachment override must become durable: {effects:#?}"
+        );
+        assert!(
+            core.sessions
+                .iter()
+                .any(|session| session.id == restored_id.as_str() && session.code_mode),
+            "the authoritative persisted-session cache must reflect the accepted override"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
                 crate::state::Effect::Backend(BackendCommand::ResumeSession {
                     provider_session_id,
                     external_tools,
                     replace_builtin_tools: false,
+                    code_mode: true,
                     allowed_builtin_tools: Some(allowed),
                     ..
                 }) if provider_session_id == "thread-restored"
@@ -6470,12 +6739,14 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            code_mode: false,
             enabled_skill_ids: Some(Vec::new()),
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: Some(vec![
                 "memory_search".to_owned(),
                 "memory_store".to_owned(),
@@ -6490,6 +6761,7 @@ mod tests {
             crate::state::Effect::Backend(BackendCommand::ResumeSession {
                 enabled_skill_ids,
                 replace_builtin_tools: false,
+                code_mode: false,
                 allowed_builtin_tools: Some(allowed),
                 ..
             }) if enabled_skill_ids.is_empty()
@@ -6520,6 +6792,7 @@ mod tests {
         let tools = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: Some(
                 ["read_skill", "read_skill_component"]
                     .map(str::to_owned)
@@ -6571,12 +6844,14 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: Some(
                 ["read_skill", "read_skill_component"]
                     .map(str::to_owned)
@@ -6681,6 +6956,7 @@ mod tests {
         let invalid = SessionToolConfiguration {
             tools: Vec::new(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: None,
         };
         core.create_session_command(
@@ -6707,6 +6983,7 @@ mod tests {
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
+            code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
@@ -6738,6 +7015,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
@@ -9366,6 +9644,7 @@ enabled = false
             created_at: 0,
             updated_at: 0,
             last_owner_activity_at: None,
+            code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);

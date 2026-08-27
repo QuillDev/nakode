@@ -1114,6 +1114,27 @@ impl NakodeClient {
         )
     }
 
+    /// Changes one idle session's model-facing tool surface for its next turn.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn set_session_code_mode(
+        &self,
+        session_id: impl Into<String>,
+        enabled: bool,
+        expected_revision: Option<u64>,
+    ) -> Result<api::MutationResult, SdkError> {
+        send_mutation!(
+            self,
+            set_session_code_mode,
+            api::SetSessionCodeModeRequest {
+                mutation: Some(mutation(expected_revision)),
+                session_id: session_id.into(),
+                enabled,
+            }
+        )
+    }
+
     /// Resolves one server-owned external tool request.
     ///
     /// # Errors
@@ -2478,6 +2499,7 @@ mod tests {
             workspace_id: protocol::WorkspaceId::from("workspace-a"),
             working_directory: "/tmp/workspace-a".to_owned(),
             title: "Attached session".to_owned(),
+            code_mode: false,
             status_message: "Ready".to_owned(),
             diagnostic_count: 0,
             activity: protocol::SessionActivity::Idle,
@@ -2774,6 +2796,7 @@ mod tests {
                     input_schema_json: r#"{"type":"object"}"#.to_owned(),
                 }],
                 replace_builtin_tools: true,
+                code_mode: false,
                 allowed_builtin_tools: vec!["read".to_owned()],
             }),
             mcp_grant: Some(api::McpSessionGrant {

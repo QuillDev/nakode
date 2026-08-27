@@ -18,6 +18,8 @@ pub enum ServiceCapability {
     InitialSessionTools,
     /// Session tool configuration supports canonical builtin allowlists and provider projection validation.
     BuiltinToolAllowlists,
+    /// Sessions may opt into the synthesized, server-owned Code Mode execution boundary.
+    CodeMode,
     /// Settings projects authoritative callable Vision readiness and its diagnostic.
     VisionAvailability,
     /// Session creation persists a filesystem/provider root independent from logical workspace ownership.

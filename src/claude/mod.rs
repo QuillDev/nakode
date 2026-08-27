@@ -525,6 +525,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             enabled_skill_ids: _,
             external_tools,
             replace_builtin_tools,
+            code_mode: _,
             allowed_builtin_tools,
             max_turns,
             finalization_reserve_turns,
@@ -539,6 +540,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             enabled_skill_ids: _,
             external_tools,
             replace_builtin_tools,
+            code_mode: _,
             allowed_builtin_tools,
             max_turns,
             timeout_seconds,
@@ -608,6 +610,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             json!({"id":id,"output":output,"failed":failed}),
         ),
         BackendCommand::ResolveQuestion { .. }
+        | BackendCommand::SetSessionCodeMode { .. }
         | BackendCommand::BeginAuthentication
         | BackendCommand::Shutdown => return Ok(None),
     };
@@ -1005,6 +1008,7 @@ fn resume_after_create(command: BackendCommand, message: &Value) -> BackendComma
             enabled_skill_ids,
             external_tools,
             replace_builtin_tools,
+            code_mode,
             allowed_builtin_tools,
             max_turns,
             timeout_seconds,
@@ -1015,6 +1019,7 @@ fn resume_after_create(command: BackendCommand, message: &Value) -> BackendComma
             enabled_skill_ids,
             external_tools,
             replace_builtin_tools,
+            code_mode,
             allowed_builtin_tools,
             max_turns,
             timeout_seconds,
@@ -1084,6 +1089,7 @@ fn operation_for(command: &BackendCommand) -> BackendOperation {
         BackendCommand::SetSessionModel { .. } | BackendCommand::SetSessionOptions { .. } => {
             BackendOperation::SetSessionModel
         }
+        BackendCommand::SetSessionCodeMode { .. } => BackendOperation::SetSessionCodeMode,
         BackendCommand::Reload { .. } => BackendOperation::Reload,
         BackendCommand::BeginAuthentication => BackendOperation::Authenticate,
         _ => BackendOperation::StartTurn,
@@ -1241,6 +1247,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn claude_external_tools_cross_the_mcp_bridge() {
         let tools = ticket_stage_tools();
         let create = bridge_request(BackendCommand::StartSession {
@@ -1251,6 +1258,7 @@ mod tests {
             enabled_skill_ids: Vec::new(),
             external_tools: tools.clone(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: None,
             max_turns: None,
             finalization_reserve_turns: 0,
@@ -1280,6 +1288,7 @@ mod tests {
             enabled_skill_ids: Vec::new(),
             external_tools: tools,
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: None,
             max_turns: None,
             timeout_seconds: None,
@@ -1300,6 +1309,7 @@ mod tests {
             enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: Some(vec!["Read".to_owned(), "Glob".to_owned()]),
             max_turns: None,
             finalization_reserve_turns: 0,
@@ -1320,6 +1330,7 @@ mod tests {
             enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: false,
+            code_mode: false,
             allowed_builtin_tools: Some(Vec::new()),
             max_turns: None,
             finalization_reserve_turns: 0,
@@ -1765,6 +1776,7 @@ assert.equal(streamMessageIds.size, 0);
             enabled_skill_ids: Vec::new(),
             external_tools: Vec::new(),
             replace_builtin_tools: true,
+            code_mode: false,
             allowed_builtin_tools: Some(vec!["Read".to_owned()]),
             max_turns: Some(4),
             finalization_reserve_turns: 0,

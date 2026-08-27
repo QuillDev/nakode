@@ -947,6 +947,9 @@ pub struct SessionView {
     #[serde(default)]
     pub working_directory: String,
     pub title: String,
+    /// Whether this logical session exposes only the synthesized Code Mode tool to its model.
+    #[serde(default)]
+    pub code_mode: bool,
     pub status_message: String,
     pub diagnostic_count: u64,
     pub activity: SessionActivity,

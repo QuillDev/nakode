@@ -386,6 +386,7 @@ mod tests {
             workspace_id: WorkspaceId::from("workspace"),
             working_directory: "/tmp/project".to_owned(),
             title: "Session".to_owned(),
+            code_mode: false,
             status_message: status.to_owned(),
             diagnostic_count: 0,
             activity: SessionActivity::Idle,
@@ -528,6 +529,7 @@ pub struct SessionPicker {
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
     pub loading: bool,
+    pub code_mode: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1169,6 +1171,7 @@ pub struct TuiState {
     pub queue: Vec<QueueItemView>,
     pub models: Vec<ModelView>,
     pub selected_model: Option<ModelId>,
+    pub code_mode: bool,
     pub approvals: VecDeque<InteractionView>,
     pub questions: VecDeque<QuestionPrompt>,
     pub todo_phases: Vec<TodoPhaseView>,
@@ -1201,6 +1204,7 @@ impl TuiState {
             queue: Vec::new(),
             models: Vec::new(),
             selected_model: None,
+            code_mode: false,
             approvals: VecDeque::new(),
             questions: VecDeque::new(),
             todo_phases: Vec::new(),
@@ -1243,6 +1247,7 @@ impl TuiState {
             self.activity = SessionActivity::Idle;
             self.context_usage = None;
             self.selected_model = None;
+            self.code_mode = false;
             self.transcript.clear();
             self.queue.clear();
             self.approvals.clear();
@@ -1263,6 +1268,7 @@ impl TuiState {
         self.activity = session.activity;
         self.context_usage = session.context_usage;
         self.selected_model.clone_from(&session.selected_model_id);
+        self.code_mode = session.code_mode;
         self.transcript.install_projection(&session.transcript);
         self.queue.clone_from(&session.queue);
         self.client.queue_selection = self
@@ -2236,11 +2242,12 @@ impl TuiState {
         picker.providers.get(picker.selected)
     }
 
-    pub fn open_session_picker(&mut self) {
+    pub fn open_session_picker(&mut self, code_mode: bool) {
         self.client.session_picker = Some(SessionPicker {
             sessions: self.sessions.clone(),
             selected: 0,
             loading: false,
+            code_mode,
         });
     }
 

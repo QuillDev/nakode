@@ -6,6 +6,7 @@ pub mod app;
 pub mod backend;
 pub mod claude;
 pub mod clipboard;
+pub mod codemode_worker;
 pub mod codex;
 pub mod commands;
 pub mod config;

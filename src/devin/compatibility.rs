@@ -585,6 +585,7 @@ async fn handle_command(
             Ok(())
         }
         BackendCommand::ResolveApproval { .. }
+        | BackendCommand::SetSessionCodeMode { .. }
         | BackendCommand::SetSessionOptions { .. }
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::ResolveExternalTool { .. }

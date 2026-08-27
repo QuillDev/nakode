@@ -414,6 +414,7 @@ async fn handle_command(
     }
     match command {
         BackendCommand::SetSessionModel { .. }
+        | BackendCommand::SetSessionCodeMode { .. }
         | BackendCommand::SetSessionOptions { .. }
         | BackendCommand::ResolveApproval { .. }
         | BackendCommand::ResolveQuestion { .. }
@@ -517,6 +518,7 @@ fn command_request(
             json!({"type": "chatgptDeviceCode"}),
         ),
         BackendCommand::SetSessionModel { .. }
+        | BackendCommand::SetSessionCodeMode { .. }
         | BackendCommand::SetSessionOptions { .. }
         | BackendCommand::CompactSession { .. }
         | BackendCommand::ResolveApproval { .. }
@@ -717,7 +719,9 @@ async fn handle_codex_rpc_response(
                 .await
                 .map_err(|_| ())?;
         }
-        BackendOperation::SetSessionModel | BackendOperation::CompactSession => {}
+        BackendOperation::SetSessionModel
+        | BackendOperation::SetSessionCodeMode
+        | BackendOperation::CompactSession => {}
         BackendOperation::StartSession => {
             events
                 .send(BackendEvent::SessionCreated {

@@ -17,9 +17,16 @@ pub(crate) enum TuiAction {
     CreateSession {
         workspace_id: view::WorkspaceId,
         title: Option<String>,
+        code_mode: bool,
     },
     OpenSession {
         session_id: view::SessionId,
+        code_mode: bool,
+    },
+    SetSessionCodeMode {
+        session_id: view::SessionId,
+        enabled: bool,
+        expected_revision: u64,
     },
     SendPrompt {
         session_id: view::SessionId,
@@ -108,22 +115,42 @@ pub(crate) async fn execute_command(
         TuiAction::CreateSession {
             workspace_id,
             title,
+            code_mode,
         } => {
-            let resource_id = client
-                .create_session(workspace_id.to_string(), title)
-                .await?;
+            let resource_id = if code_mode {
+                client
+                    .create_session_with_configuration(
+                        workspace_id.to_string(),
+                        title,
+                        None,
+                        None,
+                        Some(api::SessionToolConfiguration {
+                            tools: Vec::new(),
+                            replace_builtin_tools: false,
+                            allowed_builtin_tools: Vec::new(),
+                            code_mode: true,
+                        }),
+                    )
+                    .await?
+            } else {
+                client
+                    .create_session(workspace_id.to_string(), title)
+                    .await?
+            };
             Ok(api::MutationResult {
                 resource_id: Some(resource_id),
                 revision: None,
             })
         }
-        TuiAction::OpenSession { session_id } => {
-            let session_id = client.open_session(session_id.to_string()).await?;
-            Ok(api::MutationResult {
-                resource_id: Some(session_id),
-                revision: None,
-            })
-        }
+        TuiAction::OpenSession {
+            session_id,
+            code_mode,
+        } => open_session(client, session_id, code_mode).await,
+        TuiAction::SetSessionCodeMode {
+            session_id,
+            enabled,
+            expected_revision,
+        } => set_code_mode(client, session_id, enabled, expected_revision).await,
         TuiAction::SendPrompt { session_id, prompt } => {
             client
                 .send_prompt(session_id.to_string(), api_prompt(prompt), None)
@@ -164,6 +191,46 @@ pub(crate) async fn execute_command(
         }
         other => execute_management_command(client, other).await,
     }
+}
+
+async fn open_session(
+    client: &nakode_sdk::NakodeClient,
+    session_id: view::SessionId,
+    code_mode: bool,
+) -> Result<api::MutationResult, nakode_sdk::SdkError> {
+    let session_id = if code_mode {
+        client
+            .open_session_with_attachment(
+                session_id.to_string(),
+                nakode_sdk::SessionAttachment {
+                    tools: Some(api::SessionToolConfiguration {
+                        tools: Vec::new(),
+                        replace_builtin_tools: false,
+                        allowed_builtin_tools: Vec::new(),
+                        code_mode: true,
+                    }),
+                    ..nakode_sdk::SessionAttachment::default()
+                },
+            )
+            .await?
+    } else {
+        client.open_session(session_id.to_string()).await?
+    };
+    Ok(api::MutationResult {
+        resource_id: Some(session_id),
+        revision: None,
+    })
+}
+
+async fn set_code_mode(
+    client: &nakode_sdk::NakodeClient,
+    session_id: view::SessionId,
+    enabled: bool,
+    expected_revision: u64,
+) -> Result<api::MutationResult, nakode_sdk::SdkError> {
+    client
+        .set_session_code_mode(session_id.to_string(), enabled, Some(expected_revision))
+        .await
 }
 
 async fn execute_management_command(
@@ -592,6 +659,7 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
         workspace_id: view::WorkspaceId::from(value.workspace_id),
         working_directory: value.working_directory,
         title: value.title,
+        code_mode: value.code_mode,
         status_message: value.status_message,
         diagnostic_count: value.diagnostic_count,
         activity: session_activity(value.activity)?,
