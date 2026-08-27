@@ -695,6 +695,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             mcp_grant: mcp_grant(input.mcp_grant)?,
             profile_id: input.profile_id,
             disabled_skill_ids: Vec::new(),
+            account_id: input.account_id,
         }
     );
     command_rpc!(
@@ -707,6 +708,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             mcp_grant: mcp_grant(input.mcp_grant)?,
             profile_id: input.profile_id,
             enabled_skill_ids: Vec::new(),
+            account_id: input.account_id,
         }
     );
 
@@ -1208,6 +1210,91 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         input,
         protocol::Command::ReloadProvider {
             provider_id: protocol::ProviderId::from(input.provider_id)
+        }
+    );
+    command_rpc!(
+        add_provider_account,
+        api::AddProviderAccountRequest,
+        input,
+        protocol::Command::AddProviderAccount {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            label: input.label,
+        }
+    );
+    command_rpc!(
+        begin_provider_account_authentication,
+        api::BeginProviderAccountAuthenticationRequest,
+        input,
+        protocol::Command::BeginProviderAccountAuthentication {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            account_id: input.account_id,
+        }
+    );
+    command_rpc!(
+        set_provider_account_credential,
+        api::SetProviderAccountCredentialRequest,
+        input,
+        protocol::Command::SetProviderAccountCredential {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            account_id: input.account_id,
+            kind: input.kind,
+            credential: protocol::CredentialInput(input.credential),
+        }
+    );
+    command_rpc!(
+        clear_provider_account_credential,
+        api::ClearProviderAccountCredentialRequest,
+        input,
+        protocol::Command::ClearProviderAccountCredential {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            account_id: input.account_id,
+        }
+    );
+    command_rpc!(
+        reload_provider_account,
+        api::ReloadProviderAccountRequest,
+        input,
+        protocol::Command::ReloadProviderAccount {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            account_id: input.account_id,
+        }
+    );
+    command_rpc!(
+        set_provider_account_label,
+        api::SetProviderAccountLabelRequest,
+        input,
+        protocol::Command::SetProviderAccountLabel {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            account_id: input.account_id,
+            label: input.label,
+        }
+    );
+    command_rpc!(
+        set_provider_account_enabled,
+        api::SetProviderAccountEnabledRequest,
+        input,
+        protocol::Command::SetProviderAccountEnabled {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            account_id: input.account_id,
+            enabled: input.enabled,
+        }
+    );
+    command_rpc!(
+        set_provider_account_default,
+        api::SetProviderAccountDefaultRequest,
+        input,
+        protocol::Command::SetProviderAccountDefault {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            account_id: input.account_id,
+        }
+    );
+    command_rpc!(
+        remove_provider_account,
+        api::RemoveProviderAccountRequest,
+        input,
+        protocol::Command::RemoveProviderAccount {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            account_id: input.account_id,
         }
     );
     try_command_rpc!(
@@ -1894,6 +1981,71 @@ fn api_bridge_projection(value: &protocol::BridgeProjectionView) -> api::BridgeP
     }
 }
 
+fn provider_account(value: protocol::ProviderAccountView) -> api::ProviderAccount {
+    api::ProviderAccount {
+        account_id: value.account_id,
+        label: value.label,
+        enabled: value.enabled,
+        is_default: value.is_default,
+        identity: value.identity,
+        credential_configured: value.credential_configured,
+        credential_kind: value.credential_kind,
+        created_at_ms: value.created_at_ms,
+        updated_at_ms: value.updated_at_ms,
+        routing_mode: match value.routing_mode {
+            protocol::ProviderAccountRoutingMode::Automatic => {
+                api::ProviderAccountRoutingMode::Automatic as i32
+            }
+            protocol::ProviderAccountRoutingMode::ExplicitOnly => {
+                api::ProviderAccountRoutingMode::ExplicitOnly as i32
+            }
+        },
+        health: value.health.map(provider_account_health),
+        authentication: value.authentication.map(authentication),
+    }
+}
+
+fn provider_account_health(
+    value: protocol::ProviderAccountHealthView,
+) -> api::ProviderAccountHealth {
+    api::ProviderAccountHealth {
+        state: match value.state {
+            protocol::ProviderAccountHealthState::Unknown => {
+                api::ProviderAccountHealthState::Unknown as i32
+            }
+            protocol::ProviderAccountHealthState::Healthy => {
+                api::ProviderAccountHealthState::Healthy as i32
+            }
+            protocol::ProviderAccountHealthState::AuthenticationRequired => {
+                api::ProviderAccountHealthState::AuthenticationRequired as i32
+            }
+            protocol::ProviderAccountHealthState::QuotaExceeded => {
+                api::ProviderAccountHealthState::QuotaExceeded as i32
+            }
+            protocol::ProviderAccountHealthState::RateLimited => {
+                api::ProviderAccountHealthState::RateLimited as i32
+            }
+            protocol::ProviderAccountHealthState::TransientFailure => {
+                api::ProviderAccountHealthState::TransientFailure as i32
+            }
+        },
+        safe_reason: value.safe_reason,
+        cooldown_until_ms: value.cooldown_until_ms,
+    }
+}
+
+#[allow(dead_code)]
+fn routing_diagnostic(
+    value: protocol::ProviderAccountRoutingDiagnosticView,
+) -> api::ProviderAccountRoutingDiagnostic {
+    api::ProviderAccountRoutingDiagnostic {
+        account_id: value.account_id,
+        account_label: value.account_label,
+        reason: value.reason,
+        cooldown_until_ms: value.cooldown_until_ms,
+    }
+}
+
 fn provider(value: protocol::ProviderView) -> api::Provider {
     let supported_builtin_tools = value.supported_builtin_tools;
     let available_builtin_tools = value.available_builtin_tools;
@@ -1917,6 +2069,7 @@ fn provider(value: protocol::ProviderView) -> api::Provider {
         available_builtin_tools: available_builtin_tools.unwrap_or_default(),
         builtin_tool_support_known: supported_builtin_tools.is_some(),
         supported_builtin_tools: supported_builtin_tools.unwrap_or_default(),
+        accounts: value.accounts.into_iter().map(provider_account).collect(),
     }
 }
 
@@ -2149,6 +2302,8 @@ pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSu
             })
             .collect(),
         running: value.running,
+        selected_account_id: value.selected_account_id,
+        routing_diagnostic: value.routing_diagnostic.map(routing_diagnostic),
     }
 }
 
@@ -2192,6 +2347,8 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         created_at_ms: value.created_at_ms,
         updated_at_ms: value.updated_at_ms,
         last_owner_activity_at_ms: value.last_owner_activity_at_ms,
+        selected_account_id: value.selected_account_id,
+        routing_diagnostic: value.routing_diagnostic.map(routing_diagnostic),
     }
 }
 
@@ -2225,6 +2382,7 @@ fn agent_session(value: protocol::AgentSessionView) -> api::AgentSession {
         capabilities: Some(capabilities(value.capabilities)),
         connection: Some(connection(value.connection)),
         native_session_id: value.native_session_id,
+        account_id: value.account_id,
         transcript: Some(transcript(value.transcript)),
         usage: Some(token_usage(&value.usage)),
     }
@@ -2805,6 +2963,7 @@ mod tests {
             model_candidates: Vec::new(),
             supported_builtin_tools: Some(Vec::new()),
             available_builtin_tools,
+            accounts: Vec::new(),
         };
 
         let known = provider(view(Some(Vec::new())));

@@ -13,7 +13,7 @@ use crate::{
     backend::{
         BackendCapabilities, BackendCommand, BackendError, BackendEvent, BackendHandle,
         BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, ModelInfo,
-        ModelOptions, TurnOutcome, request_failed,
+        ModelOptions, ProviderFailureClassification, TurnOutcome, request_failed,
     },
     runtime::{
         AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
@@ -162,9 +162,33 @@ struct CodexCredential {
     email: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexFailureClassification {
+    Authentication,
+    Quota,
+    RateLimit,
+    Transient,
+    Provider,
+    Model,
+}
+
+impl CodexFailureClassification {
+    fn normalized(self) -> ProviderFailureClassification {
+        match self {
+            Self::Authentication => ProviderFailureClassification::Authentication,
+            Self::Quota => ProviderFailureClassification::Quota,
+            Self::RateLimit => ProviderFailureClassification::RateLimit,
+            Self::Transient => ProviderFailureClassification::Transient,
+            Self::Provider => ProviderFailureClassification::Provider,
+            Self::Model => ProviderFailureClassification::Model,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct InferenceAttemptError {
     message: String,
+    classification: CodexFailureClassification,
     retryable: bool,
     retry_after: Option<Duration>,
 }
@@ -173,6 +197,7 @@ impl InferenceAttemptError {
     fn terminal(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            classification: CodexFailureClassification::Provider,
             retryable: false,
             retry_after: None,
         }
@@ -181,6 +206,7 @@ impl InferenceAttemptError {
     fn transient(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            classification: CodexFailureClassification::Transient,
             retryable: true,
             retry_after: None,
         }
@@ -331,7 +357,11 @@ impl CodexProvider {
                         () = cancellation.cancelled() => return Err("turn interrupted".into()),
                     }
                 }
-                Err(error) => return Err(InferenceFailure::new(error.message, attempt)),
+                Err(error) => {
+                    let classification = error.classification.normalized();
+                    return Err(InferenceFailure::new(error.message, attempt)
+                        .with_provider_failure(classification, error.retry_after));
+                }
             }
         }
         unreachable!("the bounded inference retry loop returns on its final attempt")
@@ -372,9 +402,11 @@ impl CodexProvider {
             let status = response.status();
             let retry_after = retry_after(response.headers());
             let detail = response.text().await.unwrap_or_default();
+            let classification = codex_failure_classification(status, &detail);
             let message = format!("Codex returned {status}: {detail}");
             return Err(InferenceAttemptError {
                 message,
+                classification,
                 retryable: retryable_status(status),
                 retry_after,
             });
@@ -1303,6 +1335,58 @@ fn conversation_input(item: &ConversationItem) -> Vec<Value> {
     }
 }
 
+fn codex_failure_classification(status: StatusCode, detail: &str) -> CodexFailureClassification {
+    let detail = detail.to_ascii_lowercase();
+    let contains = |fragments: &[&str]| fragments.iter().any(|fragment| detail.contains(fragment));
+    if status == StatusCode::PAYMENT_REQUIRED
+        || contains(&[
+            "quota",
+            "billing",
+            "insufficient balance",
+            "usage limit",
+            "resource_exhausted",
+        ])
+    {
+        return CodexFailureClassification::Quota;
+    }
+    if status == StatusCode::UNAUTHORIZED
+        || status == StatusCode::FORBIDDEN
+        || contains(&[
+            "invalid api key",
+            "invalid_api_key",
+            "invalid token",
+            "authentication",
+            "unauthenticated",
+            "credential",
+        ])
+    {
+        return CodexFailureClassification::Authentication;
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || contains(&["rate limit", "rate_limit", "ratelimit", "too many requests"])
+    {
+        return CodexFailureClassification::RateLimit;
+    }
+    if status == StatusCode::NOT_FOUND
+        || contains(&[
+            "model_not_found",
+            "model not found",
+            "invalid model",
+            "unsupported model",
+            "model unavailable",
+        ])
+    {
+        return CodexFailureClassification::Model;
+    }
+    if status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::CONFLICT
+        || status.is_server_error()
+    {
+        return CodexFailureClassification::Transient;
+    }
+    CodexFailureClassification::Provider
+}
+
 fn retryable_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -1394,8 +1478,14 @@ async fn parse_codex_sse(
                     let retryable = output.text.is_empty()
                         && output.reasoning.is_empty()
                         && retryable_stream_message(&message);
+                    let classification = if retryable {
+                        CodexFailureClassification::Transient
+                    } else {
+                        codex_failure_classification(StatusCode::BAD_REQUEST, &message)
+                    };
                     return Err(InferenceAttemptError {
                         message,
+                        classification,
                         retryable,
                         retry_after: None,
                     });
@@ -1769,6 +1859,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classifies_http_failures_without_leaking_codex_categories() {
+        assert_eq!(
+            codex_failure_classification(StatusCode::UNAUTHORIZED, "token expired"),
+            CodexFailureClassification::Authentication
+        );
+        assert_eq!(
+            codex_failure_classification(StatusCode::TOO_MANY_REQUESTS, "slow down"),
+            CodexFailureClassification::RateLimit
+        );
+        assert_eq!(
+            codex_failure_classification(StatusCode::FORBIDDEN, "usage quota exhausted"),
+            CodexFailureClassification::Quota
+        );
+        assert_eq!(
+            codex_failure_classification(StatusCode::BAD_REQUEST, "model_not_found"),
+            CodexFailureClassification::Model
+        );
+        assert_eq!(
+            codex_failure_classification(StatusCode::INTERNAL_SERVER_ERROR, "overloaded"),
+            CodexFailureClassification::Transient
+        );
+    }
+
+    #[test]
+    fn preserves_retry_after_from_http_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "42".parse().expect("header"));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(42)));
+    }
+    #[test]
     fn compaction_events_are_not_sent_to_codex_inference() {
         let event = ConversationItem::CompactionEvent {
             id: "compaction-1".to_owned(),
@@ -1993,6 +2113,10 @@ mod tests {
 
         assert_eq!(requests.len(), 1);
         assert!(error.message.contains("400 Bad Request"));
+        assert_eq!(
+            error.classification,
+            Some(ProviderFailureClassification::Provider)
+        );
         assert_eq!(error.retry_count, 0);
     }
 
@@ -2049,6 +2173,10 @@ mod tests {
 
         assert_eq!(requests.len(), MAX_INFERENCE_ATTEMPTS);
         assert_eq!(error.retry_count, MAX_INFERENCE_ATTEMPTS - 1);
+        assert_eq!(
+            error.classification,
+            Some(ProviderFailureClassification::Transient)
+        );
     }
 
     #[tokio::test]

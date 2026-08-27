@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -475,6 +475,20 @@ impl BackendOperation {
     }
 }
 
+/// Provider-neutral reason for an inference failure.
+///
+/// Account-local failures may safely influence account routing. Provider- and model-wide failures
+/// must not make one account look unhealthy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderFailureClassification {
+    Authentication,
+    Quota,
+    RateLimit,
+    Transient,
+    Provider,
+    Model,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BackendTokenUsage {
     pub input_tokens: u64,
@@ -602,6 +616,13 @@ pub enum BackendEvent {
     RequestFailed {
         operation: BackendOperation,
         code: i64,
+        message: String,
+    },
+    /// Normalized provider failure metadata, emitted separately so existing turn event consumers
+    /// remain compatible with providers that do not report classifications.
+    ProviderFailure {
+        classification: ProviderFailureClassification,
+        retry_after: Option<Duration>,
         message: String,
     },
     ProtocolDiagnostic(String),

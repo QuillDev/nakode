@@ -596,6 +596,8 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
         diagnostic_count: value.diagnostic_count,
         activity: session_activity(value.activity)?,
         selected_provider_id: value.selected_provider_id.map(view::ProviderId::from),
+        selected_account_id: value.selected_account_id,
+        routing_diagnostic: value.routing_diagnostic.map(provider_routing_diagnostic),
         selected_model_id: value.selected_model_id.map(view::ModelId::from),
         selected_model_options: value.selected_model_options.map_or_else(
             view::ModelOptions::default,
@@ -764,7 +766,81 @@ fn provider(value: api::Provider) -> Result<view::ProviderView, String> {
         available_builtin_tools: value
             .builtin_tool_availability_known
             .then_some(value.available_builtin_tools),
+        accounts: value
+            .accounts
+            .into_iter()
+            .map(provider_account)
+            .collect::<Result<_, _>>()?,
     })
+}
+
+fn provider_account(value: api::ProviderAccount) -> Result<view::ProviderAccountView, String> {
+    let routing_mode = match api::ProviderAccountRoutingMode::try_from(value.routing_mode)
+        .map_err(invalid_enum)?
+    {
+        api::ProviderAccountRoutingMode::Automatic => view::ProviderAccountRoutingMode::Automatic,
+        api::ProviderAccountRoutingMode::ExplicitOnly => {
+            view::ProviderAccountRoutingMode::ExplicitOnly
+        }
+        api::ProviderAccountRoutingMode::Unspecified => {
+            return Err("unspecified provider account routing mode".to_owned());
+        }
+    };
+    Ok(view::ProviderAccountView {
+        account_id: value.account_id,
+        label: value.label,
+        enabled: value.enabled,
+        is_default: value.is_default,
+        identity: value.identity,
+        credential_configured: value.credential_configured,
+        credential_kind: value.credential_kind,
+        created_at_ms: value.created_at_ms,
+        updated_at_ms: value.updated_at_ms,
+        routing_mode,
+        health: value.health.map(provider_account_health).transpose()?,
+        authentication: value.authentication.map(authentication).transpose()?,
+    })
+}
+
+fn provider_account_health(
+    value: api::ProviderAccountHealth,
+) -> Result<view::ProviderAccountHealthView, String> {
+    let state =
+        match api::ProviderAccountHealthState::try_from(value.state).map_err(invalid_enum)? {
+            api::ProviderAccountHealthState::Unknown => view::ProviderAccountHealthState::Unknown,
+            api::ProviderAccountHealthState::Healthy => view::ProviderAccountHealthState::Healthy,
+            api::ProviderAccountHealthState::AuthenticationRequired => {
+                view::ProviderAccountHealthState::AuthenticationRequired
+            }
+            api::ProviderAccountHealthState::QuotaExceeded => {
+                view::ProviderAccountHealthState::QuotaExceeded
+            }
+            api::ProviderAccountHealthState::RateLimited => {
+                view::ProviderAccountHealthState::RateLimited
+            }
+            api::ProviderAccountHealthState::TransientFailure => {
+                view::ProviderAccountHealthState::TransientFailure
+            }
+            api::ProviderAccountHealthState::Unspecified => {
+                return Err("unspecified provider account health state".to_owned());
+            }
+        };
+    Ok(view::ProviderAccountHealthView {
+        state,
+        safe_reason: value.safe_reason,
+        cooldown_until_ms: value.cooldown_until_ms,
+    })
+}
+
+fn provider_routing_diagnostic(
+    value: api::ProviderAccountRoutingDiagnostic,
+) -> view::ProviderAccountRoutingDiagnosticView {
+    view::ProviderAccountRoutingDiagnosticView {
+        account_id: value.account_id,
+        account_label: value.account_label,
+        reason: value.reason,
+        cooldown_until_ms: value.cooldown_until_ms,
+    }
 }
 
 fn capabilities(value: api::ProviderCapabilities) -> Result<view::ProviderCapabilities, String> {
@@ -982,6 +1058,8 @@ fn session_summary(value: api::SessionSummary) -> view::SessionSummary {
             })
             .collect(),
         running: value.running,
+        selected_account_id: value.selected_account_id,
+        routing_diagnostic: value.routing_diagnostic.map(provider_routing_diagnostic),
     }
 }
 
@@ -1004,6 +1082,7 @@ fn agent_session(value: api::AgentSession) -> Result<view::AgentSessionView, Str
     Ok(view::AgentSessionView {
         id: view::AgentSessionId::from(value.id),
         provider_id: view::ProviderId::from(value.provider_id),
+        account_id: value.account_id,
         model_id: value.model_id.map(view::ModelId::from),
         role: value.role,
         capabilities: capabilities(value.capabilities.unwrap_or_default())?,

@@ -105,6 +105,8 @@ pub struct SessionAttachment {
     pub tools: Option<api::SessionToolConfiguration>,
     pub mcp_grant: Option<api::McpSessionGrant>,
     pub profile_id: Option<String>,
+    /// Optional account affinity used when restoring a legacy/unbound session.
+    pub account_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -528,6 +530,26 @@ impl NakodeClient {
         response.state.ok_or(SdkError::MissingState("workspace"))
     }
 
+    /// Returns redacted account metadata for one provider from the authoritative workspace snapshot.
+    /// No credential payload is present in this projection.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn list_provider_accounts(
+        &self,
+        workspace: impl Into<String>,
+        provider_id: impl Into<String>,
+    ) -> Result<Vec<api::ProviderAccount>, SdkError> {
+        let provider_id = provider_id.into();
+        let state = self.get_workspace(workspace, None).await?;
+        Ok(state
+            .providers
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+            .map(|provider| provider.accounts)
+            .unwrap_or_default())
+    }
+
     /// Resolves the logical session a frontend should render. The workspace is a session access
     /// root, not a service selector: the installation authority opens the requested session, reuses
     /// the most recent session rooted there, or creates one with that working directory.
@@ -575,7 +597,40 @@ impl NakodeClient {
             .await
     }
 
-    /// Creates a logical session rooted at an explicit filesystem/provider working directory.
+    /// Creates a logical session with an explicit provider-account affinity. The account is
+    /// validated by the server; omission is the only mode that permits automatic routing.
+    ///
+    /// # Errors
+    /// Returns a transport, server validation, or missing-identifier error.
+    pub async fn create_session_with_account(
+        &self,
+        workspace_id: impl Into<String>,
+        title: Option<String>,
+        account_id: impl Into<String>,
+    ) -> Result<String, SdkError> {
+        let result = send_mutation!(
+            self,
+            create_session,
+            api::CreateSessionRequest {
+                mutation: Some(mutation(None)),
+                workspace_id: workspace_id.into(),
+                title,
+                model_id: None,
+                options: None,
+                tools: None,
+                mcp_grant: None,
+                initial_instructions: None,
+                bridge: None,
+                working_directory: None,
+                profile_id: None,
+                account_id: Some(account_id.into()),
+            }
+        )?;
+        result
+            .resource_id
+            .ok_or(SdkError::MissingState("created session identifier"))
+    }
+
     /// The logical workspace remains the owner and service partition.
     ///
     /// # Errors
@@ -601,6 +656,7 @@ impl NakodeClient {
                 bridge: None,
                 working_directory: Some(working_directory.into()),
                 profile_id: None,
+                account_id: None,
             }
         )?;
         result
@@ -637,6 +693,7 @@ impl NakodeClient {
                 bridge: Some(bridge),
                 working_directory: None,
                 profile_id: None,
+                account_id: None,
             }
         )?;
         result
@@ -688,6 +745,7 @@ impl NakodeClient {
                 bridge: None,
                 working_directory: None,
                 profile_id: None,
+                account_id: None,
             }
         )?;
         result
@@ -724,11 +782,31 @@ impl NakodeClient {
                 bridge: None,
                 working_directory: None,
                 profile_id: None,
+                account_id: None,
             }
         )?;
         result
             .resource_id
             .ok_or(SdkError::MissingState("created session identifier"))
+    }
+
+    /// Opens or reattaches to a logical session with an explicit account affinity.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn open_session_with_account(
+        &self,
+        session_id: impl Into<String>,
+        account_id: impl Into<String>,
+    ) -> Result<String, SdkError> {
+        self.open_session_with_attachment(
+            session_id,
+            SessionAttachment {
+                account_id: Some(account_id.into()),
+                ..SessionAttachment::default()
+            },
+        )
+        .await
     }
 
     /// Opens a persisted logical session in the server and returns its full ID.
@@ -769,6 +847,7 @@ impl NakodeClient {
                 tools,
                 mcp_grant: None,
                 profile_id,
+                account_id: None,
             },
         )
         .await
@@ -793,6 +872,7 @@ impl NakodeClient {
                 tools: attachment.tools,
                 mcp_grant: attachment.mcp_grant,
                 profile_id: attachment.profile_id,
+                account_id: attachment.account_id,
             }
         )?;
         result
@@ -1219,6 +1299,33 @@ impl NakodeClient {
         api::ClearProviderCredentialRequest
     );
     typed_mutation!(reload_provider, api::ReloadProviderRequest);
+    typed_mutation!(add_provider_account, api::AddProviderAccountRequest);
+    typed_mutation!(
+        begin_provider_account_authentication,
+        api::BeginProviderAccountAuthenticationRequest
+    );
+    typed_mutation!(
+        set_provider_account_credential,
+        api::SetProviderAccountCredentialRequest
+    );
+    typed_mutation!(
+        clear_provider_account_credential,
+        api::ClearProviderAccountCredentialRequest
+    );
+    typed_mutation!(reload_provider_account, api::ReloadProviderAccountRequest);
+    typed_mutation!(
+        set_provider_account_label,
+        api::SetProviderAccountLabelRequest
+    );
+    typed_mutation!(
+        set_provider_account_enabled,
+        api::SetProviderAccountEnabledRequest
+    );
+    typed_mutation!(
+        set_provider_account_default,
+        api::SetProviderAccountDefaultRequest
+    );
+    typed_mutation!(remove_provider_account, api::RemoveProviderAccountRequest);
     typed_mutation!(save_mcp_server, api::SaveMcpServerRequest);
     typed_mutation!(delete_mcp_server, api::DeleteMcpServerRequest);
     typed_mutation!(set_mcp_server_enabled, api::SetMcpServerEnabledRequest);
@@ -2336,6 +2443,7 @@ mod tests {
         tools: Option<protocol::SessionToolConfiguration>,
         mcp_grant: Option<protocol::McpSessionGrant>,
         profile_id: Option<String>,
+        account_id: Option<String>,
     }
 
     struct TestUnixServer {
@@ -2402,6 +2510,8 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             last_owner_activity_at_ms: 0,
+            selected_account_id: None,
+            routing_diagnostic: None,
         }
     }
 
@@ -2460,6 +2570,7 @@ mod tests {
                             tools,
                             mcp_grant,
                             profile_id,
+                            account_id,
                             ..
                         },
                     respond,
@@ -2470,6 +2581,7 @@ mod tests {
                         tools,
                         mcp_grant,
                         profile_id,
+                        account_id,
                     });
                     attached = true;
                     let resource_id = if matches!(mode, SessionServerMode::ReattachDifferent) {
@@ -2669,6 +2781,7 @@ mod tests {
                 server_ids: vec!["linear".to_owned()],
             }),
             profile_id: Some("profile-a".to_owned()),
+            account_id: None,
         };
         let mut watch = client.watch_attached_session("session-a", attachment);
         let state = tokio::time::timeout(Duration::from_secs(3), watch.next())
@@ -2685,6 +2798,7 @@ mod tests {
             .expect("open-session attachment");
         assert_eq!(captured.session_id, "session-a");
         assert_eq!(captured.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(captured.account_id, None);
         let tools = captured.tools.expect("forwarded tools");
         assert!(tools.replace_builtin_tools);
         assert_eq!(tools.allowed_builtin_tools, Some(vec!["read".to_owned()]));

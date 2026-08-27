@@ -390,6 +390,8 @@ mod tests {
             diagnostic_count: 0,
             activity: SessionActivity::Idle,
             selected_provider_id: None,
+            selected_account_id: None,
+            routing_diagnostic: None,
             selected_model_id: None,
             selected_model_options: nakode_protocol::ModelOptions::default(),
             active_agent_session: None,

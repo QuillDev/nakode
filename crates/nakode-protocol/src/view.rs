@@ -84,6 +84,66 @@ pub enum ConnectionView {
     Disconnected { message: String },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAccountRoutingMode {
+    Automatic,
+    ExplicitOnly,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAccountHealthState {
+    Unknown,
+    Healthy,
+    AuthenticationRequired,
+    QuotaExceeded,
+    RateLimited,
+    TransientFailure,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderAccountHealthView {
+    pub state: ProviderAccountHealthState,
+    #[serde(default)]
+    pub safe_reason: Option<String>,
+    #[serde(default)]
+    pub cooldown_until_ms: Option<u64>,
+}
+
+/// Redacted account metadata. Credential payloads are intentionally not part of this type.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderAccountView {
+    pub account_id: String,
+    pub label: String,
+    pub enabled: bool,
+    pub is_default: bool,
+    #[serde(default)]
+    pub identity: Option<String>,
+    pub credential_configured: bool,
+    #[serde(default)]
+    pub credential_kind: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub routing_mode: ProviderAccountRoutingMode,
+    #[serde(default)]
+    pub health: Option<ProviderAccountHealthView>,
+    /// Ephemeral authentication state for this exact account; never contains credentials.
+    #[serde(default)]
+    pub authentication: Option<ProviderAuthenticationView>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderAccountRoutingDiagnosticView {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub account_label: Option<String>,
+    pub reason: String,
+    #[serde(default)]
+    pub cooldown_until_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderAuthenticationView {
@@ -123,6 +183,9 @@ pub struct ProviderView {
     /// `None` means an older or non-authoritative projection, never an unrestricted default.
     #[serde(default)]
     pub available_builtin_tools: Option<Vec<String>>,
+    /// Redacted account metadata; credential payloads never cross the protocol boundary.
+    #[serde(default)]
+    pub accounts: Vec<ProviderAccountView>,
 }
 
 /// Product surface that owns the user-facing projection of one logical session.
@@ -213,6 +276,12 @@ pub struct SessionSummary {
     /// True only while the service still owns live work for this logical session.
     #[serde(default)]
     pub running: bool,
+    /// Account pinned to the active provider session, if one has been selected.
+    #[serde(default)]
+    pub selected_account_id: Option<String>,
+    /// Safe explanation for account selection or ineligibility.
+    #[serde(default)]
+    pub routing_diagnostic: Option<ProviderAccountRoutingDiagnosticView>,
 }
 
 /// An opaque provider resource claimed by one Nakode logical session.
@@ -243,6 +312,9 @@ pub struct AgentSessionView {
     pub connection: ConnectionView,
     /// Opaque provider resume identity. Nakode is its lifecycle owner.
     pub native_session_id: Option<String>,
+    /// Account identity pinned to this provider-native session.
+    #[serde(default)]
+    pub account_id: Option<String>,
     /// The provider worker's normalized transcript, suitable for a read-only child view.
     pub transcript: TranscriptPage,
     #[serde(default)]
@@ -920,6 +992,10 @@ pub struct SessionView {
     /// Zero means unavailable for compatibility with projections predating this field.
     #[serde(default)]
     pub last_owner_activity_at_ms: i64,
+    #[serde(default)]
+    pub selected_account_id: Option<String>,
+    #[serde(default)]
+    pub routing_diagnostic: Option<ProviderAccountRoutingDiagnosticView>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

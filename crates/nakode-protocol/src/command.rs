@@ -272,9 +272,17 @@ pub enum Command {
         /// Runtime-resolved disabled identities. Clients cannot set this through gRPC.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         disabled_skill_ids: Vec<String>,
+        /// Optional account affinity for the initial provider-native session. `None` lets the server
+        /// apply its deterministic account-routing policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
     },
     OpenSession {
         session_id: SessionId,
+        /// Optional account affinity for restoration. Established sessions remain pinned to their
+        /// persisted account; this is only an explicit validation/legacy binding input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
         /// Tools for closed-session restoration, or the identical table for idempotent reattachment.
         tools: Option<SessionToolConfiguration>,
         /// Explicit MCP grant used only when restoring a closed session.
@@ -464,6 +472,46 @@ pub enum Command {
     ReloadProvider {
         provider_id: ProviderId,
     },
+    AddProviderAccount {
+        provider_id: ProviderId,
+        label: String,
+    },
+    BeginProviderAccountAuthentication {
+        provider_id: ProviderId,
+        account_id: String,
+    },
+    SetProviderAccountCredential {
+        provider_id: ProviderId,
+        account_id: String,
+        kind: String,
+        credential: CredentialInput,
+    },
+    ClearProviderAccountCredential {
+        provider_id: ProviderId,
+        account_id: String,
+    },
+    ReloadProviderAccount {
+        provider_id: ProviderId,
+        account_id: String,
+    },
+    SetProviderAccountLabel {
+        provider_id: ProviderId,
+        account_id: String,
+        label: String,
+    },
+    SetProviderAccountEnabled {
+        provider_id: ProviderId,
+        account_id: String,
+        enabled: bool,
+    },
+    SetProviderAccountDefault {
+        provider_id: ProviderId,
+        account_id: String,
+    },
+    RemoveProviderAccount {
+        provider_id: ProviderId,
+        account_id: String,
+    },
     SaveMcpServer {
         workspace_id: WorkspaceId,
         server: McpServerInput,
@@ -651,6 +699,7 @@ mod tests {
             mcp_grant: None,
             profile_id: None,
             disabled_skill_ids: Vec::new(),
+            account_id: None,
         };
         assert_eq!(
             serde_json::to_value(creation).expect("serialize configured session creation"),

@@ -892,6 +892,7 @@ fn install_ready_view(
         model_candidates: Vec::new(),
         supported_builtin_tools: Some(Vec::new()),
         available_builtin_tools: Some(Vec::new()),
+        accounts: Vec::new(),
     };
     if let Some(existing) = view
         .providers
@@ -912,6 +913,7 @@ fn install_ready_view(
         capabilities,
         connection: nakode_protocol::ConnectionView::Ready,
         native_session_id: None,
+        account_id: None,
         transcript: session.transcript.clone(),
         usage: nakode_protocol::TokenUsageView {
             input_tokens: 0,
@@ -1016,6 +1018,7 @@ fn install_created_session_view(
         capabilities,
         connection: nakode_protocol::ConnectionView::Ready,
         native_session_id: Some(provider_session_id.to_owned()),
+        account_id: None,
         transcript: session.transcript.clone(),
         usage: nakode_protocol::TokenUsageView {
             input_tokens: 0,
