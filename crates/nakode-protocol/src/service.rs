@@ -41,6 +41,8 @@ pub enum ServiceCapability {
     InvocationTelemetry,
     /// Profile-scoped stable skill availability can be listed and changed through the public API.
     SkillAvailability,
+    /// Retained unavailable skill records and their local telemetry can be pruned individually.
+    SkillPruning,
     /// Owner-facing clients may inspect and atomically mutate the authoritative archetype catalogue.
     ArchetypeManagement,
     /// Owner-facing clients may inspect and atomically mutate Nakode's one configured SOUL.md.
@@ -147,6 +149,14 @@ pub struct ManageableSkillView {
     pub description: String,
     pub enabled: bool,
     pub available: bool,
+    #[serde(default)]
+    pub availability_explanation: String,
+    #[serde(default)]
+    pub availability_reason: Option<String>,
+    #[serde(default)]
+    pub prunable: bool,
+    #[serde(default)]
+    pub prune_restriction: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

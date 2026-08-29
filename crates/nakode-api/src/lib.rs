@@ -108,6 +108,7 @@ mod tests {
             "RemoveProviderAccount",
             "ListSkills",
             "SetSkillEnabled",
+            "PruneSkill",
             "SetProviderEnabled",
             "BeginProviderAuthentication",
             "SetProviderCredential",

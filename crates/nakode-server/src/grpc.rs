@@ -1158,6 +1158,16 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             enabled: input.enabled,
         }
     );
+    command_rpc!(
+        prune_skill,
+        api::PruneSkillRequest,
+        input,
+        protocol::Command::PruneSkill {
+            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+            profile_id: input.profile_id,
+            skill_id: input.skill_id,
+        }
+    );
     async fn list_skills(
         &self,
         request: tonic::Request<api::ListSkillsRequest>,
@@ -1185,6 +1195,10 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                     description: skill.description,
                     enabled: skill.enabled,
                     available: skill.available,
+                    availability_reason: skill.availability_reason,
+                    prunable: skill.prunable,
+                    prune_restriction: skill.prune_restriction,
+                    availability_explanation: skill.availability_explanation,
                 })
                 .collect(),
         }))
@@ -1910,6 +1924,10 @@ pub(crate) fn workspace(value: protocol::BootstrapView) -> api::WorkspaceState {
                 description: skill.description,
                 enabled: true,
                 available: true,
+                availability_reason: None,
+                prunable: false,
+                prune_restriction: None,
+                availability_explanation: String::new(),
             })
             .collect(),
         settings: Some(settings(value.settings)),

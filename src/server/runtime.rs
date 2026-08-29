@@ -5,7 +5,7 @@
 //! resources. Frontends reach this owner only through the service protocol.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -193,6 +193,12 @@ impl BridgeMutationRollback {
             }
             | Command::ContinueSessionFromBridge { .. }
             | Command::DeleteSession { .. }
+            | Command::OpenSession {
+                profile_id: Some(_),
+                ..
+            }
+            | Command::SetSkillEnabled { .. }
+            | Command::PruneSkill { .. }
             | Command::SetSessionBridgeLifecycle { .. }
             | Command::SetWorkspaceBridgeLifecycle { .. } => {
                 Some(Self::Full(Box::new(core.clone())))
@@ -316,19 +322,29 @@ pub(crate) async fn prepare_runtime(
 
     let agents = AgentCatalog::load(&config.agents)?;
     let skills = SkillCatalog::load(&config.workspace)?;
-    let skill_preferences = session_repository
-        .list_all_skill_preferences()?
-        .into_iter()
-        .fold(
-            HashMap::<String, Vec<_>>::new(),
-            |mut profiles, preference| {
-                profiles
-                    .entry(preference.profile_id.clone())
-                    .or_default()
-                    .push(preference);
-                profiles
-            },
-        );
+    let mut persisted_skill_preferences = session_repository.list_all_skill_preferences()?;
+    let installed_skill_ids = skills.stable_ids().into_iter().collect::<HashSet<_>>();
+    let disabled_unavailable = persisted_skill_preferences
+        .iter_mut()
+        .filter(|preference| {
+            preference.enabled && !installed_skill_ids.contains(&preference.skill_id)
+        })
+        .map(|preference| {
+            preference.enabled = false;
+            preference.clone()
+        })
+        .collect::<Vec<_>>();
+    session_repository.set_skill_preferences(&disabled_unavailable)?;
+    let skill_preferences = persisted_skill_preferences.into_iter().fold(
+        HashMap::<String, Vec<_>>::new(),
+        |mut profiles, preference| {
+            profiles
+                .entry(preference.profile_id.clone())
+                .or_default()
+                .push(preference);
+            profiles
+        },
+    );
     let prompt_addenda =
         PromptAddenda::load(config.personalities.as_deref(), config.soul.as_deref())?;
     let soul_store = crate::soul::SoulStore::configured(config.soul.as_deref())?;
@@ -759,9 +775,212 @@ impl NativeServerRuntime {
         )
     }
 
-    fn refresh_skill_catalogue(&mut self) -> Result<(), crate::skill::SkillCatalogError> {
-        self.skill_catalogue =
-            SkillCatalog::load(Path::new(&self.core.engine().state().workspace))?;
+    fn reconciled_unavailable_skill_preferences(
+        &self,
+        catalogue: &SkillCatalog,
+    ) -> Result<HashMap<String, Vec<crate::skill::SkillPreference>>, crate::session::SessionError>
+    {
+        let installed_skill_ids = catalogue.stable_ids().into_iter().collect::<HashSet<_>>();
+        let changed = self
+            .skill_preferences
+            .values()
+            .flatten()
+            .filter(|preference| {
+                preference.enabled && !installed_skill_ids.contains(&preference.skill_id)
+            })
+            .map(|preference| crate::skill::SkillPreference {
+                enabled: false,
+                ..preference.clone()
+            })
+            .collect::<Vec<_>>();
+        self.effects
+            .persistence
+            .sessions
+            .set_skill_preferences(&changed)?;
+        let mut reconciled = self.skill_preferences.clone();
+        for preference in changed {
+            if let Some(saved) =
+                reconciled
+                    .get_mut(&preference.profile_id)
+                    .and_then(|preferences| {
+                        preferences
+                            .iter_mut()
+                            .find(|saved| saved.skill_id == preference.skill_id)
+                    })
+            {
+                *saved = preference;
+            }
+        }
+        Ok(reconciled)
+    }
+
+    fn disable_unavailable_skill_preferences(
+        &mut self,
+    ) -> Result<(), crate::session::SessionError> {
+        let reconciled = self.reconciled_unavailable_skill_preferences(&self.skill_catalogue)?;
+        self.skill_preferences = reconciled;
+        self.core
+            .install_skill_authority(&self.skill_catalogue, &self.skill_preferences);
+        Ok(())
+    }
+
+    fn refresh_skill_catalogue(&mut self) -> Result<(), String> {
+        let catalogue = SkillCatalog::load(Path::new(&self.core.engine().state().workspace))
+            .map_err(|error| error.to_string())?;
+        let preferences = self
+            .reconciled_unavailable_skill_preferences(&catalogue)
+            .map_err(|error| error.to_string())?;
+        self.skill_catalogue = catalogue;
+        self.skill_preferences = preferences;
+        self.core
+            .install_skill_authority(&self.skill_catalogue, &self.skill_preferences);
+        Ok(())
+    }
+
+    fn set_skill_enabled(
+        &mut self,
+        workspace_id: &nakode_protocol::WorkspaceId,
+        profile_id: &str,
+        skill_id: &str,
+        enabled: bool,
+    ) -> Result<(), ServiceError> {
+        let current_workspace =
+            crate::state::projection::workspace_id(&self.core.engine().state().workspace);
+        if workspace_id != &current_workspace
+            || profile_id.trim().is_empty()
+            || profile_id.len() > 200
+            || skill_id.trim().is_empty()
+            || skill_id.len() > 128
+        {
+            return Err(ServiceError {
+                code: ErrorCode::InvalidRequest,
+                message: "workspace, profile_id, and stable skill_id are required".to_owned(),
+                retryable: false,
+            });
+        }
+        let preferences = self
+            .skill_preferences
+            .get(profile_id)
+            .cloned()
+            .unwrap_or_default();
+        let Some(row) = self
+            .skill_catalogue
+            .manageable(&preferences, profile_id)
+            .into_iter()
+            .find(|skill| skill.id == skill_id)
+        else {
+            return Err(ServiceError {
+                code: ErrorCode::InvalidRequest,
+                message: format!("skill identity {skill_id:?} is not installed or retained"),
+                retryable: false,
+            });
+        };
+        if enabled && !row.available {
+            return Err(ServiceError {
+                code: ErrorCode::InvalidRequest,
+                message: row.availability_reason.unwrap_or_else(|| {
+                    "unavailable skills cannot be enabled until discovery finds them again"
+                        .to_owned()
+                }),
+                retryable: false,
+            });
+        }
+        let preference = crate::skill::SkillPreference {
+            profile_id: profile_id.to_owned(),
+            skill_id: row.id,
+            last_name: row.name,
+            last_description: row.description,
+            enabled,
+        };
+        self.effects
+            .persistence
+            .sessions
+            .set_skill_preference(&preference)
+            .map_err(|error| ServiceError {
+                code: ErrorCode::Internal,
+                message: error.to_string(),
+                retryable: true,
+            })?;
+        let profile_preferences = self
+            .skill_preferences
+            .entry(profile_id.to_owned())
+            .or_default();
+        if let Some(saved) = profile_preferences
+            .iter_mut()
+            .find(|saved| saved.skill_id == preference.skill_id)
+        {
+            *saved = preference;
+        } else {
+            profile_preferences.push(preference);
+        }
+        let effective = self.effective_skill_catalogue(profile_id);
+        self.core
+            .install_profile_skill_catalogue(profile_id, &effective);
+        Ok(())
+    }
+
+    fn prune_unavailable_skill(
+        &mut self,
+        workspace_id: &nakode_protocol::WorkspaceId,
+        profile_id: &str,
+        skill_id: &str,
+    ) -> Result<(), ServiceError> {
+        let current_workspace =
+            crate::state::projection::workspace_id(&self.core.engine().state().workspace);
+        if workspace_id != &current_workspace
+            || profile_id.trim().is_empty()
+            || profile_id.len() > 200
+            || skill_id.trim().is_empty()
+            || skill_id.len() > 128
+        {
+            return Err(ServiceError {
+                code: ErrorCode::InvalidRequest,
+                message: "workspace, profile_id, and stable skill_id are required".to_owned(),
+                retryable: false,
+            });
+        }
+        let preferences = self
+            .skill_preferences
+            .get(profile_id)
+            .cloned()
+            .unwrap_or_default();
+        let Some(row) = self
+            .skill_catalogue
+            .manageable(&preferences, profile_id)
+            .into_iter()
+            .find(|skill| skill.id == skill_id)
+        else {
+            return Err(ServiceError {
+                code: ErrorCode::InvalidRequest,
+                message: format!(
+                    "skill identity {skill_id:?} is not a retained unavailable record"
+                ),
+                retryable: false,
+            });
+        };
+        if !row.prunable {
+            return Err(ServiceError {
+                code: ErrorCode::Conflict,
+                message: row.prune_restriction.unwrap_or_else(|| {
+                    "this skill definition is not removable through catalogue cleanup".to_owned()
+                }),
+                retryable: false,
+            });
+        }
+        self.effects
+            .persistence
+            .sessions
+            .prune_unavailable_skill(skill_id)
+            .map_err(|error| ServiceError {
+                code: ErrorCode::Internal,
+                message: error.to_string(),
+                retryable: true,
+            })?;
+        for preferences in self.skill_preferences.values_mut() {
+            preferences.retain(|preference| preference.skill_id != skill_id);
+        }
+        self.skill_preferences
+            .retain(|_, preferences| !preferences.is_empty());
         self.core
             .install_skill_authority(&self.skill_catalogue, &self.skill_preferences);
         Ok(())
@@ -789,25 +1008,57 @@ impl NativeServerRuntime {
             }
         };
         let mut request = request;
-        let starts_profile_session = matches!(
+        let cached_command = match &request {
+            nakode_server::ServerRequest::Command {
+                idempotency_key, ..
+            } => self.core.command_cached(idempotency_key),
+            _ => false,
+        };
+        let creates_profile_session = matches!(
             &request,
             nakode_server::ServerRequest::Command {
                 command: Command::CreateSession {
-                    profile_id: Some(_),
-                    ..
-                } | Command::OpenSession {
                     profile_id: Some(_),
                     ..
                 },
                 ..
             }
         );
-        if starts_profile_session && let Err(error) = self.refresh_skill_catalogue() {
+        if !cached_command
+            && creates_profile_session
+            && let Err(error) = self.refresh_skill_catalogue()
+        {
             if let nakode_server::ServerRequest::Command { respond, .. } = request {
                 let _ = respond.send(Err(ServiceError {
                     code: ErrorCode::Internal,
                     message: format!(
                         "failed to refresh the installed skill catalogue before opening the session: {error}"
+                    ),
+                    retryable: true,
+                }));
+            }
+            return;
+        }
+        let profile_owner_intent = match &request {
+            nakode_server::ServerRequest::Command {
+                command:
+                    Command::SendPrompt { session_id, .. }
+                    | Command::EnqueuePrompt { session_id, .. }
+                    | Command::SteerQueuedPrompt { session_id, .. }
+                    | Command::ContinueSessionFromBridge { session_id, .. },
+                ..
+            } => self
+                .core
+                .engine_for(session_id)
+                .is_some_and(|engine| engine.state().skill_profile_id().is_some()),
+            _ => false,
+        };
+        if profile_owner_intent && let Err(error) = self.refresh_skill_catalogue() {
+            if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                let _ = respond.send(Err(ServiceError {
+                    code: ErrorCode::Internal,
+                    message: format!(
+                        "failed to refresh the installed skill catalogue before the owner turn: {error}"
                     ),
                     retryable: true,
                 }));
@@ -825,7 +1076,11 @@ impl NativeServerRuntime {
                 ..
             } => {
                 if profile_id.trim().is_empty() || profile_id.len() > 200 {
-                    Some("profile_id must be non-empty and at most 200 bytes".to_owned())
+                    Some(ServiceError {
+                        code: ErrorCode::InvalidRequest,
+                        message: "profile_id must be non-empty and at most 200 bytes".to_owned(),
+                        retryable: false,
+                    })
                 } else {
                     *disabled_skill_ids = self
                         .skill_preferences
@@ -847,51 +1102,70 @@ impl NativeServerRuntime {
                         ..
                     },
                 ..
-            } => match self
-                .effects
-                .persistence
-                .sessions
-                .session_skill_profile(session_id.as_str())
-            {
-                Err(error) => Some(format!("failed to resolve session skill profile: {error}")),
-                Ok(persisted_profile_id) => {
-                    let invalid = profile_id
-                        .as_deref()
-                        .is_some_and(|profile| profile.trim().is_empty() || profile.len() > 200);
-                    let mismatched = profile_id
-                        .as_deref()
-                        .zip(persisted_profile_id.as_deref())
-                        .is_some_and(|(requested, persisted)| requested != persisted);
-                    if invalid {
-                        Some("profile_id must be non-empty and at most 200 bytes".to_owned())
-                    } else if mismatched {
-                        Some("session belongs to a different skill profile".to_owned())
-                    } else {
-                        if profile_id.is_none() {
-                            profile_id.clone_from(&persisted_profile_id);
-                        }
-                        let bind_error = if persisted_profile_id.is_none() && profile_id.is_some() {
-                            self.effects
-                                .persistence
-                                .sessions
-                                .bind_session_skill_profile(
-                                    session_id.as_str(),
-                                    profile_id.as_deref().expect("profile is present"),
-                                )
-                                .err()
-                        } else {
-                            None
-                        };
-                        if let Some(error) = bind_error {
-                            Some(format!("failed to persist session skill profile: {error}"))
-                        } else {
-                            match profile_id.as_deref() {
-                                Some(profile_id) => {
-                                    *enabled_skill_ids =
-                                        self.effective_skill_catalogue(profile_id).stable_ids();
-                                    None
+            } => match self.core.canonical_session_id(session_id) {
+                Err(error) => Some(ServiceError {
+                    code: ErrorCode::Conflict,
+                    message: error.to_string(),
+                    retryable: false,
+                }),
+                Ok(canonical_session_id) => {
+                    *session_id = canonical_session_id;
+                    match self
+                        .effects
+                        .persistence
+                        .sessions
+                        .session_skill_profile(session_id.as_str())
+                    {
+                        Err(error) => Some(ServiceError {
+                            code: ErrorCode::Internal,
+                            message: format!("failed to resolve session skill profile: {error}"),
+                            retryable: true,
+                        }),
+                        Ok(persisted_profile_id) => {
+                            let invalid = profile_id.as_deref().is_some_and(|profile| {
+                                profile.trim().is_empty() || profile.len() > 200
+                            });
+                            let mismatched = profile_id
+                                .as_deref()
+                                .zip(persisted_profile_id.as_deref())
+                                .is_some_and(|(requested, persisted)| requested != persisted);
+                            if invalid {
+                                Some(ServiceError {
+                                    code: ErrorCode::InvalidRequest,
+                                    message: "profile_id must be non-empty and at most 200 bytes"
+                                        .to_owned(),
+                                    retryable: false,
+                                })
+                            } else if mismatched {
+                                Some(ServiceError {
+                                    code: ErrorCode::Conflict,
+                                    message: "session belongs to a different skill profile"
+                                        .to_owned(),
+                                    retryable: false,
+                                })
+                            } else {
+                                if profile_id.is_none() {
+                                    profile_id.clone_from(&persisted_profile_id);
                                 }
-                                None => None,
+                                match profile_id.as_deref() {
+                                    Some(_) if cached_command => None,
+                                    Some(profile_id) => match self.refresh_skill_catalogue() {
+                                        Ok(()) => {
+                                            *enabled_skill_ids = self
+                                                .effective_skill_catalogue(profile_id)
+                                                .stable_ids();
+                                            None
+                                        }
+                                        Err(error) => Some(ServiceError {
+                                            code: ErrorCode::Internal,
+                                            message: format!(
+                                                "failed to refresh the installed skill catalogue before opening the session: {error}"
+                                            ),
+                                            retryable: true,
+                                        }),
+                                    },
+                                    None => None,
+                                }
                             }
                         }
                     }
@@ -899,13 +1173,9 @@ impl NativeServerRuntime {
             },
             _ => None,
         };
-        if let Some(message) = skill_profile_error {
+        if let Some(error) = skill_profile_error {
             if let nakode_server::ServerRequest::Command { respond, .. } = request {
-                let _ = respond.send(Err(ServiceError {
-                    code: ErrorCode::Internal,
-                    message,
-                    retryable: true,
-                }));
+                let _ = respond.send(Err(error));
             }
             return;
         }
@@ -936,6 +1206,14 @@ impl NativeServerRuntime {
                 if refresh && let Err(error) = self.refresh_skill_catalogue() {
                     let _ = respond.send(Err(ServiceError {
                         code: ErrorCode::Internal,
+                        message: error,
+                        retryable: true,
+                    }));
+                    return;
+                }
+                if let Err(error) = self.disable_unavailable_skill_preferences() {
+                    let _ = respond.send(Err(ServiceError {
+                        code: ErrorCode::Internal,
                         message: error.to_string(),
                         retryable: true,
                     }));
@@ -957,103 +1235,16 @@ impl NativeServerRuntime {
                             description: skill.description,
                             enabled: skill.enabled,
                             available: skill.available,
+                            availability_explanation: skill.availability_explanation,
+                            availability_reason: skill.availability_reason,
+                            prunable: skill.prunable,
+                            prune_restriction: skill.prune_restriction,
                         })
                         .collect(),
                 };
                 let _ = respond.send(Ok(Snapshot {
                     cursor: self.endpoint.cursor(),
                     value: QueryResult::Skills(catalogue),
-                }));
-                return;
-            }
-            nakode_server::ServerRequest::Command {
-                command:
-                    Command::SetSkillEnabled {
-                        workspace_id,
-                        profile_id,
-                        skill_id,
-                        enabled,
-                    },
-                respond,
-                ..
-            } => {
-                let current_workspace =
-                    crate::state::projection::workspace_id(&self.core.engine().state().workspace);
-                if workspace_id != current_workspace
-                    || profile_id.trim().is_empty()
-                    || profile_id.len() > 200
-                    || skill_id.trim().is_empty()
-                    || skill_id.len() > 128
-                {
-                    let _ = respond.send(Err(ServiceError {
-                        code: ErrorCode::InvalidRequest,
-                        message: "workspace, profile_id, and stable skill_id are required"
-                            .to_owned(),
-                        retryable: false,
-                    }));
-                    return;
-                }
-                let preferences = self
-                    .skill_preferences
-                    .get(&profile_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let Some(row) = self
-                    .skill_catalogue
-                    .manageable(&preferences, &profile_id)
-                    .into_iter()
-                    .find(|skill| skill.id == skill_id)
-                else {
-                    let _ = respond.send(Err(ServiceError {
-                        code: ErrorCode::InvalidRequest,
-                        message: format!(
-                            "skill identity {skill_id:?} is not installed or retained"
-                        ),
-                        retryable: false,
-                    }));
-                    return;
-                };
-                let preference = crate::skill::SkillPreference {
-                    profile_id: profile_id.clone(),
-                    skill_id: row.id.clone(),
-                    last_name: row.name,
-                    last_description: row.description,
-                    enabled,
-                };
-                if let Err(error) = self
-                    .effects
-                    .persistence
-                    .sessions
-                    .set_skill_preference(&preference)
-                {
-                    let _ = respond.send(Err(ServiceError {
-                        code: ErrorCode::Internal,
-                        message: error.to_string(),
-                        retryable: true,
-                    }));
-                    return;
-                }
-                let profile_preferences = self
-                    .skill_preferences
-                    .entry(profile_id.clone())
-                    .or_default();
-                if let Some(saved) = profile_preferences
-                    .iter_mut()
-                    .find(|saved| saved.skill_id == preference.skill_id)
-                {
-                    *saved = preference;
-                } else {
-                    profile_preferences.push(preference);
-                }
-                let effective = self.effective_skill_catalogue(&profile_id);
-                self.core
-                    .install_profile_skill_catalogue(&profile_id, &effective);
-                let _ = respond.send(Ok(nakode_protocol::CommandAccepted {
-                    resource_id: Some(row.id),
-                    revision: None,
-                    bridge_continuation: None,
-                    replayed_bridge_continuation: None,
-                    replayed_bridge_source_active: None,
                 }));
                 return;
             }
@@ -1201,8 +1392,92 @@ impl NativeServerRuntime {
                 }
             }
         }
+        let session_profile_binding = match &request {
+            nakode_server::ServerRequest::Command {
+                command:
+                    Command::OpenSession {
+                        session_id,
+                        profile_id: Some(profile_id),
+                        ..
+                    },
+                ..
+            } => Some((session_id.clone(), profile_id.clone())),
+            _ => None,
+        };
+        let set_skill_enabled = match &request {
+            nakode_server::ServerRequest::Command {
+                command:
+                    Command::SetSkillEnabled {
+                        workspace_id,
+                        profile_id,
+                        skill_id,
+                        enabled,
+                    },
+                ..
+            } => Some((
+                workspace_id.clone(),
+                profile_id.clone(),
+                skill_id.clone(),
+                *enabled,
+            )),
+            _ => None,
+        };
+        let prune_skill = match &request {
+            nakode_server::ServerRequest::Command {
+                command:
+                    Command::PruneSkill {
+                        workspace_id,
+                        profile_id,
+                        skill_id,
+                    },
+                ..
+            } => Some((workspace_id.clone(), profile_id.clone(), skill_id.clone())),
+            _ => None,
+        };
         let mut rollback = BridgeMutationRollback::capture(&request, &self.core);
         let mut outcome = self.core.handle(&self.endpoint, request);
+        if outcome.changed
+            && let Some((session_id, profile_id)) = session_profile_binding
+            && let Err(error) = self
+                .effects
+                .persistence
+                .sessions
+                .bind_session_skill_profile(session_id.as_str(), &profile_id)
+        {
+            match rollback.take() {
+                Some(rollback) => rollback.restore(&mut self.core),
+                None => self.accepting_work = false,
+            }
+            outcome.respond_with_error(ServiceError {
+                code: ErrorCode::Internal,
+                message: format!("failed to persist session skill profile: {error}"),
+                retryable: true,
+            });
+            return;
+        }
+        if outcome.changed
+            && let Some((workspace_id, profile_id, skill_id, enabled)) = set_skill_enabled
+            && let Err(error) =
+                self.set_skill_enabled(&workspace_id, &profile_id, &skill_id, enabled)
+        {
+            match rollback.take() {
+                Some(rollback) => rollback.restore(&mut self.core),
+                None => self.accepting_work = false,
+            }
+            outcome.respond_with_error(error);
+            return;
+        }
+        if outcome.changed
+            && let Some((workspace_id, profile_id, skill_id)) = prune_skill
+            && let Err(error) = self.prune_unavailable_skill(&workspace_id, &profile_id, &skill_id)
+        {
+            match rollback.take() {
+                Some(rollback) => rollback.restore(&mut self.core),
+                None => self.accepting_work = false,
+            }
+            outcome.respond_with_error(error);
+            return;
+        }
         let replay_disposition = outcome.bridge_continuation();
         let inbound_event_to_claim =
             inbound_event_to_claim.and_then(|(session_id, external_event_id)| {
@@ -1408,6 +1683,20 @@ impl NativeServerRuntime {
                     .session_store_failed(error.to_string());
             }
             return;
+        }
+        let completed_profile_turn = matches!(&event, BackendEvent::TurnCompleted { .. })
+            && match &source {
+                BackendSource::Primary { session_id, .. } => self
+                    .core
+                    .engine_for(session_id)
+                    .is_some_and(|engine| engine.state().skill_profile_id().is_some()),
+                _ => false,
+            };
+        if completed_profile_turn && let Err(error) = self.refresh_skill_catalogue() {
+            // A failed refresh does not authoritatively establish absence. Keep the latest
+            // successfully validated snapshot for queued-turn promotion and retry discovery on the
+            // next owner intent instead of partially applying a failed catalogue.
+            eprintln!("nakode skills: queued-turn discovery refresh deferred: {error}");
         }
         let event_session_id = match &source {
             BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {
@@ -2307,6 +2596,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::ArchetypeManagement,
             ServiceCapability::InvocationTelemetry,
             ServiceCapability::SkillAvailability,
+            ServiceCapability::SkillPruning,
             ServiceCapability::SoulManagement,
             ServiceCapability::McpManagement,
             ServiceCapability::OrchestratorThreadBridge,
@@ -4230,7 +4520,7 @@ fn persist_session(
     options: &crate::backend::ModelOptions,
 ) {
     let enabled_skill_ids = state.enabled_skill_ids();
-    match sessions.create_with_account_id(
+    match sessions.create_with_account_id_and_skill_profile(
         &state.nakode_session_id,
         provider,
         account_id,
@@ -4241,21 +4531,10 @@ fn persist_session(
         model,
         options,
         Some(&enabled_skill_ids),
+        state.skill_profile_id(),
+        Some(state.code_mode()),
     ) {
-        Ok(mut record) => {
-            if let Err(error) = sessions.set_session_code_mode(&record.id, state.code_mode()) {
-                state.session_store_failed(error.to_string());
-                return;
-            }
-            record.code_mode = state.code_mode();
-            if let Some(profile_id) = state.skill_profile_id().map(str::to_owned)
-                && let Err(error) = sessions.bind_session_skill_profile(&record.id, &profile_id)
-            {
-                state.session_store_failed(error.to_string());
-                return;
-            }
-            state.session_persisted(&record);
-        }
+        Ok(record) => state.session_persisted(&record),
         Err(error) => state.session_store_failed(error.to_string()),
     }
 }
@@ -6300,6 +6579,663 @@ mod tests {
                 if id == "outer/denied" && output.contains("no longer granted")
         ));
         assert!(runtime.pending_mcp_calls.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn idle_profile_owner_turn_refreshes_removed_skills_before_command_handling() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill = workspace.path().join(".agents/skills/publication");
+        std::fs::create_dir_all(&skill).expect("skill directory");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nid: test.publication.v1\nname: publication\ndescription: Guarded publication\n---\n\n# Publication\n",
+        )
+        .expect("skill definition");
+        let catalogue =
+            SkillCatalog::load_from_roots(None, Some(&workspace.path().join(".agents/skills")))
+                .expect("skill catalogue");
+        let preference = SkillPreference {
+            profile_id: "profile-owner".to_owned(),
+            skill_id: "test.publication.v1".to_owned(),
+            last_name: "publication".to_owned(),
+            last_description: "Guarded publication".to_owned(),
+            enabled: true,
+        };
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let sessions = Arc::clone(&persistence.sessions);
+        sessions
+            .set_skill_preferences(std::slice::from_ref(&preference))
+            .expect("profile preference");
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::SessionCreated {
+                provider_session_id: "provider-idle-profile".to_owned(),
+                model: "model".to_owned(),
+            },
+        );
+        state.set_skill_profile(Some("profile-owner".to_owned()));
+        state.install_skill_snapshot(catalogue.clone(), Some(&["test.publication.v1".to_owned()]));
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let (backend, _commands, _events) = fake_backend();
+        let mut registry = empty_registry(workspace.path()).await;
+        registry.insert_session(
+            session_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            backend,
+        );
+        let effects = EffectExecutor::new(registry, persistence);
+        let preferences = HashMap::from([("profile-owner".to_owned(), vec![preference])]);
+        let (runtime, handle) = NativeServerRuntime::from_parts_with_skill_authority(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+            catalogue,
+            preferences,
+        );
+        std::fs::remove_dir_all(skill).expect("remove installed definition while session is idle");
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+
+        endpoint
+            .execute_command(
+                ClientId::from("skill-owner-turn-test"),
+                IdempotencyKey::from("owner-turn-after-remove"),
+                None,
+                false,
+                Command::SendPrompt {
+                    session_id,
+                    prompt: nakode_protocol::PromptInput {
+                        text: "continue".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+            )
+            .await
+            .expect("owner turn accepted after authoritative refresh");
+        let QueryResult::Skills(refreshed) = endpoint
+            .execute_query(
+                ClientId::from("skill-owner-turn-test"),
+                Query::ListSkills {
+                    workspace_id: crate::state::projection::workspace_id(
+                        &workspace.path().to_string_lossy(),
+                    ),
+                    profile_id: "profile-owner".to_owned(),
+                    refresh: false,
+                },
+            )
+            .await
+            .expect("catalogue after owner turn")
+            .value
+        else {
+            panic!("skill catalogue result")
+        };
+        let removed = refreshed
+            .skills
+            .iter()
+            .find(|skill| skill.id == "test.publication.v1")
+            .expect("retained removed skill");
+        assert!(!removed.available);
+        assert!(!removed.enabled);
+        assert!(
+            !sessions
+                .list_skill_preferences("profile-owner")
+                .expect("persisted profile preference")
+                .first()
+                .expect("profile preference")
+                .enabled,
+            "the next owner turn must durably disable a definition removed while idle"
+        );
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
+    }
+
+    #[tokio::test]
+    async fn failed_unavailable_reconciliation_preserves_last_successful_skill_authority() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill = workspace.path().join(".agents/skills/publication");
+        std::fs::create_dir_all(&skill).expect("skill directory");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nid: test.publication.v1\nname: publication\ndescription: Guarded publication\n---\n",
+        )
+        .expect("skill definition");
+        let catalogue =
+            SkillCatalog::load_from_roots(None, Some(&workspace.path().join(".agents/skills")))
+                .expect("skill catalogue");
+        let preference = SkillPreference {
+            profile_id: "profile-owner".to_owned(),
+            skill_id: "test.publication.v1".to_owned(),
+            last_name: "publication".to_owned(),
+            last_description: "Guarded publication".to_owned(),
+            enabled: true,
+        };
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let sessions = Arc::clone(&persistence.sessions);
+        sessions
+            .set_skill_preferences(std::slice::from_ref(&preference))
+            .expect("profile preference");
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let preferences = HashMap::from([("profile-owner".to_owned(), vec![preference])]);
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts_with_skill_authority(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+            catalogue,
+            preferences,
+        );
+        let previous_catalogue = runtime.skill_catalogue.clone();
+        let previous_preferences = runtime.skill_preferences.clone();
+        runtime
+            .core
+            .install_skill_authority(&previous_catalogue, &previous_preferences);
+        std::fs::remove_dir_all(skill).expect("remove installed definition");
+        let breaker = rusqlite::Connection::open(workspace.path().join("sessions.sqlite3"))
+            .expect("reconciliation breaker connection");
+        breaker
+            .execute_batch(
+                "CREATE TRIGGER fail_skill_disable \
+                 BEFORE UPDATE ON skill_preferences \
+                 WHEN OLD.skill_id = 'test.publication.v1' \
+                 BEGIN SELECT RAISE(ABORT, 'forced skill disable failure'); END;",
+            )
+            .expect("disable failure trigger");
+
+        runtime
+            .refresh_skill_catalogue()
+            .expect_err("failed durable reconciliation must reject the refresh");
+        assert!(
+            runtime
+                .skill_catalogue
+                .stable_ids()
+                .iter()
+                .any(|id| id == "test.publication.v1")
+        );
+        assert!(
+            runtime
+                .core
+                .engine()
+                .state()
+                .skill_catalogue()
+                .stable_ids()
+                .iter()
+                .any(|id| id == "test.publication.v1"),
+            "core and runtime must retain the same last successful catalogue"
+        );
+        assert!(
+            sessions
+                .list_skill_preferences("profile-owner")
+                .expect("persisted profile preference")
+                .first()
+                .expect("profile preference")
+                .enabled,
+            "failed reconciliation must not partially disable persistence"
+        );
+
+        runtime.effects.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn unavailable_skills_are_disabled_guarded_and_pruned_from_all_local_state() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let installed = workspace.path().join(".agents/skills/installed-review");
+        std::fs::create_dir_all(&installed).expect("installed skill directory");
+        std::fs::write(
+            installed.join("SKILL.md"),
+            "---\nid: installed.review\nname: installed-review\ndescription: Installed review\n---\n",
+        )
+        .expect("installed skill definition");
+        let catalogue =
+            SkillCatalog::load_from_roots(None, Some(&workspace.path().join(".agents/skills")))
+                .expect("skill catalogue");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let sessions = Arc::clone(&persistence.sessions);
+        let retained = SkillPreference {
+            profile_id: "profile-a".to_owned(),
+            skill_id: "removed.review".to_owned(),
+            last_name: "removed-review".to_owned(),
+            last_description: "Removed review".to_owned(),
+            enabled: true,
+        };
+        let retained_audit = SkillPreference {
+            skill_id: "removed.audit".to_owned(),
+            last_name: "removed-audit".to_owned(),
+            last_description: "Removed audit".to_owned(),
+            ..retained.clone()
+        };
+        sessions
+            .set_skill_preferences(&[
+                retained.clone(),
+                retained_audit.clone(),
+                SkillPreference {
+                    profile_id: "profile-b".to_owned(),
+                    enabled: false,
+                    ..retained.clone()
+                },
+            ])
+            .expect("retained preferences");
+        sessions
+            .save_invocation_telemetry_enabled(true)
+            .expect("telemetry consent");
+        sessions
+            .record_invocation(&InvocationRecord {
+                invocation_key: "removed-review-call".to_owned(),
+                kind: nakode_protocol::InvocationKind::Skill,
+                identity: "removed.review".to_owned(),
+                display_label: "Removed review".to_owned(),
+                occurred_at_ms: 1_000,
+            })
+            .expect("retained telemetry");
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let workspace_id = crate::state::projection::workspace_id(&state.workspace);
+        let preferences = HashMap::from([
+            (
+                "profile-a".to_owned(),
+                vec![retained.clone(), retained_audit],
+            ),
+            (
+                "profile-b".to_owned(),
+                vec![SkillPreference {
+                    profile_id: "profile-b".to_owned(),
+                    enabled: false,
+                    ..retained
+                }],
+            ),
+        ]);
+        let (runtime, handle) = NativeServerRuntime::from_parts_with_skill_authority(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+            catalogue,
+            preferences,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+
+        let QueryResult::Skills(before) = endpoint
+            .execute_query(
+                ClientId::from("skill-prune-test"),
+                Query::ListSkills {
+                    workspace_id: workspace_id.clone(),
+                    profile_id: "profile-a".to_owned(),
+                    refresh: false,
+                },
+            )
+            .await
+            .expect("authoritative skill catalogue")
+            .value
+        else {
+            panic!("skill catalogue result");
+        };
+        let unavailable = before
+            .skills
+            .iter()
+            .find(|skill| skill.id == "removed.review")
+            .expect("retained unavailable row");
+        assert!(!unavailable.available);
+        assert!(!unavailable.enabled);
+        assert!(unavailable.prunable);
+        assert!(unavailable.availability_reason.is_some());
+        assert!(
+            !sessions
+                .list_skill_preferences("profile-a")
+                .expect("persisted profile")
+                .first()
+                .expect("persisted row")
+                .enabled,
+            "authoritative encounter must durably disable the unavailable row"
+        );
+
+        let enable_error = endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                IdempotencyKey::from("enable-unavailable"),
+                None,
+                false,
+                Command::SetSkillEnabled {
+                    workspace_id: workspace_id.clone(),
+                    profile_id: "profile-a".to_owned(),
+                    skill_id: "removed.review".to_owned(),
+                    enabled: true,
+                },
+            )
+            .await
+            .expect_err("unavailable skill cannot be enabled");
+        assert_eq!(enable_error.code, ErrorCode::InvalidRequest);
+
+        let set_replay_error = endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                IdempotencyKey::from("set-skill-replay-miss"),
+                None,
+                true,
+                Command::SetSkillEnabled {
+                    workspace_id: workspace_id.clone(),
+                    profile_id: "profile-a".to_owned(),
+                    skill_id: "installed.review".to_owned(),
+                    enabled: false,
+                },
+            )
+            .await
+            .expect_err("replay-only cache miss cannot write a preference");
+        assert_eq!(set_replay_error.code, ErrorCode::Conflict);
+
+        let set_stale_error = endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                IdempotencyKey::from("set-skill-stale-revision"),
+                Some(u64::MAX),
+                false,
+                Command::SetSkillEnabled {
+                    workspace_id: workspace_id.clone(),
+                    profile_id: "profile-a".to_owned(),
+                    skill_id: "installed.review".to_owned(),
+                    enabled: false,
+                },
+            )
+            .await
+            .expect_err("stale expected revision cannot write a preference");
+        assert_eq!(set_stale_error.code, ErrorCode::Conflict);
+        assert!(
+            sessions
+                .list_skill_preferences("profile-a")
+                .expect("preferences after guarded skill writes")
+                .iter()
+                .all(|preference| preference.skill_id != "installed.review")
+        );
+
+        let set_breaker = rusqlite::Connection::open(workspace.path().join("sessions.sqlite3"))
+            .expect("skill preference breaker connection");
+        set_breaker
+            .execute_batch(
+                "CREATE TRIGGER fail_skill_preference_insert \
+                 BEFORE INSERT ON skill_preferences \
+                 WHEN NEW.skill_id = 'installed.review' \
+                 BEGIN SELECT RAISE(ABORT, 'forced skill preference failure'); END;",
+            )
+            .expect("skill preference failure trigger");
+        let set_key = IdempotencyKey::from("set-installed-skill");
+        let set_command = Command::SetSkillEnabled {
+            workspace_id: workspace_id.clone(),
+            profile_id: "profile-a".to_owned(),
+            skill_id: "installed.review".to_owned(),
+            enabled: false,
+        };
+        let set_durable_error = endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                set_key.clone(),
+                None,
+                false,
+                set_command.clone(),
+            )
+            .await
+            .expect_err("failed durable preference write must not be confirmed");
+        assert_eq!(set_durable_error.code, ErrorCode::Internal);
+        assert!(set_durable_error.retryable);
+        set_breaker
+            .execute_batch("DROP TRIGGER fail_skill_preference_insert;")
+            .expect("drop skill preference failure trigger");
+        endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                set_key.clone(),
+                None,
+                false,
+                set_command,
+            )
+            .await
+            .expect("same-key preference retry executes after rollback");
+        let installed_preference = sessions
+            .list_skill_preferences("profile-a")
+            .expect("preferences after skill write")
+            .into_iter()
+            .find(|preference| preference.skill_id == "installed.review")
+            .expect("installed preference");
+        assert!(!installed_preference.enabled);
+        let set_reused_error = endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                set_key,
+                None,
+                false,
+                Command::SetSkillEnabled {
+                    workspace_id: workspace_id.clone(),
+                    profile_id: "profile-a".to_owned(),
+                    skill_id: "installed.review".to_owned(),
+                    enabled: true,
+                },
+            )
+            .await
+            .expect_err("one idempotency key cannot identify two preference writes");
+        assert_eq!(set_reused_error.code, ErrorCode::Conflict);
+        assert!(
+            !sessions
+                .list_skill_preferences("profile-a")
+                .expect("preferences after key reuse")
+                .into_iter()
+                .find(|preference| preference.skill_id == "installed.review")
+                .expect("installed preference after key reuse")
+                .enabled
+        );
+
+        let installed_error = endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                IdempotencyKey::from("prune-installed"),
+                None,
+                false,
+                Command::PruneSkill {
+                    workspace_id: workspace_id.clone(),
+                    profile_id: "profile-a".to_owned(),
+                    skill_id: "installed.review".to_owned(),
+                },
+            )
+            .await
+            .expect_err("installed skill cannot be pruned");
+        assert_eq!(installed_error.code, ErrorCode::Conflict);
+
+        let replay_error = endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                IdempotencyKey::from("prune-replay-miss"),
+                None,
+                true,
+                Command::PruneSkill {
+                    workspace_id: workspace_id.clone(),
+                    profile_id: "profile-a".to_owned(),
+                    skill_id: "removed.review".to_owned(),
+                },
+            )
+            .await
+            .expect_err("replay-only cache miss cannot prune");
+        assert_eq!(replay_error.code, ErrorCode::Conflict);
+
+        let stale_error = endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                IdempotencyKey::from("prune-stale-revision"),
+                Some(u64::MAX),
+                false,
+                Command::PruneSkill {
+                    workspace_id: workspace_id.clone(),
+                    profile_id: "profile-a".to_owned(),
+                    skill_id: "removed.review".to_owned(),
+                },
+            )
+            .await
+            .expect_err("stale expected revision cannot prune");
+        assert_eq!(stale_error.code, ErrorCode::Conflict);
+
+        let reused_key = IdempotencyKey::from("prune-key-reuse");
+        endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                reused_key.clone(),
+                None,
+                false,
+                Command::PruneSkill {
+                    workspace_id: workspace_id.clone(),
+                    profile_id: "profile-a".to_owned(),
+                    skill_id: "removed.audit".to_owned(),
+                },
+            )
+            .await
+            .expect("first prune under shared key");
+        let reused_error = endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                reused_key,
+                None,
+                false,
+                Command::PruneSkill {
+                    workspace_id: workspace_id.clone(),
+                    profile_id: "profile-a".to_owned(),
+                    skill_id: "removed.review".to_owned(),
+                },
+            )
+            .await
+            .expect_err("one idempotency key cannot identify two prunes");
+        assert_eq!(reused_error.code, ErrorCode::Conflict);
+        assert!(
+            sessions
+                .list_all_skill_preferences()
+                .expect("preferences after guarded prunes")
+                .iter()
+                .any(|preference| preference.skill_id == "removed.review"),
+            "guarded prune attempts preserve the second skill"
+        );
+
+        let breaker = rusqlite::Connection::open(workspace.path().join("sessions.sqlite3"))
+            .expect("prune breaker connection");
+        breaker
+            .execute_batch(
+                "CREATE TRIGGER fail_skill_prune \
+                 BEFORE DELETE ON skill_preferences \
+                 WHEN OLD.skill_id = 'removed.review' \
+                 BEGIN SELECT RAISE(ABORT, 'forced skill prune failure'); END;",
+            )
+            .expect("prune failure trigger");
+        let prune_key = IdempotencyKey::from("prune-unavailable");
+        let prune_command = Command::PruneSkill {
+            workspace_id: workspace_id.clone(),
+            profile_id: "profile-a".to_owned(),
+            skill_id: "removed.review".to_owned(),
+        };
+        let durable_error = endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                prune_key.clone(),
+                None,
+                false,
+                prune_command.clone(),
+            )
+            .await
+            .expect_err("failed durable prune must not be confirmed");
+        assert_eq!(durable_error.code, ErrorCode::Internal);
+        assert!(durable_error.retryable);
+        assert!(
+            sessions
+                .list_all_skill_preferences()
+                .expect("preferences after failed durable prune")
+                .iter()
+                .any(|preference| preference.skill_id == "removed.review")
+        );
+        breaker
+            .execute_batch("DROP TRIGGER fail_skill_prune;")
+            .expect("drop prune failure trigger");
+
+        endpoint
+            .execute_command(
+                ClientId::from("skill-prune-test"),
+                prune_key,
+                None,
+                false,
+                prune_command,
+            )
+            .await
+            .expect("unavailable skill prune");
+        let QueryResult::Skills(after) = endpoint
+            .execute_query(
+                ClientId::from("skill-prune-test"),
+                Query::ListSkills {
+                    workspace_id,
+                    profile_id: "profile-a".to_owned(),
+                    refresh: false,
+                },
+            )
+            .await
+            .expect("replacement skill catalogue")
+            .value
+        else {
+            panic!("skill catalogue result");
+        };
+        assert!(
+            after
+                .skills
+                .iter()
+                .all(|skill| skill.id != "removed.review")
+        );
+        assert!(
+            sessions
+                .list_all_skill_preferences()
+                .expect("all preferences")
+                .iter()
+                .all(|preference| preference.skill_id != "removed.review")
+        );
+        assert!(
+            sessions
+                .invocation_summary()
+                .expect("invocation summary")
+                .items
+                .iter()
+                .all(|item| {
+                    item.kind != nakode_protocol::InvocationKind::Skill
+                        || item.identity != "removed.review"
+                })
+        );
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
     }
 
     #[tokio::test]

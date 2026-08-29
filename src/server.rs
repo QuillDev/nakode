@@ -544,6 +544,10 @@ impl ServerCore {
         self.sessions = sessions;
     }
 
+    pub(crate) fn command_cached(&self, key: &IdempotencyKey) -> bool {
+        self.command_cache.contains_key(key)
+    }
+
     fn execute_idempotent(
         &mut self,
         key: IdempotencyKey,
@@ -887,9 +891,10 @@ impl ServerCore {
                 session_id,
                 command,
             } => self.run_shell_command(&session_id, command),
-            Command::SetSkillEnabled { .. } => Err(DomainCommandError::Invalid(
-                "skill availability is served by the native persistence runtime".to_owned(),
-            )),
+            Command::SetSkillEnabled { skill_id, .. } => {
+                Ok(Self::accepted(Some(skill_id), Vec::new()))
+            }
+            Command::PruneSkill { skill_id, .. } => Ok(Self::accepted(Some(skill_id), Vec::new())),
             Command::SetProviderModelFilter {
                 provider_id,
                 enabled,
@@ -1181,13 +1186,10 @@ impl ServerCore {
             ));
         }
         self.refresh_session_template_addenda()?;
-        let skills = SkillCatalog::load(Path::new(&working_directory))
-            .map(|catalogue| catalogue.without_ids(disabled_skill_ids))
-            .map_err(|error| {
-                DomainCommandError::Invalid(format!(
-                    "failed to load skills for {working_directory}: {error}"
-                ))
-            })?;
+        let skills = self
+            .session_template
+            .skill_catalogue()
+            .without_ids(disabled_skill_ids);
         let mut engine = ServiceEngine::new(self.session_template.clone());
         engine.state_mut().set_working_directory(working_directory);
         engine.state_mut().set_skill_profile(profile_id);
@@ -1939,12 +1941,16 @@ impl ServerCore {
         enabled_skill_ids: &[String],
         account_id: Option<&str>,
     ) -> DomainCommandOutcome {
-        let loaded = self
-            .sessions_by_id
-            .keys()
-            .filter(|loaded| loaded.as_str().starts_with(session_id.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
+        let loaded = self.sessions_by_id.get_key_value(session_id).map_or_else(
+            || {
+                self.sessions_by_id
+                    .keys()
+                    .filter(|loaded| loaded.as_str().starts_with(session_id.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            },
+            |(loaded, _)| vec![loaded.clone()],
+        );
         match loaded.as_slice() {
             [loaded] => {
                 let (loaded_workspace, loaded_working_directory, loaded_account_id) = {
@@ -1992,8 +1998,11 @@ impl ServerCore {
                         )?;
                 }
                 if let Some(profile_id) = profile_id {
+                    let skills = self
+                        .session_template
+                        .skill_catalogue()
+                        .only_ids(enabled_skill_ids);
                     let state = self.session_engine_mut(loaded)?.state_mut();
-                    let skills = state.skill_catalogue().only_ids(enabled_skill_ids);
                     state.set_skill_profile(Some(profile_id));
                     state.install_skill_snapshot(skills, Some(enabled_skill_ids));
                 }
@@ -2012,9 +2021,17 @@ impl ServerCore {
         let matches = self
             .sessions
             .iter()
-            .filter(|session| session.id.starts_with(session_id.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
+            .find(|session| session.id == session_id.as_str())
+            .map_or_else(
+                || {
+                    self.sessions
+                        .iter()
+                        .filter(|session| session.id.starts_with(session_id.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                },
+                |session| vec![session.clone()],
+            );
         let requested_code_mode = tools.as_ref().map(|tools| tools.code_mode);
         let mut session = match matches.as_slice() {
             [session] => session.clone(),
@@ -2292,7 +2309,7 @@ impl ServerCore {
     /// Exact IDs win, matching repository lookup semantics. Otherwise every loaded engine, persisted
     /// record, and retained bridge participates in unique-prefix resolution so no layer can delete a
     /// different logical session from the one the runtime releases.
-    fn canonical_delete_session_id(
+    pub(crate) fn canonical_session_id(
         &self,
         requested: &SessionId,
     ) -> Result<SessionId, DomainCommandError> {
@@ -2340,7 +2357,7 @@ impl ServerCore {
     /// A unique prefix is resolved before mutation so runtime teardown and durable deletion use the
     /// same canonical identity. Deleting a closed default session installs its successor first.
     fn delete_session_command(&mut self, session_id: &SessionId) -> DomainCommandOutcome {
-        let session_id = self.canonical_delete_session_id(session_id)?;
+        let session_id = self.canonical_session_id(session_id)?;
         let lifecycle = self.sessions_by_id.get(&session_id).map(|engine| {
             let state = engine.state();
             (
@@ -4015,6 +4032,7 @@ impl ServerCore {
             | Command::SelectModel { .. }
             | Command::SetProviderModelFilter { .. }
             | Command::SetSkillEnabled { .. }
+            | Command::PruneSkill { .. }
             | Command::SetProviderEnabled { .. }
             | Command::BeginProviderAuthentication { .. }
             | Command::SetProviderCredential { .. }
@@ -4766,7 +4784,17 @@ fn validated_relative_path(path: &str) -> Result<PathBuf, DomainCommandError> {
 }
 
 fn command_digest(command: &Command) -> [u8; 32] {
-    let encoded = serde_json::to_vec(command).unwrap_or_default();
+    let mut command = command.clone();
+    match &mut command {
+        Command::CreateSession {
+            disabled_skill_ids, ..
+        } => disabled_skill_ids.clear(),
+        Command::OpenSession {
+            enabled_skill_ids, ..
+        } => enabled_skill_ids.clear(),
+        _ => {}
+    }
+    let encoded = serde_json::to_vec(&command).unwrap_or_default();
     Sha256::digest(encoded).into()
 }
 
@@ -4947,6 +4975,7 @@ mod tests {
             BridgeInboundTurnOriginRecord, BridgeProjectionRecord, ProviderRecord,
             SessionBridgeRecord, SessionRecord, SubagentObservability, SubagentRecord,
         },
+        skill::SkillCatalog,
         soul::{SoulSource, SoulStore},
         state::{AppState, DomainCommandError},
     };
@@ -5221,6 +5250,51 @@ mod tests {
         assert_eq!(
             rooted_summary.working_directory,
             explicit_canonical.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn session_creation_uses_installed_authority_without_a_second_filesystem_scan() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut state = AppState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+        core.install_skill_authority(&SkillCatalog::default(), &HashMap::new());
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let skill = workspace.path().join(".agents/skills/unapproved");
+        std::fs::create_dir_all(&skill).expect("skill directory");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nid: test.unapproved.v1\nname: unapproved\ndescription: Not refreshed\n---\n",
+        )
+        .expect("skill installed after authority snapshot");
+
+        let (created, _) = core
+            .create_session_command(&workspace_id, None, &ModelOptions::default(), None)
+            .expect("session creation uses installed authority");
+        let session_id = SessionId::from(created.resource_id.expect("created session id"));
+        assert!(
+            core.engine_for(&session_id)
+                .expect("created session engine")
+                .state()
+                .skill_catalogue()
+                .stable_ids()
+                .is_empty(),
+            "session creation must not re-admit definitions from an unrestricted second scan"
         );
     }
 

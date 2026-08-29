@@ -10,6 +10,9 @@ use thiserror::Error;
 use crate::controls::SKILL_PREFIX;
 
 const SKILL_FILE: &str = "SKILL.md";
+const AVAILABILITY_EXPLANATION: &str = "Nakode marks a skill available only after the latest successful discovery finds and validates its inert SKILL.md and safe Markdown components in the machine-local or workspace-local skill roots. Provider, model, runtime, and tool prerequisites are not skill availability inputs.";
+const UNAVAILABLE_REASON: &str = "No installed skill with this stable identity was found in the machine-local or workspace-local skill roots during the latest successful Nakode discovery.";
+const AVAILABLE_PRUNE_RESTRICTION: &str = "Installed skills cannot be pruned through catalogue cleanup. Remove the installed package first, refresh Nakode discovery, then prune its retained unavailable record.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SkillComponent {
@@ -72,6 +75,17 @@ pub struct ManageableSkill {
     pub description: String,
     pub enabled: bool,
     pub available: bool,
+    pub availability_explanation: String,
+    pub availability_reason: Option<String>,
+    pub prunable: bool,
+    pub prune_restriction: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SkillPruneReport {
+    pub preference_count: usize,
+    pub event_count: usize,
+    pub aggregate_count: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -113,6 +127,8 @@ pub enum SkillCatalogError {
         first: String,
         second: String,
     },
+    #[error("skill package or definition {path} resolves outside the configured skill root")]
+    PackageEscape { path: String },
     #[error("skill definition {path} is empty")]
     EmptyDefinition { path: String },
     #[error("skill component {component:?} declared by {path} is not a safe package-relative path")]
@@ -147,7 +163,7 @@ impl SkillCatalog {
         )
     }
 
-    fn load_from_roots(
+    pub(crate) fn load_from_roots(
         user_root: Option<&Path>,
         workspace_root: Option<&Path>,
     ) -> Result<Self, SkillCatalogError> {
@@ -267,6 +283,10 @@ impl SkillCatalog {
                     .get(skill.stable_id())
                     .is_none_or(|entry| entry.enabled),
                 available: true,
+                availability_explanation: AVAILABILITY_EXPLANATION.to_owned(),
+                availability_reason: None,
+                prunable: false,
+                prune_restriction: Some(AVAILABLE_PRUNE_RESTRICTION.to_owned()),
             })
             .collect::<Vec<_>>();
         rows.extend(
@@ -277,8 +297,12 @@ impl SkillCatalog {
                     id: entry.skill_id.clone(),
                     name: entry.last_name.clone(),
                     description: entry.last_description.clone(),
-                    enabled: entry.enabled,
+                    enabled: false,
                     available: false,
+                    availability_explanation: AVAILABILITY_EXPLANATION.to_owned(),
+                    availability_reason: Some(UNAVAILABLE_REASON.to_owned()),
+                    prunable: true,
+                    prune_restriction: None,
                 }),
         );
         rows.sort_unstable_by(|left, right| {
@@ -424,10 +448,16 @@ fn discover_root(
     if !root.exists() {
         return Ok(());
     }
-    let entries = fs::read_dir(root).map_err(|source| SkillCatalogError::ReadDirectory {
-        path: root.display().to_string(),
-        source,
-    })?;
+    let canonical_root =
+        fs::canonicalize(root).map_err(|source| SkillCatalogError::ReadDirectory {
+            path: root.display().to_string(),
+            source,
+        })?;
+    let entries =
+        fs::read_dir(&canonical_root).map_err(|source| SkillCatalogError::ReadDirectory {
+            path: root.display().to_string(),
+            source,
+        })?;
     for entry in entries {
         let entry = entry.map_err(|source| SkillCatalogError::ReadDirectory {
             path: root.display().to_string(),
@@ -437,11 +467,31 @@ fn discover_root(
         if !path.is_dir() {
             continue;
         }
-        let definition = path.join(SKILL_FILE);
+        let package =
+            fs::canonicalize(&path).map_err(|source| SkillCatalogError::ReadDirectory {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if package.parent() != Some(canonical_root.as_path()) {
+            return Err(SkillCatalogError::PackageEscape {
+                path: path.display().to_string(),
+            });
+        }
+        let definition = package.join(SKILL_FILE);
         if !definition.is_file() {
             continue;
         }
-        let skill = read_skill(&definition)?;
+        let canonical_definition =
+            fs::canonicalize(&definition).map_err(|source| SkillCatalogError::ReadDefinition {
+                path: definition.display().to_string(),
+                source,
+            })?;
+        if canonical_definition.parent() != Some(package.as_path()) {
+            return Err(SkillCatalogError::PackageEscape {
+                path: definition.display().to_string(),
+            });
+        }
+        let skill = read_skill(&canonical_definition)?;
         skills.insert(skill.name.clone(), skill);
     }
     Ok(())
@@ -1324,6 +1374,47 @@ mod tests {
         assert!(matches!(
             unreadable,
             SkillCatalogError::ReadComponent { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_and_entrypoint_symlinks_cannot_escape_the_skill_root() {
+        let root = tempdir().expect("skill root");
+        let outside = tempdir().expect("outside root");
+        write_skill(
+            outside.path(),
+            "escaped-package",
+            "outside package",
+            "Outside.",
+        );
+        std::os::unix::fs::symlink(
+            outside.path().join("escaped-package"),
+            root.path().join("escaped-package"),
+        )
+        .unwrap();
+
+        let package_error = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap_err();
+        assert!(matches!(
+            package_error,
+            SkillCatalogError::PackageEscape { .. }
+        ));
+
+        fs::remove_file(root.path().join("escaped-package")).unwrap();
+        let local = root.path().join("escaped-entrypoint");
+        fs::create_dir_all(&local).unwrap();
+        fs::write(
+            outside.path().join(SKILL_FILE),
+            "---\nname: escaped-entrypoint\n---\nOutside.\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path().join(SKILL_FILE), local.join(SKILL_FILE))
+            .unwrap();
+
+        let entrypoint_error = SkillCatalog::load_from_roots(Some(root.path()), None).unwrap_err();
+        assert!(matches!(
+            entrypoint_error,
+            SkillCatalogError::PackageEscape { .. }
         ));
     }
 
