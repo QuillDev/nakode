@@ -77,6 +77,7 @@ service NakodeService {
   rpc RemoveProviderAccount(RemoveProviderAccountRequest) returns (MutationResult);
   rpc ListSkills(ListSkillsRequest) returns (SkillCatalogue);
   rpc SetSkillEnabled(SetSkillEnabledRequest) returns (MutationResult);
+  rpc PruneSkill(PruneSkillRequest) returns (MutationResult);
   rpc BeginProviderAuthentication(BeginProviderAuthenticationRequest) returns (MutationResult);
   rpc SetProviderCredential(SetProviderCredentialRequest) returns (MutationResult);
   rpc ClearProviderCredential(ClearProviderCredentialRequest) returns (MutationResult);
@@ -653,6 +654,12 @@ message SetSkillEnabledRequest {
   string skill_id = 4;
   bool enabled = 5;
 }
+message PruneSkillRequest {
+  MutationOptions mutation = 1;
+  string workspace_id = 2;
+  string profile_id = 3;
+  string skill_id = 4;
+}
 message SkillCatalogue { repeated Skill skills = 1; }
 message BeginProviderAuthenticationRequest { MutationOptions mutation = 1; string provider_id = 2; }
 message SetProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; string kind = 3; string credential = 4; }
@@ -900,6 +907,10 @@ message Skill {
   string id = 3;
   bool enabled = 4;
   bool available = 5;
+  optional string availability_reason = 6;
+  bool prunable = 7;
+  optional string prune_restriction = 8;
+  string availability_explanation = 9;
 }
 
 message WebSettings { string backend = 1; bool credential_configured = 2; AgentBrowser agent_browser = 3; }

@@ -1309,6 +1309,7 @@ impl NakodeClient {
         api::SetProviderModelFilterRequest
     );
     typed_mutation!(set_skill_enabled, api::SetSkillEnabledRequest);
+    typed_mutation!(prune_skill, api::PruneSkillRequest);
     typed_mutation!(set_provider_enabled, api::SetProviderEnabledRequest);
     typed_mutation!(
         begin_provider_authentication,

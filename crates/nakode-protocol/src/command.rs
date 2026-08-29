@@ -462,6 +462,12 @@ pub enum Command {
         skill_id: String,
         enabled: bool,
     },
+    /// Removes one retained unavailable skill identity and its local invocation telemetry.
+    PruneSkill {
+        workspace_id: WorkspaceId,
+        profile_id: String,
+        skill_id: String,
+    },
     SetProviderModelFilter {
         provider_id: ProviderId,
         enabled: bool,

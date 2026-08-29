@@ -389,6 +389,29 @@ pub trait SessionRepository: Send + Sync {
         Ok(())
     }
 
+    /// Upserts a set of profile skill choices as one durable reconciliation where supported.
+    ///
+    /// # Errors
+    /// Returns an error when any preference cannot be updated.
+    fn set_skill_preferences(&self, preferences: &[SkillPreference]) -> Result<(), SessionError> {
+        for preference in preferences {
+            self.set_skill_preference(preference)?;
+        }
+        Ok(())
+    }
+
+    /// Removes one retained unavailable skill identity across all profiles together with only its
+    /// skill-kind invocation events and aggregate. Durable implementations perform one transaction.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
+    fn prune_unavailable_skill(
+        &self,
+        _skill_id: &str,
+    ) -> Result<crate::skill::SkillPruneReport, SessionError> {
+        Ok(crate::skill::SkillPruneReport::default())
+    }
+
     /// Returns the durable profile governing one logical session, when profile-managed.
     ///
     /// # Errors
@@ -565,6 +588,50 @@ pub trait SessionRepository: Send + Sync {
         )?;
         self.set_session_account(id, account_id)?;
         record.account_id = account_id.map(str::to_owned);
+        Ok(record)
+    }
+
+    /// Creates a session with credential affinity, optional governing skill profile, and optional
+    /// Code Mode state as one repository operation. Transactional implementations must override
+    /// this default so no partially managed row becomes visible.
+    ///
+    /// # Errors
+    /// Returns an error when the account, session, profile association, or Code Mode state cannot
+    /// be persisted.
+    #[allow(clippy::too_many_arguments)]
+    fn create_with_account_id_and_skill_profile(
+        &self,
+        id: &str,
+        provider: &str,
+        account_id: Option<&str>,
+        provider_session_id: &str,
+        workspace: &str,
+        working_directory: &str,
+        title: &str,
+        model: Option<&str>,
+        options: &ModelOptions,
+        enabled_skill_ids: Option<&[String]>,
+        profile_id: Option<&str>,
+        code_mode: Option<bool>,
+    ) -> Result<SessionRecord, SessionError> {
+        let record = self.create_with_account_id(
+            id,
+            provider,
+            account_id,
+            provider_session_id,
+            workspace,
+            working_directory,
+            title,
+            model,
+            options,
+            enabled_skill_ids,
+        )?;
+        if let Some(profile_id) = profile_id {
+            self.bind_session_skill_profile(&record.id, profile_id)?;
+        }
+        if let Some(code_mode) = code_mode {
+            self.set_session_code_mode(&record.id, code_mode)?;
+        }
         Ok(record)
     }
 
@@ -2294,6 +2361,31 @@ fn save_subagent_transaction(
     Ok(())
 }
 
+fn bind_session_skill_profile_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    profile_id: &str,
+) -> Result<(), SessionError> {
+    transaction.execute(
+        "INSERT INTO session_skill_profiles (session_id, profile_id) VALUES (?1, ?2)
+         ON CONFLICT(session_id) DO UPDATE SET profile_id = excluded.profile_id
+         WHERE session_skill_profiles.profile_id = excluded.profile_id",
+        params![session_id, profile_id],
+    )?;
+    let persisted = transaction.query_row(
+        "SELECT profile_id FROM session_skill_profiles WHERE session_id = ?1",
+        [session_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    if persisted != profile_id {
+        return Err(SessionError::InvalidStoredValue {
+            field: "session_skill_profiles.profile_id",
+            value: persisted,
+        });
+    }
+    Ok(())
+}
+
 impl SessionRepository for SqliteSessionRepository {
     fn session_skill_profile(&self, session_id: &str) -> Result<Option<String>, SessionError> {
         let connection = self
@@ -2401,6 +2493,58 @@ impl SessionRepository for SqliteSessionRepository {
             ],
         )?;
         Ok(())
+    }
+
+    fn set_skill_preferences(&self, preferences: &[SkillPreference]) -> Result<(), SessionError> {
+        let mut connection = self.connection.lock().expect("session database lock");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for preference in preferences {
+            transaction.execute(
+                "INSERT INTO skill_preferences
+                   (profile_id, skill_id, last_name, last_description, enabled, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
+                 ON CONFLICT(profile_id, skill_id) DO UPDATE SET
+                   last_name = excluded.last_name,
+                   last_description = excluded.last_description,
+                   enabled = excluded.enabled,
+                   updated_at = excluded.updated_at",
+                params![
+                    preference.profile_id,
+                    preference.skill_id,
+                    preference.last_name,
+                    preference.last_description,
+                    i64::from(preference.enabled),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn prune_unavailable_skill(
+        &self,
+        skill_id: &str,
+    ) -> Result<crate::skill::SkillPruneReport, SessionError> {
+        let mut connection = self.connection.lock().expect("session database lock");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let preference_count = transaction.execute(
+            "DELETE FROM skill_preferences WHERE skill_id = ?1",
+            [skill_id],
+        )?;
+        let event_count = transaction.execute(
+            "DELETE FROM invocation_events WHERE kind = 'skill' AND identity = ?1",
+            [skill_id],
+        )?;
+        let aggregate_count = transaction.execute(
+            "DELETE FROM invocation_aggregates WHERE kind = 'skill' AND identity = ?1",
+            [skill_id],
+        )?;
+        transaction.commit()?;
+        Ok(crate::skill::SkillPruneReport {
+            preference_count,
+            event_count,
+            aggregate_count,
+        })
     }
 
     fn list_session_bridges(
@@ -2720,6 +2864,38 @@ impl SessionRepository for SqliteSessionRepository {
         options: &ModelOptions,
         enabled_skill_ids: Option<&[String]>,
     ) -> Result<SessionRecord, SessionError> {
+        self.create_with_account_id_and_skill_profile(
+            id,
+            provider,
+            account_id,
+            provider_session_id,
+            workspace,
+            working_directory,
+            title,
+            model,
+            options,
+            enabled_skill_ids,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_with_account_id_and_skill_profile(
+        &self,
+        id: &str,
+        provider: &str,
+        account_id: Option<&str>,
+        provider_session_id: &str,
+        workspace: &str,
+        working_directory: &str,
+        title: &str,
+        model: Option<&str>,
+        options: &ModelOptions,
+        enabled_skill_ids: Option<&[String]>,
+        profile_id: Option<&str>,
+        code_mode: Option<bool>,
+    ) -> Result<SessionRecord, SessionError> {
         let now = unix_timestamp();
         let title = title.lines().next().unwrap_or("New session").trim();
         let title = if title.is_empty() {
@@ -2757,10 +2933,12 @@ impl SessionRepository for SqliteSessionRepository {
             "INSERT INTO sessions
              (id, provider, account_id, provider_session_id, workspace, working_directory,
               title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at,
-              last_owner_activity_at, enabled_skill_ids_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11, ?12)
+              last_owner_activity_at, enabled_skill_ids_json, code_mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11, ?12,
+                     COALESCE(?13, 0))
              ON CONFLICT(provider, provider_session_id) DO UPDATE SET
                account_id = COALESCE(sessions.account_id, excluded.account_id),
+               code_mode = COALESCE(?13, sessions.code_mode),
                model = excluded.model,
                model_reasoning_effort = excluded.model_reasoning_effort,
                model_fast_mode = excluded.model_fast_mode,
@@ -2788,6 +2966,7 @@ impl SessionRepository for SqliteSessionRepository {
                 i64::from(options.fast_mode),
                 now,
                 enabled_skill_ids_json,
+                code_mode.map(i64::from),
             ],
         )?;
         let record = transaction.query_row(
@@ -2804,9 +2983,12 @@ impl SessionRepository for SqliteSessionRepository {
             && requested != persisted
         {
             return Err(SessionError::ProviderAccountAffinityConflict {
-                session_id: record.id,
+                session_id: record.id.clone(),
                 account_id: persisted.to_owned(),
             });
+        }
+        if let Some(profile_id) = profile_id {
+            bind_session_skill_profile_in_transaction(&transaction, &record.id, profile_id)?;
         }
         transaction.commit()?;
         Ok(record)
@@ -4612,6 +4794,96 @@ mod tests {
         assert_eq!(timeline.buckets.len(), 4);
         assert_eq!(timeline.buckets[1].archetype_count, 1);
         assert_eq!(timeline.buckets[2].skill_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_skill_prune_removes_all_retained_records_and_only_matching_skill_telemetry()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        store.set_skill_preferences(&[
+            SkillPreference {
+                profile_id: "profile-a".to_owned(),
+                skill_id: "removed.review".to_owned(),
+                last_name: "review".to_owned(),
+                last_description: "Review".to_owned(),
+                enabled: false,
+            },
+            SkillPreference {
+                profile_id: "profile-b".to_owned(),
+                skill_id: "removed.review".to_owned(),
+                last_name: "review".to_owned(),
+                last_description: "Review".to_owned(),
+                enabled: false,
+            },
+            SkillPreference {
+                profile_id: "profile-a".to_owned(),
+                skill_id: "retained.testing".to_owned(),
+                last_name: "testing".to_owned(),
+                last_description: "Testing".to_owned(),
+                enabled: false,
+            },
+        ])?;
+        store.save_invocation_telemetry_enabled(true)?;
+        for (key, kind, identity) in [
+            (
+                "target-skill",
+                nakode_protocol::InvocationKind::Skill,
+                "removed.review",
+            ),
+            (
+                "other-skill",
+                nakode_protocol::InvocationKind::Skill,
+                "retained.testing",
+            ),
+            (
+                "same-identity-archetype",
+                nakode_protocol::InvocationKind::Archetype,
+                "removed.review",
+            ),
+        ] {
+            assert!(store.record_invocation(&InvocationRecord {
+                invocation_key: key.to_owned(),
+                kind,
+                identity: identity.to_owned(),
+                display_label: identity.to_owned(),
+                occurred_at_ms: 1_000,
+            })?);
+        }
+
+        let report = store.prune_unavailable_skill("removed.review")?;
+        assert_eq!(report.preference_count, 2);
+        assert_eq!(report.event_count, 1);
+        assert_eq!(report.aggregate_count, 1);
+        assert!(
+            store
+                .list_all_skill_preferences()?
+                .iter()
+                .all(|preference| preference.skill_id != "removed.review")
+        );
+        assert_eq!(
+            store
+                .list_all_skill_preferences()?
+                .iter()
+                .map(|preference| preference.skill_id.as_str())
+                .collect::<Vec<_>>(),
+            ["retained.testing"]
+        );
+        let summary = store.invocation_summary()?;
+        assert_eq!(summary.items.len(), 2);
+        assert!(summary.items.iter().any(|item| {
+            item.kind == nakode_protocol::InvocationKind::Skill
+                && item.identity == "retained.testing"
+        }));
+        assert!(summary.items.iter().any(|item| {
+            item.kind == nakode_protocol::InvocationKind::Archetype
+                && item.identity == "removed.review"
+        }));
+        assert_eq!(
+            store.prune_unavailable_skill("removed.review")?,
+            crate::skill::SkillPruneReport::default()
+        );
         Ok(())
     }
 
@@ -6562,6 +6834,67 @@ mod tests {
             repository.remove_provider_account(provider, &first.account_id),
             Err(SessionError::ProviderAccountInUse { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn account_profile_and_code_mode_creation_is_atomic() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repository = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let provider = crate::backend::CODEX_PROVIDER;
+        let account = repository.add_provider_account(provider, "Primary")?;
+        let options = ModelOptions::default();
+        let created = repository.create_with_account_id_and_skill_profile(
+            "logical-session",
+            provider,
+            Some(&account.account_id),
+            "native-session",
+            "/workspace",
+            "/workspace",
+            "Pinned",
+            Some("model"),
+            &options,
+            None,
+            Some("profile-a"),
+            Some(true),
+        )?;
+        assert_eq!(
+            created.account_id.as_deref(),
+            Some(account.account_id.as_str())
+        );
+        assert!(created.code_mode);
+        assert_eq!(
+            repository.session_skill_profile(&created.id)?.as_deref(),
+            Some("profile-a")
+        );
+
+        let error = repository
+            .create_with_account_id_and_skill_profile(
+                "duplicate-request",
+                provider,
+                Some(&account.account_id),
+                "native-session",
+                "/workspace",
+                "/workspace",
+                "Changed",
+                Some("other-model"),
+                &options,
+                None,
+                Some("profile-b"),
+                Some(false),
+            )
+            .expect_err("a conflicting profile must roll back the whole creation transaction");
+        assert!(matches!(error, SessionError::InvalidStoredValue { .. }));
+        let restored = repository
+            .find("logical-session")?
+            .expect("persisted session");
+        assert_eq!(restored.title, "Pinned");
+        assert_eq!(restored.model.as_deref(), Some("model"));
+        assert!(restored.code_mode);
+        assert_eq!(
+            repository.session_skill_profile(&restored.id)?.as_deref(),
+            Some("profile-a")
+        );
         Ok(())
     }
 
