@@ -411,8 +411,12 @@ impl NativeServerRuntime {
         skill_preferences: HashMap<String, Vec<crate::skill::SkillPreference>>,
     ) -> (Self, NativeServerHandle) {
         let capabilities = native_service_capabilities();
-        let (endpoint, requests) =
-            ServerEndpoint::channel(env!("CARGO_PKG_VERSION"), capabilities, 256);
+        let (endpoint, requests) = ServerEndpoint::channel_with_build_revision(
+            env!("CARGO_PKG_VERSION"),
+            crate::BUILD_REVISION.map(str::to_owned),
+            capabilities,
+            256,
+        );
         let (shutdown_tx, shutdown) = mpsc::channel(1);
         let (quiesce_tx, quiesce) = mpsc::channel(1);
         let (native_cancellation_tx, native_cancellations) = mpsc::channel(128);

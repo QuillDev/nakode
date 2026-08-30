@@ -78,6 +78,7 @@ struct Inner {
     epoch: ServerEpoch,
     capabilities: ServiceCapabilities,
     server_version: String,
+    build_revision: Option<String>,
     requests: mpsc::Sender<ServerRequest>,
     publications: broadcast::Sender<PublishedEvent>,
     sequence: AtomicU64,
@@ -161,6 +162,16 @@ impl ServerEndpoint {
         capabilities: ServiceCapabilities,
         request_capacity: usize,
     ) -> (Self, ServerRequests) {
+        Self::channel_with_build_revision(server_version, None, capabilities, request_capacity)
+    }
+
+    #[must_use]
+    pub fn channel_with_build_revision(
+        server_version: impl Into<String>,
+        build_revision: Option<String>,
+        capabilities: ServiceCapabilities,
+        request_capacity: usize,
+    ) -> (Self, ServerRequests) {
         let (requests, receiver) = mpsc::channel(request_capacity.max(1));
         let (publications, _) = broadcast::channel(DEFAULT_PUBLICATION_CAPACITY);
         (
@@ -169,6 +180,7 @@ impl ServerEndpoint {
                     epoch: ServerEpoch::from(uuid::Uuid::now_v7().to_string()),
                     capabilities,
                     server_version: server_version.into(),
+                    build_revision,
                     requests,
                     publications,
                     sequence: AtomicU64::new(0),
@@ -193,6 +205,11 @@ impl ServerEndpoint {
     #[must_use]
     pub fn server_version(&self) -> &str {
         &self.inner.server_version
+    }
+
+    #[must_use]
+    pub fn build_revision(&self) -> Option<&str> {
+        self.inner.build_revision.as_deref()
     }
 
     /// Executes one semantic mutation through the authoritative request loop.

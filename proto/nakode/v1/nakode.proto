@@ -260,6 +260,9 @@ message ServerInfo {
   repeated string capabilities = 3;
   // Stable identity of this Nakode installation, used to detect endpoint replacement.
   string server_id = 4;
+  // Immutable source revision embedded in the executable serving this response.
+  // Absent for older servers and builds without authoritative source provenance.
+  optional string build_revision = 5;
 }
 
 message GetWorkspaceRequest { string workspace = 1; optional string session_id = 2; }

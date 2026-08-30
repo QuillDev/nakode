@@ -186,6 +186,14 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
     );
 
     let old_client = NakodeClient::connect_unix(&api_socket).await?;
+    old_client
+        .set_provider_credential(api::SetProviderCredentialRequest {
+            mutation: None,
+            provider_id: "openai-codex".to_owned(),
+            kind: "api_key".to_owned(),
+            credential: "activation-lifecycle-fixture".to_owned(),
+        })
+        .await?;
     if let Err(error) = wait_for(WAIT_LIMIT, || async {
         old_client
             .get_workspace(installation.workspace.to_string_lossy(), None)
@@ -235,13 +243,39 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
             None,
         )
         .await?;
-    wait_for(WAIT_LIMIT, || async {
+    if let Err(error) = wait_for(WAIT_LIMIT, || async {
         old_client
             .get_session(&idle_session)
             .await
             .is_ok_and(|state| state.active_turn.is_some())
     })
-    .await?;
+    .await
+    {
+        match old_client.get_session(&idle_session).await {
+            Ok(state) => {
+                eprintln!(
+                    "activation lifecycle idle session after active-turn timeout: {state:#?}"
+                );
+            }
+            Err(state_error) => eprintln!(
+                "activation lifecycle idle session query after timeout failed: {state_error:#}"
+            ),
+        }
+        match old_client.get_session(&active_session).await {
+            Ok(state) => {
+                eprintln!(
+                    "activation lifecycle active session after idle active-turn timeout: {state:#?}"
+                );
+            }
+            Err(state_error) => eprintln!(
+                "activation lifecycle active session query after idle timeout failed: {state_error:#}"
+            ),
+        }
+        if let Some(runtime_directory) = api_socket.parent() {
+            dump_activation_diagnostics(runtime_directory);
+        }
+        return Err(error);
+    }
     wait_for(WAIT_LIMIT, || async {
         old_client
             .get_session(&idle_session)

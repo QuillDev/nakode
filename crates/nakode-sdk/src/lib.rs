@@ -2690,8 +2690,12 @@ mod tests {
         captured: Arc<Mutex<Option<CapturedAttachment>>>,
     ) -> TestUnixServer {
         let listener = UnixListener::bind(path).expect("bind fake Nakode API");
-        let (endpoint, requests) =
-            ServerEndpoint::channel("sdk-test", protocol::ServiceCapabilities::default(), 8);
+        let (endpoint, requests) = ServerEndpoint::channel_with_build_revision(
+            "sdk-test",
+            Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            protocol::ServiceCapabilities::default(),
+            8,
+        );
         let actor = tokio::spawn(run_session_actor(
             endpoint.clone(),
             requests,
@@ -2820,6 +2824,31 @@ mod tests {
             phase: phase as i32,
             ..api::ActivationStatus::default()
         }
+    }
+
+    #[tokio::test]
+    async fn server_info_preserves_the_live_build_revision() {
+        let directory = tempfile::tempdir().expect("SDK transport directory");
+        let socket = directory.path().join("nakode.sock");
+        let server = spawn_session_server(
+            &socket,
+            SessionServerMode::ReattachSame,
+            Arc::new(Mutex::new(None)),
+        );
+        let client = NakodeClient::connect_unix(&socket)
+            .await
+            .expect("connect fake Nakode API");
+
+        let info = client
+            .get_server_info()
+            .await
+            .expect("server info must cross the SDK transport");
+        assert_eq!(
+            info.build_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+
+        server.stop().await;
     }
 
     #[tokio::test]
