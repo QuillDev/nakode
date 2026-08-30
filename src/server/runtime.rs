@@ -970,19 +970,25 @@ impl NativeServerRuntime {
         self.effects
             .persistence
             .sessions
-            .prune_unavailable_skill(skill_id)
+            .prune_unavailable_skill(profile_id, skill_id)
             .map_err(|error| ServiceError {
                 code: ErrorCode::Internal,
                 message: error.to_string(),
                 retryable: true,
             })?;
-        for preferences in self.skill_preferences.values_mut() {
-            preferences.retain(|preference| preference.skill_id != skill_id);
+        let remove_profile =
+            self.skill_preferences
+                .get_mut(profile_id)
+                .is_some_and(|preferences| {
+                    preferences.retain(|preference| preference.skill_id != skill_id);
+                    preferences.is_empty()
+                });
+        if remove_profile {
+            self.skill_preferences.remove(profile_id);
         }
-        self.skill_preferences
-            .retain(|_, preferences| !preferences.is_empty());
+        let effective = self.effective_skill_catalogue(profile_id);
         self.core
-            .install_skill_authority(&self.skill_catalogue, &self.skill_preferences);
+            .install_profile_skill_catalogue(profile_id, &effective);
         Ok(())
     }
 
@@ -6806,7 +6812,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn unavailable_skills_are_disabled_guarded_and_pruned_from_all_local_state() {
+    async fn unavailable_skill_reads_and_pruning_are_profile_scoped() {
         let workspace = tempfile::tempdir().expect("workspace");
         let installed = workspace.path().join(".agents/skills/installed-review");
         std::fs::create_dir_all(&installed).expect("installed skill directory");
@@ -6833,6 +6839,13 @@ mod tests {
             last_description: "Removed audit".to_owned(),
             ..retained.clone()
         };
+        let retained_b_only = SkillPreference {
+            profile_id: "profile-b".to_owned(),
+            skill_id: "removed.profile-b-only".to_owned(),
+            last_name: "profile-b-only".to_owned(),
+            last_description: "Profile B only".to_owned(),
+            enabled: false,
+        };
         sessions
             .set_skill_preferences(&[
                 retained.clone(),
@@ -6842,6 +6855,7 @@ mod tests {
                     enabled: false,
                     ..retained.clone()
                 },
+                retained_b_only.clone(),
             ])
             .expect("retained preferences");
         sessions
@@ -6872,11 +6886,14 @@ mod tests {
             ),
             (
                 "profile-b".to_owned(),
-                vec![SkillPreference {
-                    profile_id: "profile-b".to_owned(),
-                    enabled: false,
-                    ..retained
-                }],
+                vec![
+                    SkillPreference {
+                        profile_id: "profile-b".to_owned(),
+                        enabled: false,
+                        ..retained
+                    },
+                    retained_b_only,
+                ],
             ),
         ]);
         let (runtime, handle) = NativeServerRuntime::from_parts_with_skill_authority(
@@ -6915,6 +6932,13 @@ mod tests {
         assert!(!unavailable.enabled);
         assert!(unavailable.prunable);
         assert!(unavailable.availability_reason.is_some());
+        assert!(
+            before
+                .skills
+                .iter()
+                .all(|skill| skill.id != "removed.profile-b-only"),
+            "one profile's unavailable catalogue must not expose another profile's retained rows"
+        );
         assert!(
             !sessions
                 .list_skill_preferences("profile-a")
@@ -7198,7 +7222,7 @@ mod tests {
             .execute_query(
                 ClientId::from("skill-prune-test"),
                 Query::ListSkills {
-                    workspace_id,
+                    workspace_id: workspace_id.clone(),
                     profile_id: "profile-a".to_owned(),
                     refresh: false,
                 },
@@ -7217,10 +7241,45 @@ mod tests {
         );
         assert!(
             sessions
-                .list_all_skill_preferences()
-                .expect("all preferences")
+                .list_skill_preferences("profile-a")
+                .expect("profile A preferences")
                 .iter()
                 .all(|preference| preference.skill_id != "removed.review")
+        );
+        assert!(
+            sessions
+                .list_skill_preferences("profile-b")
+                .expect("profile B preferences")
+                .iter()
+                .any(|preference| preference.skill_id == "removed.review"),
+            "pruning profile A must preserve profile B's association with the same skill"
+        );
+        let QueryResult::Skills(profile_b) = endpoint
+            .execute_query(
+                ClientId::from("skill-prune-test"),
+                Query::ListSkills {
+                    workspace_id,
+                    profile_id: "profile-b".to_owned(),
+                    refresh: false,
+                },
+            )
+            .await
+            .expect("profile B replacement skill catalogue")
+            .value
+        else {
+            panic!("skill catalogue result");
+        };
+        assert!(
+            profile_b
+                .skills
+                .iter()
+                .any(|skill| skill.id == "removed.review" && !skill.available)
+        );
+        assert!(
+            profile_b
+                .skills
+                .iter()
+                .any(|skill| skill.id == "removed.profile-b-only" && !skill.available)
         );
         assert!(
             sessions
@@ -7228,10 +7287,11 @@ mod tests {
                 .expect("invocation summary")
                 .items
                 .iter()
-                .all(|item| {
-                    item.kind != nakode_protocol::InvocationKind::Skill
-                        || item.identity != "removed.review"
-                })
+                .any(|item| {
+                    item.kind == nakode_protocol::InvocationKind::Skill
+                        && item.identity == "removed.review"
+                }),
+            "profile-local pruning must preserve installation-wide telemetry"
         );
 
         handle.shutdown().await;
