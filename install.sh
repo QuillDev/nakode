@@ -214,10 +214,53 @@ fi
 
 cd "$script_directory"
 normalize_managed_source_remote
-if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-  CARGO_TARGET_DIR="$script_directory/target"
-  export CARGO_TARGET_DIR
+# A source revision is trustworthy only when an immutable snapshot of this exact clean checkout is
+# what Cargo builds. The installer writes that provenance into the private snapshot; direct and
+# dirty builds retain the repository's empty provenance input.
+build_source_directory="$script_directory"
+temporary_build_directory=''
+cleanup_build_directory() {
+  if [ -n "$temporary_build_directory" ]; then
+    rm -rf "$temporary_build_directory"
+    temporary_build_directory=''
+  fi
+}
+trap cleanup_build_directory 0
+trap 'cleanup_build_directory; exit 1' 1 2 15
+temporary_build_directory="$(mktemp -d "${TMPDIR:-/tmp}/nakode-build.XXXXXX")"
+if [ -s "$script_directory/src/build_revision.txt" ]; then
+  printf '%s\n' \
+    'Cannot install Nakode because src/build_revision.txt is reserved installer provenance and must be empty.' \
+    >&2
+  exit 1
 fi
+if source_status="$(git status --porcelain=v1 --untracked-files=normal 2>/dev/null)" \
+  && [ -z "$source_status" ]; then
+  source_revision="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+  case "$source_revision" in
+    '' | *[!0-9a-f]*) ;;
+    *)
+      if [ "${#source_revision}" -eq 40 ] || [ "${#source_revision}" -eq 64 ]; then
+        mkdir "$temporary_build_directory/source"
+        git archive \
+          --format=tar \
+          --output="$temporary_build_directory/source.tar" \
+          "$source_revision"
+        tar -xf "$temporary_build_directory/source.tar" \
+          -C "$temporary_build_directory/source"
+        rm "$temporary_build_directory/source.tar"
+        printf '%s' "$source_revision" \
+          > "$temporary_build_directory/source/src/build_revision.txt"
+        build_source_directory="$temporary_build_directory/source"
+      fi
+      ;;
+  esac
+fi
+# Every invocation owns its output path, so a concurrent Cargo build cannot replace the artifact
+# between successful compilation, validation, and installation.
+CARGO_TARGET_DIR="$temporary_build_directory/target"
+export CARGO_TARGET_DIR
+cd "$build_source_directory"
 
 if [ "$debug_build" = true ]; then
   printf '%s\n' 'Building Nakode in development mode...'
@@ -241,7 +284,7 @@ if [ ! -x "$built_binary" ]; then
 fi
 built_version="$("$built_binary" --version)"
 
-install_without_privileges() {
+install_without_privileges() (
   target_directory=$1
   target_path=$2
   source_path=$3
@@ -260,7 +303,7 @@ install_without_privileges() {
   mv -f "$temporary_path" "$target_path"
   temporary_path=
   trap - 0 1 2 15
-}
+)
 
 if { [ -d "$bin_directory" ] && [ -w "$bin_directory" ]; } \
   || { [ ! -e "$bin_directory" ] && mkdir -p "$bin_directory" 2>/dev/null; }; then

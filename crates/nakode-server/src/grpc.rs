@@ -1642,6 +1642,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .map(|value| format!("{value:?}"))
                 .collect(),
             server_id: self.server_id.clone(),
+            build_revision: self.endpoint.build_revision().map(str::to_owned),
         }))
     }
 }
@@ -2952,6 +2953,30 @@ mod tests {
             .metadata_mut()
             .insert("authorization", "Bearer nk_correct".parse().unwrap());
         assert!(interceptor.call(correct).is_ok());
+    }
+
+    #[tokio::test]
+    async fn server_info_reports_the_serving_endpoints_embedded_revision() {
+        let (endpoint, _requests) = ServerEndpoint::channel_with_build_revision(
+            "test",
+            Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            protocol::ServiceCapabilities::default(),
+            1,
+        );
+        let service = GrpcService::new(endpoint).with_server_id("server-test");
+        let response = api::nakode_service_server::NakodeService::get_server_info(
+            &service,
+            tonic::Request::new(()),
+        )
+        .await
+        .expect("server info must succeed")
+        .into_inner();
+
+        assert_eq!(response.server_id, "server-test");
+        assert_eq!(
+            response.build_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
     }
 
     #[test]
