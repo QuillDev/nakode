@@ -80,11 +80,13 @@ a stable prompt ID, full semantic text, and attachment metadata. Clients must
 preserve that order and identity, including repeated prompts with identical
 text; text is never an identity or deduplication key.
 
-Queue controls cross the public boundary as one mutation, with the current
-expected session revision and an idempotency key:
+`RemoveQueuedPrompt(session_id, prompt_id)` is owner-authoritative exact-ID intent. It ignores an
+observed revision fence, removes only that stable identity from current server state, and treats an
+identity already removed or activated as success. `SteerQueuedPrompt` remains revision-fenced because
+it coordinates with one active turn and reserves queue state:
 
 - `RemoveQueuedPrompt(session_id, prompt_id)` independently cancels one waiting
-  follow-up.
+  follow-up without allowing concurrent reordering or duplicate text to retarget it.
 - `SteerQueuedPrompt(session_id, prompt_id)` atomically redirects active work to
   one waiting follow-up. It is available only when the server advertises
   `QueuedPromptSteering`; clients also require either steering or interruption
@@ -105,11 +107,11 @@ it at its original queue position. Ordinary Stop keeps queue order and starts th
 first follow-up after the interrupted turn.
 
 A frontend may optimistically overlay only operation status, keyed by prompt
-ID. Authoritative IDs, text, and order always come from the latest replacement
-snapshot. Pending controls suppress duplicate clicks; rejection may leave a
-retryable error overlay. A snapshot that no longer contains the ID confirms
-success and removes its overlay. This rule prevents loss and duplication across
-reconnects without creating a client-owned queue.
+ID. Removal becomes pending immediately and suppresses duplicate clicks until an authoritative
+replacement arrives. Rejection leaves a focused retryable error overlay while retaining the row. A
+snapshot that no longer contains the exact ID confirms success and removes its overlay; queue order
+and text never participate in reconciliation. This prevents loss and duplication across reconnects
+without creating a client-owned queue.
 
 For the FStack desktop client, `electron/nakode-protobuf.ts` decodes this
 projection, `electron/nakode.ts` owns the typed RPC envelope and capability

@@ -509,18 +509,44 @@ pub(super) fn queue_views(state: &DomainState) -> Vec<QueueItemView> {
         .pending_redirect
         .as_ref()
         .map(|pending| pending.prompt_id.as_str());
-    state
+    let view = |prompt: &super::QueuedPrompt, redirecting: bool| QueueItemView {
+        id: PromptId::from(prompt.id.clone()),
+        summary: first_line(&prompt.text),
+        text: prompt.text.clone(),
+        attachment_count: u32::try_from(prompt.attachments.len()).unwrap_or(u32::MAX),
+        redirecting,
+    };
+    let mut queue = state
         .queue
         .iter()
-        .map(|prompt| QueueItemView {
-            id: PromptId::from(prompt.id.clone()),
-            summary: first_line(&prompt.text),
-            text: prompt.text.clone(),
-            attachment_count: u32::try_from(prompt.attachments.len()).unwrap_or(u32::MAX),
-            redirecting: native_steer == Some(prompt.id.as_str())
-                || fallback == Some(prompt.id.as_str()),
+        .map(|prompt| {
+            view(
+                prompt,
+                native_steer == Some(prompt.id.as_str()) || fallback == Some(prompt.id.as_str()),
+            )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(pending) = &state.redirect_start {
+        let index = pending
+            .successor_ids
+            .iter()
+            .find_map(|successor| queue.iter().position(|item| item.id.as_str() == successor))
+            .or_else(|| {
+                pending
+                    .predecessor_ids
+                    .iter()
+                    .rev()
+                    .find_map(|predecessor| {
+                        queue
+                            .iter()
+                            .position(|item| item.id.as_str() == predecessor)
+                            .map(|position| position + 1)
+                    })
+            })
+            .unwrap_or(0);
+        queue.insert(index, view(&pending.prompt, true));
+    }
+    queue
 }
 
 fn todo_views(state: &DomainState) -> Vec<TodoPhaseView> {
