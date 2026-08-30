@@ -1227,7 +1227,7 @@ const MAX_MODEL_CATALOGUE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODEL_CATALOGUE_ENTRIES: usize = 1_024;
 const MAX_MODEL_ID_CHARS: usize = 256;
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::result_large_err, clippy::too_many_lines)]
 async fn discover_models(
     config: &BackendConfig,
     credential: &CodexCredential,
@@ -1393,6 +1393,7 @@ async fn discover_models(
     }))
 }
 
+#[allow(clippy::result_large_err)]
 async fn read_model_catalogue(
     response: reqwest::Response,
     url: &str,
