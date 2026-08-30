@@ -84,8 +84,6 @@ pub struct ManageableSkill {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SkillPruneReport {
     pub preference_count: usize,
-    pub event_count: usize,
-    pub aggregate_count: usize,
 }
 
 #[derive(Clone, Debug, Default)]

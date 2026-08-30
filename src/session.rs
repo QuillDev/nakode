@@ -400,13 +400,16 @@ pub trait SessionRepository: Send + Sync {
         Ok(())
     }
 
-    /// Removes one retained unavailable skill identity across all profiles together with only its
-    /// skill-kind invocation events and aggregate. Durable implementations perform one transaction.
+    /// Removes one retained unavailable skill preference for one client profile.
+    ///
+    /// Invocation telemetry is installation-wide and has no profile ownership key, so profile-local
+    /// pruning must preserve it.
     ///
     /// # Errors
     /// Returns an error when persistence cannot be updated.
     fn prune_unavailable_skill(
         &self,
+        _profile_id: &str,
         _skill_id: &str,
     ) -> Result<crate::skill::SkillPruneReport, SessionError> {
         Ok(crate::skill::SkillPruneReport::default())
@@ -2523,28 +2526,15 @@ impl SessionRepository for SqliteSessionRepository {
 
     fn prune_unavailable_skill(
         &self,
+        profile_id: &str,
         skill_id: &str,
     ) -> Result<crate::skill::SkillPruneReport, SessionError> {
-        let mut connection = self.connection.lock().expect("session database lock");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let preference_count = transaction.execute(
-            "DELETE FROM skill_preferences WHERE skill_id = ?1",
-            [skill_id],
+        let connection = self.connection.lock().expect("session database lock");
+        let preference_count = connection.execute(
+            "DELETE FROM skill_preferences WHERE profile_id = ?1 AND skill_id = ?2",
+            params![profile_id, skill_id],
         )?;
-        let event_count = transaction.execute(
-            "DELETE FROM invocation_events WHERE kind = 'skill' AND identity = ?1",
-            [skill_id],
-        )?;
-        let aggregate_count = transaction.execute(
-            "DELETE FROM invocation_aggregates WHERE kind = 'skill' AND identity = ?1",
-            [skill_id],
-        )?;
-        transaction.commit()?;
-        Ok(crate::skill::SkillPruneReport {
-            preference_count,
-            event_count,
-            aggregate_count,
-        })
+        Ok(crate::skill::SkillPruneReport { preference_count })
     }
 
     fn list_session_bridges(
@@ -4798,10 +4788,11 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_skill_prune_removes_all_retained_records_and_only_matching_skill_telemetry()
+    fn unavailable_skill_prune_removes_only_profile_association_and_preserves_telemetry()
     -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let database = directory.path().join("sessions.db");
+        let store = SqliteSessionRepository::open(&database)?;
         store.set_skill_preferences(&[
             SkillPreference {
                 profile_id: "profile-a".to_owned(),
@@ -4852,26 +4843,29 @@ mod tests {
             })?);
         }
 
-        let report = store.prune_unavailable_skill("removed.review")?;
-        assert_eq!(report.preference_count, 2);
-        assert_eq!(report.event_count, 1);
-        assert_eq!(report.aggregate_count, 1);
-        assert!(
-            store
-                .list_all_skill_preferences()?
-                .iter()
-                .all(|preference| preference.skill_id != "removed.review")
-        );
+        let report = store.prune_unavailable_skill("profile-a", "removed.review")?;
+        assert_eq!(report.preference_count, 1);
         assert_eq!(
             store
-                .list_all_skill_preferences()?
+                .list_skill_preferences("profile-a")?
                 .iter()
                 .map(|preference| preference.skill_id.as_str())
                 .collect::<Vec<_>>(),
             ["retained.testing"]
         );
+        assert_eq!(
+            store
+                .list_skill_preferences("profile-b")?
+                .iter()
+                .map(|preference| preference.skill_id.as_str())
+                .collect::<Vec<_>>(),
+            ["removed.review"]
+        );
         let summary = store.invocation_summary()?;
-        assert_eq!(summary.items.len(), 2);
+        assert_eq!(summary.items.len(), 3);
+        assert!(summary.items.iter().any(|item| {
+            item.kind == nakode_protocol::InvocationKind::Skill && item.identity == "removed.review"
+        }));
         assert!(summary.items.iter().any(|item| {
             item.kind == nakode_protocol::InvocationKind::Skill
                 && item.identity == "retained.testing"
@@ -4881,8 +4875,19 @@ mod tests {
                 && item.identity == "removed.review"
         }));
         assert_eq!(
-            store.prune_unavailable_skill("removed.review")?,
+            store.prune_unavailable_skill("profile-a", "removed.review")?,
             crate::skill::SkillPruneReport::default()
+        );
+        drop(store);
+        let restarted = SqliteSessionRepository::open(database)?;
+        assert_eq!(
+            restarted
+                .list_skill_preferences("profile-b")?
+                .iter()
+                .map(|preference| preference.skill_id.as_str())
+                .collect::<Vec<_>>(),
+            ["removed.review"],
+            "another profile's association must survive repository restart"
         );
         Ok(())
     }
