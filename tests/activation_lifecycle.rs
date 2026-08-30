@@ -233,6 +233,24 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
         )
         .await?;
     eprintln!("activation lifecycle: logical sessions active={active_session} idle={idle_session}");
+    wait_for(WAIT_LIMIT, || async {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            old_client.get_session(&idle_session),
+        )
+        .await
+        .is_ok_and(|result| {
+            result.is_ok_and(|state| {
+                state.active_agent_session.is_some_and(|agent_session| {
+                    agent_session.provider_id == "openai-codex"
+                        && agent_session.connection.is_some_and(|connection| {
+                            connection.state == api::ConnectionState::Ready as i32
+                        })
+                })
+            })
+        })
+    })
+    .await?;
     old_client
         .send_prompt(
             &idle_session,
