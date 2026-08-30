@@ -22,8 +22,9 @@ use crate::{
     memory::{MemoryBackend, MemoryConfig},
     personality::PromptAddenda,
     session::{
-        ContinuationProposition, SalvagedEvidence, SessionRecord, SubagentObservability,
-        SubagentRecord, SubagentSalvage,
+        ContinuationProposition, PersistedOwnerPrompt, SalvagedEvidence, SessionRecord,
+        SubagentObservability, SubagentRecord, SubagentSalvage, is_pending_provider_session_id,
+        pending_provider_session_id,
     },
     settings::TerminalImageMode,
     skill::SkillCatalog,
@@ -1220,6 +1221,14 @@ pub enum Effect {
         session_id: String,
         turn: crate::session::PersistedTurnConfiguration,
     },
+    PersistAcceptedOwnerPrompt {
+        session_id: String,
+        prompt: PersistedOwnerPrompt,
+    },
+    AcknowledgeOwnerPromptDispatch {
+        session_id: String,
+        prompt_id: String,
+    },
     RecordOwnerActivity(String),
     TouchSession(String),
     SaveWebConfig(WebConfig),
@@ -1294,6 +1303,7 @@ pub struct DomainState {
     pub active_turn: Option<ActiveTurn>,
     pub last_turn: Option<LastTurn>,
     owner_turns: HashMap<String, crate::session::PersistedTurnConfiguration>,
+    owner_prompts: Vec<PersistedOwnerPrompt>,
     pub context_usage: Option<ContextUsageState>,
     pub provider_usage: crate::backend::BackendTokenUsage,
     pub context_compaction: Option<ContextCompactionState>,
@@ -1327,6 +1337,9 @@ pub struct DomainState {
     pending_session_prompt: Option<OutgoingPrompt>,
     starting_turn: Option<OutgoingPrompt>,
     recoverable_prompt: Option<RecoverablePrompt>,
+    /// Durable owner work that could not be reconstructed after resume. It remains a busy fence so
+    /// later queue entries cannot overtake it; only an exact stable-identity retry may clear it.
+    replay_blocked_prompt: Option<QueuedPrompt>,
     pending_steer: Option<PendingSteer>,
     /// A queued follow-up reserved in place and promoted after interruption.
     pending_redirect: Option<PendingRedirect>,
@@ -1334,6 +1347,9 @@ pub struct DomainState {
     redirect_start: Option<RedirectStart>,
     pending_handoff: Option<HandoffPackage>,
     resuming_session: Option<SessionRecord>,
+    /// Server runtimes set this for one resume event when a durable bridge inbox must dispatch
+    /// before ordinary prompts queued while provider restoration was in flight.
+    defer_resume_queue: bool,
     item_turns: HashMap<String, String>,
     reasoning_summaries: ReasoningSummaryTracker,
     subagent_result_items: HashSet<String>,
@@ -2013,6 +2029,7 @@ impl DomainState {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn new_for_backend(
         workspace: impl Into<String>,
         initial_model: Option<String>,
@@ -2056,6 +2073,7 @@ impl DomainState {
             active_turn: None,
             last_turn: None,
             owner_turns: HashMap::new(),
+            owner_prompts: Vec::new(),
             context_usage: None,
             provider_usage: crate::backend::BackendTokenUsage::default(),
             context_compaction: None,
@@ -2092,11 +2110,13 @@ impl DomainState {
             pending_session_prompt: None,
             starting_turn: None,
             recoverable_prompt: None,
+            replay_blocked_prompt: None,
             pending_steer: None,
             pending_redirect: None,
             redirect_start: None,
             pending_handoff: None,
             resuming_session: None,
+            defer_resume_queue: false,
             item_turns: HashMap::new(),
             reasoning_summaries: ReasoningSummaryTracker::default(),
             subagent_result_items: HashSet::new(),
@@ -2947,6 +2967,21 @@ impl DomainState {
         self.status_message = format!("Session error: {}", message.into());
     }
 
+    pub(crate) fn session_primary_transition_failed(&mut self, message: impl Into<String>) {
+        let failed_prompt = self
+            .starting_turn
+            .take()
+            .or_else(|| self.pending_session_prompt.take());
+        self.creating_session = None;
+        self.provider_session_id = None;
+        self.active_turn = None;
+        self.resuming_session = None;
+        self.status_message = format!("Session error: {}", message.into());
+        if let Some(prompt) = failed_prompt {
+            self.restore_failed_prompt(&prompt);
+        }
+    }
+
     #[cfg(test)]
     pub fn install_providers(&mut self, providers: Vec<ProviderRecord>) {
         let picker = self.client.provider_picker.get_or_insert(ProviderPicker {
@@ -3400,6 +3435,7 @@ impl DomainState {
         self.begin_resume(session)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn begin_resume(&mut self, session: SessionRecord) -> Vec<Effect> {
         if self.is_busy() {
             self.set_status("Cannot switch sessions while a turn is active.");
@@ -3412,7 +3448,8 @@ impl DomainState {
         if !self.activate_provider(&session.provider) {
             return Vec::new();
         }
-        if !self.backend_capabilities.resume.is_supported() {
+        let pending_creation = is_pending_provider_session_id(&session.provider_session_id);
+        if !pending_creation && !self.backend_capabilities.resume.is_supported() {
             self.status_message = format!("{} does not support session resume.", self.backend_name);
             return Vec::new();
         }
@@ -3460,7 +3497,41 @@ impl DomainState {
             .cloned()
             .map(|turn| (turn.id.clone(), turn))
             .collect();
+        self.owner_prompts.clone_from(&session.owner_prompts);
         let old_provider_session = self.provider_session_id.clone();
+        if pending_creation {
+            let Some(prompt) = session
+                .owner_prompts
+                .iter()
+                .find(|prompt| prompt.dispatch_pending)
+                .or_else(|| session.owner_prompts.first())
+                .cloned()
+            else {
+                "The pending session has no owner prompt to recover."
+                    .clone_into(&mut self.status_message);
+                return Vec::new();
+            };
+            self.session_id = Some(session.id.clone());
+            self.nakode_session_id.clone_from(&session.id);
+            self.provider_session_id = None;
+            self.resuming_session = None;
+            let mut effects = old_provider_session
+                .filter(|current| current != &session.provider_session_id)
+                .map(|provider_session_id| {
+                    vec![Effect::Backend(BackendCommand::UnsubscribeSession {
+                        provider_session_id,
+                    })]
+                })
+                .unwrap_or_default();
+            effects.extend(self.begin_prompt(QueuedPrompt {
+                id: prompt.prompt_id,
+                text: prompt.raw_text,
+                attachments: Vec::new(),
+                source_transport: prompt.source_transport,
+                handoff: None,
+            }));
+            return effects;
+        }
         self.resuming_session = Some(session.clone());
         self.nakode_session_id.clone_from(&session.id);
         self.status_message = format!("Resuming session {}…", short_id(&session.id));
@@ -3540,13 +3611,22 @@ impl DomainState {
         self.status_message = format!("Could not copy selection: {error}");
     }
 
-    #[must_use]
-    pub fn is_busy(&self) -> bool {
+    pub(crate) fn defer_queue_for_next_resume(&mut self) {
+        self.defer_resume_queue = true;
+    }
+
+    fn has_active_work(&self) -> bool {
         self.creating_session.is_some()
+            || self.resuming_session.is_some()
             || self.starting_turn.is_some()
             || self.active_turn.is_some()
             || self.context_compaction.is_some()
             || self.has_running_subagents()
+    }
+
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.replay_blocked_prompt.is_some() || self.has_active_work()
     }
 
     /// Returns the logical session whose provider account affinity must be durable before backend work.
@@ -3698,9 +3778,66 @@ impl DomainState {
         attachments: Vec<PromptAttachment>,
         source_transport: Option<String>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.submit_prompt_with_identity_policy(
+            prompt_id,
+            text,
+            attachments,
+            source_transport,
+            true,
+        )
+    }
+
+    /// Replays a still-pending durable inbox item after restart. The inbox is the authority for
+    /// whether provider acceptance happened, so a synthesized owner transcript row must not suppress
+    /// this dispatch merely because its stable identity and raw body have already been restored.
+    pub(crate) fn replay_pending_prompt_with_id_and_source(
+        &mut self,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+        source_transport: Option<String>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.submit_prompt_with_identity_policy(
+            prompt_id,
+            text,
+            attachments,
+            source_transport,
+            false,
+        )
+    }
+
+    fn submit_prompt_with_identity_policy(
+        &mut self,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+        source_transport: Option<String>,
+        suppress_settled_identity: bool,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
         Self::validate_prompt_operation_id(&prompt_id)?;
         self.validate_prompt(&text)?;
-        if let Some(matches) = self.prompt_identity_matches(&prompt_id, &text, &attachments) {
+        let retrying_blocked_replay = if let Some(blocked) = self
+            .replay_blocked_prompt
+            .as_ref()
+            .filter(|blocked| blocked.id == prompt_id)
+        {
+            if blocked.text != text
+                || blocked.attachments != attachments
+                || blocked.source_transport != source_transport
+            {
+                return Err(DomainCommandError::Conflict(
+                    "the pending replay identity was reused for different prompt content or provenance"
+                        .to_owned(),
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        if suppress_settled_identity
+            && !retrying_blocked_replay
+            && let Some(matches) = self.prompt_identity_matches(&prompt_id, &text, &attachments)
+        {
             if matches {
                 return Ok(Vec::new());
             }
@@ -3713,7 +3850,9 @@ impl DomainState {
                 "the selected provider is not ready".to_owned(),
             ));
         }
-        if self.is_busy() {
+        if self.has_active_work()
+            || (self.replay_blocked_prompt.is_some() && !retrying_blocked_replay)
+        {
             return Err(DomainCommandError::Conflict(
                 "the session is busy; enqueue the prompt instead".to_owned(),
             ));
@@ -3738,6 +3877,9 @@ impl DomainState {
             source_transport,
             handoff: None,
         };
+        if retrying_blocked_replay {
+            self.replay_blocked_prompt = None;
+        }
         self.recoverable_prompt = None;
         Ok(self.begin_prompt(prompt))
     }
@@ -3778,6 +3920,22 @@ impl DomainState {
     ) -> Result<Vec<Effect>, DomainCommandError> {
         Self::validate_prompt_operation_id(&prompt_id)?;
         self.validate_prompt(&text)?;
+        if let Some(blocked) = self
+            .replay_blocked_prompt
+            .as_ref()
+            .filter(|blocked| blocked.id == prompt_id)
+        {
+            if blocked.text != text
+                || blocked.attachments != attachments
+                || blocked.source_transport.is_some()
+            {
+                return Err(DomainCommandError::Conflict(
+                    "the pending replay identity was reused for different prompt content or provenance"
+                        .to_owned(),
+                ));
+            }
+            return self.submit_prompt_with_id(prompt_id, text, attachments);
+        }
         if let Some(matches) = self.prompt_identity_matches(&prompt_id, &text, &attachments) {
             if matches {
                 return Ok(Vec::new());
@@ -6487,11 +6645,29 @@ impl DomainState {
             BackendEvent::SessionObserved {
                 provider_session_id,
             } => self.observe_session(provider_session_id),
-            BackendEvent::TurnAccepted { turn_id } | BackendEvent::TurnStarted { turn_id } => {
+            BackendEvent::TurnAccepted { turn_id } => {
                 if turn_id.is_empty() {
                     return self.protocol_problem("turn event returned an empty turn id");
                 }
+            }
+            BackendEvent::TurnStarted { turn_id } => {
+                if turn_id.is_empty() {
+                    return self.protocol_problem("turn event returned an empty turn id");
+                }
+                // Acceptance can be emitted by a local command loop before provider work is
+                // spawned. Keep the durable replay fence until the provider-facing started event.
+                let acknowledged_prompt = self
+                    .starting_turn
+                    .as_ref()
+                    .filter(|prompt| prompt.source_transport.is_none())
+                    .map(|prompt| prompt.id.clone());
                 self.observe_turn_started(turn_id);
+                if let Some(prompt_id) = acknowledged_prompt {
+                    return vec![Effect::AcknowledgeOwnerPromptDispatch {
+                        session_id: self.nakode_session_id.clone(),
+                        prompt_id,
+                    }];
+                }
             }
             BackendEvent::TurnCompleted {
                 turn_id,
@@ -6755,7 +6931,17 @@ impl DomainState {
                 options: prompt.options.clone(),
             },
         );
+        let accepted_owner_prompt = PersistedOwnerPrompt {
+            prompt_id: prompt.id.clone(),
+            raw_text: prompt.text.clone(),
+            source_transport: prompt.source_transport.clone(),
+            dispatch_pending: prompt.source_transport.is_none(),
+        };
         let mut effects = vec![persistence];
+        effects.push(Effect::PersistAcceptedOwnerPrompt {
+            session_id: self.nakode_session_id.clone(),
+            prompt: accepted_owner_prompt,
+        });
         if self
             .selected_model
             .as_deref()
@@ -6818,6 +7004,7 @@ impl DomainState {
             .cloned()
             .map(|turn| (turn.id.clone(), turn))
             .collect();
+        self.owner_prompts.clone_from(&session.owner_prompts);
         self.install_history(history);
         let _ = self.install_subagents(Vec::new());
         self.status_message = format!("Resumed session {}.", short_id(&session.id));
@@ -6840,6 +7027,43 @@ impl DomainState {
                 provider_session_id: provider_session_id_for_options,
                 options: self.selected_model_options(),
             }));
+        }
+        let pending_dispatches = self
+            .owner_prompts
+            .iter()
+            .filter(|prompt| prompt.dispatch_pending)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut pending_replay_failed = false;
+        for pending in pending_dispatches {
+            let replay_prompt = QueuedPrompt {
+                id: pending.prompt_id,
+                text: pending.raw_text,
+                attachments: Vec::new(),
+                source_transport: pending.source_transport,
+                handoff: None,
+            };
+            match self.replay_pending_prompt_with_id_and_source(
+                replay_prompt.id.clone(),
+                replay_prompt.text.clone(),
+                replay_prompt.attachments.clone(),
+                replay_prompt.source_transport.clone(),
+            ) {
+                Ok(replay_effects) => effects.extend(replay_effects),
+                Err(error) => {
+                    pending_replay_failed = true;
+                    self.replay_blocked_prompt = Some(replay_prompt);
+                    self.diagnostic_count += 1;
+                    self.status_message = format!("Pending owner prompt replay failed: {error}");
+                }
+            }
+        }
+        // SendPrompt is accepted into the normal queue while provider resume is in flight. Once
+        // restoration is authoritative, start the oldest queued prompt unless durable replay
+        // already occupied the provider or failed and must remain ordered ahead of later work.
+        let defer_queue = std::mem::take(&mut self.defer_resume_queue);
+        if !pending_replay_failed && !defer_queue {
+            effects.extend(self.drain_queue());
         }
         effects
     }
@@ -7176,6 +7400,7 @@ impl DomainState {
         {
             self.restore_failed_prompt(&prompt);
         }
+        self.sync_active_provider_context();
     }
 
     fn handle_disconnected(&mut self, reason: String) -> Vec<Effect> {
@@ -7248,6 +7473,7 @@ impl DomainState {
         prompt
     }
 
+    #[allow(clippy::too_many_lines)]
     fn begin_prompt(&mut self, mut prompt: QueuedPrompt) -> Vec<Effect> {
         if !self.prepare_selected_provider_transition() {
             let redirected = self
@@ -7307,6 +7533,12 @@ impl DomainState {
         self.record_outgoing_user_prompt(&prompt);
 
         if let Some(provider_session_id) = self.provider_session_id.clone() {
+            let accepted_owner_prompt = PersistedOwnerPrompt {
+                prompt_id: prompt.id.clone(),
+                raw_text: prompt.text.clone(),
+                source_transport: prompt.source_transport.clone(),
+                dispatch_pending: prompt.source_transport.is_none(),
+            };
             let persist = self.session_id.is_none().then(|| Effect::PersistSession {
                 provider: self.backend_provider.clone(),
                 account_id: self.provider_account_id.clone(),
@@ -7318,6 +7550,16 @@ impl DomainState {
                 options: prompt.options.clone(),
             });
             let mut effects = self.start_prompt_on_session(prompt, provider_session_id);
+            effects.insert(
+                0,
+                Effect::PersistAcceptedOwnerPrompt {
+                    session_id: self
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| self.nakode_session_id.clone()),
+                    prompt: accepted_owner_prompt,
+                },
+            );
             if let Some(session_id) = self.session_id.clone() {
                 effects.insert(0, Effect::RecordOwnerActivity(session_id));
             }
@@ -7329,20 +7571,42 @@ impl DomainState {
             self.creating_session = Some(());
             self.pending_session_prompt = Some(prompt.clone());
             self.status_message = format!("Creating a {} session…", self.backend_name);
-            vec![Effect::Backend(BackendCommand::StartSession {
-                model: prompt.model,
-                instructions: Some(self.nakode_system_instructions()),
-                owner_session_id: Some(self.nakode_session_id.clone()),
-                parent_run_id: None,
-                enabled_skill_ids: self.enabled_skill_ids(),
-                external_tools: self.provider_external_tools(),
-                replace_builtin_tools: self.replace_builtin_tools,
-                code_mode: self.code_mode,
-                allowed_builtin_tools: self.allowed_builtin_tools.clone(),
-                max_turns: None,
-                finalization_reserve_turns: 0,
-                timeout_seconds: None,
-            })]
+            let accepted_owner_prompt = PersistedOwnerPrompt {
+                prompt_id: prompt.id.clone(),
+                raw_text: prompt.text.clone(),
+                source_transport: prompt.source_transport.clone(),
+                dispatch_pending: prompt.source_transport.is_none(),
+            };
+            vec![
+                Effect::PersistSession {
+                    provider: self.backend_provider.clone(),
+                    account_id: self.provider_account_id.clone(),
+                    provider_session_id: pending_provider_session_id(&self.nakode_session_id),
+                    workspace: self.workspace.clone(),
+                    working_directory: self.working_directory.clone(),
+                    title: prompt.text.clone(),
+                    model: self.selected_model.clone(),
+                    options: prompt.options.clone(),
+                },
+                Effect::PersistAcceptedOwnerPrompt {
+                    session_id: self.nakode_session_id.clone(),
+                    prompt: accepted_owner_prompt,
+                },
+                Effect::Backend(BackendCommand::StartSession {
+                    model: prompt.model,
+                    instructions: Some(self.nakode_system_instructions()),
+                    owner_session_id: Some(self.nakode_session_id.clone()),
+                    parent_run_id: None,
+                    enabled_skill_ids: self.enabled_skill_ids(),
+                    external_tools: self.provider_external_tools(),
+                    replace_builtin_tools: self.replace_builtin_tools,
+                    code_mode: self.code_mode,
+                    allowed_builtin_tools: self.allowed_builtin_tools.clone(),
+                    max_turns: None,
+                    finalization_reserve_turns: 0,
+                    timeout_seconds: None,
+                }),
+            ]
         }
     }
 
@@ -7480,6 +7744,9 @@ impl DomainState {
         outcome: TurnOutcome,
         error: Option<String>,
     ) -> Vec<Effect> {
+        let failed_before_start = (outcome == TurnOutcome::Failed && self.active_turn.is_none())
+            .then(|| self.starting_turn.clone())
+            .flatten();
         if self.active_turn.is_none() && self.starting_turn.is_some() {
             self.observe_turn_started(turn_id.to_owned());
         }
@@ -7570,6 +7837,10 @@ impl DomainState {
         } else if let Some(session_id) = self.session_id.clone() {
             effects.push(Effect::TouchSession(session_id));
         }
+        if let Some(prompt) = failed_before_start {
+            self.restore_failed_prompt(&prompt);
+            return effects;
+        }
         if outcome == TurnOutcome::Failed && self.pending_redirect.is_some() {
             self.pending_redirect = None;
             self.status_message.push_str(" The selected follow-up remains queued; retry Steer now after the provider recovers.");
@@ -7593,7 +7864,172 @@ impl DomainState {
         self.begin_prompt(prompt)
     }
 
-    fn install_history(&mut self, history: Vec<SessionHistoryItem>) {
+    pub(crate) fn owner_prompt_dispatch_acknowledgement_failed(
+        &mut self,
+        prompt_id: &str,
+        message: impl Into<String>,
+    ) {
+        if let Some(prompt) = self
+            .owner_prompts
+            .iter()
+            .find(|prompt| prompt.prompt_id == prompt_id && prompt.dispatch_pending)
+        {
+            self.replay_blocked_prompt = Some(QueuedPrompt {
+                id: prompt.prompt_id.clone(),
+                text: prompt.raw_text.clone(),
+                attachments: Vec::new(),
+                source_transport: prompt.source_transport.clone(),
+                handoff: None,
+            });
+        }
+        self.session_store_failed(message);
+    }
+
+    pub(crate) fn settle_owner_prompt_dispatch(&mut self, prompt_id: &str) {
+        if let Some(prompt) = self
+            .owner_prompts
+            .iter_mut()
+            .find(|prompt| prompt.prompt_id == prompt_id)
+        {
+            prompt.dispatch_pending = false;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_owner_history(&self, history: &mut Vec<SessionHistoryItem>) {
+        // Pre-ledger sessions retain their provider history unchanged. The owner ledger becomes the
+        // user-body authority only after at least one accepted raw owner record exists.
+        if self.owner_prompts.is_empty() {
+            return;
+        }
+        let user_indices = history
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| (item.item.kind == ItemKind::User).then_some(index))
+            .collect::<Vec<_>>();
+        let mut prompt_by_user = vec![None; user_indices.len()];
+        let mut next_user = 0;
+        for (prompt_index, prompt) in self.owner_prompts.iter().enumerate() {
+            if prompt.raw_text.is_empty() {
+                continue;
+            }
+            let body_match_unambiguous = self
+                .owner_prompts
+                .iter()
+                .filter(|candidate| candidate.raw_text == prompt.raw_text)
+                .count()
+                == 1;
+            let stable_user_id = format!("user:{}", prompt.prompt_id);
+            let identified = (next_user..user_indices.len()).find(|user_slot| {
+                let item = &history[user_indices[*user_slot]];
+                item.turn_id == prompt.prompt_id
+                    || item.item.id == prompt.prompt_id
+                    || item.item.id == stable_user_id
+            });
+            let exact_candidates = (next_user..user_indices.len())
+                .filter(|user_slot| history[user_indices[*user_slot]].item.body == prompt.raw_text)
+                .collect::<Vec<_>>();
+            let exact = (body_match_unambiguous && exact_candidates.len() == 1)
+                .then(|| exact_candidates[0]);
+            let projected_candidates = (next_user..user_indices.len())
+                .filter(|user_slot| {
+                    let body = &history[user_indices[*user_slot]].item.body;
+                    let projected = body
+                        .strip_prefix(&prompt.raw_text)
+                        .is_some_and(|suffix| suffix.starts_with('\n'));
+                    let reserved_for_later_exact = self.owner_prompts[prompt_index + 1..]
+                        .iter()
+                        .any(|later| later.raw_text == *body);
+                    projected && !reserved_for_later_exact
+                })
+                .collect::<Vec<_>>();
+            let projected = (body_match_unambiguous && projected_candidates.len() == 1)
+                .then(|| projected_candidates[0]);
+            let matched = identified.or(exact).or(projected);
+            if let Some(user_slot) = matched {
+                prompt_by_user[user_slot] = Some(prompt_index);
+                next_user = user_slot + 1;
+            }
+        }
+        let owner_item = |prompt: &PersistedOwnerPrompt| SessionHistoryItem {
+            turn_id: prompt.prompt_id.clone(),
+            provider_id: Some(self.backend_provider.clone()),
+            model_id: None,
+            attachments: Vec::new(),
+            item: NormalizedItem {
+                id: format!("user:{}", prompt.prompt_id),
+                kind: ItemKind::User,
+                title: format!("YOU · {}", prompt.prompt_id),
+                body: prompt.raw_text.clone(),
+                status: ItemStatus::Complete,
+                tool_audit_json: None,
+            },
+        };
+        let mut reconciled = Vec::with_capacity(history.len().max(self.owner_prompts.len()));
+        let mut user_slot = 0;
+        let mut next_prompt = 0;
+        for mut history_item in history.drain(..) {
+            if history_item.item.kind != ItemKind::User {
+                // If the provider omitted an earlier user row but retained that turn's assistant or
+                // tool output, place every missing owner accepted before the next verified provider
+                // user ahead of that output. This preserves acceptance/turn chronology without ever
+                // guessing that an unmatched provider body belongs to an owner prompt.
+                let upcoming_prompt = prompt_by_user[user_slot..]
+                    .iter()
+                    .find_map(|prompt| *prompt)
+                    .unwrap_or(if user_slot < user_indices.len() {
+                        next_prompt
+                    } else {
+                        self.owner_prompts.len()
+                    });
+                while next_prompt < upcoming_prompt {
+                    if let Some(prompt) = self.owner_prompts.get(next_prompt) {
+                        reconciled.push(owner_item(prompt));
+                    }
+                    next_prompt += 1;
+                }
+                reconciled.push(history_item);
+                continue;
+            }
+            let matched_prompt = prompt_by_user.get(user_slot).copied().flatten();
+            user_slot += 1;
+            let Some(prompt_index) = matched_prompt else {
+                // A body shared by multiple ledger rows cannot identify one provider row. Preserve
+                // its provider chronology only by placing the next durable owner as a synthetic row;
+                // never borrow the provider item/turn identity for that positional placement.
+                if let Some(prompt) = self.owner_prompts.get(next_prompt)
+                    && history_item.item.body == prompt.raw_text
+                {
+                    reconciled.push(owner_item(prompt));
+                    next_prompt += 1;
+                }
+                // Once the raw-owner ledger exists, every other unmatched provider user body is not
+                // owner authority and is omitted rather than attributed by count or position.
+                continue;
+            };
+            while next_prompt < prompt_index {
+                if let Some(prompt) = self.owner_prompts.get(next_prompt) {
+                    reconciled.push(owner_item(prompt));
+                }
+                next_prompt += 1;
+            }
+            if let Some(prompt) = self.owner_prompts.get(prompt_index) {
+                history_item.item.id = format!("user:{}", prompt.prompt_id);
+                history_item.item.title = format!("YOU · {}", prompt.prompt_id);
+                history_item.item.body.clone_from(&prompt.raw_text);
+                reconciled.push(history_item);
+            }
+            next_prompt = prompt_index + 1;
+        }
+        while let Some(prompt) = self.owner_prompts.get(next_prompt) {
+            reconciled.push(owner_item(prompt));
+            next_prompt += 1;
+        }
+        *history = reconciled;
+    }
+
+    fn install_history(&mut self, mut history: Vec<SessionHistoryItem>) {
+        self.reconcile_owner_history(&mut history);
         self.active_shells.clear();
         self.transcript.clear();
         self.item_turns.clear();
@@ -7660,6 +8096,11 @@ impl DomainState {
                     })
                     .collect(),
             );
+        }
+        for prompt in &self.owner_prompts {
+            let key = format!("user:{}", prompt.prompt_id);
+            self.transcript
+                .set_source_transport(&key, prompt.source_transport.as_deref());
         }
         if self.transcript.entries().is_empty() {
             self.transcript.push(
@@ -7872,7 +8313,7 @@ impl DomainState {
                         return Vec::new();
                     }
                     self.restore_failed_prompt(&prompt);
-                    return self.drain_queue();
+                    return Vec::new();
                 } else {
                     return self.drain_queue();
                 }
@@ -7899,6 +8340,13 @@ impl DomainState {
             id: prompt.id.clone(),
             text: prompt.text.clone(),
             attachments: prompt.attachments.clone(),
+        });
+        self.replay_blocked_prompt = Some(QueuedPrompt {
+            id: prompt.id.clone(),
+            text: prompt.text.clone(),
+            attachments: prompt.attachments.clone(),
+            source_transport: prompt.source_transport.clone(),
+            handoff: None,
         });
         self.status_message
             .push_str(" Prompt is available to retry.");
@@ -10050,18 +10498,21 @@ mod tests {
         },
         domain_transcript::{EntryKind, EntryStatus, TranscriptEntry},
         personality::PromptAddenda,
-        session::{SalvagedEvidence, SessionRecord, SubagentObservability, SubagentRecord},
+        session::{
+            PersistedOwnerPrompt, SalvagedEvidence, SessionRecord, SubagentObservability,
+            SubagentRecord, pending_provider_session_id,
+        },
         skill::SkillCatalog,
         state::projection,
     };
     use tempfile::tempdir;
 
     use super::{
-        AgentEditorField, AgentRequest, AppState, ApprovalDecision, DomainCommandError, Effect,
-        MAX_CONCURRENT_SUBAGENTS, MAX_CONTINUATION_DEPTH, MAX_SALVAGED_EVIDENCE,
-        MAX_SALVAGED_EVIDENCE_BYTES, SubagentStatus, append_archetype_policy_instructions,
-        model_supports_options, objective_mismatch_handoff, parse_continuation_proposition,
-        sanitize_client_instructions,
+        AgentEditorField, AgentRequest, AppState, ApprovalDecision, ConnectionState,
+        DomainCommandError, Effect, MAX_CONCURRENT_SUBAGENTS, MAX_CONTINUATION_DEPTH,
+        MAX_SALVAGED_EVIDENCE, MAX_SALVAGED_EVIDENCE_BYTES, ProviderContext, SubagentStatus,
+        append_archetype_policy_instructions, model_supports_options, objective_mismatch_handoff,
+        parse_continuation_proposition, sanitize_client_instructions,
     };
 
     #[test]
@@ -10263,13 +10714,13 @@ mod tests {
         let effects = state
             .submit_prompt("inspect".to_owned(), Vec::new())
             .expect("first prompt");
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Backend(BackendCommand::StartSession {
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartSession {
                 enabled_skill_ids,
                 ..
-            })] if enabled_skill_ids == &["stable.review".to_owned()]
-        ));
+            }) if enabled_skill_ids == &["stable.review".to_owned()]
+        )));
     }
 
     #[test]
@@ -10514,6 +10965,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
@@ -10665,6 +11117,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
@@ -11218,13 +11671,13 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         let effects = state
             .submit_prompt("first real prompt".to_owned(), Vec::new())
             .expect("prompt accepted");
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Backend(BackendCommand::StartSession {
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartSession {
                 model: Some(model),
                 ..
-            })] if model == "model-a"
-        ));
+            }) if model == "model-a"
+        )));
 
         let effects = state.handle_backend(BackendEvent::SessionCreated {
             provider_session_id: "thread-high".to_owned(),
@@ -11234,6 +11687,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             effects.as_slice(),
             [
                 Effect::PersistSession { .. },
+                Effect::PersistAcceptedOwnerPrompt { .. },
                 Effect::Backend(BackendCommand::SetSessionOptions {
                     provider_session_id,
                     options,
@@ -11295,13 +11749,13 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         let effects = state
             .submit_prompt("first real prompt".to_owned(), Vec::new())
             .expect("prompt accepted");
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Backend(BackendCommand::StartSession {
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartSession {
                 model: Some(model),
                 ..
-            })] if model == "model-b"
-        ));
+            }) if model == "model-b"
+        )));
 
         let effects = state.handle_backend(BackendEvent::SessionCreated {
             provider_session_id: "devin-session".to_owned(),
@@ -11311,6 +11765,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             effects.as_slice(),
             [
                 Effect::PersistSession { provider_session_id, model, .. },
+                Effect::PersistAcceptedOwnerPrompt { .. },
                 Effect::Backend(BackendCommand::StartTurn { .. })
             ] if provider_session_id == "devin-session" && model.as_deref() == Some("devin-acp/model-b")
         ));
@@ -11339,8 +11794,16 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         let first = state.submit_editor();
         assert!(matches!(
             first.as_slice(),
-            [Effect::RecordOwnerActivity(session_id), Effect::Backend(_)]
-                if session_id == "nakode-session-1"
+            [
+                Effect::RecordOwnerActivity(session_id),
+                Effect::PersistAcceptedOwnerPrompt {
+                    session_id: checkpoint_session_id,
+                    prompt,
+                },
+                Effect::Backend(_)
+            ] if session_id == "nakode-session-1"
+                && checkpoint_session_id == session_id
+                && prompt.raw_text == "first"
         ));
         state.handle_backend(BackendEvent::TurnAccepted {
             turn_id: "turn-1".to_owned(),
@@ -11363,8 +11826,15 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             [
                 Effect::UpdateSessionLastTurn { session_id, .. },
                 Effect::RecordOwnerActivity(activity_session_id),
+                Effect::PersistAcceptedOwnerPrompt {
+                    session_id: checkpoint_session_id,
+                    prompt,
+                },
                 Effect::Backend(_)
-            ] if session_id == "nakode-session-1" && activity_session_id == session_id
+            ] if session_id == "nakode-session-1"
+                && activity_session_id == session_id
+                && checkpoint_session_id == session_id
+                && prompt.raw_text == "second"
         ));
     }
 
@@ -12258,6 +12728,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             effects.as_slice(),
             [
                 Effect::PersistSession { .. },
+                Effect::PersistAcceptedOwnerPrompt { .. },
                 Effect::Backend(BackendCommand::SetSessionOptions { .. }),
                 Effect::Backend(BackendCommand::StartTurn { .. })
             ]
@@ -12300,6 +12771,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             effects.as_slice(),
             [
                 Effect::PersistSession { .. },
+                Effect::PersistAcceptedOwnerPrompt { .. },
                 Effect::Backend(BackendCommand::SetSessionOptions { options, .. }),
                 Effect::Backend(BackendCommand::StartTurn { .. })
             ] if options.reasoning_effort.as_deref() == Some("high") && !options.fast_mode
@@ -12339,6 +12811,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             effects.as_slice(),
             [
                 Effect::PersistSession { .. },
+                Effect::PersistAcceptedOwnerPrompt { .. },
                 Effect::Backend(BackendCommand::SetSessionOptions { options, .. }),
                 Effect::Backend(BackendCommand::StartTurn { .. })
             ] if options.reasoning_effort.is_none() && !options.fast_mode
@@ -12376,9 +12849,69 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             effects.as_slice(),
             [
                 Effect::PersistSession { .. },
+                Effect::PersistAcceptedOwnerPrompt { .. },
                 Effect::Backend(BackendCommand::StartTurn { .. })
             ]
         ));
+    }
+
+    #[test]
+    fn failed_primary_transition_restores_the_exact_prompt_for_start_session_retry() {
+        let mut state = ready_state();
+        let prompt_id = "retry-after-transition-failure";
+        let effects = state
+            .submit_prompt_with_id(
+                prompt_id.to_owned(),
+                "preserve this exact body".to_owned(),
+                Vec::new(),
+            )
+            .expect("initial prompt");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistAcceptedOwnerPrompt { prompt, .. }
+                if prompt.prompt_id == prompt_id && prompt.raw_text == "preserve this exact body"
+        )));
+        let created = state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "uncommitted-provider-session".to_owned(),
+            model: "model-a".to_owned(),
+        });
+        assert!(created.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, prompt, .. })
+                if client_id == prompt_id && prompt == "preserve this exact body"
+        )));
+
+        state.session_primary_transition_failed("durable transition failed".to_owned());
+
+        assert!(
+            state.is_busy(),
+            "failed durable owner work must fence later prompts"
+        );
+        assert_eq!(state.provider_session_id, None);
+        assert!(state.active_turn.is_none());
+        let recovery = state.recoverable_prompt().expect("recoverable prompt");
+        assert_eq!(recovery.id, prompt_id);
+        assert_eq!(recovery.text, "preserve this exact body");
+        assert!(state.status_message.contains("durable transition failed"));
+
+        let retry = state
+            .submit_prompt_with_id(
+                prompt_id.to_owned(),
+                "preserve this exact body".to_owned(),
+                Vec::new(),
+            )
+            .expect("retry prompt");
+        assert!(retry.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistAcceptedOwnerPrompt { prompt, .. }
+                if prompt.prompt_id == prompt_id && prompt.raw_text == "preserve this exact body"
+        )));
+        assert!(
+            retry.iter().any(|effect| matches!(
+                effect,
+                Effect::Backend(BackendCommand::StartSession { .. })
+            ))
+        );
     }
 
     #[test]
@@ -12402,8 +12935,9 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             message: "rejected".to_owned(),
         });
 
-        assert!(!state.is_busy());
+        assert!(state.is_busy());
         let recovery = state.recoverable_prompt().expect("recoverable prompt");
+        let recovery_id = recovery.id.clone();
         assert!(!recovery.id.is_empty());
         assert_eq!(recovery.text, "first");
         assert_eq!(recovery.attachments, attachments);
@@ -12415,9 +12949,15 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             .expect("failed user entry");
         assert_eq!(user.status, EntryStatus::Failed);
 
-        state
-            .submit_prompt("second".to_owned(), Vec::new())
-            .expect("replacement prompt accepted");
+        let retry = state
+            .submit_prompt_with_id(recovery_id, "first".to_owned(), attachments)
+            .expect("exact failed prompt accepted for retry");
+        assert!(
+            retry.iter().any(|effect| matches!(
+                effect,
+                Effect::Backend(BackendCommand::StartSession { .. })
+            ))
+        );
         assert!(state.recoverable_prompt().is_none());
     }
 
@@ -12428,7 +12968,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.session_id = Some("nakode-session-1".to_owned());
         state.client.editor.set_text("fail prompt");
         state.submit_editor();
-        state.handle_backend(BackendEvent::TurnAccepted {
+        state.handle_backend(BackendEvent::TurnStarted {
             turn_id: "turn-failed".to_owned(),
         });
         state.handle_backend(BackendEvent::RequestFailed {
@@ -12467,12 +13007,52 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             message: "prompt failed".to_owned(),
         });
 
-        assert!(!state.is_busy());
+        assert!(state.is_busy());
         assert_eq!(
             state
                 .recoverable_prompt()
                 .map(|prompt| prompt.text.as_str()),
             Some("fail before acceptance")
+        );
+    }
+
+    #[test]
+    fn failed_unstarted_prompt_keeps_later_queue_parked_behind_its_replay_fence() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("session-1".to_owned());
+        state.session_id = Some("nakode-session-1".to_owned());
+        let accepted = state
+            .submit_prompt("first".to_owned(), Vec::new())
+            .expect("first prompt accepted");
+        assert!(accepted.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistAcceptedOwnerPrompt { prompt, .. }
+                if prompt.raw_text == "first" && prompt.dispatch_pending
+        )));
+        state
+            .enqueue_prompt("second".to_owned(), Vec::new())
+            .expect("second prompt queued");
+
+        let effects = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-failed-before-start".to_owned(),
+            outcome: TurnOutcome::Failed,
+            error: Some("failed before start".to_owned()),
+        });
+
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. })))
+        );
+        assert_eq!(
+            state.queue.front().map(|prompt| prompt.text.as_str()),
+            Some("second")
+        );
+        assert_eq!(
+            state
+                .recoverable_prompt()
+                .map(|prompt| prompt.text.as_str()),
+            Some("first")
         );
     }
 
@@ -12624,13 +13204,19 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             [
                 Effect::UpdateSessionLastTurn { session_id, .. },
                 Effect::RecordOwnerActivity(activity_session_id),
+                Effect::PersistAcceptedOwnerPrompt {
+                    session_id: checkpoint_session_id,
+                    ..
+                },
                 Effect::Backend(_)
-            ] if session_id == "nakode-session-1" && activity_session_id == session_id
+            ] if session_id == "nakode-session-1"
+                && activity_session_id == session_id
+                && checkpoint_session_id == session_id
         ));
     }
 
     #[test]
-    fn session_close_clears_all_busy_state() {
+    fn session_close_preserves_failed_owner_replay_fence() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
         state.client.editor.set_text("first");
@@ -12641,7 +13227,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider_session_id: "thread-1".to_owned(),
         });
 
-        assert!(!state.is_busy());
+        assert!(state.is_busy());
         assert!(state.provider_session_id.is_none());
         assert_eq!(
             state
@@ -12649,6 +13235,33 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .map(|prompt| prompt.text.as_str()),
             Some("first")
         );
+    }
+
+    #[test]
+    fn closed_provider_session_is_not_restored_from_cached_provider_context() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("thread-closed".to_owned());
+        state.sync_active_provider_context();
+        state.provider_contexts.insert(
+            DEVIN_PROVIDER.to_owned(),
+            ProviderContext {
+                name: "Devin".to_owned(),
+                capabilities: BackendCapabilities::default(),
+                connection: ConnectionState::Ready {
+                    server: "devin".to_owned(),
+                },
+                provider_session_id: None,
+                session_id: None,
+                context_usage: None,
+            },
+        );
+
+        state.handle_backend(BackendEvent::SessionClosed {
+            provider_session_id: "thread-closed".to_owned(),
+        });
+        assert!(state.activate_provider(DEVIN_PROVIDER));
+        assert!(state.activate_provider(CODEX_PROVIDER));
+        assert!(state.provider_session_id.is_none());
     }
 
     #[test]
@@ -13779,7 +14392,8 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
-    fn resumed_session_rebuilds_transcript_and_touches_metadata() {
+    #[allow(clippy::too_many_lines)]
+    fn resumed_session_rebuilds_transcript_touches_metadata_and_drains_queued_prompt() {
         let mut state = ready_state();
         state.install_model_options(
             CODEX_PROVIDER,
@@ -13809,6 +14423,12 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 },
                 outcome: TurnOutcome::Completed,
             }],
+            owner_prompts: vec![PersistedOwnerPrompt {
+                prompt_id: "prompt-1".to_owned(),
+                raw_text: "hello".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            }],
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
@@ -13823,6 +14443,20 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 ..
             })]
         ));
+        assert!(
+            state.is_busy(),
+            "owner submission must remain blocked until the provider confirms resume"
+        );
+        assert!(
+            state
+                .enqueue_prompt_with_id(
+                    "prompt-after-resume".to_owned(),
+                    "continue after resume".to_owned(),
+                    Vec::new(),
+                )
+                .expect("queue while resume is in flight")
+                .is_empty()
+        );
 
         let effects = state.handle_backend(BackendEvent::SessionResumed {
             provider_session_id: "thread-resumed".to_owned(),
@@ -13833,10 +14467,10 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 model_id: None,
                 attachments: Vec::new(),
                 item: NormalizedItem {
-                    id: "user-1".to_owned(),
+                    id: "provider-user-1".to_owned(),
                     kind: ItemKind::User,
-                    title: "YOU".to_owned(),
-                    body: "hello".to_owned(),
+                    title: "PROVIDER USER".to_owned(),
+                    body: "hello\n\n[Nakode Current Skill Catalogue]\nprojected".to_owned(),
                     status: ItemStatus::Complete,
                     tool_audit_json: None,
                 },
@@ -13848,15 +14482,24 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             [
                 Effect::TouchSession(touched),
                 Effect::LoadSubagents(loaded),
-                Effect::Backend(BackendCommand::SetSessionOptions { options, .. })
+                Effect::Backend(BackendCommand::SetSessionOptions { options, .. }),
+                Effect::RecordOwnerActivity(_),
+                Effect::PersistAcceptedOwnerPrompt { prompt, .. },
+                Effect::Backend(BackendCommand::StartTurn { client_id, .. })
             ] if touched == &session.id
                 && loaded == &session.id
                 && options.reasoning_effort.is_none()
                 && !options.fast_mode
+                && prompt.prompt_id == "prompt-after-resume"
+                && client_id == "prompt-after-resume"
         ));
         assert_eq!(state.session_id.as_deref(), Some(session.id.as_str()));
         assert_eq!(state.provider_session_id.as_deref(), Some("thread-resumed"));
         assert_eq!(state.transcript.entries()[0].body, "hello");
+        assert_eq!(
+            state.transcript.entries()[0].key.as_deref(),
+            Some("user:prompt-1")
+        );
         assert!(state.transcript.has_earlier_entries());
         let restored_entry = &state.transcript.entries()[0];
         assert_eq!(restored_entry.owner_turn_id.as_deref(), Some("turn-1"));
@@ -13866,6 +14509,688 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         );
         assert_eq!(restored_entry.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(restored_entry.fast_mode, Some(true));
+
+        let mut deferred = ready_state();
+        deferred.begin_resume(session);
+        deferred
+            .enqueue_prompt_with_id(
+                "queued-behind-bridge".to_owned(),
+                "bridge recovery remains first".to_owned(),
+                Vec::new(),
+            )
+            .expect("queue while deferred resume is in flight");
+        deferred.defer_queue_for_next_resume();
+        let deferred_effects = deferred.handle_backend(BackendEvent::SessionResumed {
+            provider_session_id: "thread-resumed".to_owned(),
+            model: "model-a".to_owned(),
+            history: Vec::new(),
+        });
+        assert!(
+            !deferred_effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. })))
+        );
+        assert_eq!(deferred.queue.len(), 1);
+    }
+
+    #[test]
+    fn resumed_pending_normal_owner_prompt_replays_with_stable_identity_and_acknowledges() {
+        let mut state = ready_state();
+        let session = SessionRecord {
+            id: "resume-pending-owner".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            account_id: None,
+            provider_session_id: "thread-pending-owner".to_owned(),
+            workspace: state.workspace.clone(),
+            working_directory: state.workspace.clone(),
+            title: "Pending owner".to_owned(),
+            model: None,
+            model_options: ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            owner_prompts: vec![PersistedOwnerPrompt {
+                prompt_id: "stable-prompt-id".to_owned(),
+                raw_text: "durable pending body".to_owned(),
+                source_transport: None,
+                dispatch_pending: true,
+            }],
+            created_at: 1,
+            updated_at: 2,
+            last_owner_activity_at: Some(2),
+            code_mode: false,
+            enabled_skill_ids: None,
+            owned_provider_sessions: Vec::new(),
+        };
+        state.begin_resume(session);
+        let effects = state.handle_backend(BackendEvent::SessionResumed {
+            provider_session_id: "thread-pending-owner".to_owned(),
+            model: "model-a".to_owned(),
+            history: Vec::new(),
+        });
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, prompt, attachments, .. })
+                if client_id == "stable-prompt-id"
+                    && prompt.starts_with("durable pending body")
+                    && attachments.is_empty()
+        )));
+        let accepted = state.handle_backend(BackendEvent::TurnAccepted {
+            turn_id: "provider-turn".to_owned(),
+        });
+        assert!(
+            accepted.is_empty(),
+            "local acceptance must retain the replay fence"
+        );
+        let acknowledged = state.handle_backend(BackendEvent::TurnStarted {
+            turn_id: "provider-turn".to_owned(),
+        });
+        assert!(matches!(
+            acknowledged.as_slice(),
+            [Effect::AcknowledgeOwnerPromptDispatch { session_id, prompt_id }]
+                if session_id == "resume-pending-owner" && prompt_id == "stable-prompt-id"
+        ));
+    }
+
+    #[test]
+    fn failed_pending_resume_replay_keeps_later_queue_blocked() {
+        let mut state = ready_state();
+        let session = SessionRecord {
+            id: "resume-invalid-pending-owner".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            account_id: None,
+            provider_session_id: "thread-invalid-pending-owner".to_owned(),
+            workspace: state.workspace.clone(),
+            working_directory: state.workspace.clone(),
+            title: "Invalid pending owner".to_owned(),
+            model: None,
+            model_options: ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            owner_prompts: vec![PersistedOwnerPrompt {
+                prompt_id: "invalid-pending-prompt".to_owned(),
+                raw_text: "/skill:not-installed preserve ordering".to_owned(),
+                source_transport: None,
+                dispatch_pending: true,
+            }],
+            created_at: 1,
+            updated_at: 2,
+            last_owner_activity_at: Some(2),
+            code_mode: false,
+            enabled_skill_ids: None,
+            owned_provider_sessions: Vec::new(),
+        };
+        state.begin_resume(session);
+        state
+            .enqueue_prompt_with_id(
+                "later-prompt".to_owned(),
+                "must remain behind pending replay".to_owned(),
+                Vec::new(),
+            )
+            .expect("queue while resume is in flight");
+
+        let effects = state.handle_backend(BackendEvent::SessionResumed {
+            provider_session_id: "thread-invalid-pending-owner".to_owned(),
+            model: "model-a".to_owned(),
+            history: Vec::new(),
+        });
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. })))
+        );
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(
+            state.queue.front().map(|prompt| prompt.id.as_str()),
+            Some("later-prompt")
+        );
+        assert!(
+            state
+                .status_message
+                .contains("Pending owner prompt replay failed")
+        );
+        assert!(
+            state.is_busy(),
+            "failed durable replay must remain a busy fence"
+        );
+        let later_effects = state
+            .enqueue_prompt_with_id(
+                "even-later-prompt".to_owned(),
+                "must also remain behind pending replay".to_owned(),
+                Vec::new(),
+            )
+            .expect("later prompt queues behind replay fence");
+        assert!(
+            !later_effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. })))
+        );
+        assert_eq!(state.queue.len(), 2);
+    }
+
+    #[test]
+    fn pending_session_creation_restarts_with_the_durable_prompt_identity_and_provenance() {
+        let mut state = ready_state();
+        let session_id = "resume-pending-creation";
+        let session = SessionRecord {
+            id: session_id.to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            account_id: None,
+            provider_session_id: pending_provider_session_id(session_id),
+            workspace: state.workspace.clone(),
+            working_directory: state.workspace.clone(),
+            title: "Pending creation".to_owned(),
+            model: None,
+            model_options: ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            owner_prompts: vec![PersistedOwnerPrompt {
+                prompt_id: "stable-creation-prompt".to_owned(),
+                raw_text: "durable creation body".to_owned(),
+                source_transport: Some("slack".to_owned()),
+                dispatch_pending: false,
+            }],
+            created_at: 1,
+            updated_at: 2,
+            last_owner_activity_at: Some(2),
+            code_mode: false,
+            enabled_skill_ids: None,
+            owned_provider_sessions: Vec::new(),
+        };
+
+        let effects = state.begin_resume(session);
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistSession { provider_session_id, .. }
+                if provider_session_id == &pending_provider_session_id(session_id)
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistAcceptedOwnerPrompt { session_id: persisted_session_id, prompt }
+                if persisted_session_id == session_id
+                    && prompt.prompt_id == "stable-creation-prompt"
+                    && prompt.raw_text == "durable creation body"
+                    && prompt.source_transport.as_deref() == Some("slack")
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartSession { owner_session_id, .. })
+                if owner_session_id.as_deref() == Some(session_id)
+        )));
+        let owner = state
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.key.as_deref() == Some("user:stable-creation-prompt"))
+            .expect("replayed owner row");
+        assert_eq!(owner.body, "durable creation body");
+        assert_eq!(owner.source_transport.as_deref(), Some("slack"));
+
+        let created = state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "provider-created-after-restart".to_owned(),
+            model: "model-a".to_owned(),
+        });
+        assert!(created.iter().any(|effect| matches!(
+            effect,
+            Effect::TransitionSessionPrimary { session_id: transitioned, provider_session_id, .. }
+                if transitioned == session_id
+                    && provider_session_id == "provider-created-after-restart"
+        )));
+        assert!(created.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, .. })
+                if client_id == "stable-creation-prompt"
+        )));
+    }
+
+    #[test]
+    fn persisted_owner_prompts_fill_missing_provider_history_in_acceptance_order() {
+        let mut state = ready_state();
+        state.owner_prompts = vec![
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-z".to_owned(),
+                raw_text: "first raw prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-a".to_owned(),
+                raw_text: "second raw prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+        ];
+
+        state.install_history(Vec::new());
+
+        let entries = state.transcript.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key.as_deref(), Some("user:prompt-z"));
+        assert_eq!(entries[0].body, "first raw prompt");
+        assert_eq!(entries[1].key.as_deref(), Some("user:prompt-a"));
+        assert_eq!(entries[1].body, "second raw prompt");
+    }
+
+    #[test]
+    fn owner_history_reconciliation_drops_unmatched_provider_users_and_keeps_raw_order() {
+        let mut state = ready_state();
+        state.owner_prompts = vec![
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-1".to_owned(),
+                raw_text: "first raw prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-2".to_owned(),
+                raw_text: "second raw prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+        ];
+        let item = |id: &str, kind: ItemKind, body: &str| SessionHistoryItem {
+            turn_id: id.to_owned(),
+            provider_id: Some(CODEX_PROVIDER.to_owned()),
+            model_id: None,
+            attachments: Vec::new(),
+            item: NormalizedItem {
+                id: id.to_owned(),
+                kind,
+                title: id.to_owned(),
+                body: body.to_owned(),
+                status: ItemStatus::Complete,
+                tool_audit_json: None,
+            },
+        };
+        state.install_history(vec![
+            item(
+                "provider-extra-leading",
+                ItemKind::User,
+                "provider-only leading",
+            ),
+            item(
+                "provider-first",
+                ItemKind::User,
+                "first raw prompt\n[Nakode metadata]",
+            ),
+            item("assistant-1", ItemKind::Assistant, "answer one"),
+            item("provider-second", ItemKind::User, "second raw prompt"),
+            item(
+                "provider-extra-trailing",
+                ItemKind::User,
+                "provider-only trailing",
+            ),
+        ]);
+
+        let entries = state.transcript.entries();
+        let users = entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::User)
+            .collect::<Vec<_>>();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].key.as_deref(), Some("user:prompt-1"));
+        assert_eq!(users[0].body, "first raw prompt");
+        assert_eq!(users[1].key.as_deref(), Some("user:prompt-2"));
+        assert_eq!(users[1].body, "second raw prompt");
+        assert!(entries.iter().any(|entry| entry.body == "answer one"));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.body.contains("provider-only"))
+        );
+    }
+
+    #[test]
+    fn owner_history_reconciliation_inserts_a_missing_prefix_before_a_matched_suffix() {
+        let mut state = ready_state();
+        state.owner_prompts = vec![
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-1".to_owned(),
+                raw_text: "first raw prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-2".to_owned(),
+                raw_text: "second raw prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+        ];
+        state.install_history(vec![SessionHistoryItem {
+            turn_id: "provider-second".to_owned(),
+            provider_id: Some(CODEX_PROVIDER.to_owned()),
+            model_id: None,
+            attachments: Vec::new(),
+            item: NormalizedItem {
+                id: "provider-second".to_owned(),
+                kind: ItemKind::User,
+                title: "provider second".to_owned(),
+                body: "second raw prompt".to_owned(),
+                status: ItemStatus::Complete,
+                tool_audit_json: None,
+            },
+        }]);
+
+        let users = state
+            .transcript
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::User)
+            .collect::<Vec<_>>();
+        assert_eq!(users[0].key.as_deref(), Some("user:prompt-1"));
+        assert_eq!(users[1].key.as_deref(), Some("user:prompt-2"));
+    }
+
+    #[test]
+    fn owner_history_reconciliation_keeps_missing_owner_before_retained_assistant_history() {
+        let mut state = ready_state();
+        state.owner_prompts = vec![
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-1".to_owned(),
+                raw_text: "first raw prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-2".to_owned(),
+                raw_text: "second raw prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+        ];
+        let item = |id: &str, kind: ItemKind, body: &str| SessionHistoryItem {
+            turn_id: id.to_owned(),
+            provider_id: Some(CODEX_PROVIDER.to_owned()),
+            model_id: None,
+            attachments: Vec::new(),
+            item: NormalizedItem {
+                id: id.to_owned(),
+                kind,
+                title: id.to_owned(),
+                body: body.to_owned(),
+                status: ItemStatus::Complete,
+                tool_audit_json: None,
+            },
+        };
+        state.install_history(vec![
+            item("assistant-1", ItemKind::Assistant, "answer one"),
+            item("provider-second", ItemKind::User, "second raw prompt"),
+        ]);
+
+        let bodies = state
+            .transcript
+            .entries()
+            .iter()
+            .map(|entry| entry.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies,
+            ["first raw prompt", "answer one", "second raw prompt"]
+        );
+    }
+
+    #[test]
+    fn owner_history_reconciliation_never_positionally_assigns_ambiguous_provider_users() {
+        let mut state = ready_state();
+        state.owner_prompts = vec![
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-1".to_owned(),
+                raw_text: "first raw prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-2".to_owned(),
+                raw_text: "second raw prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+        ];
+        let item = |id: &str, body: &str| SessionHistoryItem {
+            turn_id: id.to_owned(),
+            provider_id: Some(CODEX_PROVIDER.to_owned()),
+            model_id: None,
+            attachments: Vec::new(),
+            item: NormalizedItem {
+                id: id.to_owned(),
+                kind: ItemKind::User,
+                title: id.to_owned(),
+                body: body.to_owned(),
+                status: ItemStatus::Complete,
+                tool_audit_json: None,
+            },
+        };
+        state.install_history(vec![
+            item("provider-only", "unrelated provider user"),
+            item("provider-first", "first raw prompt"),
+        ]);
+
+        let users = state
+            .transcript
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::User)
+            .collect::<Vec<_>>();
+        assert_eq!(users[0].key.as_deref(), Some("user:prompt-1"));
+        assert_eq!(users[0].body, "first raw prompt");
+        assert_eq!(users[1].key.as_deref(), Some("user:prompt-2"));
+        assert_eq!(users[1].body, "second raw prompt");
+        assert!(
+            users
+                .iter()
+                .all(|entry| entry.body != "unrelated provider user")
+        );
+    }
+
+    #[test]
+    fn duplicate_owner_bodies_never_steal_each_others_stable_prompt_identity() {
+        let mut state = ready_state();
+        state.owner_prompts = vec![
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-1".to_owned(),
+                raw_text: "same owner body".to_owned(),
+                source_transport: Some("slack".to_owned()),
+                dispatch_pending: false,
+            },
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-2".to_owned(),
+                raw_text: "same owner body".to_owned(),
+                source_transport: Some("discord".to_owned()),
+                dispatch_pending: false,
+            },
+        ];
+        state.install_history(vec![SessionHistoryItem {
+            turn_id: "provider-ambiguous".to_owned(),
+            provider_id: Some(CODEX_PROVIDER.to_owned()),
+            model_id: None,
+            attachments: Vec::new(),
+            item: NormalizedItem {
+                id: "provider-ambiguous-user".to_owned(),
+                kind: ItemKind::User,
+                title: "provider user".to_owned(),
+                body: "same owner body".to_owned(),
+                status: ItemStatus::Complete,
+                tool_audit_json: None,
+            },
+        }]);
+
+        let users = state
+            .transcript
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::User)
+            .collect::<Vec<_>>();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].key.as_deref(), Some("user:prompt-1"));
+        assert_eq!(users[1].key.as_deref(), Some("user:prompt-2"));
+        assert!(users.iter().all(|entry| entry.body == "same owner body"));
+        assert_eq!(users[0].source_transport.as_deref(), Some("slack"));
+        assert_eq!(users[1].source_transport.as_deref(), Some("discord"));
+        assert_eq!(
+            state.item_turns.get("user:prompt-1").map(String::as_str),
+            Some("prompt-1")
+        );
+        assert_eq!(
+            state.item_turns.get("user:prompt-2").map(String::as_str),
+            Some("prompt-2")
+        );
+    }
+
+    #[test]
+    fn duplicate_owner_bodies_preserve_interleaved_provider_chronology_when_counts_match() {
+        let mut state = ready_state();
+        state.owner_prompts = vec![
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-1".to_owned(),
+                raw_text: "same owner body".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-2".to_owned(),
+                raw_text: "same owner body".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+        ];
+        let item = |id: &str, kind: ItemKind, body: &str| SessionHistoryItem {
+            turn_id: id.to_owned(),
+            provider_id: Some(CODEX_PROVIDER.to_owned()),
+            model_id: None,
+            attachments: Vec::new(),
+            item: NormalizedItem {
+                id: id.to_owned(),
+                kind,
+                title: id.to_owned(),
+                body: body.to_owned(),
+                status: ItemStatus::Complete,
+                tool_audit_json: None,
+            },
+        };
+        state.install_history(vec![
+            item("provider-user-1", ItemKind::User, "same owner body"),
+            item("assistant-1", ItemKind::Assistant, "first answer"),
+            item("provider-user-2", ItemKind::User, "same owner body"),
+            item("assistant-2", ItemKind::Assistant, "second answer"),
+        ]);
+
+        let entries = state.transcript.entries();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].key.as_deref(), Some("user:prompt-1"));
+        assert_eq!(entries[1].body, "first answer");
+        assert_eq!(entries[2].key.as_deref(), Some("user:prompt-2"));
+        assert_eq!(entries[3].body, "second answer");
+        assert_eq!(
+            state.item_turns.get("user:prompt-1").map(String::as_str),
+            Some("prompt-1")
+        );
+        assert_eq!(
+            state.item_turns.get("user:prompt-2").map(String::as_str),
+            Some("prompt-2")
+        );
+
+        let latest = projection::session_transcript_page(&state, None, 2)
+            .expect("latest reconciled transcript page");
+        assert_eq!(
+            latest
+                .entries
+                .iter()
+                .map(|entry| entry.body.as_str())
+                .collect::<Vec<_>>(),
+            ["same owner body", "second answer"]
+        );
+        assert!(latest.has_earlier);
+        let before = latest.entries.first().expect("latest entry").id.clone();
+        let earlier = projection::session_transcript_page(&state, Some(&before), 2)
+            .expect("earlier reconciled transcript page");
+        assert_eq!(
+            earlier
+                .entries
+                .iter()
+                .map(|entry| entry.body.as_str())
+                .collect::<Vec<_>>(),
+            ["same owner body", "first answer"]
+        );
+    }
+
+    #[test]
+    fn owner_history_reconciliation_reserves_exact_longer_prompt_matches() {
+        let mut state = ready_state();
+        state.owner_prompts = vec![
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-short".to_owned(),
+                raw_text: "foo".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+            PersistedOwnerPrompt {
+                prompt_id: "prompt-long".to_owned(),
+                raw_text: "foo\nbar".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+        ];
+        state.install_history(vec![SessionHistoryItem {
+            turn_id: "provider-long".to_owned(),
+            provider_id: Some(CODEX_PROVIDER.to_owned()),
+            model_id: None,
+            attachments: Vec::new(),
+            item: NormalizedItem {
+                id: "provider-long".to_owned(),
+                kind: ItemKind::User,
+                title: "provider long".to_owned(),
+                body: "foo\nbar".to_owned(),
+                status: ItemStatus::Complete,
+                tool_audit_json: None,
+            },
+        }]);
+
+        let users = state
+            .transcript
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::User)
+            .collect::<Vec<_>>();
+        assert_eq!(users[0].key.as_deref(), Some("user:prompt-short"));
+        assert_eq!(users[1].key.as_deref(), Some("user:prompt-long"));
+        assert_eq!(
+            state.item_turns.get("user:prompt-long").map(String::as_str),
+            Some("provider-long")
+        );
+    }
+
+    #[test]
+    fn pending_inbox_replay_is_not_suppressed_by_a_synthesized_owner_row() {
+        let mut state = ready_state();
+        state.owner_prompts = vec![PersistedOwnerPrompt {
+            prompt_id: "bridge-prompt".to_owned(),
+            raw_text: "durable bridge text".to_owned(),
+            source_transport: None,
+            dispatch_pending: false,
+        }];
+        state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "provider-session".to_owned(),
+            model: "model-a".to_owned(),
+        });
+        state.install_history(Vec::new());
+
+        let effects = state
+            .replay_pending_prompt_with_id_and_source(
+                "bridge-prompt".to_owned(),
+                "durable bridge text".to_owned(),
+                Vec::new(),
+                Some("slack".to_owned()),
+            )
+            .expect("pending durable inbox item must still dispatch");
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, .. })
+                if client_id == "bridge-prompt"
+        )));
     }
 
     #[test]
@@ -14465,7 +15790,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             code: -32602,
             message: "target provider unavailable".to_owned(),
         });
-        assert!(!state.is_busy());
+        assert!(state.is_busy());
         assert_eq!(
             state
                 .recoverable_prompt()
@@ -14474,9 +15799,13 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         );
         assert!(state.pending_handoff.is_some());
         assert_eq!(state.session_id.as_deref(), Some(logical_id.as_str()));
+        let retry_id = state
+            .recoverable_prompt()
+            .map(|prompt| prompt.id.clone())
+            .expect("stable retry identity");
         let retry = state
-            .submit_prompt("target retry".to_owned(), Vec::new())
-            .expect("target transition can be retried");
+            .submit_prompt_with_id(retry_id, "target turn".to_owned(), Vec::new())
+            .expect("target transition can be retried exactly");
         assert!(
             retry.iter().any(|effect| matches!(
                 effect,
@@ -14569,6 +15898,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 },
                 outcome: TurnOutcome::Completed,
             }],
+            owner_prompts: Vec::new(),
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
@@ -14904,16 +16234,20 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         }));
 
         state.client.editor.set_text("What is my name?");
-        assert!(matches!(
-            state.submit_editor().as_slice(),
-            [Effect::Backend(BackendCommand::StartSession { .. })]
-        ));
+        let effects = state.submit_editor();
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Backend(BackendCommand::StartSession { .. })
+            ))
+        );
         let effects = state.handle_backend(BackendEvent::SessionCreated {
             provider_session_id: "devin-thread".to_owned(),
             model: "shared".to_owned(),
         });
         let [
             Effect::PersistSession { title, .. },
+            Effect::PersistAcceptedOwnerPrompt { .. },
             Effect::Backend(BackendCommand::StartTurn { prompt, .. }),
         ] = effects.as_slice()
         else {
@@ -15696,15 +17030,16 @@ tool_profile = "none"
         state.client.editor.set_text("Start work");
 
         let effects = state.submit_editor();
-        let [
-            Effect::Backend(BackendCommand::StartSession {
-                instructions: Some(instructions),
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected session creation with Nakode instructions");
-        };
+        let instructions = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Backend(BackendCommand::StartSession {
+                    instructions: Some(instructions),
+                    ..
+                }) => Some(instructions),
+                _ => None,
+            })
+            .expect("expected session creation with Nakode instructions");
 
         assert!(instructions.starts_with("[Nakode System Instructions]"));
         assert!(instructions.contains(&format!("Session ID: {}", state.nakode_session_id)));

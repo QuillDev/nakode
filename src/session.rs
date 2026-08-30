@@ -62,6 +62,31 @@ pub struct PersistedTurnConfiguration {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedOwnerPrompt {
+    pub prompt_id: String,
+    pub raw_text: String,
+    /// Immutable transport provenance captured when the owner prompt is accepted. This remains
+    /// independent of provider item/turn identity so synthesized transcript rows retain provenance.
+    pub source_transport: Option<String>,
+    /// True until a normal owner turn reaches the backend started boundary. Local command acceptance
+    /// alone does not clear the replay fence. Bridge inbox records use their own durable pending state
+    /// and therefore never set this flag.
+    pub dispatch_pending: bool,
+}
+
+pub const PENDING_PROVIDER_SESSION_PREFIX: &str = "nakode:pending-session:";
+
+#[must_use]
+pub fn pending_provider_session_id(session_id: &str) -> String {
+    format!("{PENDING_PROVIDER_SESSION_PREFIX}{session_id}")
+}
+
+#[must_use]
+pub fn is_pending_provider_session_id(provider_session_id: &str) -> bool {
+    provider_session_id.starts_with(PENDING_PROVIDER_SESSION_PREFIX)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
     pub id: String,
     pub provider: String,
@@ -80,6 +105,8 @@ pub struct SessionRecord {
     pub last_turn: Option<PersistedTurnConfiguration>,
     /// Immutable terminal owner turns retained for historical transcript attribution.
     pub owner_turns: Vec<PersistedTurnConfiguration>,
+    /// Raw accepted owner prompts, ordered by durable acceptance for role-safe transcript replay.
+    pub owner_prompts: Vec<PersistedOwnerPrompt>,
     /// Unix epoch seconds at initial persistence; converted exactly once at API projection.
     pub created_at: i64,
     /// Unix epoch seconds at the latest persistence touch; converted exactly once at API projection.
@@ -352,6 +379,20 @@ pub enum SessionError {
         session_id: String,
         account_id: String,
     },
+    #[error("owner prompt {prompt_id:?} for session {session_id:?} was reused with different text")]
+    OwnerPromptConflict {
+        session_id: String,
+        prompt_id: String,
+    },
+    #[error(
+        "session bridge {session_id:?} already has a different unresolved inbound prompt {prompt_id:?}"
+    )]
+    BridgePendingInboundConflict {
+        session_id: String,
+        prompt_id: String,
+    },
+    #[error("session bridge {session_id:?} revision {revision} is stale")]
+    BridgeRevisionConflict { session_id: String, revision: u64 },
     #[error("provider {0} has no configured credentials")]
     MissingProviderCredential(String),
     #[error("invalid provider catalog {path}: {source}")]
@@ -616,6 +657,7 @@ pub trait SessionRepository: Send + Sync {
         enabled_skill_ids: Option<&[String]>,
         profile_id: Option<&str>,
         code_mode: Option<bool>,
+        owner_prompt: Option<&PersistedOwnerPrompt>,
     ) -> Result<SessionRecord, SessionError> {
         let record = self.create_with_account_id(
             id,
@@ -634,6 +676,9 @@ pub trait SessionRepository: Send + Sync {
         }
         if let Some(code_mode) = code_mode {
             self.set_session_code_mode(&record.id, code_mode)?;
+        }
+        if let Some(prompt) = owner_prompt {
+            self.record_owner_prompt(&record.id, prompt)?;
         }
         Ok(record)
     }
@@ -745,6 +790,34 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when persistence cannot be updated.
     fn record_owner_activity(&self, id: &str) -> Result<(), SessionError>;
+    /// Idempotently persists the raw accepted owner text before provider dispatch.
+    ///
+    /// # Errors
+    /// Returns an error when the durable transcript authority cannot be updated.
+    fn record_owner_prompt(
+        &self,
+        session_id: &str,
+        prompt: &PersistedOwnerPrompt,
+    ) -> Result<(), SessionError>;
+    /// Marks a durably accepted normal owner prompt as provider-acknowledged.
+    ///
+    /// # Errors
+    /// Returns an error when the acknowledgement cannot be persisted.
+    fn acknowledge_owner_prompt_dispatch(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+    ) -> Result<(), SessionError>;
+    /// Atomically persists accepted owner rows with every bridge checkpoint required before dispatch.
+    ///
+    /// # Errors
+    /// Returns an error without committing any owner or bridge row when one checkpoint fails.
+    fn save_prompt_dispatch_checkpoint(
+        &self,
+        owner_prompts: &[(String, PersistedOwnerPrompt)],
+        bridges: &[SessionBridgeRecord],
+        inbound_event: Option<(&str, &str, nakode_protocol::BridgeContinuationDisposition)>,
+    ) -> Result<(), SessionError>;
     /// Persists immutable attribution for the latest terminal owner turn and its activity boundary.
     ///
     /// # Errors
@@ -1250,6 +1323,17 @@ impl SqliteSessionRepository {
                PRIMARY KEY(session_id, turn_id)
              );
              CREATE INDEX IF NOT EXISTS owner_turns_session ON owner_turns(session_id);
+             CREATE TABLE IF NOT EXISTS accepted_owner_prompts (
+               acceptance_order INTEGER PRIMARY KEY AUTOINCREMENT,
+               session_id TEXT NOT NULL,
+               prompt_id TEXT NOT NULL,
+               raw_text TEXT NOT NULL,
+               source_transport TEXT,
+               dispatch_pending INTEGER NOT NULL DEFAULT 0,
+               UNIQUE(session_id, prompt_id)
+             );
+             CREATE INDEX IF NOT EXISTS accepted_owner_prompts_session
+               ON accepted_owner_prompts(session_id, acceptance_order);
              CREATE TABLE IF NOT EXISTS session_native_history (
                parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                provider TEXT NOT NULL,
@@ -1319,6 +1403,35 @@ impl SqliteSessionRepository {
              );",
         )?;
         apply_invocation_telemetry_migration(&mut connection)?;
+        let owner_prompt_columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(accepted_owner_prompts)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !owner_prompt_columns
+            .iter()
+            .any(|column| column == "source_transport")
+        {
+            execute_batch_with_busy_retry(
+                &connection,
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE accepted_owner_prompts ADD COLUMN source_transport TEXT;
+                 COMMIT;",
+            )?;
+        }
+        if !owner_prompt_columns
+            .iter()
+            .any(|column| column == "dispatch_pending")
+        {
+            execute_batch_with_busy_retry(
+                &connection,
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE accepted_owner_prompts
+                   ADD COLUMN dispatch_pending INTEGER NOT NULL DEFAULT 0;
+                 COMMIT;",
+            )?;
+        }
         let bridge_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(session_bridges)")?;
             statement
@@ -1783,6 +1896,7 @@ impl SqliteSessionRepository {
             },
             last_turn,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: row.get(13)?,
             updated_at: row.get(14)?,
             last_owner_activity_at: row.get(16)?,
@@ -1793,6 +1907,142 @@ impl SqliteSessionRepository {
     }
 }
 
+fn record_owner_prompt_on(
+    connection: &Connection,
+    session_id: &str,
+    prompt: &PersistedOwnerPrompt,
+) -> Result<(), SessionError> {
+    let existing = connection
+        .query_row(
+            "SELECT raw_text, source_transport, dispatch_pending FROM accepted_owner_prompts
+             WHERE session_id = ?1 AND prompt_id = ?2",
+            params![session_id, prompt.prompt_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((existing_text, existing_source_transport, _existing_pending)) = existing {
+        return if existing_text == prompt.raw_text
+            && existing_source_transport == prompt.source_transport
+        {
+            Ok(())
+        } else {
+            Err(SessionError::OwnerPromptConflict {
+                session_id: session_id.to_owned(),
+                prompt_id: prompt.prompt_id.clone(),
+            })
+        };
+    }
+    connection.execute(
+        "INSERT INTO accepted_owner_prompts
+           (session_id, prompt_id, raw_text, source_transport, dispatch_pending)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            session_id,
+            prompt.prompt_id,
+            prompt.raw_text,
+            prompt.source_transport,
+            i64::from(prompt.dispatch_pending)
+        ],
+    )?;
+    Ok(())
+}
+
+fn protect_bridge_pending_inbound_on(
+    connection: &Connection,
+    bridges: &[SessionBridgeRecord],
+) -> Result<(), SessionError> {
+    for bridge in bridges {
+        let existing = connection
+            .query_row(
+                "SELECT pending_inbound_json FROM session_bridges WHERE session_id = ?1",
+                params![bridge.session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .map(|value| {
+                serde_json::from_str::<BridgePendingInboundRecord>(&value).map_err(|source| {
+                    SessionError::InvalidStoredJson {
+                        field: "session_bridges.pending_inbound_json",
+                        source,
+                    }
+                })
+            })
+            .transpose()?;
+        let Some(existing) = existing else {
+            continue;
+        };
+        if bridge
+            .pending_inbound
+            .as_ref()
+            .is_some_and(|pending| pending.client_prompt_id == existing.client_prompt_id)
+        {
+            continue;
+        }
+        return Err(SessionError::BridgePendingInboundConflict {
+            session_id: bridge.session_id.clone(),
+            prompt_id: existing.client_prompt_id,
+        });
+    }
+    Ok(())
+}
+
+fn save_bridge_inbound_event_on(
+    connection: &Connection,
+    bridges: &[SessionBridgeRecord],
+    session_id: &str,
+    external_event_id: &str,
+    disposition: nakode_protocol::BridgeContinuationDisposition,
+) -> Result<(), SessionError> {
+    if !bridges.iter().any(|bridge| bridge.session_id == session_id) {
+        return Err(SessionError::InvalidStoredValue {
+            field: "session_bridge_inbound_events.session_id",
+            value: session_id.to_owned(),
+        });
+    }
+    let protected_pending_event = bridges
+        .iter()
+        .find(|bridge| bridge.session_id == session_id)
+        .and_then(|bridge| bridge.pending_inbound.as_ref())
+        .map(|pending| pending.external_event_id.as_str());
+    // Deliberately not INSERT OR IGNORE: a concurrent process that lost the event claim must
+    // roll back before dispatch and retry into the durable Duplicate path.
+    connection.execute(
+        "INSERT INTO session_bridge_inbound_events
+         (session_id, external_event_id, disposition, recorded_at_ms)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            session_id,
+            external_event_id,
+            bridge_continuation_disposition_value(disposition),
+            unix_timestamp().saturating_mul(1000)
+        ],
+    )?;
+    connection.execute(
+        "DELETE FROM session_bridge_inbound_events
+         WHERE rowid IN (
+           SELECT rowid FROM session_bridge_inbound_events
+           WHERE session_id = ?1
+             AND (?2 IS NULL OR external_event_id != ?2)
+           ORDER BY recorded_at_ms DESC, rowid DESC
+           LIMIT -1 OFFSET ?3
+         )",
+        params![
+            session_id,
+            protected_pending_event,
+            i64::try_from(MAX_BRIDGE_REPLAY_EVENTS_PER_SESSION).unwrap_or(i64::MAX)
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 fn save_session_bridge_on(
     connection: &Connection,
     bridge: &SessionBridgeRecord,
@@ -1839,7 +2089,31 @@ fn save_session_bridge_on(
             field: "session_bridges.revision",
             value: bridge.revision.to_string(),
         })?;
-    connection.execute(
+    let current = connection
+        .query_row(
+            "SELECT session_id, workspace, kind, lifecycle, display_title, revision, transport,
+                    external_parent_id, external_thread_id, last_delivered_turn_id,
+                    last_delivered_kind, delivery_json, live_turn_id, live_external_message_id,
+                    active_source_message_id, pending_inbound_json, inbound_turn_origins_json,
+                    updated_at_ms
+             FROM session_bridges WHERE session_id = ?1",
+            params![bridge.session_id],
+            SqliteSessionRepository::bridge_row,
+        )
+        .optional()?;
+    let mut comparable_bridge = bridge.clone();
+    // Replay ids live in the normalized inbound-event table and are intentionally absent from this row.
+    comparable_bridge.recent_inbound_event_ids.clear();
+    if let Some(current) = current
+        && (current.revision > bridge.revision
+            || (current.revision == bridge.revision && current != comparable_bridge))
+    {
+        return Err(SessionError::BridgeRevisionConflict {
+            session_id: bridge.session_id.clone(),
+            revision: bridge.revision,
+        });
+    }
+    let updated = connection.execute(
         "INSERT INTO session_bridges
          (session_id, workspace, kind, lifecycle, display_title, revision, transport,
           external_parent_id, external_thread_id, last_delivered_turn_id, last_delivered_kind,
@@ -1863,7 +2137,8 @@ fn save_session_bridge_on(
            active_source_message_id = excluded.active_source_message_id,
            pending_inbound_json = excluded.pending_inbound_json,
            inbound_turn_origins_json = excluded.inbound_turn_origins_json,
-           updated_at_ms = excluded.updated_at_ms",
+           updated_at_ms = excluded.updated_at_ms
+         WHERE excluded.revision >= session_bridges.revision",
         params![
             bridge.session_id,
             bridge.workspace,
@@ -1885,6 +2160,12 @@ fn save_session_bridge_on(
             bridge.updated_at_ms,
         ],
     )?;
+    if updated == 0 {
+        return Err(SessionError::BridgeRevisionConflict {
+            session_id: bridge.session_id.clone(),
+            revision: bridge.revision,
+        });
+    }
     Ok(())
 }
 
@@ -1980,6 +2261,28 @@ fn parse_bridge_continuation_disposition(
             value: value.to_owned(),
         }),
     }
+}
+
+fn load_owner_prompts(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<PersistedOwnerPrompt>, SessionError> {
+    let mut statement = connection.prepare(
+        "SELECT prompt_id, raw_text, source_transport, dispatch_pending
+         FROM accepted_owner_prompts
+         WHERE session_id = ?1 ORDER BY acceptance_order",
+    )?;
+    statement
+        .query_map([session_id], |row| {
+            Ok(PersistedOwnerPrompt {
+                prompt_id: row.get(0)?,
+                raw_text: row.get(1)?,
+                source_transport: row.get(2)?,
+                dispatch_pending: row.get::<_, i64>(3)? != 0,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn load_owner_turns(
@@ -2612,55 +2915,21 @@ impl SessionRepository for SqliteSessionRepository {
         external_event_id: &str,
         disposition: nakode_protocol::BridgeContinuationDisposition,
     ) -> Result<(), SessionError> {
-        if !bridges.iter().any(|bridge| bridge.session_id == session_id) {
-            return Err(SessionError::InvalidStoredValue {
-                field: "session_bridge_inbound_events.session_id",
-                value: session_id.to_owned(),
-            });
-        }
-        let protected_pending_event = bridges
-            .iter()
-            .find(|bridge| bridge.session_id == session_id)
-            .and_then(|bridge| bridge.pending_inbound.as_ref())
-            .map(|pending| pending.external_event_id.as_str());
         let mut connection = self
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        protect_bridge_pending_inbound_on(&transaction, bridges)?;
         for bridge in bridges {
             save_session_bridge_on(&transaction, bridge)?;
         }
-        // Deliberately not INSERT OR IGNORE: a concurrent process that lost the event claim must
-        // roll back before dispatch and retry into the durable Duplicate path.
-        transaction.execute(
-            "INSERT INTO session_bridge_inbound_events
-             (session_id, external_event_id, disposition, recorded_at_ms)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                session_id,
-                external_event_id,
-                bridge_continuation_disposition_value(disposition),
-                unix_timestamp().saturating_mul(1000)
-            ],
-        )?;
-        // External transports only replay a bounded recent event window. Retain a generous per-session
-        // durable replay ledger, plus any currently unacknowledged accepted prompt, instead of
-        // allowing an old long-lived conversation to grow this table forever.
-        transaction.execute(
-            "DELETE FROM session_bridge_inbound_events
-             WHERE rowid IN (
-               SELECT rowid FROM session_bridge_inbound_events
-               WHERE session_id = ?1
-                 AND (?2 IS NULL OR external_event_id != ?2)
-               ORDER BY recorded_at_ms DESC, rowid DESC
-               LIMIT -1 OFFSET ?3
-             )",
-            params![
-                session_id,
-                protected_pending_event,
-                i64::try_from(MAX_BRIDGE_REPLAY_EVENTS_PER_SESSION).unwrap_or(i64::MAX)
-            ],
+        save_bridge_inbound_event_on(
+            &transaction,
+            bridges,
+            session_id,
+            external_event_id,
+            disposition,
         )?;
         transaction.commit()?;
         Ok(())
@@ -2707,6 +2976,7 @@ impl SessionRepository for SqliteSessionRepository {
         drop(statement);
         for record in &mut records {
             record.owner_turns = load_owner_turns(&connection, &record.id)?;
+            record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
             record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
         }
         Ok(records)
@@ -2726,6 +2996,7 @@ impl SessionRepository for SqliteSessionRepository {
         drop(statement);
         for record in &mut records {
             record.owner_turns = load_owner_turns(&connection, &record.id)?;
+            record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
             record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
         }
         Ok(records)
@@ -2746,6 +3017,7 @@ impl SessionRepository for SqliteSessionRepository {
             .optional()?;
         if let Some(mut exact) = exact {
             exact.owner_turns = load_owner_turns(&connection, &exact.id)?;
+            exact.owner_prompts = load_owner_prompts(&connection, &exact.id)?;
             exact.owned_provider_sessions = load_owned_provider_sessions(&connection, &exact.id)?;
             return Ok(Some(exact));
         }
@@ -2763,6 +3035,7 @@ impl SessionRepository for SqliteSessionRepository {
             [record] => {
                 let mut record = record.clone();
                 record.owner_turns = load_owner_turns(&connection, &record.id)?;
+                record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
                 record.owned_provider_sessions =
                     load_owned_provider_sessions(&connection, &record.id)?;
                 Ok(Some(record))
@@ -2867,6 +3140,7 @@ impl SessionRepository for SqliteSessionRepository {
             enabled_skill_ids,
             None,
             None,
+            None,
         )
     }
 
@@ -2885,6 +3159,7 @@ impl SessionRepository for SqliteSessionRepository {
         enabled_skill_ids: Option<&[String]>,
         profile_id: Option<&str>,
         code_mode: Option<bool>,
+        owner_prompt: Option<&PersistedOwnerPrompt>,
     ) -> Result<SessionRecord, SessionError> {
         let now = unix_timestamp();
         let title = title.lines().next().unwrap_or("New session").trim();
@@ -2904,7 +3179,7 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(account_id) = account_id {
             let valid = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM provider_accounts
@@ -2979,6 +3254,9 @@ impl SessionRepository for SqliteSessionRepository {
         }
         if let Some(profile_id) = profile_id {
             bind_session_skill_profile_in_transaction(&transaction, &record.id, profile_id)?;
+        }
+        if let Some(prompt) = owner_prompt {
+            record_owner_prompt_on(&transaction, &record.id, prompt)?;
         }
         transaction.commit()?;
         Ok(record)
@@ -3087,12 +3365,14 @@ impl SessionRepository for SqliteSessionRepository {
              WHERE parent_session_id = ?1 AND provider = ?2 AND provider_session_id = ?3",
             params![id, provider, provider_session_id],
         )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO session_native_history
-             (parent_session_id, provider, provider_session_id)
-             VALUES (?1, ?2, ?3)",
-            params![id, current.0, current.1],
-        )?;
+        if !is_pending_provider_session_id(&current.1) {
+            transaction.execute(
+                "INSERT OR IGNORE INTO session_native_history
+                 (parent_session_id, provider, provider_session_id)
+                 VALUES (?1, ?2, ?3)",
+                params![id, current.0, current.1],
+            )?;
+        }
         transaction.execute(
             "UPDATE sessions
              SET provider = ?1, provider_session_id = ?2, model = ?3,
@@ -3154,7 +3434,8 @@ impl SessionRepository for SqliteSessionRepository {
             )
             .optional()?
             .ok_or_else(|| SessionError::SessionNotFound(id.to_owned()))?;
-        if let (Some(requested), Some(persisted)) = (account_id, current.2.as_deref())
+        if current.0 == provider
+            && let (Some(requested), Some(persisted)) = (account_id, current.2.as_deref())
             && requested != persisted
         {
             return Err(SessionError::ProviderAccountAffinityConflict {
@@ -3167,15 +3448,21 @@ impl SessionRepository for SqliteSessionRepository {
              WHERE parent_session_id = ?1 AND provider = ?2 AND provider_session_id = ?3",
             params![id, provider, provider_session_id],
         )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO session_native_history
-             (parent_session_id, provider, provider_session_id)
-             VALUES (?1, ?2, ?3)",
-            params![id, current.0, current.1],
-        )?;
+        if !is_pending_provider_session_id(&current.1) {
+            transaction.execute(
+                "INSERT OR IGNORE INTO session_native_history
+                 (parent_session_id, provider, provider_session_id)
+                 VALUES (?1, ?2, ?3)",
+                params![id, current.0, current.1],
+            )?;
+        }
         transaction.execute(
             "UPDATE sessions
-             SET provider = ?1, account_id = COALESCE(account_id, ?2),
+             SET provider = ?1,
+                 account_id = CASE
+                   WHEN provider != ?1 THEN ?2
+                   ELSE COALESCE(account_id, ?2)
+                 END,
                  provider_session_id = ?3, model = ?4,
                  model_reasoning_effort = ?5, model_fast_mode = ?6, updated_at = ?7
              WHERE id = ?8",
@@ -3250,6 +3537,10 @@ impl SessionRepository for SqliteSessionRepository {
                 "DELETE FROM session_bridge_inbound_events WHERE session_id = ?1",
                 [&record.id],
             )?;
+            transaction.execute(
+                "DELETE FROM accepted_owner_prompts WHERE session_id = ?1",
+                [&record.id],
+            )?;
             // Then the session itself. `orchestration_runs` and `agent_turns` go with it by cascade, which
             // the connection's `PRAGMA foreign_keys = ON` is what makes true.
             transaction.execute("DELETE FROM sessions WHERE id = ?1", params![record.id])?;
@@ -3274,6 +3565,7 @@ impl SessionRepository for SqliteSessionRepository {
         // logical session. Clear the authoritative session-runtime table directly before cascading the
         // logical session hierarchy.
         transaction.execute("DELETE FROM native_runtime_sessions", [])?;
+        transaction.execute("DELETE FROM accepted_owner_prompts", [])?;
         transaction.execute("DELETE FROM session_bridge_inbound_events", [])?;
         transaction.execute("DELETE FROM session_bridges", [])?;
         transaction.execute("DELETE FROM invocation_events", [])?;
@@ -3329,6 +3621,70 @@ impl SessionRepository for SqliteSessionRepository {
         if updated == 0 {
             return Err(SessionError::SessionNotFound(id.to_owned()));
         }
+        Ok(())
+    }
+
+    fn record_owner_prompt(
+        &self,
+        session_id: &str,
+        prompt: &PersistedOwnerPrompt,
+    ) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        record_owner_prompt_on(&connection, session_id, prompt)
+    }
+
+    fn acknowledge_owner_prompt_dispatch(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+    ) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let updated = connection.execute(
+            "UPDATE accepted_owner_prompts SET dispatch_pending = 0
+             WHERE session_id = ?1 AND prompt_id = ?2",
+            params![session_id, prompt_id],
+        )?;
+        if updated == 0 {
+            return Err(SessionError::SessionNotFound(format!(
+                "{session_id}/owner-prompt/{prompt_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn save_prompt_dispatch_checkpoint(
+        &self,
+        owner_prompts: &[(String, PersistedOwnerPrompt)],
+        bridges: &[SessionBridgeRecord],
+        inbound_event: Option<(&str, &str, nakode_protocol::BridgeContinuationDisposition)>,
+    ) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (session_id, prompt) in owner_prompts {
+            record_owner_prompt_on(&transaction, session_id, prompt)?;
+        }
+        for bridge in bridges {
+            save_session_bridge_on(&transaction, bridge)?;
+        }
+        if let Some((session_id, external_event_id, disposition)) = inbound_event {
+            save_bridge_inbound_event_on(
+                &transaction,
+                bridges,
+                session_id,
+                external_event_id,
+                disposition,
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -5377,6 +5733,37 @@ mod tests {
             store.find_session_bridge_inbound_event(&session.id, "event-2")?,
             Some(nakode_protocol::BridgeContinuationDisposition::Busy)
         );
+        let conflicting = SessionBridgeRecord {
+            pending_inbound: Some(BridgePendingInboundRecord {
+                external_event_id: "event-3".to_owned(),
+                source_message_id: "203".to_owned(),
+                client_prompt_id: "bridge-concurrent-other".to_owned(),
+                text: "must not overwrite the first inbox item".to_owned(),
+                attachments: Vec::new(),
+            }),
+            ..bridge.clone()
+        };
+        assert!(matches!(
+            store.save_session_bridges_with_inbound_event(
+                &[conflicting],
+                &session.id,
+                "event-3",
+                nakode_protocol::BridgeContinuationDisposition::Accepted,
+            ),
+            Err(SessionError::BridgePendingInboundConflict { .. })
+        ));
+        assert_eq!(
+            store.find_session_bridge_inbound_event(&session.id, "event-3")?,
+            None,
+            "a losing distinct event claim rolls back with its stale bridge replacement"
+        );
+        assert_eq!(
+            store.list_session_bridges("/tmp/project")?[0]
+                .pending_inbound
+                .as_ref()
+                .map(|pending| pending.client_prompt_id.as_str()),
+            Some("bridge-deadbeef")
+        );
         assert!(
             store
                 .save_session_bridges_with_inbound_event(
@@ -5543,6 +5930,110 @@ mod tests {
 
         assert!(store.save_session_bridges(&[first, second]).is_err());
         assert!(store.list_session_bridges("/tmp/project")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_owner_prompts_are_immutable_ordered_and_deleted_with_the_session()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("owner-prompts.db");
+        let store = SqliteSessionRepository::open(&database)?;
+        let session = store.create(
+            CODEX_PROVIDER,
+            "provider-owner-prompts",
+            "/tmp/project",
+            "Owner transcript",
+            Some("model-a"),
+        )?;
+        let first = PersistedOwnerPrompt {
+            prompt_id: "prompt-z".to_owned(),
+            raw_text: "first raw prompt".to_owned(),
+            source_transport: Some("slack".to_owned()),
+            dispatch_pending: true,
+        };
+        let second = PersistedOwnerPrompt {
+            prompt_id: "prompt-a".to_owned(),
+            raw_text: "second raw prompt".to_owned(),
+            source_transport: None,
+            dispatch_pending: true,
+        };
+        let rolled_back = PersistedOwnerPrompt {
+            prompt_id: "prompt-rolled-back".to_owned(),
+            raw_text: "must not survive a failed bridge checkpoint".to_owned(),
+            source_transport: None,
+            dispatch_pending: true,
+        };
+        assert!(
+            store
+                .save_prompt_dispatch_checkpoint(
+                    &[(session.id.clone(), rolled_back)],
+                    &[],
+                    Some((
+                        &session.id,
+                        "event-without-bridge",
+                        nakode_protocol::BridgeContinuationDisposition::Accepted,
+                    )),
+                )
+                .is_err()
+        );
+        assert!(
+            load_owner_prompts(
+                &store.connection.lock().expect("database mutex"),
+                &session.id,
+            )?
+            .is_empty()
+        );
+
+        store.record_owner_prompt(&session.id, &first)?;
+        store.record_owner_prompt(&session.id, &second)?;
+        store.record_owner_prompt(&session.id, &first)?;
+        store.acknowledge_owner_prompt_dispatch(&session.id, &first.prompt_id)?;
+        store.acknowledge_owner_prompt_dispatch(&session.id, &first.prompt_id)?;
+        assert!(matches!(
+            store.record_owner_prompt(
+                &session.id,
+                &PersistedOwnerPrompt {
+                    prompt_id: first.prompt_id.clone(),
+                    raw_text: "conflicting text".to_owned(),
+                    source_transport: None,
+                    dispatch_pending: true,
+                },
+            ),
+            Err(SessionError::OwnerPromptConflict { .. })
+        ));
+        assert!(matches!(
+            store.record_owner_prompt(
+                &session.id,
+                &PersistedOwnerPrompt {
+                    prompt_id: first.prompt_id.clone(),
+                    raw_text: first.raw_text.clone(),
+                    source_transport: Some("discord".to_owned()),
+                    dispatch_pending: true,
+                },
+            ),
+            Err(SessionError::OwnerPromptConflict { .. })
+        ));
+        drop(store);
+
+        let restarted = SqliteSessionRepository::open(&database)?;
+        let mut acknowledged_first = first.clone();
+        acknowledged_first.dispatch_pending = false;
+        assert_eq!(
+            restarted.find(&session.id)?.expect("session").owner_prompts,
+            vec![acknowledged_first, second]
+        );
+        restarted.delete(&session.id)?;
+        let remaining = restarted
+            .connection
+            .lock()
+            .expect("database mutex")
+            .query_row(
+                "SELECT COUNT(*) FROM accepted_owner_prompts WHERE session_id = ?1",
+                [&session.id],
+                |row| row.get::<_, i64>(0),
+            )?;
+        assert_eq!(remaining, 0);
         Ok(())
     }
 
@@ -5773,6 +6264,47 @@ mod tests {
             restored
                 .owned_provider_sessions
                 .contains(&(CODEX_PROVIDER.to_owned(), "codex-primary".to_owned()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_creation_identity_is_not_archived_as_provider_history() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("pending-transition.db");
+        let store = SqliteSessionRepository::open(&path)?;
+        let logical_id = "logical-pending-transition";
+        let pending_id = pending_provider_session_id(logical_id);
+        store.create_with_id(
+            logical_id,
+            CODEX_PROVIDER,
+            &pending_id,
+            "/tmp/project",
+            "/tmp/project",
+            "Pending transition",
+            Some("openai-codex/model-a"),
+            &ModelOptions::default(),
+            None,
+        )?;
+
+        store.transition_primary_with_account(
+            logical_id,
+            CODEX_PROVIDER,
+            None,
+            "provider-created",
+            Some("openai-codex/model-a"),
+            &ModelOptions::default(),
+        )?;
+        drop(store);
+
+        let restored = SqliteSessionRepository::open(&path)?
+            .find(logical_id)?
+            .expect("transitioned session");
+        assert_eq!(restored.provider_session_id, "provider-created");
+        assert!(
+            !restored
+                .owned_provider_sessions
+                .contains(&(CODEX_PROVIDER.to_owned(), pending_id,))
         );
         Ok(())
     }
@@ -6843,6 +7375,51 @@ mod tests {
     }
 
     #[test]
+    fn cross_provider_transition_rebinds_account_affinity() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repository = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        let codex = repository.add_provider_account(CODEX_PROVIDER, "Codex")?;
+        let devin = repository.add_provider_account(DEVIN_PROVIDER, "Devin")?;
+        repository.create_with_account_id(
+            "logical-cross-provider",
+            CODEX_PROVIDER,
+            Some(&codex.account_id),
+            "codex-native",
+            "/workspace",
+            "/workspace",
+            "Cross provider",
+            Some("codex-model"),
+            &ModelOptions::default(),
+            None,
+        )?;
+
+        repository.transition_primary_with_account(
+            "logical-cross-provider",
+            DEVIN_PROVIDER,
+            Some(&devin.account_id),
+            "devin-native",
+            Some("devin-model"),
+            &ModelOptions::default(),
+        )?;
+
+        let restored = repository
+            .find("logical-cross-provider")?
+            .expect("persisted session");
+        assert_eq!(restored.provider, DEVIN_PROVIDER);
+        assert_eq!(
+            restored.account_id.as_deref(),
+            Some(devin.account_id.as_str())
+        );
+        assert_eq!(restored.provider_session_id, "devin-native");
+        assert!(
+            restored
+                .owned_provider_sessions
+                .contains(&(CODEX_PROVIDER.to_owned(), "codex-native".to_owned()))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn account_profile_and_code_mode_creation_is_atomic() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let repository = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
@@ -6862,6 +7439,7 @@ mod tests {
             None,
             Some("profile-a"),
             Some(true),
+            None,
         )?;
         assert_eq!(
             created.account_id.as_deref(),
@@ -6887,6 +7465,7 @@ mod tests {
                 None,
                 Some("profile-b"),
                 Some(false),
+                None,
             )
             .expect_err("a conflicting profile must roll back the whole creation transaction");
         assert!(matches!(error, SessionError::InvalidStoredValue { .. }));
@@ -6899,6 +7478,132 @@ mod tests {
         assert_eq!(
             repository.session_skill_profile(&restored.id)?.as_deref(),
             Some("profile-a")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_owner_prompt_insert_failure_rolls_back_session_profile_and_owner()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repository = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        {
+            let connection = repository
+                .connection
+                .lock()
+                .expect("session database mutex poisoned");
+            connection.execute_batch(
+                "CREATE TRIGGER fail_first_owner_prompt
+                 BEFORE INSERT ON accepted_owner_prompts
+                 WHEN NEW.session_id = 'rollback-session'
+                 BEGIN SELECT RAISE(ABORT, 'forced first owner failure'); END;",
+            )?;
+        }
+        let prompt = PersistedOwnerPrompt {
+            prompt_id: "first-prompt".to_owned(),
+            raw_text: "exact first owner text".to_owned(),
+            source_transport: None,
+            dispatch_pending: true,
+        };
+        let error = repository
+            .create_with_account_id_and_skill_profile(
+                "rollback-session",
+                crate::backend::CODEX_PROVIDER,
+                None,
+                "rollback-native-session",
+                "/workspace",
+                "/workspace",
+                "Rollback",
+                Some("model"),
+                &ModelOptions::default(),
+                None,
+                Some("profile-a"),
+                Some(false),
+                Some(&prompt),
+            )
+            .expect_err("owner insert failure must abort the session creation transaction");
+        assert!(matches!(error, SessionError::Database(_)));
+
+        let connection = repository
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        for (table, column) in [
+            ("sessions", "id"),
+            ("session_skill_profiles", "session_id"),
+            ("accepted_owner_prompts", "session_id"),
+        ] {
+            let count = connection.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                params!["rollback-session"],
+                |row| row.get::<_, i64>(0),
+            )?;
+            assert_eq!(count, 0, "{table} must roll back with the owner prompt");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_first_owner_creation_is_idempotent_across_repositories()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("concurrent-first-owner.db");
+        let bootstrap = SqliteSessionRepository::open(&database)?;
+        let provider = crate::backend::CODEX_PROVIDER;
+        let account = bootstrap.add_provider_account(provider, "Primary")?;
+        drop(bootstrap);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let database = database.clone();
+            let account_id = account.account_id.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let repository =
+                    SqliteSessionRepository::open(database).expect("concurrent repository");
+                let prompt = PersistedOwnerPrompt {
+                    prompt_id: "stable-first-prompt".to_owned(),
+                    raw_text: "exact first owner text".to_owned(),
+                    source_transport: Some("slack".to_owned()),
+                    dispatch_pending: false,
+                };
+                barrier.wait();
+                repository.create_with_account_id_and_skill_profile(
+                    "logical-session",
+                    provider,
+                    Some(&account_id),
+                    &pending_provider_session_id("logical-session"),
+                    "/workspace",
+                    "/workspace",
+                    "First owner",
+                    Some("model"),
+                    &ModelOptions::default(),
+                    None,
+                    Some("profile-a"),
+                    Some(false),
+                    Some(&prompt),
+                )
+            }));
+        }
+        for thread in threads {
+            let created = thread.join().expect("creation thread")?;
+            assert_eq!(created.id, "logical-session");
+            assert_eq!(
+                created.account_id.as_deref(),
+                Some(account.account_id.as_str())
+            );
+        }
+
+        let repository = SqliteSessionRepository::open(&database)?;
+        let restored = repository
+            .find("logical-session")?
+            .expect("single logical session");
+        assert_eq!(restored.owner_prompts.len(), 1);
+        assert_eq!(restored.owner_prompts[0].prompt_id, "stable-first-prompt");
+        assert_eq!(restored.owner_prompts[0].raw_text, "exact first owner text");
+        assert_eq!(
+            restored.owner_prompts[0].source_transport.as_deref(),
+            Some("slack")
         );
         Ok(())
     }

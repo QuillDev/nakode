@@ -678,6 +678,7 @@ fn authentication_completed_event(params: &Value) -> BackendEvent {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_codex_rpc_response(
     operation: BackendOperation,
     result: Value,
@@ -756,10 +757,15 @@ async fn handle_codex_rpc_response(
                 .map_err(|_| ())?;
         }
         BackendOperation::StartTurn => {
+            let turn_id = nested_result_string(&result, &["turn", "id"]);
             events
                 .send(BackendEvent::TurnAccepted {
-                    turn_id: nested_result_string(&result, &["turn", "id"]),
+                    turn_id: turn_id.clone(),
                 })
+                .await
+                .map_err(|_| ())?;
+            events
+                .send(BackendEvent::TurnStarted { turn_id })
                 .await
                 .map_err(|_| ())?;
         }

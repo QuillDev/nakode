@@ -117,7 +117,9 @@ async fn verify_successful_turn(backend: &mut BackendHandle, session_id: &str) -
     let mut saw_result = false;
     loop {
         match next_event(backend).await? {
-            BackendEvent::TurnAccepted { turn_id } => assert_eq!(turn_id, "devin-turn-1"),
+            BackendEvent::TurnAccepted { turn_id } | BackendEvent::TurnStarted { turn_id } => {
+                assert_eq!(turn_id, "devin-turn-1");
+            }
             BackendEvent::ItemDelta { kind, delta, .. } => {
                 assert_eq!(kind, DeltaKind::Assistant);
                 streamed.push_str(&delta);
@@ -158,10 +160,6 @@ async fn verify_failure_and_steering(backend: &mut BackendHandle, session_id: &s
             skill_catalogue: nakode::skill::SkillCatalog::default(),
         })
         .await?;
-    assert!(matches!(
-        next_event(backend).await?,
-        BackendEvent::TurnAccepted { .. }
-    ));
     assert!(matches!(
         next_event(backend).await?,
         BackendEvent::RequestFailed {
@@ -237,10 +235,6 @@ async fn verify_resume_and_cancellation(
             skill_catalogue: nakode::skill::SkillCatalog::default(),
         })
         .await?;
-    assert!(matches!(
-        next_event(backend).await?,
-        BackendEvent::TurnAccepted { .. }
-    ));
     backend
         .commands
         .send(BackendCommand::InterruptTurn {
@@ -248,11 +242,27 @@ async fn verify_resume_and_cancellation(
             turn_id: "devin-turn-cancel".to_owned(),
         })
         .await?;
+    let mut cancellation_events = Vec::new();
     loop {
         match next_event(backend).await? {
-            BackendEvent::InterruptAccepted => {}
-            BackendEvent::TurnCompleted { outcome, .. } => {
+            BackendEvent::InterruptAccepted => cancellation_events.push("interrupt-accepted"),
+            BackendEvent::TurnAccepted { turn_id } => {
+                assert_eq!(turn_id, "devin-turn-cancel");
+                cancellation_events.push("turn-accepted");
+            }
+            BackendEvent::TurnStarted { turn_id } => {
+                assert_eq!(turn_id, "devin-turn-cancel");
+                cancellation_events.push("turn-started");
+            }
+            BackendEvent::TurnCompleted {
+                turn_id, outcome, ..
+            } => {
+                assert_eq!(turn_id, "devin-turn-cancel");
                 assert_eq!(outcome, TurnOutcome::Interrupted);
+                assert_eq!(
+                    cancellation_events,
+                    ["interrupt-accepted", "turn-accepted", "turn-started"]
+                );
                 break;
             }
             event => panic!("unexpected cancellation event: {event:?}"),

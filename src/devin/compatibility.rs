@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -129,6 +129,7 @@ struct AcpRuntime {
     capabilities: AcpCapabilities,
     initialized: bool,
     active_turns: HashMap<String, String>,
+    started_turns: HashSet<String>,
     replay: HashMap<String, Vec<SessionHistoryItem>>,
     model_options: HashMap<String, SessionModelOption>,
 }
@@ -292,6 +293,7 @@ async fn run_supervisor(input: SupervisorInput) {
         capabilities: AcpCapabilities::default(),
         initialized: false,
         active_turns: HashMap::new(),
+        started_turns: HashSet::new(),
         replay: HashMap::new(),
         model_options: HashMap::new(),
     };
@@ -413,6 +415,7 @@ async fn report_timeouts(runtime: &mut AcpRuntime, events: &mpsc::Sender<Backend
                 message,
                 events,
                 &mut runtime.active_turns,
+                &mut runtime.started_turns,
                 &runtime.model_options,
             )
             .await;
@@ -550,7 +553,7 @@ async fn handle_command(
             .await
         }
         command @ BackendCommand::StartTurn { .. } => {
-            start_turn_command(command, stdin, events, runtime).await
+            start_turn_command(command, stdin, runtime).await
         }
         BackendCommand::SteerTurn { .. } => {
             let _ = events
@@ -641,7 +644,6 @@ async fn set_session_model(
 async fn start_turn_command(
     command: BackendCommand,
     stdin: &mut ChildStdin,
-    events: &mpsc::Sender<BackendEvent>,
     runtime: &mut AcpRuntime,
 ) -> std::io::Result<()> {
     let BackendCommand::StartTurn {
@@ -660,7 +662,6 @@ async fn start_turn_command(
         prompt,
         attachments,
         stdin,
-        events,
         runtime,
     )
     .await
@@ -672,7 +673,6 @@ async fn start_turn(
     prompt: String,
     attachments: Vec<crate::backend::PromptAttachment>,
     stdin: &mut ChildStdin,
-    events: &mpsc::Sender<BackendEvent>,
     runtime: &mut AcpRuntime,
 ) -> std::io::Result<()> {
     let id = allocate_request_id(&runtime.pending, &mut runtime.next_id);
@@ -708,8 +708,7 @@ async fn start_turn(
             sent_at: Instant::now(),
         },
     );
-    runtime.active_turns.insert(session_id, turn_id.clone());
-    let _ = events.send(BackendEvent::TurnAccepted { turn_id }).await;
+    runtime.active_turns.insert(session_id, turn_id);
     Ok(())
 }
 
@@ -827,6 +826,23 @@ async fn handle_acp_method(
                 .map_err(|_| ())?;
         }
     } else if method == "session/update" {
+        let session_id = string(&params, "sessionId");
+        if let Some(turn_id) = runtime.active_turns.get(&session_id)
+            && runtime.started_turns.insert(turn_id.clone())
+        {
+            events
+                .send(BackendEvent::TurnAccepted {
+                    turn_id: turn_id.clone(),
+                })
+                .await
+                .map_err(|_| ())?;
+            events
+                .send(BackendEvent::TurnStarted {
+                    turn_id: turn_id.clone(),
+                })
+                .await
+                .map_err(|_| ())?;
+        }
         normalize_update(&params, events, &runtime.active_turns, &mut runtime.replay).await?;
     }
     Ok(())
@@ -1034,8 +1050,24 @@ async fn handle_completed_turn(
     result: &Value,
     events: &mpsc::Sender<BackendEvent>,
     active_turns: &mut HashMap<String, String>,
+    started_turns: &mut HashSet<String>,
 ) -> Result<(), ()> {
+    if started_turns.insert(turn_id.clone()) {
+        events
+            .send(BackendEvent::TurnAccepted {
+                turn_id: turn_id.clone(),
+            })
+            .await
+            .map_err(|_| ())?;
+        events
+            .send(BackendEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+            })
+            .await
+            .map_err(|_| ())?;
+    }
     active_turns.remove(&session_id);
+    started_turns.remove(&turn_id);
     let reason = string(result, "stopReason");
     let outcome = match reason.as_str() {
         "end_turn" => TurnOutcome::Completed,
@@ -1053,6 +1085,7 @@ async fn handle_completed_turn(
         .map_err(|_| ())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch_acp_message(
     message: Value,
     stdin: &mut ChildStdin,
@@ -1068,6 +1101,7 @@ async fn dispatch_acp_message(
         capabilities,
         initialized,
         active_turns,
+        started_turns,
         replay,
         model_options,
         ..
@@ -1097,7 +1131,16 @@ async fn dispatch_acp_message(
             .and_then(Value::as_str)
             .unwrap_or("ACP request failed")
             .to_owned();
-        emit_request_failure(request, code, message, events, active_turns, model_options).await?;
+        emit_request_failure(
+            request,
+            code,
+            message,
+            events,
+            active_turns,
+            started_turns,
+            model_options,
+        )
+        .await?;
         return Ok(());
     }
     let result = message.get("result").cloned().unwrap_or(Value::Null);
@@ -1151,7 +1194,15 @@ async fn dispatch_acp_message(
             session_id,
             turn_id,
         } => {
-            handle_completed_turn(session_id, turn_id, &result, events, active_turns).await?;
+            handle_completed_turn(
+                session_id,
+                turn_id,
+                &result,
+                events,
+                active_turns,
+                started_turns,
+            )
+            .await?;
         }
         PendingKind::CloseSession => announce_closed(events).await?,
     }
@@ -1171,6 +1222,7 @@ async fn emit_request_failure(
     message: String,
     events: &mpsc::Sender<BackendEvent>,
     active_turns: &mut HashMap<String, String>,
+    started_turns: &mut HashSet<String>,
     model_options: &HashMap<String, SessionModelOption>,
 ) -> Result<(), ()> {
     events
@@ -1187,6 +1239,7 @@ async fn emit_request_failure(
             turn_id,
         } => {
             active_turns.remove(&session_id);
+            started_turns.remove(&turn_id);
             events
                 .send(BackendEvent::TurnCompleted {
                     turn_id,
