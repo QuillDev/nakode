@@ -389,6 +389,7 @@ pub struct QueuedPrompt {
     pub text: String,
     pub attachments: Vec<PromptAttachment>,
     source_transport: Option<String>,
+    handoff: Option<HandoffPackage>,
 }
 
 /// A prompt that the server definitively failed to start and can offer to any
@@ -460,7 +461,8 @@ struct PendingRedirect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RedirectStart {
     prompt: QueuedPrompt,
-    index: usize,
+    predecessor_ids: Vec<String>,
+    successor_ids: Vec<String>,
 }
 
 #[cfg(test)]
@@ -3734,6 +3736,7 @@ impl DomainState {
             text,
             attachments,
             source_transport,
+            handoff: None,
         };
         self.recoverable_prompt = None;
         Ok(self.begin_prompt(prompt))
@@ -3792,6 +3795,7 @@ impl DomainState {
             text,
             attachments,
             source_transport: None,
+            handoff: None,
         });
         self.status_message = format!("Queued message {}.", self.queue.len());
         Ok(self
@@ -3873,34 +3877,43 @@ impl DomainState {
         )
     }
 
-    /// Removes one queued prompt by its stable server-owned identity.
+    pub(crate) fn contains_queued_prompt(&self, prompt_id: &str) -> bool {
+        self.queue.iter().any(|prompt| prompt.id == prompt_id)
+    }
+
+    /// Removes one queued prompt by stable identity.
+    ///
+    /// An absent identity is already in the requested state, including when another client removed
+    /// it or the provider activated it before this command reached authoritative state.
     ///
     /// # Errors
-    /// Returns not found when the prompt is no longer queued.
+    /// Rejects removal while the exact prompt is reserved for redirection.
     pub fn remove_queued_prompt(
         &mut self,
         prompt_id: &str,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        let position = self
-            .queue
-            .iter()
-            .position(|prompt| prompt.id == prompt_id)
-            .ok_or_else(|| DomainCommandError::NotFound(prompt_id.to_owned()))?;
-        let reserved = self
-            .pending_redirect
+        let redirecting = self
+            .redirect_start
             .as_ref()
-            .is_some_and(|pending| pending.prompt_id == prompt_id)
+            .is_some_and(|pending| pending.prompt.id == prompt_id)
+            || self
+                .pending_redirect
+                .as_ref()
+                .is_some_and(|pending| pending.prompt_id == prompt_id)
             || self.pending_steer.as_ref().is_some_and(|pending| {
                 pending
                     .queued_origin
                     .as_ref()
                     .is_some_and(|origin| origin.prompt_id == prompt_id)
             });
-        if reserved {
+        if redirecting {
             return Err(DomainCommandError::Conflict(
                 "the queued message is already being redirected".to_owned(),
             ));
         }
+        let Some(position) = self.queue.iter().position(|prompt| prompt.id == prompt_id) else {
+            return Ok(Vec::new());
+        };
         let Some(removed) = self.queue.remove(position) else {
             return Err(DomainCommandError::NotFound(prompt_id.to_owned()));
         };
@@ -7033,7 +7046,23 @@ impl DomainState {
         {
             return false;
         }
-        let index = pending.index.min(self.queue.len());
+        let index = pending
+            .successor_ids
+            .iter()
+            .find_map(|successor| self.queue.iter().position(|prompt| &prompt.id == successor))
+            .or_else(|| {
+                pending
+                    .predecessor_ids
+                    .iter()
+                    .rev()
+                    .find_map(|predecessor| {
+                        self.queue
+                            .iter()
+                            .position(|prompt| &prompt.id == predecessor)
+                            .map(|position| position + 1)
+                    })
+            })
+            .unwrap_or(0);
         self.queue.insert(index, pending.prompt);
         true
     }
@@ -7049,6 +7078,18 @@ impl DomainState {
             );
             return Vec::new();
         };
+        let predecessor_ids = self
+            .queue
+            .iter()
+            .take(position)
+            .map(|prompt| prompt.id.clone())
+            .collect();
+        let successor_ids = self
+            .queue
+            .iter()
+            .skip(position + 1)
+            .map(|prompt| prompt.id.clone())
+            .collect();
         let Some(prompt) = self.queue.remove(position) else {
             self.status_message.push_str(
                 " The selected follow-up could not be reserved, so no replacement turn was started.",
@@ -7057,7 +7098,8 @@ impl DomainState {
         };
         self.redirect_start = Some(RedirectStart {
             prompt: prompt.clone(),
-            index: position,
+            predecessor_ids,
+            successor_ids,
         });
         self.begin_prompt(prompt)
     }
@@ -7200,14 +7242,25 @@ impl DomainState {
             text,
             attachments,
             source_transport: None,
+            handoff: None,
         };
         self.client.editor.clear();
         prompt
     }
 
-    fn begin_prompt(&mut self, prompt: QueuedPrompt) -> Vec<Effect> {
+    fn begin_prompt(&mut self, mut prompt: QueuedPrompt) -> Vec<Effect> {
         if !self.prepare_selected_provider_transition() {
-            self.queue.push_front(prompt);
+            let redirected = self
+                .redirect_start
+                .as_ref()
+                .is_some_and(|pending| pending.prompt.id == prompt.id);
+            if redirected {
+                if let Some(pending) = self.redirect_start.take() {
+                    self.restore_redirect_start(pending);
+                }
+            } else {
+                self.queue.push_front(prompt);
+            }
             return Vec::new();
         }
         let mut wire_text = self
@@ -7224,6 +7277,17 @@ impl DomainState {
             wire_text.push_str(&self.nakode_current_skill_catalogue());
         }
         let resolved_options = self.selected_model_options();
+        let handoff = self
+            .pending_handoff
+            .take()
+            .or_else(|| prompt.handoff.take());
+        if let Some(pending) = self
+            .redirect_start
+            .as_mut()
+            .filter(|pending| pending.prompt.id == prompt.id)
+        {
+            pending.prompt.handoff.clone_from(&handoff);
+        }
         let prompt = OutgoingPrompt {
             id: prompt.id,
             text: prompt.text,
@@ -7236,7 +7300,7 @@ impl DomainState {
                 .flatten(),
             resolved_model: self.selected_model.clone(),
             options: resolved_options,
-            handoff: self.pending_handoff.take(),
+            handoff,
             attachments: prompt.attachments,
             source_transport: prompt.source_transport,
         };
@@ -7771,6 +7835,19 @@ impl DomainState {
                 } else {
                     self.creating_session = None;
                     if let Some(prompt) = self.pending_session_prompt.take() {
+                        let redirected = self
+                            .redirect_start
+                            .as_ref()
+                            .is_some_and(|pending| pending.prompt.id == prompt.id);
+                        if redirected {
+                            if let Some(pending) = self.redirect_start.take() {
+                                self.restore_redirect_start(pending);
+                            }
+                            self.status_message.push_str(
+                                " The selected follow-up remains queued; retry Steer now after fixing the provider error.",
+                            );
+                            return Vec::new();
+                        }
                         self.restore_failed_prompt(&prompt);
                     }
                 }
@@ -11716,6 +11793,18 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             Effect::Backend(BackendCommand::StartTurn { client_id, .. })
                 if client_id == &selected_id
         )));
+        assert!(
+            super::projection::queue_views(&state)
+                .iter()
+                .find(|item| item.id.as_str() == selected_id)
+                .is_some_and(|item| item.redirecting),
+            "the authoritative replacement keeps the reserved identity visible until start settles"
+        );
+        assert!(matches!(
+            state.remove_queued_prompt(&selected_id),
+            Err(super::DomainCommandError::Conflict(message))
+                if message == "the queued message is already being redirected"
+        ));
 
         let retry = state.handle_backend(BackendEvent::RequestFailed {
             operation: BackendOperation::StartTurn,
@@ -11734,6 +11823,248 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         );
         assert!(state.status_message.contains("remains queued"));
         assert!(state.recoverable_prompt().is_none());
+    }
+
+    #[test]
+    fn unavailable_provider_transition_restores_reserved_follow_up_at_its_exact_position() {
+        let mut state = ready_state();
+        state.backend_capabilities.steering = CapabilitySupport::Unsupported;
+        state.provider_session_id = Some("codex-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("openai-codex/model-a".to_owned()),
+            options: ModelOptions::default(),
+            cancelling: false,
+        });
+        state.selected_model = Some("missing-provider/model".to_owned());
+        for text in ["first", "selected", "third"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let selected_id = state.queue[1].id.clone();
+        state
+            .steer_queued_prompt(&selected_id)
+            .expect("begin fallback");
+
+        let effects = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Interrupted,
+            error: None,
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| (prompt.id.as_str(), prompt.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (state.queue[0].id.as_str(), "first"),
+                (selected_id.as_str(), "selected"),
+                (state.queue[2].id.as_str(), "third"),
+            ]
+        );
+        assert!(state.redirect_start.is_none());
+        state
+            .remove_queued_prompt(&selected_id)
+            .expect("restored follow-up remains removable");
+        assert_eq!(state.queue.len(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn replacement_session_start_failure_restores_reserved_follow_up_at_its_exact_position() {
+        let mut state = ready_state();
+        state.backend_capabilities.steering = CapabilitySupport::Unsupported;
+        state.handle_provider_backend(
+            DEVIN_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: DEVIN_PROVIDER.to_owned(),
+                display_name: "Devin".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        state.provider_session_id = Some("codex-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("openai-codex/model-a".to_owned()),
+            options: ModelOptions::default(),
+            cancelling: false,
+        });
+        state.transcript.push(
+            EntryKind::User,
+            "USER",
+            "Remember the source-provider context.",
+            EntryStatus::Complete,
+        );
+        state.transcript.push(
+            EntryKind::Assistant,
+            "ASSISTANT",
+            "I will carry it into the handoff.",
+            EntryStatus::Complete,
+        );
+        state.selected_model = Some(format!("{DEVIN_PROVIDER}/devin-model"));
+        for text in ["first", "selected", "third"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let selected_id = state.queue[1].id.clone();
+        state
+            .steer_queued_prompt(&selected_id)
+            .expect("begin fallback");
+        let start = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Interrupted,
+            error: None,
+        });
+        assert!(
+            start.iter().any(|effect| matches!(
+                effect,
+                Effect::Backend(BackendCommand::StartSession { .. })
+            ))
+        );
+        assert!(matches!(
+            state.remove_queued_prompt(&selected_id),
+            Err(super::DomainCommandError::Conflict(_))
+        ));
+
+        let retry = state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::StartSession,
+            code: -1,
+            message: "provider process failed before session creation".to_owned(),
+        });
+
+        assert!(retry.is_empty());
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| (prompt.id.as_str(), prompt.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (state.queue[0].id.as_str(), "first"),
+                (selected_id.as_str(), "selected"),
+                (state.queue[2].id.as_str(), "third"),
+            ]
+        );
+        assert!(state.redirect_start.is_none());
+        assert!(state.recoverable_prompt().is_none());
+        assert!(state.pending_handoff.is_none());
+        assert!(
+            state
+                .queue
+                .iter()
+                .find(|prompt| prompt.id == selected_id)
+                .is_some_and(|prompt| prompt.handoff.is_some()),
+            "a failed cross-provider replacement binds its continuity handoff to the exact prompt"
+        );
+
+        let unrelated = state
+            .submit_prompt_with_id(
+                "unrelated-direct-prompt".to_owned(),
+                "Do not consume the selected follow-up handoff.".to_owned(),
+                Vec::new(),
+            )
+            .expect(
+                "an unrelated direct prompt may still start while the restored queue is nonempty",
+            );
+        assert!(
+            unrelated.iter().any(|effect| matches!(
+                effect,
+                Effect::Backend(BackendCommand::StartSession { .. })
+            ))
+        );
+        assert!(
+            state
+                .pending_session_prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.handoff.is_none()),
+            "the unrelated prompt must not consume another queue identity's handoff"
+        );
+        assert!(
+            state
+                .queue
+                .iter()
+                .find(|prompt| prompt.id == selected_id)
+                .is_some_and(|prompt| prompt.handoff.is_some())
+        );
+    }
+
+    #[test]
+    fn disconnect_after_reserved_replacement_removal_rejection_restores_the_exact_follow_up() {
+        let mut state = ready_state();
+        state.backend_capabilities.steering = CapabilitySupport::Unsupported;
+        state.provider_session_id = Some("claude-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
+            cancelling: false,
+        });
+        for text in ["first", "selected", "third"] {
+            state
+                .enqueue_prompt(text.to_owned(), Vec::new())
+                .expect("queue follow-up");
+        }
+        let first_id = state.queue[0].id.clone();
+        let selected_id = state.queue[1].id.clone();
+        let third_id = state.queue[2].id.clone();
+        state
+            .steer_queued_prompt(&selected_id)
+            .expect("begin fallback");
+        let start = state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-1".to_owned(),
+            outcome: TurnOutcome::Interrupted,
+            error: None,
+        });
+        assert!(start.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::StartTurn { client_id, .. })
+                if client_id == &selected_id
+        )));
+        assert!(matches!(
+            state.remove_queued_prompt(&selected_id),
+            Err(super::DomainCommandError::Conflict(_))
+        ));
+        state
+            .remove_queued_prompt(&first_id)
+            .expect("a preceding sibling remains independently removable");
+        state
+            .remove_queued_prompt(&third_id)
+            .expect("a succeeding sibling remains independently removable");
+        state
+            .enqueue_prompt("new sibling".to_owned(), Vec::new())
+            .expect("a new sibling may append while replacement start settles");
+        let new_id = state.queue[0].id.clone();
+        assert_eq!(
+            super::projection::queue_views(&state)
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            [selected_id.as_str(), new_id.as_str()],
+            "the reserved identity stays before work appended after its reservation"
+        );
+
+        state.handle_backend(BackendEvent::Disconnected {
+            reason: "provider disconnected while starting replacement".to_owned(),
+        });
+
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| (prompt.id.as_str(), prompt.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (selected_id.as_str(), "selected"),
+                (new_id.as_str(), "new sibling"),
+            ]
+        );
+        assert!(state.redirect_start.is_none());
     }
 
     #[test]

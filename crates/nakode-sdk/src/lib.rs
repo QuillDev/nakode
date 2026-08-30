@@ -1299,7 +1299,28 @@ impl NakodeClient {
         .map_err(Into::into)
     }
     typed_mutation!(save_soul, api::SaveSoulRequest);
-    typed_mutation!(remove_queued_prompt, api::RemoveQueuedPromptRequest);
+    /// Removes one exact queued prompt against authoritative session state.
+    ///
+    /// A caller-supplied idempotency key is preserved across transport retries. Any supplied
+    /// `expected_revision` is omitted because queue progress, activation, and concurrent appends do
+    /// not invalidate removal of a stable prompt identity. A target already absent is success.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error, or a domain refusal while the target is reserved
+    /// for redirection.
+    pub async fn remove_queued_prompt(
+        &self,
+        request: api::RemoveQueuedPromptRequest,
+    ) -> Result<api::MutationResult, SdkError> {
+        let request = authoritative_remove_request(request);
+        retry_transport(request, |request| {
+            let mut transport = self.transport.clone();
+            async move { transport.remove_queued_prompt(request).await }
+        })
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(Into::into)
+    }
     typed_mutation!(cancel_turn, api::CancelTurnRequest);
     typed_mutation!(compact_context, api::CompactContextRequest);
     typed_mutation!(run_shell, api::RunShellRequest);
@@ -2214,6 +2235,14 @@ fn bridge_continuation_mutation(
     }
 }
 
+fn authoritative_remove_request(
+    mut request: api::RemoveQueuedPromptRequest,
+) -> api::RemoveQueuedPromptRequest {
+    let options = request.mutation.get_or_insert_with(|| mutation(None));
+    options.expected_revision = None;
+    request
+}
+
 fn mutation(expected_revision: Option<u64>) -> api::MutationOptions {
     api::MutationOptions {
         idempotency_key: uuid::Uuid::now_v7().to_string(),
@@ -2426,9 +2455,26 @@ mod tests {
 
     use super::{
         ActivationClient, ActivationCursor, NakodeClient, SdkError, SessionAttachment,
-        activation_cursor_changed, api, bridge_continuation_mutation, managed_watch,
-        retry_transport,
+        activation_cursor_changed, api, authoritative_remove_request, bridge_continuation_mutation,
+        managed_watch, retry_transport,
     };
+
+    #[test]
+    fn queued_prompt_removal_preserves_identity_and_omits_the_revision_fence() {
+        let request = authoritative_remove_request(api::RemoveQueuedPromptRequest {
+            mutation: Some(api::MutationOptions {
+                idempotency_key: "remove-one-exact-prompt".to_owned(),
+                expected_revision: Some(41),
+            }),
+            session_id: "session-1".to_owned(),
+            prompt_id: "prompt-2".to_owned(),
+        });
+        let options = request.mutation.expect("normalized mutation options");
+
+        assert_eq!(options.idempotency_key, "remove-one-exact-prompt");
+        assert_eq!(options.expected_revision, None);
+        assert_eq!(request.prompt_id, "prompt-2");
+    }
 
     fn bridge_request(
         session_id: &str,

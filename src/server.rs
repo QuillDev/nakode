@@ -585,19 +585,30 @@ impl ServerCore {
                 false,
             );
         }
+        let queue_removal_changes_state = match &command {
+            Command::RemoveQueuedPrompt {
+                session_id,
+                prompt_id,
+            } => self
+                .engine_for(session_id)
+                .is_some_and(|engine| engine.state().contains_queued_prompt(prompt_id.as_str())),
+            _ => true,
+        };
         let effect_session = self.command_session(&command);
         let command_revision = effect_session
             .as_ref()
             .and_then(|session_id| self.engine_for(session_id))
             .map_or_else(|| self.engine().revision(), ServiceEngine::revision);
-        // Prompt submission is append-only owner intent. Its idempotency key, not a snapshot fence,
-        // distinguishes a retry from another deliberate send; lifecycle and queue placement are
-        // therefore evaluated against authoritative state when this command executes.
+        // Prompt submission and exact-ID queue removal are owner intent, not edits to a rendered
+        // queue position. Their idempotency keys distinguish transport retries; lifecycle, queue
+        // placement, and target presence are evaluated against authoritative state at execution.
         let append_prompt = matches!(
             &command,
             Command::SendPrompt { .. } | Command::EnqueuePrompt { .. }
         );
-        let revision_fenced = !append_prompt;
+        let authoritative_queue_intent =
+            append_prompt || matches!(&command, Command::RemoveQueuedPrompt { .. });
+        let revision_fenced = !authoritative_queue_intent;
         let (mut result, effects) = if revision_fenced
             && expected_revision.is_some_and(|revision| revision != command_revision)
         {
@@ -621,12 +632,13 @@ impl ServerCore {
                 .map(|resource_id| SessionId::from(resource_id.clone()))
                 .filter(|session_id| self.sessions_by_id.contains_key(session_id))
         });
+        let changed = result.is_ok() && queue_removal_changes_state;
         if let Ok(accepted) = &mut result {
             let revision = effect_session
                 .as_ref()
                 .and_then(|session_id| self.engine_for(session_id))
                 .map_or_else(|| self.engine().revision(), ServiceEngine::revision);
-            accepted.revision = Some(revision.saturating_add(1));
+            accepted.revision = Some(revision.saturating_add(u64::from(changed)));
         }
         self.command_cache.insert(
             key.clone(),
@@ -641,7 +653,6 @@ impl ServerCore {
         {
             self.command_cache.remove(&expired);
         }
-        let changed = result.is_ok();
         (result, effects, effect_session, changed)
     }
 
@@ -7529,6 +7540,239 @@ mod tests {
         );
         assert!(matches!(conflict.0, Err(error) if error.code == ErrorCode::Conflict));
         assert!(conflict.1.is_empty());
+    }
+
+    #[test]
+    fn stale_queued_prompt_removal_uses_stable_identity_and_converges_when_already_absent() {
+        let (mut core, session_id, observed_revision) =
+            busy_server_with_stale_revision("active-turn");
+        let duplicate = PromptInput {
+            text: "same visible follow-up".to_owned(),
+            attachments: Vec::new(),
+        };
+
+        for prompt_id in ["keep-before", "remove-exactly-this", "keep-after"] {
+            core.execute_idempotent(
+                IdempotencyKey::from(prompt_id),
+                Some(observed_revision),
+                false,
+                Command::EnqueuePrompt {
+                    session_id: session_id.clone(),
+                    prompt: duplicate.clone(),
+                },
+            )
+            .0
+            .expect("stale prompt append is accepted");
+        }
+
+        let (removed, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("remove-target-at-current-state"),
+            Some(observed_revision),
+            false,
+            Command::RemoveQueuedPrompt {
+                session_id: session_id.clone(),
+                prompt_id: "remove-exactly-this".into(),
+            },
+        );
+        removed.expect("stale removal is evaluated against authoritative queue state");
+        assert!(effects.is_empty());
+        assert!(changed);
+        assert_eq!(
+            core.session_view(&session_id)
+                .expect("session view")
+                .queue
+                .iter()
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>(),
+            ["keep-before", "keep-after"],
+            "removal uses the stable prompt ID, never duplicate text or queue position"
+        );
+
+        let revision_before_noop = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+        let (already_absent, retry_effects, _, retry_changed) = core.execute_idempotent(
+            IdempotencyKey::from("remove-target-after-authoritative-absence"),
+            Some(observed_revision),
+            false,
+            Command::RemoveQueuedPrompt {
+                session_id: session_id.clone(),
+                prompt_id: "remove-exactly-this".into(),
+            },
+        );
+        let already_absent =
+            already_absent.expect("an already removed or activated target converges as success");
+        assert!(retry_effects.is_empty());
+        assert!(!retry_changed, "converged absence is not a state mutation");
+        assert_eq!(already_absent.revision, Some(revision_before_noop));
+        assert_eq!(
+            core.engine_for(&session_id)
+                .expect("session engine")
+                .revision(),
+            revision_before_noop,
+            "a no-op removal must not advance the session revision"
+        );
+        assert_eq!(
+            core.session_view(&session_id)
+                .expect("session view")
+                .queue
+                .iter()
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>(),
+            ["keep-before", "keep-after"]
+        );
+
+        let (fenced, fenced_effects, _, fenced_changed) = core.execute_idempotent(
+            IdempotencyKey::from("fenced-command-after-removal-noop"),
+            Some(revision_before_noop),
+            false,
+            shell_command(&session_id, "true"),
+        );
+        fenced.expect("a no-op removal must not stale the previously current revision");
+        assert!(!fenced_effects.is_empty());
+        assert!(fenced_changed);
+    }
+
+    #[test]
+    fn queued_prompt_removal_publishes_only_when_authoritative_queue_changes() {
+        let (mut core, session_id, observed_revision) =
+            busy_server_with_stale_revision("active-turn");
+        let (endpoint, _requests) = ServerEndpoint::channel(
+            "queue-removal-publication",
+            ServiceCapabilities::default(),
+            16,
+        );
+        core.publish_state(&endpoint, &session_id);
+        let mut publications = endpoint.subscribe_publications();
+
+        let (_, _, _, queued) = core.execute_idempotent(
+            IdempotencyKey::from("publication-removal-target"),
+            Some(observed_revision),
+            false,
+            Command::EnqueuePrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "remove once".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        );
+        assert!(queued);
+        core.commit_and_publish_session(&endpoint, &session_id);
+        drain_publications(&mut publications);
+        let revision_before_removal = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+
+        let (removed, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("publication-remove-present"),
+            Some(observed_revision),
+            false,
+            Command::RemoveQueuedPrompt {
+                session_id: session_id.clone(),
+                prompt_id: "publication-removal-target".into(),
+            },
+        );
+        removed.expect("present target removal");
+        assert!(effects.is_empty());
+        assert!(changed);
+        core.commit_and_publish_session(&endpoint, &session_id);
+        let revision_after_removal = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+        assert_eq!(revision_after_removal, revision_before_removal + 1);
+        let events = drain_publications(&mut publications);
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            ViewEvent::QueueChanged {
+                session_id: published_session,
+                revision,
+                queue,
+            } if published_session == &session_id
+                && *revision == revision_after_removal
+                && queue.is_empty()
+        )));
+
+        let (absent, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("publication-remove-absent"),
+            Some(observed_revision),
+            false,
+            Command::RemoveQueuedPrompt {
+                session_id: session_id.clone(),
+                prompt_id: "publication-removal-target".into(),
+            },
+        );
+        let absent = absent.expect("absent target converges successfully");
+        assert_eq!(absent.revision, Some(revision_after_removal));
+        assert!(effects.is_empty());
+        assert!(!changed);
+        if changed {
+            core.commit_and_publish_session(&endpoint, &session_id);
+        }
+        assert_eq!(
+            core.engine_for(&session_id)
+                .expect("session engine")
+                .revision(),
+            revision_after_removal
+        );
+        assert!(drain_publications(&mut publications).is_empty());
+    }
+
+    #[test]
+    fn queued_prompt_removal_converges_after_the_target_was_activated() {
+        let (mut core, session_id, observed_revision) =
+            busy_server_with_stale_revision("active-turn");
+        core.execute_idempotent(
+            IdempotencyKey::from("activate-before-removal"),
+            Some(observed_revision),
+            false,
+            Command::EnqueuePrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text: "already running".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        )
+        .0
+        .expect("queue target");
+        assert_queued_turn_starts(
+            &mut core,
+            &session_id,
+            "active-turn",
+            "promoted-turn",
+            "already running",
+            "activate-before-removal",
+        );
+
+        let revision_before_noop = core
+            .engine_for(&session_id)
+            .expect("session engine")
+            .revision();
+        let (result, effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("remove-after-activation"),
+            Some(observed_revision),
+            false,
+            Command::RemoveQueuedPrompt {
+                session_id: session_id.clone(),
+                prompt_id: "activate-before-removal".into(),
+            },
+        );
+
+        let accepted = result.expect("activated target is authoritatively absent from the queue");
+        assert!(effects.is_empty(), "the active turn must not be disturbed");
+        assert!(!changed);
+        assert_eq!(accepted.revision, Some(revision_before_noop));
+        let view = core.session_view(&session_id).expect("session view");
+        assert!(view.queue.is_empty());
+        assert!(
+            view.transcript.entries.iter().any(|entry| {
+                entry.source_prompt_id.as_deref() == Some("activate-before-removal")
+            })
+        );
     }
 
     #[test]

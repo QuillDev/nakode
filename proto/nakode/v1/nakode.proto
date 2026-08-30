@@ -48,6 +48,8 @@ service NakodeService {
   // deliberate repeated sends from a retry of one logical send.
   rpc SendPrompt(SendPromptRequest) returns (MutationResult);
   rpc EnqueuePrompt(EnqueuePromptRequest) returns (MutationResult);
+  // Removes one exact queued prompt identity against authoritative state. expected_revision does not
+  // fence this operation. An identity already absent because it was removed or activated is success.
   rpc RemoveQueuedPrompt(RemoveQueuedPromptRequest) returns (MutationResult);
   // Atomically redirects active work to one queued prompt. Providers steer the current turn when
   // supported; interruption-only providers stop it and start the selected prompt next.
@@ -239,8 +241,9 @@ message ActivationStatus {
 message MutationOptions {
   // SDK-generated and stable across a retry of one logical operation.
   string idempotency_key = 1;
-  // For revision-fenced commands, a mismatch rejects the mutation. SendPrompt is append-only owner
-  // intent and ignores this field so incidental turn progress cannot reject a safe queue append.
+  // For revision-fenced commands, a mismatch rejects the mutation. SendPrompt, EnqueuePrompt, and
+  // RemoveQueuedPrompt are authoritative queue intent and ignore this field; prompt submission uses
+  // the mutation identity while removal addresses one stable queue identity.
   // When omitted, the command is evaluated against authoritative state current at execution time.
   optional uint64 expected_revision = 2;
 }
