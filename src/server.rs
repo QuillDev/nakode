@@ -1380,6 +1380,12 @@ impl ServerCore {
         external_thread_id: &str,
     ) -> DomainCommandOutcome {
         let bridge = self.session_bridge_mut(session_id)?;
+        if bridge.pending_inbound.is_some() {
+            return Err(DomainCommandError::Conflict(
+                "cannot clear an external thread while its accepted inbound prompt is unresolved"
+                    .to_owned(),
+            ));
+        }
         if bridge.transport.as_deref() != Some(transport)
             || bridge.external_thread_id.as_deref() != Some(external_thread_id)
         {
@@ -1700,7 +1706,7 @@ impl ServerCore {
             accepted.replayed_bridge_source_active = replayed_source_active;
             return Ok((accepted, effects));
         }
-        if consume_as_busy {
+        if consume_as_busy || bridge.pending_inbound.is_some() {
             self.remember_bridge_inbound_event(
                 session_id,
                 external_event_id,
@@ -1793,7 +1799,7 @@ impl ServerCore {
         match self
             .session_engine_mut(session_id)?
             .state_mut()
-            .submit_prompt_with_id_and_source(
+            .replay_pending_prompt_with_id_and_source(
                 pending.client_prompt_id,
                 pending.text,
                 pending.attachments,
@@ -2244,9 +2250,23 @@ impl ServerCore {
     ) -> DomainCommandOutcome {
         self.ensure_session(session_id)?;
         self.reload_agent_catalogue_for_session(session_id)?;
+        let recovered_prompt_id = if prompt_id.is_none() {
+            self.session_view(session_id)
+                .ok()
+                .and_then(|session| session.recoverable_prompt)
+                .filter(|recoverable| {
+                    recoverable.text == prompt.text && recoverable.attachments == prompt.attachments
+                })
+                .map(|recoverable| recoverable.id.to_string())
+        } else {
+            None
+        };
         let (text, attachments) = self.convert_prompt(session_id, prompt)?;
         let accepted_prompt_id = prompt_id.map_or_else(
-            || format!("nakode-msg-{}", uuid::Uuid::now_v7()),
+            || {
+                recovered_prompt_id
+                    .unwrap_or_else(|| format!("nakode-msg-{}", uuid::Uuid::now_v7()))
+            },
             str::to_owned,
         );
         let state = self.session_engine_mut(session_id)?.state_mut();
@@ -5354,6 +5374,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
@@ -5404,6 +5425,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
@@ -5887,6 +5909,29 @@ mod tests {
             effects.first(),
             Some(crate::state::Effect::PersistSessionBridge(_))
         ));
+        let unresolved_pending = core
+            .session_bridge(&session_id)
+            .expect("bridge")
+            .pending_inbound
+            .clone()
+            .expect("accepted pending inbound");
+        assert!(matches!(
+            core.clear_session_bridge_thread_command(
+                &session_id,
+                "thread-transport",
+                "101",
+            ),
+            Err(DomainCommandError::Conflict(message))
+                if message.contains("accepted inbound prompt is unresolved")
+        ));
+        assert_eq!(
+            core.session_bridge(&session_id)
+                .expect("bridge")
+                .transport
+                .as_deref(),
+            Some("thread-transport"),
+            "unresolved recovery provenance must not be cleared for rebinding"
+        );
         let (duplicate_result, duplicate) = core
             .continue_session_from_bridge_command(
                 &session_id,
@@ -5927,6 +5972,14 @@ mod tests {
             busy_effects.as_slice(),
             [crate::state::Effect::PersistSessionBridge(_)]
         ));
+        assert_eq!(
+            core.session_bridge(&session_id)
+                .expect("bridge")
+                .pending_inbound
+                .as_ref(),
+            Some(&unresolved_pending),
+            "a later continuation must not overwrite the unresolved recovery record"
+        );
         let (busy_duplicate, duplicate_effects) = core
             .continue_session_from_bridge_command(
                 &session_id,
@@ -6745,6 +6798,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
@@ -6821,6 +6875,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
@@ -6926,6 +6981,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
@@ -7065,6 +7121,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
@@ -7097,6 +7154,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
@@ -9959,6 +10017,7 @@ enabled = false
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
             created_at: 0,
             updated_at: 0,
             last_owner_activity_at: None,

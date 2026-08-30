@@ -15,8 +15,8 @@ use std::{
 use tokio::sync::{Mutex, mpsc};
 
 use nakode_protocol::{
-    BridgeContinuationDisposition, Command, ErrorCode, Query, QueryResult, ServiceCapabilities,
-    ServiceCapability, ServiceError, Snapshot,
+    BridgeContinuationDisposition, BridgeLifecycle, Command, ErrorCode, Query, QueryResult,
+    ServiceCapabilities, ServiceCapability, ServiceError, Snapshot,
 };
 use nakode_server::{ServerEndpoint, ServerRequests};
 use thiserror::Error;
@@ -37,7 +37,7 @@ use crate::{
     service::ServiceEngine,
     session::{
         ProviderAccountRecord, ProviderRecord, SessionError, SessionRecord, SessionRepository,
-        SqliteSessionRepository,
+        SqliteSessionRepository, is_pending_provider_session_id,
     },
     shell::{ShellEvent, ShellProcesses},
     skill::{SkillCatalog, SkillCatalogError},
@@ -191,6 +191,8 @@ impl BridgeMutationRollback {
             Command::CreateSession {
                 bridge: Some(_), ..
             }
+            | Command::SendPrompt { .. }
+            | Command::EnqueuePrompt { .. }
             | Command::ContinueSessionFromBridge { .. }
             | Command::DeleteSession { .. }
             | Command::OpenSession {
@@ -232,7 +234,7 @@ pub(crate) struct NativeServerRuntime {
     shutdown: mpsc::Receiver<()>,
     quiesce: mpsc::Receiver<QuiesceRequest>,
     accepting_work: bool,
-    pending_bridge_acknowledgements: HashMap<nakode_protocol::SessionId, String>,
+    pending_bridge_acknowledgements: HashMap<nakode_protocol::SessionId, (String, String)>,
     delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
     native_cancellation_tx: mpsc::Sender<u64>,
     native_cancellations: mpsc::Receiver<u64>,
@@ -1514,25 +1516,20 @@ impl NativeServerRuntime {
             .effect_session
             .clone()
             .unwrap_or_else(|| self.core.default_session_id().clone());
-        if let Err(_error) = persist_bridge_effects(
+        if let Err(_error) = persist_command_dispatch_effects(
+            &mut self.core,
+            &session_id,
             self.effects.persistence.sessions.as_ref(),
             &mut effects,
             inbound_event_to_claim.as_ref(),
         ) {
-            // The external transport and provider must observe bridge work only after its durable
-            // authority checkpoint. Restore both logical-session and idempotency state so a
-            // same-process retry (including the same key) can execute rather than replaying an
-            // un-dispatched success.
             match rollback {
                 Some(rollback) => rollback.restore(&mut self.core),
-                None => {
-                    // A new bridge-producing command must opt into rollback before retries are safe.
-                    self.accepting_work = false;
-                }
+                None => self.accepting_work = false,
             }
             outcome.respond_with_error(ServiceError {
                 code: ErrorCode::Internal,
-                message: "the durable orchestrator bridge checkpoint failed; retry the operation"
+                message: "the durable owner transcript checkpoint failed; retry the operation"
                     .to_owned(),
                 retryable: true,
             });
@@ -1652,6 +1649,49 @@ impl NativeServerRuntime {
             .commit_and_publish_session(&self.endpoint, &session_id);
     }
 
+    fn fence_owner_prompt_dispatch(
+        &mut self,
+        session_id: &nakode_protocol::SessionId,
+        effects: &mut Vec<Effect>,
+    ) {
+        let starts_turn = effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. })));
+        let Err(error) = persist_owner_prompt_effects(
+            &mut self.core,
+            session_id,
+            self.effects.persistence.sessions.as_ref(),
+            effects,
+        ) else {
+            return;
+        };
+        effects
+            .retain(|effect| !matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. })));
+        if !starts_turn {
+            return;
+        }
+        if let Some(engine) = self.core.engine_for_mut(session_id) {
+            let state = engine.state_mut();
+            let provider = state.active_provider_id().to_owned();
+            // A persistence outage is not a provider rejection of every queued owner turn. Hold the
+            // queue out of the generic StartTurn failure transition so it restores only the fenced
+            // prompt; then retain and execute any other recovery effects that transition returns.
+            let queued = std::mem::take(&mut state.queue);
+            let recovery = state.handle_provider_backend(
+                &provider,
+                BackendEvent::RequestFailed {
+                    operation: crate::backend::BackendOperation::StartTurn,
+                    code: -1,
+                    message: format!(
+                        "Owner message was not sent because its durable transcript checkpoint failed: {error}"
+                    ),
+                },
+            );
+            state.queue = queued;
+            effects.extend(recovery);
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     // Provider-event correlation, durable bridge acknowledgement, and downstream effect ordering
     // intentionally share this dispatcher so persistence failure can stop every dependent effect.
@@ -1712,25 +1752,91 @@ impl NativeServerRuntime {
             BackendSource::Subagent(_) => None,
         };
         let history_was_rebuilt = matches!(&event, BackendEvent::SessionResumed { .. });
+        if history_was_rebuilt
+            && let Some(session_id) = event_session_id.as_ref()
+            && self.core.session_bridge(session_id).is_ok_and(|bridge| {
+                bridge.lifecycle == BridgeLifecycle::Open && bridge.pending_inbound.is_some()
+            })
+            && let Some(engine) = self.core.engine_for_mut(session_id)
+        {
+            // The durable bridge inbox predates owner prompts accepted while resume was in flight.
+            // Let post-event bridge recovery claim provider dispatch before the ordinary queue.
+            engine.state_mut().defer_queue_for_next_resume();
+        }
         let bridge_origin_turn_id = event_session_id.as_ref().and_then(|_| match &event {
             BackendEvent::TurnAccepted { turn_id }
             | BackendEvent::TurnStarted { turn_id }
             | BackendEvent::TurnCompleted { turn_id, .. } => Some(turn_id.clone()),
             _ => None,
         });
-        let acknowledged_prompt_id = event_session_id.as_ref().and_then(|session_id| {
+        if let Some((session_id, prompt_id, provider_turn_id)) =
+            event_session_id.as_ref().and_then(|session_id| {
+                let BackendEvent::TurnAccepted { turn_id } = &event else {
+                    return None;
+                };
+                self.core
+                    .bridge_prompt_acknowledgement_id(session_id, turn_id, true)
+                    .map(|prompt_id| (session_id.clone(), prompt_id, turn_id.clone()))
+            })
+        {
+            // A provider-generated turn id is trusted only after the backend's acceptance event has
+            // associated it with the bridge prompt currently being dispatched. A bare TurnStarted
+            // cannot manufacture this tuple and consume an unrelated durable inbox item.
+            self.pending_bridge_acknowledgements
+                .insert(session_id, (prompt_id, provider_turn_id));
+        }
+        let acknowledged_bridge = event_session_id.as_ref().and_then(|session_id| {
+            let (BackendEvent::TurnStarted { turn_id }
+            | BackendEvent::TurnCompleted { turn_id, .. }) = &event
+            else {
+                return None;
+            };
             self.pending_bridge_acknowledgements
                 .get(session_id)
-                .cloned()
-                .or_else(|| match &event {
-                    BackendEvent::TurnAccepted { turn_id }
-                    | BackendEvent::TurnStarted { turn_id }
-                    | BackendEvent::TurnCompleted { turn_id, .. } => self
-                        .core
-                        .bridge_prompt_acknowledgement_id(session_id, turn_id, true),
-                    _ => None,
+                .filter(|(_, pending_turn_id)| pending_turn_id == turn_id)
+                .map(|(prompt_id, _)| (prompt_id.clone(), turn_id.clone()))
+                .or_else(|| {
+                    // Providers that echo the stable client prompt id may omit TurnAccepted; that
+                    // exact identity is sufficient on start. Completion participates only when an
+                    // earlier failed checkpoint retained the explicit in-process tuple above.
+                    if matches!(&event, BackendEvent::TurnStarted { .. }) {
+                        self.core
+                            .bridge_prompt_acknowledgement_id(session_id, turn_id, false)
+                            .map(|prompt_id| (prompt_id, turn_id.clone()))
+                    } else {
+                        None
+                    }
                 })
         });
+        let acknowledged_prompt_id = acknowledged_bridge
+            .as_ref()
+            .map(|(prompt_id, _)| prompt_id.clone());
+        if acknowledged_bridge.is_none()
+            && matches!(
+                &event,
+                BackendEvent::TurnStarted { .. } | BackendEvent::TurnCompleted { .. }
+            )
+            && event_session_id.as_ref().is_some_and(|session_id| {
+                self.core
+                    .session_bridge(session_id)
+                    .ok()
+                    .and_then(|bridge| bridge.pending_inbound.as_ref())
+                    .is_some()
+            })
+        {
+            // Do not let an uncorrelated provider event consume `starting_turn`, source provenance,
+            // complete the wrong turn, or reopen delivery of the durable bridge inbox. A generated
+            // provider id becomes eligible only through the TurnAccepted tuple above; an echoed stable
+            // client id is eligible directly on start.
+            return;
+        }
+        let bridge_event_checkpoint = (acknowledged_prompt_id.is_some()
+            || event_session_id.as_ref().is_some_and(|session_id| {
+                self.core.session_bridge(session_id).is_ok_and(|bridge| {
+                    bridge.pending_inbound.is_some() || bridge.active_source_message_id.is_some()
+                })
+            }))
+        .then(|| Box::new(self.core.clone()));
         let origin = match &source {
             BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {
                 EffectOrigin::ProviderControl
@@ -1842,9 +1948,6 @@ impl NativeServerRuntime {
         if history_was_rebuilt {
             self.core.reapply_bridge_turn_origins(&session_id);
         }
-        let bridge_checkpoint = (acknowledged_prompt_id.is_some()
-            || bridge_origin_turn_id.is_some())
-        .then(|| self.core.bridge_state_checkpoint());
         if let Some(turn_id) = bridge_origin_turn_id.as_deref()
             && let Some(effect) = self.core.record_bridge_turn_origin(&session_id, turn_id)
         {
@@ -1864,12 +1967,16 @@ impl NativeServerRuntime {
         )
         .is_err()
         {
-            if let Some(checkpoint) = bridge_checkpoint {
-                self.core.restore_bridge_state(checkpoint);
+            if let Some(checkpoint) = bridge_event_checkpoint {
+                self.core = *checkpoint;
             }
-            if let Some(client_prompt_id) = acknowledged_prompt_id {
+            // Every effect below the provider event was derived from state that has just been
+            // restored. In particular, do not dispatch a queued owner prompt popped by terminal
+            // bridge completion until the inbox acknowledgement is durable.
+            effects.clear();
+            if let Some((client_prompt_id, provider_turn_id)) = acknowledged_bridge {
                 self.pending_bridge_acknowledgements
-                    .insert(session_id.clone(), client_prompt_id);
+                    .insert(session_id.clone(), (client_prompt_id, provider_turn_id));
             }
             // Keep the inbox item pending and retain its in-process acknowledgement correlation. A
             // later provider event or restart retries the same stable client turn identity.
@@ -1881,6 +1988,16 @@ impl NativeServerRuntime {
             }
             false
         };
+        if let Err(error) = persist_session_primary_transitions(
+            self.effects.persistence.sessions.as_ref(),
+            &mut effects,
+        ) && let Some(engine) = self.core.engine_for_mut(&session_id)
+        {
+            engine
+                .state_mut()
+                .session_primary_transition_failed(error.to_string());
+        }
+        self.fence_owner_prompt_dispatch(&session_id, &mut effects);
         let had_effects = !effects.is_empty();
         self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);
@@ -1895,7 +2012,8 @@ impl NativeServerRuntime {
         self.refresh_builtin_tool_availability();
         if !bridge_checkpoint_deferred {
             match self.core.resume_pending_bridge_prompt(&session_id) {
-                Ok(pending_effects) if !pending_effects.is_empty() => {
+                Ok(mut pending_effects) if !pending_effects.is_empty() => {
+                    self.fence_owner_prompt_dispatch(&session_id, &mut pending_effects);
                     self.register_effect_owners(&session_id, &pending_effects);
                     if let Some(engine) = self.core.engine_for_mut(&session_id) {
                         self.effects
@@ -4166,6 +4284,8 @@ impl EffectExecutor {
             | Effect::UpdateSessionModel { .. }
             | Effect::TransitionSessionPrimary { .. }
             | Effect::UpdateSessionLastTurn { .. }
+            | Effect::PersistAcceptedOwnerPrompt { .. }
+            | Effect::AcknowledgeOwnerPromptDispatch { .. }
             | Effect::RecordOwnerActivity(_)
             | Effect::TouchSession(_)) => {
                 execute_persistence_effect(state, sessions, effect);
@@ -4373,6 +4493,179 @@ fn bridge_inbound_event_identity(
     Some((session_id.clone(), external_event_id.clone()))
 }
 
+fn persist_command_dispatch_effects(
+    core: &mut ServerCore,
+    effect_session: &nakode_protocol::SessionId,
+    sessions: &dyn SessionRepository,
+    effects: &mut Vec<Effect>,
+    inbound_event_to_claim: Option<&(
+        nakode_protocol::SessionId,
+        String,
+        BridgeContinuationDisposition,
+    )>,
+) -> Result<(), SessionError> {
+    if effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::PersistSession { .. }))
+    {
+        persist_owner_prompt_effects(core, effect_session, sessions, effects)?;
+        return persist_bridge_effects(sessions, effects, inbound_event_to_claim);
+    }
+    let mut owner_prompts = Vec::new();
+    let mut bridges = Vec::new();
+    let mut remaining = Vec::with_capacity(effects.len());
+    for effect in effects.drain(..) {
+        match effect {
+            Effect::PersistAcceptedOwnerPrompt { session_id, prompt } => {
+                owner_prompts.push((session_id, prompt));
+            }
+            Effect::PersistSessionBridge(bridge) => bridges.push(bridge),
+            effect => remaining.push(effect),
+        }
+    }
+    let inbound_event = inbound_event_to_claim.map(|(session_id, event_id, disposition)| {
+        (session_id.as_str(), event_id.as_str(), *disposition)
+    });
+    let result = if owner_prompts.is_empty() && bridges.is_empty() {
+        Ok(())
+    } else {
+        sessions.save_prompt_dispatch_checkpoint(&owner_prompts, &bridges, inbound_event)
+    };
+    *effects = remaining;
+    result
+}
+
+fn persist_owner_prompt_effects(
+    core: &mut ServerCore,
+    effect_session: &nakode_protocol::SessionId,
+    sessions: &dyn SessionRepository,
+    effects: &mut Vec<Effect>,
+) -> Result<(), SessionError> {
+    let state = core
+        .engine_for_mut(effect_session)
+        .ok_or_else(|| SessionError::SessionNotFound(effect_session.to_string()))?
+        .state_mut();
+    let mut checkpoints = Vec::new();
+    let mut remaining = Vec::with_capacity(effects.len());
+    for effect in effects.drain(..) {
+        match effect {
+            effect
+            @ (Effect::PersistSession { .. } | Effect::PersistAcceptedOwnerPrompt { .. }) => {
+                checkpoints.push(effect);
+            }
+            effect => remaining.push(effect),
+        }
+    }
+    let creation_prompt = checkpoints.iter().find_map(|checkpoint| match checkpoint {
+        Effect::PersistAcceptedOwnerPrompt { prompt, .. } => Some(prompt.clone()),
+        _ => None,
+    });
+    let checkpoint_result = (|| {
+        let mut creation_prompt_persisted = false;
+        for checkpoint in checkpoints {
+            match checkpoint {
+                Effect::PersistSession {
+                    provider,
+                    account_id,
+                    provider_session_id,
+                    workspace,
+                    working_directory,
+                    title,
+                    model,
+                    options,
+                } => {
+                    let enabled_skill_ids = state.enabled_skill_ids();
+                    let record = sessions.create_with_account_id_and_skill_profile(
+                        &state.nakode_session_id,
+                        &provider,
+                        account_id.as_deref(),
+                        &provider_session_id,
+                        &workspace,
+                        &working_directory,
+                        &title,
+                        model.as_deref(),
+                        &options,
+                        Some(&enabled_skill_ids),
+                        state.skill_profile_id(),
+                        None,
+                        creation_prompt.as_ref(),
+                    )?;
+                    creation_prompt_persisted = creation_prompt.is_some();
+                    state.session_persisted(&record);
+                }
+                Effect::PersistAcceptedOwnerPrompt { session_id, prompt } => {
+                    if !creation_prompt_persisted {
+                        sessions.record_owner_prompt(&session_id, &prompt)?;
+                    }
+                }
+                _ => unreachable!("only owner transcript checkpoints are collected"),
+            }
+        }
+        Ok(())
+    })();
+    *effects = remaining;
+    checkpoint_result
+}
+
+fn persist_session_primary_transitions(
+    sessions: &dyn SessionRepository,
+    effects: &mut Vec<Effect>,
+) -> Result<(), SessionError> {
+    let mut transitions = Vec::new();
+    let mut remaining = Vec::with_capacity(effects.len());
+    for effect in effects.drain(..) {
+        match effect {
+            Effect::TransitionSessionPrimary {
+                session_id,
+                provider,
+                account_id,
+                provider_session_id,
+                model,
+                options,
+            } => transitions.push((
+                session_id,
+                provider,
+                account_id,
+                provider_session_id,
+                model,
+                options,
+            )),
+            effect => remaining.push(effect),
+        }
+    }
+    let provider_sessions = transitions
+        .iter()
+        .map(|(_, _, _, provider_session_id, _, _)| provider_session_id.clone())
+        .collect::<Vec<_>>();
+    let result = transitions.into_iter().try_for_each(
+        |(session_id, provider, account_id, provider_session_id, model, options)| {
+            sessions.transition_primary_with_account(
+                &session_id,
+                &provider,
+                account_id.as_deref(),
+                &provider_session_id,
+                model.as_deref(),
+                &options,
+            )
+        },
+    );
+    if result.is_err() {
+        // A provider session now exists remotely, but no turn may start until its native identity
+        // replaces the durable pending-creation sentinel. Fence all other provider work and make a
+        // bounded best effort to release each identity returned by SessionCreated; restart recovery
+        // can then retry creation from the still-pending owner checkpoint without knowingly leaving
+        // an unreachable provider session behind.
+        remaining.retain(|effect| !matches!(effect, Effect::Backend(_)));
+        remaining.extend(provider_sessions.into_iter().map(|provider_session_id| {
+            Effect::Backend(BackendCommand::UnsubscribeSession {
+                provider_session_id,
+            })
+        }));
+    }
+    *effects = remaining;
+    result
+}
+
 fn persist_bridge_effects(
     sessions: &dyn SessionRepository,
     effects: &mut Vec<Effect>,
@@ -4412,6 +4705,7 @@ fn persist_bridge_effects(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_persistence_effect(
     state: &mut DomainState,
     sessions: &dyn SessionRepository,
@@ -4501,6 +4795,20 @@ fn execute_persistence_effect(
         Effect::UpdateSessionLastTurn { session_id, turn } => {
             update_session_last_turn(state, sessions, &session_id, &turn);
         }
+        Effect::PersistAcceptedOwnerPrompt { session_id, prompt } => {
+            record_owner_prompt(state, sessions, &session_id, &prompt);
+        }
+        Effect::AcknowledgeOwnerPromptDispatch {
+            session_id,
+            prompt_id,
+        } => match acknowledge_owner_prompt_dispatch_with_retry(|| {
+            sessions.acknowledge_owner_prompt_dispatch(&session_id, &prompt_id)
+        }) {
+            Ok(()) => state.settle_owner_prompt_dispatch(&prompt_id),
+            Err(error) => {
+                state.owner_prompt_dispatch_acknowledgement_failed(&prompt_id, error.to_string());
+            }
+        },
         Effect::RecordOwnerActivity(id) => record_owner_activity(state, sessions, &id),
         Effect::TouchSession(id) => touch_session(state, sessions, &id),
         Effect::PersistSessionBridge(bridge) => {
@@ -4509,6 +4817,24 @@ fn execute_persistence_effect(
             }
         }
         _ => unreachable!("only persistence effects are routed here"),
+    }
+}
+
+const OWNER_PROMPT_DISPATCH_ACKNOWLEDGEMENT_ATTEMPTS: usize = 2;
+
+/// Retry one failed idempotent dispatch acknowledgement before leaving the durable prompt pending.
+/// Provider dispatch is not repeated here, and in-memory settlement still follows durable success.
+fn acknowledge_owner_prompt_dispatch_with_retry(
+    mut acknowledge: impl FnMut() -> Result<(), SessionError>,
+) -> Result<(), SessionError> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match acknowledge() {
+            Ok(()) => return Ok(()),
+            Err(_error) if attempts < OWNER_PROMPT_DISPATCH_ACKNOWLEDGEMENT_ATTEMPTS => {}
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -4539,6 +4865,7 @@ fn persist_session(
         Some(&enabled_skill_ids),
         state.skill_profile_id(),
         Some(state.code_mode()),
+        None,
     ) {
         Ok(record) => state.session_persisted(&record),
         Err(error) => state.session_store_failed(error.to_string()),
@@ -4596,24 +4923,28 @@ async fn send_backend_command(
     let durable_session_id = state
         .durable_session_id_for_backend()
         .map(ToOwned::to_owned);
-    let unbound_durable_session = if let Some(durable_session_id) = durable_session_id.as_deref() {
-        match sessions.find(durable_session_id) {
-            Ok(Some(record)) => record.account_id.is_none(),
-            Ok(None) => false,
-            Err(error) => {
-                state.handle_provider_backend(
-                    &provider,
-                    BackendEvent::Disconnected {
-                        reason: format!("could not read provider account affinity: {error}"),
-                    },
-                );
-                return;
+    let (unbound_durable_session, pending_creation_session) =
+        if let Some(durable_session_id) = durable_session_id.as_deref() {
+            match sessions.find(durable_session_id) {
+                Ok(Some(record)) => (
+                    record.account_id.is_none(),
+                    is_pending_provider_session_id(&record.provider_session_id),
+                ),
+                Ok(None) => (false, false),
+                Err(error) => {
+                    state.handle_provider_backend(
+                        &provider,
+                        BackendEvent::Disconnected {
+                            reason: format!("could not read provider account affinity: {error}"),
+                        },
+                    );
+                    return;
+                }
             }
-        }
-    } else {
-        false
-    };
-    if unbound_durable_session && requested_account.is_none() {
+        } else {
+            (false, false)
+        };
+    if unbound_durable_session && !pending_creation_session && requested_account.is_none() {
         state.handle_provider_backend(
             &provider,
             BackendEvent::Disconnected {
@@ -4640,9 +4971,10 @@ async fn send_backend_command(
         }
     };
 
-    // A historical durable session can be safely bound only when the caller explicitly identifies
-    // its original account. Never guess from the current least-loaded account: the provider-native
-    // conversation may not be portable across credentials.
+    // Historical unbound rows require an explicit account because their provider-native identity
+    // may belong to credentials that are no longer the automatic choice. A pending-creation row has
+    // no provider-native identity yet, so automatic routing is safe; bind that selected account
+    // durably before releasing StartSession.
     let needs_affinity = unbound_durable_session;
     if needs_affinity && let Some(durable_session_id) = durable_session_id.as_deref() {
         if let Err(error) =
@@ -5015,6 +5347,17 @@ fn remove_session_release_effect(effects: &mut Vec<Effect>, session_id: &str) {
     effects.retain(|effect| {
         !matches!(effect, Effect::ReleaseSessionBackends(released) if released == session_id)
     });
+}
+
+fn record_owner_prompt(
+    state: &mut DomainState,
+    sessions: &dyn SessionRepository,
+    session_id: &str,
+    prompt: &crate::session::PersistedOwnerPrompt,
+) {
+    if let Err(error) = sessions.record_owner_prompt(session_id, prompt) {
+        state.session_store_failed(error.to_string());
+    }
 }
 
 fn record_owner_activity(state: &mut DomainState, sessions: &dyn SessionRepository, id: &str) {
@@ -5432,14 +5775,15 @@ mod tests {
         BackendRegistry, BackendSource, EffectExecutor, EffectOrigin, McpCallCompletion,
         NativeServerRuntime, PendingMcpCall, PendingNativeDelegation, PersistenceServices,
         ProviderCredentialInput, QuiesceMode, QuiesceRequest, QuiescenceBlocker,
-        SessionBackendTasks, load_subagents, merge_invocation_catalogue,
-        native_service_capabilities, provider_enablement_changes, save_provider_credential,
+        SessionBackendTasks, acknowledge_owner_prompt_dispatch_with_retry, load_subagents,
+        merge_invocation_catalogue, native_service_capabilities,
+        persist_session_primary_transitions, provider_enablement_changes, save_provider_credential,
     };
     use crate::{
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendHandle, BackendIdentity,
             CODEX_PROVIDER, DEVIN_PROVIDER, ExternalToolRequest, ModelInfo,
-            ProviderFailureClassification,
+            ModelOptions as BackendModelOptions, ProviderFailureClassification,
         },
         config::{Config, OpenAiReasoningEffort},
         credential::{CredentialStore, SqliteCredentialStore},
@@ -5447,8 +5791,9 @@ mod tests {
         service::ServiceEngine,
         session::{
             BridgeInboundTurnOriginRecord, BridgePendingInboundRecord, InvocationRecord,
-            ProviderAccountRecord, SessionBridgeRecord, SessionRepository, SqliteSessionRepository,
-            SubagentObservability, SubagentRecord,
+            ProviderAccountRecord, SessionBridgeRecord, SessionError, SessionRepository,
+            SqliteSessionRepository, SubagentObservability, SubagentRecord,
+            pending_provider_session_id,
         },
         skill::{SkillCatalog, SkillPreference},
         state::{DomainState, Effect, SubagentStatus},
@@ -5472,6 +5817,457 @@ mod tests {
             model_filter_enabled: false,
             selected_model_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn provider_session_transition_is_checkpointed_before_backend_effects() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let store = SqliteSessionRepository::open(workspace.path().join("sessions.sqlite3"))
+            .expect("session store");
+        let session_id = "pending-transition";
+        store
+            .create_with_id(
+                session_id,
+                CODEX_PROVIDER,
+                &pending_provider_session_id(session_id),
+                workspace.path().to_string_lossy().as_ref(),
+                workspace.path().to_string_lossy().as_ref(),
+                "pending owner",
+                Some("model"),
+                &BackendModelOptions::default(),
+                None,
+            )
+            .expect("pending session");
+        let mut effects = vec![
+            Effect::TransitionSessionPrimary {
+                session_id: session_id.to_owned(),
+                provider: CODEX_PROVIDER.to_owned(),
+                account_id: None,
+                provider_session_id: "provider-created".to_owned(),
+                model: Some("model".to_owned()),
+                options: BackendModelOptions::default(),
+            },
+            Effect::Backend(BackendCommand::BeginAuthentication),
+        ];
+
+        persist_session_primary_transitions(&store, &mut effects)
+            .expect("provider identity checkpoint");
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(BackendCommand::BeginAuthentication)]
+        ));
+        assert_eq!(
+            store
+                .find(session_id)
+                .expect("load session")
+                .expect("session")
+                .provider_session_id,
+            "provider-created"
+        );
+    }
+
+    #[test]
+    fn failed_provider_session_transition_fences_backend_effects() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let store = SqliteSessionRepository::open(workspace.path().join("sessions.sqlite3"))
+            .expect("session store");
+        let mut effects = vec![
+            Effect::TransitionSessionPrimary {
+                session_id: "missing-session".to_owned(),
+                provider: CODEX_PROVIDER.to_owned(),
+                account_id: None,
+                provider_session_id: "provider-created".to_owned(),
+                model: Some("model".to_owned()),
+                options: BackendModelOptions::default(),
+            },
+            Effect::Backend(BackendCommand::BeginAuthentication),
+        ];
+
+        persist_session_primary_transitions(&store, &mut effects)
+            .expect_err("missing pending checkpoint must fail");
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(BackendCommand::UnsubscribeSession { provider_session_id })]
+                if provider_session_id == "provider-created"
+        ));
+    }
+
+    #[test]
+    fn owner_prompt_dispatch_acknowledgement_retries_once_without_repeating_provider_work() {
+        let mut attempts = 0;
+        acknowledge_owner_prompt_dispatch_with_retry(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(SessionError::SessionNotFound(
+                    "injected first failure".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("second durable acknowledgement succeeds");
+        assert_eq!(attempts, 2);
+
+        let mut exhausted_attempts = 0;
+        let error = acknowledge_owner_prompt_dispatch_with_retry(|| {
+            exhausted_attempts += 1;
+            Err(SessionError::SessionNotFound(format!(
+                "injected failure {exhausted_attempts}"
+            )))
+        })
+        .expect_err("bounded acknowledgement retry must stop");
+        assert_eq!(exhausted_attempts, 2);
+        assert!(error.to_string().contains("injected failure 2"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn failed_owner_checkpoint_fences_only_promoted_prompt_and_preserves_queue() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let database = workspace.path().join("sessions.sqlite3");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let account_id = persistence
+            .sessions
+            .add_provider_account(CODEX_PROVIDER, "Codex test")
+            .expect("provider account")
+            .account_id;
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        state.handle_backend(BackendEvent::Ready(BackendIdentity {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            version: None,
+            capabilities: BackendCapabilities::default(),
+        }));
+        state.handle_backend(BackendEvent::Models(vec![ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "model".to_owned(),
+            is_default: true,
+            capabilities: crate::codex::model_capabilities(),
+        }]));
+        state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "provider-session".to_owned(),
+            model: "model".to_owned(),
+        });
+        state.provider_account_id = Some(account_id.clone());
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let mut initial_effects = state
+            .submit_prompt_with_id_and_source(
+                "initial-prompt".to_owned(),
+                "initial".to_owned(),
+                Vec::new(),
+                None,
+            )
+            .expect("initial prompt starts");
+        assert!(
+            initial_effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. }))),
+            "initial prompt must produce StartTurn: {initial_effects:?}"
+        );
+        let (backend, mut commands, _events) = fake_backend();
+        let mut registry = empty_registry(workspace.path()).await;
+        let (control, _control_commands) = mpsc::channel(1);
+        registry.commands.insert(CODEX_PROVIDER.to_owned(), control);
+        registry.provider_accounts.insert(
+            CODEX_PROVIDER.to_owned(),
+            vec![routing_account(
+                CODEX_PROVIDER,
+                account_id.as_str(),
+                "Codex test",
+                true,
+                true,
+                nakode_protocol::ProviderAccountRoutingMode::Automatic,
+            )],
+        );
+        registry.insert_session(
+            session_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            account_id.clone(),
+            backend,
+        );
+        let effects = EffectExecutor::new(registry, persistence);
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        runtime.fence_owner_prompt_dispatch(&session_id, &mut initial_effects);
+        assert!(
+            initial_effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. }))),
+            "durable checkpoint unexpectedly fenced the initial prompt: {initial_effects:?}; status={} ",
+            runtime
+                .core
+                .engine_for(&session_id)
+                .expect("session state")
+                .state()
+                .status_message
+        );
+        runtime.register_effect_owners(&session_id, &initial_effects);
+        if let Some(engine) = runtime.core.engine_for_mut(&session_id) {
+            runtime
+                .effects
+                .execute(
+                    &session_id,
+                    engine.state_mut(),
+                    initial_effects,
+                    EffectOrigin::PrimarySession,
+                )
+                .await;
+        }
+        let initial_command = tokio::time::timeout(Duration::from_secs(1), commands.recv()).await;
+        assert!(
+            matches!(initial_command, Ok(Some(BackendCommand::StartTurn { .. }))),
+            "initial backend command missing: {initial_command:?}; status={}",
+            runtime
+                .core
+                .engine_for(&session_id)
+                .expect("session state")
+                .state()
+                .status_message
+        );
+        runtime
+            .handle_backend_event(
+                BackendSource::Primary {
+                    session_id: session_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                    account_id: account_id.clone(),
+                },
+                BackendEvent::TurnStarted {
+                    turn_id: "initial-provider-turn".to_owned(),
+                },
+            )
+            .await;
+        let state = runtime
+            .core
+            .engine_for_mut(&session_id)
+            .expect("session state")
+            .state_mut();
+        state
+            .enqueue_prompt_with_id(
+                "queued-first".to_owned(),
+                "first queued".to_owned(),
+                Vec::new(),
+            )
+            .expect("first queue item");
+        state
+            .enqueue_prompt_with_id(
+                "queued-second".to_owned(),
+                "second queued".to_owned(),
+                Vec::new(),
+            )
+            .expect("second queue item");
+
+        let breaker = rusqlite::Connection::open(&database).expect("breaker connection");
+        breaker
+            .execute_batch(
+                "CREATE TRIGGER fail_promoted_owner_checkpoint \
+                 BEFORE INSERT ON accepted_owner_prompts \
+                 WHEN NEW.prompt_id = 'queued-first' \
+                 BEGIN SELECT RAISE(ABORT, 'forced owner checkpoint failure'); END;",
+            )
+            .expect("owner checkpoint failure trigger");
+        runtime
+            .handle_backend_event(
+                BackendSource::Primary {
+                    session_id: session_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                    account_id: account_id.clone(),
+                },
+                BackendEvent::TurnCompleted {
+                    turn_id: "initial-provider-turn".to_owned(),
+                    outcome: crate::backend::TurnOutcome::Completed,
+                    error: None,
+                },
+            )
+            .await;
+
+        assert!(
+            commands.try_recv().is_err(),
+            "fenced prompt reached provider"
+        );
+        let state = runtime
+            .core
+            .engine_for(&session_id)
+            .expect("session state")
+            .state();
+        assert_eq!(
+            state.recoverable_prompt().map(|prompt| prompt.id.as_str()),
+            Some("queued-first")
+        );
+        assert_eq!(
+            state
+                .queue
+                .iter()
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>(),
+            ["queued-second"]
+        );
+        let stored: i64 = breaker
+            .query_row(
+                "SELECT COUNT(*) FROM accepted_owner_prompts WHERE prompt_id = 'queued-first'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("owner checkpoint count");
+        assert_eq!(stored, 0);
+        runtime.effects.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn first_dispatch_acknowledgement_failure_retries_without_provider_redispatch() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let database = workspace.path().join("sessions.sqlite3");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let account_id = persistence
+            .sessions
+            .add_provider_account(CODEX_PROVIDER, "Codex test")
+            .expect("provider account")
+            .account_id;
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        state.handle_backend(BackendEvent::Ready(BackendIdentity {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            version: None,
+            capabilities: BackendCapabilities::default(),
+        }));
+        state.handle_backend(BackendEvent::Models(vec![ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "model".to_owned(),
+            is_default: true,
+            capabilities: crate::codex::model_capabilities(),
+        }]));
+        state.handle_backend(BackendEvent::SessionCreated {
+            provider_session_id: "provider-session".to_owned(),
+            model: "model".to_owned(),
+        });
+        state.provider_account_id = Some(account_id.clone());
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let mut prompt_effects = state
+            .submit_prompt_with_id_and_source(
+                "retry-ack-prompt".to_owned(),
+                "retry acknowledgement".to_owned(),
+                Vec::new(),
+                None,
+            )
+            .expect("prompt starts");
+        assert!(
+            prompt_effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. }))),
+            "owner prompt must produce StartTurn: {prompt_effects:?}"
+        );
+        let (backend, mut commands, _events) = fake_backend();
+        let mut registry = empty_registry(workspace.path()).await;
+        let (control, _control_commands) = mpsc::channel(1);
+        registry.commands.insert(CODEX_PROVIDER.to_owned(), control);
+        registry.provider_accounts.insert(
+            CODEX_PROVIDER.to_owned(),
+            vec![routing_account(
+                CODEX_PROVIDER,
+                account_id.as_str(),
+                "Codex test",
+                true,
+                true,
+                nakode_protocol::ProviderAccountRoutingMode::Automatic,
+            )],
+        );
+        registry.insert_session(
+            session_id.clone(),
+            CODEX_PROVIDER.to_owned(),
+            account_id.clone(),
+            backend,
+        );
+        let effects = EffectExecutor::new(registry, persistence);
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        runtime.fence_owner_prompt_dispatch(&session_id, &mut prompt_effects);
+        runtime.register_effect_owners(&session_id, &prompt_effects);
+        if let Some(engine) = runtime.core.engine_for_mut(&session_id) {
+            runtime
+                .effects
+                .execute(
+                    &session_id,
+                    engine.state_mut(),
+                    prompt_effects,
+                    EffectOrigin::PrimarySession,
+                )
+                .await;
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), commands.recv())
+                .await
+                .expect("backend command timeout"),
+            Some(BackendCommand::StartTurn { .. })
+        ));
+
+        let breaker = rusqlite::Connection::open(&database).expect("breaker connection");
+        breaker
+            .execute_batch(
+                "CREATE TABLE acknowledgement_attempts (attempted INTEGER NOT NULL); \
+                 INSERT INTO acknowledgement_attempts VALUES (0); \
+                 CREATE TRIGGER fail_first_owner_acknowledgement \
+                 BEFORE UPDATE OF dispatch_pending ON accepted_owner_prompts \
+                 WHEN NEW.prompt_id = 'retry-ack-prompt' \
+                   AND (SELECT attempted FROM acknowledgement_attempts) = 0 \
+                 BEGIN \
+                   UPDATE acknowledgement_attempts SET attempted = 1; \
+                   SELECT RAISE(FAIL, 'forced first acknowledgement failure'); \
+                 END;",
+            )
+            .expect("one-shot acknowledgement failure trigger");
+        runtime
+            .handle_backend_event(
+                BackendSource::Primary {
+                    session_id: session_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                    account_id: account_id.clone(),
+                },
+                BackendEvent::TurnStarted {
+                    turn_id: "provider-turn".to_owned(),
+                },
+            )
+            .await;
+
+        let (dispatch_pending, attempts): (i64, i64) = breaker
+            .query_row(
+                "SELECT prompt.dispatch_pending, attempts.attempted \
+                 FROM accepted_owner_prompts prompt CROSS JOIN acknowledgement_attempts attempts \
+                 WHERE prompt.prompt_id = 'retry-ack-prompt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("durable acknowledgement state");
+        assert_eq!(dispatch_pending, 0);
+        assert_eq!(attempts, 1);
+        assert!(
+            commands.try_recv().is_err(),
+            "acknowledgement retry repeated provider work"
+        );
+        runtime.effects.shutdown().await;
     }
 
     #[test]
@@ -6114,6 +6910,89 @@ mod tests {
             Some(BackendCommand::Shutdown)
         ));
     }
+    #[tokio::test]
+    async fn pending_creation_uses_and_persists_automatic_account_selection() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let session_id = "pending-automatic-account";
+        persistence
+            .sessions
+            .create_with_id(
+                session_id,
+                CODEX_PROVIDER,
+                &pending_provider_session_id(session_id),
+                workspace.path().to_str().expect("utf8 workspace"),
+                workspace.path().to_str().expect("utf8 workspace"),
+                "Pending session",
+                None,
+                &BackendModelOptions::default(),
+                None,
+            )
+            .expect("pending session");
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        state.session_id = Some(session_id.to_owned());
+
+        let mut registry = empty_registry(workspace.path()).await;
+        registry.provider_accounts.insert(
+            CODEX_PROVIDER.to_owned(),
+            vec![routing_account(
+                CODEX_PROVIDER,
+                CODEX_TEST_ACCOUNT_ID,
+                "Codex test",
+                true,
+                true,
+                nakode_protocol::ProviderAccountRoutingMode::Automatic,
+            )],
+        );
+        registry.provider_account_credentials.insert(
+            (CODEX_PROVIDER.to_owned(), CODEX_TEST_ACCOUNT_ID.to_owned()),
+            serde_json::json!({"fixture": "pending"}),
+        );
+        let (provider_commands, _provider_events) = mpsc::channel(1);
+        registry
+            .commands
+            .insert(CODEX_PROVIDER.to_owned(), provider_commands);
+        let (backend_commands, mut received) = mpsc::channel(1);
+        registry.session_commands.insert(
+            (SessionId::from(session_id), CODEX_PROVIDER.to_owned()),
+            backend_commands,
+        );
+
+        super::send_backend_command(
+            &SessionId::from(session_id),
+            &mut state,
+            &mut registry,
+            persistence.sessions.as_ref(),
+            BackendCommand::Shutdown,
+        )
+        .await;
+
+        assert_eq!(
+            persistence
+                .sessions
+                .find(session_id)
+                .expect("read session")
+                .expect("session")
+                .account_id
+                .as_deref(),
+            Some(CODEX_TEST_ACCOUNT_ID)
+        );
+        assert_eq!(
+            state.provider_account_id.as_deref(),
+            Some(CODEX_TEST_ACCOUNT_ID)
+        );
+        assert!(matches!(
+            received.recv().await,
+            Some(BackendCommand::Shutdown)
+        ));
+    }
+
     #[tokio::test]
     async fn running_workspace_synchronizes_shared_provider_enablement() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -8550,13 +9429,72 @@ mod tests {
                     account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
                 },
                 BackendEvent::TurnStarted {
+                    turn_id: "unrelated-initial-turn".to_owned(),
+                },
+            )
+            .await;
+        assert!(
+            !runtime
+                .pending_bridge_acknowledgements
+                .contains_key(&session_id),
+            "an initial uncorrelated start must not create an acknowledgement tuple"
+        );
+        assert_eq!(
+            runtime
+                .core
+                .engine_for(&session_id)
+                .and_then(|engine| engine.state().starting_prompt_id()),
+            Some("bridge-stable-prompt"),
+            "an initial uncorrelated start must not consume the bridge's starting prompt"
+        );
+        assert!(
+            runtime
+                .core
+                .session_bridge(&session_id)
+                .expect("runtime bridge")
+                .pending_inbound
+                .is_some()
+        );
+
+        runtime
+            .handle_backend_event(
+                BackendSource::Primary {
+                    session_id: session_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                    account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
+                },
+                BackendEvent::TurnAccepted {
                     turn_id: "provider-generated-turn".to_owned(),
                 },
             )
             .await;
         assert_eq!(
             runtime.pending_bridge_acknowledgements.get(&session_id),
-            Some(&"bridge-stable-prompt".to_owned())
+            Some(&(
+                "bridge-stable-prompt".to_owned(),
+                "provider-generated-turn".to_owned(),
+            )),
+            "provider acceptance establishes the exact prompt/turn tuple"
+        );
+
+        runtime
+            .handle_backend_event(
+                BackendSource::Primary {
+                    session_id: session_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                    account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
+                },
+                BackendEvent::TurnStarted {
+                    turn_id: "provider-generated-turn".to_owned(),
+                },
+            )
+            .await;
+        assert_eq!(
+            runtime.pending_bridge_acknowledgements.get(&session_id),
+            Some(&(
+                "bridge-stable-prompt".to_owned(),
+                "provider-generated-turn".to_owned(),
+            ))
         );
         assert!(
             runtime
@@ -8577,6 +9515,63 @@ mod tests {
         breaker
             .execute_batch("DROP TRIGGER fail_bridge_acknowledgement;")
             .expect("drop failure trigger");
+        runtime
+            .handle_backend_event(
+                BackendSource::Primary {
+                    session_id: session_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                    account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
+                },
+                BackendEvent::TurnStarted {
+                    turn_id: "unrelated-provider-turn".to_owned(),
+                },
+            )
+            .await;
+        assert_eq!(
+            runtime.pending_bridge_acknowledgements.get(&session_id),
+            Some(&(
+                "bridge-stable-prompt".to_owned(),
+                "provider-generated-turn".to_owned(),
+            )),
+            "an unrelated started event cannot settle a deferred acknowledgement"
+        );
+        assert!(
+            sessions
+                .list_session_bridges(&workspace.path().to_string_lossy())
+                .expect("stored bridge")[0]
+                .pending_inbound
+                .is_some()
+        );
+        runtime
+            .handle_backend_event(
+                BackendSource::Primary {
+                    session_id: session_id.clone(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                    account_id: CODEX_TEST_ACCOUNT_ID.to_owned(),
+                },
+                BackendEvent::TurnCompleted {
+                    turn_id: "unrelated-provider-turn".to_owned(),
+                    outcome: crate::backend::TurnOutcome::Completed,
+                    error: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            runtime.pending_bridge_acknowledgements.get(&session_id),
+            Some(&(
+                "bridge-stable-prompt".to_owned(),
+                "provider-generated-turn".to_owned(),
+            )),
+            "an unrelated terminal event cannot settle or replay a deferred acknowledgement"
+        );
+        assert!(
+            runtime
+                .core
+                .session_bridge(&session_id)
+                .expect("runtime bridge")
+                .pending_inbound
+                .is_some()
+        );
         runtime
             .handle_backend_event(
                 BackendSource::Primary {
@@ -8614,7 +9609,7 @@ mod tests {
                 turn_id: "provider-generated-turn".to_owned(),
                 transport: "thread-transport".to_owned(),
             }],
-            "terminal retry persists source provenance and acknowledgement as one final bridge state"
+            "matching terminal-event retry persists source provenance and acknowledgement as one final bridge state"
         );
         runtime.effects.shutdown().await;
     }

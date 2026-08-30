@@ -1,8 +1,10 @@
 /target
+/target-ticket/
 /gen
 **/target/
 crates/nakode-api/Cargo.lock
 /.desloppify/
 /.pi-subagents/
+/.tmp/
 __pycache__/
 *.py[cod]
