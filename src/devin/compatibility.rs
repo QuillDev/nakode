@@ -484,6 +484,7 @@ async fn finish(
                     operation: request.operation,
                     code: -32002,
                     message: reason.clone(),
+                    detail: None,
                 })
                 .await;
         }
@@ -561,6 +562,7 @@ async fn handle_command(
                     operation: BackendOperation::SteerTurn,
                     code: -32601,
                     message: "ACP does not define turn steering".to_owned(),
+                    detail: None,
                 })
                 .await;
             Ok(())
@@ -583,6 +585,7 @@ async fn handle_command(
                     operation: BackendOperation::CompactSession,
                     code: -32601,
                     message: "ACP does not define manual context compression".to_owned(),
+                    detail: None,
                 })
                 .await;
             Ok(())
@@ -609,6 +612,7 @@ async fn set_session_model(
                 operation: BackendOperation::SetSessionModel,
                 code: -32601,
                 message: "Devin session did not expose a model config option".to_owned(),
+                detail: None,
             })
             .await;
         return Ok(());
@@ -619,6 +623,7 @@ async fn set_session_model(
                 operation: BackendOperation::SetSessionModel,
                 code: -32602,
                 message: format!("Devin did not advertise model {model}"),
+                detail: None,
             })
             .await;
         return Ok(());
@@ -739,6 +744,7 @@ async fn reload_models(
                 operation: BackendOperation::Reload,
                 code: -32601,
                 message: "Devin session did not expose a model config option".to_owned(),
+                detail: None,
             })
             .await;
         return Ok(());
@@ -777,6 +783,7 @@ async fn resume_session(
                 operation: BackendOperation::ResumeSession,
                 code: -32601,
                 message: "Devin ACP did not advertise session resume".to_owned(),
+                detail: None,
             })
             .await;
         return Ok(());
@@ -864,6 +871,7 @@ async fn handle_acp_initialize_response(
                 operation: BackendOperation::Initialize,
                 code: -32600,
                 message: format!("unsupported ACP protocol version {protocol_version}"),
+                detail: None,
             })
             .await
             .map_err(|_| ())?;
@@ -996,6 +1004,7 @@ async fn handle_model_selection(
                 operation: BackendOperation::SetSessionModel,
                 code: -32603,
                 message: "Devin returned no model options after selection".to_owned(),
+                detail: None,
             })
             .await
             .map_err(|_| ())?;
@@ -1032,6 +1041,7 @@ async fn handle_reloaded_models(
                 operation: BackendOperation::Reload,
                 code: -32603,
                 message: "Devin returned no model options during refresh".to_owned(),
+                detail: None,
             })
             .await
             .map_err(|_| ())?;
@@ -1230,6 +1240,7 @@ async fn emit_request_failure(
             operation: request.operation,
             code,
             message: message.clone(),
+            detail: None,
         })
         .await
         .map_err(|_| ())?;
@@ -1646,6 +1657,7 @@ async fn authenticate_devin(config: OAuthConfig, events: mpsc::Sender<BackendEve
                 operation: BackendOperation::Authenticate,
                 code: -32003,
                 message,
+                detail: None,
             })
             .await;
     }

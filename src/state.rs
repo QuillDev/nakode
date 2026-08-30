@@ -11,11 +11,12 @@ pub use crate::{backend::ApprovalDecision, session::SubagentStatus};
 use crate::{
     agent::{AgentCatalog, AgentDefinition, AgentFallbackPolicy, AgentToolProfile},
     backend::{
-        ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent, BackendOperation,
+        ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
+        BackendFailureClassification, BackendFailureDetail, BackendFailurePhase, BackendOperation,
         CODEX_PROVIDER, CURSOR_PROVIDER, CompactionReason, DEVIN_PROVIDER, DeltaKind, GLM_PROVIDER,
         ItemKind, ItemStatus, KIMI_PROVIDER, ModelInfo, ModelOptions, NormalizedItem,
         PromptAttachment, QuestionRequest, SessionHistoryItem, TodoPhase, TurnOutcome,
-        display_qualified_model_name,
+        display_qualified_model_name, sanitize_failure_endpoint, sanitize_failure_text,
     },
     domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
     handoff::HandoffPackage,
@@ -46,6 +47,46 @@ const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 const MAX_CONTINUATION_DEPTH: u32 = 3;
 const MAX_SALVAGED_EVIDENCE: usize = 8;
 const MAX_SALVAGED_EVIDENCE_BYTES: usize = 4 * 1024;
+
+fn failure_phase(operation: BackendOperation) -> BackendFailurePhase {
+    match operation {
+        BackendOperation::Initialize | BackendOperation::Reload => {
+            BackendFailurePhase::ProviderInitialization
+        }
+        BackendOperation::Authenticate => BackendFailurePhase::Authentication,
+        BackendOperation::ModelList => BackendFailurePhase::ModelDiscovery,
+        BackendOperation::StartSession
+        | BackendOperation::SetSessionModel
+        | BackendOperation::SetSessionCodeMode
+        | BackendOperation::UnsubscribeSession => BackendFailurePhase::SessionStart,
+        BackendOperation::ResumeSession => BackendFailurePhase::SessionResume,
+        BackendOperation::StartTurn
+        | BackendOperation::SteerTurn
+        | BackendOperation::InterruptTurn => BackendFailurePhase::TurnStart,
+        BackendOperation::CompactSession => BackendFailurePhase::ContextCompaction,
+    }
+}
+
+fn normalize_failure_detail(mut detail: BackendFailureDetail) -> BackendFailureDetail {
+    detail.summary = sanitize_failure_text(&detail.summary, 512);
+    detail.operation = sanitize_failure_text(&detail.operation, 128);
+    detail.safe_endpoint = detail
+        .safe_endpoint
+        .as_deref()
+        .map(|endpoint| sanitize_failure_endpoint(endpoint, 512));
+    detail.source_chain = detail
+        .source_chain
+        .into_iter()
+        .take(4)
+        .map(|source| sanitize_failure_text(&source, 256))
+        .filter(|source| !source.is_empty())
+        .collect();
+    detail.correlation_id = detail
+        .correlation_id
+        .as_deref()
+        .map(|id| sanitize_failure_text(id, 128));
+    detail
+}
 
 fn bounded_salvage_text(value: &str) -> (String, bool) {
     if value.len() <= MAX_SALVAGED_EVIDENCE_BYTES {
@@ -1276,6 +1317,12 @@ pub struct ClientPresentationState {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct SessionFailureState {
+    pub detail: BackendFailureDetail,
+    pub initial_start: bool,
+}
+
+#[derive(Clone, Debug)]
 // Independent lifecycle and consent facts are protocol state, not one interchangeable flag set.
 #[allow(clippy::struct_excessive_bools)]
 pub struct DomainState {
@@ -1328,6 +1375,7 @@ pub struct DomainState {
     pub todo_phases: Vec<TodoPhase>,
     pub status_message: String,
     pub diagnostic_count: usize,
+    pub(crate) latest_failure: Option<SessionFailureState>,
     pub nakode_session_id: String,
     nakode_executable: String,
     pub subagents: Vec<SubagentRun>,
@@ -2101,6 +2149,7 @@ impl DomainState {
             todo_phases: Vec::new(),
             status_message: format!("Connecting to {backend_name}…"),
             diagnostic_count: 0,
+            latest_failure: None,
             nakode_session_id: uuid::Uuid::now_v7().to_string(),
             nakode_executable: "nakode".to_owned(),
             subagents: Vec::new(),
@@ -3621,12 +3670,19 @@ impl DomainState {
             || self.starting_turn.is_some()
             || self.active_turn.is_some()
             || self.context_compaction.is_some()
+            || !self.active_shells.is_empty()
             || self.has_running_subagents()
     }
 
     #[must_use]
     pub fn is_busy(&self) -> bool {
         self.replay_blocked_prompt.is_some() || self.has_active_work()
+    }
+
+    /// True only while deletion must first stop executing provider, delegate, compaction, or shell work.
+    #[must_use]
+    pub(crate) fn has_active_execution(&self) -> bool {
+        self.has_active_work()
     }
 
     /// Returns the logical session whose provider account affinity must be durable before backend work.
@@ -6662,6 +6718,7 @@ impl DomainState {
                     .filter(|prompt| prompt.source_transport.is_none())
                     .map(|prompt| prompt.id.clone());
                 self.observe_turn_started(turn_id);
+                self.latest_failure = None;
                 if let Some(prompt_id) = acknowledged_prompt {
                     return vec![Effect::AcknowledgeOwnerPromptDispatch {
                         session_id: self.nakode_session_id.clone(),
@@ -6733,7 +6790,8 @@ impl DomainState {
                 operation,
                 code,
                 message,
-            } => return self.request_failed(operation, code, message),
+                detail,
+            } => return self.request_failed(operation, code, message, detail),
             BackendEvent::ProtocolDiagnostic(message) => {
                 self.diagnostic_count += 1;
                 self.status_message = format!("Protocol diagnostic: {message}");
@@ -6746,6 +6804,7 @@ impl DomainState {
         Vec::new()
     }
 
+    #[allow(clippy::result_large_err)]
     fn reduce_context_compaction_event(
         &mut self,
         event: BackendEvent,
@@ -6803,7 +6862,18 @@ impl DomainState {
         }
     }
 
+    fn clear_recovered_failure(&mut self, phase: BackendFailurePhase) {
+        if self
+            .latest_failure
+            .as_ref()
+            .is_some_and(|failure| !failure.initial_start && failure.detail.phase == phase)
+        {
+            self.latest_failure = None;
+        }
+    }
+
     fn handle_ready(&mut self, identity: crate::backend::BackendIdentity) -> Vec<Effect> {
+        self.clear_recovered_failure(BackendFailurePhase::ProviderInitialization);
         self.backend_provider = identity.provider;
         self.backend_name = identity.display_name;
         self.backend_capabilities = identity.capabilities;
@@ -6869,6 +6939,7 @@ impl DomainState {
             return Vec::new();
         }
         let cached = models.clone();
+        self.clear_recovered_failure(BackendFailurePhase::ModelDiscovery);
         self.install_models(models);
         let mut effects = vec![Effect::PersistModels {
             provider: self.backend_provider.clone(),
@@ -6890,6 +6961,7 @@ impl DomainState {
         if provider_session_id.is_empty() {
             return self.protocol_problem("session creation returned an empty provider id");
         }
+        self.latest_failure = None;
         self.provider_session_id = Some(provider_session_id.clone());
         self.context_usage = None;
         self.provider_usage = crate::backend::BackendTokenUsage::default();
@@ -6975,6 +7047,7 @@ impl DomainState {
         }
         let provider_session_id_for_options = provider_session_id.clone();
         self.provider_session_id = Some(provider_session_id);
+        self.latest_failure = None;
         self.nakode_session_id.clone_from(&session.id);
         self.session_id = Some(session.id.clone());
         self.context_usage = None;
@@ -7489,6 +7562,7 @@ impl DomainState {
             }
             return Vec::new();
         }
+        self.latest_failure = None;
         let mut wire_text = self
             .skills
             .render_prompt(&prompt.text)
@@ -7716,6 +7790,7 @@ impl DomainState {
             options,
             cancelling: false,
         });
+        self.latest_failure = None;
         self.status_message = format!("{} is working…", self.backend_name);
     }
 
@@ -8232,12 +8307,40 @@ impl DomainState {
         );
     }
 
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn request_failed(
         &mut self,
         operation: BackendOperation,
         code: i64,
         message: String,
+        detail: Option<BackendFailureDetail>,
     ) -> Vec<Effect> {
+        let message = sanitize_failure_text(&message, 1_024);
+        let initial_start = operation == BackendOperation::StartSession
+            && code != -32001
+            && self.provider_session_id.is_none();
+        let fallback_classification = if code == -32001 {
+            BackendFailureClassification::Timeout
+        } else {
+            BackendFailureClassification::Unknown
+        };
+        let detail = detail.map_or_else(
+            || BackendFailureDetail {
+                phase: failure_phase(operation),
+                classification: fallback_classification,
+                summary: sanitize_failure_text(&message, 512),
+                operation: operation.label().to_owned(),
+                safe_endpoint: None,
+                http_status: None,
+                source_chain: Vec::new(),
+                correlation_id: None,
+            },
+            normalize_failure_detail,
+        );
+        self.latest_failure = Some(SessionFailureState {
+            detail,
+            initial_start,
+        });
         let display = format!("{} failed ({code}): {message}", operation.label());
         self.transcript.push(
             EntryKind::Error,
@@ -9243,6 +9346,7 @@ impl DomainState {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn reduce_subagent_compaction_event(
         &mut self,
         run_id: &str,
@@ -9276,6 +9380,7 @@ impl DomainState {
         Ok(Vec::new())
     }
 
+    #[allow(clippy::result_large_err)]
     fn reduce_subagent_artifact_event(
         &mut self,
         run_id: &str,
@@ -10490,6 +10595,7 @@ mod tests {
         agent::{AgentCatalog, AgentDefinition, AgentToolProfile},
         backend::{
             ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
+            BackendFailureClassification, BackendFailureDetail, BackendFailurePhase,
             BackendIdentity, BackendOperation, CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER,
             CapabilitySupport, CompactionReason, DEVIN_PROVIDER, DeltaKind, ItemKind, ItemStatus,
             ModelCapabilities, ModelInfo, ModelOptions, NormalizedItem, PromptAttachment,
@@ -12080,6 +12186,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::InterruptTurn,
             code: -1,
             message: "turn already ended".to_owned(),
+            detail: None,
         });
 
         assert!(state.pending_redirect.is_none());
@@ -12280,6 +12387,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::StartTurn,
             code: -1,
             message: "provider process failed before the turn started".to_owned(),
+            detail: None,
         });
 
         assert!(retry.is_empty(), "a failed replacement must not auto-retry");
@@ -12406,6 +12514,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::StartSession,
             code: -1,
             message: "provider process failed before session creation".to_owned(),
+            detail: None,
         });
 
         assert!(retry.is_empty());
@@ -12561,6 +12670,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::SteerTurn,
             code: -32603,
             message: "provider refused steering".to_owned(),
+            detail: None,
         });
 
         assert_eq!(
@@ -12705,6 +12815,69 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    fn initial_session_start_failure_projects_structured_terminal_state() {
+        let mut state = ready_state();
+        state.client.editor.set_text("first");
+        state.submit_editor();
+        state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::StartSession,
+            code: -1,
+            message: "Provider model discovery could not reach the provider.".to_owned(),
+            detail: Some(BackendFailureDetail {
+                phase: BackendFailurePhase::ModelDiscovery,
+                classification: BackendFailureClassification::Connectivity,
+                summary: "Provider model discovery could not reach the provider.".to_owned(),
+                operation: "discover provider models".to_owned(),
+                safe_endpoint: Some(
+                    "https://user:password@chatgpt.com/backend-api/codex/models?client_version=secret"
+                        .to_owned(),
+                ),
+                http_status: None,
+                source_chain: vec![
+                    "send failed for url (https://chatgpt.com/models?client_version=secret)"
+                        .to_owned(),
+                    "Authorization: Bearer never-display".to_owned(),
+                ],
+                correlation_id: Some("request\r\nheader".to_owned()),
+            }),
+        });
+
+        assert!(
+            state.is_busy(),
+            "the replay fence still protects the prompt"
+        );
+        assert!(!state.has_active_execution());
+        let failure = state.latest_failure.as_ref().expect("latest failure");
+        assert!(failure.initial_start);
+        assert_eq!(failure.detail.phase, BackendFailurePhase::ModelDiscovery);
+        let snapshot = projection::bootstrap(&state, 1, &[], &[]);
+        let projected = snapshot
+            .active_session
+            .expect("projected session")
+            .failure
+            .expect("projected failure");
+        assert!(projected.initial_start);
+        assert_eq!(
+            projected.phase,
+            nakode_protocol::SessionFailurePhase::ModelDiscovery
+        );
+        assert_eq!(
+            projected.classification,
+            nakode_protocol::SessionFailureClassification::Connectivity
+        );
+        assert_eq!(projected.source_chain.len(), 2);
+        assert_eq!(
+            projected.safe_endpoint.as_deref(),
+            Some("https://chatgpt.com/backend-api/codex/models")
+        );
+        assert_eq!(projected.correlation_id.as_deref(), Some("request header"));
+        let serialized = format!("{projected:?}");
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("client_version"));
+        assert!(!serialized.contains("never-display"));
+    }
+
+    #[test]
     fn session_start_timeout_preserves_the_pending_prompt() {
         let mut state = ready_state();
         state.client.editor.set_text("first");
@@ -12714,11 +12887,21 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::StartSession,
             code: -32001,
             message: "timeout".to_owned(),
+            detail: None,
         });
         assert!(effects.is_empty());
         assert!(state.is_busy());
         assert!(state.client.editor.is_blank());
         assert!(state.recoverable_prompt().is_none());
+        let timeout_failure = state.latest_failure.as_ref().expect("timeout diagnostic");
+        assert!(
+            !timeout_failure.initial_start,
+            "an unresolved timeout remains in flight rather than becoming terminal"
+        );
+        assert_eq!(
+            timeout_failure.detail.classification,
+            BackendFailureClassification::Timeout
+        );
 
         let effects = state.handle_backend(BackendEvent::SessionCreated {
             provider_session_id: "thread-late".to_owned(),
@@ -12933,6 +13116,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::StartSession,
             code: -32602,
             message: "rejected".to_owned(),
+            detail: None,
         });
 
         assert!(state.is_busy());
@@ -12975,6 +13159,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::StartTurn,
             code: -32602,
             message: "prompt failed".to_owned(),
+            detail: None,
         });
         assert!(state.recoverable_prompt().is_none());
         let effects = state.handle_backend(BackendEvent::TurnCompleted {
@@ -13005,9 +13190,17 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::StartTurn,
             code: -32602,
             message: "prompt failed".to_owned(),
+            detail: None,
         });
 
         assert!(state.is_busy());
+        assert!(
+            !state
+                .latest_failure
+                .as_ref()
+                .expect("turn failure")
+                .initial_start
+        );
         assert_eq!(
             state
                 .recoverable_prompt()
@@ -13074,6 +13267,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::StartTurn,
             code: -32602,
             message: "prompt failed".to_owned(),
+            detail: None,
         });
 
         let replay = state
@@ -13173,6 +13367,95 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    fn successful_provider_readiness_and_model_refresh_clear_only_recovered_failures() {
+        let mut state = ready_state();
+        state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::Initialize,
+            code: -1,
+            message: "provider unavailable".to_owned(),
+            detail: None,
+        });
+        assert!(state.latest_failure.is_some());
+        state.handle_backend(BackendEvent::Ready(BackendIdentity {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "codex-test".to_owned(),
+            version: None,
+            capabilities: state.backend_capabilities.clone(),
+        }));
+        assert!(state.latest_failure.is_none());
+
+        state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::ModelList,
+            code: -1,
+            message: "model refresh failed".to_owned(),
+            detail: None,
+        });
+        assert!(state.latest_failure.is_some());
+        let models = state.models.clone();
+        state.handle_backend(BackendEvent::Models(models));
+        assert!(state.latest_failure.is_none());
+
+        state.provider_session_id = None;
+        state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::StartSession,
+            code: -1,
+            message: "initial model discovery failed".to_owned(),
+            detail: Some(BackendFailureDetail {
+                phase: BackendFailurePhase::ModelDiscovery,
+                classification: BackendFailureClassification::MalformedResponse,
+                summary: "initial model discovery failed".to_owned(),
+                operation: "discover provider models".to_owned(),
+                safe_endpoint: None,
+                http_status: None,
+                source_chain: Vec::new(),
+                correlation_id: None,
+            }),
+        });
+        assert!(
+            state
+                .latest_failure
+                .as_ref()
+                .is_some_and(|failure| failure.initial_start)
+        );
+        let models = state.models.clone();
+        state.handle_backend(BackendEvent::Models(models));
+        assert!(
+            state
+                .latest_failure
+                .as_ref()
+                .is_some_and(|failure| failure.initial_start),
+            "catalogue refresh alone cannot turn a failed initial conversation into a usable one"
+        );
+    }
+
+    #[test]
+    fn late_turn_completion_without_started_event_clears_start_timeout() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("thread-1".to_owned());
+        state.session_id = Some("nakode-session-1".to_owned());
+        state.client.editor.set_text("first");
+        state.submit_editor();
+
+        state.handle_backend(BackendEvent::RequestFailed {
+            operation: BackendOperation::StartTurn,
+            code: -32001,
+            message: "timeout".to_owned(),
+            detail: None,
+        });
+        assert!(state.latest_failure.is_some());
+
+        state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-late".to_owned(),
+            outcome: TurnOutcome::Completed,
+            error: None,
+        });
+        assert!(
+            state.latest_failure.is_none(),
+            "accepted completion proves that the timed-out turn started and finished"
+        );
+    }
+
+    #[test]
     fn start_turn_timeout_does_not_launch_the_next_queued_prompt() {
         let mut state = ready_state();
         state.provider_session_id = Some("thread-1".to_owned());
@@ -13186,6 +13469,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::StartTurn,
             code: -32001,
             message: "timeout".to_owned(),
+            detail: None,
         });
         assert!(effects.is_empty());
         assert!(state.is_busy());
@@ -13194,6 +13478,10 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.handle_backend(BackendEvent::TurnStarted {
             turn_id: "turn-late".to_owned(),
         });
+        assert!(
+            state.latest_failure.is_none(),
+            "an authoritative late start clears its superseded timeout diagnostic"
+        );
         let effects = state.handle_backend(BackendEvent::TurnCompleted {
             turn_id: "turn-late".to_owned(),
             outcome: TurnOutcome::Completed,
@@ -13213,6 +13501,15 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 && activity_session_id == session_id
                 && checkpoint_session_id == session_id
         ));
+    }
+
+    #[test]
+    fn active_shells_are_active_execution_for_deletion_fencing() {
+        let mut state = ready_state();
+        state.active_shells.insert("shell-1".to_owned());
+
+        assert!(state.has_active_execution());
+        assert!(state.is_busy());
     }
 
     #[test]
@@ -15789,6 +16086,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             operation: BackendOperation::StartSession,
             code: -32602,
             message: "target provider unavailable".to_owned(),
+            detail: None,
         });
         assert!(state.is_busy());
         assert_eq!(
@@ -17341,6 +17639,7 @@ model = "claude-agent/sonnet"
                 operation: BackendOperation::StartSession,
                 code: -1,
                 message: "model unavailable".to_owned(),
+                detail: None,
             },
         );
         assert!(matches!(

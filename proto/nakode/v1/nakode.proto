@@ -1041,6 +1041,48 @@ message SessionState {
   optional ProviderAccountRoutingDiagnostic routing_diagnostic = 32;
   // True only when this session exposes the synthesized Code Mode tool to its model.
   bool code_mode = 33;
+  // Latest bounded, credential-safe lifecycle failure. Absent after a later operation succeeds.
+  optional SessionFailure failure = 34;
+}
+enum SessionFailurePhase {
+  SESSION_FAILURE_PHASE_UNSPECIFIED = 0;
+  SESSION_FAILURE_PHASE_PROVIDER_INITIALIZATION = 1;
+  SESSION_FAILURE_PHASE_AUTHENTICATION = 2;
+  SESSION_FAILURE_PHASE_MODEL_DISCOVERY = 3;
+  SESSION_FAILURE_PHASE_SESSION_START = 4;
+  SESSION_FAILURE_PHASE_SESSION_RESUME = 5;
+  SESSION_FAILURE_PHASE_TURN_START = 6;
+  SESSION_FAILURE_PHASE_CONTEXT_COMPACTION = 7;
+  SESSION_FAILURE_PHASE_LOCAL_SERVICE = 8;
+}
+enum SessionFailureClassification {
+  SESSION_FAILURE_CLASSIFICATION_UNSPECIFIED = 0;
+  SESSION_FAILURE_CLASSIFICATION_TIMEOUT = 1;
+  SESSION_FAILURE_CLASSIFICATION_DNS = 2;
+  SESSION_FAILURE_CLASSIFICATION_CONNECTIVITY = 3;
+  SESSION_FAILURE_CLASSIFICATION_TLS = 4;
+  SESSION_FAILURE_CLASSIFICATION_AUTHENTICATION = 5;
+  SESSION_FAILURE_CLASSIFICATION_AUTHORIZATION = 6;
+  SESSION_FAILURE_CLASSIFICATION_HTTP_STATUS = 7;
+  SESSION_FAILURE_CLASSIFICATION_MALFORMED_RESPONSE = 8;
+  SESSION_FAILURE_CLASSIFICATION_PROVIDER_UNAVAILABLE = 9;
+  SESSION_FAILURE_CLASSIFICATION_LOCAL_SERVICE = 10;
+  SESSION_FAILURE_CLASSIFICATION_TRANSPORT = 11;
+}
+message SessionFailure {
+  // A logical session exists, but no usable provider conversation was established.
+  bool initial_start = 1;
+  SessionFailurePhase phase = 2;
+  SessionFailureClassification classification = 3;
+  string summary = 4;
+  optional string provider_id = 5;
+  string operation = 6;
+  // Scheme, authority and path only. Userinfo, query and fragment are prohibited.
+  optional string safe_endpoint = 7;
+  optional uint32 http_status = 8;
+  // Sanitized provider/runtime causes, ordered outermost to innermost and bounded by the server.
+  repeated string source_chain = 9;
+  optional string correlation_id = 10;
 }
 message ProviderAccountRoutingDiagnostic {
   optional string account_id = 1;

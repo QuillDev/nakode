@@ -132,11 +132,21 @@ pub(crate) async fn request_failed(
     operation: BackendOperation,
     message: impl Into<String>,
 ) {
+    request_failed_with_detail(events, operation, message, None).await;
+}
+
+pub(crate) async fn request_failed_with_detail(
+    events: &mpsc::Sender<BackendEvent>,
+    operation: BackendOperation,
+    message: impl Into<String>,
+    detail: Option<BackendFailureDetail>,
+) {
     let _ = events
         .send(BackendEvent::RequestFailed {
             operation,
             code: -1,
             message: message.into(),
+            detail,
         })
         .await;
 }
@@ -491,6 +501,211 @@ pub enum ProviderFailureClassification {
     Model,
 }
 
+/// Safe provider-neutral context for one failed lifecycle operation.
+///
+/// Adapters must sanitize and bound every string before emitting this structure. Provider response
+/// bodies, request headers, credentials, cookies, and query strings do not belong here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendFailurePhase {
+    Unknown,
+    ProviderInitialization,
+    Authentication,
+    ModelDiscovery,
+    SessionStart,
+    SessionResume,
+    TurnStart,
+    ContextCompaction,
+    LocalService,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendFailureClassification {
+    Unknown,
+    Timeout,
+    Dns,
+    Connectivity,
+    Tls,
+    Authentication,
+    Authorization,
+    HttpStatus,
+    MalformedResponse,
+    ProviderUnavailable,
+    LocalService,
+    Transport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendFailureDetail {
+    pub phase: BackendFailurePhase,
+    pub classification: BackendFailureClassification,
+    pub summary: String,
+    pub operation: String,
+    pub safe_endpoint: Option<String>,
+    pub http_status: Option<u16>,
+    pub source_chain: Vec<String>,
+    pub correlation_id: Option<String>,
+}
+
+fn contains_whitespace_delimited_credential(value: &str) -> bool {
+    [
+        ("authorization", false),
+        ("proxy-authorization", false),
+        ("cookie", true),
+        ("set-cookie", true),
+    ]
+    .into_iter()
+    .any(|(label, cookie)| {
+        value.match_indices(label).any(|(start, _)| {
+            let boundary_before = start == 0
+                || value[..start].chars().next_back().is_some_and(|character| {
+                    character.is_whitespace() || matches!(character, ',' | ';' | '(' | '[' | '{')
+                });
+            let after = &value[start + label.len()..];
+            let Some(first) = after.split_whitespace().next() else {
+                return false;
+            };
+            boundary_before
+                && after.chars().next().is_some_and(char::is_whitespace)
+                && if cookie {
+                    first.contains('=')
+                } else {
+                    matches!(first, "basic" | "bearer" | "digest" | "negotiate")
+                        || first.chars().count() >= 16
+                }
+        })
+    })
+}
+
+/// Removes credential-bearing fragments and URL userinfo/query data before diagnostic text crosses
+/// the provider boundary. The result is one line and is bounded by Unicode scalar count.
+pub(crate) fn sanitize_failure_text(value: &str, maximum: usize) -> String {
+    let single_line = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let collapsed = single_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lowercase = collapsed.to_ascii_lowercase();
+    let compact = lowercase
+        .chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '"' | '\''))
+        .collect::<String>();
+    if contains_whitespace_delimited_credential(&lowercase)
+        || [
+            "authorization:",
+            "authorization=",
+            "proxy-authorization:",
+            "proxy-authorization=",
+            "cookie:",
+            "cookie=",
+            "set-cookie:",
+            "set-cookie=",
+            "bearer",
+            "access_token",
+            "accesstoken:",
+            "accesstoken=",
+            "refresh_token",
+            "refreshtoken:",
+            "refreshtoken=",
+            "id_token",
+            "idtoken:",
+            "idtoken=",
+            "session_token",
+            "sessiontoken:",
+            "sessiontoken=",
+            "credential:",
+            "credential=",
+            "api_key",
+            "api-key:",
+            "api-key=",
+            "apikey",
+            "client_secret",
+            "clientsecret:",
+            "clientsecret=",
+            "password=",
+            "password:",
+            "secret=",
+            "secret:",
+            "token=",
+            "token:",
+        ]
+        .iter()
+        .any(|marker| compact.contains(marker))
+    {
+        return "[redacted credential-bearing diagnostic]".to_owned();
+    }
+
+    let mut sanitized = String::with_capacity(collapsed.len().min(maximum));
+    let mut remaining = collapsed.as_str();
+    while let Some(start) = next_diagnostic_url(remaining) {
+        sanitized.push_str(&remaining[..start]);
+        let candidate_tail = &remaining[start..];
+        let end = candidate_tail
+            .find(char::is_whitespace)
+            .unwrap_or(candidate_tail.len());
+        let candidate = &candidate_tail[..end];
+        let parseable = candidate.trim_end_matches(|character: char| {
+            matches!(character, ')' | '}' | '>' | '"' | '\'' | ',' | ';')
+        });
+        sanitized.push_str(&sanitize_failure_endpoint(parseable, maximum));
+        remaining = &candidate_tail[end..];
+    }
+    sanitized.push_str(remaining);
+    bounded_failure_text(&sanitized, maximum)
+}
+
+pub(crate) fn sanitize_failure_endpoint(value: &str, maximum: usize) -> String {
+    reqwest::Url::parse(value).map_or_else(
+        |_| "provider endpoint unavailable".to_owned(),
+        |mut url| {
+            if !matches!(url.scheme(), "http" | "https") {
+                return "provider endpoint unavailable".to_owned();
+            }
+            url.set_query(None);
+            url.set_fragment(None);
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            bounded_failure_text(url.as_str(), maximum)
+        },
+    )
+}
+
+fn next_diagnostic_url(value: &str) -> Option<usize> {
+    value.match_indices("://").find_map(|(separator, _)| {
+        let prefix = &value[..separator];
+        let start = prefix
+            .char_indices()
+            .rev()
+            .find(|(_, character)| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '+' | '-' | '.')
+            })
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        let scheme = &value[start..separator];
+        (scheme
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
+            && scheme.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            }))
+        .then_some(start)
+    })
+}
+
+pub(crate) fn bounded_failure_text(value: &str, maximum: usize) -> String {
+    let mut characters = value.chars();
+    let mut bounded = characters.by_ref().take(maximum).collect::<String>();
+    if characters.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BackendTokenUsage {
     pub input_tokens: u64,
@@ -619,6 +834,7 @@ pub enum BackendEvent {
         operation: BackendOperation,
         code: i64,
         message: String,
+        detail: Option<BackendFailureDetail>,
     },
     /// Normalized provider failure metadata, emitted separately so existing turn event consumers
     /// remain compatible with providers that do not report classifications.
@@ -859,8 +1075,28 @@ impl BackendHandle {
 mod tests {
     use super::{
         CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER, DEVIN_PROVIDER, GLM_PROVIDER,
-        KIMI_PROVIDER, display_model_name, project_provider_tools,
+        KIMI_PROVIDER, display_model_name, project_provider_tools, sanitize_failure_text,
     };
+
+    #[test]
+    fn whitespace_delimited_credential_headers_are_redacted() {
+        for diagnostic in [
+            "Cookie session=secret-value",
+            "Set-Cookie session_id=secret-value; Secure",
+            "Proxy-Authorization Basic c2VjcmV0",
+            "request failed: Authorization opaque-secret-value",
+        ] {
+            assert_eq!(
+                sanitize_failure_text(diagnostic, 512),
+                "[redacted credential-bearing diagnostic]",
+                "{diagnostic}"
+            );
+        }
+        assert_eq!(
+            sanitize_failure_text("device authorization failed", 512),
+            "device authorization failed"
+        );
+    }
 
     #[test]
     fn model_ids_are_normalized_for_display_without_changing_provider_ids() {

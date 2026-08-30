@@ -2581,6 +2581,7 @@ mod tests {
             last_owner_activity_at_ms: 0,
             selected_account_id: None,
             routing_diagnostic: None,
+            failure: None,
         }
     }
 

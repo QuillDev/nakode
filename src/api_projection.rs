@@ -666,6 +666,7 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
         selected_provider_id: value.selected_provider_id.map(view::ProviderId::from),
         selected_account_id: value.selected_account_id,
         routing_diagnostic: value.routing_diagnostic.map(provider_routing_diagnostic),
+        failure: value.failure.map(session_failure),
         selected_model_id: value.selected_model_id.map(view::ModelId::from),
         selected_model_options: value.selected_model_options.map_or_else(
             view::ModelOptions::default,
@@ -1128,6 +1129,72 @@ fn session_summary(value: api::SessionSummary) -> view::SessionSummary {
         running: value.running,
         selected_account_id: value.selected_account_id,
         routing_diagnostic: value.routing_diagnostic.map(provider_routing_diagnostic),
+    }
+}
+
+fn session_failure(value: api::SessionFailure) -> view::SessionFailureView {
+    view::SessionFailureView {
+        initial_start: value.initial_start,
+        phase: match api::SessionFailurePhase::try_from(value.phase)
+            .unwrap_or(api::SessionFailurePhase::Unspecified)
+        {
+            api::SessionFailurePhase::Unspecified => view::SessionFailurePhase::Unknown,
+            api::SessionFailurePhase::ProviderInitialization => {
+                view::SessionFailurePhase::ProviderInitialization
+            }
+            api::SessionFailurePhase::Authentication => view::SessionFailurePhase::Authentication,
+            api::SessionFailurePhase::ModelDiscovery => view::SessionFailurePhase::ModelDiscovery,
+            api::SessionFailurePhase::SessionStart => view::SessionFailurePhase::SessionStart,
+            api::SessionFailurePhase::SessionResume => view::SessionFailurePhase::SessionResume,
+            api::SessionFailurePhase::TurnStart => view::SessionFailurePhase::TurnStart,
+            api::SessionFailurePhase::ContextCompaction => {
+                view::SessionFailurePhase::ContextCompaction
+            }
+            api::SessionFailurePhase::LocalService => view::SessionFailurePhase::LocalService,
+        },
+        classification: match api::SessionFailureClassification::try_from(value.classification)
+            .unwrap_or(api::SessionFailureClassification::Unspecified)
+        {
+            api::SessionFailureClassification::Unspecified => {
+                view::SessionFailureClassification::Unknown
+            }
+            api::SessionFailureClassification::Timeout => {
+                view::SessionFailureClassification::Timeout
+            }
+            api::SessionFailureClassification::Dns => view::SessionFailureClassification::Dns,
+            api::SessionFailureClassification::Connectivity => {
+                view::SessionFailureClassification::Connectivity
+            }
+            api::SessionFailureClassification::Tls => view::SessionFailureClassification::Tls,
+            api::SessionFailureClassification::Authentication => {
+                view::SessionFailureClassification::Authentication
+            }
+            api::SessionFailureClassification::Authorization => {
+                view::SessionFailureClassification::Authorization
+            }
+            api::SessionFailureClassification::HttpStatus => {
+                view::SessionFailureClassification::HttpStatus
+            }
+            api::SessionFailureClassification::MalformedResponse => {
+                view::SessionFailureClassification::MalformedResponse
+            }
+            api::SessionFailureClassification::ProviderUnavailable => {
+                view::SessionFailureClassification::ProviderUnavailable
+            }
+            api::SessionFailureClassification::LocalService => {
+                view::SessionFailureClassification::LocalService
+            }
+            api::SessionFailureClassification::Transport => {
+                view::SessionFailureClassification::Transport
+            }
+        },
+        summary: value.summary,
+        provider_id: value.provider_id.map(view::ProviderId::from),
+        operation: value.operation,
+        safe_endpoint: value.safe_endpoint,
+        http_status: value.http_status,
+        source_chain: value.source_chain,
+        correlation_id: value.correlation_id,
     }
 }
 

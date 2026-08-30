@@ -941,6 +941,51 @@ pub enum SessionActivity {
     RunningShell,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFailurePhase {
+    Unknown,
+    ProviderInitialization,
+    Authentication,
+    ModelDiscovery,
+    SessionStart,
+    SessionResume,
+    TurnStart,
+    ContextCompaction,
+    LocalService,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFailureClassification {
+    Unknown,
+    Timeout,
+    Dns,
+    Connectivity,
+    Tls,
+    Authentication,
+    Authorization,
+    HttpStatus,
+    MalformedResponse,
+    ProviderUnavailable,
+    LocalService,
+    Transport,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionFailureView {
+    pub initial_start: bool,
+    pub phase: SessionFailurePhase,
+    pub classification: SessionFailureClassification,
+    pub summary: String,
+    pub provider_id: Option<ProviderId>,
+    pub operation: String,
+    pub safe_endpoint: Option<String>,
+    pub http_status: Option<u32>,
+    pub source_chain: Vec<String>,
+    pub correlation_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionView {
     pub id: SessionId,
@@ -1002,6 +1047,8 @@ pub struct SessionView {
     pub selected_account_id: Option<String>,
     #[serde(default)]
     pub routing_diagnostic: Option<ProviderAccountRoutingDiagnosticView>,
+    #[serde(default)]
+    pub failure: Option<SessionFailureView>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1034,6 +1081,8 @@ pub struct SessionMetadataView {
     #[serde(default)]
     pub recoverable_prompt: Option<RecoverablePromptView>,
     pub notices: Vec<NoticeView>,
+    #[serde(default)]
+    pub failure: Option<SessionFailureView>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

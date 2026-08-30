@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, error::Error as _, path::PathBuf, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
@@ -11,9 +11,12 @@ use uuid::Uuid;
 
 use crate::{
     backend::{
-        BackendCapabilities, BackendCommand, BackendError, BackendEvent, BackendHandle,
+        BackendCapabilities, BackendCommand, BackendError, BackendEvent,
+        BackendFailureClassification, BackendFailureDetail, BackendFailurePhase, BackendHandle,
         BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, ModelInfo,
-        ModelOptions, ProviderFailureClassification, TurnOutcome, request_failed,
+        ModelOptions, ProviderFailureClassification, TurnOutcome, bounded_failure_text,
+        request_failed, request_failed_with_detail, sanitize_failure_endpoint,
+        sanitize_failure_text as sanitize_backend_failure_text,
     },
     runtime::{
         AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
@@ -148,6 +151,10 @@ impl BackendConfig {
     #[cfg(test)]
     fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url;
+        self.client = Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
         self
     }
 }
@@ -391,7 +398,12 @@ impl CodexProvider {
             .send()
             .await
             .map_err(|error| {
-                let message = format!("Codex request failed: {error}");
+                let safe = sanitize_backend_failure_text(&error.to_string(), 256);
+                let message = if safe.is_empty() {
+                    "Codex request transport failed.".to_owned()
+                } else {
+                    format!("Codex request transport failed: {safe}")
+                };
                 if error.is_connect() || error.is_timeout() || error.is_request() {
                     InferenceAttemptError::transient(message)
                 } else {
@@ -401,9 +413,9 @@ impl CodexProvider {
         if !response.status().is_success() {
             let status = response.status();
             let retry_after = retry_after(response.headers());
-            let detail = response.text().await.unwrap_or_default();
+            let detail = read_bounded_provider_error_body(response).await;
             let classification = codex_failure_classification(status, &detail);
-            let message = format!("Codex returned {status}: {detail}");
+            let message = format!("Codex returned {status}.");
             return Err(InferenceAttemptError {
                 message,
                 classification,
@@ -614,7 +626,15 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                         .send(BackendEvent::Models(model_infos(models)))
                         .await;
                 }
-                Err(error) => request_failed(context.events, BackendOperation::Reload, error).await,
+                Err(error) => {
+                    request_failed_with_detail(
+                        context.events,
+                        BackendOperation::Reload,
+                        error.message,
+                        Some(error.detail),
+                    )
+                    .await;
+                }
             },
             None => {
                 request_failed(
@@ -1001,7 +1021,13 @@ async fn start_session(
     let models = match discover_models(context.config, credential).await {
         Ok(models) => models,
         Err(error) => {
-            request_failed(context.events, BackendOperation::StartSession, error).await;
+            request_failed_with_detail(
+                context.events,
+                BackendOperation::StartSession,
+                error.message,
+                Some(error.detail),
+            )
+            .await;
             return;
         }
     };
@@ -1166,15 +1192,52 @@ fn native_capabilities() -> BackendCapabilities {
     }
 }
 
+#[derive(Debug)]
+struct ModelDiscoveryFailure {
+    message: String,
+    detail: BackendFailureDetail,
+}
+
+impl ModelDiscoveryFailure {
+    fn new(
+        classification: BackendFailureClassification,
+        summary: impl Into<String>,
+        endpoint: &str,
+        http_status: Option<u16>,
+        source_chain: Vec<String>,
+    ) -> Self {
+        let summary = bounded_text(&summary.into(), 512);
+        Self {
+            message: summary.clone(),
+            detail: BackendFailureDetail {
+                phase: BackendFailurePhase::ModelDiscovery,
+                classification,
+                summary,
+                operation: "discover provider models".to_owned(),
+                safe_endpoint: Some(safe_endpoint(endpoint)),
+                http_status,
+                source_chain,
+                correlation_id: None,
+            },
+        }
+    }
+}
+
+const MAX_MODEL_CATALOGUE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MODEL_CATALOGUE_ENTRIES: usize = 1_024;
+const MAX_MODEL_ID_CHARS: usize = 256;
+
+#[allow(clippy::too_many_lines)]
 async fn discover_models(
     config: &BackendConfig,
     credential: &CodexCredential,
-) -> Result<Vec<DiscoveredModel>, String> {
+) -> Result<Vec<DiscoveredModel>, ModelDiscoveryFailure> {
+    let mut last_failure = None;
     for path in ["codex/models", "models"] {
         let url = format!("{}/{path}", config.base_url.trim_end_matches('/'));
-        let response = config
+        let response = match config
             .client
-            .get(url)
+            .get(&url)
             .query(&[("client_version", CODEX_CLIENT_VERSION)])
             .bearer_auth(&credential.access_token)
             .header("chatgpt-account-id", &credential.account_id)
@@ -1183,19 +1246,89 @@ async fn discover_models(
             .header("version", CODEX_CLIENT_VERSION)
             .send()
             .await
-            .map_err(|error| format!("model discovery failed: {error}"))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let classification = if error.is_timeout() {
+                    BackendFailureClassification::Timeout
+                } else if error.is_connect() {
+                    BackendFailureClassification::Connectivity
+                } else {
+                    BackendFailureClassification::Transport
+                };
+                return Err(ModelDiscoveryFailure::new(
+                    classification,
+                    "Provider model discovery could not reach the provider.",
+                    &url,
+                    None,
+                    safe_source_chain(&error),
+                ));
+            }
+        };
         if !response.status().is_success() {
-            continue;
+            let status = response.status();
+            let (classification, summary) = match status {
+                StatusCode::UNAUTHORIZED => (
+                    BackendFailureClassification::Authentication,
+                    "Provider model discovery was not authenticated.",
+                ),
+                StatusCode::FORBIDDEN => (
+                    BackendFailureClassification::Authorization,
+                    "Provider model discovery was not authorized.",
+                ),
+                StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => (
+                    BackendFailureClassification::Timeout,
+                    "Provider model discovery timed out at the provider.",
+                ),
+                status if status.is_server_error() => (
+                    BackendFailureClassification::ProviderUnavailable,
+                    "The provider model catalogue is unavailable.",
+                ),
+                _ => (
+                    BackendFailureClassification::HttpStatus,
+                    "Provider model discovery returned an unexpected HTTP status.",
+                ),
+            };
+            let failure = ModelDiscoveryFailure::new(
+                classification,
+                summary,
+                &url,
+                Some(status.as_u16()),
+                Vec::new(),
+            );
+            if matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ) {
+                last_failure = Some(failure);
+                continue;
+            }
+            return Err(failure);
         }
-        let payload: Value = response
-            .json()
-            .await
-            .map_err(|error| format!("invalid model catalog: {error}"))?;
+        let payload = read_model_catalogue(response, &url).await?;
         let entries = payload
             .get("models")
             .or_else(|| payload.get("data"))
             .and_then(Value::as_array);
-        let Some(entries) = entries else { continue };
+        let Some(entries) = entries else {
+            last_failure = Some(ModelDiscoveryFailure::new(
+                BackendFailureClassification::MalformedResponse,
+                "The provider response did not contain a model catalogue.",
+                &url,
+                None,
+                Vec::new(),
+            ));
+            continue;
+        };
+        if entries.len() > MAX_MODEL_CATALOGUE_ENTRIES {
+            return Err(ModelDiscoveryFailure::new(
+                BackendFailureClassification::MalformedResponse,
+                "The provider model catalogue exceeded its safe entry limit.",
+                &url,
+                None,
+                Vec::new(),
+            ));
+        }
         let models = entries
             .iter()
             .filter_map(|entry| {
@@ -1207,7 +1340,7 @@ async fn discover_models(
                     .or_else(|| entry.get("id"))
                     .and_then(Value::as_str)?
                     .trim();
-                if id.is_empty() {
+                if id.is_empty() || id.chars().count() > MAX_MODEL_ID_CHARS {
                     return None;
                 }
                 let context_window = entry
@@ -1237,9 +1370,123 @@ async fn discover_models(
                 })
             })
             .collect::<Vec<_>>();
+        if models.is_empty() {
+            last_failure = Some(ModelDiscoveryFailure::new(
+                BackendFailureClassification::MalformedResponse,
+                "The provider returned no usable models.",
+                &url,
+                None,
+                Vec::new(),
+            ));
+            continue;
+        }
         return Ok(models);
     }
-    Err("OpenAI did not expose a usable Codex model catalog".to_owned())
+    Err(last_failure.unwrap_or_else(|| {
+        ModelDiscoveryFailure::new(
+            BackendFailureClassification::Unknown,
+            "The provider did not expose a usable model catalogue.",
+            config.base_url.as_str(),
+            None,
+            Vec::new(),
+        )
+    }))
+}
+
+async fn read_model_catalogue(
+    response: reqwest::Response,
+    url: &str,
+) -> Result<Value, ModelDiscoveryFailure> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MODEL_CATALOGUE_BYTES as u64)
+    {
+        return Err(ModelDiscoveryFailure::new(
+            BackendFailureClassification::MalformedResponse,
+            "The provider model catalogue exceeded its safe response limit.",
+            url,
+            None,
+            Vec::new(),
+        ));
+    }
+
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| {
+            let (classification, summary) = if error.is_timeout() {
+                (
+                    BackendFailureClassification::Timeout,
+                    "Provider model discovery timed out while reading the response.",
+                )
+            } else if error.is_connect() {
+                (
+                    BackendFailureClassification::Connectivity,
+                    "Provider model discovery lost its connection while reading the response.",
+                )
+            } else {
+                (
+                    BackendFailureClassification::Transport,
+                    "Provider model discovery could not read the provider response.",
+                )
+            };
+            ModelDiscoveryFailure::new(
+                classification,
+                summary,
+                url,
+                None,
+                safe_source_chain(&error),
+            )
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_MODEL_CATALOGUE_BYTES {
+            return Err(ModelDiscoveryFailure::new(
+                BackendFailureClassification::MalformedResponse,
+                "The provider model catalogue exceeded its safe response limit.",
+                url,
+                None,
+                Vec::new(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body).map_err(|_| {
+        ModelDiscoveryFailure::new(
+            BackendFailureClassification::MalformedResponse,
+            "The provider returned a malformed model catalogue.",
+            url,
+            None,
+            Vec::new(),
+        )
+    })
+}
+
+fn safe_endpoint(value: &str) -> String {
+    sanitize_failure_endpoint(value, 512)
+}
+
+fn safe_source_chain(error: &reqwest::Error) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if result.len() == 4 {
+            break;
+        }
+        let safe = sanitize_failure_text(&cause.to_string());
+        if !safe.is_empty() && result.last() != Some(&safe) {
+            result.push(safe);
+        }
+        source = cause.source();
+    }
+    result
+}
+
+fn sanitize_failure_text(value: &str) -> String {
+    sanitize_backend_failure_text(value, 256)
+}
+
+fn bounded_text(value: &str, maximum: usize) -> String {
+    bounded_failure_text(value, maximum)
 }
 
 fn model_infos(models: Vec<DiscoveredModel>) -> Vec<ModelInfo> {
@@ -1351,9 +1598,34 @@ fn conversation_input(item: &ConversationItem) -> Vec<Value> {
     }
 }
 
+const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+async fn read_bounded_provider_error_body(response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_PROVIDER_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(chunk.len());
+        body.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 fn codex_failure_classification(status: StatusCode, detail: &str) -> CodexFailureClassification {
     let detail = detail.to_ascii_lowercase();
     let contains = |fragments: &[&str]| fragments.iter().any(|fragment| detail.contains(fragment));
+    if status == StatusCode::UNAUTHORIZED {
+        return CodexFailureClassification::Authentication;
+    }
     if status == StatusCode::PAYMENT_REQUIRED
         || contains(&[
             "quota",
@@ -1365,8 +1637,7 @@ fn codex_failure_classification(status: StatusCode, detail: &str) -> CodexFailur
     {
         return CodexFailureClassification::Quota;
     }
-    if status == StatusCode::UNAUTHORIZED
-        || status == StatusCode::FORBIDDEN
+    if status == StatusCode::FORBIDDEN
         || contains(&[
             "invalid api key",
             "invalid_api_key",
@@ -1449,6 +1720,19 @@ fn retryable_stream_message(message: &str) -> bool {
     .any(|fragment| message.contains(fragment))
 }
 
+const MAX_CODEX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
+fn append_codex_sse_chunk(pending: &mut String, chunk: &[u8]) -> Result<(), InferenceAttemptError> {
+    let chunk = String::from_utf8_lossy(chunk);
+    if pending.len().saturating_add(chunk.len()) > MAX_CODEX_SSE_EVENT_BYTES {
+        return Err(InferenceAttemptError::terminal(
+            "Codex stream event exceeded its safe size limit",
+        ));
+    }
+    pending.push_str(&chunk);
+    Ok(())
+}
+
 async fn parse_codex_sse(
     response: reqwest::Response,
     events: mpsc::Sender<InferenceEvent>,
@@ -1467,14 +1751,19 @@ async fn parse_codex_sse(
         };
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|error| {
-            let message = format!("Codex stream failed: {error}");
+            let safe = sanitize_backend_failure_text(&error.to_string(), 256);
+            let message = if safe.is_empty() {
+                "Codex stream transport failed.".to_owned()
+            } else {
+                format!("Codex stream transport failed: {safe}")
+            };
             if output.text.is_empty() && output.reasoning.is_empty() {
                 InferenceAttemptError::transient(message)
             } else {
                 InferenceAttemptError::terminal(message)
             }
         })?;
-        pending.push_str(&String::from_utf8_lossy(&chunk));
+        append_codex_sse_chunk(&mut pending, &chunk)?;
         while let Some(boundary) = pending.find('\n') {
             let line = pending[..boundary].trim_end_matches('\r').to_owned();
             pending.drain(..=boundary);
@@ -1499,6 +1788,7 @@ async fn parse_codex_sse(
                     } else {
                         codex_failure_classification(StatusCode::BAD_REQUEST, &message)
                     };
+                    let message = sanitize_backend_failure_text(&message, 512);
                     return Err(InferenceAttemptError {
                         message,
                         classification,
@@ -1634,12 +1924,51 @@ fn codex_error_message(event: &Value, fallback: &str) -> String {
         .or_else(|| event.pointer("/error/code"))
         .or_else(|| event.pointer("/response/error/code"))
         .and_then(Value::as_str);
-    match (code, message) {
-        (Some(code), Some(message)) => format!("{code}: {message}"),
-        (_, Some(message)) => message.to_owned(),
-        (Some(code), None) => code.to_owned(),
-        (None, None) => fallback.to_owned(),
+    sanitize_backend_failure_text(
+        &match (code, message) {
+            (Some(code), Some(message)) => format!("{code}: {message}"),
+            (_, Some(message)) => message.to_owned(),
+            (Some(code), None) => code.to_owned(),
+            (None, None) => fallback.to_owned(),
+        },
+        512,
+    )
+}
+
+fn safe_adapter_error(prefix: &str, error: &dyn std::fmt::Display) -> String {
+    let detail = sanitize_backend_failure_text(&error.to_string(), 384);
+    if detail.is_empty() {
+        prefix.to_owned()
+    } else {
+        bounded_text(&format!("{prefix}: {detail}"), 512)
     }
+}
+
+const MAX_AUTH_RESPONSE_BYTES: usize = 1024 * 1024;
+
+fn append_bounded_auth_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    context: &str,
+) -> Result<(), String> {
+    if body.len().saturating_add(chunk.len()) > MAX_AUTH_RESPONSE_BYTES {
+        return Err(format!("{context}: response exceeded its safe size limit"));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn read_bounded_auth_json(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<Value, String> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| safe_adapter_error(context, &error))?;
+        append_bounded_auth_response_chunk(&mut body, &chunk, context)?;
+    }
+    serde_json::from_slice(&body).map_err(|error| safe_adapter_error(context, &error))
 }
 
 async fn authenticate(config: BackendConfig, events: mpsc::Sender<BackendEvent>) {
@@ -1658,17 +1987,14 @@ async fn authenticate_inner(
         .json(&json!({"client_id": OPENAI_CLIENT_ID}))
         .send()
         .await
-        .map_err(|error| format!("device authorization failed: {error}"))?;
+        .map_err(|error| safe_adapter_error("device authorization failed", &error))?;
     if !response.status().is_success() {
         return Err(format!(
             "device authorization returned {}",
             response.status()
         ));
     }
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("invalid device authorization: {error}"))?;
+    let payload = read_bounded_auth_json(response, "invalid device authorization").await?;
     let device_id = required_string(&payload, "device_auth_id")?;
     let user_code = required_string(&payload, "user_code")?;
     let interval = payload
@@ -1693,7 +2019,7 @@ async fn authenticate_inner(
             .json(&json!({"device_auth_id": device_id, "user_code": user_code}))
             .send()
             .await
-            .map_err(|error| format!("device authorization poll failed: {error}"))?;
+            .map_err(|error| safe_adapter_error("device authorization poll failed", &error))?;
         if matches!(poll.status(), StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
             continue;
         }
@@ -1703,17 +2029,16 @@ async fn authenticate_inner(
                 poll.status()
             ));
         }
-        let payload: Value = poll
-            .json()
-            .await
-            .map_err(|error| format!("invalid device token response: {error}"))?;
+        let payload = read_bounded_auth_json(poll, "invalid device token response").await?;
         let authorization_code = required_string(&payload, "authorization_code")?;
         let verifier = required_string(&payload, "code_verifier")?;
         let credential = exchange_token(config, authorization_code, verifier).await?;
         events
             .send(BackendEvent::AuthenticationCompleted {
                 kind: "chatgpt_oauth".to_owned(),
-                metadata: serde_json::to_value(credential).map_err(|error| error.to_string())?,
+                metadata: serde_json::to_value(credential).map_err(|error| {
+                    safe_adapter_error("credential serialization failed", &error)
+                })?,
             })
             .await
             .map_err(|_| "backend event receiver closed".to_owned())?;
@@ -1739,14 +2064,11 @@ async fn exchange_token(
         ])
         .send()
         .await
-        .map_err(|error| format!("token exchange failed: {error}"))?;
+        .map_err(|error| safe_adapter_error("token exchange failed", &error))?;
     if !response.status().is_success() {
         return Err(format!("token exchange returned {}", response.status()));
     }
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("invalid token response: {error}"))?;
+    let payload = read_bounded_auth_json(response, "invalid token response").await?;
     credential_from_token_payload(&payload, None)
 }
 
@@ -1791,14 +2113,11 @@ async fn refresh_credential(
         ])
         .send()
         .await
-        .map_err(|error| format!("token refresh failed: {error}"))?;
+        .map_err(|error| safe_adapter_error("token refresh failed", &error))?;
     if !response.status().is_success() {
         return Err(format!("token refresh returned {}", response.status()));
     }
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("invalid token refresh: {error}"))?;
+    let payload = read_bounded_auth_json(response, "invalid token refresh").await?;
     credential_from_token_payload(&payload, Some(&credential.refresh_token))
 }
 
@@ -1882,6 +2201,10 @@ mod tests {
             CodexFailureClassification::Authentication
         );
         assert_eq!(
+            codex_failure_classification(StatusCode::UNAUTHORIZED, "quota exhausted"),
+            CodexFailureClassification::Authentication
+        );
+        assert_eq!(
             codex_failure_classification(StatusCode::TOO_MANY_REQUESTS, "slow down"),
             CodexFailureClassification::RateLimit
         );
@@ -1938,6 +2261,189 @@ mod tests {
         assert_eq!(input[0]["output"], "bounded model output");
     }
 
+    #[test]
+    fn failure_text_sanitization_removes_wrapped_queries_userinfo_and_credentials() {
+        let sanitized = sanitize_failure_text(
+            "send failed for url (HTTPS://person:password@example.test/models?client_version=secret#fragment)",
+        );
+        assert!(sanitized.contains("https://example.test/models"));
+        assert!(!sanitized.contains("person"));
+        assert!(!sanitized.contains("password"));
+        assert!(!sanitized.contains("client_version"));
+        assert!(!sanitized.contains("secret"));
+        assert!(!sanitized.contains("fragment"));
+
+        let non_http = sanitize_failure_text(
+            "rpc failed for grpc://person:password@example.test/models?client_version=secret",
+        );
+        assert!(!non_http.contains("person"));
+        assert!(!non_http.contains("password"));
+        assert!(!non_http.contains("client_version"));
+        assert!(!non_http.contains("secret"));
+        assert!(non_http.contains("provider endpoint unavailable"));
+
+        let ipv6 = sanitize_failure_text(
+            "send failed for HTTPS://[2001:db8::1]:443/models?signature=secret-value",
+        );
+        assert!(ipv6.contains("https://[2001:db8::1]/models"));
+        assert!(!ipv6.contains("signature"));
+        assert!(!ipv6.contains("secret-value"));
+
+        for credential in [
+            "Authorization=secret-token",
+            "cookie: session=secret",
+            r#"{"authorization":"secret-token"}"#,
+            r#"{"credential":"secret-token"}"#,
+            r#"{"sessionToken":"secret-token"}"#,
+            "token: secret-token",
+            "access token: secret-token",
+            "password=secret-token",
+            "secret: secret-token",
+        ] {
+            assert_eq!(
+                sanitize_failure_text(credential),
+                "[redacted credential-bearing diagnostic]"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_sse_events_before_accumulating_them() {
+        let mut pending = String::new();
+        let oversized = vec![b'x'; MAX_CODEX_SSE_EVENT_BYTES + 1];
+
+        let error = append_codex_sse_chunk(&mut pending, &oversized)
+            .expect_err("oversized SSE event must be rejected");
+
+        assert!(pending.is_empty());
+        assert!(error.message.contains("safe size limit"));
+        assert!(error.message.chars().count() <= 512);
+    }
+
+    #[test]
+    fn rejects_oversized_authentication_responses_before_accumulating_them() {
+        let mut body = Vec::new();
+        let oversized = vec![b'x'; MAX_AUTH_RESPONSE_BYTES + 1];
+
+        let error =
+            append_bounded_auth_response_chunk(&mut body, &oversized, "invalid token response")
+                .expect_err("oversized authentication response must be rejected");
+
+        assert!(body.is_empty());
+        assert_eq!(
+            error,
+            "invalid token response: response exceeded its safe size limit"
+        );
+    }
+
+    #[test]
+    fn sanitizes_authentication_transport_errors() {
+        let raw = "request failed for HTTPS://person:password@example.test/token?signature=private";
+        let safe = safe_adapter_error("token exchange failed", &raw);
+
+        assert!(safe.contains("https://example.test/token"));
+        assert!(!safe.contains("person"));
+        assert!(!safe.contains("password"));
+        assert!(!safe.contains("signature"));
+        assert!(!safe.contains("private"));
+        assert!(safe.chars().count() <= 512);
+    }
+
+    #[test]
+    fn sanitizes_provider_supplied_stream_errors_before_propagation() {
+        let error = codex_error_message(
+            &json!({
+                "type": "response.failed",
+                "response": {"error": {"code": "provider_error", "message": "credential=secret-token"}}
+            }),
+            "Codex response failed",
+        );
+
+        assert_eq!(error, "[redacted credential-bearing diagnostic]");
+        assert!(!error.contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn start_session_reports_sanitized_model_discovery_transport_failure() {
+        let (base_url, server) = drop_response_once().await;
+        let credential = serde_json::to_value(test_credential()).expect("serialize credential");
+        let config = BackendConfig::native(PathBuf::from("."))
+            .with_base_url(base_url.clone())
+            .with_credential(Some(credential));
+        let mut handle = spawn(config).await.expect("native backend");
+        assert!(matches!(
+            handle.events.recv().await,
+            Some(BackendEvent::Ready(_))
+        ));
+
+        handle
+            .commands
+            .send(BackendCommand::StartSession {
+                model: Some("fixture-model".to_owned()),
+                instructions: None,
+                owner_session_id: Some("logical-session".to_owned()),
+                parent_run_id: None,
+                enabled_skill_ids: Vec::new(),
+                external_tools: Vec::new(),
+                replace_builtin_tools: false,
+                code_mode: false,
+                allowed_builtin_tools: None,
+                max_turns: None,
+                finalization_reserve_turns: 0,
+                timeout_seconds: None,
+            })
+            .await
+            .expect("start command");
+        let event = tokio::time::timeout(Duration::from_secs(2), handle.events.recv())
+            .await
+            .expect("bounded provider event")
+            .expect("provider event");
+        let request = server.await.expect("mock server task");
+        let BackendEvent::RequestFailed {
+            operation,
+            code,
+            message,
+            detail: Some(detail),
+        } = event
+        else {
+            panic!("expected structured request failure, got {event:?}");
+        };
+
+        assert_eq!(operation, BackendOperation::StartSession);
+        assert_eq!(code, -1);
+        assert_eq!(
+            message,
+            "Provider model discovery could not reach the provider."
+        );
+        assert_eq!(detail.phase, BackendFailurePhase::ModelDiscovery);
+        assert!(matches!(
+            detail.classification,
+            BackendFailureClassification::Connectivity | BackendFailureClassification::Transport
+        ));
+        let expected_endpoint = format!("{base_url}/codex/models");
+        assert_eq!(
+            detail.safe_endpoint.as_deref(),
+            Some(expected_endpoint.as_str())
+        );
+        assert!(detail.source_chain.len() <= 4);
+        assert!(
+            detail
+                .source_chain
+                .iter()
+                .all(|source| source.chars().count() <= 257)
+        );
+        assert!(!format!("{detail:?}").contains("access-token"));
+        assert!(!format!("{detail:?}").contains("client_version"));
+        assert!(request.starts_with("GET /codex/models?client_version="));
+
+        handle
+            .commands
+            .send(BackendCommand::Shutdown)
+            .await
+            .expect("shutdown command");
+        handle.join().await.expect("backend shutdown");
+    }
+
     #[tokio::test]
     async fn discovers_models_over_the_native_transport() {
         let (base_url, server) = serve_once(
@@ -1959,6 +2465,55 @@ mod tests {
         assert_eq!(models[0].info.id, "gpt-native");
         assert!(models[0].info.is_default);
         assert_eq!(models[0].context_window, Some(258_400));
+    }
+
+    #[tokio::test]
+    async fn falls_back_after_an_empty_primary_model_catalogue() {
+        let (base_url, server) = serve_sequence(vec![
+            (200, "application/json", r#"{"models":[]}"#),
+            (
+                200,
+                "application/json",
+                r#"{"models":[{"slug":"gpt-fallback","is_default":true}]}"#,
+            ),
+        ])
+        .await;
+        let config = BackendConfig::native(PathBuf::from(".")).with_base_url(base_url);
+
+        let models = discover_models(&config, &test_credential())
+            .await
+            .expect("fallback model discovery");
+        let requests = server.await.expect("mock server task");
+
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /codex/models?client_version="));
+        assert!(requests[1].starts_with("GET /models?client_version="));
+        assert_eq!(models[0].info.id, "gpt-fallback");
+    }
+
+    #[tokio::test]
+    async fn preserves_primary_authentication_failure_without_fallback_overwrite() {
+        let (base_url, server) = serve_sequence(vec![(401, "application/json", "{}")]).await;
+        let config = BackendConfig::native(PathBuf::from(".")).with_base_url(base_url);
+
+        let failure = discover_models(&config, &test_credential())
+            .await
+            .expect_err("authentication failure");
+        let requests = server.await.expect("mock server task");
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            failure.detail.classification,
+            BackendFailureClassification::Authentication
+        );
+        assert_eq!(failure.detail.http_status, Some(401));
+        assert!(
+            failure
+                .detail
+                .safe_endpoint
+                .as_deref()
+                .is_some_and(|endpoint| endpoint.ends_with("/codex/models"))
+        );
     }
 
     #[tokio::test]
@@ -2458,6 +3013,21 @@ mod tests {
                     .expect("write response");
             }
             requests
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn drop_response_once() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock server address");
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0; 16 * 1024];
+            let read = socket.read(&mut request).await.expect("read request");
+            request.truncate(read);
+            String::from_utf8(request).expect("UTF-8 request")
         });
         (format!("http://{address}"), task)
     }

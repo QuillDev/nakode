@@ -527,6 +527,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                         operation: BackendOperation::SetSessionCodeMode,
                         code: 1,
                         message: error,
+                        detail: None,
                     })
                     .await;
             }
