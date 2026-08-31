@@ -311,6 +311,7 @@ mod tests {
             modified_at_unix_ms: Some(1_754_000_000_000),
             device: Some("7".to_owned()),
             inode: Some(inode.to_string()),
+            build_revision: Some(format!("revision-{sha256}")),
         }
     }
 
@@ -333,6 +334,7 @@ mod tests {
                 server_version: "0.3.0".to_owned(),
                 api_version: "nakode.v1".to_owned(),
                 capabilities: vec!["Resume".to_owned(), "Steering".to_owned()],
+                build_revision: Some("revision-service".to_owned()),
             }),
         }
     }

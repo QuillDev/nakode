@@ -2,6 +2,17 @@
 
 > **Scope note.** The command traces, root-cause matrix, and “today” wording below describe the pre-change behavior at the ticket's merged base. The current branch implements the selected whole-service Option A contract; its post-change behavior and evidence are recorded under [Implemented preservation contract](#implemented-preservation-contract).
 
+## Current managed-build identity contract
+
+A managed install built from a clean trusted Git checkout embeds that checkout's immutable GitHub/source revision. Nakode carries that revision through runtime records, live server reports, endpoint verification, activation journals, and the public activation protocol, and it owns the installed-versus-running decision:
+
+1. If both sides have a source/build revision, equality of that revision alone determines whether the managed target is running.
+2. If both sides are revisionless, exact executable SHA-256 and size equality remains the compatibility rule for older builds and records.
+3. If only one side has a revision, Nakode cannot prove that the target is current; it does not fall through to fingerprint equality.
+4. Semantic version is never immutable artifact identity.
+
+Thus an equal source revision is current despite semantic-version or binary-fingerprint differences, and automatic checks remain no-ops after that revision is live. A different source revision must activate even when semantic version is unchanged. Executable SHA-256 remains diagnostic and supports the revisionless fallback, but a binary-only difference at an equal source revision does not create automatic activation work. An operator who intentionally wants that same-revision binary replacement can explicitly install the desired executable and run the administrative `nakode restart` command, accepting its lifecycle semantics. FStack only decodes and presents these distinct semantic-version, source-revision, and fingerprint fields; it does not duplicate this policy.
+
 ## Pre-change executive finding
 
 The owner-visible behavior is the combination of three different mechanisms, not session deletion:
@@ -34,7 +45,7 @@ No live update, restart, signal, endpoint mutation, or owner-data mutation was u
 
 There is no release API, version manifest, semver comparison, binary download, or package selection. Source discovery is fixed to the managed Git checkout.
 
-The installer requires Cargo, runs `cargo build --release --locked`, verifies the resulting executable, copies it to a temporary file in the destination directory, and atomically renames it over `$HOME/.local/bin/nakode` by default (`install.sh:122-288`). A running service continues executing its old inode.
+The installer requires Cargo and, for a clean trusted checkout, resolves `HEAD`, builds an archived copy of exactly that revision, and embeds the revision through `src/build_revision.txt`. It then runs `cargo build --release --locked`, verifies the resulting executable, copies it to a temporary file in the destination directory, and atomically renames it over `$HOME/.local/bin/nakode` by default (`install.sh:122-288`). Dirty or otherwise unprovable source builds remain revisionless for compatibility rather than claiming trusted provenance. A running service continues executing its old inode.
 
 After replacement, `install.sh` invokes the new executable by absolute path as `restart-stale`. That command scans the installation singleton and legacy runtime directories (`src/service_cli.rs:69-91`, `src/control_service.rs:1853-2030`):
 
@@ -180,10 +191,10 @@ The safe handoff boundary is after every active turn, accepted queue, interactio
 3. If quiescence is refused, Nakode records installed B versus running A and starts one installation-scoped detached activation helper.
 4. The helper reports structured blocker IDs/reasons, checks immediately and every 15 seconds, and keeps a bounded audit history.
 5. Each check uses the existing activation lease only for the check/cutover and treats `QuiesceShutdown` as the final atomic authority.
-6. Once the whole service is quiescent, the helper activates B through the existing detached start/readiness path and verifies B's executable identity.
+6. Once the whole service is quiescent, the helper activates B through the existing detached start/readiness path and verifies B under the revision-first managed-build identity rule.
 7. SDK, TUI, and FStack watches reconnect, reopen the same persisted logical sessions, and consume full authoritative replacement snapshots.
 
-Installation and activation are separate observable states. An update is not reported as fully current while the installed and running build identities differ.
+Installation and activation are separate observable states. An update is not reported as fully current while the installed and running identities differ under the revision-first rule: differing trusted revisions are pending even at equal semantic version; equal trusted revisions are current regardless of fingerprint; exact SHA-256 plus size is consulted only when both sides are revisionless; and mixed revision presence cannot prove current identity.
 
 The implementation-ready product, helper, public protocol, dashboard modal, audit-state, rollout, and deterministic test specification is in [`deferred-activation-plan.md`](deferred-activation-plan.md).
 
@@ -195,7 +206,7 @@ Side-by-side generations therefore remain a higher-complexity future architectur
 
 ### Selected contract
 
-1. Report installed executable identity separately from the running service and persist/recompute pending activation.
+1. Report installed semantic version, source/build revision, and executable fingerprint separately from the running service, and persist/recompute pending activation with Nakode's revision-first identity rule.
 2. Keep the stale service available while accepted work settles; do not ask the owner to close idle sessions.
 3. Recheck automatically with visible cadence/history and perform the existing quiescent replacement as soon as the entire service is idle.
 4. Keep unconditional interruption behind an explicit, revision-fenced destructive confirmation that lists exactly what work will be interrupted.
@@ -210,6 +221,7 @@ The current branch implements the selected contract across Nakode and FStack:
 
 - `install.sh` still atomically replaces the executable first, but now reports installation separately from running-service activation. `restart-stale` either activates immediately or durably schedules activation instead of ending with a one-shot refusal.
 - `src/activation.rs` owns a schema-1 journal and two distinct leases under the private control directory: `activation-helper.lock` for the singleton helper generation and short-lived `activation.lock` for observation/mutation/cutover serialization. Ownership is PID plus random instance ID with heartbeat validation, compare-before-remove reclamation, stale-socket verification, corrupt-journal quarantine, and forward-schema preservation.
+- The immutable source/build revision embedded from a clean managed Git checkout is the authoritative managed-build identity. `ServerInfo.build_revision` reports live-process provenance; executable/runtime/journal identities retain target provenance; and the activation protocol carries both. Equal revisions resolve to current even when executable SHA-256 differs, different revisions remain stale even at the same semantic version, both-revisionless records use exact SHA-256 plus size, and mixed revision presence cannot prove current identity. Periodic observations of the matching revision do not create new attempts or history writes. A desired binary-only same-revision replacement requires explicitly installing that executable and running the administrative `nakode restart` command.
 - The installed B executable runs one detached `activation-helper`. It checks immediately and every 15 seconds, refreshes its heartbeat even in failed states, bounds stale-service blocker queries, and uses the existing runtime-owned `QuiesceShutdown` fence as final authority. Matching runtime JSON without a reachable matching API is never projected as `current` or `activated`.
 - `nakode.v1.ActivationService` publicly exposes query, attempt-qualified replacement watch, manual recheck, and conditional force. Status includes installed/running/helper identities, capabilities, exact blockers, bounded history, failures, and audit results. While A drains, the helper serves this service on `activation.sock`; after B readiness, authority hands to B on `api.sock`, terminal helper watches close, and the helper exits.
 - Force is never an unconditional fallback. The owner must confirm the exact observed attempt ID, attempt-local activation revision, and blocker ID/revision set. The running service compares and fences that set atomically, audits accepted and rejected results, and preserves idempotency replay. If execution fails after durable acceptance, the same key replays the original gRPC error shape rather than pretending the retry succeeded. A pre-capability stale service reports conditional force unavailable.
@@ -295,7 +307,7 @@ Every pass/fail command below was run by the bounded test runner. No validation 
 
 The all-feature lifecycle regression copied two distinct executable identities into one private temporary installation and isolated `HOME`, `TMPDIR`, `NAKODE_HOME`, `NAKODE_CONTROL_DIR`, workspace, database, fixture, FIFO gate, sockets, process records, logs, and binaries. It proved: A remained authoritative during a held owner turn; stale refresh deferred; the helper reported the exact blocker; concurrent discovery retained one helper; a `SIGKILL`ed helper was replaced without stale-socket ownership damage; a stopped-A/no-B cutover gap recovered; B became the verified service identity; both the formerly active and persisted-idle logical session IDs reattached; transcripts survived; and the helper handed status to B and exited. The test's RAII cleanup stopped or killed only PIDs published beneath that private root.
 
-Focused module coverage additionally proves that failed replacement verification cannot leave `activating` or `forcing` stuck, a live/corrupt runtime owner prevents unfenced no-service replacement, same-version/different-build identity remains stale, helper leases and history are bounded, force fences reject any authoritative change, and an execution error after durable idempotency acceptance replays the original gRPC code and message.
+Focused module coverage additionally proves that failed replacement verification cannot leave `activating` or `forcing` stuck, a live/corrupt runtime owner prevents unfenced no-service replacement, equal source revisions are current despite differing binary fingerprints, changed source revisions remain stale at equal semantic version, changed semantic version/revision remains stale, revisionless identities use exact SHA-256/size compatibility fallback, mixed revision presence is not current, repeated current observations are idempotent, helper leases and history are bounded, force fences reject any authoritative change, and an execution error after durable idempotency acceptance replays the original gRPC code and message.
 
 ### FStack dashboard
 
