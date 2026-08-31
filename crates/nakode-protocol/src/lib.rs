@@ -52,11 +52,12 @@ pub use view::{
     ProviderAccountView, ProviderAuthenticationView, ProviderCapabilities, ProviderCapability,
     ProviderView, QueueItemView, RecoverablePromptView, RunMetadataView, RunOutcome, RunPage,
     RunPolicyView, RunSalvageView, RunStatus, RunTextWindow, RunToolDenialView, RunView,
-    SalvagedEvidenceView, SessionActivity, SessionBridgeView, SessionMetadataView, SessionSummary,
-    SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView, TodoPhaseView,
-    TodoStatusView, TokenUsageView, TranscriptBodyWindow, TranscriptEntryKind,
-    TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TranscriptWindowView, TurnStatus,
-    TurnView, ViewEvent, VisionAvailabilityView, VisionSettingsView, WebSettingsView,
+    SalvagedEvidenceView, SessionActivity, SessionBridgeView, SessionFailureClassification,
+    SessionFailurePhase, SessionFailureView, SessionMetadataView, SessionSummary, SessionView,
+    SettingsView, SkillView, TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView,
+    TokenUsageView, TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus,
+    TranscriptEntryView, TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent,
+    VisionAvailabilityView, VisionSettingsView, WebSettingsView,
 };
 
 /// Maximum encoded Protobuf request or response accepted by Nakode's API.

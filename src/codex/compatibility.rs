@@ -331,6 +331,7 @@ async fn report_timeouts(
                         "request {id} timed out after {}s",
                         REQUEST_TIMEOUT.as_secs()
                     ),
+                    detail: None,
                 })
                 .await;
         }
@@ -370,6 +371,7 @@ async fn finish(
                     operation: request.operation,
                     code: -32002,
                     message: reason.clone(),
+                    detail: None,
                 })
                 .await;
         }
@@ -408,6 +410,7 @@ async fn handle_command(
                 message:
                     "the Codex compatibility adapter does not support manual context compression"
                         .to_owned(),
+                detail: None,
             })
             .await;
         return Ok(());
@@ -596,6 +599,7 @@ async fn dispatch_codex_rpc_message(
                 operation: request.operation,
                 code: error.code,
                 message: error.message,
+                detail: None,
             })
             .await
             .map_err(|_| ())?;
@@ -675,6 +679,7 @@ fn authentication_completed_event(params: &Value) -> BackendEvent {
             .and_then(Value::as_str)
             .unwrap_or("Codex device authentication failed")
             .to_owned(),
+        detail: None,
     }
 }
 

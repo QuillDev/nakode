@@ -733,6 +733,7 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
             operation: BackendOperation::StartTurn,
             code: -1,
             message: string(message, "message"),
+            detail: None,
         },
         "warning" => BackendEvent::Warning(string(message, "message")),
         "process_release_failed" => process_release_failed_event(message),

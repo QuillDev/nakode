@@ -2380,7 +2380,78 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         last_owner_activity_at_ms: value.last_owner_activity_at_ms,
         selected_account_id: value.selected_account_id,
         routing_diagnostic: value.routing_diagnostic.map(routing_diagnostic),
+        failure: value.failure.map(session_failure),
     }
+}
+
+fn session_failure(value: protocol::SessionFailureView) -> api::SessionFailure {
+    api::SessionFailure {
+        initial_start: value.initial_start,
+        phase: session_failure_phase(value.phase),
+        classification: session_failure_classification(value.classification),
+        summary: value.summary,
+        provider_id: value.provider_id.map(|id| id.to_string()),
+        operation: value.operation,
+        safe_endpoint: value.safe_endpoint,
+        http_status: value.http_status,
+        source_chain: value.source_chain,
+        correlation_id: value.correlation_id,
+    }
+}
+
+fn session_failure_phase(value: protocol::SessionFailurePhase) -> i32 {
+    (match value {
+        protocol::SessionFailurePhase::Unknown => api::SessionFailurePhase::Unspecified,
+        protocol::SessionFailurePhase::ProviderInitialization => {
+            api::SessionFailurePhase::ProviderInitialization
+        }
+        protocol::SessionFailurePhase::Authentication => api::SessionFailurePhase::Authentication,
+        protocol::SessionFailurePhase::ModelDiscovery => api::SessionFailurePhase::ModelDiscovery,
+        protocol::SessionFailurePhase::SessionStart => api::SessionFailurePhase::SessionStart,
+        protocol::SessionFailurePhase::SessionResume => api::SessionFailurePhase::SessionResume,
+        protocol::SessionFailurePhase::TurnStart => api::SessionFailurePhase::TurnStart,
+        protocol::SessionFailurePhase::ContextCompaction => {
+            api::SessionFailurePhase::ContextCompaction
+        }
+        protocol::SessionFailurePhase::LocalService => api::SessionFailurePhase::LocalService,
+    }) as i32
+}
+
+fn session_failure_classification(value: protocol::SessionFailureClassification) -> i32 {
+    (match value {
+        protocol::SessionFailureClassification::Unknown => {
+            api::SessionFailureClassification::Unspecified
+        }
+        protocol::SessionFailureClassification::Timeout => {
+            api::SessionFailureClassification::Timeout
+        }
+        protocol::SessionFailureClassification::Dns => api::SessionFailureClassification::Dns,
+        protocol::SessionFailureClassification::Connectivity => {
+            api::SessionFailureClassification::Connectivity
+        }
+        protocol::SessionFailureClassification::Tls => api::SessionFailureClassification::Tls,
+        protocol::SessionFailureClassification::Authentication => {
+            api::SessionFailureClassification::Authentication
+        }
+        protocol::SessionFailureClassification::Authorization => {
+            api::SessionFailureClassification::Authorization
+        }
+        protocol::SessionFailureClassification::HttpStatus => {
+            api::SessionFailureClassification::HttpStatus
+        }
+        protocol::SessionFailureClassification::MalformedResponse => {
+            api::SessionFailureClassification::MalformedResponse
+        }
+        protocol::SessionFailureClassification::ProviderUnavailable => {
+            api::SessionFailureClassification::ProviderUnavailable
+        }
+        protocol::SessionFailureClassification::LocalService => {
+            api::SessionFailureClassification::LocalService
+        }
+        protocol::SessionFailureClassification::Transport => {
+            api::SessionFailureClassification::Transport
+        }
+    }) as i32
 }
 
 fn projected_model_options(value: protocol::ModelOptions) -> api::ModelOptions {

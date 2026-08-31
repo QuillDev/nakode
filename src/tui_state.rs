@@ -393,6 +393,7 @@ mod tests {
             selected_provider_id: None,
             selected_account_id: None,
             routing_diagnostic: None,
+            failure: None,
             selected_model_id: None,
             selected_model_options: nakode_protocol::ModelOptions::default(),
             active_agent_session: None,

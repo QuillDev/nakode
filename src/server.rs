@@ -2392,7 +2392,7 @@ impl ServerCore {
         let lifecycle = self.sessions_by_id.get(&session_id).map(|engine| {
             let state = engine.state();
             (
-                state.is_busy() && state.provider_is_live(),
+                state.has_active_execution(),
                 state.provider_is_live() && state.provider_session_id.is_some(),
             )
         });
@@ -4608,6 +4608,7 @@ fn session_metadata(view: &SessionView) -> SessionMetadataView {
         context_usage: view.context_usage,
         recoverable_prompt: view.recoverable_prompt.clone(),
         notices: view.notices.clone(),
+        failure: view.failure.clone(),
     }
 }
 
@@ -6133,6 +6134,7 @@ mod tests {
                     operation: BackendOperation::StartTurn,
                     code: -1,
                     message: "process stopped before acknowledgement".to_owned(),
+                    detail: None,
                 },
             );
         let replay = core
@@ -8909,6 +8911,7 @@ enabled = false
                 operation: BackendOperation::StartTurn,
                 code: -32602,
                 message: "rejected".to_owned(),
+                detail: None,
             });
 
         let QueryResult::Session(session) = core
@@ -9829,12 +9832,13 @@ enabled = false
         assert!(core.engine_for(&attached).is_none());
     }
 
-    /// A legacy session with orphaned busy display state behind a dead backend is deletable too.
+    /// A session with independently delegated work remains protected after its primary provider
+    /// disconnects.
     ///
-    /// Live disconnect handling now settles executable delegated runs. This guard remains for older
-    /// or otherwise inconsistent in-memory projections that have no execution left to cancel.
+    /// A disconnected primary provider does not prove that independently delegated work has stopped.
+    /// Authoritative cleanup remains fenced until that child work reaches a terminal state.
     #[test]
-    fn a_session_stuck_busy_behind_a_dead_backend_is_deletable() {
+    fn a_session_with_active_delegated_work_is_not_deletable_after_provider_disconnect() {
         let (mut core, _) = ready_codex_server();
         let dead = attached_session(&mut core);
         {
@@ -9875,8 +9879,59 @@ enabled = false
             },
         );
 
-        result.expect("a session with no backend behind it has no work to cancel");
-        assert!(core.engine_for(&dead).is_none());
+        let error = result.expect_err(
+            "provider disconnect does not prove independently delegated work has stopped",
+        );
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(core.engine_for(&dead).is_some());
+    }
+
+    /// A failed initial start retains its prompt replay fence, but that fence is not executing work
+    /// and cannot make the logical Chat undeletable.
+    #[test]
+    fn deleting_an_initial_start_failure_ignores_its_replay_only_busy_fence() {
+        let (mut core, _) = ready_codex_server();
+        let failed = attached_session(&mut core);
+        {
+            let state = core
+                .engine_for_mut(&failed)
+                .expect("session runtime")
+                .state_mut();
+            state
+                .submit_prompt("first prompt".to_owned(), Vec::new())
+                .expect("prompt accepted");
+            state.handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::RequestFailed {
+                    operation: BackendOperation::StartSession,
+                    code: -1,
+                    message: "model discovery transport failure".to_owned(),
+                    detail: None,
+                },
+            );
+            assert!(state.is_busy(), "failed prompt retains its replay fence");
+            assert!(!state.has_active_execution());
+            assert!(state.provider_session_id.is_none());
+        }
+
+        let (result, effects, _, _) = core.execute_idempotent(
+            IdempotencyKey::from("delete-failed-start"),
+            None,
+            false,
+            Command::DeleteSession {
+                session_id: failed.clone(),
+            },
+        );
+
+        result.expect("replay-only failed start is deletable");
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                crate::state::Effect::ReleaseSessionBackends(released),
+                crate::state::Effect::DeleteSession(deleted),
+            ] if released == failed.as_str() && deleted == failed.as_str()
+        ));
+        assert!(core.engine_for(&failed).is_none());
     }
 
     /// A session actually working is still refused, and cancelling is still its verb.

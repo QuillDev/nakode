@@ -37,6 +37,7 @@ pub enum AppError {
 /// # Errors
 /// Returns an error when SDK connection, signal handling, projection, or
 /// terminal ownership fails.
+#[allow(clippy::large_futures)]
 pub async fn run(config: Config) -> Result<(), AppError> {
     let nakode_executable = std::env::current_exe().map_err(AppError::CurrentExecutable)?;
     let client = native_client::connect(&config)

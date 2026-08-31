@@ -14,8 +14,9 @@ use nakode_protocol::{
     ProviderCapabilities, ProviderCapability, ProviderId, ProviderView, QueueItemView,
     RecoverablePromptView, RunId, RunOutcome, RunPage, RunPolicyView, RunSalvageView, RunStatus,
     RunTextField, RunTextWindow, RunToolDenialView, RunView, SalvagedEvidenceView, SessionActivity,
-    SessionId, SessionSummary, SessionView, SettingsView, SkillView, TerminalImageModeView,
-    TodoItemView, TodoPhaseView, TodoStatusView, TranscriptBodyWindow, TranscriptEntryKind,
+    SessionFailureClassification, SessionFailurePhase, SessionFailureView, SessionId,
+    SessionSummary, SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView,
+    TodoPhaseView, TodoStatusView, TranscriptBodyWindow, TranscriptEntryKind,
     TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TurnId, TurnStatus, TurnView,
     VisionAvailabilityView, VisionSettingsView, WebSettingsView, WorkspaceId,
 };
@@ -27,8 +28,9 @@ use super::{
 use crate::{
     agent::{AgentDefinition, AgentToolProfile},
     backend::{
-        BackendCapabilities, CLAUDE_PROVIDER, CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport,
-        GLM_PROVIDER, KIMI_PROVIDER, ModelInfo, TodoStatus,
+        BackendCapabilities, BackendFailureClassification, BackendFailurePhase, CLAUDE_PROVIDER,
+        CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, GLM_PROVIDER, KIMI_PROVIDER, ModelInfo,
+        TodoStatus,
     },
     domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
     memory::MemoryBackend,
@@ -243,6 +245,7 @@ fn session_view(
         selected_provider_id: provider,
         selected_account_id: state.provider_account_id.clone(),
         routing_diagnostic: state.provider_account_routing.clone(),
+        failure: session_failure(state),
         selected_model_id: state.selected_model.clone().map(ModelId::from),
         selected_model_options: ProtocolModelOptions {
             reasoning_effort: selected_options.reasoning_effort,
@@ -276,6 +279,60 @@ fn session_view(
         updated_at_ms,
         last_owner_activity_at_ms,
     }
+}
+
+fn session_failure(state: &DomainState) -> Option<SessionFailureView> {
+    let failure = state.latest_failure.as_ref()?;
+    Some(SessionFailureView {
+        initial_start: failure.initial_start,
+        phase: match failure.detail.phase {
+            BackendFailurePhase::Unknown => SessionFailurePhase::Unknown,
+            BackendFailurePhase::ProviderInitialization => {
+                SessionFailurePhase::ProviderInitialization
+            }
+            BackendFailurePhase::Authentication => SessionFailurePhase::Authentication,
+            BackendFailurePhase::ModelDiscovery => SessionFailurePhase::ModelDiscovery,
+            BackendFailurePhase::SessionStart => SessionFailurePhase::SessionStart,
+            BackendFailurePhase::SessionResume => SessionFailurePhase::SessionResume,
+            BackendFailurePhase::TurnStart => SessionFailurePhase::TurnStart,
+            BackendFailurePhase::ContextCompaction => SessionFailurePhase::ContextCompaction,
+            BackendFailurePhase::LocalService => SessionFailurePhase::LocalService,
+        },
+        classification: match failure.detail.classification {
+            BackendFailureClassification::Unknown => SessionFailureClassification::Unknown,
+            BackendFailureClassification::Timeout => SessionFailureClassification::Timeout,
+            BackendFailureClassification::Dns => SessionFailureClassification::Dns,
+            BackendFailureClassification::Connectivity => {
+                SessionFailureClassification::Connectivity
+            }
+            BackendFailureClassification::Tls => SessionFailureClassification::Tls,
+            BackendFailureClassification::Authentication => {
+                SessionFailureClassification::Authentication
+            }
+            BackendFailureClassification::Authorization => {
+                SessionFailureClassification::Authorization
+            }
+            BackendFailureClassification::HttpStatus => SessionFailureClassification::HttpStatus,
+            BackendFailureClassification::MalformedResponse => {
+                SessionFailureClassification::MalformedResponse
+            }
+            BackendFailureClassification::ProviderUnavailable => {
+                SessionFailureClassification::ProviderUnavailable
+            }
+            BackendFailureClassification::LocalService => {
+                SessionFailureClassification::LocalService
+            }
+            BackendFailureClassification::Transport => SessionFailureClassification::Transport,
+        },
+        summary: failure.detail.summary.clone(),
+        provider_id: (!state.backend_provider.is_empty())
+            .then(|| ProviderId::from(state.backend_provider.clone())),
+        operation: failure.detail.operation.clone(),
+        safe_endpoint: failure.detail.safe_endpoint.clone(),
+        http_status: failure.detail.http_status.map(u32::from),
+        source_chain: failure.detail.source_chain.clone(),
+        correlation_id: failure.detail.correlation_id.clone(),
+    })
 }
 
 fn recoverable_prompt_view(state: &DomainState) -> Option<RecoverablePromptView> {

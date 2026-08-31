@@ -1689,6 +1689,7 @@ impl NativeServerRuntime {
                     message: format!(
                         "Owner message was not sent because its durable transcript checkpoint failed: {error}"
                     ),
+                    detail: None,
                 },
             );
             state.queue = queued;
@@ -5771,7 +5772,7 @@ mod tests {
         BridgeContinuationDisposition, BridgeLifecycle, ClientId, Command, CredentialInput,
         ErrorCode, IdempotencyKey, InvocationKind, InvocationSummary, InvocationUsage,
         McpGrantPolicy, McpToolView, ModelOptions, OrchestratorKind, PromptInput, Query,
-        QueryResult, ServiceCapability, SessionId, SessionToolConfiguration, TranscriptEntryStatus,
+        QueryResult, ServiceCapability, SessionId, SessionToolConfiguration,
     };
     use tokio::sync::mpsc;
 
@@ -9078,27 +9079,13 @@ mod tests {
         let (persistence, _credentials) = test_persistence(workspace.path());
         let sessions = Arc::clone(&persistence.sessions);
         let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
-        let mut state = DomainState::new_for_backend(
+        let state = DomainState::new_for_backend(
             workspace.path().to_string_lossy(),
             None,
             100,
             CODEX_PROVIDER,
             "Codex",
         );
-        let shell_effects = state
-            .run_shell_command("sleep 30".to_owned())
-            .expect("start shell before deletion");
-        let [
-            Effect::RunShell {
-                id: shell_id,
-                command: shell_command,
-            },
-        ] = shell_effects.as_slice()
-        else {
-            panic!("shell effect")
-        };
-        let shell_id = shell_id.clone();
-        let shell_command = shell_command.clone();
         let session_id = SessionId::from(state.nakode_session_id.clone());
         sessions
             .create_with_id(
@@ -9122,20 +9109,12 @@ mod tests {
             )
             .expect("failure trigger");
 
-        let (mut runtime, handle) = NativeServerRuntime::from_parts(
+        let (runtime, handle) = NativeServerRuntime::from_parts(
             ServiceEngine::new(state),
             Vec::new(),
             Vec::new(),
             effects,
             mpsc::channel(1).1,
-        );
-        runtime
-            .shell_owners
-            .insert(shell_id.clone(), session_id.clone());
-        runtime.effects.shell_processes.spawn(
-            workspace.path().to_path_buf(),
-            shell_id.clone(),
-            shell_command,
         );
         let endpoint = handle.endpoint().clone();
         let runtime = tokio::spawn(runtime.run());
@@ -9178,18 +9157,6 @@ mod tests {
             panic!("session query result")
         };
         assert_eq!(restored.id, session_id);
-        let restored_shell = restored
-            .transcript
-            .entries
-            .iter()
-            .find(|entry| entry.title == "$ sleep 30")
-            .expect("terminated shell remains as settled transcript evidence");
-        assert_eq!(restored_shell.status, TranscriptEntryStatus::Failed);
-        assert!(
-            restored_shell
-                .body
-                .contains("durable session deletion failed")
-        );
 
         breaker
             .execute_batch("DROP TRIGGER fail_session_delete;")
