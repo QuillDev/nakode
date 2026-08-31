@@ -731,6 +731,7 @@ async fn run_remote_grpc_listener(
         .add_service(
             nakode_server::grpc::GrpcService::new(endpoint)
                 .with_server_id(server_id)
+                .with_nakode_service_only_lane_catalogue()
                 .into_authenticated_server(config.api_key),
         )
         .serve(config.bind)

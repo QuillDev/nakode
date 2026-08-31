@@ -2848,6 +2848,11 @@ mod tests {
             info.build_revision.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
+        assert!(info.rpc_lanes.iter().any(|assignment| {
+            assignment.service == "NakodeService"
+                && assignment.method == "GetTranscriptBodyWindow"
+                && assignment.rule == i32::from(api::rpc_lane_definition::Rule::Hydration)
+        }));
 
         server.stop().await;
     }

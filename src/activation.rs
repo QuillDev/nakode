@@ -9,11 +9,19 @@ use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
     pin::Pin,
-    time::Duration,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use futures_util::{Stream, StreamExt};
 use nakode_sdk::v1 as api;
+use nakode_server::{
+    RequestLane, ServerTiming,
+    grpc::{response_with_timing, tonic_status_with_timing},
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
@@ -884,12 +892,22 @@ impl Drop for ActivationSocketLease {
 enum HelperCommand {
     Recheck {
         idempotency_key: String,
+        timing: ActivationRequestTiming,
         response: oneshot::Sender<Result<api::ActivationStatus, Status>>,
     },
     Force {
         request: api::ForceActivateRequest,
+        timing: ActivationRequestTiming,
         response: oneshot::Sender<Result<api::ActivationStatus, Status>>,
     },
+}
+
+impl HelperCommand {
+    fn mark_dequeued(&self) {
+        match self {
+            Self::Recheck { timing, .. } | Self::Force { timing, .. } => timing.mark_dequeued(),
+        }
+    }
 }
 
 /// Runs the detached singleton activation helper until activation succeeds or is cancelled.
@@ -943,6 +961,7 @@ pub async fn run_helper(config: Config) -> Result<(), ActivationError> {
             }
             command = command_rx.recv() => {
                 let Some(command) = command else { break; };
+                command.mark_dequeued();
                 if !helper_lease.still_owns_path() {
                     let error = Status::unavailable(
                         "activation helper ownership changed; rediscover the activation endpoint",
@@ -956,7 +975,11 @@ pub async fn run_helper(config: Config) -> Result<(), ActivationError> {
                     break;
                 }
                 match command {
-                    HelperCommand::Recheck { idempotency_key, response } => {
+                    HelperCommand::Recheck {
+                        idempotency_key,
+                        response,
+                        ..
+                    } => {
                         let result = manual_recheck(&paths, &executable, &config, idempotency_key).await;
                         let activated = result.as_ref().is_ok_and(|status| {
                             status.phase == api::ActivationPhase::Activated as i32
@@ -964,7 +987,9 @@ pub async fn run_helper(config: Config) -> Result<(), ActivationError> {
                         let _ = response.send(result);
                         activated
                     }
-                    HelperCommand::Force { request, response } => {
+                    HelperCommand::Force {
+                        request, response, ..
+                    } => {
                         let result = force_activate(&paths, &executable, &config, request).await;
                         let activated = result.as_ref().is_ok_and(|status| {
                             status.phase == api::ActivationPhase::Activated as i32
@@ -1000,14 +1025,18 @@ async fn resolve_queued_terminal_commands(
     commands.close();
     let _activation = ActivationLease::acquire(paths.activation()).await?;
     while let Ok(command) = commands.try_recv() {
+        command.mark_dequeued();
         match command {
             HelperCommand::Recheck {
                 idempotency_key,
                 response,
+                ..
             } => {
                 let _ = response.send(complete_terminal_recheck(paths, idempotency_key));
             }
-            HelperCommand::Force { request, response } => {
+            HelperCommand::Force {
+                request, response, ..
+            } => {
                 let _ = response.send(complete_terminal_force(paths, request));
             }
         }
@@ -1754,11 +1783,93 @@ fn internal_status(error: &ActivationError) -> Status {
     Status::internal(error.to_string())
 }
 
+#[derive(Clone, Debug)]
+struct ActivationRequestTiming {
+    lane: RequestLane,
+    lane_sequence: u64,
+    started_at: Instant,
+    admitted_at: Arc<OnceLock<Instant>>,
+    dequeued_at: Arc<OnceLock<Instant>>,
+}
+
+impl ActivationRequestTiming {
+    fn new(lane: RequestLane, lane_sequence: u64) -> Self {
+        Self {
+            lane,
+            lane_sequence,
+            started_at: Instant::now(),
+            admitted_at: Arc::new(OnceLock::new()),
+            dequeued_at: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn mark_immediate(&self) {
+        let _ = self.admitted_at.set(self.started_at);
+        let _ = self.dequeued_at.set(self.started_at);
+    }
+
+    fn mark_admitted(&self) {
+        let _ = self.admitted_at.set(Instant::now());
+    }
+
+    fn mark_dequeued(&self) {
+        let _ = self.dequeued_at.set(Instant::now());
+    }
+
+    fn finish(&self) -> ServerTiming {
+        let finished_at = Instant::now();
+        let admitted_at = self.admitted_at.get().copied().unwrap_or(finished_at);
+        let dequeued_at = self.dequeued_at.get().copied().unwrap_or(admitted_at);
+        let admission = admitted_at.saturating_duration_since(self.started_at);
+        let queue = dequeued_at.saturating_duration_since(admitted_at);
+        let service = finished_at.saturating_duration_since(dequeued_at);
+        ServerTiming {
+            lane: self.lane,
+            lane_sequence: self.lane_sequence,
+            admission,
+            queue,
+            service,
+            total: admission + queue + service,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ActivationTimingSequences {
+    control: AtomicU64,
+    query: AtomicU64,
+    hydration: AtomicU64,
+    subscription: AtomicU64,
+}
+
+impl ActivationTimingSequences {
+    fn next(&self, lane: RequestLane) -> u64 {
+        let sequence = match lane {
+            RequestLane::Control => &self.control,
+            RequestLane::Query => &self.query,
+            RequestLane::Hydration => &self.hydration,
+            RequestLane::Subscription => &self.subscription,
+        };
+        sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+fn activation_response<T>(
+    result: Result<T, Status>,
+    request_timing: &ActivationRequestTiming,
+) -> Result<Response<T>, Status> {
+    let timing = request_timing.finish();
+    result
+        .map(|value| response_with_timing(value, &timing))
+        .map_err(|status| tonic_status_with_timing(status, &timing))
+}
+
 #[derive(Clone)]
 pub(crate) struct ActivationGrpcService {
     paths: ServicePaths,
     executable: PathBuf,
     commands: Option<mpsc::Sender<HelperCommand>>,
+    timing_sequences: Arc<ActivationTimingSequences>,
 }
 
 impl ActivationGrpcService {
@@ -1775,7 +1886,44 @@ impl ActivationGrpcService {
             paths,
             executable,
             commands,
+            timing_sequences: Arc::new(ActivationTimingSequences::default()),
         }
+    }
+
+    fn begin_timing(&self, lane: RequestLane) -> ActivationRequestTiming {
+        ActivationRequestTiming::new(lane, self.timing_sequences.next(lane))
+    }
+
+    async fn execute_command(
+        &self,
+        make_command: impl FnOnce(
+            ActivationRequestTiming,
+            oneshot::Sender<Result<api::ActivationStatus, Status>>,
+        ) -> HelperCommand,
+    ) -> Result<Response<api::ActivationStatus>, Status> {
+        let timing = self.begin_timing(RequestLane::Control);
+        let Some(commands) = self.commands.as_ref() else {
+            timing.mark_immediate();
+            return activation_response(
+                Err(Status::failed_precondition(
+                    "activation mutations must use the helper endpoint advertised by endpoint discovery",
+                )),
+                &timing,
+            );
+        };
+        let Ok(permit) = commands.reserve().await else {
+            return activation_response(
+                Err(Status::unavailable("activation helper stopped")),
+                &timing,
+            );
+        };
+        timing.mark_admitted();
+        let (response_tx, response_rx) = oneshot::channel();
+        permit.send(make_command(timing.clone(), response_tx));
+        let result = response_rx
+            .await
+            .unwrap_or_else(|_| Err(Status::unavailable("activation helper stopped")));
+        activation_response(result, &timing)
     }
 
     pub(crate) fn into_server(
@@ -1798,7 +1946,9 @@ impl api::activation_service_server::ActivationService for ActivationGrpcService
         &self,
         _request: Request<api::GetActivationStatusRequest>,
     ) -> Result<Response<api::ActivationStatus>, Status> {
-        Ok(Response::new(self.status().await?))
+        let timing = self.begin_timing(RequestLane::Query);
+        timing.mark_immediate();
+        activation_response(self.status().await, &timing)
     }
 
     type WatchActivationStatusStream =
@@ -1808,6 +1958,8 @@ impl api::activation_service_server::ActivationService for ActivationGrpcService
         &self,
         request: Request<api::WatchActivationStatusRequest>,
     ) -> Result<Response<Self::WatchActivationStatusStream>, Status> {
+        let timing = self.begin_timing(RequestLane::Subscription);
+        timing.mark_immediate();
         let request = request.into_inner();
         let after_revision = request.after_revision.unwrap_or(0);
         let after_attempt_id = request.after_attempt_id;
@@ -1839,53 +1991,34 @@ impl api::activation_service_server::ActivationService for ActivationGrpcService
                 tokio::time::sleep(WATCH_CADENCE).await;
             }
         });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        let stream: Self::WatchActivationStatusStream = Box::pin(ReceiverStream::new(rx));
+        activation_response(Ok(stream), &timing)
     }
 
     async fn force_activation_recheck(
         &self,
         request: Request<api::ActivationMutationRequest>,
     ) -> Result<Response<api::ActivationStatus>, Status> {
-        let commands = self.commands.as_ref().ok_or_else(|| {
-            Status::failed_precondition(
-                "activation mutations must use the helper endpoint advertised by endpoint discovery",
-            )
-        })?;
-        let (response_tx, response_rx) = oneshot::channel();
-        commands
-            .send(HelperCommand::Recheck {
-                idempotency_key: request.into_inner().idempotency_key,
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| Status::unavailable("activation helper stopped"))?;
-        response_rx
-            .await
-            .map_err(|_| Status::unavailable("activation helper stopped"))?
-            .map(Response::new)
+        let idempotency_key = request.into_inner().idempotency_key;
+        self.execute_command(|timing, response| HelperCommand::Recheck {
+            idempotency_key,
+            timing,
+            response,
+        })
+        .await
     }
 
     async fn force_activate(
         &self,
         request: Request<api::ForceActivateRequest>,
     ) -> Result<Response<api::ActivationStatus>, Status> {
-        let commands = self.commands.as_ref().ok_or_else(|| {
-            Status::failed_precondition(
-                "activation mutations must use the helper endpoint advertised by endpoint discovery",
-            )
-        })?;
-        let (response_tx, response_rx) = oneshot::channel();
-        commands
-            .send(HelperCommand::Force {
-                request: request.into_inner(),
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| Status::unavailable("activation helper stopped"))?;
-        response_rx
-            .await
-            .map_err(|_| Status::unavailable("activation helper stopped"))?
-            .map(Response::new)
+        let request = request.into_inner();
+        self.execute_command(|timing, response| HelperCommand::Force {
+            request,
+            timing,
+            response,
+        })
+        .await
     }
 }
 
@@ -2012,6 +2145,35 @@ const fn result_to_api(result: CheckResult) -> api::ActivationCheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_timing_metadata(metadata: &tonic::metadata::MetadataMap, lane: &str) {
+        assert_eq!(metadata.get("x-nakode-lane").unwrap(), lane);
+        for key in [
+            "x-nakode-lane-sequence",
+            "x-nakode-admission-us",
+            "x-nakode-queue-us",
+            "x-nakode-service-us",
+            "x-nakode-server-total-us",
+        ] {
+            assert!(metadata.get(key).is_some(), "missing {key}");
+        }
+    }
+
+    fn timing_us(metadata: &tonic::metadata::MetadataMap, key: &'static str) -> u64 {
+        metadata
+            .get(key)
+            .expect("timing metadata")
+            .to_str()
+            .expect("ASCII timing")
+            .parse()
+            .expect("numeric timing")
+    }
+
+    fn control_timing(sequence: u64) -> ActivationRequestTiming {
+        let timing = ActivationRequestTiming::new(RequestLane::Control, sequence);
+        timing.mark_admitted();
+        timing
+    }
 
     fn identity(hash: &str) -> ExecutableIdentity {
         ExecutableIdentity {
@@ -2561,6 +2723,7 @@ mod tests {
         commands
             .send(HelperCommand::Recheck {
                 idempotency_key: "queued-recheck".to_owned(),
+                timing: control_timing(1),
                 response: recheck_tx,
             })
             .await
@@ -2568,6 +2731,7 @@ mod tests {
         commands
             .send(HelperCommand::Recheck {
                 idempotency_key: "queued-recheck".to_owned(),
+                timing: control_timing(2),
                 response: recheck_replay_tx,
             })
             .await
@@ -2575,6 +2739,7 @@ mod tests {
         commands
             .send(HelperCommand::Force {
                 request: stale_force.clone(),
+                timing: control_timing(3),
                 response: force_tx,
             })
             .await
@@ -2582,6 +2747,7 @@ mod tests {
         commands
             .send(HelperCommand::Force {
                 request: stale_force,
+                timing: control_timing(4),
                 response: force_replay_tx,
             })
             .await
@@ -2675,6 +2841,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activation_queries_and_queued_mutations_expose_complete_phase_timing() {
+        let directory = tempfile::tempdir().expect("activation directory");
+        let paths = ServicePaths::in_directory(directory.path());
+        let mut terminal = terminal_journal(true);
+        write_journal(&paths, &mut terminal).expect("terminal journal");
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let service =
+            ActivationGrpcService::new(paths, PathBuf::from("/tmp/fake-nakode"), Some(commands));
+
+        let status = api::activation_service_server::ActivationService::get_activation_status(
+            &service,
+            Request::new(api::GetActivationStatusRequest {}),
+        )
+        .await
+        .expect("activation status");
+        assert_timing_metadata(status.metadata(), "query");
+        assert_eq!(timing_us(status.metadata(), "x-nakode-admission-us"), 0);
+        assert_eq!(timing_us(status.metadata(), "x-nakode-queue-us"), 0);
+
+        let mutation = api::activation_service_server::ActivationService::force_activation_recheck(
+            &service,
+            Request::new(api::ActivationMutationRequest {
+                idempotency_key: "timed-recheck".to_owned(),
+            }),
+        );
+        let helper = async {
+            let command = command_rx.recv().await.expect("queued activation mutation");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            command.mark_dequeued();
+            let HelperCommand::Recheck { response, .. } = command else {
+                panic!("expected activation recheck");
+            };
+            let _ = response.send(Ok(journal_to_api(terminal)));
+        };
+        let (mutation, ()) = tokio::join!(mutation, helper);
+        let mutation = mutation.expect("activation mutation");
+        assert_timing_metadata(mutation.metadata(), "control");
+        let admission = timing_us(mutation.metadata(), "x-nakode-admission-us");
+        let queue = timing_us(mutation.metadata(), "x-nakode-queue-us");
+        let service = timing_us(mutation.metadata(), "x-nakode-service-us");
+        let total = timing_us(mutation.metadata(), "x-nakode-server-total-us");
+        assert!(queue >= 2_000);
+        let summed_phases = admission + queue + service;
+        assert!((summed_phases..=summed_phases + 2).contains(&total));
+    }
+
+    #[tokio::test]
+    async fn unavailable_activation_mutation_retains_control_timing() {
+        let directory = tempfile::tempdir().expect("activation directory");
+        let service = ActivationGrpcService::read_only(
+            ServicePaths::in_directory(directory.path()),
+            PathBuf::from("/tmp/fake-nakode"),
+        );
+        let error = api::activation_service_server::ActivationService::force_activation_recheck(
+            &service,
+            Request::new(api::ActivationMutationRequest {
+                idempotency_key: "unavailable".to_owned(),
+            }),
+        )
+        .await
+        .expect_err("read-only endpoint must reject activation mutation");
+        assert_timing_metadata(error.metadata(), "control");
+    }
+
+    #[tokio::test]
     async fn helper_owned_terminal_watch_delivers_activated_then_closes() {
         use futures_util::StreamExt;
 
@@ -2694,6 +2925,9 @@ mod tests {
         )
         .await
         .expect("open helper watch");
+        assert_timing_metadata(response.metadata(), "subscription");
+        assert_eq!(timing_us(response.metadata(), "x-nakode-admission-us"), 0);
+        assert_eq!(timing_us(response.metadata(), "x-nakode-queue-us"), 0);
         let mut stream = response.into_inner();
         let status = tokio::time::timeout(Duration::from_secs(1), stream.next())
             .await
