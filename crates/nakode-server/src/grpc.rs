@@ -3,7 +3,7 @@
 //! Conversion lives here so provider/runtime protocol types never leak into
 //! the public generated contract. The adapter never owns domain state.
 
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::Instant};
 
 use futures_util::Stream;
 use nakode_api::v1 as api;
@@ -11,7 +11,10 @@ use nakode_protocol as protocol;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::Interceptor;
 
-use crate::{PublishedEvent, ServerEndpoint, ServerTiming, TimedServerResponse};
+use crate::{
+    PublishedEvent, RPC_LANE_CATALOGUE, RequestLane, RpcLaneRule, ServerEndpoint, ServerTiming,
+    TimedServerResponse,
+};
 
 #[derive(Clone, Debug)]
 pub struct ApiKeyInterceptor {
@@ -52,6 +55,7 @@ pub struct GrpcService {
     endpoint: ServerEndpoint,
     client_id: protocol::ClientId,
     server_id: String,
+    include_activation_rpc_lanes: bool,
 }
 
 impl GrpcService {
@@ -62,12 +66,20 @@ impl GrpcService {
             endpoint,
             client_id: protocol::ClientId::new(format!("grpc-{}", uuid::Uuid::now_v7())),
             server_id,
+            include_activation_rpc_lanes: true,
         }
     }
 
     #[must_use]
     pub fn with_server_id(mut self, server_id: impl Into<String>) -> Self {
         self.server_id = server_id.into();
+        self
+    }
+
+    /// Restricts the advertised catalogue to the `NakodeService` surface bound by this listener.
+    #[must_use]
+    pub fn with_nakode_service_only_lane_catalogue(mut self) -> Self {
+        self.include_activation_rpc_lanes = false;
         self
     }
 
@@ -91,16 +103,34 @@ impl GrpcService {
         )
     }
 
+    fn immediate_status(
+        &self,
+        lane: RequestLane,
+        started_at: Instant,
+        status: tonic::Status,
+    ) -> tonic::Status {
+        let timing = self.endpoint.complete_immediate_timing(lane, started_at);
+        tonic_status_with_timing(status, &timing)
+    }
+
     async fn execute_mutation(
         &self,
         options: Option<api::MutationOptions>,
         command: protocol::Command,
     ) -> Result<TimedServerResponse<protocol::CommandAccepted>, tonic::Status> {
-        let options =
-            options.ok_or_else(|| tonic::Status::invalid_argument("mutation is required"))?;
+        let started_at = Instant::now();
+        let options = options.ok_or_else(|| {
+            self.immediate_status(
+                RequestLane::Control,
+                started_at,
+                tonic::Status::invalid_argument("mutation is required"),
+            )
+        })?;
         if options.idempotency_key.is_empty() {
-            return Err(tonic::Status::invalid_argument(
-                "mutation.idempotency_key is required",
+            return Err(self.immediate_status(
+                RequestLane::Control,
+                started_at,
+                tonic::Status::invalid_argument("mutation.idempotency_key is required"),
             ));
         }
         Ok(self
@@ -145,8 +175,12 @@ impl GrpcService {
     async fn query(
         &self,
         query: protocol::Query,
-    ) -> Result<protocol::Snapshot<protocol::QueryResult>, tonic::Status> {
-        self.query_timed(query).await.result.map_err(status)
+    ) -> Result<(protocol::Snapshot<protocol::QueryResult>, ServerTiming), tonic::Status> {
+        let timed = self.query_timed(query).await;
+        timed
+            .result
+            .map(|result| (result, timed.timing.clone()))
+            .map_err(|error| status_with_timing(error, &timed.timing))
     }
 
     async fn subscription_timed(
@@ -202,16 +236,24 @@ fn insert_server_timing(metadata: &mut tonic::metadata::MetadataMap, timing: &Se
     );
 }
 
-fn response_with_timing<T>(value: T, timing: &ServerTiming) -> tonic::Response<T> {
+pub fn response_with_timing<T>(value: T, timing: &ServerTiming) -> tonic::Response<T> {
     let mut response = tonic::Response::new(value);
     insert_server_timing(response.metadata_mut(), timing);
     response
 }
 
+#[must_use]
+pub fn tonic_status_with_timing(mut status: tonic::Status, timing: &ServerTiming) -> tonic::Status {
+    insert_server_timing(status.metadata_mut(), timing);
+    status
+}
+
 fn status_with_timing(error: protocol::ServiceError, timing: &ServerTiming) -> tonic::Status {
-    let mut value = status(error);
-    insert_server_timing(value.metadata_mut(), timing);
-    value
+    tonic_status_with_timing(status(error), timing)
+}
+
+fn internal_with_timing(message: &'static str, timing: &ServerTiming) -> tonic::Status {
+    tonic_status_with_timing(tonic::Status::internal(message), timing)
 }
 
 fn status(error: protocol::ServiceError) -> tonic::Status {
@@ -527,9 +569,12 @@ macro_rules! try_command_rpc {
             Self: 'async_trait,
         {
             Box::pin(async move {
+                let started_at = Instant::now();
                 let mut $input = request.into_inner();
                 let options = $input.mutation.take();
-                let command = $command?;
+                let command = $command.map_err(|status| {
+                    self.immediate_status(RequestLane::Control, started_at, status)
+                })?;
                 self.mutate(options, command).await
             })
         }
@@ -553,7 +598,10 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             .result
             .map_err(|error| status_with_timing(error, &timed.timing))?;
         let protocol::QueryResult::Bootstrap(value) = result.value else {
-            return Err(tonic::Status::internal("unexpected workspace response"));
+            return Err(internal_with_timing(
+                "unexpected workspace response",
+                &timed.timing,
+            ));
         };
         Ok(response_with_timing(
             api::WorkspaceSnapshot {
@@ -569,24 +617,28 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         request: tonic::Request<api::InspectWorkspacePathRequest>,
     ) -> Result<tonic::Response<api::WorkspacePathInspection>, tonic::Status> {
         let request = request.into_inner();
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::InspectWorkspacePath {
                 path: request.path,
                 expected_git_repository: request.expected_git_repository,
             })
             .await?;
         let protocol::QueryResult::WorkspacePathInspection(value) = result.value else {
-            return Err(tonic::Status::internal(
+            return Err(internal_with_timing(
                 "unexpected workspace path inspection response",
+                &timing,
             ));
         };
-        Ok(tonic::Response::new(api::WorkspacePathInspection {
-            canonical_path: value.canonical_path,
-            git_repository: value.git_repository,
-            branch: value.branch,
-            revision: value.revision,
-            dirty: value.dirty,
-        }))
+        Ok(response_with_timing(
+            api::WorkspacePathInspection {
+                canonical_path: value.canonical_path,
+                git_repository: value.git_repository,
+                branch: value.branch,
+                revision: value.revision,
+                dirty: value.dirty,
+            },
+            &timing,
+        ))
     }
 
     type WatchWorkspaceStream = ApiStream<api::WorkspaceSnapshot>;
@@ -598,9 +650,15 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             workspace_id: protocol::WorkspaceId::from(request.into_inner().workspace_id),
         };
         let publications = self.endpoint.subscribe_publications();
-        let initial = self.subscription(scope.clone()).await?;
+        let timed = self.subscription_timed(scope.clone()).await;
+        let initial = timed
+            .result
+            .map_err(|error| status_with_timing(error, &timed.timing))?;
         let protocol::SubscriptionView::Workspace(value) = initial.value else {
-            return Err(tonic::Status::internal("unexpected workspace subscription"));
+            return Err(internal_with_timing(
+                "unexpected workspace subscription",
+                &timed.timing,
+            ));
         };
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         sender
@@ -609,11 +667,14 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 state: Some(workspace(*value)),
             }))
             .await
-            .map_err(|_| tonic::Status::cancelled("watch closed"))?;
+            .map_err(|_| {
+                tonic_status_with_timing(tonic::Status::cancelled("watch closed"), &timed.timing)
+            })?;
         spawn_workspace_watch(self.clone(), scope, publications, sender);
-        Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
-            receiver,
-        ))))
+        Ok(response_with_timing(
+            Box::pin(ReceiverStream::new(receiver)),
+            &timed.timing,
+        ))
     }
 
     command_rpc!(
@@ -631,27 +692,30 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         request: tonic::Request<api::GetSoulRequest>,
     ) -> Result<tonic::Response<api::SoulDocument>, tonic::Status> {
         let request = request.into_inner();
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::GetSoul {
                 workspace_id: protocol::WorkspaceId::from(request.workspace_id),
             })
             .await?;
         let protocol::QueryResult::SoulDocument(value) = result.value else {
-            return Err(tonic::Status::internal("unexpected Soul response"));
+            return Err(internal_with_timing("unexpected Soul response", &timing));
         };
         let source = match value.source.as_str() {
             "file" => api::soul_document::Source::File,
             "missing" => api::soul_document::Source::Missing,
             _ => api::soul_document::Source::Unspecified,
         };
-        Ok(tonic::Response::new(api::SoulDocument {
-            workspace_id: value.workspace_id.to_string(),
-            content: value.content,
-            path: value.path,
-            source: source.into(),
-            exists: value.exists,
-            digest: value.digest,
-        }))
+        Ok(response_with_timing(
+            api::SoulDocument {
+                workspace_id: value.workspace_id.to_string(),
+                content: value.content,
+                path: value.path,
+                source: source.into(),
+                exists: value.exists,
+                digest: value.digest,
+            },
+            &timing,
+        ))
     }
 
     command_rpc!(
@@ -668,28 +732,31 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         &self,
         request: tonic::Request<api::GetMcpManagementRequest>,
     ) -> Result<tonic::Response<api::McpManagement>, tonic::Status> {
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::GetMcpManagement {
                 workspace_id: protocol::WorkspaceId::from(request.into_inner().workspace_id),
             })
             .await?;
         let protocol::QueryResult::McpManagement(value) = result.value else {
-            return Err(tonic::Status::internal(
+            return Err(internal_with_timing(
                 "unexpected MCP management response",
+                &timing,
             ));
         };
-        Ok(tonic::Response::new(mcp_management(value)))
+        Ok(response_with_timing(mcp_management(value), &timing))
     }
 
-    command_rpc!(
+    try_command_rpc!(
         save_mcp_server,
         api::SaveMcpServerRequest,
         input,
-        protocol::Command::SaveMcpServer {
-            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
-            server: mcp_server_input(input.server)?,
-            grants: mcp_grants(input.grants),
-        }
+        (|| -> Result<protocol::Command, tonic::Status> {
+            Ok(protocol::Command::SaveMcpServer {
+                workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+                server: mcp_server_input(input.server)?,
+                grants: mcp_grants(input.grants),
+            })
+        })()
     );
     command_rpc!(
         delete_mcp_server,
@@ -750,56 +817,64 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
 
-    command_rpc!(
+    try_command_rpc!(
         create_session,
         api::CreateSessionRequest,
         input,
-        protocol::Command::CreateSession {
-            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
-            working_directory: input.working_directory,
-            title: input.title,
-            model_id: input.model_id.map(protocol::ModelId::from),
-            options: model_options(input.options),
-            tools: session_tools(input.tools),
-            initial_instructions: input.initial_instructions,
-            bridge: bridge_intent(input.bridge)?,
-            mcp_grant: mcp_grant(input.mcp_grant)?,
-            profile_id: input.profile_id,
-            disabled_skill_ids: Vec::new(),
-            account_id: input.account_id,
-        }
+        (|| -> Result<protocol::Command, tonic::Status> {
+            Ok(protocol::Command::CreateSession {
+                workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+                working_directory: input.working_directory,
+                title: input.title,
+                model_id: input.model_id.map(protocol::ModelId::from),
+                options: model_options(input.options),
+                tools: session_tools(input.tools),
+                initial_instructions: input.initial_instructions,
+                bridge: bridge_intent(input.bridge)?,
+                mcp_grant: mcp_grant(input.mcp_grant)?,
+                profile_id: input.profile_id,
+                disabled_skill_ids: Vec::new(),
+                account_id: input.account_id,
+            })
+        })()
     );
-    command_rpc!(
+    try_command_rpc!(
         open_session,
         api::OpenSessionRequest,
         input,
-        protocol::Command::OpenSession {
-            session_id: protocol::SessionId::from(input.session_id),
-            tools: session_tools(input.tools),
-            mcp_grant: mcp_grant(input.mcp_grant)?,
-            profile_id: input.profile_id,
-            enabled_skill_ids: Vec::new(),
-            account_id: input.account_id,
-        }
+        (|| -> Result<protocol::Command, tonic::Status> {
+            Ok(protocol::Command::OpenSession {
+                session_id: protocol::SessionId::from(input.session_id),
+                tools: session_tools(input.tools),
+                mcp_grant: mcp_grant(input.mcp_grant)?,
+                profile_id: input.profile_id,
+                enabled_skill_ids: Vec::new(),
+                account_id: input.account_id,
+            })
+        })()
     );
 
-    command_rpc!(
+    try_command_rpc!(
         set_session_bridge_lifecycle,
         api::SetSessionBridgeLifecycleRequest,
         input,
-        protocol::Command::SetSessionBridgeLifecycle {
-            session_id: protocol::SessionId::from(input.session_id),
-            lifecycle: bridge_lifecycle(input.lifecycle)?,
-        }
+        bridge_lifecycle(input.lifecycle).map(|lifecycle| {
+            protocol::Command::SetSessionBridgeLifecycle {
+                session_id: protocol::SessionId::from(input.session_id),
+                lifecycle,
+            }
+        })
     );
-    command_rpc!(
+    try_command_rpc!(
         set_workspace_bridge_lifecycle,
         api::SetWorkspaceBridgeLifecycleRequest,
         input,
-        protocol::Command::SetWorkspaceBridgeLifecycle {
-            workspace_id: protocol::WorkspaceId::from(input.workspace_id),
-            lifecycle: bridge_lifecycle(input.lifecycle)?,
-        }
+        bridge_lifecycle(input.lifecycle).map(|lifecycle| {
+            protocol::Command::SetWorkspaceBridgeLifecycle {
+                workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+                lifecycle,
+            }
+        })
     );
     command_rpc!(
         bind_session_bridge_thread,
@@ -882,9 +957,11 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         &self,
         request: tonic::Request<api::ContinueSessionFromBridgeRequest>,
     ) -> Result<tonic::Response<api::ContinueSessionFromBridgeResponse>, tonic::Status> {
+        let started_at = Instant::now();
         let mut input = request.into_inner();
         let options = input.mutation.take();
-        let prompt = prompt(input.prompt)?;
+        let prompt = prompt(input.prompt)
+            .map_err(|status| self.immediate_status(RequestLane::Control, started_at, status))?;
         let timed = self
             .execute_mutation(
                 options,
@@ -917,7 +994,10 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             .bridge_continuation
             .map(wire_disposition)
             .ok_or_else(|| {
-                tonic::Status::internal("bridge continuation result omitted its disposition")
+                internal_with_timing(
+                    "bridge continuation result omitted its disposition",
+                    &timed.timing,
+                )
             })?;
         let replayed_disposition = result
             .replayed_bridge_continuation
@@ -942,41 +1022,50 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         request: tonic::Request<api::ListSessionsRequest>,
     ) -> Result<tonic::Response<api::ListSessionsResponse>, tonic::Status> {
         let request = request.into_inner();
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::ListSessions {
                 workspace_id: protocol::WorkspaceId::from(request.workspace_id),
                 limit: request.limit,
             })
             .await?;
         let protocol::QueryResult::Sessions(inventory) = result.value else {
-            return Err(tonic::Status::internal("unexpected sessions response"));
+            return Err(internal_with_timing(
+                "unexpected sessions response",
+                &timing,
+            ));
         };
-        Ok(tonic::Response::new(api::ListSessionsResponse {
-            sessions: inventory
-                .sessions
-                .into_iter()
-                .map(session_summary)
-                .collect(),
-            complete: inventory.complete,
-        }))
+        Ok(response_with_timing(
+            api::ListSessionsResponse {
+                sessions: inventory
+                    .sessions
+                    .into_iter()
+                    .map(session_summary)
+                    .collect(),
+                complete: inventory.complete,
+            },
+            &timing,
+        ))
     }
 
     async fn get_session(
         &self,
         request: tonic::Request<api::GetSessionRequest>,
     ) -> Result<tonic::Response<api::SessionSnapshot>, tonic::Status> {
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::GetSession {
                 session_id: protocol::SessionId::from(request.into_inner().session_id),
             })
             .await?;
         let protocol::QueryResult::Session(value) = result.value else {
-            return Err(tonic::Status::internal("unexpected session response"));
+            return Err(internal_with_timing("unexpected session response", &timing));
         };
-        Ok(tonic::Response::new(api::SessionSnapshot {
-            cursor: Some(cursor(&result.cursor)),
-            state: Some(session(*value)),
-        }))
+        Ok(response_with_timing(
+            api::SessionSnapshot {
+                cursor: Some(cursor(&result.cursor)),
+                state: Some(session(*value)),
+            },
+            &timing,
+        ))
     }
 
     type WatchSessionStream = ApiStream<api::SessionSnapshot>;
@@ -988,9 +1077,15 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             session_id: protocol::SessionId::from(request.into_inner().session_id),
         };
         let publications = self.endpoint.subscribe_publications();
-        let initial = self.subscription(scope.clone()).await?;
+        let timed = self.subscription_timed(scope.clone()).await;
+        let initial = timed
+            .result
+            .map_err(|error| status_with_timing(error, &timed.timing))?;
         let protocol::SubscriptionView::Session(value) = initial.value else {
-            return Err(tonic::Status::internal("unexpected session subscription"));
+            return Err(internal_with_timing(
+                "unexpected session subscription",
+                &timed.timing,
+            ));
         };
         let (sender, receiver) = tokio::sync::mpsc::channel(32);
         sender
@@ -999,11 +1094,14 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 state: Some(session(*value)),
             }))
             .await
-            .map_err(|_| tonic::Status::cancelled("watch closed"))?;
+            .map_err(|_| {
+                tonic_status_with_timing(tonic::Status::cancelled("watch closed"), &timed.timing)
+            })?;
         spawn_session_watch(self.clone(), scope, publications, sender);
-        Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
-            receiver,
-        ))))
+        Ok(response_with_timing(
+            Box::pin(ReceiverStream::new(receiver)),
+            &timed.timing,
+        ))
     }
 
     try_command_rpc!(
@@ -1080,48 +1178,60 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         &self,
         request: tonic::Request<api::ResolveInteractionRequest>,
     ) -> Result<tonic::Response<api::MutationResult>, tonic::Status> {
+        let started_at = Instant::now();
         let mut input = request.into_inner();
         let options = input.mutation.take();
-        let resolution = match api::InteractionResolutionKind::try_from(input.resolution)
-            .map_err(|_| tonic::Status::invalid_argument("invalid interaction resolution"))?
-        {
-            api::InteractionResolutionKind::ApproveOnce => {
-                protocol::InteractionResolution::ApproveOnce
-            }
-            api::InteractionResolutionKind::ApproveForSession => {
-                protocol::InteractionResolution::ApproveForSession
-            }
-            api::InteractionResolutionKind::Decline => protocol::InteractionResolution::Decline,
-            api::InteractionResolutionKind::Answer => {
-                if input.answers.is_empty() {
-                    protocol::InteractionResolution::Answer {
-                        option_ids: input.option_ids,
-                    }
-                } else {
-                    if !input.option_ids.is_empty() {
-                        return Err(tonic::Status::invalid_argument(
-                            "use either legacy option_ids or structured answers, not both",
-                        ));
-                    }
-                    protocol::InteractionResolution::AnswerQuestions {
-                        answers: input
-                            .answers
-                            .into_iter()
-                            .map(|answer| protocol::QuestionResponse {
-                                question_id: answer.question_id,
-                                option_ids: answer.option_ids,
-                                text: answer.text,
-                            })
-                            .collect(),
+        let resolution =
+            match api::InteractionResolutionKind::try_from(input.resolution).map_err(|_| {
+                self.immediate_status(
+                    RequestLane::Control,
+                    started_at,
+                    tonic::Status::invalid_argument("invalid interaction resolution"),
+                )
+            })? {
+                api::InteractionResolutionKind::ApproveOnce => {
+                    protocol::InteractionResolution::ApproveOnce
+                }
+                api::InteractionResolutionKind::ApproveForSession => {
+                    protocol::InteractionResolution::ApproveForSession
+                }
+                api::InteractionResolutionKind::Decline => protocol::InteractionResolution::Decline,
+                api::InteractionResolutionKind::Answer => {
+                    if input.answers.is_empty() {
+                        protocol::InteractionResolution::Answer {
+                            option_ids: input.option_ids,
+                        }
+                    } else {
+                        if !input.option_ids.is_empty() {
+                            return Err(self.immediate_status(
+                                RequestLane::Control,
+                                started_at,
+                                tonic::Status::invalid_argument(
+                                    "use either legacy option_ids or structured answers, not both",
+                                ),
+                            ));
+                        }
+                        protocol::InteractionResolution::AnswerQuestions {
+                            answers: input
+                                .answers
+                                .into_iter()
+                                .map(|answer| protocol::QuestionResponse {
+                                    question_id: answer.question_id,
+                                    option_ids: answer.option_ids,
+                                    text: answer.text,
+                                })
+                                .collect(),
+                        }
                     }
                 }
-            }
-            api::InteractionResolutionKind::Unspecified => {
-                return Err(tonic::Status::invalid_argument(
-                    "interaction resolution is required",
-                ));
-            }
-        };
+                api::InteractionResolutionKind::Unspecified => {
+                    return Err(self.immediate_status(
+                        RequestLane::Control,
+                        started_at,
+                        tonic::Status::invalid_argument("interaction resolution is required"),
+                    ));
+                }
+            };
         self.mutate(
             options,
             protocol::Command::ResolveInteraction {
@@ -1247,7 +1357,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         request: tonic::Request<api::ListSkillsRequest>,
     ) -> Result<tonic::Response<api::SkillCatalogue>, tonic::Status> {
         let input = request.into_inner();
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::ListSkills {
                 workspace_id: protocol::WorkspaceId::from(input.workspace_id),
                 profile_id: input.profile_id,
@@ -1255,27 +1365,31 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             })
             .await?;
         let protocol::QueryResult::Skills(value) = result.value else {
-            return Err(tonic::Status::internal(
+            return Err(internal_with_timing(
                 "unexpected skill catalogue response",
+                &timing,
             ));
         };
-        Ok(tonic::Response::new(api::SkillCatalogue {
-            skills: value
-                .skills
-                .into_iter()
-                .map(|skill| api::Skill {
-                    id: skill.id,
-                    name: skill.name,
-                    description: skill.description,
-                    enabled: skill.enabled,
-                    available: skill.available,
-                    availability_reason: skill.availability_reason,
-                    prunable: skill.prunable,
-                    prune_restriction: skill.prune_restriction,
-                    availability_explanation: skill.availability_explanation,
-                })
-                .collect(),
-        }))
+        Ok(response_with_timing(
+            api::SkillCatalogue {
+                skills: value
+                    .skills
+                    .into_iter()
+                    .map(|skill| api::Skill {
+                        id: skill.id,
+                        name: skill.name,
+                        description: skill.description,
+                        enabled: skill.enabled,
+                        available: skill.available,
+                        availability_reason: skill.availability_reason,
+                        prunable: skill.prunable,
+                        prune_restriction: skill.prune_restriction,
+                        availability_explanation: skill.availability_explanation,
+                    })
+                    .collect(),
+            },
+            &timing,
+        ))
     }
     command_rpc!(
         begin_provider_authentication,
@@ -1454,7 +1568,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         request: tonic::Request<api::ListRunsRequest>,
     ) -> Result<tonic::Response<api::ListRunsResponse>, tonic::Status> {
         let request = request.into_inner();
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::ListRuns {
                 session_id: protocol::SessionId::from(request.session_id),
                 before: request.before_run_id.map(protocol::RunId::from),
@@ -1462,30 +1576,36 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             })
             .await?;
         let protocol::QueryResult::Runs(values) = result.value else {
-            return Err(tonic::Status::internal("unexpected runs response"));
+            return Err(internal_with_timing("unexpected runs response", &timing));
         };
-        Ok(tonic::Response::new(api::ListRunsResponse {
-            runs: values.runs.into_iter().map(run).collect(),
-            has_earlier: values.has_earlier,
-        }))
+        Ok(response_with_timing(
+            api::ListRunsResponse {
+                runs: values.runs.into_iter().map(run).collect(),
+                has_earlier: values.has_earlier,
+            },
+            &timing,
+        ))
     }
 
     async fn get_run(
         &self,
         request: tonic::Request<api::GetRunRequest>,
     ) -> Result<tonic::Response<api::RunSnapshot>, tonic::Status> {
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::GetRun {
                 run_id: protocol::RunId::from(request.into_inner().run_id),
             })
             .await?;
         let protocol::QueryResult::Run(value) = result.value else {
-            return Err(tonic::Status::internal("unexpected run response"));
+            return Err(internal_with_timing("unexpected run response", &timing));
         };
-        Ok(tonic::Response::new(api::RunSnapshot {
-            cursor: Some(cursor(&result.cursor)),
-            state: Some(run(*value)),
-        }))
+        Ok(response_with_timing(
+            api::RunSnapshot {
+                cursor: Some(cursor(&result.cursor)),
+                state: Some(run(*value)),
+            },
+            &timing,
+        ))
     }
 
     type WatchRunStream = ApiStream<api::RunSnapshot>;
@@ -1497,9 +1617,15 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             run_id: protocol::RunId::from(request.into_inner().run_id),
         };
         let publications = self.endpoint.subscribe_publications();
-        let initial = self.subscription(scope.clone()).await?;
+        let timed = self.subscription_timed(scope.clone()).await;
+        let initial = timed
+            .result
+            .map_err(|error| status_with_timing(error, &timed.timing))?;
         let protocol::SubscriptionView::Run(value) = initial.value else {
-            return Err(tonic::Status::internal("unexpected run subscription"));
+            return Err(internal_with_timing(
+                "unexpected run subscription",
+                &timed.timing,
+            ));
         };
         let (sender, receiver) = tokio::sync::mpsc::channel(32);
         sender
@@ -1508,11 +1634,14 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 state: Some(run(*value)),
             }))
             .await
-            .map_err(|_| tonic::Status::cancelled("watch closed"))?;
+            .map_err(|_| {
+                tonic_status_with_timing(tonic::Status::cancelled("watch closed"), &timed.timing)
+            })?;
         spawn_run_watch(self.clone(), scope, publications, sender);
-        Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
-            receiver,
-        ))))
+        Ok(response_with_timing(
+            Box::pin(ReceiverStream::new(receiver)),
+            &timed.timing,
+        ))
     }
 
     command_rpc!(
@@ -1538,10 +1667,15 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         &self,
         request: tonic::Request<api::GetTranscriptPageRequest>,
     ) -> Result<tonic::Response<api::TranscriptPage>, tonic::Status> {
+        let started_at = Instant::now();
         let request = request.into_inner();
-        let query = match api::TranscriptOwnerKind::try_from(request.owner_kind)
-            .map_err(|_| tonic::Status::invalid_argument("invalid transcript owner"))?
-        {
+        let query = match api::TranscriptOwnerKind::try_from(request.owner_kind).map_err(|_| {
+            self.immediate_status(
+                RequestLane::Hydration,
+                started_at,
+                tonic::Status::invalid_argument("invalid transcript owner"),
+            )
+        })? {
             api::TranscriptOwnerKind::Session => protocol::Query::GetTranscriptPage {
                 session_id: protocol::SessionId::from(request.owner_id),
                 before: request.before_entry_id.map(protocol::EntryId::from),
@@ -1553,26 +1687,36 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 limit: request.limit,
             },
             api::TranscriptOwnerKind::Unspecified => {
-                return Err(tonic::Status::invalid_argument(
-                    "transcript owner is required",
+                return Err(self.immediate_status(
+                    RequestLane::Hydration,
+                    started_at,
+                    tonic::Status::invalid_argument("transcript owner is required"),
                 ));
             }
         };
-        let result = self.query(query).await?;
+        let (result, timing) = self.query(query).await?;
         let protocol::QueryResult::Transcript(value) = result.value else {
-            return Err(tonic::Status::internal("unexpected transcript response"));
+            return Err(internal_with_timing(
+                "unexpected transcript response",
+                &timing,
+            ));
         };
-        Ok(tonic::Response::new(transcript(*value)))
+        Ok(response_with_timing(transcript(*value), &timing))
     }
 
     async fn get_transcript_body_window(
         &self,
         request: tonic::Request<api::GetTranscriptBodyWindowRequest>,
     ) -> Result<tonic::Response<api::TranscriptBodyWindow>, tonic::Status> {
+        let started_at = Instant::now();
         let request = request.into_inner();
-        let owner = match api::TranscriptOwnerKind::try_from(request.owner_kind)
-            .map_err(|_| tonic::Status::invalid_argument("invalid transcript owner"))?
-        {
+        let owner = match api::TranscriptOwnerKind::try_from(request.owner_kind).map_err(|_| {
+            self.immediate_status(
+                RequestLane::Hydration,
+                started_at,
+                tonic::Status::invalid_argument("invalid transcript owner"),
+            )
+        })? {
             api::TranscriptOwnerKind::Session => protocol::TranscriptOwner::Session {
                 session_id: protocol::SessionId::from(request.owner_id),
             },
@@ -1580,8 +1724,10 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 run_id: protocol::RunId::from(request.owner_id),
             },
             api::TranscriptOwnerKind::Unspecified => {
-                return Err(tonic::Status::invalid_argument(
-                    "transcript owner is required",
+                return Err(self.immediate_status(
+                    RequestLane::Hydration,
+                    started_at,
+                    tonic::Status::invalid_argument("transcript owner is required"),
                 ));
             }
         };
@@ -1597,8 +1743,9 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             .result
             .map_err(|error| status_with_timing(error, &timed.timing))?;
         let protocol::QueryResult::TranscriptBody(value) = result.value else {
-            return Err(tonic::Status::internal(
+            return Err(internal_with_timing(
                 "unexpected transcript body response",
+                &timed.timing,
             ));
         };
         Ok(response_with_timing(transcript_body(value), &timed.timing))
@@ -1608,21 +1755,28 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         &self,
         request: tonic::Request<api::GetRunTextWindowRequest>,
     ) -> Result<tonic::Response<api::RunTextWindow>, tonic::Status> {
+        let started_at = Instant::now();
         let request = request.into_inner();
-        let field = match api::RunTextField::try_from(request.field)
-            .map_err(|_| tonic::Status::invalid_argument("invalid run text field"))?
-        {
+        let field = match api::RunTextField::try_from(request.field).map_err(|_| {
+            self.immediate_status(
+                RequestLane::Hydration,
+                started_at,
+                tonic::Status::invalid_argument("invalid run text field"),
+            )
+        })? {
             api::RunTextField::Objective => protocol::RunTextField::Objective,
             api::RunTextField::LatestActivity => protocol::RunTextField::LatestActivity,
             api::RunTextField::Outcome => protocol::RunTextField::Outcome,
             api::RunTextField::Result => protocol::RunTextField::Result,
             api::RunTextField::Unspecified => {
-                return Err(tonic::Status::invalid_argument(
-                    "run text field is required",
+                return Err(self.immediate_status(
+                    RequestLane::Hydration,
+                    started_at,
+                    tonic::Status::invalid_argument("run text field is required"),
                 ));
             }
         };
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::GetRunTextWindow {
                 run_id: protocol::RunId::from(request.run_id),
                 field,
@@ -1631,34 +1785,46 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             })
             .await?;
         let protocol::QueryResult::RunText(value) = result.value else {
-            return Err(tonic::Status::internal("unexpected run text response"));
+            return Err(internal_with_timing(
+                "unexpected run text response",
+                &timing,
+            ));
         };
-        Ok(tonic::Response::new(run_text(value)))
+        Ok(response_with_timing(run_text(value), &timing))
     }
 
     async fn get_artifact(
         &self,
         request: tonic::Request<api::GetArtifactRequest>,
     ) -> Result<tonic::Response<api::Artifact>, tonic::Status> {
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::GetArtifact {
                 artifact_id: protocol::ArtifactId::from(request.into_inner().artifact_id),
             })
             .await?;
         let protocol::QueryResult::Artifact(value) = result.value else {
-            return Err(tonic::Status::internal("unexpected artifact response"));
+            return Err(internal_with_timing(
+                "unexpected artifact response",
+                &timing,
+            ));
         };
-        Ok(tonic::Response::new(artifact(value)))
+        Ok(response_with_timing(artifact(value), &timing))
     }
 
     async fn get_diagnostics(
         &self,
         request: tonic::Request<api::GetDiagnosticsRequest>,
     ) -> Result<tonic::Response<api::DiagnosticsReport>, tonic::Status> {
+        let started_at = Instant::now();
         let request = request.into_inner();
-        let days = u16::try_from(request.days)
-            .map_err(|_| tonic::Status::invalid_argument("days exceeds 65535"))?;
-        let result = self
+        let days = u16::try_from(request.days).map_err(|_| {
+            self.immediate_status(
+                RequestLane::Query,
+                started_at,
+                tonic::Status::invalid_argument("days exceeds 65535"),
+            )
+        })?;
+        let (result, timing) = self
             .query(protocol::Query::GetDiagnostics {
                 days,
                 session_limit: request.session_limit,
@@ -1666,22 +1832,26 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             })
             .await?;
         let protocol::QueryResult::Diagnostics(value) = result.value else {
-            return Err(tonic::Status::internal("unexpected diagnostics response"));
+            return Err(internal_with_timing(
+                "unexpected diagnostics response",
+                &timing,
+            ));
         };
-        Ok(tonic::Response::new(diagnostics(*value)))
+        Ok(response_with_timing(diagnostics(*value), &timing))
     }
 
     async fn get_invocation_summary(
         &self,
         _request: tonic::Request<api::GetInvocationSummaryRequest>,
     ) -> Result<tonic::Response<api::InvocationSummary>, tonic::Status> {
-        let result = self.query(protocol::Query::GetInvocationSummary).await?;
+        let (result, timing) = self.query(protocol::Query::GetInvocationSummary).await?;
         let protocol::QueryResult::InvocationSummary(value) = result.value else {
-            return Err(tonic::Status::internal(
+            return Err(internal_with_timing(
                 "unexpected invocation summary response",
+                &timing,
             ));
         };
-        Ok(tonic::Response::new(invocation_summary(*value)))
+        Ok(response_with_timing(invocation_summary(*value), &timing))
     }
 
     async fn get_invocation_timeline(
@@ -1689,7 +1859,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         request: tonic::Request<api::GetInvocationTimelineRequest>,
     ) -> Result<tonic::Response<api::InvocationTimeline>, tonic::Status> {
         let request = request.into_inner();
-        let result = self
+        let (result, timing) = self
             .query(protocol::Query::GetInvocationTimeline {
                 start_at_ms: request.start_at_ms,
                 end_at_ms: request.end_at_ms,
@@ -1697,18 +1867,20 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             })
             .await?;
         let protocol::QueryResult::InvocationTimeline(value) = result.value else {
-            return Err(tonic::Status::internal(
+            return Err(internal_with_timing(
                 "unexpected invocation timeline response",
+                &timing,
             ));
         };
-        Ok(tonic::Response::new(invocation_timeline(*value)))
+        Ok(response_with_timing(invocation_timeline(*value), &timing))
     }
 
     async fn get_server_info(
         &self,
         _request: tonic::Request<()>,
     ) -> Result<tonic::Response<api::ServerInfo>, tonic::Status> {
-        Ok(tonic::Response::new(api::ServerInfo {
+        let started_at = Instant::now();
+        let response = api::ServerInfo {
             server_version: self.endpoint.server_version().to_owned(),
             api_version: "nakode.v1".to_owned(),
             capabilities: self
@@ -1720,7 +1892,38 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .collect(),
             server_id: self.server_id.clone(),
             build_revision: self.endpoint.build_revision().map(str::to_owned),
-        }))
+            rpc_lanes: RPC_LANE_CATALOGUE
+                .iter()
+                .filter(|assignment| {
+                    self.include_activation_rpc_lanes || assignment.service != "ActivationService"
+                })
+                .map(|assignment| api::RpcLaneDefinition {
+                    service: assignment.service.to_owned(),
+                    method: assignment.method.to_owned(),
+                    rule: match assignment.rule {
+                        RpcLaneRule::Fixed(RequestLane::Control) => {
+                            api::rpc_lane_definition::Rule::Control.into()
+                        }
+                        RpcLaneRule::Fixed(RequestLane::Query) => {
+                            api::rpc_lane_definition::Rule::Query.into()
+                        }
+                        RpcLaneRule::Fixed(RequestLane::Hydration) => {
+                            api::rpc_lane_definition::Rule::Hydration.into()
+                        }
+                        RpcLaneRule::Fixed(RequestLane::Subscription) => {
+                            api::rpc_lane_definition::Rule::Subscription.into()
+                        }
+                        RpcLaneRule::WorkspaceBootstrap => {
+                            api::rpc_lane_definition::Rule::WorkspaceBootstrap.into()
+                        }
+                    },
+                })
+                .collect(),
+        };
+        let timing = self
+            .endpoint
+            .complete_immediate_timing(RequestLane::Control, started_at);
+        Ok(response_with_timing(response, &timing))
     }
 }
 
@@ -3077,6 +3280,20 @@ fn diagnostics_totals(value: &protocol::DiagnosticsUsageTotals) -> api::Diagnost
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ServerRequest;
+
+    fn assert_timing_metadata(metadata: &tonic::metadata::MetadataMap, lane: &str) {
+        assert_eq!(metadata.get("x-nakode-lane").unwrap(), lane);
+        for key in [
+            "x-nakode-lane-sequence",
+            "x-nakode-admission-us",
+            "x-nakode-queue-us",
+            "x-nakode-service-us",
+            "x-nakode-server-total-us",
+        ] {
+            assert!(metadata.get(key).is_some(), "missing {key}");
+        }
+    }
 
     #[test]
     fn api_key_interceptor_rejects_missing_and_wrong_credentials() {
@@ -3117,14 +3334,209 @@ mod tests {
             tonic::Request::new(()),
         )
         .await
-        .expect("server info must succeed")
-        .into_inner();
+        .expect("server info must succeed");
+        assert_timing_metadata(response.metadata(), "control");
+        assert_eq!(
+            response.metadata().get("x-nakode-admission-us").unwrap(),
+            "0"
+        );
+        assert_eq!(response.metadata().get("x-nakode-queue-us").unwrap(), "0");
+        let response = response.into_inner();
 
         assert_eq!(response.server_id, "server-test");
         assert_eq!(
             response.build_revision.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
+        assert_eq!(response.rpc_lanes.len(), RPC_LANE_CATALOGUE.len());
+        for expected in RPC_LANE_CATALOGUE {
+            let actual = response
+                .rpc_lanes
+                .iter()
+                .find(|assignment| {
+                    assignment.service == expected.service && assignment.method == expected.method
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing exported lane rule for {}.{}",
+                        expected.service, expected.method
+                    )
+                });
+            let expected_rule = match expected.rule {
+                RpcLaneRule::Fixed(RequestLane::Control) => api::rpc_lane_definition::Rule::Control,
+                RpcLaneRule::Fixed(RequestLane::Query) => api::rpc_lane_definition::Rule::Query,
+                RpcLaneRule::Fixed(RequestLane::Hydration) => {
+                    api::rpc_lane_definition::Rule::Hydration
+                }
+                RpcLaneRule::Fixed(RequestLane::Subscription) => {
+                    api::rpc_lane_definition::Rule::Subscription
+                }
+                RpcLaneRule::WorkspaceBootstrap => {
+                    api::rpc_lane_definition::Rule::WorkspaceBootstrap
+                }
+            };
+            assert_eq!(actual.rule, i32::from(expected_rule));
+        }
+
+        let nakode_only = service.with_nakode_service_only_lane_catalogue();
+        let response = api::nakode_service_server::NakodeService::get_server_info(
+            &nakode_only,
+            tonic::Request::new(()),
+        )
+        .await
+        .expect("Nakode-only server info")
+        .into_inner();
+        assert_eq!(
+            response.rpc_lanes.len(),
+            RPC_LANE_CATALOGUE
+                .iter()
+                .filter(|assignment| assignment.service == "NakodeService")
+                .count()
+        );
+        assert!(
+            response
+                .rpc_lanes
+                .iter()
+                .all(|assignment| assignment.service == "NakodeService")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_validation_errors_retain_the_dictated_lane_timing() {
+        let (endpoint, _requests) =
+            ServerEndpoint::channel("test", protocol::ServiceCapabilities::default(), 4);
+        let service = GrpcService::new(endpoint);
+
+        let diagnostics = api::nakode_service_server::NakodeService::get_diagnostics(
+            &service,
+            tonic::Request::new(api::GetDiagnosticsRequest {
+                days: 70_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("oversized day range must fail");
+        assert_timing_metadata(diagnostics.metadata(), "query");
+
+        let missing_mutation = api::nakode_service_server::NakodeService::reload_workspace(
+            &service,
+            tonic::Request::new(api::ReloadWorkspaceRequest::default()),
+        )
+        .await
+        .expect_err("missing mutation must fail");
+        assert_timing_metadata(missing_mutation.metadata(), "control");
+
+        let interaction = api::nakode_service_server::NakodeService::resolve_interaction(
+            &service,
+            tonic::Request::new(api::ResolveInteractionRequest::default()),
+        )
+        .await
+        .expect_err("unspecified interaction resolution must fail");
+        assert_timing_metadata(interaction.metadata(), "control");
+
+        let conversion = api::nakode_service_server::NakodeService::save_mcp_server(
+            &service,
+            tonic::Request::new(api::SaveMcpServerRequest {
+                mutation: Some(api::MutationOptions {
+                    idempotency_key: "invalid-server".to_owned(),
+                    expected_revision: None,
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("missing MCP server must fail");
+        assert_timing_metadata(conversion.metadata(), "control");
+    }
+
+    #[tokio::test]
+    async fn unary_query_success_and_error_retain_complete_timing_metadata() {
+        let (endpoint, mut requests) =
+            ServerEndpoint::channel("test", protocol::ServiceCapabilities::default(), 4);
+        let service = GrpcService::new(endpoint);
+
+        let success = api::nakode_service_server::NakodeService::list_sessions(
+            &service,
+            tonic::Request::new(api::ListSessionsRequest {
+                workspace_id: "workspace".to_owned(),
+                limit: 10,
+            }),
+        );
+        let reply = async {
+            let ServerRequest::Query { respond, .. } =
+                requests.recv().await.expect("list sessions request")
+            else {
+                panic!("expected query request");
+            };
+            let _ = respond.send(Ok(protocol::Snapshot {
+                cursor: protocol::Cursor {
+                    server_epoch: protocol::ServerEpoch::from("epoch"),
+                    sequence: 1,
+                },
+                value: protocol::QueryResult::Sessions(protocol::SessionInventory {
+                    sessions: Vec::new(),
+                    complete: true,
+                }),
+            }));
+        };
+        let (success, ()) = tokio::join!(success, reply);
+        let success = success.expect("list sessions must succeed");
+        assert_timing_metadata(success.metadata(), "query");
+
+        let error = api::nakode_service_server::NakodeService::list_sessions(
+            &service,
+            tonic::Request::new(api::ListSessionsRequest {
+                workspace_id: "workspace".to_owned(),
+                limit: 10,
+            }),
+        );
+        let reply = async {
+            let ServerRequest::Query { respond, .. } =
+                requests.recv().await.expect("list sessions request")
+            else {
+                panic!("expected query request");
+            };
+            let _ = respond.send(Err(protocol::ServiceError {
+                code: protocol::ErrorCode::Internal,
+                message: "query failed".to_owned(),
+                retryable: false,
+            }));
+        };
+        let (error, ()) = tokio::join!(error, reply);
+        let error = error.expect_err("list sessions must fail");
+        assert_timing_metadata(error.metadata(), "query");
+    }
+
+    #[tokio::test]
+    async fn initial_watch_error_retains_subscription_timing_metadata() {
+        let (endpoint, mut requests) =
+            ServerEndpoint::channel("test", protocol::ServiceCapabilities::default(), 4);
+        let service = GrpcService::new(endpoint);
+        let watch = api::nakode_service_server::NakodeService::watch_workspace(
+            &service,
+            tonic::Request::new(api::WatchWorkspaceRequest {
+                workspace_id: "workspace".to_owned(),
+                after: None,
+            }),
+        );
+        let reply = async {
+            let ServerRequest::Subscribe { respond, .. } =
+                requests.recv().await.expect("watch workspace request")
+            else {
+                panic!("expected subscription request");
+            };
+            let _ = respond.send(Err(protocol::ServiceError {
+                code: protocol::ErrorCode::Internal,
+                message: "watch failed".to_owned(),
+                retryable: false,
+            }));
+        };
+        let (watch, ()) = tokio::join!(watch, reply);
+        let error = match watch {
+            Ok(_) => panic!("watch must fail"),
+            Err(error) => error,
+        };
+        assert_timing_metadata(error.metadata(), "subscription");
     }
 
     #[test]

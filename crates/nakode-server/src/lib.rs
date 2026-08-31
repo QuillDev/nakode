@@ -62,7 +62,7 @@ pub enum ServerRequest {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RequestLane {
     Control,
     Query,
@@ -82,6 +82,248 @@ impl RequestLane {
     }
 }
 
+/// Authoritative scheduling rule for one public RPC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RpcLaneRule {
+    Fixed(RequestLane),
+    /// Initial workspace bootstrap is control-plane work; opening a known session is hydration.
+    WorkspaceBootstrap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RpcLaneAssignment {
+    pub service: &'static str,
+    pub method: &'static str,
+    pub rule: RpcLaneRule,
+}
+
+const fn fixed(
+    service: &'static str,
+    method: &'static str,
+    lane: RequestLane,
+) -> RpcLaneAssignment {
+    RpcLaneAssignment {
+        service,
+        method,
+        rule: RpcLaneRule::Fixed(lane),
+    }
+}
+
+/// Complete public RPC lane catalogue. The descriptor conformance test rejects omissions.
+pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
+    RpcLaneAssignment {
+        service: "NakodeService",
+        method: "GetWorkspace",
+        rule: RpcLaneRule::WorkspaceBootstrap,
+    },
+    fixed("NakodeService", "InspectWorkspacePath", RequestLane::Query),
+    fixed("NakodeService", "WatchWorkspace", RequestLane::Subscription),
+    fixed("NakodeService", "ReloadWorkspace", RequestLane::Control),
+    fixed("NakodeService", "GetSoul", RequestLane::Query),
+    fixed("NakodeService", "SaveSoul", RequestLane::Control),
+    fixed("NakodeService", "GetMcpManagement", RequestLane::Query),
+    fixed("NakodeService", "SaveMcpServer", RequestLane::Control),
+    fixed("NakodeService", "DeleteMcpServer", RequestLane::Control),
+    fixed("NakodeService", "SetMcpServerEnabled", RequestLane::Control),
+    fixed("NakodeService", "RefreshMcpServer", RequestLane::Control),
+    fixed(
+        "NakodeService",
+        "SetMcpServerCredential",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "ClearMcpServerCredential",
+        RequestLane::Control,
+    ),
+    fixed("NakodeService", "SetMcpServerGrants", RequestLane::Control),
+    fixed("NakodeService", "CreateSession", RequestLane::Control),
+    fixed("NakodeService", "OpenSession", RequestLane::Control),
+    fixed(
+        "NakodeService",
+        "SetSessionBridgeLifecycle",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "SetWorkspaceBridgeLifecycle",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "BindSessionBridgeThread",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "ClearSessionBridgeThread",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "PrepareBridgeDelivery",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "CompleteBridgeDeliveryPart",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "FinalizeBridgeDelivery",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "SetBridgeLiveMessage",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "ContinueSessionFromBridge",
+        RequestLane::Control,
+    ),
+    fixed("NakodeService", "ListSessions", RequestLane::Query),
+    fixed("NakodeService", "DeleteSession", RequestLane::Control),
+    fixed("NakodeService", "GetSession", RequestLane::Hydration),
+    fixed("NakodeService", "WatchSession", RequestLane::Subscription),
+    fixed("NakodeService", "SendPrompt", RequestLane::Control),
+    fixed("NakodeService", "EnqueuePrompt", RequestLane::Control),
+    fixed("NakodeService", "RemoveQueuedPrompt", RequestLane::Control),
+    fixed("NakodeService", "SteerQueuedPrompt", RequestLane::Control),
+    fixed("NakodeService", "SteerTurn", RequestLane::Control),
+    fixed("NakodeService", "CancelTurn", RequestLane::Control),
+    fixed("NakodeService", "CancelSessionWork", RequestLane::Control),
+    fixed("NakodeService", "CompactContext", RequestLane::Control),
+    fixed("NakodeService", "ResolveInteraction", RequestLane::Control),
+    fixed(
+        "NakodeService",
+        "ConfigureSessionTools",
+        RequestLane::Control,
+    ),
+    fixed("NakodeService", "SetSessionCodeMode", RequestLane::Control),
+    fixed(
+        "NakodeService",
+        "SubmitExternalToolResult",
+        RequestLane::Control,
+    ),
+    fixed("NakodeService", "RunShell", RequestLane::Control),
+    fixed("NakodeService", "SelectModel", RequestLane::Control),
+    fixed("NakodeService", "SetProviderEnabled", RequestLane::Control),
+    fixed(
+        "NakodeService",
+        "SetProviderModelFilter",
+        RequestLane::Control,
+    ),
+    fixed("NakodeService", "AddProviderAccount", RequestLane::Control),
+    fixed(
+        "NakodeService",
+        "BeginProviderAccountAuthentication",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "SetProviderAccountCredential",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "ClearProviderAccountCredential",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "ReloadProviderAccount",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "SetProviderAccountLabel",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "SetProviderAccountEnabled",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "SetProviderAccountDefault",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "RemoveProviderAccount",
+        RequestLane::Control,
+    ),
+    fixed("NakodeService", "ListSkills", RequestLane::Query),
+    fixed("NakodeService", "SetSkillEnabled", RequestLane::Control),
+    fixed("NakodeService", "PruneSkill", RequestLane::Control),
+    fixed(
+        "NakodeService",
+        "BeginProviderAuthentication",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "SetProviderCredential",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "ClearProviderCredential",
+        RequestLane::Control,
+    ),
+    fixed("NakodeService", "ReloadProvider", RequestLane::Control),
+    fixed("NakodeService", "SaveAgent", RequestLane::Control),
+    fixed("NakodeService", "DeleteAgent", RequestLane::Control),
+    fixed("NakodeService", "UpdateSettings", RequestLane::Control),
+    fixed("NakodeService", "CheckAgentBrowser", RequestLane::Control),
+    fixed("NakodeService", "Delegate", RequestLane::Control),
+    fixed("NakodeService", "ListRuns", RequestLane::Hydration),
+    fixed("NakodeService", "GetRun", RequestLane::Hydration),
+    fixed("NakodeService", "WatchRun", RequestLane::Subscription),
+    fixed("NakodeService", "CancelRun", RequestLane::Control),
+    fixed("NakodeService", "ContinueRun", RequestLane::Control),
+    fixed("NakodeService", "GetTranscriptPage", RequestLane::Hydration),
+    fixed(
+        "NakodeService",
+        "GetTranscriptBodyWindow",
+        RequestLane::Hydration,
+    ),
+    fixed("NakodeService", "GetRunTextWindow", RequestLane::Hydration),
+    fixed("NakodeService", "GetArtifact", RequestLane::Hydration),
+    fixed("NakodeService", "GetDiagnostics", RequestLane::Query),
+    fixed("NakodeService", "GetInvocationSummary", RequestLane::Query),
+    fixed("NakodeService", "GetInvocationTimeline", RequestLane::Query),
+    fixed("NakodeService", "GetServerInfo", RequestLane::Control),
+    fixed(
+        "ActivationService",
+        "GetActivationStatus",
+        RequestLane::Query,
+    ),
+    fixed(
+        "ActivationService",
+        "WatchActivationStatus",
+        RequestLane::Subscription,
+    ),
+    fixed(
+        "ActivationService",
+        "ForceActivationRecheck",
+        RequestLane::Control,
+    ),
+    fixed("ActivationService", "ForceActivate", RequestLane::Control),
+];
+
+#[must_use]
+pub fn rpc_lane_rule(service: &str, method: &str) -> Option<RpcLaneRule> {
+    RPC_LANE_CATALOGUE
+        .iter()
+        .find(|assignment| assignment.service == service && assignment.method == method)
+        .map(|assignment| assignment.rule)
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerTiming {
     pub lane: RequestLane,
@@ -90,6 +332,20 @@ pub struct ServerTiming {
     pub queue: Duration,
     pub service: Duration,
     pub total: Duration,
+}
+
+impl ServerTiming {
+    #[must_use]
+    pub fn immediate(lane: RequestLane, lane_sequence: u64, service: Duration) -> Self {
+        Self {
+            lane,
+            lane_sequence,
+            admission: Duration::ZERO,
+            queue: Duration::ZERO,
+            service,
+            total: service,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -163,7 +419,14 @@ fn query_lane(query: &Query) -> QueryLane {
         | Query::ListRuns { .. }
         | Query::GetRunTextWindow { .. }
         | Query::GetArtifact { .. } => QueryLane::Hydration,
-        _ => QueryLane::Ordinary,
+        Query::InspectWorkspacePath { .. }
+        | Query::ListSkills { .. }
+        | Query::GetSoul { .. }
+        | Query::GetMcpManagement { .. }
+        | Query::ListSessions { .. }
+        | Query::GetDiagnostics { .. }
+        | Query::GetInvocationSummary
+        | Query::GetInvocationTimeline { .. } => QueryLane::Ordinary,
     }
 }
 
@@ -378,15 +641,16 @@ impl ServerEndpoint {
         let started_at = Instant::now();
         let lane_sequence = self.next_lane_sequence(lane);
         let Ok(permit) = sender.reserve().await else {
+            let admission = started_at.elapsed();
             return TimedServerResponse {
                 result: Err(server_unavailable()),
                 timing: ServerTiming {
                     lane,
                     lane_sequence,
-                    admission: started_at.elapsed(),
+                    admission,
                     queue: Duration::ZERO,
                     service: Duration::ZERO,
-                    total: started_at.elapsed(),
+                    total: admission,
                 },
             };
         };
@@ -401,17 +665,29 @@ impl ServerEndpoint {
         let result = receive.await.unwrap_or_else(|_| Err(server_unavailable()));
         let response_ready_at = Instant::now();
         let dequeued_at = pending.dequeued_at.get().copied().unwrap_or(admitted_at);
+        let admission = admitted_at.saturating_duration_since(started_at);
+        let queue = dequeued_at.saturating_duration_since(admitted_at);
+        let service = response_ready_at.saturating_duration_since(dequeued_at);
         TimedServerResponse {
             result,
             timing: ServerTiming {
                 lane: pending.lane,
                 lane_sequence: pending.lane_sequence,
-                admission: admitted_at.saturating_duration_since(started_at),
-                queue: dequeued_at.saturating_duration_since(admitted_at),
-                service: response_ready_at.saturating_duration_since(dequeued_at),
-                total: response_ready_at.saturating_duration_since(started_at),
+                admission,
+                queue,
+                service,
+                total: admission + queue + service,
             },
         }
+    }
+
+    #[must_use]
+    pub fn complete_immediate_timing(
+        &self,
+        lane: RequestLane,
+        started_at: Instant,
+    ) -> ServerTiming {
+        ServerTiming::immediate(lane, self.next_lane_sequence(lane), started_at.elapsed())
     }
 
     pub async fn execute_command_timed(
@@ -697,9 +973,14 @@ fn server_unavailable() -> ServiceError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        collections::BTreeSet,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use futures_util::future::join_all;
+    use prost::Message;
+    use prost_types::FileDescriptorSet;
 
     use super::*;
 
@@ -837,6 +1118,47 @@ mod tests {
         let entries = cache.entries.lock().await;
         assert_eq!(entries.len(), 1);
         assert!(entries.values().all(|entry| entry.strong_count() == 0));
+    }
+
+    #[test]
+    fn public_rpc_lane_catalogue_is_authoritative_and_exhaustive() {
+        let descriptor = FileDescriptorSet::decode(nakode_api::v1::FILE_DESCRIPTOR_SET)
+            .expect("generated descriptor must decode");
+        let public_methods = descriptor
+            .file
+            .iter()
+            .flat_map(|file| &file.service)
+            .flat_map(|service| {
+                service
+                    .method
+                    .iter()
+                    .filter_map(|method| Some((service.name.clone()?, method.name.clone()?)))
+            })
+            .collect::<BTreeSet<_>>();
+        let assignments = RPC_LANE_CATALOGUE
+            .iter()
+            .map(|assignment| (assignment.service.to_owned(), assignment.method.to_owned()))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            assignments.len(),
+            RPC_LANE_CATALOGUE.len(),
+            "duplicate RPC lane assignment"
+        );
+        assert_eq!(assignments, public_methods);
+        assert_eq!(
+            rpc_lane_rule("NakodeService", "GetWorkspace"),
+            Some(RpcLaneRule::WorkspaceBootstrap)
+        );
+        assert_eq!(
+            rpc_lane_rule("NakodeService", "GetTranscriptPage"),
+            Some(RpcLaneRule::Fixed(RequestLane::Hydration))
+        );
+        assert_eq!(
+            rpc_lane_rule("ActivationService", "GetActivationStatus"),
+            Some(RpcLaneRule::Fixed(RequestLane::Query))
+        );
+        assert_eq!(rpc_lane_rule("NakodeService", "FutureMethod"), None);
     }
 
     #[test]

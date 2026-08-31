@@ -254,6 +254,22 @@ message MutationResult {
 }
 
 message Cursor { string server_epoch = 1; uint64 sequence = 2; }
+message RpcLaneDefinition {
+  enum Rule {
+    RULE_UNSPECIFIED = 0;
+    RULE_CONTROL = 1;
+    RULE_QUERY = 2;
+    RULE_HYDRATION = 3;
+    RULE_SUBSCRIPTION = 4;
+    // Sessionless workspace bootstrap is control; a request with session_id is hydration.
+    RULE_WORKSPACE_BOOTSTRAP = 5;
+  }
+
+  string service = 1;
+  string method = 2;
+  Rule rule = 3;
+}
+
 message ServerInfo {
   string server_version = 1;
   string api_version = 2;
@@ -263,6 +279,9 @@ message ServerInfo {
   // Immutable source revision embedded in the executable serving this response.
   // Absent for older servers and builds without authoritative source provenance.
   optional string build_revision = 5;
+  // Complete RPC lane catalogue for services bound alongside the responding NakodeService
+  // endpoint. Older servers omit this additive field.
+  repeated RpcLaneDefinition rpc_lanes = 6;
 }
 
 message GetWorkspaceRequest { string workspace = 1; optional string session_id = 2; }

@@ -50,6 +50,7 @@ mod tests {
             capabilities: Vec::new(),
             server_id: "server-1".to_owned(),
             build_revision: None,
+            rpc_lanes: Vec::new(),
         };
         let legacy_wire = legacy.encode_to_vec();
         assert_eq!(
@@ -61,15 +62,46 @@ mod tests {
 
         let current = super::v1::ServerInfo {
             build_revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            rpc_lanes: vec![super::v1::RpcLaneDefinition {
+                service: "NakodeService".to_owned(),
+                method: "GetWorkspace".to_owned(),
+                rule: super::v1::rpc_lane_definition::Rule::WorkspaceBootstrap.into(),
+            }],
             ..legacy
         };
         let current_wire = current.encode_to_vec();
+        let decoded = super::v1::ServerInfo::decode(current_wire.as_slice())
+            .expect("current server info must decode");
         assert_eq!(
-            super::v1::ServerInfo::decode(current_wire.as_slice())
-                .expect("current server info must decode")
-                .build_revision
-                .as_deref(),
+            decoded.build_revision.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(decoded.rpc_lanes.len(), 1);
+        assert_eq!(decoded.rpc_lanes[0].method, "GetWorkspace");
+    }
+
+    #[test]
+    fn get_workspace_session_id_preserves_optional_presence() {
+        let absent = super::v1::GetWorkspaceRequest {
+            workspace: "/workspace".to_owned(),
+            session_id: None,
+        };
+        assert_eq!(
+            super::v1::GetWorkspaceRequest::decode(absent.encode_to_vec().as_slice())
+                .expect("sessionless workspace request must decode")
+                .session_id,
+            None
+        );
+
+        let present = super::v1::GetWorkspaceRequest {
+            workspace: "/workspace".to_owned(),
+            session_id: Some(String::new()),
+        };
+        assert_eq!(
+            super::v1::GetWorkspaceRequest::decode(present.encode_to_vec().as_slice())
+                .expect("session-bound workspace request must decode")
+                .session_id,
+            Some(String::new())
         );
     }
 
@@ -185,5 +217,34 @@ mod tests {
             .expect("ServerInfo.build_revision must remain public");
         assert_eq!(build_revision.number, Some(5));
         assert_eq!(build_revision.proto3_optional, Some(true));
+
+        let rpc_lanes = descriptor
+            .file
+            .iter()
+            .flat_map(|file| &file.message_type)
+            .find(|message| message.name.as_deref() == Some("ServerInfo"))
+            .and_then(|message| {
+                message
+                    .field
+                    .iter()
+                    .find(|field| field.name.as_deref() == Some("rpc_lanes"))
+            })
+            .expect("ServerInfo.rpc_lanes must remain public");
+        assert_eq!(rpc_lanes.number, Some(6));
+
+        let session_id = descriptor
+            .file
+            .iter()
+            .flat_map(|file| &file.message_type)
+            .find(|message| message.name.as_deref() == Some("GetWorkspaceRequest"))
+            .and_then(|message| {
+                message
+                    .field
+                    .iter()
+                    .find(|field| field.name.as_deref() == Some("session_id"))
+            })
+            .expect("GetWorkspaceRequest.session_id must remain public");
+        assert_eq!(session_id.number, Some(2));
+        assert_eq!(session_id.proto3_optional, Some(true));
     }
 }
