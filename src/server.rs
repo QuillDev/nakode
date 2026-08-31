@@ -4986,7 +4986,7 @@ mod tests {
         ServiceCapability, SessionBridgeIntent, SessionId, SessionToolConfiguration,
         SubscriptionScope, SubscriptionView, TranscriptOwner, TurnId, ViewEvent, WorkspaceId,
     };
-    use nakode_server::{PublishedEvent, ServerEndpoint, ServerRequest};
+    use nakode_server::{PublishedEvent, ServerEndpoint};
     use tokio::sync::broadcast;
 
     use super::{
@@ -9062,25 +9062,26 @@ enabled = false
     async fn artifact_queries_fail_with_a_capability_error_when_not_advertised() {
         let state = AppState::new_unconfigured("/tmp/project", None, 100);
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
-        let (endpoint, _requests) =
+        let (endpoint, mut requests) =
             ServerEndpoint::channel("test", ServiceCapabilities::default(), 1);
-        let (respond, result) = tokio::sync::oneshot::channel();
+        let query_endpoint = endpoint.clone();
+        let result = tokio::spawn(async move {
+            query_endpoint
+                .execute_query(
+                    ClientId::from("plain"),
+                    Query::GetArtifact {
+                        artifact_id: nakode_protocol::ArtifactId::from("artifact-1"),
+                    },
+                )
+                .await
+        });
+        let request = requests.recv().await.expect("queued artifact query");
 
-        let outcome = core.handle(
-            &endpoint,
-            ServerRequest::Query {
-                client_id: ClientId::from("plain"),
-                request_id: nakode_protocol::RequestId::from("artifact-query"),
-                query: Query::GetArtifact {
-                    artifact_id: nakode_protocol::ArtifactId::from("artifact-1"),
-                },
-                respond,
-            },
-        );
+        let outcome = core.handle(&endpoint, request);
         assert!(!outcome.changed);
         let error = result
             .await
-            .expect("query response")
+            .expect("query task")
             .expect_err("capability is not advertised");
         assert_eq!(error.code, ErrorCode::CapabilityUnsupported);
         assert!(error.message.contains("artifact transfer"));

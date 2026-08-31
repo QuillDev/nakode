@@ -11,7 +11,7 @@ use nakode_protocol as protocol;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::Interceptor;
 
-use crate::{PublishedEvent, ServerEndpoint};
+use crate::{PublishedEvent, ServerEndpoint, ServerTiming, TimedServerResponse};
 
 #[derive(Clone, Debug)]
 pub struct ApiKeyInterceptor {
@@ -95,7 +95,7 @@ impl GrpcService {
         &self,
         options: Option<api::MutationOptions>,
         command: protocol::Command,
-    ) -> Result<protocol::CommandAccepted, tonic::Status> {
+    ) -> Result<TimedServerResponse<protocol::CommandAccepted>, tonic::Status> {
         let options =
             options.ok_or_else(|| tonic::Status::invalid_argument("mutation is required"))?;
         if options.idempotency_key.is_empty() {
@@ -103,16 +103,16 @@ impl GrpcService {
                 "mutation.idempotency_key is required",
             ));
         }
-        self.endpoint
-            .execute_command(
+        Ok(self
+            .endpoint
+            .execute_command_timed(
                 self.client_id.clone(),
                 protocol::IdempotencyKey::new(options.idempotency_key),
                 options.expected_revision,
                 false,
                 command,
             )
-            .await
-            .map_err(status)
+            .await)
     }
 
     async fn mutate(
@@ -120,35 +120,99 @@ impl GrpcService {
         options: Option<api::MutationOptions>,
         command: protocol::Command,
     ) -> Result<tonic::Response<api::MutationResult>, tonic::Status> {
-        let result = self.execute_mutation(options, command).await?;
-        Ok(tonic::Response::new(api::MutationResult {
-            resource_id: result.resource_id,
-            revision: result.revision,
-        }))
+        let timed = self.execute_mutation(options, command).await?;
+        let result = timed
+            .result
+            .map_err(|error| status_with_timing(error, &timed.timing))?;
+        Ok(response_with_timing(
+            api::MutationResult {
+                resource_id: result.resource_id,
+                revision: result.revision,
+            },
+            &timed.timing,
+        ))
+    }
+
+    async fn query_timed(
+        &self,
+        query: protocol::Query,
+    ) -> TimedServerResponse<protocol::Snapshot<protocol::QueryResult>> {
+        self.endpoint
+            .execute_query_timed(self.client_id.clone(), query)
+            .await
     }
 
     async fn query(
         &self,
         query: protocol::Query,
     ) -> Result<protocol::Snapshot<protocol::QueryResult>, tonic::Status> {
+        self.query_timed(query).await.result.map_err(status)
+    }
+
+    async fn subscription_timed(
+        &self,
+        scope: protocol::SubscriptionScope,
+    ) -> TimedServerResponse<protocol::Snapshot<protocol::SubscriptionView>> {
         self.endpoint
-            .execute_query(self.client_id.clone(), query)
+            .execute_subscription_timed(self.client_id.clone(), scope)
             .await
-            .map_err(status)
     }
 
     async fn subscription(
         &self,
         scope: protocol::SubscriptionScope,
     ) -> Result<protocol::Snapshot<protocol::SubscriptionView>, tonic::Status> {
-        self.endpoint
-            .execute_subscription(self.client_id.clone(), scope)
-            .await
-            .map_err(status)
+        self.subscription_timed(scope).await.result.map_err(status)
     }
 }
 
 type ApiStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
+
+fn insert_server_timing(metadata: &mut tonic::metadata::MetadataMap, timing: &ServerTiming) {
+    fn insert(metadata: &mut tonic::metadata::MetadataMap, key: &'static str, value: &str) {
+        if let Ok(value) = value.parse() {
+            metadata.insert(key, value);
+        }
+    }
+    insert(metadata, "x-nakode-lane", timing.lane.as_str());
+    insert(
+        metadata,
+        "x-nakode-lane-sequence",
+        &timing.lane_sequence.to_string(),
+    );
+    insert(
+        metadata,
+        "x-nakode-admission-us",
+        &timing.admission.as_micros().to_string(),
+    );
+    insert(
+        metadata,
+        "x-nakode-queue-us",
+        &timing.queue.as_micros().to_string(),
+    );
+    insert(
+        metadata,
+        "x-nakode-service-us",
+        &timing.service.as_micros().to_string(),
+    );
+    insert(
+        metadata,
+        "x-nakode-server-total-us",
+        &timing.total.as_micros().to_string(),
+    );
+}
+
+fn response_with_timing<T>(value: T, timing: &ServerTiming) -> tonic::Response<T> {
+    let mut response = tonic::Response::new(value);
+    insert_server_timing(response.metadata_mut(), timing);
+    response
+}
+
+fn status_with_timing(error: protocol::ServiceError, timing: &ServerTiming) -> tonic::Status {
+    let mut value = status(error);
+    insert_server_timing(value.metadata_mut(), timing);
+    value
+}
 
 fn status(error: protocol::ServiceError) -> tonic::Status {
     let code = match error.code {
@@ -479,19 +543,25 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         request: tonic::Request<api::GetWorkspaceRequest>,
     ) -> Result<tonic::Response<api::WorkspaceSnapshot>, tonic::Status> {
         let request = request.into_inner();
-        let result = self
-            .query(protocol::Query::Bootstrap {
+        let timed = self
+            .query_timed(protocol::Query::Bootstrap {
                 workspace: request.workspace,
                 session_id: request.session_id.map(protocol::SessionId::from),
             })
-            .await?;
+            .await;
+        let result = timed
+            .result
+            .map_err(|error| status_with_timing(error, &timed.timing))?;
         let protocol::QueryResult::Bootstrap(value) = result.value else {
             return Err(tonic::Status::internal("unexpected workspace response"));
         };
-        Ok(tonic::Response::new(api::WorkspaceSnapshot {
-            cursor: Some(cursor(&result.cursor)),
-            state: Some(workspace(*value)),
-        }))
+        Ok(response_with_timing(
+            api::WorkspaceSnapshot {
+                cursor: Some(cursor(&result.cursor)),
+                state: Some(workspace(*value)),
+            },
+            &timed.timing,
+        ))
     }
 
     async fn inspect_workspace_path(
@@ -815,7 +885,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         let mut input = request.into_inner();
         let options = input.mutation.take();
         let prompt = prompt(input.prompt)?;
-        let result = self
+        let timed = self
             .execute_mutation(
                 options,
                 protocol::Command::ContinueSessionFromBridge {
@@ -829,6 +899,9 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 },
             )
             .await?;
+        let result = timed
+            .result
+            .map_err(|error| status_with_timing(error, &timed.timing))?;
         let wire_disposition = |disposition| match disposition {
             protocol::BridgeContinuationDisposition::Accepted => {
                 api::BridgeContinuationDisposition::Accepted
@@ -850,7 +923,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             .replayed_bridge_continuation
             .map(wire_disposition)
             .map(|disposition| disposition as i32);
-        Ok(tonic::Response::new(
+        Ok(response_with_timing(
             api::ContinueSessionFromBridgeResponse {
                 mutation: Some(api::MutationResult {
                     resource_id: result.resource_id,
@@ -860,6 +933,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 replayed_disposition,
                 replayed_source_active: result.replayed_bridge_source_active,
             },
+            &timed.timing,
         ))
     }
 
@@ -1511,20 +1585,23 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 ));
             }
         };
-        let result = self
-            .query(protocol::Query::GetTranscriptBodyWindow {
+        let timed = self
+            .query_timed(protocol::Query::GetTranscriptBodyWindow {
                 owner,
                 entry_id: protocol::EntryId::from(request.entry_id),
                 before_byte: request.before_byte,
                 limit_bytes: request.limit_bytes,
             })
-            .await?;
+            .await;
+        let result = timed
+            .result
+            .map_err(|error| status_with_timing(error, &timed.timing))?;
         let protocol::QueryResult::TranscriptBody(value) = result.value else {
             return Err(tonic::Status::internal(
                 "unexpected transcript body response",
             ));
         };
-        Ok(tonic::Response::new(transcript_body(value)))
+        Ok(response_with_timing(transcript_body(value), &timed.timing))
     }
 
     async fn get_run_text_window(
