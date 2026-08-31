@@ -72,6 +72,9 @@ pub struct ServerReport {
     pub server_version: String,
     pub api_version: String,
     pub capabilities: Vec<String>,
+    /// Immutable source revision reported by the serving process when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_revision: Option<String>,
 }
 
 /// Process identity published by the installation-wide service.
@@ -96,10 +99,12 @@ pub struct ServiceRuntimeRecord {
     pub executable: Option<ExecutableIdentity>,
 }
 
-/// Content and filesystem identity of one concrete Nakode executable.
+/// Source and binary identity of one concrete Nakode executable.
 ///
-/// SHA-256 is the compatibility identity. The remaining fields make stale-process diagnostics
-/// actionable and prove when a process still maps a replaced vnode at the same display path.
+/// An embedded source revision is authoritative when both artifacts provide one. SHA-256 and size
+/// are the compatibility fallback only when neither artifact has revision provenance. The remaining
+/// fields make stale-process diagnostics actionable and prove when a process still maps a replaced
+/// vnode at the same display path.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExecutableIdentity {
     pub path: PathBuf,
@@ -111,12 +116,34 @@ pub struct ExecutableIdentity {
     pub device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inode: Option<String>,
+    /// Immutable source revision embedded at build time. Direct and legacy builds omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_revision: Option<String>,
 }
 
 impl ExecutableIdentity {
     #[must_use]
-    pub(crate) fn same_build(&self, other: &Self) -> bool {
+    pub(crate) fn same_binary(&self, other: &Self) -> bool {
         self.sha256 == other.sha256 && self.size == other.size
+    }
+
+    #[must_use]
+    pub(crate) fn same_build(&self, other: &Self) -> bool {
+        self.same_build_with_revision(other, None)
+    }
+
+    #[must_use]
+    pub(crate) fn same_build_with_revision(
+        &self,
+        other: &Self,
+        authoritative_other_revision: Option<&str>,
+    ) -> bool {
+        let other_revision = authoritative_other_revision.or(other.build_revision.as_deref());
+        match (self.build_revision.as_deref(), other_revision) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => self.same_binary(other),
+            (Some(_), None) | (None, Some(_)) => false,
+        }
     }
 }
 
@@ -930,6 +957,7 @@ pub(crate) fn executable_identity(path: &Path) -> Result<ExecutableIdentity, Con
         modified_at_unix_ms,
         device,
         inode,
+        build_revision: crate::BUILD_REVISION.map(str::to_owned),
     })
 }
 
@@ -1407,10 +1435,23 @@ async fn ensure_api_service(
 
 const FRONTEND_API_VERSION: &str = "nakode.v1";
 
-fn runtime_matches_cli(record: Option<&ServiceRuntimeRecord>, cli: &ExecutableIdentity) -> bool {
-    record
-        .and_then(|record| record.executable.as_ref())
-        .is_some_and(|running| running.same_build(cli))
+pub(crate) fn runtime_matches_cli(
+    record: Option<&ServiceRuntimeRecord>,
+    cli: &ExecutableIdentity,
+    server: Option<&ServerReport>,
+) -> bool {
+    let Some(record) = record else {
+        return false;
+    };
+    let running = record.executable.as_ref();
+    let running_revision = server
+        .and_then(|server| server.build_revision.as_deref())
+        .or_else(|| running.and_then(|identity| identity.build_revision.as_deref()));
+    match (cli.build_revision.as_deref(), running_revision) {
+        (Some(installed), Some(running)) => installed == running,
+        (None, None) => running.is_some_and(|running| running.same_build(cli)),
+        (Some(_), None) | (None, Some(_)) => false,
+    }
 }
 
 fn server_is_api_compatible(server: Option<&ServerReport>) -> bool {
@@ -1424,7 +1465,8 @@ fn service_can_be_reused(
     cli: &ExecutableIdentity,
     server: Option<&ServerReport>,
 ) -> bool {
-    runtime_matches_cli(record, cli) || server_is_api_compatible(server)
+    record.is_some()
+        && (runtime_matches_cli(record, cli, server) || server_is_api_compatible(server))
 }
 
 /// Returns a compatible live endpoint or starts/activates the workspace server.
@@ -1586,8 +1628,9 @@ fn server_report_label(server: Option<ServerReport>) -> String {
         || "unavailable".to_owned(),
         |server| {
             format!(
-                "version={} api={} capabilities=[{}]",
+                "version={} revision={} api={} capabilities=[{}]",
                 server.server_version,
+                server.build_revision.as_deref().unwrap_or("unknown"),
                 server.api_version,
                 server.capabilities.join(",")
             )
@@ -1682,10 +1725,7 @@ async fn verified_frontend_endpoint(
             "the ready service is neither the invoking CLI build nor API-compatible",
         )));
     }
-    let installed_is_running = service
-        .executable
-        .as_ref()
-        .is_some_and(|running| running.same_build(&cli));
+    let installed_is_running = runtime_matches_cli(Some(&service), &cli, server.as_ref());
     let activation_endpoint = if installed_is_running {
         crate::activation::observe_current_service(paths, &cli, &service, server.as_ref())
             .await
@@ -1767,8 +1807,9 @@ fn quiescence_refusal(running: &[String]) -> Result<(), String> {
 
 fn executable_identity_label(identity: &ExecutableIdentity) -> String {
     format!(
-        "path={} sha256={} size={} device={} inode={}",
+        "path={} revision={} sha256={} size={} device={} inode={}",
         identity.path.display(),
+        identity.build_revision.as_deref().unwrap_or("unknown"),
         identity.sha256,
         identity.size,
         identity.device.as_deref().unwrap_or("unknown"),
@@ -1805,8 +1846,9 @@ fn activation_diagnostic(
         || "server=unavailable".to_owned(),
         |server| {
             format!(
-                "server_version={} api_version={} capabilities=[{}]",
+                "server_version={} build_revision={} api_version={} capabilities=[{}]",
                 server.server_version,
+                server.build_revision.as_deref().unwrap_or("unknown"),
                 server.api_version,
                 server.capabilities.join(",")
             )
@@ -1961,6 +2003,7 @@ pub(crate) async fn server_report(api_path: &Path) -> Option<ServerReport> {
             server_version: info.server_version,
             api_version: info.api_version,
             capabilities: info.capabilities,
+            build_revision: info.build_revision,
         })
     };
     tokio::time::timeout(Duration::from_secs(2), query)
@@ -2170,7 +2213,17 @@ pub async fn restart_stale_services(
         }
         let record = read_runtime_record(paths.runtime());
         let is_singleton = directory == singleton_directory;
-        if is_singleton && runtime_matches_cli(record.as_ref(), &cli) {
+        let server = if is_singleton {
+            server_report(paths.api()).await
+        } else {
+            None
+        };
+        if is_singleton && runtime_matches_cli(record.as_ref(), &cli, server.as_ref()) {
+            if let (Some(runtime), Some(server)) = (record.as_ref(), server.as_ref()) {
+                crate::activation::observe_current_service(&paths, &cli, runtime, Some(server))
+                    .await
+                    .map_err(|error| ControlError::ServiceRejected(error.to_string()))?;
+            }
             report.current += 1;
             continue;
         }
@@ -2638,6 +2691,14 @@ mod tests {
             modified_at_unix_ms: Some(123),
             device: Some("7".to_owned()),
             inode: Some("11".to_owned()),
+            build_revision: None,
+        }
+    }
+
+    fn revised_identity(path: &str, sha256: &str, size: u64, revision: &str) -> ExecutableIdentity {
+        ExecutableIdentity {
+            build_revision: Some(revision.to_owned()),
+            ..identity(path, sha256, size)
         }
     }
 
@@ -2697,27 +2758,123 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_requires_published_matching_content_not_semver() {
-        let cli = identity("/installed/nakode", "new-hash", 200);
-        let matching = ServiceRuntimeRecord {
+    fn runtime_identity_prefers_revision_and_uses_fingerprint_only_for_legacy_builds() {
+        let revision_a = "1111111111111111111111111111111111111111";
+        let revision_b = "2222222222222222222222222222222222222222";
+        let installed = revised_identity("/installed/nakode", "installed-hash", 200, revision_a);
+        let matching_revision = ServiceRuntimeRecord {
             pid: 42,
             started_at_unix_ms: 10,
             version: "0.3.0".to_owned(),
             workspace: None,
-            executable: Some(identity("/same/display/path", "new-hash", 200)),
+            executable: Some(revised_identity(
+                "/same/display/path",
+                "different-hash",
+                190,
+                revision_a,
+            )),
         };
-        let same_version_old_build = ServiceRuntimeRecord {
-            executable: Some(identity("/installed/nakode", "old-hash", 190)),
-            ..matching.clone()
+        let changed_revision = ServiceRuntimeRecord {
+            executable: Some(revised_identity(
+                "/installed/nakode",
+                "installed-hash",
+                200,
+                revision_b,
+            )),
+            ..matching_revision.clone()
+        };
+        let missing_revision = ServiceRuntimeRecord {
+            executable: Some(identity("/installed/nakode", "installed-hash", 200)),
+            ..matching_revision.clone()
+        };
+        let legacy_installed = identity("/installed/nakode", "legacy-hash", 180);
+        let legacy_matching = ServiceRuntimeRecord {
+            executable: Some(identity("/running/nakode", "legacy-hash", 180)),
+            ..matching_revision.clone()
+        };
+        let legacy_changed = ServiceRuntimeRecord {
+            executable: Some(identity("/running/nakode", "other-hash", 180)),
+            ..matching_revision.clone()
         };
         let old_record: ServiceRuntimeRecord =
             serde_json::from_str(r#"{"pid":41,"started_at_unix_ms":9,"version":"0.3.0"}"#)
                 .expect("old records remain readable");
 
-        assert!(runtime_matches_cli(Some(&matching), &cli));
-        assert!(!runtime_matches_cli(Some(&same_version_old_build), &cli));
-        assert!(!runtime_matches_cli(Some(&old_record), &cli));
-        assert!(!runtime_matches_cli(None, &cli));
+        assert!(runtime_matches_cli(
+            Some(&matching_revision),
+            &installed,
+            None
+        ));
+        assert!(!runtime_matches_cli(
+            Some(&changed_revision),
+            &installed,
+            None
+        ));
+        assert!(!runtime_matches_cli(
+            Some(&missing_revision),
+            &installed,
+            None
+        ));
+        assert!(runtime_matches_cli(
+            Some(&legacy_matching),
+            &legacy_installed,
+            None
+        ));
+        assert!(!runtime_matches_cli(
+            Some(&legacy_changed),
+            &legacy_installed,
+            None
+        ));
+        assert!(!runtime_matches_cli(Some(&old_record), &installed, None));
+        assert!(!runtime_matches_cli(None, &installed, None));
+    }
+
+    #[test]
+    fn live_server_revision_recovers_legacy_runtime_provenance() {
+        let revision = "1111111111111111111111111111111111111111";
+        let installed = revised_identity("/installed/nakode", "new-hash", 200, revision);
+        let runtime = ServiceRuntimeRecord {
+            pid: 42,
+            started_at_unix_ms: 10,
+            version: "0.3.0".to_owned(),
+            workspace: None,
+            executable: Some(identity("/installed/nakode", "old-hash", 190)),
+        };
+        let matching_server = super::ServerReport {
+            server_version: "0.3.0".to_owned(),
+            api_version: "nakode.v1".to_owned(),
+            capabilities: Vec::new(),
+            build_revision: Some(revision.to_owned()),
+        };
+        let stale_server = super::ServerReport {
+            build_revision: Some("2222222222222222222222222222222222222222".to_owned()),
+            ..matching_server.clone()
+        };
+
+        let missing_executable = ServiceRuntimeRecord {
+            executable: None,
+            ..runtime.clone()
+        };
+        assert!(runtime_matches_cli(
+            Some(&runtime),
+            &installed,
+            Some(&matching_server)
+        ));
+        assert!(runtime_matches_cli(
+            Some(&missing_executable),
+            &installed,
+            Some(&matching_server)
+        ));
+        assert!(!runtime_matches_cli(
+            None,
+            &installed,
+            Some(&matching_server)
+        ));
+        assert!(!runtime_matches_cli(
+            Some(&runtime),
+            &installed,
+            Some(&stale_server)
+        ));
     }
 
     #[test]
@@ -2734,6 +2891,7 @@ mod tests {
             server_version: "0.3.0".to_owned(),
             api_version: "nakode.v1".to_owned(),
             capabilities: vec!["Subscriptions".to_owned()],
+            build_revision: None,
         };
         let incompatible = super::ServerReport {
             api_version: "nakode.v2".to_owned(),
@@ -2751,6 +2909,7 @@ mod tests {
             &cli,
             Some(&incompatible)
         ));
+        assert!(!service_can_be_reused(None, &cli, Some(&compatible)));
         assert!(!service_can_be_reused(Some(&old_build), &cli, None));
     }
 

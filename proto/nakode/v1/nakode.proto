@@ -179,6 +179,8 @@ message ActivationExecutableIdentity {
   optional string device = 5;
   optional string inode = 6;
   string version = 7;
+  // Immutable source revision embedded in this executable when available.
+  optional string build_revision = 8;
 }
 
 message ActivationRunningService {
@@ -188,6 +190,8 @@ message ActivationRunningService {
   optional ActivationExecutableIdentity executable = 4;
   optional string api_version = 5;
   repeated string capabilities = 6;
+  // Authoritative source revision reported by the serving process when available.
+  optional string build_revision = 7;
 }
 
 message ActivationHelperIdentity {

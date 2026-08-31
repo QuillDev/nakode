@@ -106,6 +106,42 @@ mod tests {
     }
 
     #[test]
+    fn activation_build_revisions_are_additive_and_presence_aware() {
+        let legacy_executable = super::v1::ActivationExecutableIdentity::default();
+        let legacy_running = super::v1::ActivationRunningService::default();
+        assert_eq!(legacy_executable.build_revision, None);
+        assert_eq!(legacy_running.build_revision, None);
+
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let executable = super::v1::ActivationExecutableIdentity {
+            build_revision: Some(revision.to_owned()),
+            ..legacy_executable
+        };
+        let running = super::v1::ActivationRunningService {
+            executable: Some(executable.clone()),
+            build_revision: Some(revision.to_owned()),
+            ..legacy_running
+        };
+        let executable_wire = executable.encode_to_vec();
+        let running_wire = running.encode_to_vec();
+
+        assert_eq!(
+            super::v1::ActivationExecutableIdentity::decode(executable_wire.as_slice())
+                .expect("activation executable must decode")
+                .build_revision
+                .as_deref(),
+            Some(revision)
+        );
+        assert_eq!(
+            super::v1::ActivationRunningService::decode(running_wire.as_slice())
+                .expect("activation running service must decode")
+                .build_revision
+                .as_deref(),
+            Some(revision)
+        );
+    }
+
+    #[test]
     fn public_descriptor_exposes_the_complete_frontend_edge_inventory() {
         let descriptor = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
             .expect("generated descriptor must decode");

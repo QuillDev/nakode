@@ -35,7 +35,8 @@ use crate::{
         ServiceRuntimeRecord, activation_owner_is_alive, bind_service_listener,
         capture_service_output, detach_service_process, executable_identity, installation_config,
         read_runtime_record, restart_service_conditionally, restart_service_quiescent,
-        server_report, session_has_live_work, socket_is_live, wait_for_api, write_private_file,
+        runtime_matches_cli, server_report, session_has_live_work, socket_is_live, wait_for_api,
+        write_private_file,
     },
     server::runtime::QuiescenceBlocker,
 };
@@ -411,11 +412,14 @@ async fn running_identity(paths: &ServicePaths) -> Option<RunningIdentity> {
 
 fn running_service_has_build(running: &RunningIdentity, installed: &ExecutableIdentity) -> bool {
     running.server.is_some()
-        && running
-            .runtime
-            .executable
-            .as_ref()
-            .is_some_and(|identity| identity.same_build(installed))
+        && runtime_matches_cli(Some(&running.runtime), installed, running.server.as_ref())
+}
+
+fn matches_recorded_target(recorded: &ExecutableIdentity, current: &ExecutableIdentity) -> bool {
+    recorded.same_build(current)
+        || (recorded.build_revision.is_none()
+            && current.build_revision.is_some()
+            && recorded.same_binary(current))
 }
 
 async fn synthesized_journal(
@@ -427,14 +431,9 @@ async fn synthesized_journal(
         version: env!("CARGO_PKG_VERSION").to_owned(),
     };
     let running = running_identity(paths).await;
-    let is_current = running.as_ref().is_none_or(|running| {
-        running.server.is_some()
-            && running
-                .runtime
-                .executable
-                .as_ref()
-                .is_none_or(|identity| identity.same_build(&installed.executable))
-    });
+    let is_current = running
+        .as_ref()
+        .is_none_or(|running| running_service_has_build(running, &installed.executable));
     let unreachable_runtime = running
         .as_ref()
         .is_some_and(|identity| identity.server.is_none());
@@ -477,15 +476,13 @@ pub(crate) async fn observe_current_service(
     runtime: &ServiceRuntimeRecord,
     server: Option<&ServerReport>,
 ) -> Result<(), ActivationError> {
-    if server.is_none()
-        || !runtime
-            .executable
-            .as_ref()
-            .is_some_and(|running| running.same_build(installed))
-    {
+    if server.is_none() || !runtime_matches_cli(Some(runtime), installed, server) {
         return Ok(());
     }
     let _activation = ActivationLease::acquire(paths.activation()).await?;
+    if read_runtime_record(paths.runtime()).as_ref() != Some(runtime) {
+        return Ok(());
+    }
     let mut journal = match read_journal(paths) {
         Ok(Some(journal)) => journal,
         Ok(None) => return Ok(()),
@@ -518,16 +515,24 @@ pub(crate) async fn observe_current_service(
         }
         Err(error) => return Err(error),
     };
-    if !journal.installed.executable.same_build(installed) {
+    if !matches_recorded_target(&journal.installed.executable, installed) {
         return Ok(());
     }
+    let provenance_upgraded =
+        journal.installed.executable.build_revision.is_none() && installed.build_revision.is_some();
+    if provenance_upgraded {
+        installed.clone_into(&mut journal.installed.executable);
+        env!("CARGO_PKG_VERSION").clone_into(&mut journal.installed.version);
+    }
+    let observed_running = RunningIdentity {
+        runtime: runtime.clone(),
+        server: server.cloned(),
+    };
+    let running_changed = journal.running.as_ref() != Some(&observed_running);
     if !matches!(journal.phase, Phase::Current | Phase::Activated) {
         let started = journal.last_check_at_unix_ms.unwrap_or_else(now_ms);
         journal.phase = Phase::Activated;
-        journal.running = Some(RunningIdentity {
-            runtime: runtime.clone(),
-            server: server.cloned(),
-        });
+        journal.running = Some(observed_running);
         journal.blockers.clear();
         journal.failure = None;
         journal.next_check_at_unix_ms = None;
@@ -537,6 +542,9 @@ pub(crate) async fn observe_current_service(
             CheckResult::Activated,
             "endpoint discovery verified the installed service",
         );
+        write_journal(paths, &mut journal)?;
+    } else if provenance_upgraded || running_changed {
+        journal.running = Some(observed_running);
         write_journal(paths, &mut journal)?;
     }
     Ok(())
@@ -567,10 +575,7 @@ pub(crate) async fn schedule_deferred_activation(
     let activation = ActivationLease::acquire(paths.activation()).await?;
     let (mut journal, existing_attempt, recovered_corruption) = match read_journal(paths) {
         Ok(Some(existing))
-            if existing
-                .installed
-                .executable
-                .same_build(&installed.executable) =>
+            if matches_recorded_target(&existing.installed.executable, &installed.executable) =>
         {
             (existing, true, None)
         }
@@ -644,7 +649,7 @@ pub(crate) async fn recover_deferred_helper(
     let installed = executable_identity(executable)?;
     let activation = ActivationLease::acquire(paths.activation()).await?;
     let pending = read_journal(paths)?.is_some_and(|journal| {
-        journal.installed.executable.same_build(&installed)
+        matches_recorded_target(&journal.installed.executable, &installed)
             && !matches!(
                 journal.phase,
                 Phase::Current | Phase::Activated | Phase::Cancelled
@@ -1464,8 +1469,13 @@ async fn check_once_fenced(
     let started = now_ms();
     let mut journal = read_required_journal(paths)?;
     let installed_now = executable_identity(executable)?;
-    if !installed_now.same_build(&journal.installed.executable) {
+    if !matches_recorded_target(&journal.installed.executable, &installed_now) {
         return fail_changed_installed_executable(paths, journal, trigger, started);
+    }
+    if journal.installed.executable.build_revision.is_none()
+        && installed_now.build_revision.is_some()
+    {
+        journal.installed.executable = installed_now;
     }
 
     journal.phase = Phase::Checking;
@@ -2072,6 +2082,7 @@ fn installed_to_api(installed: InstalledIdentity) -> api::ActivationExecutableId
         device: identity.device,
         inode: identity.inode,
         version: installed.version,
+        build_revision: identity.build_revision,
     }
 }
 
@@ -2079,10 +2090,18 @@ fn running_to_api(running: RunningIdentity) -> api::ActivationRunningService {
     let runtime = running.runtime;
     let version = runtime.version;
     let executable_version = version.clone();
-    let (api_version, capabilities) = running.server.map_or_else(
-        || (None, Vec::new()),
-        |server| (Some(server.api_version), server.capabilities),
-    );
+    let executable_build_revision = runtime
+        .executable
+        .as_ref()
+        .and_then(|identity| identity.build_revision.clone());
+    let (api_version, capabilities, build_revision) = match running.server {
+        None => (None, Vec::new(), executable_build_revision),
+        Some(server) => (
+            Some(server.api_version),
+            server.capabilities,
+            server.build_revision.or(executable_build_revision),
+        ),
+    };
     api::ActivationRunningService {
         pid: runtime.pid,
         started_at_unix_ms: runtime.started_at_unix_ms,
@@ -2095,6 +2114,7 @@ fn running_to_api(running: RunningIdentity) -> api::ActivationRunningService {
         }),
         api_version,
         capabilities,
+        build_revision,
     }
 }
 
@@ -2183,7 +2203,150 @@ mod tests {
             modified_at_unix_ms: Some(1),
             device: Some("1".to_owned()),
             inode: Some("2".to_owned()),
+            build_revision: None,
         }
+    }
+
+    fn revised_identity(hash: &str, revision: &str) -> ExecutableIdentity {
+        ExecutableIdentity {
+            build_revision: Some(revision.to_owned()),
+            ..identity(hash)
+        }
+    }
+
+    fn running_with_revision(
+        executable: ExecutableIdentity,
+        server_revision: Option<&str>,
+        version: &str,
+    ) -> RunningIdentity {
+        RunningIdentity {
+            runtime: ServiceRuntimeRecord {
+                pid: 42,
+                started_at_unix_ms: 10,
+                version: version.to_owned(),
+                workspace: None,
+                executable: Some(executable),
+            },
+            server: Some(ServerReport {
+                server_version: version.to_owned(),
+                api_version: "nakode.v1".to_owned(),
+                capabilities: Vec::new(),
+                build_revision: server_revision.map(str::to_owned),
+            }),
+        }
+    }
+
+    fn write_runtime(paths: &ServicePaths, runtime: &ServiceRuntimeRecord) {
+        write_private_file(
+            paths.runtime(),
+            &serde_json::to_vec(runtime).expect("runtime record encoding"),
+        )
+        .expect("runtime record");
+    }
+
+    #[test]
+    fn running_build_match_is_revision_authoritative_and_legacy_safe() {
+        let revision_a = "1111111111111111111111111111111111111111";
+        let revision_b = "2222222222222222222222222222222222222222";
+        let installed = revised_identity("installed-hash", revision_a);
+
+        assert!(running_service_has_build(
+            &running_with_revision(
+                revised_identity("different-hash", revision_a),
+                Some(revision_a),
+                "0.3.0",
+            ),
+            &installed,
+        ));
+        assert!(!running_service_has_build(
+            &running_with_revision(
+                revised_identity("installed-hash", revision_b),
+                Some(revision_b),
+                "0.3.0",
+            ),
+            &installed,
+        ));
+        assert!(!running_service_has_build(
+            &running_with_revision(
+                revised_identity("another-hash", revision_b),
+                Some(revision_b),
+                "0.4.0",
+            ),
+            &installed,
+        ));
+        assert!(running_service_has_build(
+            &running_with_revision(identity("old-hash"), Some(revision_a), "0.2.9"),
+            &installed,
+        ));
+        assert!(!running_service_has_build(
+            &running_with_revision(identity("installed-hash"), None, "0.3.0"),
+            &installed,
+        ));
+        assert!(!running_service_has_build(
+            &running_with_revision(identity("legacy-hash"), Some(revision_a), "0.3.0"),
+            &identity("legacy-hash"),
+        ));
+        assert!(running_service_has_build(
+            &running_with_revision(identity("legacy-hash"), None, "9.0.0"),
+            &identity("legacy-hash"),
+        ));
+    }
+
+    #[test]
+    fn legacy_recorded_target_upgrades_only_on_exact_fingerprint_match() {
+        let revision = "1111111111111111111111111111111111111111";
+        let recorded = identity("legacy-hash");
+        let current = revised_identity("legacy-hash", revision);
+
+        assert!(matches_recorded_target(&recorded, &current));
+
+        let changed_hash = revised_identity("changed-hash", revision);
+        assert!(!matches_recorded_target(&recorded, &changed_hash));
+
+        let changed_size = ExecutableIdentity {
+            size: current.size + 1,
+            ..current
+        };
+        assert!(!matches_recorded_target(&recorded, &changed_size));
+    }
+
+    #[test]
+    fn running_api_revision_prefers_server_and_falls_back_to_executable_provenance() {
+        let executable_revision = "1111111111111111111111111111111111111111";
+        let server_revision = "2222222222222222222222222222222222222222";
+        let fallback = running_to_api(running_with_revision(
+            revised_identity("hash-a", executable_revision),
+            None,
+            "0.3.0",
+        ));
+        assert_eq!(
+            fallback.build_revision.as_deref(),
+            Some(executable_revision)
+        );
+        assert_eq!(
+            fallback
+                .executable
+                .as_ref()
+                .and_then(|identity| identity.build_revision.as_deref()),
+            Some(executable_revision)
+        );
+
+        let authoritative = running_to_api(running_with_revision(
+            revised_identity("hash-b", executable_revision),
+            Some(server_revision),
+            "0.3.0",
+        ));
+        assert_eq!(
+            authoritative.build_revision.as_deref(),
+            Some(server_revision)
+        );
+        assert_eq!(
+            authoritative
+                .executable
+                .as_ref()
+                .and_then(|identity| identity.build_revision.as_deref()),
+            Some(executable_revision)
+        );
     }
 
     fn journal() -> Journal {
@@ -2215,6 +2378,7 @@ mod tests {
                     .then(|| CONDITIONAL_FORCE_CAPABILITY.to_owned())
                     .into_iter()
                     .collect(),
+                build_revision: None,
             }),
         });
         journal
@@ -2501,11 +2665,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_observation_reconciles_an_interrupted_cutover() {
+    async fn endpoint_observation_reconciles_an_interrupted_cutover_idempotently_by_revision() {
         let directory = tempfile::tempdir().expect("activation directory");
         let paths = ServicePaths::in_directory(directory.path());
-        let installed = identity("new");
-        let mut pending = journal();
+        let installed = revised_identity(
+            "installed-binary-hash",
+            "1111111111111111111111111111111111111111",
+        );
+        let mut legacy_recorded = installed.clone();
+        legacy_recorded.build_revision = None;
+        let mut pending = Journal::new(
+            InstalledIdentity {
+                executable: legacy_recorded,
+                version: "1.0.0".to_owned(),
+            },
+            None,
+        );
         pending.phase = Phase::Activating;
         pending.blockers.push(Blocker {
             session_id: "session-a".to_owned(),
@@ -2521,27 +2696,138 @@ mod tests {
             started_at_unix_ms: 10,
             version: "1.0.0".to_owned(),
             workspace: None,
-            executable: Some(installed.clone()),
+            executable: Some(identity("different-running-binary-hash")),
         };
+        write_runtime(&paths, &runtime);
         let server = ServerReport {
             server_version: "1.0.0".to_owned(),
             api_version: "nakode.v1".to_owned(),
             capabilities: vec![CONDITIONAL_FORCE_CAPABILITY.to_owned()],
+            build_revision: installed.build_revision.clone(),
         };
+        let stale_server = ServerReport {
+            build_revision: Some("2222222222222222222222222222222222222222".to_owned()),
+            ..server.clone()
+        };
+
+        observe_current_service(&paths, &installed, &runtime, Some(&stale_server))
+            .await
+            .expect("different revision remains pending");
+        assert_eq!(
+            read_required_journal(&paths)
+                .expect("pending journal")
+                .phase,
+            Phase::Activating
+        );
 
         observe_current_service(&paths, &installed, &runtime, Some(&server))
             .await
             .expect("reconcile current service");
         let recovered = read_required_journal(&paths).expect("recovered journal");
         assert_eq!(recovered.phase, Phase::Activated);
+        assert_eq!(recovered.installed.executable, installed);
         assert!(recovered.blockers.is_empty());
         assert_eq!(
-            recovered.running.map(|running| running.runtime),
-            Some(runtime)
+            recovered.running.as_ref().map(|running| &running.runtime),
+            Some(&runtime)
         );
         assert!(recovered.history.last().is_some_and(|record| {
             record.trigger == CheckTrigger::Recovered && record.result == CheckResult::Activated
         }));
+        let settled_revision = recovered.revision;
+
+        observe_current_service(&paths, &installed, &runtime, Some(&server))
+            .await
+            .expect("repeat current observation");
+        let repeated = read_required_journal(&paths).expect("repeated journal");
+        assert_eq!(repeated.phase, Phase::Activated);
+        assert_eq!(repeated.revision, settled_revision);
+        assert_eq!(repeated.history.len(), recovered.history.len());
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_upgrades_terminal_legacy_metadata_once() {
+        let directory = tempfile::tempdir().expect("activation directory");
+        let paths = ServicePaths::in_directory(directory.path());
+        let installed = revised_identity(
+            "installed-binary-hash",
+            "1111111111111111111111111111111111111111",
+        );
+        let mut legacy_recorded = installed.clone();
+        legacy_recorded.build_revision = None;
+        let mut terminal = Journal::new(
+            InstalledIdentity {
+                executable: legacy_recorded,
+                version: "1.0.0".to_owned(),
+            },
+            None,
+        );
+        terminal.phase = Phase::Activated;
+        write_journal(&paths, &mut terminal).expect("terminal journal");
+        let runtime = ServiceRuntimeRecord {
+            pid: 42,
+            started_at_unix_ms: 10,
+            version: "1.0.0".to_owned(),
+            workspace: None,
+            executable: Some(identity("different-running-binary-hash")),
+        };
+        write_runtime(&paths, &runtime);
+        let server = ServerReport {
+            server_version: "1.0.0".to_owned(),
+            api_version: "nakode.v1".to_owned(),
+            capabilities: vec![CONDITIONAL_FORCE_CAPABILITY.to_owned()],
+            build_revision: installed.build_revision.clone(),
+        };
+
+        observe_current_service(&paths, &installed, &runtime, Some(&server))
+            .await
+            .expect("upgrade terminal metadata");
+        let upgraded = read_required_journal(&paths).expect("upgraded journal");
+        assert_eq!(upgraded.installed.executable, installed);
+        assert_eq!(upgraded.installed.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            upgraded.running,
+            Some(RunningIdentity {
+                runtime: runtime.clone(),
+                server: Some(server.clone()),
+            })
+        );
+        let upgraded_revision = upgraded.revision;
+        let history_len = upgraded.history.len();
+        let newer_runtime = ServiceRuntimeRecord {
+            pid: 43,
+            started_at_unix_ms: 20,
+            ..runtime.clone()
+        };
+        write_runtime(&paths, &newer_runtime);
+
+        observe_current_service(&paths, &installed, &runtime, Some(&server))
+            .await
+            .expect("stale observation is ignored");
+        let after_stale = read_required_journal(&paths).expect("journal after stale observation");
+        assert_eq!(after_stale.revision, upgraded_revision);
+        assert_eq!(
+            after_stale.running.as_ref().map(|running| &running.runtime),
+            Some(&runtime)
+        );
+
+        observe_current_service(&paths, &installed, &newer_runtime, Some(&server))
+            .await
+            .expect("refresh terminal observation");
+        let refreshed = read_required_journal(&paths).expect("refreshed journal");
+        assert_eq!(
+            refreshed.running.as_ref().map(|running| &running.runtime),
+            Some(&newer_runtime)
+        );
+        assert_eq!(refreshed.history.len(), history_len);
+        let refreshed_revision = refreshed.revision;
+
+        observe_current_service(&paths, &installed, &newer_runtime, Some(&server))
+            .await
+            .expect("repeat terminal observation");
+        let repeated = read_required_journal(&paths).expect("repeated journal");
+        assert_eq!(repeated.revision, refreshed_revision);
+        assert_eq!(repeated.history.len(), history_len);
     }
 
     #[tokio::test]
@@ -2558,11 +2844,13 @@ mod tests {
             workspace: None,
             executable: Some(installed.clone()),
         };
+        write_runtime(&paths, &runtime);
 
         let server = ServerReport {
             server_version: "1.0.0".to_owned(),
             api_version: "nakode.v1".to_owned(),
             capabilities: Vec::new(),
+            build_revision: installed.build_revision.clone(),
         };
 
         observe_current_service(&paths, &installed, &runtime, Some(&server))

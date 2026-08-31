@@ -4,9 +4,20 @@ Status: implemented on this branch; this document records the approved product c
 
 ## Product decision
 
-After an update installs a new Nakode executable, the currently running service may continue on its old executable only while it owns live work. Nakode must then keep an explicit, auditable activation attempt pending and automatically replace the stale service as soon as it becomes quiescent.
+After an update installs a new Nakode executable whose trusted source revision differs from the running service, the currently running service may continue on its old executable only while it owns live work. Nakode must then keep an explicit, auditable activation attempt pending and automatically replace the stale service as soon as it becomes quiescent.
 
-The owner must not have to close idle sessions or remember to run `nakode restart`. The dashboard must make the pending activation visible until installed and running executable identities agree.
+The owner must not have to close idle sessions or remember to run `nakode restart`. The dashboard must make the pending activation visible until Nakode's authoritative installed-versus-running identity comparison says the target is current.
+
+### Managed-build identity policy
+
+Managed GitHub/source builds embed the immutable source revision from the trusted managed checkout. Nakode, not a client, applies this precedence whenever it compares the installed target with a running service, runtime record, endpoint, or activation journal:
+
+1. When both identities contain a source/build revision, revision equality alone decides whether they are the same managed build.
+2. When neither identity contains a revision, exact executable SHA-256 and size equality is the compatibility fallback for legacy revisionless builds and records.
+3. When only one identity contains a revision, the available metadata is insufficient to prove that the target is current; fingerprint equality must not erase the provenance mismatch.
+4. Semantic version is display and compatibility information. It never decides immutable artifact identity.
+
+Consequently, equal trusted source revisions are current even if semantic versions or executable fingerprints differ, while different trusted source revisions remain pending even when semantic versions are equal. SHA-256, size, path, inode, and device remain useful diagnostics, but they are not automatic managed-update identity when both source revisions are present. If an operator intentionally wants to replace a running executable with a binary-only variation built from the same revision, that is an explicit administrative action such as `nakode restart`, not work for the periodic activation helper. Once the matching revision is live, periodic checks are idempotent no-ops.
 
 Terminology in product copy:
 
@@ -135,9 +146,9 @@ The normal `Close` action dismisses only the modal. It does not stop the helper 
 The modal uses the shared `Fold` disclosure and shows:
 
 1. **Versions and identities**
-   - installed executable path, version, SHA-256, inode/device when available;
-   - running service version, PID, start time, executable identity;
-   - target API version and an informational capability delta when available. Today endpoint reuse is decided by executable identity or the literal API version string (`nakode.v1`), not by capability comparison; the delta must not be used to reinterpret that existing compatibility rule.
+   - installed executable path, semantic version, source/build revision, SHA-256 fingerprint, and inode/device when available;
+   - running service semantic version, authoritative live source/build revision, PID, start time, and SHA-256 fingerprint;
+   - target API version and an informational capability delta when available. API version describes wire compatibility, not artifact identity, and capability comparison must not reinterpret the revision-first managed-build rule.
 2. **Helper**
    - helper state and PID/instance ID;
    - started time and heartbeat;
@@ -161,8 +172,8 @@ Nakode owns the durable phases; FStack renders them and invokes typed operations
 
 | State | Meaning | Sidebar |
 |---|---|---|
-| `current` | No pending attempt; installed and running executable identities agree | Hidden |
-| `installed_pending` | B is installed and differs from running A; first check has not completed | Amber clock; count unknown |
+| `current` | No pending attempt; installed and running identities match under the revision-first rule | Hidden |
+| `installed_pending` | B is installed and does not match running A under the revision-first rule; first check has not completed | Amber clock; count unknown |
 | `checking` | One scheduled/manual authoritative check is in flight | Amber busy row |
 | `blocked` | Latest check refused quiescence and reports current blockers | Amber clock + blocker count |
 | `activating` | Quiescence was fenced and safe replacement is in progress | Amber busy row; modal non-dismissible |
@@ -174,7 +185,7 @@ Nakode owns the durable phases; FStack renders them and invokes typed operations
 
 A helper crash or missed heartbeat projects as `failed`, not `cancelled`. A newer installed target may cancel/supersede the old attempt only by atomically creating the new `installed_pending` attempt; it must not leave an unowned identity mismatch.
 
-`current` is derived from full executable build identity, not only a display version. A rebuilt binary with the same package version is still stale when its content identity differs.
+`current` is derived from the managed-build identity policy above, never from semantic version. Two trusted source revisions that differ are stale even when their semantic versions match. Two equal trusted source revisions are current even when their executable SHA-256 fingerprints differ. SHA-256 plus size decides only when both sides are revisionless; mixed revision presence cannot prove current identity.
 
 The pending activation record survives dashboard relaunch, helper crash, and machine restart. Querying activation status through the newly installed executable must ensure that a pending helper is running or return `failed` with an exact reason.
 
@@ -194,7 +205,7 @@ The helper:
 - exact blocker rows are built from the stale service's existing full session snapshots and final lifecycle refusal IDs; an ID that an older A cannot classify is retained as `Unclassified live work reported by running service <identity>` rather than omitted;
 - uses `QuiesceShutdown` as the final atomic authority rather than trusting a prior observation;
 - starts the installed executable through the existing detached service-start path;
-- verifies readiness and build identity before recording success and exiting;
+- verifies readiness and revision-first build identity before recording success and exiting;
 - retains bounded structured audit history in a forward-compatible activation journal.
 
 A helper crash cannot leave the runtime fenced: the existing abandoned quiescence response rollback remains required. A stale helper lease is reclaimed only after process identity proves the owner is gone, following the existing activation lease safeguards.
@@ -221,7 +232,7 @@ A status watch prevents every dashboard renderer from inventing polling cadence.
 The Protobuf shape includes:
 
 - stable activation attempt ID and monotonic revision;
-- installed and running version/build identities;
+- installed and running semantic versions, source/build revisions, and executable fingerprints as distinct fields;
 - helper state, instance identity, started/heartbeat timestamps;
 - cadence, last-check, and next-check timestamps;
 - blocker rows with logical session ID, display title, activity class, queue count, reason, and observed session revision;
@@ -312,8 +323,11 @@ Every changed sidebar scene, including unrelated tabs whose footer is visible, m
 - duplicate helper spawn loses the helper lease without killing the owner;
 - endpoint discovery racing a helper-owned scheduled check/cutover serializes through the activation lease and cannot start a second replacement;
 - a stale helper lease is retained during startup grace or while its socket and matching heartbeat are healthy; otherwise compare-before-remove reclamation permits deterministic recovery even from a live-but-wedged PID;
-- installed/running same version but different hashes remains pending;
-- success requires replacement readiness and matching executable identity;
+- equal source revisions are current despite semantic-version or executable-fingerprint differences, and repeated scheduled checks remain no-ops;
+- different source revisions remain pending even when semantic versions are equal;
+- different semantic versions and source revisions remain pending;
+- SHA-256 plus size is used only when both identities are revisionless, while mixed revision presence cannot prove current identity;
+- success requires replacement readiness and matching revision-first build identity;
 - helper/service startup failure becomes `failed`, is presented as stalled, and retains the pending identity mismatch;
 - bounded history truncates oldest attempts deterministically;
 - forced activation rejects changed activation/blocker revisions;
@@ -380,8 +394,10 @@ This ordering ensures the visual queue is always backed by Nakode-authoritative 
 
 ## Done criteria
 
-- `nakode update` never reports an unqualified current state while the running build differs.
-- Deferred activation is durable, automatically rechecked, and visible until resolved.
+- `nakode update` never reports an unqualified current state while the trusted running source revision differs from the installed target revision.
+- Equal trusted source revisions resolve to current regardless of semantic version or executable fingerprint; binary-only same-revision replacement requires an explicit administrative restart if desired.
+- Revisionless identities retain exact SHA-256-and-size fallback compatibility, and mixed revision presence never proves current identity.
+- Deferred activation is durable, automatically rechecked, visible until resolved, and idempotently remains absent after the target revision is live.
 - The dashboard names cadence, last/next check, blocker count/reasons, identities, and bounded history.
 - Manual recheck is auditable and closes the modal only after verified activation.
 - Forced activation is explicit, confirmed, revision-fenced, and audited.
