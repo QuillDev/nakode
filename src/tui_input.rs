@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nakode_protocol::{
@@ -116,8 +119,8 @@ fn handle_paste(state: &mut TuiState, bootstrap: &BootstrapView, text: &str) -> 
         return InputOutcome::default();
     }
     if no_modal_is_open(state) && state.approvals.is_empty() && state.questions.is_empty() {
-        if let Some(attachments) = clipboard::attachments_from_terminal_paste(text) {
-            state.insert_attachments(protocol_attachments(attachments, &bootstrap.workspace_path));
+        if let Some(input) = clipboard::local_files_from_terminal_paste(text) {
+            insert_local_file_input(state, input, &bootstrap.workspace_path);
         } else {
             state.client.editor.insert_str(text);
             state.set_status("Pasted text into the draft.");
@@ -1729,8 +1732,44 @@ fn handle_subagent_modal_key(
     InputOutcome::default()
 }
 
+fn insert_local_file_input(
+    state: &mut TuiState,
+    input: clipboard::LocalFileInput,
+    workspace: &str,
+) {
+    let file_count = input.paths.len();
+    let image_count = input.image_attachments.len();
+    if image_count > 0 {
+        state.insert_attachments(protocol_attachments(input.image_attachments, workspace));
+    }
+    insert_local_file_paths(&mut state.client.editor, &input.paths);
+    state.set_status(match (file_count, image_count) {
+        (0, _) => "Pasted image attachments.".to_owned(),
+        (_, 0) => format!("Pasted {file_count} local file path(s)."),
+        _ => format!("Pasted {file_count} local file path(s) and image attachments."),
+    });
+}
+
+fn insert_local_file_paths(editor: &mut crate::editor::EditorState, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    if !editor.is_blank() && !editor.text().ends_with('\n') {
+        editor.insert_char('\n');
+    }
+    for (index, path) in paths.iter().enumerate() {
+        if index > 0 {
+            editor.insert_char('\n');
+        }
+        editor.insert_str(&path.to_string_lossy());
+    }
+}
+
 fn paste_desktop_clipboard(state: &mut TuiState, workspace: &str) {
     match clipboard::read_desktop() {
+        Ok(clipboard::ClipboardPayload::Files(input)) => {
+            insert_local_file_input(state, input, workspace);
+        }
         Ok(clipboard::ClipboardPayload::Attachments(attachments)) => {
             state.insert_attachments(protocol_attachments(attachments, workspace));
         }
@@ -1754,13 +1793,15 @@ fn no_modal_is_open(state: &TuiState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
     use nakode_protocol::{
         AgentSessionId, ModelConfigurationView, ModelId, ModelView, ProviderId, SessionActivity,
         TurnId, TurnStatus, TurnView,
     };
 
-    use super::{handle_terminal, open_model_picker};
+    use super::{handle_terminal, insert_local_file_paths, open_model_picker};
     use crate::{
         api_projection::TuiAction as Command,
         tui_state::{ModelPickerStage, ModelSelectionScope, SettingsView, TuiState},
@@ -2246,5 +2287,22 @@ mod tests {
         state.close_model_picker();
         let _ = handle_terminal(&mut state, &view, wheel(MouseEventKind::ScrollUp));
         assert!(state.client.model_picker.is_none());
+    }
+
+    #[test]
+    fn local_file_paths_append_without_clobbering_and_preserve_spaces_unicode_and_order() {
+        let mut editor = crate::editor::EditorState::default();
+        editor.insert_str("existing draft");
+        let paths = [
+            PathBuf::from("/tmp/first file.txt"),
+            PathBuf::from("/tmp/資料.json"),
+        ];
+
+        insert_local_file_paths(&mut editor, &paths);
+
+        assert_eq!(
+            editor.text(),
+            "existing draft\n/tmp/first file.txt\n/tmp/資料.json"
+        );
     }
 }
