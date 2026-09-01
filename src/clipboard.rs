@@ -15,8 +15,15 @@ const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ClipboardPayload {
+    Files(LocalFileInput),
     Attachments(Vec<ClipboardAttachment>),
     Text(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalFileInput {
+    pub paths: Vec<PathBuf>,
+    pub image_attachments: Vec<ClipboardAttachment>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,9 +58,9 @@ pub fn read_desktop() -> Result<ClipboardPayload, ClipboardError> {
         let files = context
             .get_files()
             .map_err(|error| ClipboardError::Unavailable(error.to_string()))?;
-        let attachments = attachments_from_paths(files.iter().map(PathBuf::from))?;
-        if !attachments.is_empty() {
-            return Ok(ClipboardPayload::Attachments(attachments));
+        let input = local_file_input(files.iter().map(PathBuf::from), false)?;
+        if !input.paths.is_empty() || !input.image_attachments.is_empty() {
+            return Ok(ClipboardPayload::Files(input));
         }
     }
     if context.has(ContentFormat::Image) {
@@ -80,10 +87,11 @@ pub fn read_desktop() -> Result<ClipboardPayload, ClipboardError> {
         .map_err(|error| ClipboardError::Unavailable(error.to_string()))
 }
 
-/// Converts a terminal paste to attachments when every pasted token names an
-/// existing file. Terminal emulators use this path for drag and drop.
+/// Converts terminal-pasted path text when every token names a local file.
+/// Terminal events expose text only, so relative paths are resolved against the
+/// TUI process while native clipboard paths are kept exactly as the host reports them.
 #[must_use]
-pub fn attachments_from_terminal_paste(text: &str) -> Option<Vec<ClipboardAttachment>> {
+pub fn local_files_from_terminal_paste(text: &str) -> Option<LocalFileInput> {
     let trimmed = text.trim();
     let direct = PathBuf::from(trimmed);
     let paths = if direct.is_file() {
@@ -98,17 +106,35 @@ pub fn attachments_from_terminal_paste(text: &str) -> Option<Vec<ClipboardAttach
     if paths.is_empty() || !paths.iter().all(|path| path.is_file()) {
         return None;
     }
-    attachments_from_paths(paths).ok()
+    local_file_input(paths, true).ok()
 }
 
-fn attachments_from_paths(
+fn local_file_input(
     paths: impl IntoIterator<Item = PathBuf>,
-) -> Result<Vec<ClipboardAttachment>, ClipboardError> {
-    paths
-        .into_iter()
-        .filter(|path| path.is_file())
-        .map(attachment_from_path)
-        .collect()
+    resolve_relative: bool,
+) -> Result<LocalFileInput, ClipboardError> {
+    let mut input = LocalFileInput {
+        paths: Vec::new(),
+        image_attachments: Vec::new(),
+    };
+    for path in paths {
+        if !path.is_file() {
+            continue;
+        }
+        let path = if resolve_relative && !path.is_absolute() {
+            fs::canonicalize(path)?
+        } else if path.is_absolute() {
+            path
+        } else {
+            continue;
+        };
+        if image_mime(&path).is_some() {
+            input.image_attachments.push(attachment_from_path(path)?);
+        } else {
+            input.paths.push(path);
+        }
+    }
+    Ok(input)
 }
 
 fn attachment_from_path(path: PathBuf) -> Result<ClipboardAttachment, ClipboardError> {
@@ -193,8 +219,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        MAX_ATTACHMENT_BYTES, MAX_SELECTION_BYTES, attachments_from_terminal_paste,
-        check_attachment_size, osc52_sequence, write_osc52,
+        MAX_ATTACHMENT_BYTES, MAX_SELECTION_BYTES, check_attachment_size, local_file_input,
+        local_files_from_terminal_paste, osc52_sequence, write_osc52,
     };
 
     #[test]
@@ -231,19 +257,27 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_dragged_or_pasted_file_paths() {
+    fn preserves_image_file_paste_and_extracts_generic_absolute_paths_in_order() {
         let directory = tempfile::tempdir().expect("temp directory");
-        let path = directory.path().join("screen shot.png");
-        fs::write(&path, b"png bytes").expect("fixture image");
+        let image = directory.path().join("screen shot.png");
+        let first = directory.path().join("notes with spaces.txt");
+        let second = directory.path().join("資料.json");
+        fs::write(&image, b"png bytes").expect("fixture image");
+        fs::write(&first, b"notes").expect("first generic file");
+        fs::write(&second, b"data").expect("second generic file");
 
-        let attachments = attachments_from_terminal_paste(&path.to_string_lossy())
-            .expect("path should become attachment");
+        let input = local_file_input([image.clone(), first.clone(), second.clone()], false)
+            .expect("extract local files");
 
-        assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0].label, "screen shot.png");
-        assert_eq!(attachments[0].path.as_deref(), Some(path.as_path()));
+        assert_eq!(input.paths, vec![first, second]);
+        assert_eq!(input.image_attachments.len(), 1);
+        assert_eq!(input.image_attachments[0].label, "screen shot.png");
         assert_eq!(
-            attachments[0]
+            input.image_attachments[0].path.as_deref(),
+            Some(image.as_path())
+        );
+        assert_eq!(
+            input.image_attachments[0]
                 .image
                 .as_ref()
                 .map(|image| image.mime_type.as_str()),
@@ -252,7 +286,32 @@ mod tests {
     }
 
     #[test]
-    fn leaves_regular_pasted_text_as_text() {
-        assert!(attachments_from_terminal_paste("not a local file").is_none());
+    fn terminal_path_text_resolves_relative_files_but_rejects_directories_and_ordinary_text() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let file = directory.path().join("normal.txt");
+        fs::write(&file, b"normal").expect("fixture file");
+
+        let input = local_files_from_terminal_paste(&file.to_string_lossy())
+            .expect("absolute path should resolve");
+        assert_eq!(input.paths, vec![file]);
+        assert!(local_files_from_terminal_paste(&directory.path().to_string_lossy()).is_none());
+        assert!(local_files_from_terminal_paste("not a local file").is_none());
+    }
+
+    #[test]
+    fn native_file_metadata_rejects_relative_paths_instead_of_fabricating_authority() {
+        let directory = tempfile::tempdir_in(".").expect("workspace temp directory");
+        let path = directory.path().join("relative.txt");
+        fs::write(&path, b"relative").expect("fixture file");
+        let absolute = fs::canonicalize(&path).expect("absolute fixture path");
+        let relative = absolute
+            .strip_prefix(std::env::current_dir().expect("current directory"))
+            .expect("fixture is below current directory")
+            .to_path_buf();
+
+        let input = local_file_input([relative], false)
+            .expect("relative path is an unsupported payload, not an error");
+        assert!(input.paths.is_empty());
+        assert!(input.image_attachments.is_empty());
     }
 }
