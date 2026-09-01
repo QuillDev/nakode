@@ -1896,7 +1896,7 @@ fn append_provider_authentication<'a>(
             ]));
             if user_code.is_empty() {
                 lines.push(Line::styled(
-                    "Complete sign-in in your browser; this screen will update automatically.",
+                    "Complete sign-in in your browser; Nakode updates automatically.",
                     Style::default().fg(MUTED),
                 ));
             } else {
@@ -3306,6 +3306,11 @@ mod tests {
             .collect::<String>();
         assert!(rendered_authentication.contains("https://app.example.test/auth/cli/continue"));
         assert!(rendered_authentication.contains("[c] Copy URL"));
+        assert!(
+            rendered_authentication
+                .contains("Complete sign-in in your browser; Nakode updates automatically.")
+        );
+        assert!(!rendered_authentication.contains("Code "));
         assert_eq!(
             state
                 .oauth_url_at(crate::selection::ScreenPoint::new(

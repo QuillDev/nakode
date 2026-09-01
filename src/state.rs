@@ -3340,10 +3340,42 @@ impl DomainState {
         account_id: &str,
         message: &str,
     ) {
-        self.provider_account_authentication
-            .remove(&(provider.to_owned(), account_id.to_owned()));
+        let key = (provider.to_owned(), account_id.to_owned());
+        self.provider_account_authentication.remove(&key);
+        let authentication_required = {
+            let message = message.to_ascii_lowercase();
+            message.contains("not authenticated") || message.contains("authentication required")
+        };
+        let (state, safe_reason) = if authentication_required {
+            (
+                nakode_protocol::ProviderAccountHealthState::AuthenticationRequired,
+                "Sign in to this account, then retry.",
+            )
+        } else {
+            (
+                nakode_protocol::ProviderAccountHealthState::TransientFailure,
+                "Could not check this account. Retry sign-in. If it still fails, check Nakode diagnostics.",
+            )
+        };
+        self.provider_account_health.insert(
+            key,
+            nakode_protocol::ProviderAccountHealthView {
+                state,
+                safe_reason: Some(safe_reason.to_owned()),
+                cooldown_until_ms: None,
+            },
+        );
         self.set_status(&format!(
-            "Authentication failed for {provider} account {account_id}: {message}"
+            "Could not check {provider} account {account_id}. Retry sign-in or check Nakode diagnostics."
+        ));
+    }
+
+    pub fn provider_account_recovered(&mut self, provider: &str, account_id: &str) {
+        let key = (provider.to_owned(), account_id.to_owned());
+        self.provider_account_authentication.remove(&key);
+        self.provider_account_health.remove(&key);
+        self.set_status(&format!(
+            "Authentication recovered for {provider} account {account_id}."
         ));
     }
 
@@ -6434,14 +6466,11 @@ impl DomainState {
                 }]
             }
             BackendEvent::RequestFailed {
-                operation: BackendOperation::Authenticate,
+                operation: BackendOperation::Authenticate | BackendOperation::Reload,
                 message,
                 ..
             } => {
-                self.provider_account_authentication.remove(&key);
-                self.set_status(&format!(
-                    "Authentication failed for {provider} account {account_id}: {message}"
-                ));
+                self.provider_account_authentication_failed(provider, account_id, message);
                 Vec::new()
             }
             _ => self.handle_provider_backend(provider, event),
@@ -18431,6 +18460,14 @@ model = "claude-agent/sonnet"
                 user_code: "CODE-B".to_owned(),
             },
         );
+        state.provider_account_health.insert(
+            (CODEX_PROVIDER.to_owned(), "account-a".to_owned()),
+            nakode_protocol::ProviderAccountHealthView {
+                state: nakode_protocol::ProviderAccountHealthState::AuthenticationRequired,
+                safe_reason: Some("expired credential".to_owned()),
+                cooldown_until_ms: Some(42),
+            },
+        );
         let effects = state.handle_provider_account_backend(
             CODEX_PROVIDER,
             "account-a",
@@ -18456,6 +18493,87 @@ model = "claude-agent/sonnet"
             Some(super::ProviderAuthenticationState::Challenge { user_code, .. })
                 if user_code == "CODE-B"
         ));
+
+        state.provider_account_recovered(CODEX_PROVIDER, "account-a");
+        assert!(
+            !state
+                .provider_account_health
+                .contains_key(&(CODEX_PROVIDER.to_owned(), "account-a".to_owned()))
+        );
+        assert!(matches!(
+            state
+                .provider_account_authentication
+                .get(&(CODEX_PROVIDER.to_owned(), "account-b".to_owned())),
+            Some(super::ProviderAuthenticationState::Challenge { user_code, .. })
+                if user_code == "CODE-B"
+        ));
+    }
+
+    #[test]
+    fn provider_account_authentication_failure_is_actionable() {
+        let mut state = ready_state();
+        let _ = state.begin_provider_account_authentication(CODEX_PROVIDER, "account-a", "Codex");
+
+        let effects = state.handle_provider_account_backend(
+            CODEX_PROVIDER,
+            "account-a",
+            BackendEvent::RequestFailed {
+                operation: BackendOperation::Reload,
+                code: -1,
+                message: "credential helper unavailable".to_owned(),
+                detail: None,
+            },
+        );
+        assert!(effects.is_empty());
+
+        assert!(
+            !state
+                .provider_account_authentication
+                .contains_key(&(CODEX_PROVIDER.to_owned(), "account-a".to_owned()))
+        );
+        let health = state
+            .provider_account_health
+            .get(&(CODEX_PROVIDER.to_owned(), "account-a".to_owned()))
+            .expect("failure health");
+        assert_eq!(
+            health.state,
+            nakode_protocol::ProviderAccountHealthState::TransientFailure
+        );
+        assert_eq!(
+            health.safe_reason.as_deref(),
+            Some(
+                "Could not check this account. Retry sign-in. If it still fails, check Nakode diagnostics."
+            )
+        );
+    }
+
+    #[test]
+    fn provider_account_unauthenticated_failure_requires_sign_in_again() {
+        let mut state = ready_state();
+        let effects = state.handle_provider_account_backend(
+            CLAUDE_PROVIDER,
+            "account-a",
+            BackendEvent::RequestFailed {
+                operation: BackendOperation::Reload,
+                code: -1,
+                message: "Claude is not authenticated; sign in from Provider Auth, then retry"
+                    .to_owned(),
+                detail: None,
+            },
+        );
+        assert!(effects.is_empty());
+        let health = state
+            .provider_account_health
+            .get(&(CLAUDE_PROVIDER.to_owned(), "account-a".to_owned()))
+            .expect("authentication health");
+        assert_eq!(
+            health.state,
+            nakode_protocol::ProviderAccountHealthState::AuthenticationRequired
+        );
+        assert_eq!(
+            health.safe_reason.as_deref(),
+            Some("Sign in to this account, then retry.")
+        );
     }
 
     #[test]

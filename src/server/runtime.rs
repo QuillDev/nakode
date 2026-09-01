@@ -79,10 +79,14 @@ pub(crate) enum SessionBackendError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BackendSource {
-    ProviderControl(String),
+    ProviderControl {
+        provider: String,
+        generation: uuid::Uuid,
+    },
     ProviderAccountControl {
         provider: String,
         account_id: String,
+        generation: uuid::Uuid,
     },
     Primary {
         session_id: nakode_protocol::SessionId,
@@ -1701,6 +1705,9 @@ impl NativeServerRuntime {
     // Provider-event correlation, durable bridge acknowledgement, and downstream effect ordering
     // intentionally share this dispatcher so persistence failure can stop every dependent effect.
     async fn handle_backend_event(&mut self, source: BackendSource, event: BackendEvent) {
+        if !self.effects.backends.is_current_control_source(&source) {
+            return;
+        }
         let is_streaming_delta = matches!(&event, BackendEvent::ItemDelta { .. });
         if let BackendEvent::ExternalToolRequested(request) = &event
             && request.name.starts_with(nakode_protocol::MCP_TOOL_PREFIX)
@@ -1750,7 +1757,8 @@ impl NativeServerRuntime {
             eprintln!("nakode skills: queued-turn discovery refresh deferred: {error}");
         }
         let event_session_id = match &source {
-            BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {
+            BackendSource::ProviderControl { .. }
+            | BackendSource::ProviderAccountControl { .. } => {
                 Some(self.core.default_session_id().clone())
             }
             BackendSource::Primary { session_id, .. } => Some(session_id.clone()),
@@ -1843,9 +1851,8 @@ impl NativeServerRuntime {
             }))
         .then(|| Box::new(self.core.clone()));
         let origin = match &source {
-            BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {
-                EffectOrigin::ProviderControl
-            }
+            BackendSource::ProviderControl { .. }
+            | BackendSource::ProviderAccountControl { .. } => EffectOrigin::ProviderControl,
             BackendSource::Primary { .. } => EffectOrigin::PrimarySession,
             BackendSource::Subagent(_) => EffectOrigin::Subagent,
         };
@@ -1857,6 +1864,7 @@ impl NativeServerRuntime {
             BackendSource::ProviderAccountControl {
                 provider,
                 account_id,
+                ..
             }
             | BackendSource::Primary {
                 provider,
@@ -1866,7 +1874,7 @@ impl NativeServerRuntime {
             _ => None,
         };
         let (session_id, mut effects) = match source {
-            BackendSource::ProviderControl(provider) => {
+            BackendSource::ProviderControl { provider, .. } => {
                 let session_id = self.core.default_session_id().clone();
                 let effects = self
                     .core
@@ -1879,6 +1887,7 @@ impl NativeServerRuntime {
             BackendSource::ProviderAccountControl {
                 provider,
                 account_id,
+                ..
             } => {
                 let session_id = self.core.default_session_id().clone();
                 let effects =
@@ -2057,7 +2066,8 @@ impl NativeServerRuntime {
                     .unwrap_or_else(|| self.core.default_session_id().clone()),
                 Some(run_id.clone()),
             ),
-            BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {
+            BackendSource::ProviderControl { .. }
+            | BackendSource::ProviderAccountControl { .. } => {
                 return;
             }
         };
@@ -2256,7 +2266,8 @@ impl NativeServerRuntime {
             BackendSource::Subagent(run_id) => {
                 let _ = self.effects.backends.send_subagent(run_id, command).await;
             }
-            BackendSource::ProviderControl(_) | BackendSource::ProviderAccountControl { .. } => {}
+            BackendSource::ProviderControl { .. }
+            | BackendSource::ProviderAccountControl { .. } => {}
         }
     }
 
@@ -2791,6 +2802,8 @@ pub(crate) struct BackendRegistry {
     pub(crate) commands: HashMap<String, mpsc::Sender<BackendCommand>>,
     /// Account-scoped control handles isolate OAuth and refresh lifecycle.
     pub(crate) account_commands: HashMap<(String, String), mpsc::Sender<BackendCommand>>,
+    provider_control_generations: HashMap<String, uuid::Uuid>,
+    account_control_generations: HashMap<(String, String), uuid::Uuid>,
     /// Session-scoped handles own native sessions and turns. A provider adapter
     /// may supervise only the logical session named by this key.
     pub(crate) session_commands:
@@ -2969,6 +2982,8 @@ impl BackendRegistry {
         let mut registry = Self {
             commands: HashMap::new(),
             account_commands: HashMap::new(),
+            provider_control_generations: HashMap::new(),
+            account_control_generations: HashMap::new(),
             session_commands: HashMap::new(),
             session_accounts: HashMap::new(),
             session_tasks: HashMap::new(),
@@ -3008,8 +3023,17 @@ impl BackendRegistry {
         if self.commands.contains_key(provider) {
             return Ok(());
         }
+        let publish_credential_updates = self
+            .provider_accounts
+            .get(provider)
+            .is_none_or(Vec::is_empty);
         let handle = self
-            .spawn_provider_handle(provider, &self.config.workspace)
+            .spawn_provider_handle_for_account(
+                provider,
+                None,
+                &self.config.workspace,
+                publish_credential_updates,
+            )
             .await?;
         self.insert_provider_control(provider.to_owned(), handle);
         Ok(())
@@ -3020,7 +3044,7 @@ impl BackendRegistry {
         provider: &str,
         working_directory: &Path,
     ) -> Result<BackendHandle, BackendError> {
-        self.spawn_provider_handle_for_account(provider, None, working_directory)
+        self.spawn_provider_handle_for_account(provider, None, working_directory, false)
             .await
     }
 
@@ -3030,6 +3054,7 @@ impl BackendRegistry {
         provider: &str,
         account_id: Option<&str>,
         working_directory: &Path,
+        publish_credential_updates: bool,
     ) -> Result<BackendHandle, BackendError> {
         let credential = account_id.map_or_else(
             || self.provider_credentials.get(provider).cloned(),
@@ -3068,9 +3093,13 @@ impl BackendRegistry {
                 .await?
             }
             crate::backend::CLAUDE_PROVIDER => {
+                let mut config = claude::BackendConfig::native(working_directory.to_path_buf())
+                    .with_credential(credential);
+                if publish_credential_updates {
+                    config = config.with_credential_updates();
+                }
                 claude::spawn(
-                    claude::BackendConfig::native(working_directory.to_path_buf())
-                        .with_credential(credential)
+                    config
                         .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
                 )
                 .await?
@@ -3161,9 +3190,17 @@ impl BackendRegistry {
             return Ok(());
         }
         let handle = self
-            .spawn_provider_handle_for_account(provider, Some(account_id), &self.config.workspace)
+            .spawn_provider_handle_for_account(
+                provider,
+                Some(account_id),
+                &self.config.workspace,
+                true,
+            )
             .await?;
         let (commands, mut events, task) = handle.into_parts();
+        let generation = uuid::Uuid::now_v7();
+        self.account_control_generations
+            .insert(key.clone(), generation);
         self.account_commands.insert(key, commands);
         self.tasks.push(task);
         let event_tx = self.event_tx.clone();
@@ -3176,6 +3213,7 @@ impl BackendRegistry {
                         BackendSource::ProviderAccountControl {
                             provider: provider.clone(),
                             account_id: account_id.clone(),
+                            generation,
                         },
                         event,
                     ))
@@ -3201,6 +3239,7 @@ impl BackendRegistry {
         };
         if commands.send(command).await.is_err() {
             self.account_commands.remove(&key);
+            self.account_control_generations.remove(&key);
             return false;
         }
         true
@@ -3229,12 +3268,15 @@ impl BackendRegistry {
     }
 
     async fn stop_provider_control(&mut self, provider: &str) {
+        self.provider_control_generations.remove(provider);
         if let Some(commands) = self.commands.remove(provider) {
             let _ = commands.send(BackendCommand::Shutdown).await;
         }
     }
 
     async fn stop_provider_account_control(&mut self, provider: &str, account_id: &str) {
+        self.account_control_generations
+            .remove(&(provider.to_owned(), account_id.to_owned()));
         if let Some(commands) = self
             .account_commands
             .remove(&(provider.to_owned(), account_id.to_owned()))
@@ -3363,10 +3405,10 @@ impl BackendRegistry {
         account_id: &str,
         metadata: serde_json::Value,
     ) {
-        self.provider_account_credentials.insert(
-            (provider.to_owned(), account_id.to_owned()),
-            metadata.clone(),
-        );
+        let key = (provider.to_owned(), account_id.to_owned());
+        self.provider_account_credentials
+            .insert(key.clone(), metadata.clone());
+        self.provider_cooldowns.remove(&key);
         if self
             .provider_accounts
             .get(provider)
@@ -3379,6 +3421,19 @@ impl BackendRegistry {
         {
             self.set_provider_credential(provider, metadata);
         }
+    }
+
+    pub(crate) async fn replace_provider_account_credential(
+        &mut self,
+        provider: &str,
+        account_id: &str,
+        metadata: serde_json::Value,
+    ) {
+        // Account-control adapters capture their credential when spawned. Replace the control so a
+        // completed login cannot leave an unauthenticated supervisor serving later reloads.
+        self.stop_provider_account_control(provider, account_id)
+            .await;
+        self.set_provider_account_credential(provider, account_id, metadata);
     }
 
     pub(crate) async fn clear_provider_account_credential(
@@ -3440,13 +3495,22 @@ impl BackendRegistry {
     fn insert_provider_control(&mut self, provider: String, handle: BackendHandle) {
         let (commands, mut events, task) = handle.into_parts();
         self.reap_finished_tasks();
+        let generation = uuid::Uuid::now_v7();
+        self.provider_control_generations
+            .insert(provider.clone(), generation);
         self.commands.insert(provider.clone(), commands);
         self.tasks.push(task);
         let event_tx = self.event_tx.clone();
         self.tasks.push(tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 if event_tx
-                    .send((BackendSource::ProviderControl(provider.clone()), event))
+                    .send((
+                        BackendSource::ProviderControl {
+                            provider: provider.clone(),
+                            generation,
+                        },
+                        event,
+                    ))
                     .await
                     .is_err()
                 {
@@ -3682,6 +3746,25 @@ impl BackendRegistry {
         })
     }
 
+    pub(crate) fn is_current_control_source(&self, source: &BackendSource) -> bool {
+        match source {
+            BackendSource::ProviderControl {
+                provider,
+                generation,
+            } => self.provider_control_generations.get(provider) == Some(generation),
+            BackendSource::ProviderAccountControl {
+                provider,
+                account_id,
+                generation,
+            } => {
+                self.account_control_generations
+                    .get(&(provider.clone(), account_id.clone()))
+                    == Some(generation)
+            }
+            BackendSource::Primary { .. } | BackendSource::Subagent(_) => true,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn observe_provider_event(
         &mut self,
@@ -3689,12 +3772,13 @@ impl BackendRegistry {
         event: &BackendEvent,
     ) -> Option<(String, String, nakode_protocol::ProviderAccountHealthView)> {
         let provider_account = match source {
-            BackendSource::ProviderControl(provider) => self
+            BackendSource::ProviderControl { provider, .. } => self
                 .default_account_id(provider)
                 .map(|account_id| (provider.clone(), account_id)),
             BackendSource::ProviderAccountControl {
                 provider,
                 account_id,
+                ..
             }
             | BackendSource::Primary {
                 provider,
@@ -3833,6 +3917,7 @@ impl BackendRegistry {
         };
         if commands.send(command).await.is_err() {
             self.commands.remove(provider);
+            self.provider_control_generations.remove(provider);
             return false;
         }
         true
@@ -3896,6 +3981,7 @@ impl BackendRegistry {
                     provider,
                     Some(&selection.account_id),
                     working_directory,
+                    false,
                 )
                 .await?;
             self.insert_session(
@@ -4211,7 +4297,11 @@ impl EffectExecutor {
                     state.session_store_failed(error.to_string());
                 } else {
                     self.backends
-                        .set_provider_account_credential(&provider, &account_id, metadata);
+                        .replace_provider_account_credential(&provider, &account_id, metadata)
+                        .await;
+                    state.provider_account_recovered(&provider, &account_id);
+                    self.reload_provider_account(state, &provider, &account_id)
+                        .await;
                 }
             }
             Effect::ClearProviderAccountCredential {
@@ -5787,7 +5877,7 @@ mod tests {
     use crate::{
         backend::{
             BackendCapabilities, BackendCommand, BackendEvent, BackendHandle, BackendIdentity,
-            CODEX_PROVIDER, DEVIN_PROVIDER, ExternalToolRequest, ModelInfo,
+            CLAUDE_PROVIDER, CODEX_PROVIDER, DEVIN_PROVIDER, ExternalToolRequest, ModelInfo,
             ModelOptions as BackendModelOptions, ProviderFailureClassification,
         },
         config::{Config, OpenAiReasoningEffort},
@@ -6611,6 +6701,53 @@ mod tests {
             registry
                 .select_account(CODEX_PROVIDER, Some("disabled"))
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_account_replaces_stale_control_and_cooldown() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let key = (CLAUDE_PROVIDER.to_owned(), "account-a".to_owned());
+        let (commands, mut received) = mpsc::channel(1);
+        let stale_generation = uuid::Uuid::now_v7();
+        registry
+            .account_control_generations
+            .insert(key.clone(), stale_generation);
+        registry.account_commands.insert(key.clone(), commands);
+        let stale_source = BackendSource::ProviderAccountControl {
+            provider: CLAUDE_PROVIDER.to_owned(),
+            account_id: "account-a".to_owned(),
+            generation: stale_generation,
+        };
+        assert!(registry.is_current_control_source(&stale_source));
+        registry.provider_cooldowns.insert(
+            key.clone(),
+            super::ProviderCooldown {
+                until: Instant::now() + Duration::from_secs(60),
+                reason: "authentication required".to_owned(),
+            },
+        );
+
+        let credential = serde_json::json!({
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at_ms": 4_102_444_800_000_u64
+        });
+        registry
+            .replace_provider_account_credential(CLAUDE_PROVIDER, "account-a", credential.clone())
+            .await;
+
+        assert!(matches!(
+            received.recv().await,
+            Some(BackendCommand::Shutdown)
+        ));
+        assert!(!registry.account_commands.contains_key(&key));
+        assert!(!registry.is_current_control_source(&stale_source));
+        assert!(!registry.provider_cooldowns.contains_key(&key));
+        assert_eq!(
+            registry.provider_account_credentials.get(&key),
+            Some(&credential)
         );
     }
 
