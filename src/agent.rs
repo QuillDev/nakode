@@ -1473,6 +1473,7 @@ description = "Research the requested topic and report concrete findings"
                 "read".to_owned(),
                 "read_skill".to_owned(),
                 "read_skill_component".to_owned(),
+                "search_shared_context".to_owned(),
                 "nakode_agent".to_owned(),
             ])
         );
