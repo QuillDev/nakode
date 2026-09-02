@@ -35,6 +35,10 @@ export function providerProcessLifecycle(oauthAccessToken) {
         signal: options.signal,
         stdio: ["pipe", "pipe", "pipe", "pipe"],
       });
+      // A child may exit before consuming the credential descriptor. Node reports that normal
+      // process race as EPIPE/ECONNRESET on the parent pipe; child close remains the lifecycle and
+      // provider-error authority, so never let the auxiliary credential stream crash the bridge.
+      child.stdio[3].on("error", () => {});
       child.stdio[3].end(oauthAccessToken);
       release = new Promise((resolve, reject) => {
         let forceTimer = null;
