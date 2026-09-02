@@ -15,9 +15,10 @@ mod service;
 mod view;
 
 pub use command::{
-    AgentDefinitionInput, Command, CredentialInput, ExternalToolDefinition, InteractionResolution,
-    ModelOptions, ModelTarget, PromptAttachment, PromptInput, Query, QuestionResponse,
-    RunTextField, SessionBridgeIntent, SessionToolConfiguration, SettingsPatch, TranscriptOwner,
+    AgentDefinitionInput, ClientContext, Command, CredentialInput, ExternalToolDefinition,
+    InteractionResolution, ModelOptions, ModelTarget, PromptAttachment, PromptInput, Query,
+    QuestionResponse, RunTextField, SessionBridgeIntent, SessionToolConfiguration, SettingsPatch,
+    TranscriptOwner,
 };
 pub use diagnostics::{
     DiagnosticsDailyUsage, DiagnosticsReport, DiagnosticsSessionUsage, DiagnosticsToolUsage,

@@ -37,6 +37,7 @@ fn frontend_picker_authentication(
         ProviderAuthenticationView::Challenge {
             verification_url,
             user_code,
+            ..
         } => ProviderAuthentication::Challenge {
             verification_url: verification_url.clone(),
             user_code: user_code.clone(),

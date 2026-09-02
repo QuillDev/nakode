@@ -81,6 +81,7 @@ service NakodeService {
   rpc SetSkillEnabled(SetSkillEnabledRequest) returns (MutationResult);
   rpc PruneSkill(PruneSkillRequest) returns (MutationResult);
   rpc BeginProviderAuthentication(BeginProviderAuthenticationRequest) returns (MutationResult);
+  rpc SubmitProviderAuthenticationCallback(SubmitProviderAuthenticationCallbackRequest) returns (MutationResult);
   rpc SetProviderCredential(SetProviderCredentialRequest) returns (MutationResult);
   rpc ClearProviderCredential(ClearProviderCredentialRequest) returns (MutationResult);
   rpc ReloadProvider(ReloadProviderRequest) returns (MutationResult);
@@ -748,7 +749,7 @@ message SelectModelRequest { MutationOptions mutation = 1; ModelTarget target = 
 message SetProviderEnabledRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; }
 message SetProviderModelFilterRequest { MutationOptions mutation = 1; string provider_id = 2; bool enabled = 3; repeated string selected_model_ids = 4; }
 message AddProviderAccountRequest { MutationOptions mutation = 1; string provider_id = 2; string label = 3; }
-message BeginProviderAccountAuthenticationRequest { MutationOptions mutation = 1; string provider_id = 2; string account_id = 3; }
+message BeginProviderAccountAuthenticationRequest { MutationOptions mutation = 1; string provider_id = 2; string account_id = 3; ClientContext client_context = 4; }
 message SetProviderAccountCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; string account_id = 3; string kind = 4; string credential = 5; }
 message ClearProviderAccountCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; string account_id = 3; }
 message ReloadProviderAccountRequest { MutationOptions mutation = 1; string provider_id = 2; string account_id = 3; }
@@ -771,7 +772,14 @@ message PruneSkillRequest {
   string skill_id = 4;
 }
 message SkillCatalogue { repeated Skill skills = 1; }
-message BeginProviderAuthenticationRequest { MutationOptions mutation = 1; string provider_id = 2; }
+message BeginProviderAuthenticationRequest { MutationOptions mutation = 1; string provider_id = 2; ClientContext client_context = 3; }
+// A pasted OAuth callback is accepted only for the exact pending challenge selected by provider/account.
+message SubmitProviderAuthenticationCallbackRequest {
+  MutationOptions mutation = 1;
+  string provider_id = 2;
+  optional string account_id = 3;
+  string callback_url = 4;
+}
 message SetProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; string kind = 3; string credential = 4; }
 message ClearProviderCredentialRequest { MutationOptions mutation = 1; string provider_id = 2; }
 message ReloadProviderRequest { MutationOptions mutation = 1; string provider_id = 2; }
@@ -900,6 +908,12 @@ message SessionBridge {
   optional BridgeProjection last_projected = 15;
 }
 
+enum ClientContext {
+  CLIENT_CONTEXT_UNSPECIFIED = 0;
+  CLIENT_CONTEXT_LOCAL = 1;
+  CLIENT_CONTEXT_REMOTE = 2;
+}
+
 message ProviderCapabilities { repeated ProviderCapability supported = 1; }
 enum ProviderCapability {
   PROVIDER_CAPABILITY_UNSPECIFIED = 0;
@@ -918,7 +932,7 @@ enum ProviderCapability {
 }
 enum ConnectionState { CONNECTION_STATE_UNSPECIFIED = 0; CONNECTION_STATE_DISABLED = 1; CONNECTION_STATE_STARTING = 2; CONNECTION_STATE_READY = 3; CONNECTION_STATE_FAILED = 4; CONNECTION_STATE_DISCONNECTED = 5; }
 message Connection { ConnectionState state = 1; optional string message = 2; }
-message ProviderAuthentication { enum Kind { KIND_UNSPECIFIED = 0; KIND_STARTING = 1; KIND_API_KEY_REQUIRED = 2; KIND_CHALLENGE = 3; } Kind kind = 1; optional string dashboard_url = 2; optional string credential_kind = 3; optional string verification_url = 4; optional string user_code = 5; }
+message ProviderAuthentication { enum Kind { KIND_UNSPECIFIED = 0; KIND_STARTING = 1; KIND_API_KEY_REQUIRED = 2; KIND_CHALLENGE = 3; } Kind kind = 1; optional string dashboard_url = 2; optional string credential_kind = 3; optional string verification_url = 4; optional string user_code = 5; optional string login_id = 6; optional string callback_url = 7; }
 message Provider {
   string id = 1;
   string display_name = 2;
@@ -938,6 +952,8 @@ message Provider {
   repeated string supported_builtin_tools = 14;
   bool builtin_tool_support_known = 15;
   repeated ProviderAccount accounts = 16;
+  // Whether the adapter can satisfy remote interactive authentication without a local callback.
+  bool remote_authentication_supported = 17;
 }
 enum ProviderAccountRoutingMode {
   PROVIDER_ACCOUNT_ROUTING_MODE_UNSPECIFIED = 0;

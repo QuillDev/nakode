@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::backend::{
     BackendCapabilities, BackendCommand, BackendError, BackendEvent, BackendHandle,
     BackendIdentity, BackendOperation, CapabilitySupport, DEVIN_PROVIDER, DeltaKind, ItemKind,
-    ItemStatus, ModelInfo, NormalizedItem, SessionHistoryItem, TurnOutcome,
+    ItemStatus, ModelInfo, NormalizedItem, SessionHistoryItem, TurnOutcome, request_failed,
 };
 
 const COMMAND_CAPACITY: usize = 128;
@@ -132,6 +132,7 @@ struct AcpRuntime {
     started_turns: HashSet<String>,
     replay: HashMap<String, Vec<SessionHistoryItem>>,
     model_options: HashMap<String, SessionModelOption>,
+    authentication_callback: Option<mpsc::Sender<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -296,6 +297,7 @@ async fn run_supervisor(input: SupervisorInput) {
         started_turns: HashSet::new(),
         replay: HashMap::new(),
         model_options: HashMap::new(),
+        authentication_callback: None,
     };
     let mut timeout_tick = interval(Duration::from_secs(1));
     let mut last_error = None;
@@ -491,6 +493,56 @@ async fn finish(
     }
 }
 
+async fn begin_authentication(
+    client_context: crate::backend::ClientContext,
+    events: &mpsc::Sender<BackendEvent>,
+    oauth: &OAuthConfig,
+    authentication_callback: &mut Option<mpsc::Sender<String>>,
+) {
+    if matches!(client_context, crate::backend::ClientContext::Remote) {
+        request_failed(
+            events,
+            BackendOperation::Authenticate,
+            "Devin remote authentication is unsupported; use a client on the Nakode server machine",
+        )
+        .await;
+        return;
+    }
+    let (callback_tx, callback_rx) = mpsc::channel(1);
+    *authentication_callback = Some(callback_tx);
+    tokio::spawn(authenticate_devin(
+        oauth.clone(),
+        events.clone(),
+        callback_rx,
+    ));
+}
+
+async fn submit_authentication_callback(
+    callback_url: String,
+    events: &mpsc::Sender<BackendEvent>,
+    authentication_callback: Option<&mpsc::Sender<String>>,
+) {
+    let Some(callback) = authentication_callback else {
+        request_failed(
+            events,
+            BackendOperation::Authenticate,
+            "no in-progress browser authentication challenge",
+        )
+        .await;
+        return;
+    };
+    if callback.send(callback_url).await.is_err() {
+        request_failed(
+            events,
+            BackendOperation::Authenticate,
+            "browser authentication challenge is no longer active",
+        )
+        .await;
+    }
+}
+
+// Keep the ACP command dispatch exhaustive in one place; provider lifecycle branches delegate work.
+#[allow(clippy::too_many_lines)]
 async fn handle_command(
     command: BackendCommand,
     stdin: &mut ChildStdin,
@@ -506,8 +558,23 @@ async fn handle_command(
         ..
     } = runtime;
     match command {
-        BackendCommand::BeginAuthentication => {
-            tokio::spawn(authenticate_devin(oauth.clone(), events.clone()));
+        BackendCommand::BeginAuthentication { client_context } => {
+            begin_authentication(
+                client_context,
+                events,
+                oauth,
+                &mut runtime.authentication_callback,
+            )
+            .await;
+            Ok(())
+        }
+        BackendCommand::SubmitAuthenticationCallback { callback_url } => {
+            submit_authentication_callback(
+                callback_url,
+                events,
+                runtime.authentication_callback.as_ref(),
+            )
+            .await;
             Ok(())
         }
         BackendCommand::StartSession { model, .. } => {
@@ -1650,8 +1717,12 @@ fn actionable_stderr_warning(line: &str) -> bool {
         || line.contains("authentication required")
 }
 
-async fn authenticate_devin(config: OAuthConfig, events: mpsc::Sender<BackendEvent>) {
-    if let Err(message) = run_devin_oauth(&config, &events).await {
+async fn authenticate_devin(
+    config: OAuthConfig,
+    events: mpsc::Sender<BackendEvent>,
+    callback_rx: mpsc::Receiver<String>,
+) {
+    if let Err(message) = run_devin_oauth(&config, &events, callback_rx).await {
         let _ = events
             .send(BackendEvent::RequestFailed {
                 operation: BackendOperation::Authenticate,
@@ -1664,6 +1735,7 @@ async fn authenticate_devin(config: OAuthConfig, events: mpsc::Sender<BackendEve
 }
 
 pub(super) async fn authenticate_native(events: mpsc::Sender<BackendEvent>) {
+    let (_callback_tx, callback_rx) = mpsc::channel(1);
     authenticate_devin(
         OAuthConfig {
             webapp_url: DEVIN_WEBAPP_URL.to_owned(),
@@ -1671,6 +1743,7 @@ pub(super) async fn authenticate_native(events: mpsc::Sender<BackendEvent>) {
             callback_port: DEVIN_CALLBACK_PORT,
         },
         events,
+        callback_rx,
     )
     .await;
 }
@@ -1678,6 +1751,7 @@ pub(super) async fn authenticate_native(events: mpsc::Sender<BackendEvent>) {
 async fn run_devin_oauth(
     config: &OAuthConfig,
     events: &mpsc::Sender<BackendEvent>,
+    callback_rx: mpsc::Receiver<String>,
 ) -> Result<(), String> {
     let listener = bind_callback_listener(config.callback_port).await?;
     let callback_address = listener
@@ -1698,13 +1772,14 @@ async fn run_devin_oauth(
             login_id: state.clone(),
             verification_url: authentication_url,
             user_code: String::new(),
+            callback_url: Some(redirect_uri.clone()),
         })
         .await
         .map_err(|_| "provider authentication channel closed".to_owned())?;
 
     let authorization_code = timeout(
         AUTHENTICATION_TIMEOUT,
-        receive_authorization_code(&listener, &state),
+        receive_authorization_code(&listener, &state, callback_rx),
     )
     .await
     .map_err(|_| "Devin authentication timed out after 10 minutes".to_owned())??;
@@ -1764,12 +1839,20 @@ fn devin_authentication_url(
 async fn receive_authorization_code(
     listener: &TcpListener,
     expected_state: &str,
+    callback_rx: mpsc::Receiver<String>,
 ) -> Result<String, String> {
+    let mut callback_rx = callback_rx;
     loop {
-        let (mut stream, _) = listener
-            .accept()
-            .await
-            .map_err(|error| format!("failed to accept Devin OAuth callback: {error}"))?;
+        let (mut stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted
+                .map_err(|error| format!("failed to accept Devin OAuth callback: {error}"))?,
+            callback = callback_rx.recv() => {
+                let callback = callback.ok_or_else(|| "Devin OAuth callback channel closed".to_owned())?;
+                relay_devin_callback(listener, &callback).await?;
+                listener.accept().await
+                    .map_err(|error| format!("failed to relay Devin OAuth callback: {error}"))?
+            }
+        };
         match parse_callback(&mut stream, expected_state).await {
             Ok(code) => {
                 respond_to_callback(
@@ -1785,6 +1868,26 @@ async fn receive_authorization_code(
             }
         }
     }
+}
+
+async fn relay_devin_callback(listener: &TcpListener, callback_url: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(callback_url)
+        .map_err(|_| "Devin OAuth callback URL was malformed".to_owned())?;
+    let target = url.query().map_or_else(
+        || url.path().to_owned(),
+        |query| format!("{}?{query}", url.path()),
+    );
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("failed to inspect Devin OAuth callback listener: {error}"))?;
+    let mut stream = TcpStream::connect(address)
+        .await
+        .map_err(|error| format!("failed to relay Devin OAuth callback: {error}"))?;
+    let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|error| format!("failed to relay Devin OAuth callback: {error}"))
 }
 
 async fn parse_callback(stream: &mut TcpStream, expected_state: &str) -> Result<String, String> {
@@ -1943,7 +2046,9 @@ mod tests {
             callback_port: 0,
         };
         let (events, mut event_rx) = mpsc::channel(4);
-        let oauth = tokio::spawn(async move { run_devin_oauth(&config, &events).await });
+        let (_callback_tx, callback_rx) = mpsc::channel(1);
+        let oauth =
+            tokio::spawn(async move { run_devin_oauth(&config, &events, callback_rx).await });
 
         let challenge = event_rx.recv().await.expect("authentication challenge");
         let (verification_url, state, redirect_uri) = match challenge {
@@ -1951,6 +2056,7 @@ mod tests {
                 verification_url,
                 login_id,
                 user_code,
+                ..
             } => {
                 assert!(user_code.is_empty());
                 let url = reqwest::Url::parse(&verification_url).expect("authentication URL");

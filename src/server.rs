@@ -915,9 +915,19 @@ impl ServerCore {
                 provider_id,
                 enabled,
             } => self.set_provider_enabled_command(&provider_id, enabled),
-            Command::BeginProviderAuthentication { provider_id } => {
-                self.begin_provider_authentication_command(&provider_id)
-            }
+            Command::BeginProviderAuthentication {
+                provider_id,
+                client_context,
+            } => self.begin_provider_authentication_command(&provider_id, client_context),
+            Command::SubmitProviderAuthenticationCallback {
+                provider_id,
+                account_id,
+                callback_url,
+            } => self.submit_provider_authentication_callback_command(
+                &provider_id,
+                account_id.as_deref(),
+                callback_url,
+            ),
             Command::SetProviderCredential {
                 provider_id,
                 kind,
@@ -940,8 +950,9 @@ impl ServerCore {
             Command::BeginProviderAccountAuthentication {
                 provider_id,
                 account_id,
+                client_context,
             } => {
-                self.ensure_provider(&provider_id)?;
+                self.ensure_provider_account(&provider_id, &account_id)?;
                 let display_name = self
                     .providers
                     .iter()
@@ -958,6 +969,7 @@ impl ServerCore {
                         provider_id.as_str(),
                         &account_id,
                         &display_name,
+                        client_context.into(),
                     );
                 Ok(Self::accepted(Some(account_id), effects))
             }
@@ -967,7 +979,7 @@ impl ServerCore {
                 kind,
                 credential,
             } => {
-                self.ensure_provider(&provider_id)?;
+                self.ensure_provider_account(&provider_id, &account_id)?;
                 Ok(Self::accepted(
                     Some(account_id.clone()),
                     vec![Effect::SaveProviderAccountCredential {
@@ -982,7 +994,7 @@ impl ServerCore {
                 provider_id,
                 account_id,
             } => {
-                self.ensure_provider(&provider_id)?;
+                self.ensure_provider_account(&provider_id, &account_id)?;
                 Ok(Self::accepted(
                     Some(account_id.clone()),
                     vec![Effect::ClearProviderAccountCredential {
@@ -995,7 +1007,7 @@ impl ServerCore {
                 provider_id,
                 account_id,
             } => {
-                self.ensure_provider(&provider_id)?;
+                self.ensure_provider_account(&provider_id, &account_id)?;
                 Ok(Self::accepted(
                     Some(account_id.clone()),
                     vec![Effect::ReloadProviderAccount {
@@ -1009,7 +1021,7 @@ impl ServerCore {
                 account_id,
                 label,
             } => {
-                self.ensure_provider(&provider_id)?;
+                self.ensure_provider_account(&provider_id, &account_id)?;
                 Ok(Self::accepted(
                     Some(account_id.clone()),
                     vec![Effect::SetProviderAccountLabel {
@@ -1024,7 +1036,7 @@ impl ServerCore {
                 account_id,
                 enabled,
             } => {
-                self.ensure_provider(&provider_id)?;
+                self.ensure_provider_account(&provider_id, &account_id)?;
                 Ok(Self::accepted(
                     Some(account_id.clone()),
                     vec![Effect::SetProviderAccountEnabled {
@@ -1038,7 +1050,7 @@ impl ServerCore {
                 provider_id,
                 account_id,
             } => {
-                self.ensure_provider(&provider_id)?;
+                self.ensure_provider_account(&provider_id, &account_id)?;
                 Ok(Self::accepted(
                     Some(account_id.clone()),
                     vec![Effect::SetProviderAccountDefault {
@@ -1051,7 +1063,7 @@ impl ServerCore {
                 provider_id,
                 account_id,
             } => {
-                self.ensure_provider(&provider_id)?;
+                self.ensure_provider_account(&provider_id, &account_id)?;
                 Ok(Self::accepted(
                     Some(account_id.clone()),
                     vec![Effect::RemoveProviderAccount {
@@ -2813,6 +2825,7 @@ impl ServerCore {
     fn begin_provider_authentication_command(
         &mut self,
         provider_id: &ProviderId,
+        client_context: nakode_protocol::ClientContext,
     ) -> DomainCommandOutcome {
         self.ensure_provider(provider_id)?;
         let display_name = self
@@ -2827,10 +2840,35 @@ impl ServerCore {
         let effects = self
             .session_engine_mut(&session_id)?
             .state_mut()
-            .begin_provider_authentication(provider_id.as_str(), &display_name);
+            .begin_provider_authentication(
+                provider_id.as_str(),
+                &display_name,
+                client_context.into(),
+            );
         Ok(Self::accepted(Some(provider_id.to_string()), effects))
     }
 
+    fn submit_provider_authentication_callback_command(
+        &mut self,
+        provider_id: &ProviderId,
+        account_id: Option<&str>,
+        callback_url: String,
+    ) -> DomainCommandOutcome {
+        self.ensure_provider(provider_id)?;
+        if let Some(account_id) = account_id {
+            self.ensure_provider_account(provider_id, account_id)?;
+        }
+        let session_id = self.default_session.clone();
+        let effects = self
+            .session_engine_mut(&session_id)?
+            .state_mut()
+            .submit_provider_authentication_callback(
+                provider_id.as_str(),
+                account_id,
+                callback_url,
+            )?;
+        Ok(Self::accepted(Some(provider_id.to_string()), effects))
+    }
     fn set_provider_credential_command(
         &self,
         provider_id: &ProviderId,
@@ -3926,6 +3964,29 @@ impl ServerCore {
             .ok_or_else(|| DomainCommandError::NotFound(session_id.to_string()))
     }
 
+    fn ensure_provider_account(
+        &self,
+        provider_id: &ProviderId,
+        account_id: &str,
+    ) -> Result<(), DomainCommandError> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.provider == provider_id.as_str())
+            .ok_or_else(|| DomainCommandError::NotFound(provider_id.to_string()))?;
+        if provider
+            .accounts
+            .iter()
+            .any(|account| account.account_id == account_id)
+        {
+            Ok(())
+        } else {
+            Err(DomainCommandError::NotFound(format!(
+                "provider account {provider_id}/{account_id}"
+            )))
+        }
+    }
+
     fn ensure_provider(&self, provider_id: &ProviderId) -> Result<(), DomainCommandError> {
         if self
             .providers
@@ -4066,6 +4127,7 @@ impl ServerCore {
             | Command::PruneSkill { .. }
             | Command::SetProviderEnabled { .. }
             | Command::BeginProviderAuthentication { .. }
+            | Command::SubmitProviderAuthenticationCallback { .. }
             | Command::SetProviderCredential { .. }
             | Command::ClearProviderCredential { .. }
             | Command::ReloadProvider { .. }
@@ -8236,12 +8298,15 @@ mod tests {
         let mut core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
 
         let (_, effects) = core
-            .begin_provider_authentication_command(&ProviderId::from(CODEX_PROVIDER))
+            .begin_provider_authentication_command(
+                &ProviderId::from(CODEX_PROVIDER),
+                nakode_protocol::ClientContext::Unspecified,
+            )
             .expect("authentication intent");
 
         assert!(matches!(
             effects.as_slice(),
-            [crate::state::Effect::AuthenticateProvider(provider)]
+            [crate::state::Effect::AuthenticateProvider { provider, .. }]
                 if provider == CODEX_PROVIDER
         ));
         let bootstrap = core.workspace_bootstrap();

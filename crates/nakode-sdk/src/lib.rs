@@ -1406,6 +1406,10 @@ impl NakodeClient {
         begin_provider_authentication,
         api::BeginProviderAuthenticationRequest
     );
+    typed_mutation!(
+        submit_provider_authentication_callback,
+        api::SubmitProviderAuthenticationCallbackRequest
+    );
     typed_mutation!(set_provider_credential, api::SetProviderCredentialRequest);
     typed_mutation!(
         clear_provider_credential,

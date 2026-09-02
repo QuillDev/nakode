@@ -267,6 +267,11 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     ),
     fixed(
         "NakodeService",
+        "SubmitProviderAuthenticationCallback",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
         "SetProviderCredential",
         RequestLane::Control,
     ),

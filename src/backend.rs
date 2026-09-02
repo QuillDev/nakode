@@ -10,6 +10,24 @@ use tokio::{
 
 pub use crate::media::ImageData as PromptImage;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ClientContext {
+    #[default]
+    Unspecified,
+    Local,
+    Remote,
+}
+
+impl From<nakode_protocol::ClientContext> for ClientContext {
+    fn from(context: nakode_protocol::ClientContext) -> Self {
+        match context {
+            nakode_protocol::ClientContext::Unspecified => Self::Unspecified,
+            nakode_protocol::ClientContext::Local => Self::Local,
+            nakode_protocol::ClientContext::Remote => Self::Remote,
+        }
+    }
+}
+
 pub const CODEX_PROVIDER: &str = "openai-codex";
 pub const DEVIN_PROVIDER: &str = "devin-acp";
 pub const CURSOR_PROVIDER: &str = "cursor-sdk";
@@ -125,6 +143,13 @@ pub fn api_key_provider_setup(provider: &str) -> Option<ApiKeyProviderSetup> {
         }),
         _ => None,
     }
+}
+
+#[must_use]
+pub fn remote_authentication_supported(provider: &str) -> bool {
+    // Codex's device-code flow is safe to complete when the client and server are on
+    // different machines. Other interactive providers currently require a localhost callback.
+    matches!(provider, CODEX_PROVIDER)
 }
 
 pub(crate) async fn request_failed(
@@ -721,6 +746,8 @@ pub enum BackendEvent {
         login_id: String,
         verification_url: String,
         user_code: String,
+        /// Exact redirect URI bound to the listener, absent for device-code auth.
+        callback_url: Option<String>,
     },
     AuthenticationCompleted {
         kind: String,
@@ -886,7 +913,12 @@ pub struct NativeDelegationRequest {
 /// Provider-neutral commands understood by an agent backend adapter.
 #[derive(Clone, Debug)]
 pub enum BackendCommand {
-    BeginAuthentication,
+    BeginAuthentication {
+        client_context: ClientContext,
+    },
+    SubmitAuthenticationCallback {
+        callback_url: String,
+    },
     StartSession {
         model: Option<String>,
         instructions: Option<String>,
