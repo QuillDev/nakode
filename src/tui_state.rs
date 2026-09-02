@@ -533,12 +533,32 @@ pub struct SessionPicker {
     pub code_mode: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderDetailRow {
+    State,
+    Credential,
+    ModelFilter,
+}
+
+impl ProviderDetailRow {
+    pub const ALL: [Self; 3] = [Self::State, Self::Credential, Self::ModelFilter];
+}
+
+fn default_provider_detail_row(provider: Option<&ProviderView>) -> ProviderDetailRow {
+    if provider.is_some_and(|provider| provider.credential_configured) {
+        ProviderDetailRow::State
+    } else {
+        ProviderDetailRow::Credential
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderPicker {
     pub providers: Vec<ProviderView>,
     pub selected: usize,
     pub loading: bool,
     pub showing_details: bool,
+    pub detail_row: ProviderDetailRow,
     pub authentication: Option<ProviderAuthentication>,
     pub model_picker: Option<ProviderModelPicker>,
 }
@@ -1451,20 +1471,25 @@ impl TuiState {
         }
 
         if let Some(picker) = &mut self.client.provider_picker {
-            let selected_id = picker
+            let previous_selected_id = picker
                 .providers
                 .get(picker.selected)
                 .map(|provider| provider.id.clone());
             picker.providers.clone_from(&self.providers);
-            picker.selected = selected_id
+            picker.selected = previous_selected_id
+                .as_ref()
                 .and_then(|id| {
                     picker
                         .providers
                         .iter()
-                        .position(|provider| provider.id == id)
+                        .position(|provider| &provider.id == id)
                 })
                 .unwrap_or_default()
                 .min(picker.providers.len().saturating_sub(1));
+            let selected_provider = picker.providers.get(picker.selected);
+            if selected_provider.map(|provider| &provider.id) != previous_selected_id.as_ref() {
+                picker.detail_row = default_provider_detail_row(selected_provider);
+            }
             picker.loading = false;
             if let Some(model_picker) = &mut picker.model_picker {
                 let selected_id = model_picker
@@ -1999,6 +2024,7 @@ impl TuiState {
             selected: 0,
             loading: false,
             showing_details: false,
+            detail_row: default_provider_detail_row(self.providers.first()),
             authentication: self
                 .providers
                 .first()
@@ -2016,11 +2042,23 @@ impl TuiState {
             return;
         }
         picker.selected = offset_index(picker.selected, picker.providers.len(), delta);
-        picker.authentication = picker
-            .providers
-            .get(picker.selected)
+        let provider = picker.providers.get(picker.selected);
+        picker.detail_row = default_provider_detail_row(provider);
+        picker.authentication = provider
             .and_then(|provider| provider.authentication.as_ref())
             .map(frontend_picker_authentication);
+    }
+
+    pub fn provider_detail_move(&mut self, delta: isize) {
+        let Some(picker) = &mut self.client.provider_picker else {
+            return;
+        };
+        let index = ProviderDetailRow::ALL
+            .iter()
+            .position(|row| *row == picker.detail_row)
+            .unwrap_or_default();
+        picker.detail_row =
+            ProviderDetailRow::ALL[offset_index(index, ProviderDetailRow::ALL.len(), delta)];
     }
 
     pub fn open_provider_model_picker(&mut self) {
@@ -2118,6 +2156,7 @@ impl TuiState {
             return;
         };
         picker.showing_details = true;
+        picker.detail_row = default_provider_detail_row(Some(provider));
         if matches!(
             provider.authentication,
             Some(ProviderAuthenticationView::ApiKeyRequired { .. })

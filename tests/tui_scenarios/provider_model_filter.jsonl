@@ -1,11 +1,18 @@
-# Provider model filtering is configured through the same public commands as external clients.
+# Provider detail actions follow the selected row and use the same public commands as external clients.
 {"action":"service","event":{"type":"ready","display_name":"Codex","capabilities":["model_catalog"]}}
 {"action":"service","event":{"type":"models","models":[{"id":"model-a","is_default":true},{"id":"model-b","is_default":false}]}}
 {"action":"type","text":"/providers"}
 {"action":"key","key":"enter"}
 {"action":"assert","modal":"providers","screen_contains":["Codex","enabled"]}
 {"action":"key","key":"enter"}
-{"action":"assert","modal":"providers","screen_contains":["Model filter disabled","2 candidates","f enable/disable model filter","m edit selected models"]}
+{"action":"assert","modal":"providers","screen_contains":["› State","Model filter disabled","Enter or Space enable/disable","↑/↓ select"]}
+{"action":"key","key":"down"}
+{"action":"key","key":"down"}
+{"action":"assert","modal":"providers","screen_contains":["› Model filter disabled","Enter or Space enable/disable model filter","m edit selected models"]}
+{"action":"key","key":"enter"}
+{"action":"assert","commands_include":["set_provider_model_filter"],"commands_exclude":["set_provider_enabled","begin_provider_authentication"]}
+{"action":"key","key":"space"}
+{"action":"assert","commands_include":["set_provider_model_filter"],"commands_exclude":["set_provider_enabled","begin_provider_authentication"]}
 {"action":"type","text":"f"}
 {"action":"assert","commands_include":["set_provider_model_filter"]}
 {"action":"type","text":"m"}

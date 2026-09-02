@@ -74,6 +74,7 @@ pub enum ControlAction {
     CopyUrl,
     Logout,
     Toggle,
+    ToggleProviderModelFilter,
     Focus,
     Open,
     Create,
@@ -392,6 +393,8 @@ const KEY_CONTROLS: &[KeyControl] = &[
     control!(ProviderDetails, Logout, KeyCode::Char('l'), Any),
     control!(ProviderDetails, Toggle, KeyCode::Enter, Any),
     control!(ProviderDetails, Toggle, KeyCode::Char(' '), Any),
+    control!(ProviderDetails, Previous, KeyCode::Up, Any),
+    control!(ProviderDetails, Next, KeyCode::Down, Any),
     control!(ProviderDetails, Open, KeyCode::Char('m'), Any),
     control!(ProviderModelPicker, Close, KeyCode::Esc, Any),
     control!(ProviderModelPicker, Select, KeyCode::Enter, Any),
@@ -399,7 +402,12 @@ const KEY_CONTROLS: &[KeyControl] = &[
     control!(ProviderModelPicker, Previous, KeyCode::Up, Any),
     control!(ProviderModelPicker, Next, KeyCode::Down, Any),
     control!(ProviderModelPicker, Backspace, KeyCode::Backspace, Any),
-    control!(ProviderDetails, Toggle, KeyCode::Char('f'), Any),
+    control!(
+        ProviderDetails,
+        ToggleProviderModelFilter,
+        KeyCode::Char('f'),
+        Any
+    ),
     control!(ProviderCredential, Submit, KeyCode::Enter, Any),
     control!(ProviderCredential, Backspace, KeyCode::Backspace, Any),
     control!(AgentList, Close, KeyCode::Esc, Any),
@@ -669,6 +677,26 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
             ),
             Some(ControlAction::SteerOrSubmit)
+        );
+    }
+
+    #[test]
+    fn provider_detail_keys_preserve_distinct_selected_row_and_filter_actions() {
+        for key in [KeyCode::Enter, KeyCode::Char(' ')] {
+            assert_eq!(
+                resolve(
+                    ControlContext::ProviderDetails,
+                    KeyEvent::new(key, KeyModifiers::NONE)
+                ),
+                Some(ControlAction::Toggle)
+            );
+        }
+        assert_eq!(
+            resolve(
+                ControlContext::ProviderDetails,
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)
+            ),
+            Some(ControlAction::ToggleProviderModelFilter)
         );
     }
 
