@@ -205,6 +205,7 @@ impl BridgeMutationRollback {
             }
             | Command::SetSkillEnabled { .. }
             | Command::PruneSkill { .. }
+            | Command::RemoveProviderAccount { .. }
             | Command::SetSessionBridgeLifecycle { .. }
             | Command::SetWorkspaceBridgeLifecycle { .. } => {
                 Some(Self::Full(Box::new(core.clone())))
@@ -1545,6 +1546,25 @@ impl NativeServerRuntime {
         }
         if cancels_provider_turn {
             self.cancel_session_mcp_calls(&session_id);
+        }
+        if let Some((provider, account_id)) = take_remove_provider_account_effect(&mut effects) {
+            if let Err(error) = self
+                .effects
+                .persistence
+                .sessions
+                .remove_provider_account(&provider, &account_id)
+            {
+                match rollback.take() {
+                    Some(rollback) => rollback.restore(&mut self.core),
+                    None => self.accepting_work = false,
+                }
+                outcome.respond_with_error(provider_account_removal_error(&error));
+                return;
+            }
+            self.effects
+                .backends
+                .clear_provider_account_credential(&provider, &account_id)
+                .await;
         }
         if let Some(delete_session_id) = take_delete_session_effect(&mut effects) {
             let canonical_id = nakode_protocol::SessionId::from(delete_session_id.clone());
@@ -4267,17 +4287,8 @@ impl EffectExecutor {
                     self.backends.stop_provider_control(&provider).await;
                 }
             }
-            Effect::RemoveProviderAccount {
-                provider,
-                account_id,
-            } => {
-                if let Err(error) = sessions.remove_provider_account(&provider, &account_id) {
-                    state.session_store_failed(error.to_string());
-                } else {
-                    self.backends
-                        .clear_provider_account_credential(&provider, &account_id)
-                        .await;
-                }
+            Effect::RemoveProviderAccount { .. } => {
+                unreachable!("provider account removal is committed before ordinary effects")
             }
             Effect::SaveProviderAccountCredential {
                 provider,
@@ -5419,6 +5430,33 @@ fn install_changed_agent_catalog(
             state.set_status(success_message);
         }
         Err(error) => state.session_store_failed(error.to_string()),
+    }
+}
+
+fn take_remove_provider_account_effect(effects: &mut Vec<Effect>) -> Option<(String, String)> {
+    let index = effects
+        .iter()
+        .position(|effect| matches!(effect, Effect::RemoveProviderAccount { .. }))?;
+    let Effect::RemoveProviderAccount {
+        provider,
+        account_id,
+    } = effects.remove(index)
+    else {
+        unreachable!("the located effect is a provider account removal")
+    };
+    Some((provider, account_id))
+}
+
+fn provider_account_removal_error(error: &SessionError) -> ServiceError {
+    let (code, retryable) = match error {
+        SessionError::ProviderAccountNotFound { .. } => (ErrorCode::NotFound, false),
+        SessionError::ProviderAccountInUse { .. } => (ErrorCode::Conflict, false),
+        _ => (ErrorCode::Internal, true),
+    };
+    ServiceError {
+        code,
+        message: error.to_string(),
+        retryable,
     }
 }
 
@@ -7232,6 +7270,96 @@ mod tests {
             },
             credentials,
         )
+    }
+
+    #[tokio::test]
+    async fn provider_account_removal_refuses_in_use_account_through_command_result() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let account = persistence
+            .sessions
+            .add_provider_account(CODEX_PROVIDER, "Pinned")
+            .expect("provider account");
+        persistence
+            .sessions
+            .create_with_account_id(
+                "pinned-session",
+                CODEX_PROVIDER,
+                Some(&account.account_id),
+                "native-session",
+                workspace.path().to_str().expect("workspace path"),
+                workspace.path().to_str().expect("workspace path"),
+                "Pinned",
+                None,
+                &BackendModelOptions::default(),
+                None,
+            )
+            .expect("pinned session");
+        let providers = persistence
+            .sessions
+            .list_providers()
+            .expect("provider records");
+        let effects =
+            EffectExecutor::new(empty_registry(workspace.path()).await, persistence.clone());
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let (runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            providers,
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = handle.endpoint().clone();
+        let runtime = tokio::spawn(runtime.run());
+
+        let error = endpoint
+            .execute_command(
+                ClientId::from("provider-removal-test"),
+                IdempotencyKey::from("remove-pinned-account"),
+                None,
+                false,
+                Command::RemoveProviderAccount {
+                    provider_id: nakode_protocol::ProviderId::from(CODEX_PROVIDER),
+                    account_id: account.account_id.clone(),
+                },
+            )
+            .await
+            .expect_err("pinned account removal must be refused to the client");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(error.message.contains("pinned to persisted sessions"));
+        let retry = endpoint
+            .execute_command(
+                ClientId::from("provider-removal-test"),
+                IdempotencyKey::from("remove-pinned-account"),
+                None,
+                false,
+                Command::RemoveProviderAccount {
+                    provider_id: nakode_protocol::ProviderId::from(CODEX_PROVIDER),
+                    account_id: account.account_id.clone(),
+                },
+            )
+            .await
+            .expect_err("same-key retry must re-run the refused removal");
+        assert_eq!(retry.code, ErrorCode::Conflict);
+        assert!(retry.message.contains("pinned to persisted sessions"));
+        assert!(
+            persistence
+                .sessions
+                .list_providers()
+                .expect("provider records after refusal")
+                .into_iter()
+                .flat_map(|provider| provider.accounts)
+                .any(|candidate| candidate.account_id == account.account_id)
+        );
+
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
     }
 
     fn profile_session_command(
