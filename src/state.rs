@@ -6603,7 +6603,7 @@ impl DomainState {
                         user_code: user_code.clone(),
                     },
                 );
-                self.set_status("Complete the provider device authentication in your browser.");
+                self.set_status("Complete provider sign-in in your browser.");
                 Some(Vec::new())
             }
             BackendEvent::AuthenticationCompleted { kind, metadata } => {
