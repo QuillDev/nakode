@@ -58,7 +58,7 @@ repairing enablement or changing the bind address. `regenerate-key` revokes only
 `check` performs a real pinned-TLS and authenticated `GetServerInfo` call and rejects API/server-ID
 mismatch. A wildcard bind needs a separate reachable `--endpoint` in enrollment output.
 
-The descriptor contains a random 256-bit bearer key and pinned self-signed TLS identity; handle it as a secret. The installation keeps a stable server ID across key regeneration. Remote frontends use the same `nakode.v1` service, including read-only `InspectWorkspacePath` for server-side canonical path and Git placement checks. Nakode remains the sole session, provider, tool, persistence, lifecycle, and resumability authority.
+The descriptor contains a random 256-bit bearer key and pinned self-signed TLS identity; handle it as a secret. The installation keeps a stable server ID across key regeneration. Remote frontends use the same `nakode.v1` service, including read-only `InspectWorkspacePath` for server-side canonical path and Git placement checks. A workspace request of `~` or `~/…` resolves against the Nakode service runtime user's authoritative home on the execution host; failures name the resolved server path and filesystem cause. Nakode remains the sole session, provider, tool, persistence, lifecycle, and resumability authority.
 
 After installation, Nakode preserves an already-current singleton, restarts it only
 when it is stale and quiescent, and retires quiescent legacy per-workspace services.

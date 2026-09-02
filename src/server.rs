@@ -13,6 +13,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use directories::BaseDirs;
 use nakode_protocol::{
     AgentDefinitionInput, AgentSessionId, BridgeContinuationDisposition, BridgeLifecycle,
     BridgeProjectionKind, BridgeProjectionView, Command, CommandAccepted, CredentialInput, EntryId,
@@ -4378,25 +4379,60 @@ fn canonical_working_directory(
     requested: Option<&str>,
     workspace: &str,
 ) -> Result<String, DomainCommandError> {
-    let path = match requested {
-        None => Path::new(workspace),
-        Some(value) if value.trim().is_empty() => {
-            return Err(DomainCommandError::Invalid(
-                "working_directory must not be empty when supplied".to_owned(),
-            ));
-        }
-        Some(value) => Path::new(value),
+    let runtime_home = BaseDirs::new().map(|base| base.home_dir().to_path_buf());
+    canonical_working_directory_with_home(requested, workspace, runtime_home.as_deref())
+}
+
+fn canonical_working_directory_with_home(
+    requested: Option<&str>,
+    workspace: &str,
+    runtime_home: Option<&Path>,
+) -> Result<String, DomainCommandError> {
+    let value = requested.unwrap_or(workspace);
+    if requested.is_some() && value.trim().is_empty() {
+        return Err(DomainCommandError::Invalid(
+            "working_directory must not be empty when supplied".to_owned(),
+        ));
+    }
+    let home_relative = value
+        .strip_prefix("~/")
+        .map(|relative| relative.trim_start_matches('/'))
+        .map(Path::new)
+        .or_else(|| (value == "~").then(|| Path::new("")));
+    let (path, home_request) = if let Some(relative) = home_relative {
+        let home = runtime_home.ok_or_else(|| {
+            DomainCommandError::Invalid(format!(
+                "working_directory {value} could not be resolved by the Nakode server: the runtime user home directory is unavailable"
+            ))
+        })?;
+        (home.join(relative), Some(value))
+    } else {
+        (PathBuf::from(value), None)
     };
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        DomainCommandError::Invalid(format!(
-            "working_directory {} is unavailable: {error}",
-            path.display()
-        ))
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        let location = home_request.map_or_else(
+            || format!("working_directory {}", path.display()),
+            |requested| {
+                format!(
+                    "working_directory {requested} resolved by the Nakode server to {}",
+                    path.display()
+                )
+            },
+        );
+        DomainCommandError::Invalid(format!("{location} is unavailable: {error}"))
     })?;
     if !canonical.is_dir() {
+        let location = home_request.map_or_else(
+            || canonical.display().to_string(),
+            |requested| {
+                format!(
+                    "{requested} resolved by the Nakode server to {}",
+                    canonical.display()
+                )
+            },
+        );
         return Err(DomainCommandError::Invalid(format!(
-            "working_directory {} is not a directory",
-            canonical.display()
+            "working_directory {location} is not a directory"
         )));
     }
     Ok(canonical.to_string_lossy().into_owned())
@@ -5072,8 +5108,8 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::{
-        IDEMPOTENCY_CAPACITY, ServerCore, inspect_workspace_path, sanitized_repository_identity,
-        unix_timestamp_ms,
+        IDEMPOTENCY_CAPACITY, ServerCore, canonical_working_directory_with_home,
+        inspect_workspace_path, sanitized_repository_identity, unix_timestamp_ms,
     };
     use crate::{
         agent::{AgentCatalog, AgentDefinition},
@@ -5310,6 +5346,124 @@ mod tests {
                 .expect_err("invalid inspection path");
             assert_eq!(error.code, ErrorCode::InvalidRequest);
         }
+    }
+
+    #[test]
+    fn server_resolves_home_workspace_shorthand_for_the_runtime_user() {
+        let home = tempfile::tempdir().expect("runtime home");
+        let child = home.path().join("specs");
+        fs::create_dir(&child).expect("home child");
+        let canonical_home = home.path().canonicalize().expect("canonical home");
+        let canonical_child = child.canonicalize().expect("canonical child");
+
+        assert_eq!(
+            canonical_working_directory_with_home(Some("~"), "/unused", Some(home.path()))
+                .expect("resolve runtime home"),
+            canonical_home.to_string_lossy()
+        );
+        assert_eq!(
+            canonical_working_directory_with_home(Some("~/specs"), "/unused", Some(home.path()))
+                .expect("resolve child under runtime home"),
+            canonical_child.to_string_lossy()
+        );
+        assert_eq!(
+            canonical_working_directory_with_home(None, "~/specs", Some(home.path()))
+                .expect("resolve fallback workspace under runtime home"),
+            canonical_child.to_string_lossy()
+        );
+        assert_eq!(
+            canonical_working_directory_with_home(Some("~//specs"), "/unused", Some(home.path()))
+                .expect("keep repeated separators under runtime home"),
+            canonical_child.to_string_lossy()
+        );
+        assert_eq!(
+            canonical_working_directory_with_home(
+                Some(child.to_str().expect("utf8 path")),
+                "/unused",
+                None,
+            )
+            .expect("absolute paths do not need a runtime home"),
+            canonical_child.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn home_workspace_failures_name_the_server_resolution_and_cause() {
+        let home = tempfile::tempdir().expect("runtime home");
+        let missing = home.path().join("missing");
+        let unavailable =
+            canonical_working_directory_with_home(Some("~/missing"), "/unused", Some(home.path()))
+                .expect_err("missing home child");
+        let unavailable = unavailable.to_string();
+        assert!(unavailable.contains("~/missing resolved by the Nakode server"));
+        assert!(unavailable.contains(&missing.to_string_lossy().into_owned()));
+        assert!(unavailable.contains("unavailable"));
+
+        let unresolved = canonical_working_directory_with_home(Some("~"), "/unused", None)
+            .expect_err("missing runtime home")
+            .to_string();
+        assert!(unresolved.contains("could not be resolved by the Nakode server"));
+        assert!(unresolved.contains("runtime user home directory is unavailable"));
+    }
+
+    #[test]
+    fn workspace_path_inspection_resolves_the_server_runtime_home() {
+        let home = directories::BaseDirs::new().expect("test runtime home");
+        let inspected = inspect_workspace_path("~", None).expect("inspect runtime home");
+
+        assert_eq!(
+            inspected.canonical_path,
+            home.home_dir().canonicalize().unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn workspace_path_inspection_accepts_a_repository_free_directory() {
+        let directory = tempfile::tempdir().expect("repository-free directory");
+        let inspected = inspect_workspace_path(directory.path().to_str().expect("utf8 path"), None)
+            .expect("inspect repository-free directory");
+
+        assert_eq!(
+            inspected.canonical_path,
+            directory.path().canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(inspected.git_repository, None);
+        assert_eq!(inspected.branch, None);
+        assert_eq!(inspected.revision, None);
+        assert!(!inspected.dirty);
+    }
+
+    #[test]
+    fn session_creation_resolves_the_server_runtime_home() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let (created, _) = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                Some("~"),
+                None,
+                None,
+                &ModelOptions::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("create home-rooted session");
+        let session_id = SessionId::from(created.resource_id.expect("session id"));
+        let expected_home = directories::BaseDirs::new()
+            .expect("test runtime home")
+            .home_dir()
+            .canonicalize()
+            .expect("canonical runtime home");
+
+        assert_eq!(
+            core.engine_for(&session_id)
+                .expect("created session")
+                .state()
+                .working_directory,
+            expected_home.to_string_lossy()
+        );
     }
 
     #[test]

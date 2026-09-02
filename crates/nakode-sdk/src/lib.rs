@@ -632,16 +632,19 @@ impl NakodeClient {
         requested_session: Option<String>,
     ) -> Result<(api::WorkspaceState, String), SdkError> {
         let requested_workspace = workspace.into();
-        let canonical_workspace = std::fs::canonicalize(&requested_workspace)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&requested_workspace))
-            .to_string_lossy()
-            .into_owned();
+        if let Some(session_id) = requested_session {
+            let state = self.get_workspace(requested_workspace, None).await?;
+            let session_id = self.open_session(session_id).await?;
+            return Ok((state, session_id));
+        }
+        let canonical_workspace = self
+            .inspect_workspace_path(requested_workspace, None)
+            .await?
+            .canonical_path;
         let state = self
             .get_workspace(canonical_workspace.clone(), None)
             .await?;
-        let session_id = if let Some(session_id) = requested_session {
-            self.open_session(session_id).await?
-        } else if let Some(session) = state
+        let session_id = if let Some(session) = state
             .sessions
             .iter()
             .find(|session| session.working_directory == canonical_workspace)
@@ -2700,6 +2703,8 @@ mod tests {
             interactions: Vec::new(),
             todos: Vec::new(),
             runs: Vec::new(),
+            shared_context: Vec::new(),
+            shared_context_total: 0,
             runs_total: Some(0),
             runs_has_earlier: false,
             notices: Vec::new(),
