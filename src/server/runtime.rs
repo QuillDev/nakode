@@ -1565,6 +1565,38 @@ impl NativeServerRuntime {
                 .backends
                 .clear_provider_account_credential(&provider, &account_id)
                 .await;
+            self.effects.backends.stop_provider_control(&provider).await;
+            if let Ok(providers) = self.effects.persistence.sessions.list_providers() {
+                self.effects.backends.update_provider_accounts(&providers);
+                let runnable = providers.iter().any(|record| {
+                    record.provider == provider
+                        && record.enabled
+                        && (record.accounts.is_empty()
+                            || record
+                                .accounts
+                                .iter()
+                                .any(|account| account.enabled && account.credential.is_some()))
+                });
+                if runnable
+                    && self
+                        .effects
+                        .backends
+                        .start_provider(&provider)
+                        .await
+                        .is_ok()
+                {
+                    let _ = self
+                        .effects
+                        .backends
+                        .send(
+                            &provider,
+                            BackendCommand::Reload {
+                                provider_session_id: None,
+                            },
+                        )
+                        .await;
+                }
+            }
         }
         if let Some(delete_session_id) = take_delete_session_effect(&mut effects) {
             let canonical_id = nakode_protocol::SessionId::from(delete_session_id.clone());
@@ -1914,10 +1946,10 @@ impl NativeServerRuntime {
                     self.core
                         .engine_for_mut(&session_id)
                         .map_or_else(Vec::new, |engine| {
-                            engine.state_mut().handle_provider_account_backend(
+                            engine.state_mut().handle_provider_account_control_backend(
                                 &provider,
                                 &account_id,
-                                event,
+                                &event,
                             )
                         });
                 (session_id, effects)
@@ -3267,6 +3299,16 @@ impl BackendRegistry {
 
     pub(crate) async fn stop_provider(&mut self, provider: &str) {
         self.stop_provider_control(provider).await;
+        let account_ids = self
+            .account_commands
+            .keys()
+            .filter(|(account_provider, _)| account_provider == provider)
+            .map(|(_, account_id)| account_id.clone())
+            .collect::<Vec<_>>();
+        for account_id in account_ids {
+            self.stop_provider_account_control(provider, &account_id)
+                .await;
+        }
         let mut session_keys = self
             .session_commands
             .keys()
@@ -3415,6 +3457,8 @@ impl BackendRegistry {
                 } else {
                     self.provider_credentials.remove(&provider.provider);
                 }
+            } else {
+                self.provider_credentials.remove(&provider.provider);
             }
         }
     }
@@ -3437,7 +3481,7 @@ impl BackendRegistry {
                     .iter()
                     .find(|account| account.account_id == account_id)
             })
-            .is_some_and(|account| account.is_default)
+            .is_some_and(|account| account.is_default && account.enabled)
         {
             self.set_provider_credential(provider, metadata);
         }
@@ -3461,12 +3505,8 @@ impl BackendRegistry {
         provider: &str,
         account_id: &str,
     ) {
-        if let Some(commands) = self
-            .account_commands
-            .remove(&(provider.to_owned(), account_id.to_owned()))
-        {
-            let _ = commands.send(BackendCommand::Shutdown).await;
-        }
+        self.stop_provider_account_control(provider, account_id)
+            .await;
         let session_ids = self
             .session_accounts
             .iter()
@@ -3758,6 +3798,16 @@ impl BackendRegistry {
     }
 
     pub(crate) fn default_account_id(&self, provider: &str) -> Option<String> {
+        self.provider_accounts.get(provider).and_then(|accounts| {
+            accounts
+                .iter()
+                .find(|account| account.is_default && account.enabled)
+                .or_else(|| accounts.iter().find(|account| account.enabled))
+                .map(|account| account.account_id.clone())
+        })
+    }
+
+    fn configured_default_account_id(&self, provider: &str) -> Option<String> {
         self.provider_accounts.get(provider).and_then(|accounts| {
             accounts
                 .iter()
@@ -4086,7 +4136,7 @@ impl BackendRegistry {
             let _ = self.stop_subagent(&run_id).await;
         }
         self.provider_credentials.remove(provider);
-        if let Some(account_id) = self.default_account_id(provider) {
+        if let Some(account_id) = self.configured_default_account_id(provider) {
             self.provider_account_credentials
                 .remove(&(provider.to_owned(), account_id));
         }
@@ -4100,6 +4150,11 @@ impl BackendRegistry {
         for commands in self.commands.values() {
             let _ = commands.send(BackendCommand::Shutdown).await;
         }
+        for commands in self.account_commands.values() {
+            let _ = commands.send(BackendCommand::Shutdown).await;
+        }
+        self.provider_control_generations.clear();
+        self.account_control_generations.clear();
         let mut session_ids = self
             .session_commands
             .keys()
@@ -4261,7 +4316,11 @@ impl EffectExecutor {
                     state.session_store_failed(error.to_string());
                 } else {
                     match sessions.list_providers() {
-                        Ok(providers) => self.backends.update_provider_accounts(&providers),
+                        Ok(providers) => {
+                            self.backends.update_provider_accounts(&providers);
+                            self.rebind_provider_control(state, &provider, &providers)
+                                .await;
+                        }
                         Err(error) => state.session_store_failed(error.to_string()),
                     }
                     if !enabled {
@@ -4279,12 +4338,13 @@ impl EffectExecutor {
                     state.session_store_failed(error.to_string());
                 } else {
                     match sessions.list_providers() {
-                        Ok(providers) => self.backends.update_provider_accounts(&providers),
+                        Ok(providers) => {
+                            self.backends.update_provider_accounts(&providers);
+                            self.rebind_provider_control(state, &provider, &providers)
+                                .await;
+                        }
                         Err(error) => state.session_store_failed(error.to_string()),
                     }
-                    // Legacy provider-control handles are built from the default credential. Drop
-                    // only that catalog/auth handle so established session backends stay pinned.
-                    self.backends.stop_provider_control(&provider).await;
                 }
             }
             Effect::RemoveProviderAccount { .. } => {
@@ -4311,6 +4371,14 @@ impl EffectExecutor {
                         .replace_provider_account_credential(&provider, &account_id, metadata)
                         .await;
                     state.provider_account_recovered(&provider, &account_id);
+                    match sessions.list_providers() {
+                        Ok(providers) => {
+                            self.backends.update_provider_accounts(&providers);
+                            self.rebind_provider_control(state, &provider, &providers)
+                                .await;
+                        }
+                        Err(error) => state.session_store_failed(error.to_string()),
+                    }
                     self.reload_provider_account(state, &provider, &account_id)
                         .await;
                 }
@@ -4329,6 +4397,14 @@ impl EffectExecutor {
                     self.backends
                         .clear_provider_account_credential(&provider, &account_id)
                         .await;
+                    match sessions.list_providers() {
+                        Ok(providers) => {
+                            self.backends.update_provider_accounts(&providers);
+                            self.rebind_provider_control(state, &provider, &providers)
+                                .await;
+                        }
+                        Err(error) => state.session_store_failed(error.to_string()),
+                    }
                 }
             }
             Effect::AuthenticateProviderAccount {
@@ -4500,6 +4576,46 @@ impl EffectExecutor {
                 "provider account authentication channel closed",
             );
         }
+    }
+
+    async fn rebind_provider_control(
+        &mut self,
+        state: &mut DomainState,
+        provider: &str,
+        providers: &[ProviderRecord],
+    ) {
+        // Provider controls own catalogue discovery for the currently eligible default account.
+        // Sticky primary-session controls remain untouched and continue with their bound account.
+        self.backends.stop_provider_control(provider).await;
+        let Some(record) = providers
+            .iter()
+            .find(|record| record.provider == provider && record.enabled)
+        else {
+            state.provider_disabled(provider);
+            return;
+        };
+        if !record.accounts.is_empty()
+            && !record
+                .accounts
+                .iter()
+                .any(|account| account.enabled && account.credential.is_some())
+        {
+            state.provider_disabled(provider);
+            return;
+        }
+        if let Err(error) = self.backends.start_provider(provider).await {
+            state.provider_start_failed(provider, &record.display_name, &error.to_string());
+            return;
+        }
+        let _ = self
+            .backends
+            .send(
+                provider,
+                BackendCommand::Reload {
+                    provider_session_id: None,
+                },
+            )
+            .await;
     }
 
     async fn reload_provider_account(
@@ -5192,10 +5308,20 @@ fn ensure_default_provider_account(
         .iter()
         .find(|record| record.provider == provider)
         .ok_or_else(|| SessionError::ProviderNotFound(provider.to_owned()))?;
-    if let Some(account) = record.accounts.iter().find(|account| account.is_default) {
+    if let Some(account) = record
+        .accounts
+        .iter()
+        .find(|account| account.is_default && account.enabled)
+    {
         return Ok(account.account_id.clone());
     }
-    if let Some(account) = record.accounts.first() {
+    if let Some(account) = record
+        .accounts
+        .iter()
+        .find(|account| account.enabled)
+        .or_else(|| record.accounts.iter().find(|account| account.is_default))
+        .or_else(|| record.accounts.first())
+    {
         let account_id = account.account_id.clone();
         sessions.set_provider_account_default(provider, &account_id)?;
         return Ok(account_id);
@@ -5827,14 +5953,10 @@ fn load_provider_credentials(
         {
             match credentials.get_account(&provider.provider, &account.account_id) {
                 Ok(Some(credential)) => {
-                    let secret = credential.secret.into_inner();
                     accounts.insert(
                         (provider.provider.clone(), account.account_id.clone()),
-                        secret.clone(),
+                        credential.secret.into_inner(),
                     );
-                    if account.is_default {
-                        defaults.insert(provider.provider.clone(), secret);
-                    }
                 }
                 Ok(None) => {}
                 Err(error) => failures.push((
@@ -5842,6 +5964,16 @@ fn load_provider_credentials(
                     error.to_string(),
                 )),
             }
+        }
+        let eligible = provider
+            .accounts
+            .iter()
+            .find(|account| account.is_default && account.enabled)
+            .or_else(|| provider.accounts.iter().find(|account| account.enabled));
+        if let Some(secret) = eligible.and_then(|account| {
+            accounts.get(&(provider.provider.clone(), account.account_id.clone()))
+        }) {
+            defaults.insert(provider.provider.clone(), secret.clone());
         }
     }
     (defaults, accounts, failures)
@@ -5924,8 +6056,8 @@ mod tests {
         service::ServiceEngine,
         session::{
             BridgeInboundTurnOriginRecord, BridgePendingInboundRecord, InvocationRecord,
-            ProviderAccountRecord, SessionBridgeRecord, SessionError, SessionRepository,
-            SqliteSessionRepository, SubagentObservability, SubagentRecord,
+            ProviderAccountRecord, ProviderRecord, SessionBridgeRecord, SessionError,
+            SessionRepository, SqliteSessionRepository, SubagentObservability, SubagentRecord,
             pending_provider_session_id,
         },
         skill::{SkillCatalog, SkillPreference},
@@ -6740,6 +6872,67 @@ mod tests {
                 .select_account(CODEX_PROVIDER, Some("disabled"))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn provider_control_credential_follows_an_enabled_account_only() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let automatic = nakode_protocol::ProviderAccountRoutingMode::Automatic;
+        let disabled_default = routing_account(
+            CODEX_PROVIDER,
+            "disabled-default",
+            "Disabled",
+            false,
+            true,
+            automatic,
+        );
+        let enabled_fallback = routing_account(
+            CODEX_PROVIDER,
+            "enabled-fallback",
+            "Enabled",
+            true,
+            false,
+            automatic,
+        );
+        registry.provider_account_credentials.insert(
+            (CODEX_PROVIDER.to_owned(), "disabled-default".to_owned()),
+            serde_json::json!({"fixture": "disabled"}),
+        );
+        registry.provider_account_credentials.insert(
+            (CODEX_PROVIDER.to_owned(), "enabled-fallback".to_owned()),
+            serde_json::json!({"fixture": "enabled"}),
+        );
+        let record = |accounts| ProviderRecord {
+            provider: CODEX_PROVIDER.to_owned(),
+            display_name: "Codex".to_owned(),
+            enabled: true,
+            credential: None,
+            accounts,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
+        };
+
+        registry.update_provider_accounts(&[record(vec![
+            disabled_default.clone(),
+            enabled_fallback.clone(),
+        ])]);
+
+        assert_eq!(
+            registry.default_account_id(CODEX_PROVIDER).as_deref(),
+            Some("enabled-fallback")
+        );
+        assert_eq!(
+            registry.provider_credentials.get(CODEX_PROVIDER),
+            Some(&serde_json::json!({"fixture": "enabled"}))
+        );
+
+        let mut disabled_fallback = enabled_fallback;
+        disabled_fallback.enabled = false;
+        registry.update_provider_accounts(&[record(vec![disabled_default, disabled_fallback])]);
+
+        assert_eq!(registry.default_account_id(CODEX_PROVIDER), None);
+        assert!(!registry.provider_credentials.contains_key(CODEX_PROVIDER));
     }
 
     #[tokio::test]
@@ -10182,6 +10375,14 @@ mod tests {
         registry
             .commands
             .insert(CODEX_PROVIDER.to_owned(), control_tx);
+        let (account_tx, mut account_rx) = mpsc::channel(1);
+        let account_key = (CODEX_PROVIDER.to_owned(), CODEX_TEST_ACCOUNT_ID.to_owned());
+        registry
+            .account_commands
+            .insert(account_key.clone(), account_tx);
+        registry
+            .account_control_generations
+            .insert(account_key, uuid::Uuid::now_v7());
         let first_id = SessionId::from("session-first");
         let second_id = SessionId::from("session-second");
         let (first, mut first_commands, _first_events) = fake_backend();
@@ -10206,6 +10407,10 @@ mod tests {
             Some(BackendCommand::Shutdown)
         ));
         assert!(matches!(
+            account_rx.recv().await,
+            Some(BackendCommand::Shutdown)
+        ));
+        assert!(matches!(
             first_commands.recv().await,
             Some(BackendCommand::Shutdown)
         ));
@@ -10215,6 +10420,8 @@ mod tests {
         ));
         assert!(registry.session_commands.is_empty());
         assert!(!registry.commands.contains_key(CODEX_PROVIDER));
+        assert!(registry.account_commands.is_empty());
+        assert!(registry.account_control_generations.is_empty());
     }
 
     #[tokio::test]
