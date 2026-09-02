@@ -121,7 +121,11 @@ whose selection no longer matches any discovered model (for example an enabled f
 empty selection) fails open and shows the provider's full catalogue, since silently hiding every
 discovered model is never the intent of a selection that selects nothing.
 
-Nakode does not require the separate Codex, Devin, Kimi, or z.ai applications. Claude
+Nakode does not require the separate Codex, Devin, Kimi, or z.ai applications. OpenAI
+Codex sign-in uses the normal browser OAuth flow by default and returns to Nakode through
+a localhost callback; Nakode then persists and refreshes the OAuth credential. Embedders
+can retain device-code authentication by explicitly calling
+`BackendConfig::with_device_code_authentication`. Claude
 uses the official Claude Agent SDK and the login managed by an installed Claude Code
 CLI; install Claude Code and run `claude auth login` before connecting Claude in
 `/providers`. Claude requires Node.js 18 or newer plus npm. Nakode stores only an

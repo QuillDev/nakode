@@ -1,11 +1,24 @@
-use std::{collections::HashMap, error::Error as _, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error as _,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use sha2::{Digest as _, Sha256};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -30,11 +43,17 @@ const EVENT_CAPACITY: usize = 1_024;
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const CODEX_CLIENT_VERSION: &str = "0.144.6";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const BROWSER_CALLBACK_PATH: &str = "/auth/callback";
+const BROWSER_CALLBACK_PORTS: [u16; 2] = [1455, 1457];
+const BROWSER_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const OAUTH_SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const MAX_DEVICE_POLLS: usize = 120;
 const MAX_INFERENCE_ATTEMPTS: usize = 4;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
@@ -46,6 +65,8 @@ pub struct BackendConfig {
     pub base_url: String,
     client: Client,
     auth_urls: AuthUrls,
+    auth_flow: CodexAuthFlow,
+    callback_ports: Vec<u16>,
     session_database: Option<PathBuf>,
     compaction_threshold_percent: usize,
     reasoning_effort: Option<String>,
@@ -58,10 +79,18 @@ pub struct BackendConfig {
 
 #[derive(Clone, Debug)]
 struct AuthUrls {
+    authorize: String,
     user_code: String,
     device_token: String,
     verification: String,
     token: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CodexAuthFlow {
+    #[default]
+    Browser,
+    DeviceCode,
 }
 
 impl BackendConfig {
@@ -73,11 +102,14 @@ impl BackendConfig {
             base_url: CODEX_BASE_URL.to_owned(),
             client: Client::new(),
             auth_urls: AuthUrls {
+                authorize: AUTHORIZE_URL.to_owned(),
                 user_code: DEVICE_USER_CODE_URL.to_owned(),
                 device_token: DEVICE_TOKEN_URL.to_owned(),
                 verification: DEVICE_AUTH_URL.to_owned(),
                 token: TOKEN_URL.to_owned(),
             },
+            auth_flow: CodexAuthFlow::default(),
+            callback_ports: BROWSER_CALLBACK_PORTS.to_vec(),
             session_database: None,
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             reasoning_effort: Some("medium".to_owned()),
@@ -145,6 +177,33 @@ impl BackendConfig {
     #[must_use]
     pub fn with_reasoning_effort(mut self, reasoning_effort: impl Into<String>) -> Self {
         self.reasoning_effort = Some(reasoning_effort.into());
+        self
+    }
+
+    /// Explicitly opts this adapter into `OpenAI`'s device-code login flow.
+    ///
+    /// Ordinary Codex authentication uses browser OAuth with a localhost callback.
+    #[must_use]
+    pub fn with_device_code_authentication(mut self) -> Self {
+        self.auth_flow = CodexAuthFlow::DeviceCode;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_auth_urls(mut self, base_url: &str) -> Self {
+        self.auth_urls = AuthUrls {
+            authorize: format!("{base_url}/oauth/authorize"),
+            user_code: format!("{base_url}/device/usercode"),
+            device_token: format!("{base_url}/device/token"),
+            verification: format!("{base_url}/codex/device"),
+            token: format!("{base_url}/oauth/token"),
+        };
+        self
+    }
+
+    #[cfg(test)]
+    fn with_callback_port(mut self, port: u16) -> Self {
+        self.callback_ports = vec![port];
         self
     }
 
@@ -499,6 +558,7 @@ async fn run_supervisor(
     let mut sessions = HashMap::<String, RuntimeSession>::new();
     let mut pending_options = HashMap::<String, ModelOptions>::new();
     let mut active: Option<ActiveTurn> = None;
+    let mut authentication_task: Option<tokio::task::JoinHandle<()>> = None;
     let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedTurn>(8);
 
     loop {
@@ -507,6 +567,10 @@ async fn run_supervisor(
                 let Some(command) = command else { break };
                 if matches!(command, BackendCommand::Shutdown) {
                     if let Some(active) = active.take() { active.cancellation.cancel(); }
+                    if let Some(task) = authentication_task.take() {
+                        task.abort();
+                        let _ = task.await;
+                    }
                     break;
                 }
                 let mut context = CommandContext {
@@ -516,6 +580,7 @@ async fn run_supervisor(
                     sessions: &mut sessions,
                     pending_options: &mut pending_options,
                     active: &mut active,
+                    authentication_task: &mut authentication_task,
                     completed: &completed_tx,
                     events: &events,
                     session_store: session_store.as_ref(),
@@ -534,6 +599,10 @@ async fn run_supervisor(
                 ).await;
             }
         }
+    }
+    if let Some(task) = authentication_task {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -607,6 +676,7 @@ struct CommandContext<'a> {
     sessions: &'a mut HashMap<String, RuntimeSession>,
     pending_options: &'a mut HashMap<String, ModelOptions>,
     active: &'a mut Option<ActiveTurn>,
+    authentication_task: &'a mut Option<tokio::task::JoinHandle<()>>,
     completed: &'a mpsc::Sender<CompletedTurn>,
     events: &'a mpsc::Sender<BackendEvent>,
     session_store: Option<&'a RuntimeSessionStore>,
@@ -616,7 +686,14 @@ struct CommandContext<'a> {
 async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_>) {
     match command {
         BackendCommand::BeginAuthentication => {
-            tokio::spawn(authenticate(context.config.clone(), context.events.clone()));
+            if let Some(task) = context.authentication_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            *context.authentication_task = Some(tokio::spawn(authenticate(
+                context.config.clone(),
+                context.events.clone(),
+            )));
         }
         BackendCommand::Reload { .. } => match context.credential {
             Some(credential) => match discover_models(context.config, credential).await {
@@ -1982,6 +2059,273 @@ async fn authenticate_inner(
     config: &BackendConfig,
     events: &mpsc::Sender<BackendEvent>,
 ) -> Result<(), String> {
+    match config.auth_flow {
+        CodexAuthFlow::Browser => authenticate_browser(config, events).await,
+        CodexAuthFlow::DeviceCode => authenticate_device_code(config, events).await,
+    }
+}
+
+struct BrowserCallbackListeners {
+    ipv4: TcpListener,
+    ipv6: Option<TcpListener>,
+}
+
+impl BrowserCallbackListeners {
+    fn port(&self) -> Result<u16, String> {
+        self.ipv4
+            .local_addr()
+            .map(|address| address.port())
+            .map_err(|error| format!("could not inspect Codex sign-in callback: {error}"))
+    }
+
+    async fn accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        if let Some(ipv6) = &self.ipv6 {
+            tokio::select! {
+                accepted = self.ipv4.accept() => accepted,
+                accepted = ipv6.accept() => accepted,
+            }
+        } else {
+            self.ipv4.accept().await
+        }
+    }
+}
+
+async fn authenticate_browser(
+    config: &BackendConfig,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), String> {
+    let listener = bind_browser_callback(&config.callback_ports).await?;
+    let port = listener.port()?;
+    let redirect_uri = format!("http://localhost:{port}{BROWSER_CALLBACK_PATH}");
+    let state = Uuid::now_v7().simple().to_string();
+    let verifier = pkce_verifier();
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let verification_url = browser_authorization_url(
+        &config.auth_urls.authorize,
+        &redirect_uri,
+        &state,
+        &challenge,
+    )?;
+    events
+        .send(BackendEvent::AuthenticationChallenge {
+            login_id: state.clone(),
+            verification_url,
+            user_code: String::new(),
+        })
+        .await
+        .map_err(|_| "Codex sign-in was cancelled".to_owned())?;
+    let (code, mut callback) = timeout(
+        BROWSER_AUTHENTICATION_TIMEOUT,
+        receive_browser_authorization_code(&listener, &state),
+    )
+    .await
+    .map_err(|_| "Codex sign-in timed out. Retry sign-in from Provider Auth.".to_owned())??;
+    let credential = match exchange_browser_token(config, &code, &verifier, &redirect_uri).await {
+        Ok(credential) => credential,
+        Err(error) => {
+            respond_to_browser_callback(
+                &mut callback,
+                "400 Bad Request",
+                "Codex sign-in could not be completed. Return to Nakode and retry.",
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    respond_to_browser_callback(
+        &mut callback,
+        "200 OK",
+        "Codex sign-in is complete. Return to Nakode.",
+    )
+    .await;
+    events
+        .send(BackendEvent::AuthenticationCompleted {
+            kind: "chatgpt_oauth".to_owned(),
+            metadata: serde_json::to_value(credential)
+                .map_err(|error| safe_adapter_error("credential serialization failed", &error))?,
+        })
+        .await
+        .map_err(|_| "Codex sign-in was cancelled".to_owned())
+}
+
+async fn bind_browser_callback(ports: &[u16]) -> Result<BrowserCallbackListeners, String> {
+    let mut last_error = None;
+    for port in ports {
+        match TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *port)).await {
+            Ok(ipv4) => {
+                let bound_port = ipv4
+                    .local_addr()
+                    .map_err(|error| format!("could not inspect Codex sign-in callback: {error}"))?
+                    .port();
+                let ipv6 =
+                    TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), bound_port))
+                        .await
+                        .ok();
+                return Ok(BrowserCallbackListeners { ipv4, ipv6 });
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "could not start the Codex sign-in callback: {}",
+        last_error.map_or_else(
+            || "no callback ports configured".to_owned(),
+            |error| error.to_string()
+        )
+    ))
+}
+
+fn pkce_verifier() -> String {
+    format!(
+        "{}{}{}",
+        Uuid::now_v7().simple(),
+        Uuid::now_v7().simple(),
+        Uuid::now_v7().simple()
+    )
+}
+
+fn browser_authorization_url(
+    authorize_url: &str,
+    redirect_uri: &str,
+    state: &str,
+    challenge: &str,
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(authorize_url)
+        .map_err(|error| format!("Codex sign-in URL is invalid: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", OPENAI_CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", OAUTH_SCOPES)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("id_token_add_organizations", "true")
+        .append_pair("codex_cli_simplified_flow", "true")
+        .append_pair("state", state)
+        .append_pair("originator", "codex_cli_rs");
+    Ok(url.into())
+}
+
+async fn receive_browser_authorization_code(
+    listener: &BrowserCallbackListeners,
+    expected_state: &str,
+) -> Result<(String, TcpStream), String> {
+    loop {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("Codex sign-in callback failed: {error}"))?;
+        match parse_browser_callback(&mut stream, expected_state).await {
+            Ok(code) => return Ok((code, stream)),
+            Err(message) => {
+                respond_to_browser_callback(&mut stream, "400 Bad Request", &message).await;
+                if message == "Codex sign-in was not completed. Retry sign-in from Provider Auth." {
+                    return Err(message);
+                }
+            }
+        }
+    }
+}
+
+async fn parse_browser_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<String, String> {
+    let request = timeout(Duration::from_secs(5), async {
+        let mut request = Vec::with_capacity(1_024);
+        let mut buffer = [0_u8; 1_024];
+        loop {
+            let bytes = stream
+                .read(&mut buffer)
+                .await
+                .map_err(|error| format!("could not read Codex sign-in callback: {error}"))?;
+            if bytes == 0 {
+                return Err("Codex sign-in callback ended before its headers".to_owned());
+            }
+            request.extend_from_slice(&buffer[..bytes]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(request);
+            }
+            if request.len() >= 8_192 {
+                return Err("Codex sign-in callback headers were too large".to_owned());
+            }
+        }
+    })
+    .await
+    .map_err(|_| "Codex sign-in callback connection timed out".to_owned())??;
+    let request = std::str::from_utf8(&request)
+        .map_err(|_| "Codex sign-in callback was not valid UTF-8".to_owned())?;
+    let mut request_line = request
+        .lines()
+        .next()
+        .into_iter()
+        .flat_map(str::split_whitespace);
+    if request_line.next() != Some("GET") {
+        return Err("Codex sign-in callback must use GET".to_owned());
+    }
+    let target = request_line
+        .next()
+        .ok_or_else(|| "Codex sign-in callback was malformed".to_owned())?;
+    let url = reqwest::Url::parse(&format!("http://localhost{target}"))
+        .map_err(|_| "Codex sign-in callback URL was malformed".to_owned())?;
+    if url.path() != BROWSER_CALLBACK_PATH {
+        return Err("Unexpected Codex sign-in callback path".to_owned());
+    }
+    let parameters = url.query_pairs().collect::<HashMap<_, _>>();
+    if parameters.get("state").map(AsRef::as_ref) != Some(expected_state) {
+        return Err("Codex sign-in callback state did not match".to_owned());
+    }
+    if parameters.contains_key("error") {
+        return Err(
+            "Codex sign-in was not completed. Retry sign-in from Provider Auth.".to_owned(),
+        );
+    }
+    parameters
+        .get("code")
+        .filter(|code| !code.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "Codex sign-in callback did not include a code".to_owned())
+}
+
+async fn respond_to_browser_callback(stream: &mut TcpStream, status: &str, message: &str) {
+    let body = format!("<html><body><p>{message}</p></body></html>");
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+async fn exchange_browser_token(
+    config: &BackendConfig,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<CodexCredential, String> {
+    let response = config
+        .client
+        .post(&config.auth_urls.token)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", OPENAI_CLIENT_ID),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await
+        .map_err(|error| safe_adapter_error("token exchange failed", &error))?;
+    if !response.status().is_success() {
+        return Err(format!("token exchange returned {}", response.status()));
+    }
+    let payload = read_bounded_auth_json(response, "invalid token response").await?;
+    credential_from_token_payload(&payload, None)
+}
+
+async fn authenticate_device_code(
+    config: &BackendConfig,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), String> {
     let response = config
         .client
         .post(&config.auth_urls.user_code)
@@ -2799,6 +3143,174 @@ mod tests {
         assert_eq!(credential.email.as_deref(), Some("quill@example.test"));
     }
 
+    #[tokio::test]
+    async fn ordinary_authentication_uses_browser_pkce_and_completes_from_callback() {
+        let token_body = r#"{"access_token":"header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC1icm93c2VyIn0sImh0dHBzOi8vL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJicm93c2VyQGV4YW1wbGUudGVzdCJ9fQ.signature","refresh_token":"refresh-browser","expires_in":3600}"#;
+        let (base_url, token_server) =
+            serve_sequence(vec![(200, "application/json", token_body)]).await;
+        let callback_port = available_local_port().await;
+        let config = BackendConfig::native(PathBuf::from("."))
+            .with_auth_urls(&base_url)
+            .with_callback_port(callback_port);
+        let (events, mut receiver) = mpsc::channel(4);
+        let authentication =
+            tokio::spawn(async move { authenticate_inner(&config, &events).await });
+
+        let (verification_url, state) = match receiver.recv().await {
+            Some(BackendEvent::AuthenticationChallenge {
+                verification_url,
+                login_id,
+                user_code,
+            }) => {
+                assert!(user_code.is_empty());
+                (verification_url, login_id)
+            }
+            event => panic!("expected browser authentication challenge, got {event:?}"),
+        };
+        let authorization_url = reqwest::Url::parse(&verification_url).expect("authorization URL");
+        assert_eq!(authorization_url.path(), "/oauth/authorize");
+        let parameters = authorization_url.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            parameters.get("response_type").map(AsRef::as_ref),
+            Some("code")
+        );
+        assert_eq!(
+            parameters.get("state").map(AsRef::as_ref),
+            Some(state.as_str())
+        );
+        assert_eq!(
+            parameters.get("code_challenge_method").map(AsRef::as_ref),
+            Some("S256")
+        );
+        assert!(
+            parameters
+                .get("code_challenge")
+                .is_some_and(|value| !value.is_empty())
+        );
+
+        let mut callback = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, callback_port))
+            .await
+            .expect("connect callback");
+        callback
+            .write_all(
+                format!(
+                    "GET {BROWSER_CALLBACK_PATH}?code=browser-code&state={state} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send callback");
+        let mut callback_response = String::new();
+        callback
+            .read_to_string(&mut callback_response)
+            .await
+            .expect("read callback response");
+        assert!(callback_response.starts_with("HTTP/1.1 200 OK"));
+
+        authentication
+            .await
+            .expect("authentication task")
+            .expect("browser authentication succeeds");
+        match receiver.recv().await {
+            Some(BackendEvent::AuthenticationCompleted { kind, metadata }) => {
+                assert_eq!(kind, "chatgpt_oauth");
+                assert_eq!(metadata["account_id"], "account-browser");
+                assert_eq!(metadata["refresh_token"], "refresh-browser");
+            }
+            event => panic!("expected authentication completion, got {event:?}"),
+        }
+        let requests = token_server.await.expect("token server");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /oauth/token "));
+        assert!(requests[0].contains("grant_type=authorization_code"));
+        assert!(requests[0].contains("code=browser-code"));
+        assert!(requests[0].contains("redirect_uri=http%3A%2F%2Flocalhost%3A"));
+        assert!(requests[0].contains("code_verifier="));
+    }
+
+    #[tokio::test]
+    async fn browser_callback_accepts_ipv6_localhost_when_available() {
+        let listeners = bind_browser_callback(&[0])
+            .await
+            .expect("callback listeners");
+        if listeners.ipv6.is_none() {
+            return;
+        }
+        let port = listeners.port().expect("callback port");
+        let callback = tokio::spawn(async move {
+            receive_browser_authorization_code(&listeners, "expected-state").await
+        });
+        let mut browser = tokio::net::TcpStream::connect((Ipv6Addr::LOCALHOST, port))
+            .await
+            .expect("connect IPv6 callback");
+        browser
+            .write_all(
+                b"GET /auth/callback?code=ipv6-code&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .expect("send IPv6 callback");
+
+        let (code, _) = callback
+            .await
+            .expect("callback task")
+            .expect("IPv6 callback succeeds");
+        assert_eq!(code, "ipv6-code");
+    }
+
+    #[tokio::test]
+    async fn device_code_authentication_requires_explicit_opt_in() {
+        let token_body = r#"{"access_token":"header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC1icm93c2VyIn0sImh0dHBzOi8vL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJicm93c2VyQGV4YW1wbGUudGVzdCJ9fQ.signature","refresh_token":"refresh-device","expires_in":3600}"#;
+        let (base_url, server) = serve_sequence(vec![
+            (
+                200,
+                "application/json",
+                r#"{"device_auth_id":"device-id","user_code":"NAKODE-CODE","interval":1}"#,
+            ),
+            (
+                200,
+                "application/json",
+                r#"{"authorization_code":"device-code","code_verifier":"device-verifier"}"#,
+            ),
+            (200, "application/json", token_body),
+        ])
+        .await;
+        let config = BackendConfig::native(PathBuf::from("."))
+            .with_auth_urls(&base_url)
+            .with_device_code_authentication();
+        let (events, mut receiver) = mpsc::channel(4);
+        let authentication =
+            tokio::spawn(async move { authenticate_inner(&config, &events).await });
+
+        match receiver.recv().await {
+            Some(BackendEvent::AuthenticationChallenge {
+                verification_url,
+                user_code,
+                ..
+            }) => {
+                assert_eq!(verification_url, format!("{base_url}/codex/device"));
+                assert_eq!(user_code, "NAKODE-CODE");
+            }
+            event => panic!("expected device authentication challenge, got {event:?}"),
+        }
+        authentication
+            .await
+            .expect("authentication task")
+            .expect("device authentication succeeds");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(BackendEvent::AuthenticationCompleted { kind, metadata })
+                if kind == "chatgpt_oauth" && metadata["refresh_token"] == "refresh-device"
+        ));
+        let requests = server.await.expect("device server");
+        assert!(requests[0].starts_with("POST /device/usercode "));
+        assert!(requests[1].starts_with("POST /device/token "));
+        assert!(requests[2].starts_with("POST /oauth/token "));
+        assert!(
+            requests[2]
+                .contains("redirect_uri=https%3A%2F%2Fauth.openai.com%2Fdeviceauth%2Fcallback")
+        );
+    }
+
     #[test]
     fn codex_request_registers_the_configured_dynamic_tools() {
         let mut request = test_request();
@@ -2980,6 +3492,13 @@ mod tests {
         assert_eq!(output.usage.output_tokens, Some(75));
         assert_eq!(output.usage.cached_input_tokens, Some(900));
         assert_eq!(output.usage.cache_write_tokens, Some(100));
+    }
+
+    async fn available_local_port() -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("reserve callback port");
+        listener.local_addr().expect("callback address").port()
     }
 
     async fn serve_sequence(
