@@ -1533,6 +1533,7 @@ pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
             .map(salvaged_evidence)
             .collect(),
         shared_context_utilization: shared_context_utilization(value.shared_context_utilization),
+        shared_context_briefing: value.shared_context_briefing.map(shared_context_briefing),
         native_session_id: value.native_session_id,
         usage: token_usage(value.usage.unwrap_or_default()),
         objective: value.objective,
@@ -1564,6 +1565,33 @@ pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
             .transpose()?,
         transcript: transcript(required(value.transcript, "run transcript")?)?,
     })
+}
+
+fn shared_context_briefing(
+    briefing: api::SharedContextBriefing,
+) -> view::SharedContextBriefingView {
+    view::SharedContextBriefingView {
+        task_packet: briefing.task_packet,
+        captured_at_ms: briefing.captured_at_ms,
+        entries: briefing
+            .entries
+            .into_iter()
+            .map(|entry| view::SharedContextBriefingEntryView {
+                source_sequence: entry.source_sequence,
+                source_id: entry.source_id,
+                source_author_run_id: entry.source_author_run_id.map(view::RunId::from),
+                source_author_label: entry.source_author_label,
+                kind: entry.kind,
+                delivered_body: entry.delivered_body,
+                source_body_bytes: entry.source_body_bytes,
+                delivered_body_bytes: entry.delivered_body_bytes,
+                truncated: entry.truncated,
+                fallback: entry.fallback,
+            })
+            .collect(),
+        fallback: briefing.fallback,
+        delivered_bytes: briefing.delivered_bytes,
+    }
 }
 
 fn shared_context_utilization(

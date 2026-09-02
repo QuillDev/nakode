@@ -15,10 +15,11 @@ use nakode_protocol::{
     RecoverablePromptView, RunId, RunOutcome, RunPage, RunPolicyView, RunSalvageView, RunStatus,
     RunTextField, RunTextWindow, RunToolDenialView, RunView, SalvagedEvidenceView, SessionActivity,
     SessionFailureClassification, SessionFailurePhase, SessionFailureView, SessionId,
-    SessionSummary, SessionView, SettingsView, SharedContextUtilizationView, SkillView,
-    TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TranscriptBodyWindow,
-    TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TurnId,
-    TurnStatus, TurnView, VisionAvailabilityView, VisionSettingsView, WebSettingsView, WorkspaceId,
+    SessionSummary, SessionView, SettingsView, SharedContextBriefingEntryView,
+    SharedContextBriefingView, SharedContextUtilizationView, SkillView, TerminalImageModeView,
+    TodoItemView, TodoPhaseView, TodoStatusView, TranscriptBodyWindow, TranscriptEntryKind,
+    TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TurnId, TurnStatus, TurnView,
+    VisionAvailabilityView, VisionSettingsView, WebSettingsView, WorkspaceId,
 };
 
 use super::{
@@ -914,6 +915,12 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
         shared_context_utilization: project_shared_context_utilization(
             &run.observability.shared_context_utilization,
         ),
+        shared_context_briefing: run
+            .observability
+            .shared_context_utilization
+            .briefing
+            .as_ref()
+            .map(project_shared_context_briefing),
         tool_denials_retained_total,
         native_session_id: run.provider_session_id.clone(),
         usage: token_usage_view(run.usage),
@@ -934,6 +941,33 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
         invocation_call_id: run.observability.invocation_call_id.clone(),
         originating_owner_entry,
         transcript,
+    }
+}
+
+fn project_shared_context_briefing(
+    briefing: &crate::session::SharedContextBriefingSnapshot,
+) -> SharedContextBriefingView {
+    SharedContextBriefingView {
+        task_packet: briefing.task_packet.clone(),
+        captured_at_ms: briefing.captured_at_ms,
+        entries: briefing
+            .entries
+            .iter()
+            .map(|entry| SharedContextBriefingEntryView {
+                source_sequence: entry.source_sequence,
+                source_id: entry.source_id.clone(),
+                source_author_run_id: entry.source_author_run_id.clone().map(RunId::from),
+                source_author_label: entry.source_author_label.clone(),
+                kind: entry.kind.clone(),
+                delivered_body: entry.delivered_body.clone(),
+                source_body_bytes: entry.source_body_bytes,
+                delivered_body_bytes: entry.delivered_body_bytes,
+                truncated: entry.truncated,
+                fallback: entry.fallback,
+            })
+            .collect(),
+        fallback: briefing.fallback,
+        delivered_bytes: briefing.delivered_bytes,
     }
 }
 

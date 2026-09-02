@@ -314,6 +314,31 @@ pub struct SharedContextUtilization {
     pub search_count: u32,
     pub search_results: u32,
     pub search_duration_ms: u64,
+    #[serde(default)]
+    pub briefing: Option<SharedContextBriefingSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SharedContextBriefingEntry {
+    pub source_sequence: u64,
+    pub source_id: String,
+    pub source_author_run_id: Option<String>,
+    pub source_author_label: String,
+    pub kind: String,
+    pub delivered_body: String,
+    pub source_body_bytes: u32,
+    pub delivered_body_bytes: u32,
+    pub truncated: bool,
+    pub fallback: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SharedContextBriefingSnapshot {
+    pub task_packet: String,
+    pub captured_at_ms: u64,
+    pub entries: Vec<SharedContextBriefingEntry>,
+    pub fallback: bool,
+    pub delivered_bytes: u32,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -6751,6 +6776,14 @@ mod tests {
     }
 
     #[test]
+    fn legacy_shared_context_utilization_defaults_to_no_briefing_snapshot() {
+        let utilization: SharedContextUtilization =
+            serde_json::from_str("{}").expect("legacy utilization json");
+        assert_eq!(utilization, SharedContextUtilization::default());
+        assert!(utilization.briefing.is_none());
+    }
+
+    #[test]
     fn shared_context_persists_order_and_deduplicates_replay() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteSessionRepository::open(directory.path().join("context.db"))?;
@@ -7038,6 +7071,24 @@ mod tests {
                     search_count: 2,
                     search_results: 4,
                     search_duration_ms: 7,
+                    briefing: Some(SharedContextBriefingSnapshot {
+                        task_packet: "inspect persisted context".to_owned(),
+                        captured_at_ms: 41,
+                        entries: vec![SharedContextBriefingEntry {
+                            source_sequence: 9,
+                            source_id: "context-9".to_owned(),
+                            source_author_run_id: Some("source-run".to_owned()),
+                            source_author_label: "repo-explorer".to_owned(),
+                            kind: "finding".to_owned(),
+                            delivered_body: "exact delivered evidence".to_owned(),
+                            source_body_bytes: 40,
+                            delivered_body_bytes: 24,
+                            truncated: true,
+                            fallback: false,
+                        }],
+                        fallback: false,
+                        delivered_bytes: 24,
+                    }),
                 },
             },
         transcript_has_earlier: true,
