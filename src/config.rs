@@ -177,6 +177,14 @@ pub enum NakodeCommand {
     /// Refresh every stale workspace service after installation.
     #[command(hide = true)]
     RestartStale,
+    /// Continue one server-authorized update inside its detached systemd handoff.
+    #[command(hide = true)]
+    RemoteUpdateHelper {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        attempt: String,
+    },
     /// Update the managed source checkout and reinstall Nakode.
     Update(UpdateOptions),
     /// Invoke a predefined agent through the native Nakode server.
@@ -415,7 +423,8 @@ impl Config {
                 Some(
                     NakodeCommand::Update(_)
                         | NakodeCommand::PurgeUnsafe
-                        | NakodeCommand::RestartStale,
+                        | NakodeCommand::RestartStale
+                        | NakodeCommand::RemoteUpdateHelper { .. },
                 )
             )
         {
@@ -464,6 +473,15 @@ impl Config {
     }
 }
 
+fn absolute_path(path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err("path must be absolute".to_owned())
+    }
+}
+
 pub(crate) fn nakode_home() -> Result<PathBuf, ConfigError> {
     if let Some(home) = std::env::var_os("NAKODE_HOME") {
         return Ok(PathBuf::from(home));
@@ -472,15 +490,6 @@ pub(crate) fn nakode_home() -> Result<PathBuf, ConfigError> {
         .map(PathBuf::from)
         .map(|home| home.join(".nakode"))
         .ok_or(ConfigError::MissingNakodeHome)
-}
-
-fn absolute_path(path: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Err("path must be absolute".to_owned())
-    }
 }
 
 fn canonicalize(path: &Path) -> Result<PathBuf, ConfigError> {

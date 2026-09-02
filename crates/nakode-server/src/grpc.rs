@@ -56,6 +56,7 @@ pub struct GrpcService {
     client_id: protocol::ClientId,
     server_id: String,
     include_activation_rpc_lanes: bool,
+    additional_capabilities: Arc<[String]>,
 }
 
 impl GrpcService {
@@ -67,6 +68,7 @@ impl GrpcService {
             client_id: protocol::ClientId::new(format!("grpc-{}", uuid::Uuid::now_v7())),
             server_id,
             include_activation_rpc_lanes: true,
+            additional_capabilities: Arc::from([]),
         }
     }
 
@@ -80,6 +82,13 @@ impl GrpcService {
     #[must_use]
     pub fn with_nakode_service_only_lane_catalogue(mut self) -> Self {
         self.include_activation_rpc_lanes = false;
+        self
+    }
+
+    /// Adds a capability implemented by another typed service bound on the same listener.
+    #[must_use]
+    pub fn with_additional_capability(mut self, capability: impl Into<String>) -> Self {
+        self.additional_capabilities = Arc::from([capability.into()]);
         self
     }
 
@@ -1889,6 +1898,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .supported
                 .iter()
                 .map(|value| format!("{value:?}"))
+                .chain(self.additional_capabilities.iter().cloned())
                 .collect(),
             server_id: self.server_id.clone(),
             build_revision: self.endpoint.build_revision().map(str::to_owned),
