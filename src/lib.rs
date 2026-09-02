@@ -18,6 +18,7 @@ pub mod devin;
 pub mod diagnostics;
 pub mod domain_transcript;
 pub mod editor;
+pub mod execution_host;
 pub mod glm;
 pub mod handoff;
 mod herdr;
