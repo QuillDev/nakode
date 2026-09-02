@@ -155,10 +155,18 @@ pub enum ProviderAuthenticationView {
     Challenge {
         verification_url: String,
         user_code: String,
+        /// Non-secret login identity used to fence a pasted callback.
+        #[serde(default)]
+        login_id: String,
+        /// Exact loopback redirect URI expected by this challenge, if applicable.
+        #[serde(default)]
+        callback_url: Option<String>,
     },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// These are independent server capabilities/status facts, not one combinatorial state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ProviderView {
     pub id: ProviderId,
     pub display_name: String,
@@ -183,6 +191,10 @@ pub struct ProviderView {
     /// `None` means an older or non-authoritative projection, never an unrestricted default.
     #[serde(default)]
     pub available_builtin_tools: Option<Vec<String>>,
+    /// Whether the provider can complete interactive authentication from a remote client without
+    /// opening a callback on the server's machine.
+    #[serde(default)]
+    pub remote_authentication_supported: bool,
     /// Redacted account metadata; credential payloads never cross the protocol boundary.
     #[serde(default)]
     pub accounts: Vec<ProviderAccountView>,

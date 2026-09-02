@@ -56,6 +56,7 @@ pub struct GrpcService {
     client_id: protocol::ClientId,
     server_id: String,
     include_activation_rpc_lanes: bool,
+    additional_capabilities: Arc<[String]>,
 }
 
 impl GrpcService {
@@ -67,6 +68,7 @@ impl GrpcService {
             client_id: protocol::ClientId::new(format!("grpc-{}", uuid::Uuid::now_v7())),
             server_id,
             include_activation_rpc_lanes: true,
+            additional_capabilities: Arc::from([]),
         }
     }
 
@@ -80,6 +82,13 @@ impl GrpcService {
     #[must_use]
     pub fn with_nakode_service_only_lane_catalogue(mut self) -> Self {
         self.include_activation_rpc_lanes = false;
+        self
+    }
+
+    /// Adds a capability implemented by another typed service bound on the same listener.
+    #[must_use]
+    pub fn with_additional_capability(mut self, capability: impl Into<String>) -> Self {
+        self.additional_capabilities = Arc::from([capability.into()]);
         self
     }
 
@@ -1396,7 +1405,18 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         api::BeginProviderAuthenticationRequest,
         input,
         protocol::Command::BeginProviderAuthentication {
-            provider_id: protocol::ProviderId::from(input.provider_id)
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            client_context: client_context(input.client_context),
+        }
+    );
+    command_rpc!(
+        submit_provider_authentication_callback,
+        api::SubmitProviderAuthenticationCallbackRequest,
+        input,
+        protocol::Command::SubmitProviderAuthenticationCallback {
+            provider_id: protocol::ProviderId::from(input.provider_id),
+            account_id: input.account_id,
+            callback_url: input.callback_url,
         }
     );
     command_rpc!(
@@ -1441,6 +1461,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         protocol::Command::BeginProviderAccountAuthentication {
             provider_id: protocol::ProviderId::from(input.provider_id),
             account_id: input.account_id,
+            client_context: client_context(input.client_context),
         }
     );
     command_rpc!(
@@ -1902,6 +1923,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .supported
                 .iter()
                 .map(|value| format!("{value:?}"))
+                .chain(self.additional_capabilities.iter().cloned())
                 .collect(),
             server_id: self.server_id.clone(),
             build_revision: self.endpoint.build_revision().map(str::to_owned),
@@ -2369,6 +2391,14 @@ fn routing_diagnostic(
     }
 }
 
+fn client_context(value: i32) -> protocol::ClientContext {
+    match api::ClientContext::try_from(value).unwrap_or_default() {
+        api::ClientContext::Unspecified => protocol::ClientContext::Unspecified,
+        api::ClientContext::Local => protocol::ClientContext::Local,
+        api::ClientContext::Remote => protocol::ClientContext::Remote,
+    }
+}
+
 fn provider(value: protocol::ProviderView) -> api::Provider {
     let supported_builtin_tools = value.supported_builtin_tools;
     let available_builtin_tools = value.available_builtin_tools;
@@ -2392,6 +2422,7 @@ fn provider(value: protocol::ProviderView) -> api::Provider {
         available_builtin_tools: available_builtin_tools.unwrap_or_default(),
         builtin_tool_support_known: supported_builtin_tools.is_some(),
         supported_builtin_tools: supported_builtin_tools.unwrap_or_default(),
+        remote_authentication_supported: value.remote_authentication_supported,
         accounts: value.accounts.into_iter().map(provider_account).collect(),
     }
 }
@@ -2474,10 +2505,14 @@ fn authentication(value: protocol::ProviderAuthenticationView) -> api::ProviderA
         protocol::ProviderAuthenticationView::Challenge {
             verification_url,
             user_code,
+            login_id,
+            callback_url,
         } => api::ProviderAuthentication {
             kind: Kind::Challenge as i32,
             verification_url: Some(verification_url),
             user_code: Some(user_code),
+            login_id: Some(login_id),
+            callback_url,
             ..Default::default()
         },
     }
@@ -3672,6 +3707,7 @@ mod tests {
             supported_builtin_tools: Some(Vec::new()),
             available_builtin_tools,
             accounts: Vec::new(),
+            remote_authentication_supported: false,
         };
 
         let known = provider(view(Some(Vec::new())));

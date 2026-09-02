@@ -1149,6 +1149,7 @@ fn toggle_provider(state: &mut TuiState, bootstrap: &BootstrapView) -> InputOutc
     InputOutcome {
         commands: vec![CommandIntent::new(Command::BeginProviderAuthentication {
             provider_id: provider.id,
+            client_context: nakode_protocol::ClientContext::Unspecified,
         })],
         ..InputOutcome::default()
     }
@@ -1927,6 +1928,7 @@ mod tests {
             supported_builtin_tools: Some(Vec::new()),
             available_builtin_tools: Some(Vec::new()),
             accounts: Vec::new(),
+            remote_authentication_supported: false,
         }
     }
 
@@ -1952,7 +1954,10 @@ mod tests {
             assert_eq!(outcome.commands.len(), 1);
             assert!(matches!(
                 &outcome.commands[0].command,
-                Command::BeginProviderAuthentication { provider_id }
+                Command::BeginProviderAuthentication {
+                    provider_id,
+                    client_context: nakode_protocol::ClientContext::Unspecified,
+                }
                     if provider_id.as_str() == "openai-codex"
             ));
             assert!(matches!(

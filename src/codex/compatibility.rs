@@ -381,7 +381,7 @@ async fn finish(
 fn requires_initialization(command: &BackendCommand) -> bool {
     matches!(
         command,
-        BackendCommand::BeginAuthentication
+        BackendCommand::BeginAuthentication { .. }
             | BackendCommand::StartSession { .. }
             | BackendCommand::ResumeSession { .. }
             | BackendCommand::UnsubscribeSession { .. }
@@ -422,6 +422,7 @@ async fn handle_command(
         | BackendCommand::ResolveApproval { .. }
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::ResolveExternalTool { .. }
+        | BackendCommand::SubmitAuthenticationCallback { .. }
         | BackendCommand::Shutdown => return Ok(()),
         _ => {}
     }
@@ -515,7 +516,7 @@ fn command_request(
             "turn/interrupt",
             json!({"threadId": provider_session_id, "turnId": turn_id}),
         ),
-        BackendCommand::BeginAuthentication => (
+        BackendCommand::BeginAuthentication { .. } => (
             BackendOperation::Authenticate,
             "account/login/start",
             json!({"type": "chatgptDeviceCode"}),
@@ -527,6 +528,7 @@ fn command_request(
         | BackendCommand::ResolveApproval { .. }
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::ResolveExternalTool { .. }
+        | BackendCommand::SubmitAuthenticationCallback { .. }
         | BackendCommand::Shutdown => unreachable!(),
     }
 }
@@ -715,6 +717,7 @@ async fn handle_codex_rpc_response(
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
+                    callback_url: None,
                 })
                 .await
                 .map_err(|_| ())?;

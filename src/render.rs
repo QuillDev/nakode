@@ -2601,6 +2601,7 @@ mod tests {
             model_candidates: Vec::new(),
             supported_builtin_tools: Some(Vec::new()),
             available_builtin_tools: Some(Vec::new()),
+            remote_authentication_supported: false,
         }
     }
 
@@ -3346,6 +3347,8 @@ mod tests {
         codex.authentication = Some(ProviderAuthenticationView::Challenge {
             verification_url: "https://app.example.test/auth/cli/continue".to_owned(),
             user_code: String::new(),
+            login_id: String::new(),
+            callback_url: None,
         });
         view.providers = vec![codex];
         let mut state = TuiState::from_bootstrap(&view, 100);

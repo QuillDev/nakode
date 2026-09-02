@@ -1039,6 +1039,8 @@ enum ProviderAuthenticationState {
     Challenge {
         verification_url: String,
         user_code: String,
+        login_id: String,
+        callback_url: Option<String>,
     },
 }
 
@@ -1229,7 +1231,15 @@ pub enum Effect {
         provider: String,
         enabled: bool,
     },
-    AuthenticateProvider(String),
+    AuthenticateProvider {
+        provider: String,
+        client_context: crate::backend::ClientContext,
+    },
+    SubmitProviderAuthenticationCallback {
+        provider: String,
+        account_id: Option<String>,
+        callback_url: String,
+    },
     AddProviderAccount {
         provider: String,
         label: String,
@@ -1237,6 +1247,7 @@ pub enum Effect {
     AuthenticateProviderAccount {
         provider: String,
         account_id: String,
+        client_context: crate::backend::ClientContext,
     },
     SetProviderAccountLabel {
         provider: String,
@@ -1534,6 +1545,39 @@ pub struct DomainState {
 /// convenience methods.
 #[cfg(test)]
 pub type AppState = DomainState;
+
+fn validate_loopback_callback(
+    callback_url: &str,
+    expected_url: &str,
+    expected_state: &str,
+) -> Result<(), DomainCommandError> {
+    let actual = reqwest::Url::parse(callback_url)
+        .map_err(|_| DomainCommandError::Invalid("callback URL is malformed".to_owned()))?;
+    let expected = reqwest::Url::parse(expected_url).map_err(|_| {
+        DomainCommandError::Invalid("pending callback challenge is malformed".to_owned())
+    })?;
+    let valid_host = matches!(actual.host_str(), Some("localhost" | "127.0.0.1"));
+    let state_values = actual
+        .query_pairs()
+        .filter(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
+        .collect::<Vec<_>>();
+    if actual.scheme() != "http"
+        || !valid_host
+        || actual.username() != ""
+        || actual.password().is_some()
+        || actual.fragment().is_some()
+        || actual.port_or_known_default() != expected.port_or_known_default()
+        || actual.path() != expected.path()
+        || state_values.len() != 1
+        || state_values[0] != expected_state
+    {
+        return Err(DomainCommandError::Invalid(
+            "callback URL does not match the pending localhost challenge".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 impl DomainState {
     pub(crate) fn workspace_configuration_matches(&self, source: &Self) -> bool {
@@ -3362,7 +3406,10 @@ impl DomainState {
             self.provider_authentication
                 .insert(provider_id, ProviderAuthenticationState::Starting);
             self.status_message = format!("Starting {} authentication…", provider.display_name);
-            return vec![Effect::AuthenticateProvider(provider.provider.clone())];
+            return vec![Effect::AuthenticateProvider {
+                provider: provider.provider.clone(),
+                client_context: crate::backend::ClientContext::Unspecified,
+            }];
         }
         provider.enabled = !provider.enabled;
         self.status_message = format!(
@@ -3503,11 +3550,15 @@ impl DomainState {
         &mut self,
         provider: &str,
         display_name: &str,
+        client_context: crate::backend::ClientContext,
     ) -> Vec<Effect> {
         self.provider_authentication
             .insert(provider.to_owned(), ProviderAuthenticationState::Starting);
         self.set_status(&format!("Starting {display_name} authentication…"));
-        vec![Effect::AuthenticateProvider(provider.to_owned())]
+        vec![Effect::AuthenticateProvider {
+            provider: provider.to_owned(),
+            client_context,
+        }]
     }
 
     pub fn begin_provider_account_authentication(
@@ -3515,6 +3566,7 @@ impl DomainState {
         provider: &str,
         account_id: &str,
         display_name: &str,
+        client_context: crate::backend::ClientContext,
     ) -> Vec<Effect> {
         self.provider_account_authentication.insert(
             (provider.to_owned(), account_id.to_owned()),
@@ -3524,9 +3576,53 @@ impl DomainState {
         vec![Effect::AuthenticateProviderAccount {
             provider: provider.to_owned(),
             account_id: account_id.to_owned(),
+            client_context,
         }]
     }
 
+    /// # Errors
+    /// Returns a conflict when there is no matching pending provider/account challenge, or an
+    /// invalid-input error when the pasted URL does not exactly match its loopback redirect/state.
+    pub fn submit_provider_authentication_callback(
+        &mut self,
+        provider: &str,
+        account_id: Option<&str>,
+        callback_url: String,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        let challenge = account_id.map_or_else(
+            || self.provider_authentication.get(provider),
+            |account_id| {
+                self.provider_account_authentication
+                    .get(&(provider.to_owned(), account_id.to_owned()))
+            },
+        );
+        let Some(ProviderAuthenticationState::Challenge {
+            login_id,
+            callback_url: Some(expected_callback),
+            ..
+        }) = challenge
+        else {
+            return Err(DomainCommandError::Conflict(
+                "no in-progress loopback authentication challenge for this provider/account"
+                    .to_owned(),
+            ));
+        };
+        validate_loopback_callback(&callback_url, expected_callback, login_id)?;
+        if let Some(account_id) = account_id {
+            self.provider_account_authentication.insert(
+                (provider.to_owned(), account_id.to_owned()),
+                ProviderAuthenticationState::Starting,
+            );
+        } else {
+            self.provider_authentication
+                .insert(provider.to_owned(), ProviderAuthenticationState::Starting);
+        }
+        Ok(vec![Effect::SubmitProviderAuthenticationCallback {
+            provider: provider.to_owned(),
+            account_id: account_id.map(str::to_owned),
+            callback_url,
+        }])
+    }
     pub fn provider_account_authentication_failed(
         &mut self,
         provider: &str,
@@ -6634,15 +6730,18 @@ impl DomainState {
         let key = (provider.to_owned(), account_id.to_owned());
         match event {
             BackendEvent::AuthenticationChallenge {
+                login_id,
                 verification_url,
                 user_code,
-                ..
+                callback_url,
             } => {
                 self.provider_account_authentication.insert(
                     key,
                     ProviderAuthenticationState::Challenge {
                         verification_url: verification_url.clone(),
                         user_code: user_code.clone(),
+                        login_id: login_id.clone(),
+                        callback_url: callback_url.clone(),
                     },
                 );
                 self.set_status("Complete the account authentication in your browser.");
@@ -6805,15 +6904,18 @@ impl DomainState {
     ) -> Option<Vec<Effect>> {
         match event {
             BackendEvent::AuthenticationChallenge {
+                login_id,
                 verification_url,
                 user_code,
-                ..
+                callback_url,
             } => {
                 self.provider_authentication.insert(
                     provider.to_owned(),
                     ProviderAuthenticationState::Challenge {
                         verification_url: verification_url.clone(),
                         user_code: user_code.clone(),
+                        login_id: login_id.clone(),
+                        callback_url: callback_url.clone(),
                     },
                 );
                 self.set_status("Complete provider sign-in in your browser.");
@@ -11019,6 +11121,7 @@ mod tests {
         MAX_SHARED_CONTEXT_BRIEFING_ENTRIES, ProviderContext, SubagentStatus,
         append_archetype_policy_instructions, model_supports_options, objective_mismatch_handoff,
         parse_continuation_proposition, sanitize_client_instructions, shared_context_briefing,
+        validate_loopback_callback,
     };
 
     #[test]
@@ -19069,8 +19172,18 @@ model = "claude-agent/sonnet"
     #[test]
     fn provider_account_authentication_is_scoped_per_account() {
         let mut state = ready_state();
-        let _ = state.begin_provider_account_authentication(CODEX_PROVIDER, "account-a", "Codex");
-        let _ = state.begin_provider_account_authentication(CODEX_PROVIDER, "account-b", "Codex");
+        let _ = state.begin_provider_account_authentication(
+            CODEX_PROVIDER,
+            "account-a",
+            "Codex",
+            crate::backend::ClientContext::Unspecified,
+        );
+        let _ = state.begin_provider_account_authentication(
+            CODEX_PROVIDER,
+            "account-b",
+            "Codex",
+            crate::backend::ClientContext::Unspecified,
+        );
 
         let _ = state.handle_provider_account_backend(
             CODEX_PROVIDER,
@@ -19079,6 +19192,7 @@ model = "claude-agent/sonnet"
                 login_id: "login-a".to_owned(),
                 verification_url: "https://example.test/a".to_owned(),
                 user_code: "CODE-A".to_owned(),
+                callback_url: None,
             },
         );
         let _ = state.handle_provider_account_backend(
@@ -19088,6 +19202,7 @@ model = "claude-agent/sonnet"
                 login_id: "login-b".to_owned(),
                 verification_url: "https://example.test/b".to_owned(),
                 user_code: "CODE-B".to_owned(),
+                callback_url: None,
             },
         );
         state.provider_account_health.insert(
@@ -19167,7 +19282,12 @@ model = "claude-agent/sonnet"
     #[test]
     fn provider_account_authentication_failure_is_actionable() {
         let mut state = ready_state();
-        let _ = state.begin_provider_account_authentication(CODEX_PROVIDER, "account-a", "Codex");
+        let _ = state.begin_provider_account_authentication(
+            CODEX_PROVIDER,
+            "account-a",
+            "Codex",
+            crate::backend::ClientContext::Unspecified,
+        );
 
         let effects = state.handle_provider_account_backend(
             CODEX_PROVIDER,
@@ -19232,6 +19352,93 @@ model = "claude-agent/sonnet"
     }
 
     #[test]
+    fn loopback_callback_requires_the_exact_pending_challenge() {
+        let expected = "http://127.0.0.1:1455/callback";
+        assert!(
+            validate_loopback_callback(
+                "http://localhost:1455/callback?state=expected&result=accepted",
+                expected,
+                "expected",
+            )
+            .is_ok()
+        );
+
+        for invalid in [
+            "https://localhost:1455/callback?state=expected",
+            "http://example.test:1455/callback?state=expected",
+            "http://user@localhost:1455/callback?state=expected",
+            "http://localhost:1456/callback?state=expected",
+            "http://localhost:1455/other?state=expected",
+            "http://localhost:1455/callback",
+            "http://localhost:1455/callback?state=wrong",
+            "http://localhost:1455/callback?state=expected&state=expected",
+            "http://localhost:1455/callback?state=expected#fragment",
+        ] {
+            assert!(
+                validate_loopback_callback(invalid, expected, "expected").is_err(),
+                "accepted invalid callback shape: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_callback_is_fenced_to_the_exact_account_challenge() {
+        let mut state = ready_state();
+        state.handle_provider_account_backend(
+            CLAUDE_PROVIDER,
+            "account-a",
+            BackendEvent::AuthenticationChallenge {
+                login_id: "state-a".to_owned(),
+                verification_url: "https://example.test/authorize".to_owned(),
+                user_code: String::new(),
+                callback_url: Some("http://localhost:1455/callback".to_owned()),
+            },
+        );
+
+        let pasted = "http://localhost:1455/callback?state=state-a&result=accepted";
+        assert!(
+            state
+                .submit_provider_authentication_callback(
+                    CLAUDE_PROVIDER,
+                    Some("account-b"),
+                    pasted.to_owned(),
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .submit_provider_authentication_callback(
+                    CODEX_PROVIDER,
+                    Some("account-a"),
+                    pasted.to_owned(),
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            state
+                .submit_provider_authentication_callback(
+                    CLAUDE_PROVIDER,
+                    Some("account-a"),
+                    pasted.to_owned(),
+                )
+                .expect("matching challenge")
+                .as_slice(),
+            [Effect::SubmitProviderAuthenticationCallback { provider, account_id: Some(account_id), callback_url }]
+                if provider == CLAUDE_PROVIDER && account_id == "account-a" && callback_url == pasted
+        ));
+        assert!(
+            state
+                .submit_provider_authentication_callback(
+                    CLAUDE_PROVIDER,
+                    Some("account-a"),
+                    pasted.to_owned(),
+                )
+                .is_err(),
+            "an accepted callback must consume its pending challenge"
+        );
+    }
+
+    #[test]
     fn unconfigured_provider_starts_authentication_before_enablement() {
         let mut state = ready_state();
         state.client.editor.set_text("/providers");
@@ -19249,7 +19456,7 @@ model = "claude-agent/sonnet"
 
         assert!(matches!(
             state.toggle_provider().as_slice(),
-            [Effect::AuthenticateProvider(provider)] if provider == CODEX_PROVIDER
+            [Effect::AuthenticateProvider { provider, .. }] if provider == CODEX_PROVIDER
         ));
         assert!(matches!(
             state.provider_authentication.get(CODEX_PROVIDER),
@@ -19262,6 +19469,7 @@ model = "claude-agent/sonnet"
                 login_id: "login-1".to_owned(),
                 verification_url: "https://example.test/device".to_owned(),
                 user_code: "NAKODE-CODE".to_owned(),
+                callback_url: None,
             },
         );
         assert!(matches!(

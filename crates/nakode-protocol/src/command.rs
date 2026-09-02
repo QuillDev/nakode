@@ -244,6 +244,15 @@ pub enum SettingsPatch {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientContext {
+    #[default]
+    Unspecified,
+    Local,
+    Remote,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 // Keep commands as value-shaped protocol messages. Boxing only this variant would alter the public
@@ -483,6 +492,16 @@ pub enum Command {
     },
     BeginProviderAuthentication {
         provider_id: ProviderId,
+        #[serde(default)]
+        client_context: ClientContext,
+    },
+    /// Submits the complete callback URL copied from a browser. The server validates it against
+    /// the currently pending challenge before relaying it to the provider's loopback listener.
+    SubmitProviderAuthenticationCallback {
+        provider_id: ProviderId,
+        #[serde(default)]
+        account_id: Option<String>,
+        callback_url: String,
     },
     SetProviderCredential {
         provider_id: ProviderId,
@@ -502,6 +521,8 @@ pub enum Command {
     BeginProviderAccountAuthentication {
         provider_id: ProviderId,
         account_id: String,
+        #[serde(default)]
+        client_context: ClientContext,
     },
     SetProviderAccountCredential {
         provider_id: ProviderId,

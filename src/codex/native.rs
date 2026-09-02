@@ -559,6 +559,7 @@ async fn run_supervisor(
     let mut pending_options = HashMap::<String, ModelOptions>::new();
     let mut active: Option<ActiveTurn> = None;
     let mut authentication_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut authentication_callback: Option<mpsc::Sender<String>> = None;
     let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedTurn>(8);
 
     loop {
@@ -581,6 +582,7 @@ async fn run_supervisor(
                     pending_options: &mut pending_options,
                     active: &mut active,
                     authentication_task: &mut authentication_task,
+                    authentication_callback: &mut authentication_callback,
                     completed: &completed_tx,
                     events: &events,
                     session_store: session_store.as_ref(),
@@ -677,6 +679,7 @@ struct CommandContext<'a> {
     pending_options: &'a mut HashMap<String, ModelOptions>,
     active: &'a mut Option<ActiveTurn>,
     authentication_task: &'a mut Option<tokio::task::JoinHandle<()>>,
+    authentication_callback: &'a mut Option<mpsc::Sender<String>>,
     completed: &'a mpsc::Sender<CompletedTurn>,
     events: &'a mpsc::Sender<BackendEvent>,
     session_store: Option<&'a RuntimeSessionStore>,
@@ -685,15 +688,38 @@ struct CommandContext<'a> {
 #[allow(clippy::too_many_lines)]
 async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_>) {
     match command {
-        BackendCommand::BeginAuthentication => {
+        BackendCommand::BeginAuthentication { client_context } => {
             if let Some(task) = context.authentication_task.take() {
                 task.abort();
                 let _ = task.await;
             }
+            let (callback_tx, callback_rx) = mpsc::channel(1);
+            *context.authentication_callback = Some(callback_tx);
             *context.authentication_task = Some(tokio::spawn(authenticate(
+                client_context,
                 context.config.clone(),
                 context.events.clone(),
+                callback_rx,
             )));
+        }
+        BackendCommand::SubmitAuthenticationCallback { callback_url } => {
+            let Some(callback) = context.authentication_callback.as_ref() else {
+                request_failed(
+                    context.events,
+                    BackendOperation::Authenticate,
+                    "no in-progress browser authentication challenge",
+                )
+                .await;
+                return;
+            };
+            if callback.send(callback_url).await.is_err() {
+                request_failed(
+                    context.events,
+                    BackendOperation::Authenticate,
+                    "browser authentication challenge is no longer active",
+                )
+                .await;
+            }
         }
         BackendCommand::Reload { .. } => match context.credential {
             Some(credential) => match discover_models(context.config, credential).await {
@@ -2049,8 +2075,13 @@ async fn read_bounded_auth_json(
     serde_json::from_slice(&body).map_err(|error| safe_adapter_error(context, &error))
 }
 
-async fn authenticate(config: BackendConfig, events: mpsc::Sender<BackendEvent>) {
-    if let Err(error) = authenticate_inner(&config, &events).await {
+async fn authenticate(
+    client_context: crate::backend::ClientContext,
+    config: BackendConfig,
+    events: mpsc::Sender<BackendEvent>,
+    callback_rx: mpsc::Receiver<String>,
+) {
+    if let Err(error) = authenticate_inner(&config, &events, client_context, callback_rx).await {
         request_failed(&events, BackendOperation::Authenticate, error).await;
     }
 }
@@ -2058,9 +2089,14 @@ async fn authenticate(config: BackendConfig, events: mpsc::Sender<BackendEvent>)
 async fn authenticate_inner(
     config: &BackendConfig,
     events: &mpsc::Sender<BackendEvent>,
+    client_context: crate::backend::ClientContext,
+    callback_rx: mpsc::Receiver<String>,
 ) -> Result<(), String> {
+    if matches!(client_context, crate::backend::ClientContext::Remote) {
+        return authenticate_device_code(config, events).await;
+    }
     match config.auth_flow {
-        CodexAuthFlow::Browser => authenticate_browser(config, events).await,
+        CodexAuthFlow::Browser => authenticate_browser(config, events, callback_rx).await,
         CodexAuthFlow::DeviceCode => authenticate_device_code(config, events).await,
     }
 }
@@ -2093,6 +2129,7 @@ impl BrowserCallbackListeners {
 async fn authenticate_browser(
     config: &BackendConfig,
     events: &mpsc::Sender<BackendEvent>,
+    callback_rx: mpsc::Receiver<String>,
 ) -> Result<(), String> {
     let listener = bind_browser_callback(&config.callback_ports).await?;
     let port = listener.port()?;
@@ -2111,12 +2148,13 @@ async fn authenticate_browser(
             login_id: state.clone(),
             verification_url,
             user_code: String::new(),
+            callback_url: Some(redirect_uri.clone()),
         })
         .await
         .map_err(|_| "Codex sign-in was cancelled".to_owned())?;
     let (code, mut callback) = timeout(
         BROWSER_AUTHENTICATION_TIMEOUT,
-        receive_browser_authorization_code(&listener, &state),
+        receive_browser_authorization_code(&listener, &state, callback_rx),
     )
     .await
     .map_err(|_| "Codex sign-in timed out. Retry sign-in from Provider Auth.".to_owned())??;
@@ -2209,12 +2247,20 @@ fn browser_authorization_url(
 async fn receive_browser_authorization_code(
     listener: &BrowserCallbackListeners,
     expected_state: &str,
+    callback_rx: mpsc::Receiver<String>,
 ) -> Result<(String, TcpStream), String> {
+    let mut callback_rx = callback_rx;
     loop {
-        let (mut stream, _) = listener
-            .accept()
-            .await
-            .map_err(|error| format!("Codex sign-in callback failed: {error}"))?;
+        let (mut stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted
+                .map_err(|error| format!("Codex sign-in callback failed: {error}"))?,
+            callback = callback_rx.recv() => {
+                let callback = callback.ok_or_else(|| "Codex sign-in callback channel closed".to_owned())?;
+                relay_callback_to_listener(listener, &callback).await?;
+                listener.accept().await
+                    .map_err(|error| format!("Codex sign-in callback relay failed: {error}"))?
+            }
+        };
         match parse_browser_callback(&mut stream, expected_state).await {
             Ok(code) => return Ok((code, stream)),
             Err(message) => {
@@ -2227,6 +2273,29 @@ async fn receive_browser_authorization_code(
     }
 }
 
+async fn relay_callback_to_listener(
+    listener: &BrowserCallbackListeners,
+    callback_url: &str,
+) -> Result<(), String> {
+    let url = reqwest::Url::parse(callback_url)
+        .map_err(|_| "Codex sign-in callback URL was malformed".to_owned())?;
+    let target = url.query().map_or_else(
+        || url.path().to_owned(),
+        |query| format!("{}?{query}", url.path()),
+    );
+    let address = listener
+        .ipv4
+        .local_addr()
+        .map_err(|error| format!("could not inspect Codex callback listener: {error}"))?;
+    let mut stream = TcpStream::connect(address)
+        .await
+        .map_err(|error| format!("could not relay Codex callback: {error}"))?;
+    let request = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|error| format!("could not relay Codex callback: {error}"))
+}
 async fn parse_browser_callback(
     stream: &mut TcpStream,
     expected_state: &str,
@@ -2353,6 +2422,7 @@ async fn authenticate_device_code(
             login_id,
             verification_url: config.auth_urls.verification.clone(),
             user_code: user_code.to_owned(),
+            callback_url: None,
         })
         .await
         .map_err(|_| "backend event receiver closed".to_owned())?;
@@ -3153,14 +3223,23 @@ mod tests {
             .with_auth_urls(&base_url)
             .with_callback_port(callback_port);
         let (events, mut receiver) = mpsc::channel(4);
-        let authentication =
-            tokio::spawn(async move { authenticate_inner(&config, &events).await });
+        let (_callback_tx, callback_rx) = mpsc::channel(1);
+        let authentication = tokio::spawn(async move {
+            authenticate_inner(
+                &config,
+                &events,
+                crate::backend::ClientContext::Unspecified,
+                callback_rx,
+            )
+            .await
+        });
 
         let (verification_url, state) = match receiver.recv().await {
             Some(BackendEvent::AuthenticationChallenge {
                 verification_url,
                 login_id,
                 user_code,
+                ..
             }) => {
                 assert!(user_code.is_empty());
                 (verification_url, login_id)
@@ -3238,7 +3317,8 @@ mod tests {
         }
         let port = listeners.port().expect("callback port");
         let callback = tokio::spawn(async move {
-            receive_browser_authorization_code(&listeners, "expected-state").await
+            let (_callback_tx, callback_rx) = mpsc::channel(1);
+            receive_browser_authorization_code(&listeners, "expected-state", callback_rx).await
         });
         let mut browser = tokio::net::TcpStream::connect((Ipv6Addr::LOCALHOST, port))
             .await
@@ -3278,8 +3358,16 @@ mod tests {
             .with_auth_urls(&base_url)
             .with_device_code_authentication();
         let (events, mut receiver) = mpsc::channel(4);
-        let authentication =
-            tokio::spawn(async move { authenticate_inner(&config, &events).await });
+        let (_callback_tx, callback_rx) = mpsc::channel(1);
+        let authentication = tokio::spawn(async move {
+            authenticate_inner(
+                &config,
+                &events,
+                crate::backend::ClientContext::Unspecified,
+                callback_rx,
+            )
+            .await
+        });
 
         match receiver.recv().await {
             Some(BackendEvent::AuthenticationChallenge {

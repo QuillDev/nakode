@@ -236,6 +236,9 @@ mod tests {
             "WatchActivationStatus",
             "ForceActivationRecheck",
             "ForceActivate",
+            "GetRemoteUpdateStatus",
+            "WatchRemoteUpdateStatus",
+            "StartRemoteUpdate",
         ];
         assert_eq!(methods, required.into_iter().map(str::to_owned).collect());
 
@@ -267,6 +270,21 @@ mod tests {
             })
             .expect("ServerInfo.rpc_lanes must remain public");
         assert_eq!(rpc_lanes.number, Some(6));
+
+        let expected_build_revision = descriptor
+            .file
+            .iter()
+            .flat_map(|file| &file.message_type)
+            .find(|message| message.name.as_deref() == Some("StartRemoteUpdateRequest"))
+            .and_then(|message| {
+                message
+                    .field
+                    .iter()
+                    .find(|field| field.name.as_deref() == Some("expected_build_revision"))
+            })
+            .expect("StartRemoteUpdateRequest.expected_build_revision must remain public");
+        assert_eq!(expected_build_revision.number, Some(3));
+        assert_eq!(expected_build_revision.proto3_optional, Some(true));
 
         let session_id = descriptor
             .file

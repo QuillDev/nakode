@@ -2,7 +2,7 @@ use clap::CommandFactory;
 use nakode::{
     activation, agent_cli, app,
     config::{Config, NakodeCommand, RemoteAction, UpdateOptions},
-    diagnostics, purge, remote, service_cli, tui_eval, update,
+    diagnostics, purge, remote, remote_update, service_cli, tui_eval, update,
 };
 
 #[tokio::main]
@@ -112,6 +112,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         NakodeCommand::RestartStale => {
             service_cli::restart_stale().await?;
+        }
+        NakodeCommand::RemoteUpdateHelper { state, attempt } => {
+            remote_update::run_helper(&state, &attempt)?;
         }
         NakodeCommand::Service { .. } => {
             unreachable!("deprecated service actions are rewritten before dispatch")

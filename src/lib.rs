@@ -32,6 +32,7 @@ pub mod personality;
 pub mod pty;
 pub mod purge;
 pub mod remote;
+pub mod remote_update;
 pub mod render;
 pub mod runtime;
 pub mod searchable_dropdown;

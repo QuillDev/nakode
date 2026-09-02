@@ -346,8 +346,25 @@ struct CommandContext<'a> {
 #[allow(clippy::too_many_lines)]
 async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_>) {
     match command {
-        BackendCommand::BeginAuthentication => {
-            tokio::spawn(compatibility::authenticate_native(context.events.clone()));
+        BackendCommand::BeginAuthentication { client_context } => {
+            if matches!(client_context, crate::backend::ClientContext::Remote) {
+                request_failed(
+                    context.events,
+                    BackendOperation::Authenticate,
+                    "Devin remote authentication is unsupported; use a client on the Nakode server machine",
+                )
+                .await;
+            } else {
+                tokio::spawn(compatibility::authenticate_native(context.events.clone()));
+            }
+        }
+        BackendCommand::SubmitAuthenticationCallback { .. } => {
+            request_failed(
+                context.events,
+                BackendOperation::Authenticate,
+                "this provider does not expose a loopback callback here",
+            )
+            .await;
         }
         BackendCommand::Reload { .. } => match context.api_key {
             Some(api_key) => match discover_models(context.config, api_key).await {

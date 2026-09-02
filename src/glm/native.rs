@@ -399,7 +399,15 @@ struct CommandContext<'a> {
 #[allow(clippy::too_many_lines)]
 async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_>) {
     match command {
-        BackendCommand::BeginAuthentication => api_key_auth_required(context.events).await,
+        BackendCommand::BeginAuthentication { .. } => api_key_auth_required(context.events).await,
+        BackendCommand::SubmitAuthenticationCallback { .. } => {
+            request_failed(
+                context.events,
+                BackendOperation::Authenticate,
+                "this provider does not use a loopback callback",
+            )
+            .await;
+        }
         BackendCommand::Reload { .. } => match context.api_key {
             Some(api_key) => match discover_models(context.config, api_key).await {
                 Ok(models) => {

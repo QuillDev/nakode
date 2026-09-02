@@ -322,7 +322,7 @@ async fn handle_command(
     bridge: Option<&mut Bridge>,
     events: &mpsc::Sender<BackendEvent>,
 ) {
-    if matches!(command, BackendCommand::BeginAuthentication) {
+    if matches!(command, BackendCommand::BeginAuthentication { .. }) {
         authenticate(api_key, events).await;
         return;
     }
@@ -390,6 +390,7 @@ async fn authenticate(api_key: Option<&str>, events: &mpsc::Sender<BackendEvent>
             login_id: Uuid::now_v7().to_string(),
             verification_url: "https://cursor.com/dashboard/api".to_owned(),
             user_code: "Set CURSOR_API_KEY, then retry".to_owned(),
+            callback_url: None,
         },
         |key| BackendEvent::AuthenticationCompleted {
             kind: "api_key".to_owned(),
@@ -460,7 +461,8 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         | BackendCommand::SetSessionCodeMode { .. }
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::ResolveExternalTool { .. }
-        | BackendCommand::BeginAuthentication
+        | BackendCommand::BeginAuthentication { .. }
+        | BackendCommand::SubmitAuthenticationCallback { .. }
         | BackendCommand::Shutdown => return Ok(None),
     };
     Ok(Some(BridgeRequest { method, payload }))
@@ -691,7 +693,7 @@ fn operation_for(command: &BackendCommand) -> BackendOperation {
             BackendOperation::SetSessionModel
         }
         BackendCommand::Reload { .. } => BackendOperation::Reload,
-        BackendCommand::BeginAuthentication => BackendOperation::Authenticate,
+        BackendCommand::BeginAuthentication { .. } => BackendOperation::Authenticate,
         _ => BackendOperation::StartTurn,
     }
 }

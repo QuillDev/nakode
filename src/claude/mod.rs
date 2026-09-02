@@ -429,6 +429,7 @@ async fn run_supervisor(
     let mut recovery_ready_event = None;
     let mut deferred_command = None;
     let mut authentication_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut authentication_callback: Option<mpsc::Sender<String>> = None;
     let _ = events.send(BackendEvent::Ready(claude_identity())).await;
     if publish_credential_updates
         && credential_updated
@@ -448,15 +449,41 @@ async fn run_supervisor(
                     if let Some(bridge) = bridge.as_mut() { let _ = send(bridge, json!({"method":"shutdown"})).await; }
                     break;
                 }
-                if matches!(command, BackendCommand::BeginAuthentication) {
+                if matches!(
+                    command,
+                    BackendCommand::BeginAuthentication {
+                        client_context: crate::backend::ClientContext::Remote
+                    }
+                ) {
+                    request_failed(
+                        &events,
+                        BackendOperation::Authenticate,
+                        "Claude remote authentication is unsupported; use a client on the Nakode server machine",
+                    )
+                    .await;
+                    continue;
+                }
+                if matches!(command, BackendCommand::BeginAuthentication { .. }) {
                     if let Some(task) = authentication_task.take() {
                         task.abort();
                         let _ = task.await;
                     }
                     let authentication_events = events.clone();
+                    let (callback_tx, callback_rx) = mpsc::channel(1);
+                    authentication_callback = Some(callback_tx);
                     authentication_task = Some(tokio::spawn(async move {
-                        authenticate(&authentication_events).await;
+                        authenticate(&authentication_events, callback_rx).await;
                     }));
+                    continue;
+                }
+                if let BackendCommand::SubmitAuthenticationCallback { callback_url } = command {
+                    let Some(callback) = authentication_callback.as_ref() else {
+                        request_failed(&events, BackendOperation::Authenticate, "no in-progress browser authentication challenge").await;
+                        continue;
+                    };
+                    if callback.send(callback_url).await.is_err() {
+                        request_failed(&events, BackendOperation::Authenticate, "browser authentication challenge is no longer active").await;
+                    }
                     continue;
                 }
                 if let Err(message) = refresh_supervisor_credential(
@@ -646,8 +673,23 @@ async fn handle_command(
     bridge: Option<&mut Bridge>,
     events: &mpsc::Sender<BackendEvent>,
 ) {
-    if matches!(command, BackendCommand::BeginAuthentication) {
-        authenticate(events).await;
+    if matches!(
+        command,
+        BackendCommand::BeginAuthentication {
+            client_context: crate::backend::ClientContext::Remote
+        }
+    ) {
+        request_failed(
+            events,
+            BackendOperation::Authenticate,
+            "Claude remote authentication is unsupported; use a client on the Nakode server machine",
+        )
+        .await;
+        return;
+    }
+    if matches!(command, BackendCommand::BeginAuthentication { .. }) {
+        let (_callback_tx, callback_rx) = mpsc::channel(1);
+        authenticate(events, callback_rx).await;
         return;
     }
     if credential.is_none() {
@@ -711,8 +753,10 @@ async fn handle_command(
     }
 }
 
-async fn authenticate(events: &mpsc::Sender<BackendEvent>) {
-    if let Err(message) = run_claude_oauth(CLAUDE_AUTHORIZE_URL, CLAUDE_TOKEN_URL, events).await {
+async fn authenticate(events: &mpsc::Sender<BackendEvent>, callback_rx: mpsc::Receiver<String>) {
+    if let Err(message) =
+        run_claude_oauth(CLAUDE_AUTHORIZE_URL, CLAUDE_TOKEN_URL, events, callback_rx).await
+    {
         request_failed(events, BackendOperation::Authenticate, message).await;
     }
 }
@@ -721,6 +765,7 @@ async fn run_claude_oauth(
     authorize_url: &str,
     token_url: &str,
     events: &mpsc::Sender<BackendEvent>,
+    callback_rx: mpsc::Receiver<String>,
 ) -> Result<(), String> {
     let listener = bind_claude_callback().await?;
     let port = listener.port()?;
@@ -735,12 +780,13 @@ async fn run_claude_oauth(
             login_id: state.clone(),
             verification_url,
             user_code: String::new(),
+            callback_url: Some(redirect_uri.clone()),
         })
         .await
         .map_err(|_| "Claude sign-in was cancelled".to_owned())?;
     let code = timeout(
         AUTHENTICATION_TIMEOUT,
-        receive_claude_authorization_code(&listener, &state),
+        receive_claude_authorization_code(&listener, &state, callback_rx),
     )
     .await
     .map_err(|_| "Claude sign-in timed out. Retry sign-in from Provider Auth.".to_owned())??;
@@ -807,12 +853,20 @@ fn claude_authorization_url(
 async fn receive_claude_authorization_code(
     listener: &ClaudeCallbackListeners,
     expected_state: &str,
+    callback_rx: mpsc::Receiver<String>,
 ) -> Result<String, String> {
+    let mut callback_rx = callback_rx;
     loop {
-        let (mut stream, _) = listener
-            .accept()
-            .await
-            .map_err(|error| format!("Claude sign-in callback failed: {error}"))?;
+        let (mut stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted
+                .map_err(|error| format!("Claude sign-in callback failed: {error}"))?,
+            callback = callback_rx.recv() => {
+                let callback = callback.ok_or_else(|| "Claude sign-in callback channel closed".to_owned())?;
+                relay_claude_callback(listener, &callback).await?;
+                listener.accept().await
+                    .map_err(|error| format!("Claude sign-in callback relay failed: {error}"))?
+            }
+        };
         match parse_claude_callback(&mut stream, expected_state).await {
             Ok(code) => {
                 respond_to_claude_callback(
@@ -839,6 +893,29 @@ async fn receive_claude_authorization_code(
     }
 }
 
+async fn relay_claude_callback(
+    listener: &ClaudeCallbackListeners,
+    callback_url: &str,
+) -> Result<(), String> {
+    let url = reqwest::Url::parse(callback_url)
+        .map_err(|_| "Claude sign-in callback URL was malformed".to_owned())?;
+    let target = url.query().map_or_else(
+        || url.path().to_owned(),
+        |query| format!("{}?{query}", url.path()),
+    );
+    let address = listener
+        .ipv4
+        .local_addr()
+        .map_err(|error| format!("Could not inspect Claude callback listener: {error}"))?;
+    let mut stream = TcpStream::connect(address)
+        .await
+        .map_err(|error| format!("Could not relay Claude callback: {error}"))?;
+    let request = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|error| format!("Could not relay Claude callback: {error}"))
+}
 async fn parse_claude_callback(
     stream: &mut TcpStream,
     expected_state: &str,
@@ -1156,7 +1233,8 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         ),
         BackendCommand::ResolveQuestion { .. }
         | BackendCommand::SetSessionCodeMode { .. }
-        | BackendCommand::BeginAuthentication
+        | BackendCommand::BeginAuthentication { .. }
+        | BackendCommand::SubmitAuthenticationCallback { .. }
         | BackendCommand::Shutdown => return Ok(None),
     };
     Ok(Some(BridgeRequest { method, payload }))
@@ -1615,7 +1693,8 @@ fn should_recover_bridge(
 fn command_needs_bridge(command: &BackendCommand) -> bool {
     !matches!(
         command,
-        BackendCommand::BeginAuthentication
+        BackendCommand::BeginAuthentication { .. }
+            | BackendCommand::SubmitAuthenticationCallback { .. }
             | BackendCommand::Shutdown
             | BackendCommand::SetSessionModel { .. }
             | BackendCommand::CompactSession { .. }
@@ -1637,7 +1716,7 @@ fn operation_for(command: &BackendCommand) -> BackendOperation {
         }
         BackendCommand::SetSessionCodeMode { .. } => BackendOperation::SetSessionCodeMode,
         BackendCommand::Reload { .. } => BackendOperation::Reload,
-        BackendCommand::BeginAuthentication => BackendOperation::Authenticate,
+        BackendCommand::BeginAuthentication { .. } => BackendOperation::Authenticate,
         _ => BackendOperation::StartTurn,
     }
 }
@@ -2350,7 +2429,9 @@ assert.equal(streamMessageIds.size, 0);
         assert!(!should_recover_bridge(
             true,
             false,
-            &BackendCommand::BeginAuthentication
+            &BackendCommand::BeginAuthentication {
+                client_context: crate::backend::ClientContext::Unspecified,
+            }
         ));
         assert!(!should_recover_bridge(
             true,
@@ -2476,7 +2557,9 @@ assert.equal(streamMessageIds.size, 0);
         let (commands, mut events, task) = handle.into_parts();
         assert!(matches!(events.recv().await, Some(BackendEvent::Ready(_))));
         commands
-            .send(BackendCommand::BeginAuthentication)
+            .send(BackendCommand::BeginAuthentication {
+                client_context: crate::backend::ClientContext::Unspecified,
+            })
             .await
             .expect("begin authentication");
         let verification_url = match events.recv().await {
