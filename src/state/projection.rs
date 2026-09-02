@@ -3287,7 +3287,11 @@ mod tests {
         assert!(run.policy.provider_tools_restricted);
         assert_eq!(
             run.policy.provider_allowed_tools,
-            ["read_skill", "read_skill_component"]
+            [
+                "read_skill",
+                "read_skill_component",
+                "search_shared_context"
+            ]
         );
         assert_eq!(
             run.policy.unsupported_canonical_tools.len(),
