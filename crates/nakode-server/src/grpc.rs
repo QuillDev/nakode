@@ -3118,6 +3118,7 @@ pub(crate) fn run(value: protocol::RunView) -> api::RunState {
             search_results: value.shared_context_utilization.search_results,
             search_duration_ms: value.shared_context_utilization.search_duration_ms,
         }),
+        shared_context_briefing: value.shared_context_briefing.map(shared_context_briefing),
         native_session_id: value.native_session_id,
         usage: Some(token_usage(&value.usage)),
         objective: value.objective,
@@ -3144,6 +3145,33 @@ pub(crate) fn run(value: protocol::RunView) -> api::RunState {
         invocation_call_id: value.invocation_call_id,
         originating_owner_entry: value.originating_owner_entry.map(transcript_entry),
         transcript: Some(transcript(value.transcript)),
+    }
+}
+
+fn shared_context_briefing(
+    briefing: protocol::SharedContextBriefingView,
+) -> api::SharedContextBriefing {
+    api::SharedContextBriefing {
+        task_packet: briefing.task_packet,
+        captured_at_ms: briefing.captured_at_ms,
+        entries: briefing
+            .entries
+            .into_iter()
+            .map(|entry| api::SharedContextBriefingEntry {
+                source_sequence: entry.source_sequence,
+                source_id: entry.source_id,
+                source_author_run_id: entry.source_author_run_id.map(|id| id.to_string()),
+                source_author_label: entry.source_author_label,
+                kind: entry.kind,
+                delivered_body: entry.delivered_body,
+                source_body_bytes: entry.source_body_bytes,
+                delivered_body_bytes: entry.delivered_body_bytes,
+                truncated: entry.truncated,
+                fallback: entry.fallback,
+            })
+            .collect(),
+        fallback: briefing.fallback,
+        delivered_bytes: briefing.delivered_bytes,
     }
 }
 
@@ -3352,6 +3380,76 @@ fn diagnostics_totals(value: &protocol::DiagnosticsUsageTotals) -> api::Diagnost
 mod tests {
     use super::*;
     use crate::ServerRequest;
+
+    fn run_view_with_briefing(
+        briefing: Option<protocol::SharedContextBriefingView>,
+    ) -> protocol::RunView {
+        protocol::RunView {
+            id: protocol::RunId::from("run-briefed"),
+            parent_run_id: None,
+            agent_slug: "repo-explorer".to_owned(),
+            archetype_purpose: "Inspect evidence".to_owned(),
+            provider_id: protocol::ProviderId::from("openai-codex"),
+            model_id: None,
+            reasoning_effort: None,
+            fast_mode: false,
+            started_at_ms: 100,
+            ended_at_ms: None,
+            duration_ms: None,
+            termination_kind: None,
+            termination_detail: None,
+            objective_mismatch_handoff: None,
+            policy: protocol::RunPolicyView::default(),
+            tool_denials: Vec::new(),
+            salvage: None,
+            continued_from_run_id: None,
+            continued_by_run_id: None,
+            continuation_depth: 0,
+            additional_turns: None,
+            inherited_evidence: Vec::new(),
+            shared_context_utilization: protocol::SharedContextUtilizationView {
+                briefing_entries: u32::from(briefing.is_some()),
+                briefing_bytes: briefing.as_ref().map_or(0, |value| value.delivered_bytes),
+                briefing_fallback: briefing.as_ref().is_some_and(|value| value.fallback),
+                search_count: 0,
+                search_results: 0,
+                search_duration_ms: 0,
+            },
+            shared_context_briefing: briefing,
+            tool_denials_retained_total: 0,
+            native_session_id: None,
+            usage: protocol::TokenUsageView {
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            objective: "Inspect runtime".to_owned(),
+            objective_start_byte: 0,
+            objective_total_bytes: 15,
+            status: protocol::RunStatus::Working,
+            latest_activity: "Working".to_owned(),
+            latest_activity_start_byte: 0,
+            latest_activity_total_bytes: 7,
+            outcome: None,
+            outcome_start_byte: 0,
+            outcome_total_bytes: 0,
+            result: None,
+            result_start_byte: 0,
+            result_total_bytes: 0,
+            invocation_turn_id: None,
+            invocation_call_id: None,
+            originating_owner_entry: None,
+            transcript: protocol::TranscriptPage {
+                entries: Vec::new(),
+                has_earlier: false,
+                stream_active: false,
+                stream_label: "repo-explorer".to_owned(),
+                current_owner_entry: None,
+                current_owner_omitted_tool_calls: 0,
+            },
+        }
+    }
 
     fn assert_timing_metadata(metadata: &tonic::metadata::MetadataMap, lane: &str) {
         assert_eq!(metadata.get("x-nakode-lane").unwrap(), lane);
@@ -3787,6 +3885,67 @@ mod tests {
         assert!(ambiguous.effective_builtin_tools_uses_runtime_default);
         assert!(ambiguous.effective_capabilities.is_empty());
         assert!(ambiguous.effective_capabilities_use_runtime_default);
+    }
+
+    #[test]
+    fn shared_context_briefing_survives_run_projection_and_protobuf_round_trip() {
+        let briefing = protocol::SharedContextBriefingView {
+            task_packet: "explicit child objective".to_owned(),
+            captured_at_ms: 123,
+            entries: vec![protocol::SharedContextBriefingEntryView {
+                source_sequence: 17,
+                source_id: "context-17".to_owned(),
+                source_author_run_id: Some(protocol::RunId::from("source-run")),
+                source_author_label: "repo-explorer".to_owned(),
+                kind: "finding".to_owned(),
+                delivered_body: "exact delivered evidence".to_owned(),
+                source_body_bytes: 42,
+                delivered_body_bytes: 24,
+                truncated: true,
+                fallback: true,
+            }],
+            fallback: true,
+            delivered_bytes: 24,
+        };
+        let projected = run(run_view_with_briefing(Some(briefing)));
+        let encoded = prost::Message::encode_to_vec(&projected);
+        let decoded = <api::RunState as prost::Message>::decode(encoded.as_slice())
+            .expect("decode projected run state");
+        let decoded_briefing = decoded
+            .shared_context_briefing
+            .expect("briefing field 44 survives wire round trip");
+
+        assert_eq!(decoded_briefing.task_packet, "explicit child objective");
+        assert_eq!(decoded_briefing.captured_at_ms, 123);
+        assert!(decoded_briefing.fallback);
+        assert_eq!(decoded_briefing.delivered_bytes, 24);
+        assert_eq!(decoded_briefing.entries.len(), 1);
+        let entry = &decoded_briefing.entries[0];
+        assert_eq!(entry.source_sequence, 17);
+        assert_eq!(entry.source_id, "context-17");
+        assert_eq!(entry.source_author_run_id.as_deref(), Some("source-run"));
+        assert_eq!(entry.source_author_label, "repo-explorer");
+        assert_eq!(entry.kind, "finding");
+        assert_eq!(entry.delivered_body, "exact delivered evidence");
+        assert_eq!(entry.source_body_bytes, 42);
+        assert_eq!(entry.delivered_body_bytes, 24);
+        assert!(entry.truncated);
+        assert!(entry.fallback);
+        let utilization = decoded
+            .shared_context_utilization
+            .expect("field 43 utilization survives wire round trip");
+        assert_eq!(utilization.briefing_entries, 1);
+        assert_eq!(utilization.briefing_bytes, 24);
+        assert!(utilization.briefing_fallback);
+        assert_eq!(utilization.search_count, 0);
+        assert_eq!(utilization.search_results, 0);
+        assert_eq!(utilization.search_duration_ms, 0);
+
+        let legacy = run(run_view_with_briefing(None));
+        let encoded = prost::Message::encode_to_vec(&legacy);
+        let decoded = <api::RunState as prost::Message>::decode(encoded.as_slice())
+            .expect("decode legacy run state");
+        assert!(decoded.shared_context_briefing.is_none());
     }
 
     #[test]

@@ -664,6 +664,29 @@ pub struct SharedContextUtilizationView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SharedContextBriefingEntryView {
+    pub source_sequence: u64,
+    pub source_id: String,
+    pub source_author_run_id: Option<RunId>,
+    pub source_author_label: String,
+    pub kind: String,
+    pub delivered_body: String,
+    pub source_body_bytes: u32,
+    pub delivered_body_bytes: u32,
+    pub truncated: bool,
+    pub fallback: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SharedContextBriefingView {
+    pub task_packet: String,
+    pub captured_at_ms: u64,
+    pub entries: Vec<SharedContextBriefingEntryView>,
+    pub fallback: bool,
+    pub delivered_bytes: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunView {
     pub id: RunId,
     #[serde(default)]
@@ -707,6 +730,8 @@ pub struct RunView {
     pub inherited_evidence: Vec<SalvagedEvidenceView>,
     #[serde(default)]
     pub shared_context_utilization: SharedContextUtilizationView,
+    #[serde(default)]
+    pub shared_context_briefing: Option<SharedContextBriefingView>,
     /// Total denials still present in the authoritative retained transcript before projection caps.
     #[serde(default)]
     pub tool_denials_retained_total: u32,

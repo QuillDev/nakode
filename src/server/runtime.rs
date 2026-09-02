@@ -750,21 +750,7 @@ impl NativeServerRuntime {
                     request.limit,
                 )
             });
-        if let Ok(output) = &result {
-            let result_count = u32::try_from(
-                output
-                    .lines()
-                    .filter(|line| {
-                        line.strip_prefix('#')
-                            .and_then(|line| line.split_once(" ["))
-                            .is_some_and(|(sequence, _)| {
-                                !sequence.is_empty()
-                                    && sequence.bytes().all(|byte| byte.is_ascii_digit())
-                            })
-                    })
-                    .count(),
-            )
-            .unwrap_or(u32::MAX);
+        if let Ok(search) = &result {
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let effects = self
                 .core
@@ -772,7 +758,7 @@ impl NativeServerRuntime {
                 .map_or_else(Vec::new, |engine| {
                     engine.state_mut().record_shared_context_search(
                         request.requester_run_id.as_deref(),
-                        result_count,
+                        search.entries,
                         duration_ms,
                     )
                 });
@@ -790,7 +776,7 @@ impl NativeServerRuntime {
             self.core
                 .commit_and_publish_session(&self.endpoint, &session_id);
         }
-        let _ = request.respond.send(result);
+        let _ = request.respond.send(result.map(|search| search.text));
     }
 
     async fn handle_native_delegation(&mut self, request: NativeDelegationRequest) {

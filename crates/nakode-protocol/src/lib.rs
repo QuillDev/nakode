@@ -55,10 +55,11 @@ pub use view::{
     RunPolicyView, RunSalvageView, RunStatus, RunTextWindow, RunToolDenialView, RunView,
     SalvagedEvidenceView, SessionActivity, SessionBridgeView, SessionFailureClassification,
     SessionFailurePhase, SessionFailureView, SessionMetadataView, SessionSummary, SessionView,
-    SettingsView, SharedContextEntryView, SharedContextUtilizationView, SkillView,
-    TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TokenUsageView,
-    TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView,
-    TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionAvailabilityView,
+    SettingsView, SharedContextBriefingEntryView, SharedContextBriefingView,
+    SharedContextEntryView, SharedContextUtilizationView, SkillView, TerminalImageModeView,
+    TodoItemView, TodoPhaseView, TodoStatusView, TokenUsageView, TranscriptBodyWindow,
+    TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
+    TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionAvailabilityView,
     VisionSettingsView, WebSettingsView,
 };
 
