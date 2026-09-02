@@ -74,7 +74,7 @@ pub struct BackendConfig {
     vision_config: Option<Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
     vision_service: Option<crate::vision::SharedVisionService>,
     memory_service: Option<crate::memory::SharedMemoryService>,
-    native_delegation: Option<mpsc::Sender<crate::backend::NativeDelegationRequest>>,
+    native_delegation: Option<mpsc::Sender<crate::backend::NativeAgentRequest>>,
 }
 
 #[derive(Clone, Debug)]
@@ -168,7 +168,7 @@ impl BackendConfig {
     #[must_use]
     pub fn with_native_delegation(
         mut self,
-        requests: mpsc::Sender<crate::backend::NativeDelegationRequest>,
+        requests: mpsc::Sender<crate::backend::NativeAgentRequest>,
     ) -> Self {
         self.native_delegation = Some(requests);
         self

@@ -24,7 +24,9 @@ use thiserror::Error;
 use crate::{
     agent::{AgentCatalog, AgentCatalogError},
     backend::{
-        BackendCommand, BackendError, BackendEvent, BackendHandle, NativeDelegationRequest,
+        BackendCommand, BackendError, BackendEvent, BackendHandle, NativeAgentRequest,
+        NativeDelegationRequest, NativeSharedContextSearchRequest,
+        NativeValidationEvidenceOperation, NativeValidationEvidenceRequest,
         ProviderFailureClassification,
     },
     claude, codex,
@@ -242,7 +244,7 @@ pub(crate) struct NativeServerRuntime {
     quiesce: mpsc::Receiver<QuiesceRequest>,
     accepting_work: bool,
     pending_bridge_acknowledgements: HashMap<nakode_protocol::SessionId, (String, String)>,
-    delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
+    delegation_requests: mpsc::Receiver<NativeAgentRequest>,
     native_cancellation_tx: mpsc::Sender<u64>,
     native_cancellations: mpsc::Receiver<u64>,
     pending_native_delegations: HashMap<u64, PendingNativeDelegation>,
@@ -264,7 +266,7 @@ pub(crate) struct PreparedRuntime {
     pub(crate) providers: Vec<ProviderRecord>,
     pub(crate) sessions: Vec<SessionRecord>,
     pub(crate) session_inventory_complete: bool,
-    pub(crate) delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
+    pub(crate) delegation_requests: mpsc::Receiver<NativeAgentRequest>,
     pub(crate) soul_store: crate::soul::SoulStore,
     pub(crate) skill_catalogue: SkillCatalog,
     pub(crate) skill_preferences: HashMap<String, Vec<crate::skill::SkillPreference>>,
@@ -398,7 +400,7 @@ impl NativeServerRuntime {
         providers: Vec<ProviderRecord>,
         sessions: Vec<SessionRecord>,
         effects: EffectExecutor,
-        delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
+        delegation_requests: mpsc::Receiver<NativeAgentRequest>,
     ) -> (Self, NativeServerHandle) {
         let skill_catalogue = engine.state().skill_catalogue();
         Self::from_parts_with_skill_authority(
@@ -417,7 +419,7 @@ impl NativeServerRuntime {
         providers: Vec<ProviderRecord>,
         sessions: Vec<SessionRecord>,
         effects: EffectExecutor,
-        delegation_requests: mpsc::Receiver<NativeDelegationRequest>,
+        delegation_requests: mpsc::Receiver<NativeAgentRequest>,
         skill_catalogue: SkillCatalog,
         skill_preferences: HashMap<String, Vec<crate::skill::SkillPreference>>,
     ) -> (Self, NativeServerHandle) {
@@ -519,7 +521,7 @@ impl NativeServerRuntime {
                 }
                 request = self.delegation_requests.recv() => {
                     if let Some(request) = request {
-                        self.handle_native_delegation(request).await;
+                        self.handle_native_agent_request(request).await;
                     }
                 }
                 request_id = self.native_cancellations.recv() => {
@@ -642,6 +644,153 @@ impl NativeServerRuntime {
             };
             let _ = request.respond.send(Err(message));
         }
+    }
+
+    async fn handle_native_agent_request(&mut self, request: NativeAgentRequest) {
+        match request {
+            NativeAgentRequest::Delegate(request) => self.handle_native_delegation(request).await,
+            NativeAgentRequest::SearchSharedContext(request) => {
+                self.handle_shared_context_search(request).await;
+            }
+            NativeAgentRequest::ValidationEvidence(request) => {
+                self.handle_validation_evidence(request).await;
+            }
+        }
+    }
+
+    async fn handle_validation_evidence(&mut self, request: NativeValidationEvidenceRequest) {
+        let session_id = nakode_protocol::SessionId::from(request.owner_session_id.clone());
+        match request.operation {
+            NativeValidationEvidenceOperation::Check => {
+                let result = self
+                    .core
+                    .engine_for(&session_id)
+                    .ok_or_else(|| "validation owner session is not open".to_owned())
+                    .and_then(|engine| {
+                        engine.state().validation_evidence_sequence(
+                            request.requester_run_id.as_deref(),
+                            &request.identity,
+                        )
+                    });
+                let _ = request.respond.send(result);
+            }
+            NativeValidationEvidenceOperation::Record { body } => {
+                let recorded = self.record_validation_evidence(
+                    &session_id,
+                    request.requester_run_id.as_deref(),
+                    &request.identity,
+                    &body,
+                );
+                let (sequence, effects) = match recorded {
+                    Ok(recorded) => recorded,
+                    Err(error) => {
+                        let _ = request.respond.send(Err(error));
+                        return;
+                    }
+                };
+                self.register_effect_owners(&session_id, &effects);
+                if let Some(engine) = self.core.engine_for_mut(&session_id) {
+                    self.effects
+                        .execute(
+                            &session_id,
+                            engine.state_mut(),
+                            effects,
+                            EffectOrigin::PrimarySession,
+                        )
+                        .await;
+                }
+                self.core
+                    .commit_and_publish_session(&self.endpoint, &session_id);
+                let _ = request.respond.send(Ok(Some(sequence)));
+            }
+        }
+    }
+
+    fn record_validation_evidence(
+        &mut self,
+        session_id: &nakode_protocol::SessionId,
+        requester_run_id: Option<&str>,
+        identity: &str,
+        body: &str,
+    ) -> Result<(u64, Vec<Effect>), String> {
+        let engine = self
+            .core
+            .engine_for_mut(session_id)
+            .ok_or_else(|| "validation owner session is not open".to_owned())?;
+        let existing = engine
+            .state()
+            .validation_evidence_sequence(requester_run_id, identity)?;
+        if let Some(sequence) = existing {
+            return Ok((sequence, Vec::new()));
+        }
+        let key = format!("validation:{identity}");
+        let (_, effects) = engine
+            .state_mut()
+            .publish_shared_context(requester_run_id, &key, "validation", body)
+            .map_err(|error| error.to_string())?;
+        let sequence = engine
+            .state()
+            .validation_evidence_sequence(requester_run_id, identity)?
+            .ok_or_else(|| "recorded validation evidence was not retained".to_owned())?;
+        Ok((sequence, effects))
+    }
+
+    async fn handle_shared_context_search(&mut self, request: NativeSharedContextSearchRequest) {
+        let session_id = nakode_protocol::SessionId::from(request.owner_session_id.clone());
+        let started = std::time::Instant::now();
+        let result = self
+            .core
+            .engine_for(&session_id)
+            .ok_or_else(|| "shared-context owner session is not open".to_owned())
+            .and_then(|engine| {
+                engine.state().search_shared_context(
+                    request.requester_run_id.as_deref(),
+                    &request.query,
+                    &request.kinds,
+                    request.limit,
+                )
+            });
+        if let Ok(output) = &result {
+            let result_count = u32::try_from(
+                output
+                    .lines()
+                    .filter(|line| {
+                        line.strip_prefix('#')
+                            .and_then(|line| line.split_once(" ["))
+                            .is_some_and(|(sequence, _)| {
+                                !sequence.is_empty()
+                                    && sequence.bytes().all(|byte| byte.is_ascii_digit())
+                            })
+                    })
+                    .count(),
+            )
+            .unwrap_or(u32::MAX);
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let effects = self
+                .core
+                .engine_for_mut(&session_id)
+                .map_or_else(Vec::new, |engine| {
+                    engine.state_mut().record_shared_context_search(
+                        request.requester_run_id.as_deref(),
+                        result_count,
+                        duration_ms,
+                    )
+                });
+            self.register_effect_owners(&session_id, &effects);
+            if let Some(engine) = self.core.engine_for_mut(&session_id) {
+                self.effects
+                    .execute(
+                        &session_id,
+                        engine.state_mut(),
+                        effects,
+                        EffectOrigin::PrimarySession,
+                    )
+                    .await;
+            }
+            self.core
+                .commit_and_publish_session(&self.endpoint, &session_id);
+        }
+        let _ = request.respond.send(result);
     }
 
     async fn handle_native_delegation(&mut self, request: NativeDelegationRequest) {
@@ -2847,7 +2996,7 @@ pub(crate) struct BackendRegistrySpawn {
     pub(crate) web_config: Arc<RwLock<crate::web::WebConfig>>,
     pub(crate) memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
     pub(crate) vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
-    pub(crate) native_delegation: mpsc::Sender<NativeDelegationRequest>,
+    pub(crate) native_delegation: mpsc::Sender<NativeAgentRequest>,
 }
 
 struct SessionBackendTasks {
@@ -2889,7 +3038,7 @@ pub(crate) struct BackendRegistry {
     pub(crate) memory_services: Mutex<HashMap<String, crate::memory::SharedMemoryService>>,
     pub(crate) vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
     pub(crate) vision_service: Option<crate::vision::SharedVisionService>,
-    pub(crate) native_delegation: mpsc::Sender<NativeDelegationRequest>,
+    pub(crate) native_delegation: mpsc::Sender<NativeAgentRequest>,
 }
 
 pub(crate) struct ProviderCooldown {
@@ -4468,6 +4617,7 @@ impl EffectExecutor {
             | Effect::SaveModelOptions { .. }
             | Effect::PersistSubagent(_)
             | Effect::PersistSubagentContinuation(_)
+            | Effect::PersistSharedContext(_)
             | Effect::LoadSubagents(_)
             | Effect::UpdateSessionModel { .. }
             | Effect::TransitionSessionPrimary { .. }
@@ -4993,8 +5143,14 @@ fn execute_persistence_effect(
         Effect::PersistSubagentContinuation(records) => {
             persist_subagent_continuation(state, sessions, &records.0, &records.1);
         }
+        Effect::PersistSharedContext(entry) => {
+            if let Err(error) = sessions.save_shared_context(&entry) {
+                state.session_store_failed(error.to_string());
+            }
+        }
         Effect::LoadSubagents(parent_session_id) => {
             load_subagents(state, sessions, &parent_session_id);
+            load_shared_context(state, sessions, &parent_session_id);
         }
         Effect::UpdateSessionModel {
             session_id,
@@ -5803,6 +5959,17 @@ fn persist_subagent_continuation(
     }
 }
 
+fn load_shared_context(
+    state: &mut DomainState,
+    sessions: &dyn SessionRepository,
+    parent_session_id: &str,
+) {
+    match sessions.list_shared_context(parent_session_id) {
+        Ok(entries) => state.install_shared_context(entries),
+        Err(error) => state.session_store_failed(error.to_string()),
+    }
+}
+
 fn load_subagents(
     state: &mut DomainState,
     sessions: &dyn SessionRepository,
@@ -6046,8 +6213,8 @@ mod tests {
         BackendRegistry, BackendSource, EffectExecutor, EffectOrigin, McpCallCompletion,
         NativeServerRuntime, PendingMcpCall, PendingNativeDelegation, PersistenceServices,
         ProviderCredentialInput, QuiesceMode, QuiesceRequest, QuiescenceBlocker,
-        SessionBackendTasks, acknowledge_owner_prompt_dispatch_with_retry, load_subagents,
-        merge_invocation_catalogue, native_service_capabilities,
+        SessionBackendTasks, acknowledge_owner_prompt_dispatch_with_retry, load_shared_context,
+        load_subagents, merge_invocation_catalogue, native_service_capabilities,
         persist_session_primary_transitions, provider_enablement_changes, save_provider_credential,
     };
     use crate::{
@@ -6651,6 +6818,7 @@ mod tests {
             100,
         );
         load_subagents(&mut state, &sessions, &parent.id);
+        load_shared_context(&mut state, &sessions, &parent.id);
 
         let restored = sessions
             .list_subagents(&parent.id)
@@ -6725,6 +6893,7 @@ mod tests {
             100,
         );
         load_subagents(&mut state, &sessions, &parent.id);
+        load_shared_context(&mut state, &sessions, &parent.id);
 
         let restored = sessions
             .list_subagents(&parent.id)

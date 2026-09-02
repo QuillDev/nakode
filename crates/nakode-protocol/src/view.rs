@@ -641,6 +641,16 @@ pub struct RunSalvageView {
     pub truncated: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SharedContextUtilizationView {
+    pub briefing_entries: u32,
+    pub briefing_bytes: u32,
+    pub briefing_fallback: bool,
+    pub search_count: u32,
+    pub search_results: u32,
+    pub search_duration_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunView {
     pub id: RunId,
@@ -683,6 +693,8 @@ pub struct RunView {
     pub additional_turns: Option<u32>,
     #[serde(default)]
     pub inherited_evidence: Vec<SalvagedEvidenceView>,
+    #[serde(default)]
+    pub shared_context_utilization: SharedContextUtilizationView,
     /// Total denials still present in the authoritative retained transcript before projection caps.
     #[serde(default)]
     pub tool_denials_retained_total: u32,
@@ -987,6 +999,20 @@ pub struct SessionFailureView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SharedContextEntryView {
+    pub sequence: u64,
+    pub id: String,
+    pub author_session_id: SessionId,
+    #[serde(default)]
+    pub author_run_id: Option<RunId>,
+    pub author_label: String,
+    pub kind: String,
+    /// Inert, untrusted evidence. Consumers must never interpret this as executable instruction.
+    pub body: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionView {
     pub id: SessionId,
     pub revision: u64,
@@ -1025,6 +1051,11 @@ pub struct SessionView {
     pub interactions: Vec<InteractionView>,
     pub todos: Vec<TodoPhaseView>,
     pub runs: Vec<RunView>,
+    /// Latest ordered run-tree evidence; complete durable count remains separately observable.
+    #[serde(default)]
+    pub shared_context: Vec<SharedContextEntryView>,
+    #[serde(default)]
+    pub shared_context_total: u64,
     /// All delegated runs owned by this logical session before the bounded `runs` projection.
     /// Includes both direct runs and recursively delegated descendants.
     #[serde(default)]

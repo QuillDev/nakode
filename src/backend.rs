@@ -866,6 +866,40 @@ pub struct ExternalToolRequest {
     pub arguments_json: String,
 }
 
+pub enum NativeAgentRequest {
+    Delegate(NativeDelegationRequest),
+    SearchSharedContext(NativeSharedContextSearchRequest),
+    ValidationEvidence(NativeValidationEvidenceRequest),
+}
+
+pub enum NativeValidationEvidenceOperation {
+    Check,
+    Record { body: String },
+}
+
+pub struct NativeValidationEvidenceRequest {
+    /// Logical Nakode session that authoritatively owns the validation ledger.
+    pub owner_session_id: String,
+    /// Active delegated run performing the validation, absent for the primary run.
+    pub requester_run_id: Option<String>,
+    /// SHA-256 identity over normalized command, cwd, and relevant repository state.
+    pub identity: String,
+    pub operation: NativeValidationEvidenceOperation,
+    /// `Some(sequence)` means evidence exists or was recorded; `None` means it is absent.
+    pub respond: oneshot::Sender<Result<Option<u64>, String>>,
+}
+
+pub struct NativeSharedContextSearchRequest {
+    /// Logical Nakode session owning the provider tool invocation.
+    pub owner_session_id: String,
+    /// Active delegated run when the search is issued by a child.
+    pub requester_run_id: Option<String>,
+    pub query: String,
+    pub kinds: Vec<String>,
+    pub limit: usize,
+    pub respond: oneshot::Sender<Result<String, String>>,
+}
+
 pub struct NativeDelegationRequest {
     /// Logical Nakode session owning the provider tool invocation.
     pub owner_session_id: String,

@@ -364,7 +364,7 @@ pub struct AgentRuntime {
     vision: Option<crate::vision::SharedVisionService>,
     direct_image_input: bool,
     external_tools: Arc<ExternalToolBroker>,
-    native_delegation: Option<mpsc::Sender<crate::backend::NativeDelegationRequest>>,
+    native_delegation: Option<mpsc::Sender<crate::backend::NativeAgentRequest>>,
     code_mode_worker_executable: Option<PathBuf>,
 }
 
@@ -401,7 +401,7 @@ impl AgentRuntime {
     #[must_use]
     pub fn with_native_delegation(
         mut self,
-        requests: mpsc::Sender<crate::backend::NativeDelegationRequest>,
+        requests: mpsc::Sender<crate::backend::NativeAgentRequest>,
     ) -> Self {
         self.tools = self.tools.with_native_delegation();
         self.native_delegation = Some(requests);
@@ -2062,6 +2062,13 @@ async fn finish_tool_result(
     Ok(())
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ValidationEvidence {
+    pub command: String,
+    pub cwd: String,
+    pub relevant_state: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeSession {
     pub id: String,
@@ -2095,6 +2102,9 @@ pub struct RuntimeSession {
     /// Active parent run for recursively delegated provider sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<String>,
+    /// Successful routine validation keyed by exact command/cwd and relevant Git state.
+    #[serde(default)]
+    pub validation_evidence: Vec<ValidationEvidence>,
 }
 
 impl RuntimeSession {
@@ -2116,6 +2126,7 @@ impl RuntimeSession {
             skill_catalogue: crate::skill::SkillCatalog::default(),
             owner_session_id: None,
             parent_run_id: None,
+            validation_evidence: Vec::new(),
         }
     }
 
@@ -2936,8 +2947,8 @@ mod tests {
         runtime_tool_audit,
     };
     use crate::backend::{
-        BackendEvent, CompactionReason, ItemKind, ProviderFailureClassification, QuestionOption,
-        QuestionRequest,
+        BackendEvent, CompactionReason, ItemKind, NativeAgentRequest,
+        ProviderFailureClassification, QuestionOption, QuestionRequest,
     };
     use crate::session::SqliteSessionRepository;
     use crate::tools::{
@@ -4053,6 +4064,9 @@ mod tests {
         let request = tokio::select! {
             request = delegation_rx.recv() => request.expect("native delegation request"),
             _result = &mut execution => panic!("tool settled before dispatch"),
+        };
+        let NativeAgentRequest::Delegate(request) = request else {
+            panic!("expected native delegation request");
         };
         assert_eq!(request.owner_session_id, "logical-session");
         assert_eq!(request.parent_run_id.as_deref(), Some("parent-run"));

@@ -1209,6 +1209,36 @@ impl NakodeClient {
             .ok_or(SdkError::MissingState("delegated run identifier"))
     }
 
+    /// Idempotently publishes inert evidence to the logical session's bounded run-tree context.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn publish_shared_context(
+        &self,
+        session_id: impl Into<String>,
+        author_run_id: Option<impl Into<String>>,
+        kind: impl Into<String>,
+        body: impl Into<String>,
+        idempotency_key: impl Into<String>,
+    ) -> Result<api::MutationResult, SdkError> {
+        let idempotency_key = idempotency_key.into();
+        send_mutation!(
+            self,
+            publish_shared_context,
+            api::PublishSharedContextRequest {
+                mutation: Some(api::MutationOptions {
+                    expected_revision: None,
+                    idempotency_key: idempotency_key.clone(),
+                }),
+                session_id: session_id.into(),
+                author_run_id: author_run_id.map(Into::into),
+                kind: kind.into(),
+                body: body.into(),
+                idempotency_key,
+            }
+        )
+    }
+
     /// Returns authoritative state for one orchestration run.
     ///
     /// # Errors

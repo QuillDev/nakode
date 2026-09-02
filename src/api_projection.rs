@@ -712,6 +712,21 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
             .map(todo_phase)
             .collect::<Result<_, _>>()?,
         runs: value.runs.into_iter().map(run).collect::<Result<_, _>>()?,
+        shared_context: value
+            .shared_context
+            .into_iter()
+            .map(|entry| view::SharedContextEntryView {
+                sequence: entry.sequence,
+                id: entry.id,
+                author_session_id: view::SessionId::from(entry.author_session_id),
+                author_run_id: entry.author_run_id.map(view::RunId::from),
+                author_label: entry.author_label,
+                kind: entry.kind,
+                body: entry.body,
+                created_at_ms: entry.created_at_ms,
+            })
+            .collect(),
+        shared_context_total: value.shared_context_total,
         runs_total: value.runs_total,
         runs_has_earlier: value.runs_has_earlier,
         notices: value
@@ -1501,6 +1516,7 @@ pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
             .into_iter()
             .map(salvaged_evidence)
             .collect(),
+        shared_context_utilization: shared_context_utilization(value.shared_context_utilization),
         native_session_id: value.native_session_id,
         usage: token_usage(value.usage.unwrap_or_default()),
         objective: value.objective,
@@ -1531,6 +1547,21 @@ pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
             .map(transcript_entry)
             .transpose()?,
         transcript: transcript(required(value.transcript, "run transcript")?)?,
+    })
+}
+
+fn shared_context_utilization(
+    value: Option<api::SharedContextUtilization>,
+) -> view::SharedContextUtilizationView {
+    value.map_or_else(view::SharedContextUtilizationView::default, |usage| {
+        view::SharedContextUtilizationView {
+            briefing_entries: usage.briefing_entries,
+            briefing_bytes: usage.briefing_bytes,
+            briefing_fallback: usage.briefing_fallback,
+            search_count: usage.search_count,
+            search_results: usage.search_results,
+            search_duration_ms: usage.search_duration_ms,
+        }
     })
 }
 

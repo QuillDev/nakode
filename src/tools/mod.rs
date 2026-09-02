@@ -10,10 +10,12 @@ mod ls;
 mod memory;
 mod nakode_agent;
 pub(crate) use nakode_agent::NAKODE_AGENT_TOOL_NAME;
+pub(crate) use shared_context::SEARCH_SHARED_CONTEXT_TOOL_NAME;
 mod process;
 mod read;
 mod read_skill;
 mod read_skill_component;
+mod shared_context;
 mod todo;
 mod truncate;
 mod vision;
@@ -26,7 +28,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    backend::{BackendEvent, NativeDelegationRequest},
+    backend::{BackendEvent, NativeAgentRequest},
     runtime::{QuestionBroker, RuntimeSession, ToolDefinition},
 };
 
@@ -49,7 +51,7 @@ pub struct ToolContext<'a> {
     /// Stable provider-neutral call identity for correlation with delegated runs.
     pub call_id: &'a str,
     pub questions: &'a QuestionBroker,
-    pub delegation: Option<&'a mpsc::Sender<NativeDelegationRequest>>,
+    pub delegation: Option<&'a mpsc::Sender<NativeAgentRequest>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +160,8 @@ impl ToolRegistry {
     #[must_use]
     pub fn with_native_delegation(mut self) -> Self {
         self.tools.push(Arc::new(nakode_agent::NakodeAgentTool));
+        self.tools
+            .push(Arc::new(shared_context::SearchSharedContextTool));
         self
     }
 
@@ -525,6 +529,7 @@ mod tests {
         prepare_and_validate, resolve_workspace_path,
     };
     use crate::{
+        backend::NativeAgentRequest,
         memory::{MemoryBackend, MemoryConfig, MemoryService},
         runtime::{QuestionBroker, RuntimeSession},
         vision::VisionConfig,
@@ -655,7 +660,7 @@ mod tests {
         assert_eq!(properties("edit"), ["edits", "path"]);
         assert_eq!(
             properties("bash"),
-            ["command", "cwd", "env", "pty", "timeout"]
+            ["command", "cwd", "env", "pty", "reason", "timeout"]
         );
         assert_eq!(
             properties("grep"),
@@ -1005,6 +1010,170 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn bash_skips_unchanged_successful_validation_until_reason_or_state_change() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .expect("initialize Git workspace");
+        let mut harness = ToolHarness {
+            registry: ToolRegistry::base(),
+            workspace: directory.path(),
+            session: RuntimeSession::new("test-model".to_owned(), String::new()),
+            events: mpsc::channel(8).0,
+            questions: QuestionBroker::default(),
+            cancellation: CancellationToken::new(),
+        };
+        let validation = json!({"command": "printf validated # cargo test", "timeout": 5});
+
+        let first = harness.execute("bash", validation.clone()).await;
+        assert!(!first.failed, "{}", first.output);
+        assert_eq!(harness.session.validation_evidence.len(), 1);
+
+        let repeated = harness.execute("bash", validation.clone()).await;
+        assert!(!repeated.failed, "{}", repeated.output);
+        assert!(repeated.output.contains("Skipped unchanged validation"));
+
+        let reasoned = harness
+            .execute(
+                "bash",
+                json!({
+                    "command": "printf validated # cargo test",
+                    "timeout": 5,
+                    "reason": "confirm after external toolchain repair"
+                }),
+            )
+            .await;
+        assert!(!reasoned.failed, "{}", reasoned.output);
+
+        std::fs::write(directory.path().join("changed.txt"), "changed").expect("change Git state");
+        let changed = harness.execute("bash", validation).await;
+        assert!(!changed.failed, "{}", changed.output);
+        assert_eq!(harness.session.validation_evidence.len(), 1);
+
+        let failing = json!({"command": "false # cargo check", "timeout": 5});
+        assert!(harness.execute("bash", failing.clone()).await.failed);
+        assert!(harness.execute("bash", failing).await.failed);
+        assert_eq!(harness.session.validation_evidence.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn bash_reuses_logical_session_validation_across_fresh_runtime_sessions() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::backend::{NativeAgentRequest, NativeValidationEvidenceOperation};
+
+        let directory = tempfile::tempdir().expect("workspace");
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .expect("initialize Git workspace");
+        let (requests, mut receiver) = mpsc::channel(8);
+        let ledger = Arc::new(Mutex::new(std::collections::HashMap::<String, u64>::new()));
+        let server_ledger = Arc::clone(&ledger);
+        let server = tokio::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                let NativeAgentRequest::ValidationEvidence(request) = request else {
+                    panic!("expected validation evidence request");
+                };
+                match request.operation {
+                    NativeValidationEvidenceOperation::Check => {
+                        let sequence = server_ledger
+                            .lock()
+                            .expect("ledger mutex")
+                            .get(&request.identity)
+                            .copied();
+                        request.respond.send(Ok(sequence)).expect("tool waiter");
+                    }
+                    NativeValidationEvidenceOperation::Record { .. } => {
+                        let mut ledger = server_ledger.lock().expect("ledger mutex");
+                        let next = u64::try_from(ledger.len()).unwrap_or(u64::MAX) + 1;
+                        let sequence = *ledger.entry(request.identity).or_insert(next);
+                        request
+                            .respond
+                            .send(Ok(Some(sequence)))
+                            .expect("tool waiter");
+                    }
+                }
+            }
+        });
+        let command = "printf x >> .git/executions.txt # cargo test";
+        let validation = json!({"command": command, "timeout": 5});
+
+        let mut first = ToolHarness {
+            registry: ToolRegistry::base(),
+            workspace: directory.path(),
+            session: RuntimeSession::new("test-model".to_owned(), String::new()),
+            events: mpsc::channel(8).0,
+            questions: QuestionBroker::default(),
+            cancellation: CancellationToken::new(),
+        };
+        first.session.owner_session_id = Some("logical-session".to_owned());
+        let result = first
+            .execute_with_delegation("bash", validation.clone(), Some(&requests))
+            .await;
+        assert!(!result.failed, "{}", result.output);
+
+        let mut fresh = ToolHarness {
+            registry: ToolRegistry::base(),
+            workspace: directory.path(),
+            session: RuntimeSession::new("test-model".to_owned(), String::new()),
+            events: mpsc::channel(8).0,
+            questions: QuestionBroker::default(),
+            cancellation: CancellationToken::new(),
+        };
+        fresh.session.owner_session_id = Some("logical-session".to_owned());
+        let skipped = fresh
+            .execute_with_delegation("bash", validation.clone(), Some(&requests))
+            .await;
+        assert!(!skipped.failed, "{}", skipped.output);
+        assert!(skipped.output.contains("shared-context entry #1"));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(".git/executions.txt"))
+                .expect("execution marker"),
+            "x"
+        );
+
+        let reasoned = fresh
+            .execute_with_delegation(
+                "bash",
+                json!({
+                    "command": command,
+                    "timeout": 5,
+                    "reason": "explicitly confirm after external environment repair"
+                }),
+                Some(&requests),
+            )
+            .await;
+        assert!(!reasoned.failed, "{}", reasoned.output);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(".git/executions.txt"))
+                .expect("execution marker"),
+            "xx"
+        );
+
+        std::fs::write(directory.path().join("changed.txt"), "changed").expect("change Git state");
+        let changed = fresh
+            .execute_with_delegation("bash", validation, Some(&requests))
+            .await;
+        assert!(!changed.failed, "{}", changed.output);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(".git/executions.txt"))
+                .expect("execution marker"),
+            "xxx"
+        );
+
+        drop(requests);
+        server.await.expect("validation server");
+        assert_eq!(ledger.lock().expect("ledger mutex").len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn bash_automatically_uses_hypa_when_it_is_on_path() {
         let directory = tempfile::tempdir().expect("workspace");
         let path = install_fake_hypa(
@@ -1138,6 +1307,9 @@ mod tests {
         );
         let server = async {
             let request = receiver.recv().await.expect("server request");
+            let NativeAgentRequest::Delegate(request) = request else {
+                panic!("expected native delegation request");
+            };
             assert_eq!(request.owner_session_id, "logical-session");
             assert_eq!(request.parent_run_id.as_deref(), Some("parent-run"));
             assert_eq!(request.invocation_turn_id, "turn-native");
@@ -1167,6 +1339,15 @@ mod tests {
 
     impl ToolHarness<'_> {
         async fn execute(&mut self, name: &str, arguments: Value) -> ToolResult {
+            self.execute_with_delegation(name, arguments, None).await
+        }
+
+        async fn execute_with_delegation(
+            &mut self,
+            name: &str,
+            arguments: Value,
+            delegation: Option<&mpsc::Sender<crate::backend::NativeAgentRequest>>,
+        ) -> ToolResult {
             let tool = self.registry.find(name).expect("registered tool").clone();
             let arguments = match prepare_and_validate(tool.as_ref(), arguments) {
                 Ok(arguments) => arguments,
@@ -1180,7 +1361,7 @@ mod tests {
                     turn_id: "turn-1",
                     call_id: "call-harness",
                     questions: &self.questions,
-                    delegation: None,
+                    delegation,
                 },
                 arguments,
                 &self.cancellation,

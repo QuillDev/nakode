@@ -441,6 +441,14 @@ pub enum Command {
         task: String,
         parent_run_id: Option<RunId>,
     },
+    /// Publishes one inert, bounded finding to the logical session's delegation run tree.
+    PublishSharedContext {
+        session_id: SessionId,
+        author_run_id: Option<RunId>,
+        idempotency_key: String,
+        kind: String,
+        body: String,
+    },
     CancelRun {
         run_id: RunId,
     },

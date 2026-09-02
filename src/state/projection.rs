@@ -15,10 +15,10 @@ use nakode_protocol::{
     RecoverablePromptView, RunId, RunOutcome, RunPage, RunPolicyView, RunSalvageView, RunStatus,
     RunTextField, RunTextWindow, RunToolDenialView, RunView, SalvagedEvidenceView, SessionActivity,
     SessionFailureClassification, SessionFailurePhase, SessionFailureView, SessionId,
-    SessionSummary, SessionView, SettingsView, SkillView, TerminalImageModeView, TodoItemView,
-    TodoPhaseView, TodoStatusView, TranscriptBodyWindow, TranscriptEntryKind,
-    TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TurnId, TurnStatus, TurnView,
-    VisionAvailabilityView, VisionSettingsView, WebSettingsView, WorkspaceId,
+    SessionSummary, SessionView, SettingsView, SharedContextUtilizationView, SkillView,
+    TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TranscriptBodyWindow,
+    TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage, TurnId,
+    TurnStatus, TurnView, VisionAvailabilityView, VisionSettingsView, WebSettingsView, WorkspaceId,
 };
 
 use super::{
@@ -266,6 +266,24 @@ fn session_view(
         interactions: interactions(state, revision),
         todos: todo_views(state),
         runs,
+        shared_context: state
+            .shared_context
+            .iter()
+            .map(|entry| nakode_protocol::SharedContextEntryView {
+                sequence: entry.sequence,
+                id: entry.id.clone(),
+                author_session_id: session_id.clone(),
+                author_run_id: entry
+                    .author_run_id
+                    .clone()
+                    .map(nakode_protocol::RunId::from),
+                author_label: entry.author_label.clone(),
+                kind: entry.kind.clone(),
+                body: entry.body.clone(),
+                created_at_ms: entry.created_at_ms,
+            })
+            .collect(),
+        shared_context_total: state.shared_context_total,
         runs_total: Some(u64::try_from(state.subagents.len()).unwrap_or(u64::MAX)),
         runs_has_earlier,
         notices: notice_views(state, revision),
@@ -893,6 +911,9 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
             .iter()
             .map(project_salvaged_evidence)
             .collect(),
+        shared_context_utilization: project_shared_context_utilization(
+            &run.observability.shared_context_utilization,
+        ),
         tool_denials_retained_total,
         native_session_id: run.provider_session_id.clone(),
         usage: token_usage_view(run.usage),
@@ -913,6 +934,19 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
         invocation_call_id: run.observability.invocation_call_id.clone(),
         originating_owner_entry,
         transcript,
+    }
+}
+
+fn project_shared_context_utilization(
+    usage: &crate::session::SharedContextUtilization,
+) -> SharedContextUtilizationView {
+    SharedContextUtilizationView {
+        briefing_entries: usage.briefing_entries,
+        briefing_bytes: usage.briefing_bytes,
+        briefing_fallback: usage.briefing_fallback,
+        search_count: usage.search_count,
+        search_results: usage.search_results,
+        search_duration_ms: usage.search_duration_ms,
     }
 }
 

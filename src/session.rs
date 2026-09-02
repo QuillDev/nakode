@@ -32,6 +32,18 @@ const INVOCATION_TELEMETRY_MIGRATION_VERSION: i64 = 1;
 const SUBAGENT_TRANSCRIPT_BOUNDARY_MIGRATION_VERSION: i64 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SharedContextEntry {
+    pub sequence: u64,
+    pub id: String,
+    pub parent_session_id: String,
+    pub author_run_id: Option<String>,
+    pub author_label: String,
+    pub kind: String,
+    pub body: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvocationRecord {
     pub invocation_key: String,
     pub kind: nakode_protocol::InvocationKind,
@@ -293,6 +305,17 @@ pub struct SubagentSalvage {
     pub truncated: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct SharedContextUtilization {
+    pub briefing_entries: u32,
+    pub briefing_bytes: u32,
+    pub briefing_fallback: bool,
+    pub search_count: u32,
+    pub search_results: u32,
+    pub search_duration_ms: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SubagentObservability {
     pub parent_run_id: Option<String>,
@@ -316,6 +339,7 @@ pub struct SubagentObservability {
     pub continuation_depth: u32,
     pub additional_turns: Option<u32>,
     pub inherited_evidence: Vec<SalvagedEvidence>,
+    pub shared_context_utilization: SharedContextUtilization,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -973,6 +997,23 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when persistence cannot be queried or contains invalid data.
     fn list_subagents(&self, parent_session_id: &str) -> Result<Vec<SubagentRecord>, SessionError>;
+    /// Idempotently appends one bounded run-tree context entry.
+    ///
+    /// # Errors
+    /// Returns an error when persistence rejects the entry.
+    fn save_shared_context(&self, _entry: &SharedContextEntry) -> Result<(), SessionError> {
+        Ok(())
+    }
+    /// Loads ordered run-tree context for session resume.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried or contains invalid data.
+    fn list_shared_context(
+        &self,
+        _parent_session_id: &str,
+    ) -> Result<Vec<SharedContextEntry>, SessionError> {
+        Ok(Vec::new())
+    }
     /// Loads optional web-browser add-on preferences.
     ///
     /// # Errors
@@ -1372,6 +1413,7 @@ impl SqliteSessionRepository {
                continuation_depth INTEGER NOT NULL DEFAULT 0,
                additional_turns INTEGER,
                inherited_evidence_json TEXT NOT NULL DEFAULT '[]',
+               shared_context_utilization_json TEXT NOT NULL DEFAULT '{}',
                transcript_has_earlier INTEGER NOT NULL DEFAULT 0,
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL,
@@ -1379,6 +1421,20 @@ impl SqliteSessionRepository {
              );
              CREATE INDEX IF NOT EXISTS orchestration_runs_parent_created
                ON orchestration_runs(parent_session_id, created_at, id);
+             CREATE TABLE IF NOT EXISTS shared_run_context (
+               sequence INTEGER NOT NULL,
+               id TEXT NOT NULL,
+               parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+               author_run_id TEXT,
+               author_label TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               body TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(parent_session_id, sequence),
+               UNIQUE(parent_session_id, id)
+             );
+             CREATE INDEX IF NOT EXISTS shared_run_context_parent_sequence
+               ON shared_run_context(parent_session_id, sequence);
              CREATE TABLE IF NOT EXISTS agent_turns (
                parent_session_id TEXT NOT NULL,
                run_id TEXT NOT NULL,
@@ -1625,6 +1681,10 @@ impl SqliteSessionRepository {
             ("continuation_depth", "INTEGER NOT NULL DEFAULT 0"),
             ("additional_turns", "INTEGER"),
             ("inherited_evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
+            (
+                "shared_context_utilization_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            ),
             ("transcript_has_earlier", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             if !orchestration_columns
@@ -2548,10 +2608,11 @@ fn save_subagent_transaction(
             remaining_delegation_depth, started_at_ms, ended_at_ms, termination_kind,
             termination_detail, objective_mismatch_handoff, salvage_json,
             continued_from_run_id, continued_by_run_id, continuation_depth, additional_turns,
-            inherited_evidence_json, transcript_has_earlier, created_at, updated_at)
+            inherited_evidence_json, shared_context_utilization_json, transcript_has_earlier,
+            created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                 ?30, ?31, ?32, ?33, ?33)
+                 ?30, ?31, ?32, ?33, ?34, ?34)
          ON CONFLICT(parent_session_id, id) DO UPDATE SET
            agent_slug = excluded.agent_slug,
            provider = excluded.provider,
@@ -2582,6 +2643,7 @@ fn save_subagent_transaction(
            continuation_depth = excluded.continuation_depth,
            additional_turns = excluded.additional_turns,
            inherited_evidence_json = excluded.inherited_evidence_json,
+           shared_context_utilization_json = excluded.shared_context_utilization_json,
            transcript_has_earlier = excluded.transcript_has_earlier,
            updated_at = excluded.updated_at",
         params![
@@ -2624,6 +2686,8 @@ fn save_subagent_transaction(
             record.observability.additional_turns.map(i64::from),
             serde_json::to_string(&record.observability.inherited_evidence)
                 .expect("inherited evidence serializes"),
+            serde_json::to_string(&record.observability.shared_context_utilization)
+                .expect("shared context utilization serializes"),
             i64::from(record.transcript_has_earlier),
             now,
         ],
@@ -4378,7 +4442,8 @@ impl SessionRepository for SqliteSessionRepository {
                     policy_json, remaining_delegation_depth, started_at_ms, ended_at_ms,
                     termination_kind, termination_detail, objective_mismatch_handoff,
                     salvage_json, continued_from_run_id, continued_by_run_id, continuation_depth,
-                    additional_turns, inherited_evidence_json, transcript_has_earlier
+                    additional_turns, inherited_evidence_json, shared_context_utilization_json,
+                    transcript_has_earlier
              FROM orchestration_runs
              WHERE parent_session_id = ?1
              ORDER BY started_at_ms, id",
@@ -4417,7 +4482,8 @@ impl SessionRepository for SqliteSessionRepository {
                 row.get::<_, Option<i64>>(28)?
                     .map(|value| u32::try_from(value).unwrap_or_default()),
                 row.get::<_, String>(29)?,
-                row.get::<_, i64>(30)? != 0,
+                row.get::<_, String>(30)?,
+                row.get::<_, i64>(31)? != 0,
             ))
         })?;
         let stored_runs = rows.collect::<Result<Vec<_>, _>>()?;
@@ -4453,6 +4519,7 @@ impl SessionRepository for SqliteSessionRepository {
             continuation_depth,
             additional_turns,
             inherited_evidence_json,
+            shared_context_utilization_json,
             transcript_has_earlier,
         ) in stored_runs
         {
@@ -4470,6 +4537,11 @@ impl SessionRepository for SqliteSessionRepository {
                         field: "orchestration_runs.inherited_evidence_json",
                         source,
                     }
+                })?;
+            let shared_context_utilization = serde_json::from_str(&shared_context_utilization_json)
+                .map_err(|source| SessionError::InvalidStoredJson {
+                    field: "orchestration_runs.shared_context_utilization_json",
+                    source,
                 })?;
             let transcript = load_subagent_transcript(&connection, parent_session_id, &id)?;
             records.push(SubagentRecord {
@@ -4505,12 +4577,101 @@ impl SessionRepository for SqliteSessionRepository {
                     continuation_depth,
                     additional_turns,
                     inherited_evidence,
+                    shared_context_utilization,
                 },
                 transcript,
                 transcript_has_earlier,
             });
         }
         Ok(records)
+    }
+
+    fn save_shared_context(&self, entry: &SharedContextEntry) -> Result<(), SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO shared_run_context
+             (sequence, id, parent_session_id, author_run_id, author_label, kind, body, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                i64::try_from(entry.sequence).unwrap_or(i64::MAX),
+                entry.id,
+                entry.parent_session_id,
+                entry.author_run_id,
+                entry.author_label,
+                entry.kind,
+                entry.body,
+                i64::try_from(entry.created_at_ms).unwrap_or(i64::MAX),
+            ],
+        )?;
+        let stored = transaction.query_row(
+            "SELECT author_run_id, author_label, kind, body
+             FROM shared_run_context WHERE parent_session_id = ?1 AND id = ?2",
+            params![entry.parent_session_id, entry.id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        if stored
+            != (
+                entry.author_run_id.clone(),
+                entry.author_label.clone(),
+                entry.kind.clone(),
+                entry.body.clone(),
+            )
+        {
+            return Err(SessionError::InvalidStoredValue {
+                field: "shared_run_context.id",
+                value: entry.id.clone(),
+            });
+        }
+        transaction.execute(
+            "DELETE FROM shared_run_context
+             WHERE parent_session_id = ?1 AND sequence NOT IN (
+               SELECT sequence FROM shared_run_context WHERE parent_session_id = ?1
+               ORDER BY sequence DESC LIMIT 64
+             )",
+            [&entry.parent_session_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn list_shared_context(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<Vec<SharedContextEntry>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT sequence, id, author_run_id, author_label, kind, body, created_at_ms
+             FROM shared_run_context WHERE parent_session_id = ?1 ORDER BY sequence",
+        )?;
+        statement
+            .query_map([parent_session_id], |row| {
+                Ok(SharedContextEntry {
+                    sequence: u64::try_from(row.get::<_, i64>(0)?).unwrap_or_default(),
+                    id: row.get(1)?,
+                    parent_session_id: parent_session_id.to_owned(),
+                    author_run_id: row.get(2)?,
+                    author_label: row.get(3)?,
+                    kind: row.get(4)?,
+                    body: row.get(5)?,
+                    created_at_ms: u64::try_from(row.get::<_, i64>(6)?).unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn load_web_config(&self) -> Result<WebConfig, SessionError> {
@@ -6589,6 +6750,71 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn shared_context_persists_order_and_deduplicates_replay() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("context.db"))?;
+        let session = store.create(CODEX_PROVIDER, "provider", "/tmp/project", "Work", None)?;
+        let first = SharedContextEntry {
+            sequence: 1,
+            id: "context-1".to_owned(),
+            parent_session_id: session.id.clone(),
+            author_run_id: None,
+            author_label: "parent".to_owned(),
+            kind: "finding".to_owned(),
+            body: "Mapped persistence".to_owned(),
+            created_at_ms: 10,
+        };
+        let second = SharedContextEntry {
+            sequence: 2,
+            id: "context-2".to_owned(),
+            author_run_id: Some("run-1".to_owned()),
+            author_label: "explorer".to_owned(),
+            kind: "validation".to_owned(),
+            body: "Focused test passed".to_owned(),
+            created_at_ms: 20,
+            ..first.clone()
+        };
+        store.save_shared_context(&first)?;
+        store.save_shared_context(&first)?;
+        store.save_shared_context(&second)?;
+        let other_session = store.create(
+            CODEX_PROVIDER,
+            "other-provider",
+            "/tmp/other",
+            "Other",
+            None,
+        )?;
+        store.save_shared_context(&SharedContextEntry {
+            parent_session_id: other_session.id.clone(),
+            ..first.clone()
+        })?;
+        for sequence in 3..=70 {
+            store.save_shared_context(&SharedContextEntry {
+                sequence,
+                id: format!("context-{sequence}"),
+                body: format!("finding {sequence}"),
+                ..first.clone()
+            })?;
+        }
+        let restored = store.list_shared_context(&session.id)?;
+        assert_eq!(restored.len(), 64);
+        assert_eq!(restored[0].sequence, 7);
+        assert_eq!(restored[63].sequence, 70);
+        assert_eq!(store.list_shared_context(&other_session.id)?.len(), 1);
+        assert!(
+            store
+                .save_shared_context(&SharedContextEntry {
+                    sequence: 70,
+                    id: "context-70".to_owned(),
+                    body: "replayed replacement".to_owned(),
+                    ..first
+                })
+                .is_err()
+        );
+        Ok(())
+    }
+
     /// Deleting a session must take everything under it, including the one table no cascade reaches.
     ///
     /// `native_runtime_sessions` holds the transcripts and has no foreign key to `sessions`, so it is
@@ -6805,6 +7031,14 @@ mod tests {
                     body: "retained source output".to_owned(),
                     truncated: false,
                 }],
+                shared_context_utilization: SharedContextUtilization {
+                    briefing_entries: 3,
+                    briefing_bytes: 640,
+                    briefing_fallback: false,
+                    search_count: 2,
+                    search_results: 4,
+                    search_duration_ms: 7,
+                },
             },
         transcript_has_earlier: true,
         };

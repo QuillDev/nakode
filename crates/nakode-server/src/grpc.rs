@@ -1563,6 +1563,19 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
 
+    command_rpc!(
+        publish_shared_context,
+        api::PublishSharedContextRequest,
+        input,
+        protocol::Command::PublishSharedContext {
+            session_id: protocol::SessionId::from(input.session_id),
+            author_run_id: input.author_run_id.map(protocol::RunId::from),
+            idempotency_key: input.idempotency_key,
+            kind: input.kind,
+            body: input.body,
+        }
+    );
+
     async fn list_runs(
         &self,
         request: tonic::Request<api::ListRunsRequest>,
@@ -2643,6 +2656,21 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         interactions: value.interactions.into_iter().map(interaction).collect(),
         todos: value.todos.into_iter().map(todo_phase).collect(),
         runs: value.runs.into_iter().map(run).collect(),
+        shared_context: value
+            .shared_context
+            .into_iter()
+            .map(|entry| api::SharedContextEntry {
+                sequence: entry.sequence,
+                id: entry.id,
+                author_session_id: entry.author_session_id.to_string(),
+                author_run_id: entry.author_run_id.map(|id| id.to_string()),
+                author_label: entry.author_label,
+                kind: entry.kind,
+                body: entry.body,
+                created_at_ms: entry.created_at_ms,
+            })
+            .collect(),
+        shared_context_total: value.shared_context_total,
         runs_total: value.runs_total,
         runs_has_earlier: value.runs_has_earlier,
         notices: value.notices.into_iter().map(notice).collect(),
@@ -3047,6 +3075,14 @@ pub(crate) fn run(value: protocol::RunView) -> api::RunState {
             .into_iter()
             .map(salvaged_evidence)
             .collect(),
+        shared_context_utilization: Some(api::SharedContextUtilization {
+            briefing_entries: value.shared_context_utilization.briefing_entries,
+            briefing_bytes: value.shared_context_utilization.briefing_bytes,
+            briefing_fallback: value.shared_context_utilization.briefing_fallback,
+            search_count: value.shared_context_utilization.search_count,
+            search_results: value.shared_context_utilization.search_results,
+            search_duration_ms: value.shared_context_utilization.search_duration_ms,
+        }),
         native_session_id: value.native_session_id,
         usage: Some(token_usage(&value.usage)),
         objective: value.objective,
@@ -3447,6 +3483,62 @@ mod tests {
         .await
         .expect_err("missing MCP server must fail");
         assert_timing_metadata(conversion.metadata(), "control");
+    }
+
+    #[tokio::test]
+    async fn publish_shared_context_projects_mutation_and_entry_idempotency_to_the_command() {
+        let (endpoint, mut requests) =
+            ServerEndpoint::channel("test", protocol::ServiceCapabilities::default(), 4);
+        let service = GrpcService::new(endpoint);
+        let publish = api::nakode_service_server::NakodeService::publish_shared_context(
+            &service,
+            tonic::Request::new(api::PublishSharedContextRequest {
+                mutation: Some(api::MutationOptions {
+                    idempotency_key: "transport-key".to_owned(),
+                    expected_revision: Some(9),
+                }),
+                session_id: "session-1".to_owned(),
+                author_run_id: Some("run-1".to_owned()),
+                kind: "decision".to_owned(),
+                body: "Use the typed projection".to_owned(),
+                idempotency_key: "entry-key".to_owned(),
+            }),
+        );
+        let reply = async {
+            let ServerRequest::Command {
+                idempotency_key,
+                expected_revision,
+                command,
+                respond,
+                ..
+            } = requests.recv().await.expect("publish command")
+            else {
+                panic!("expected command request");
+            };
+            assert_eq!(idempotency_key.as_str(), "transport-key");
+            assert_eq!(expected_revision, Some(9));
+            assert_eq!(
+                command,
+                protocol::Command::PublishSharedContext {
+                    session_id: protocol::SessionId::from("session-1"),
+                    author_run_id: Some(protocol::RunId::from("run-1")),
+                    idempotency_key: "entry-key".to_owned(),
+                    kind: "decision".to_owned(),
+                    body: "Use the typed projection".to_owned(),
+                }
+            );
+            let _ = respond.send(Ok(protocol::CommandAccepted {
+                resource_id: Some("entry-key".to_owned()),
+                revision: Some(10),
+                bridge_continuation: None,
+                replayed_bridge_continuation: None,
+                replayed_bridge_source_active: None,
+            }));
+        };
+        let (publish, ()) = tokio::join!(publish, reply);
+        let response = publish.expect("publish must succeed").into_inner();
+        assert_eq!(response.resource_id.as_deref(), Some("entry-key"));
+        assert_eq!(response.revision, Some(10));
     }
 
     #[tokio::test]
