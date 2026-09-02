@@ -51,7 +51,7 @@ On repository open, migrate each legacy `provider_credentials` row transactional
 1. create one enabled/default account with ID `legacy-<provider>` and label `Default`;
 2. copy the credential kind/JSON/timestamp into `provider_account_credentials` without serializing it through logs;
 3. backfill existing `sessions.account_id` for that provider;
-4. retain the legacy table for forward compatibility but stop writing it after successful migration.
+4. retain the legacy table for forward compatibility but stop writing it after successful migration; removing a migrated `legacy-<provider>` account also deletes its source row so repository reopen cannot recreate it.
 
 A single-account installation therefore keeps the same credential, provider enablement, default selection, session affinity, and first-session behavior without reauthentication. Reopening is idempotent. A legacy session whose provider had no credential remains unbound rather than receiving a fabricated account. Because its provider-native conversation may belong to any later-added account, Nakode never least-load routes that resume; it returns an actionable error requiring a new/restarted session with an explicit original-account selection.
 

@@ -4281,6 +4281,11 @@ impl SessionRepository for SqliteSessionRepository {
             return Err(provider_account_not_found(provider, account_id));
         }
         transaction.execute(
+            "DELETE FROM provider_credentials
+             WHERE provider = ?1 AND ?2 = 'legacy-' || provider",
+            params![provider, account_id],
+        )?;
+        transaction.execute(
             "UPDATE provider_accounts SET is_default = 1, updated_at = ?2
              WHERE account_id = (
                SELECT account_id FROM provider_accounts WHERE provider = ?1
@@ -7315,6 +7320,101 @@ mod tests {
         let diagnostic = format!("{restored:?}");
         assert!(!diagnostic.contains("never-print"));
         assert!(!diagnostic.contains("access_token"));
+        Ok(())
+    }
+
+    #[test]
+    fn current_provider_account_removal_is_durable_and_reassigns_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("accounts.db");
+        let provider = crate::backend::CODEX_PROVIDER;
+        let repository = SqliteSessionRepository::open(&database)?;
+        let removed = repository.add_provider_account(provider, "First")?;
+        let replacement = repository.add_provider_account(provider, "Second")?;
+        let credentials = crate::credential::SqliteCredentialStore::open(&database)?;
+        credentials.put_account(
+            provider,
+            &removed.account_id,
+            &Credential {
+                kind: "oauth".to_owned(),
+                secret: SecretValue::new(serde_json::json!({"access_token": "remove-me"})),
+            },
+        )?;
+
+        repository.remove_provider_account(provider, &removed.account_id)?;
+        assert!(
+            credentials
+                .get_account(provider, &removed.account_id)?
+                .is_none(),
+            "account credential is removed by the authoritative delete"
+        );
+        drop(repository);
+        drop(credentials);
+
+        let restarted = SqliteSessionRepository::open(&database)?;
+        let accounts = restarted
+            .list_providers()?
+            .into_iter()
+            .find(|record| record.provider == provider)
+            .expect("provider")
+            .accounts;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id, replacement.account_id);
+        assert!(accounts[0].is_default);
+        Ok(())
+    }
+
+    #[test]
+    fn migrated_legacy_provider_account_removal_survives_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("legacy-removal.db");
+        let provider = crate::backend::CODEX_PROVIDER;
+        let repository = SqliteSessionRepository::open(&database)?;
+        {
+            let connection = repository.connection.lock().expect("database mutex");
+            connection.execute(
+                "INSERT INTO provider_credentials
+                 (provider, credential_kind, credential_json, updated_at)
+                 VALUES (?1, 'oauth', ?2, 42)",
+                params![
+                    provider,
+                    serde_json::json!({"access_token": "legacy-secret"}).to_string()
+                ],
+            )?;
+        }
+        drop(repository);
+
+        let migrated = SqliteSessionRepository::open(&database)?;
+        let account_id = format!("legacy-{provider}");
+        assert!(
+            migrated
+                .list_providers()?
+                .into_iter()
+                .find(|record| record.provider == provider)
+                .expect("provider")
+                .accounts
+                .iter()
+                .any(|account| account.account_id == account_id)
+        );
+        migrated.remove_provider_account(provider, &account_id)?;
+        drop(migrated);
+
+        let restarted = SqliteSessionRepository::open(&database)?;
+        let provider_record = restarted
+            .list_providers()?
+            .into_iter()
+            .find(|record| record.provider == provider)
+            .expect("provider");
+        assert!(provider_record.accounts.is_empty());
+        let connection = restarted.connection.lock().expect("database mutex");
+        let legacy_rows = connection.query_row(
+            "SELECT COUNT(*) FROM provider_credentials WHERE provider = ?1",
+            [provider],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(legacy_rows, 0);
         Ok(())
     }
 
