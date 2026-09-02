@@ -174,8 +174,12 @@ nakode update
 
 `nakode update` retargets a recognized Cursor Origin or non-canonical GitHub
 remote to `https://github.com/QuillDev/nakode.git`, then runs
-`git pull --ff-only` in `~/.nakode/src` and that checkout's `install.sh`.
-`nakode --update` is supported as a convenience alias.
+`git pull --ff-only` in the managed source checkout and that checkout's
+`install.sh`. The checkout is `$NAKODE_HOME/src` when `NAKODE_HOME` is set,
+or `$HOME/.nakode/src` otherwise. An explicit `--prefix` must be absolute;
+`--no-activation` leaves running-service activation to the supervisor (and is
+also accepted as `--supervisor-owned`). `nakode --update` remains supported as
+a convenience alias with the default installation options.
 
 For local development in another checkout, `./install.sh --debug` reuses the
 development build for much faster iteration, at the cost of a larger and less
