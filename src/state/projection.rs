@@ -100,8 +100,11 @@ pub fn bootstrap(
             .filter(|model| {
                 providers
                     .iter()
-                    .find(|p| p.provider == model.provider)
-                    .is_none_or(|p| model_filter_passes(state, p, model))
+                    .find(|provider| provider.provider == model.provider)
+                    .is_some_and(|provider| {
+                        provider_accepts_new_work(provider)
+                            && model_filter_passes(state, provider, model)
+                    })
             })
             .map(|model| model_view(state, model))
             .collect(),
@@ -1308,6 +1311,15 @@ fn notice_views(state: &DomainState, revision: u64) -> Vec<NoticeView> {
         .collect()
 }
 
+fn provider_accepts_new_work(provider: &ProviderRecord) -> bool {
+    provider.enabled
+        && (provider.accounts.is_empty()
+            || provider
+                .accounts
+                .iter()
+                .any(|account| account.enabled && account.credential.is_some()))
+}
+
 /// Whether `model` survives its provider's discovery filter in the ordinary catalogue.
 ///
 /// An enabled filter whose selection matches **no currently discovered model** — an empty
@@ -2370,7 +2382,7 @@ mod tests {
             CURSOR_PROVIDER, CapabilitySupport, ModelInfo, PromptImage,
         },
         domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
-        session::{ProviderRecord, SubagentObservability, SubagentRecord},
+        session::{ProviderAccountRecord, ProviderRecord, SubagentObservability, SubagentRecord},
         state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
     };
 
@@ -2650,6 +2662,51 @@ mod tests {
                 .iter()
                 .any(|id| id.as_str() == "openai-codex/stale")
         );
+    }
+
+    #[test]
+    fn unavailable_provider_models_never_enter_the_ordinary_catalogue() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        state.models = vec![
+            model(CLAUDE_PROVIDER, "provider-disabled"),
+            model(CODEX_PROVIDER, "account-disabled"),
+        ];
+        let providers = vec![
+            ProviderRecord {
+                provider: CLAUDE_PROVIDER.to_owned(),
+                display_name: "Claude".to_owned(),
+                enabled: false,
+                credential: None,
+                model_filter_enabled: false,
+                selected_model_ids: Vec::new(),
+                accounts: Vec::new(),
+            },
+            ProviderRecord {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                enabled: true,
+                credential: None,
+                model_filter_enabled: false,
+                selected_model_ids: Vec::new(),
+                accounts: vec![ProviderAccountRecord {
+                    account_id: "disabled-account".to_owned(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                    label: "Disabled".to_owned(),
+                    enabled: false,
+                    is_default: true,
+                    identity: None,
+                    credential: None,
+                    created_at: 0,
+                    updated_at: 0,
+                    routing_mode: nakode_protocol::ProviderAccountRoutingMode::ExplicitOnly,
+                }],
+            },
+        ];
+
+        let view = bootstrap(&state, 1, &providers, &[]);
+
+        assert!(view.models.is_empty());
+        assert_eq!(view.providers.len(), 2, "auth state remains visible");
     }
 
     #[test]

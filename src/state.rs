@@ -6432,14 +6432,14 @@ impl DomainState {
         })])
     }
 
-    pub fn handle_provider_account_backend(
+    pub fn handle_provider_account_control_backend(
         &mut self,
         provider: &str,
         account_id: &str,
-        event: BackendEvent,
+        event: &BackendEvent,
     ) -> Vec<Effect> {
         let key = (provider.to_owned(), account_id.to_owned());
-        match &event {
+        match event {
             BackendEvent::AuthenticationChallenge {
                 verification_url,
                 user_code,
@@ -6473,6 +6473,26 @@ impl DomainState {
                 self.provider_account_authentication_failed(provider, account_id, message);
                 Vec::new()
             }
+            // Account controls exist only to authenticate and refresh one account. Readiness,
+            // catalogue, session, and turn events belong to the enabled provider or a primary
+            // session control and must not mutate provider-global execution state.
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn handle_provider_account_backend(
+        &mut self,
+        provider: &str,
+        account_id: &str,
+        event: BackendEvent,
+    ) -> Vec<Effect> {
+        match &event {
+            BackendEvent::AuthenticationChallenge { .. }
+            | BackendEvent::AuthenticationCompleted { .. }
+            | BackendEvent::RequestFailed {
+                operation: BackendOperation::Authenticate | BackendOperation::Reload,
+                ..
+            } => self.handle_provider_account_control_backend(provider, account_id, &event),
             _ => self.handle_provider_backend(provider, event),
         }
     }
@@ -18507,6 +18527,31 @@ model = "claude-agent/sonnet"
             Some(super::ProviderAuthenticationState::Challenge { user_code, .. })
                 if user_code == "CODE-B"
         ));
+    }
+
+    #[test]
+    fn provider_account_controls_cannot_publish_global_readiness_or_models() {
+        let mut state = ready_state();
+
+        let ready_effects = state.handle_provider_account_control_backend(
+            CLAUDE_PROVIDER,
+            "account-a",
+            &BackendEvent::Ready(BackendIdentity {
+                provider: CLAUDE_PROVIDER.to_owned(),
+                display_name: "Claude account control".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        let model_effects = state.handle_provider_account_control_backend(
+            CLAUDE_PROVIDER,
+            "account-a",
+            &BackendEvent::Models(Vec::new()),
+        );
+
+        assert!(ready_effects.is_empty());
+        assert!(model_effects.is_empty());
+        assert!(!state.provider_contexts.contains_key(CLAUDE_PROVIDER));
     }
 
     #[test]
