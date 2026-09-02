@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 
 /// Command-line and environment configuration for Nakode.
@@ -103,6 +103,16 @@ impl OpenAiReasoningEffort {
     }
 }
 
+#[derive(Clone, Debug, Args, Default)]
+pub struct UpdateOptions {
+    /// Install the updated executable below this absolute prefix instead of the default.
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    pub prefix: Option<PathBuf>,
+    /// Leave running-service activation to the supervisor that owns this update.
+    #[arg(long, visible_alias = "supervisor-owned")]
+    pub no_activation: bool,
+}
+
 #[derive(Clone, Debug, Subcommand)]
 pub enum NakodeCommand {
     /// Run the Nakode service in the foreground until Ctrl-C.
@@ -168,7 +178,7 @@ pub enum NakodeCommand {
     #[command(hide = true)]
     RestartStale,
     /// Update the managed source checkout and reinstall Nakode.
-    Update,
+    Update(UpdateOptions),
     /// Invoke a predefined agent through the native Nakode server.
     Agent {
         agent_slug: String,
@@ -403,7 +413,7 @@ impl Config {
             || matches!(
                 self.command.as_ref(),
                 Some(
-                    NakodeCommand::Update
+                    NakodeCommand::Update(_)
                         | NakodeCommand::PurgeUnsafe
                         | NakodeCommand::RestartStale,
                 )
@@ -464,6 +474,15 @@ pub(crate) fn nakode_home() -> Result<PathBuf, ConfigError> {
         .ok_or(ConfigError::MissingNakodeHome)
 }
 
+fn absolute_path(path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err("path must be absolute".to_owned())
+    }
+}
+
 fn canonicalize(path: &Path) -> Result<PathBuf, ConfigError> {
     path.canonicalize()
         .map_err(|source| ConfigError::ResolveWorkspace {
@@ -474,9 +493,11 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::Parser;
 
-    use super::{Config, NakodeCommand, OpenAiReasoningEffort, ServiceAction};
+    use super::{Config, NakodeCommand, OpenAiReasoningEffort, ServiceAction, UpdateOptions};
 
     /// Parses arguments and states the workspace the command would have run in.
     ///
@@ -902,7 +923,24 @@ mod tests {
     #[test]
     fn update_command_and_flag_are_supported() {
         let command = Config::try_parse_from(["nakode", "update"]).expect("update command");
-        assert!(matches!(command.command, Some(NakodeCommand::Update)));
+        assert!(matches!(command.command, Some(NakodeCommand::Update(_))));
+
+        let configured = Config::try_parse_from([
+            "nakode",
+            "update",
+            "--prefix",
+            "/opt/nakode",
+            "--no-activation",
+        ])
+        .expect("configured update command");
+        assert!(matches!(
+            configured.command,
+            Some(NakodeCommand::Update(UpdateOptions {
+                prefix: Some(path),
+                no_activation: true,
+            })) if path == Path::new("/opt/nakode")
+        ));
+        assert!(Config::try_parse_from(["nakode", "update", "--prefix", "relative"]).is_err());
 
         let flag = Config::try_parse_from(["nakode", "--update"]).expect("update flag");
         assert!(flag.update);

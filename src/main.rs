@@ -1,7 +1,7 @@
 use clap::CommandFactory;
 use nakode::{
     activation, agent_cli, app,
-    config::{Config, NakodeCommand, RemoteAction},
+    config::{Config, NakodeCommand, RemoteAction, UpdateOptions},
     diagnostics, purge, remote, service_cli, tui_eval, update,
 };
 
@@ -27,8 +27,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = Config::load()?;
-    if config.update || matches!(config.command.as_ref(), Some(NakodeCommand::Update)) {
-        update::run()?;
+    let update_options = requested_update_options(&config);
+    if let Some(options) = update_options {
+        update::run(&options)?;
         return Ok(());
     }
     let Some(command) = config.command.clone() else {
@@ -115,9 +116,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NakodeCommand::Service { .. } => {
             unreachable!("deprecated service actions are rewritten before dispatch")
         }
-        NakodeCommand::Update => unreachable!("update commands return before dispatch"),
+        NakodeCommand::Update(_) => unreachable!("update commands return before dispatch"),
     }
     Ok(())
+}
+
+fn requested_update_options(config: &Config) -> Option<UpdateOptions> {
+    if config.update {
+        Some(UpdateOptions::default())
+    } else {
+        match config.command.as_ref() {
+            Some(NakodeCommand::Update(options)) => Some(options.clone()),
+            _ => None,
+        }
+    }
 }
 
 async fn run_remote(action: &RemoteAction) -> Result<(), Box<dyn std::error::Error>> {

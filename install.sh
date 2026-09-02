@@ -11,7 +11,7 @@ canonical_source_remote='https://github.com/QuillDev/nakode.git'
 
 usage() {
   cat <<EOF
-Usage: ./install.sh [--debug] [--system | --prefix PATH]
+Usage: ./install.sh [--debug] [--system | --prefix PATH] [--preflight] [--no-activation]
 
 Build and install the Nakode executable. Rerun the same command after updating
 this checkout to replace an existing installation.
@@ -21,7 +21,10 @@ Options:
                  installed executable will be larger and less optimized.
   --system       Install to /usr/local/bin, using sudo only for the copy when
                  the destination is not writable.
-  --prefix PATH  Install to PATH/bin without using sudo.
+  --prefix PATH  Install to PATH/bin without using sudo. PATH must be absolute.
+  --preflight    Check build and destination prerequisites, then exit without changing anything.
+  --no-activation
+                 Do not refresh running services; activation is owned by the supervisor.
   -h, --help     Show this help.
 
 The default prefix is \$HOME/.local, or \$PREFIX when that variable is set.
@@ -123,7 +126,12 @@ normalize_managed_source_remote() {
 
 system_install=false
 debug_build=false
-prefix="${PREFIX:-${HOME:?HOME must be set}/.local}"
+preflight=false
+no_activation=false
+prefix="${PREFIX:-}"
+if [ -z "$prefix" ] && [ -n "${HOME:-}" ]; then
+  prefix="$HOME/.local"
+fi
 prefix_was_set=false
 
 while [ "$#" -gt 0 ]; do
@@ -138,6 +146,12 @@ while [ "$#" -gt 0 ]; do
       fi
       system_install=true
       prefix=/usr/local
+      ;;
+    --preflight)
+      preflight=true
+      ;;
+    --no-activation | --supervisor-owned)
+      no_activation=true
       ;;
     --prefix)
       if [ "$system_install" = true ]; then
@@ -155,6 +169,13 @@ while [ "$#" -gt 0 ]; do
           exit 2
           ;;
       esac
+      case "$1" in
+        /*) ;;
+        *)
+          printf '%s\n' '--prefix requires an absolute path.' >&2
+          exit 2
+          ;;
+      esac
       prefix=$1
       prefix_was_set=true
       ;;
@@ -168,6 +189,13 @@ while [ "$#" -gt 0 ]; do
         printf '%s\n' '--prefix requires a non-empty path.' >&2
         exit 2
       fi
+      case "$prefix" in
+        /*) ;;
+        *)
+          printf '%s\n' '--prefix requires an absolute path.' >&2
+          exit 2
+          ;;
+      esac
       prefix_was_set=true
       ;;
     -h | --help)
@@ -183,6 +211,11 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+if [ -z "$prefix" ]; then
+  printf '%s\n' 'HOME must be set when --prefix or PREFIX is not provided.' >&2
+  exit 1
+fi
+
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
   printf '%s\n' \
     'Do not run install.sh through sudo.' \
@@ -190,8 +223,14 @@ if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
   exit 2
 fi
 
-if ! command -v cargo >/dev/null 2>&1; then
-  printf '%s\n' 'cargo is required to build Nakode but was not found in PATH.' >&2
+missing_commands=''
+for required in cargo rustc cc git tar make; do
+  if ! command -v "$required" >/dev/null 2>&1; then
+    missing_commands="$missing_commands $required"
+  fi
+done
+if [ -n "$missing_commands" ]; then
+  printf 'Missing required Nakode installation commands:%s\n' "$missing_commands" >&2
   exit 1
 fi
 
@@ -209,6 +248,31 @@ destination="$bin_directory/nakode"
 
 if [ -d "$destination" ]; then
   printf 'Cannot install Nakode because %s is a directory.\n' "$destination" >&2
+  exit 1
+fi
+
+if [ "$preflight" = true ]; then
+  preflight_parent="$bin_directory"
+  while [ ! -e "$preflight_parent" ]; do
+    case "$preflight_parent" in
+      /) break ;;
+      */*)
+        next_parent=${preflight_parent%/*}
+        [ -n "$next_parent" ] || next_parent=/
+        [ "$next_parent" = "$preflight_parent" ] && break
+        preflight_parent=$next_parent
+        ;;
+      *) break ;;
+    esac
+  done
+  if { [ -d "$bin_directory" ] && [ -w "$bin_directory" ]; } \
+    || { [ ! -e "$bin_directory" ] && [ -d "$preflight_parent" ] && [ -w "$preflight_parent" ]; } \
+    || { [ "$system_install" = true ] && command -v sudo >/dev/null 2>&1; }; then
+    printf '%s\n' 'Nakode installer prerequisites are satisfied.'
+    exit 0
+  fi
+  printf 'Cannot write to %s. Choose a writable --prefix or use --system.\n' \
+    "$bin_directory" >&2
   exit 1
 fi
 
@@ -323,17 +387,25 @@ else
   exit 1
 fi
 
-# A running service keeps executing the inode it started from after an atomic
-# replacement. Refresh every idle stale workspace service only after the new
-# executable is in place. The helper is invoked by explicit path so this works
-# even when the caller is still running the previous Nakode binary.
-printf '%s\n' 'Activating idle Nakode services or scheduling safe deferred activation...'
-"$destination" restart-stale ||
-  printf '%s\n' 'Nakode installed, but running-service activation could not be started; run nakode endpoint for diagnostics.' >&2
+if [ "$no_activation" = true ]; then
+  printf '%s\n' 'Skipping running-service activation; the supervisor owns activation.'
+else
+  # A running service keeps executing the inode it started from after an atomic
+  # replacement. Refresh every idle stale workspace service only after the new
+  # executable is in place. The helper is invoked by explicit path so this works
+  # even when the caller is still running the previous Nakode binary.
+  printf '%s\n' 'Activating idle Nakode services or scheduling safe deferred activation...'
+  "$destination" restart-stale ||
+    printf '%s\n' 'Nakode installed, but running-service activation could not be started; run nakode endpoint for diagnostics.' >&2
+fi
 
 printf '\nInstalled binary %s\n' "$destination"
 printf '%s\n' "$built_version"
-printf '%s\n' 'Running-service activation may be immediate or safely deferred while live work finishes.'
+if [ "$no_activation" = true ]; then
+  printf '%s\n' 'Running-service activation is owned by the supervisor.'
+else
+  printf '%s\n' 'Running-service activation may be immediate or safely deferred while live work finishes.'
+fi
 
 case ":${PATH:-}:" in
   *:"$bin_directory":*) ;;

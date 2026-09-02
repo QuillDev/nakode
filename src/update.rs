@@ -1,7 +1,10 @@
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
 };
+
+use crate::config::UpdateOptions;
 
 use thiserror::Error;
 
@@ -10,7 +13,7 @@ const CANONICAL_SOURCE_REMOTE: &str = "https://github.com/QuillDev/nakode.git";
 
 #[derive(Debug, Error)]
 pub enum UpdateError {
-    #[error("HOME is not set; cannot locate the Nakode source checkout")]
+    #[error("NAKODE_HOME and HOME are not set; cannot locate the Nakode source checkout")]
     MissingHome,
     #[error(
         "the managed Nakode source checkout was not found at {0}\n\
@@ -25,6 +28,8 @@ pub enum UpdateError {
     GitFailed { status: ExitStatus },
     #[error("failed to start install.sh: {0}")]
     StartInstaller(#[source] std::io::Error),
+    #[error("install.sh prerequisite preflight failed (exit status {0})")]
+    InstallerPreflightFailed(ExitStatus),
     #[error("install.sh could not install the updated Nakode build (exit status {0})")]
     InstallerFailed(ExitStatus),
 }
@@ -35,16 +40,28 @@ pub enum UpdateError {
 ///
 /// Returns an error when the managed checkout is missing, Git cannot pull the
 /// update, or the installer cannot complete successfully.
-pub fn run() -> Result<(), UpdateError> {
-    let home = std::env::var_os("HOME").ok_or(UpdateError::MissingHome)?;
-    run_from(&source_directory(&PathBuf::from(home)))
+pub fn run(options: &UpdateOptions) -> Result<(), UpdateError> {
+    let nakode_home = std::env::var_os("NAKODE_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let source = source_directory_for(nakode_home.as_deref(), home.as_deref())?;
+    run_from(&source, options)
+}
+
+fn source_directory_for(
+    nakode_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf, UpdateError> {
+    nakode_home
+        .map(|home| home.join("src"))
+        .or_else(|| home.map(source_directory))
+        .ok_or(UpdateError::MissingHome)
 }
 
 fn source_directory(home: &Path) -> PathBuf {
     home.join(SOURCE_DIRECTORY)
 }
 
-fn run_from(source: &Path) -> Result<(), UpdateError> {
+fn run_from(source: &Path, options: &UpdateOptions) -> Result<(), UpdateError> {
     if !source.is_dir() {
         return Err(UpdateError::MissingSource(source.display().to_string()));
     }
@@ -56,6 +73,7 @@ fn run_from(source: &Path) -> Result<(), UpdateError> {
         ));
     }
 
+    preflight_installer(&installer, options)?;
     retarget_managed_source_remote(source)?;
 
     println!("Updating Nakode source in {}…", source.display());
@@ -69,8 +87,7 @@ fn run_from(source: &Path) -> Result<(), UpdateError> {
     }
 
     println!("Installing the updated Nakode build…");
-    let status = Command::new("sh")
-        .arg("./install.sh")
+    let status = installer_command(&installer, options, false)
         .current_dir(source)
         .status()
         .map_err(UpdateError::StartInstaller)?;
@@ -78,10 +95,51 @@ fn run_from(source: &Path) -> Result<(), UpdateError> {
         return Err(UpdateError::InstallerFailed(status));
     }
 
-    println!(
-        "Nakode update installation completed. Running-service activation is reported separately."
-    );
+    if options.no_activation {
+        println!(
+            "Nakode update installation completed; running-service activation is owned by the supervisor."
+        );
+    } else {
+        println!(
+            "Nakode update installation completed. Running-service activation is reported separately."
+        );
+    }
     Ok(())
+}
+
+fn preflight_installer(installer: &Path, options: &UpdateOptions) -> Result<(), UpdateError> {
+    println!("Checking Nakode installer prerequisites…");
+    let status = installer_command(installer, options, true)
+        .current_dir(installer.parent().unwrap_or_else(|| Path::new(".")))
+        .status()
+        .map_err(UpdateError::StartInstaller)?;
+    if !status.success() {
+        return Err(UpdateError::InstallerPreflightFailed(status));
+    }
+    Ok(())
+}
+
+fn installer_command(installer: &Path, options: &UpdateOptions, preflight: bool) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .arg(installer)
+        .args(installer_args(options, preflight));
+    command
+}
+
+fn installer_args(options: &UpdateOptions, preflight: bool) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(4);
+    if preflight {
+        args.push(OsString::from("--preflight"));
+    }
+    if let Some(prefix) = &options.prefix {
+        args.push(OsString::from("--prefix"));
+        args.push(prefix.clone().into_os_string());
+    }
+    if options.no_activation {
+        args.push(OsString::from("--no-activation"));
+    }
+    args
 }
 
 fn strip_url_credentials(url: &str) -> String {
@@ -187,24 +245,94 @@ fn retarget_managed_source_remote(source: &Path) -> Result<(), UpdateError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use tempfile::tempdir;
 
     use super::{
-        CANONICAL_SOURCE_REMOTE, UpdateError, is_managed_upstream_url, origin_remote_url,
-        remote_has_userinfo, repo_key, retarget_managed_source_remote, run_from,
-        should_retarget_remote, source_directory, strip_url_credentials,
+        CANONICAL_SOURCE_REMOTE, UpdateError, UpdateOptions, installer_args,
+        is_managed_upstream_url, origin_remote_url, remote_has_userinfo, repo_key,
+        retarget_managed_source_remote, run_from, should_retarget_remote, source_directory,
+        source_directory_for, strip_url_credentials,
     };
 
+    #[test]
+    fn prefers_nakode_home_for_the_managed_checkout() {
+        assert_eq!(
+            source_directory_for(
+                Some(Path::new("/custom/nakode")),
+                Some(Path::new("/home/user")),
+            )
+            .expect("custom source"),
+            Path::new("/custom/nakode/src")
+        );
+        assert_eq!(
+            source_directory_for(None, Some(Path::new("/home/user"))).expect("default source"),
+            Path::new("/home/user/.nakode/src")
+        );
+        assert!(matches!(
+            source_directory_for(None, None),
+            Err(UpdateError::MissingHome)
+        ));
+    }
+    #[test]
+    fn forwards_update_options_without_shell_reinterpretation() {
+        let options = UpdateOptions {
+            prefix: Some(PathBuf::from("/opt/Nakode builds/current")),
+            no_activation: true,
+        };
+        assert_eq!(
+            installer_args(&options, true),
+            vec![
+                OsString::from("--preflight"),
+                OsString::from("--prefix"),
+                OsString::from("/opt/Nakode builds/current"),
+                OsString::from("--no-activation"),
+            ]
+        );
+        assert_eq!(
+            installer_args(&UpdateOptions::default(), false),
+            Vec::<OsString>::new()
+        );
+    }
+
+    #[test]
+    fn installer_preflight_happens_before_git_changes() {
+        let source = tempdir().expect("temporary checkout");
+        let installer = source.path().join("install.sh");
+        std::fs::write(
+            &installer,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$(dirname \"$0\")/preflight-args\"\nexit 42\n",
+        )
+        .expect("write test installer");
+
+        let result = run_from(
+            source.path(),
+            &UpdateOptions {
+                prefix: Some(PathBuf::from("/opt/nakode")),
+                no_activation: true,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(UpdateError::InstallerPreflightFailed(status)) if status.code() == Some(42)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(source.path().join("preflight-args"))
+                .expect("preflight invocation"),
+            "--preflight --prefix /opt/nakode --no-activation\n"
+        );
+        assert!(!source.path().join(".git").exists());
+    }
     #[test]
     fn rejects_a_missing_managed_checkout() {
         let home = tempdir().expect("temporary home");
         let source = home.path().join(".nakode/src");
 
         assert!(matches!(
-            run_from(&source),
+            run_from(&source, &UpdateOptions::default()),
             Err(UpdateError::MissingSource(path)) if path == source.display().to_string()
         ));
     }
@@ -215,7 +343,7 @@ mod tests {
         let installer = source.path().join("install.sh");
 
         assert!(matches!(
-            run_from(source.path()),
+            run_from(source.path(), &UpdateOptions::default()),
             Err(UpdateError::MissingInstaller(path)) if path == installer.display().to_string()
         ));
     }
