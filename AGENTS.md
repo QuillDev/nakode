@@ -268,6 +268,7 @@ Every primary and delegated provider session receives the same execution-host co
 Local tools must:
 
 - Resolve relative paths against the configured workspace.
+- Resolve `~` and `~/…` workspace roots against the authoritative server runtime user's home before canonicalization; never against a client's filesystem.
 - Use bounded output and cancellation-aware execution.
 - Keep process supervision and terminal ownership outside provider modules.
 - Return explicit failures rather than silently substituting hosted execution.
