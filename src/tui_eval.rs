@@ -1551,7 +1551,7 @@ mod tests {
         .expect("provider model filter scenario");
         assert_eq!(
             String::from_utf8(output).expect("JSONL").lines().count(),
-            14
+            21
         );
     }
 

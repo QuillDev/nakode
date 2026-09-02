@@ -19,8 +19,8 @@ use crate::{
     tui_state::{
         AgentBrowserStatus, AgentEditor, AgentEditorField, AgentModelOption, AgentPicker,
         MemoryBackend, ModelPickerStage, ModelSelectionScope, ProviderAuthentication,
-        ProviderPicker, QuestionPrompt, SettingsState, SettingsView, TuiState, WebBackend,
-        connection_label, provider_capability_rows, provider_dashboard_url,
+        ProviderDetailRow, ProviderPicker, QuestionPrompt, SettingsState, SettingsView, TuiState,
+        WebBackend, connection_label, provider_capability_rows, provider_dashboard_url,
         terminal_image_mode_label,
     },
 };
@@ -1530,9 +1530,13 @@ fn render_provider_details(
     let connection = connection_label(&provider.connection);
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("State      ", Style::default().fg(MUTED)),
+            provider_detail_label("State      ", ProviderDetailRow::State, picker.detail_row),
             Span::styled(enabled, Style::default().fg(state_color).bold()),
-        ]),
+        ])
+        .style(provider_detail_style(
+            ProviderDetailRow::State,
+            picker.detail_row,
+        )),
         Line::from(vec![
             Span::styled("Connection ", Style::default().fg(MUTED)),
             Span::styled(connection, Style::default().fg(TEXT)),
@@ -1542,7 +1546,11 @@ fn render_provider_details(
             Span::styled(provider.id.as_str(), Style::default().fg(TEXT)),
         ]),
         Line::from(vec![
-            Span::styled("Credential ", Style::default().fg(MUTED)),
+            provider_detail_label(
+                "Credential ",
+                ProviderDetailRow::Credential,
+                picker.detail_row,
+            ),
             Span::styled(
                 provider
                     .credential_kind
@@ -1554,9 +1562,13 @@ fn render_provider_details(
                     WARNING
                 }),
             ),
-        ]),
+        ])
+        .style(provider_detail_style(
+            ProviderDetailRow::Credential,
+            picker.detail_row,
+        )),
     ];
-    append_provider_filter(&mut lines, provider);
+    append_provider_filter(&mut lines, provider, picker.detail_row);
     append_provider_accounts(&mut lines, provider);
     append_provider_capabilities(&mut lines, state, provider);
     let mut api_key_input_line = None;
@@ -1576,9 +1588,9 @@ fn render_provider_details(
     };
     if !matches!(
         picker.authentication,
-        Some(ProviderAuthentication::ApiKeyInput { .. })
+        Some(ProviderAuthentication::ApiKeyInput { focused: true, .. })
     ) {
-        append_provider_actions(&mut lines, provider.credential_configured);
+        append_provider_actions(&mut lines, provider, picker.detail_row);
     }
     let block = overlay_block(format!(" {} ", provider.display_name), ACCENT);
     frame.render_widget(
@@ -1656,30 +1668,59 @@ fn append_provider_accounts(lines: &mut Vec<Line<'_>>, provider: &nakode_protoco
     }
 }
 
-fn append_provider_filter(lines: &mut Vec<Line<'_>>, provider: &nakode_protocol::ProviderView) {
-    lines.push(Line::from(vec![
-        Span::styled("Model filter ", Style::default().fg(MUTED)),
-        Span::styled(
-            if provider.model_filter_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            Style::default().fg(if provider.model_filter_enabled {
-                SUCCESS
-            } else {
-                MUTED
-            }),
-        ),
-        Span::styled(
-            format!(
-                " ({} selected, {} candidates)",
-                provider.selected_model_ids.len(),
-                provider.model_candidates.len()
+fn provider_detail_label(
+    label: &str,
+    row: ProviderDetailRow,
+    selected: ProviderDetailRow,
+) -> Span<'static> {
+    Span::styled(
+        format!("{} {label}", if row == selected { '›' } else { ' ' }),
+        Style::default().fg(MUTED),
+    )
+}
+
+fn provider_detail_style(row: ProviderDetailRow, selected: ProviderDetailRow) -> Style {
+    Style::default().bg(if row == selected {
+        SURFACE_RAISED
+    } else {
+        SURFACE
+    })
+}
+
+fn append_provider_filter(
+    lines: &mut Vec<Line<'_>>,
+    provider: &nakode_protocol::ProviderView,
+    selected: ProviderDetailRow,
+) {
+    lines.push(
+        Line::from(vec![
+            provider_detail_label("Model filter ", ProviderDetailRow::ModelFilter, selected),
+            Span::styled(
+                if provider.model_filter_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                Style::default().fg(if provider.model_filter_enabled {
+                    SUCCESS
+                } else {
+                    MUTED
+                }),
             ),
-            Style::default().fg(TEXT),
-        ),
-    ]));
+            Span::styled(
+                format!(
+                    " ({} selected, {} candidates)",
+                    provider.selected_model_ids.len(),
+                    provider.model_candidates.len()
+                ),
+                Style::default().fg(TEXT),
+            ),
+        ])
+        .style(provider_detail_style(
+            ProviderDetailRow::ModelFilter,
+            selected,
+        )),
+    );
     let has_stale_selection = provider.model_filter_enabled
         && provider.selected_model_ids.iter().any(|id| {
             !provider
@@ -1792,19 +1833,32 @@ fn register_api_key_input(output: &mut RenderOutput, popup: Rect, line: Option<u
     ));
 }
 
-fn append_provider_actions(lines: &mut Vec<Line<'_>>, has_credential: bool) {
+fn append_provider_actions(
+    lines: &mut Vec<Line<'_>>,
+    provider: &nakode_protocol::ProviderView,
+    selected: ProviderDetailRow,
+) {
     lines.push(Line::default());
-    if has_credential {
-        lines.push(Line::styled(
-            "[l] Log out and clear credentials",
-            Style::default().fg(DANGER),
-        ));
-    }
+    let hint = match (selected, provider.credential_configured) {
+        (ProviderDetailRow::State, true) => {
+            "Enter or Space enable/disable · ↑/↓ select · Esc providers"
+        }
+        (ProviderDetailRow::State | ProviderDetailRow::Credential, false) => {
+            "Enter or Space set up credentials · ↑/↓ select · Esc providers"
+        }
+        (ProviderDetailRow::Credential, true) => {
+            "Enter or Space log out and clear credentials · ↑/↓ select · Esc providers"
+        }
+        (ProviderDetailRow::ModelFilter, _) => {
+            "Enter or Space enable/disable model filter · m edit selected models · ↑/↓ select · Esc providers"
+        }
+    };
+    lines.push(Line::styled(hint, Style::default().fg(MUTED)));
     lines.push(Line::styled(
-        if has_credential {
-            "f enable/disable model filter · m edit selected models · Enter or Space enable/disable · Esc providers"
+        if provider.credential_configured {
+            "f model filter · m edit models · l log out"
         } else {
-            "Enter or Space set up credentials · Esc providers"
+            "f model filter · m edit models"
         },
         Style::default().fg(MUTED),
     ));
@@ -3207,7 +3261,9 @@ mod tests {
         assert!(details.contains("Capabilities"));
         assert!(details.contains("Resume"));
         assert!(details.contains("supported"));
-        assert!(details.contains("[l] Log out and clear credentials"));
+        assert!(details.contains("› State"));
+        assert!(details.contains("Enter or Space enable/disable"));
+        assert!(details.contains("↑/↓ select"));
     }
 
     #[test]
@@ -3228,6 +3284,15 @@ mod tests {
         terminal
             .draw(|frame| super::draw(frame, &mut state))
             .expect("render unfocused Cursor API key input");
+        let unfocused = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(unfocused.contains("› Credential not configured"));
+        assert!(unfocused.contains("Enter or Space set up credentials"));
         let input_row = terminal
             .backend()
             .buffer()
@@ -3264,6 +3329,7 @@ mod tests {
         assert!(!rendered.contains("Enter save"));
         assert!(!rendered.contains("Capabilities"));
         assert!(!rendered.contains("Unavailable until"));
+        assert!(!rendered.contains("Enter or Space set up credentials"));
         assert!(rendered.contains('•'));
         assert!(!rendered.contains("cursor-super-secret"));
     }

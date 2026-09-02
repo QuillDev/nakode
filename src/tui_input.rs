@@ -19,8 +19,8 @@ use crate::{
     selection::ScreenPoint,
     tui_state::{
         AgentEditor, AgentEditorField, AgentModelOption, AgentPendingOptions, ComposerDraft,
-        ModelPickerStage, ModelSelectionScope, ProviderAuthentication, SettingsSection,
-        SettingsView, TuiState, model_supports_fast_mode, model_supports_options,
+        ModelPickerStage, ModelSelectionScope, ProviderAuthentication, ProviderDetailRow,
+        SettingsSection, SettingsView, TuiState, model_supports_fast_mode, model_supports_options,
     },
 };
 
@@ -956,10 +956,15 @@ fn handle_provider_picker_key(
                 };
             }
         }
-        Some(ControlAction::Toggle) if showing_details && !api_key_input => {
+        Some(ControlAction::ToggleProviderModelFilter) if showing_details => {
             return toggle_provider_filter(state, bootstrap);
         }
+        Some(ControlAction::Toggle) if showing_details && !api_key_input => {
+            return activate_provider_detail(state, bootstrap);
+        }
         Some(ControlAction::Open) if showing_details => state.open_provider_model_picker(),
+        Some(ControlAction::Previous) if showing_details => state.provider_detail_move(-1),
+        Some(ControlAction::Next) if showing_details => state.provider_detail_move(1),
         Some(ControlAction::Toggle) => return toggle_provider(state, bootstrap),
         Some(ControlAction::Focus) => {
             state.focus_provider_api_key();
@@ -1045,6 +1050,32 @@ fn handle_provider_model_picker_key(
     InputOutcome::default()
 }
 
+fn activate_provider_detail(state: &mut TuiState, bootstrap: &BootstrapView) -> InputOutcome {
+    let Some(detail_row) = state
+        .client
+        .provider_picker
+        .as_ref()
+        .map(|picker| picker.detail_row)
+    else {
+        return InputOutcome::default();
+    };
+    let Some(provider) = selected_provider(state, bootstrap).cloned() else {
+        return InputOutcome::default();
+    };
+    match detail_row {
+        ProviderDetailRow::ModelFilter => toggle_provider_filter(state, bootstrap),
+        ProviderDetailRow::Credential if provider.credential_configured => InputOutcome {
+            commands: vec![CommandIntent::new(Command::ClearProviderCredential {
+                provider_id: provider.id,
+            })],
+            ..InputOutcome::default()
+        },
+        ProviderDetailRow::State | ProviderDetailRow::Credential => {
+            toggle_provider(state, bootstrap)
+        }
+    }
+}
+
 fn toggle_provider_filter(state: &mut TuiState, bootstrap: &BootstrapView) -> InputOutcome {
     let Some(provider) = selected_provider(state, bootstrap).cloned() else {
         return InputOutcome::default();
@@ -1062,12 +1093,16 @@ fn selected_provider<'a>(
     state: &TuiState,
     bootstrap: &'a BootstrapView,
 ) -> Option<&'a nakode_protocol::ProviderView> {
-    let selected = state
+    let provider_id = state
         .client
         .provider_picker
         .as_ref()
-        .map_or(0, |picker| picker.selected);
-    bootstrap.providers.get(selected)
+        .and_then(|picker| picker.providers.get(picker.selected))
+        .map(|provider| &provider.id)?;
+    bootstrap
+        .providers
+        .iter()
+        .find(|provider| &provider.id == provider_id)
 }
 
 fn selected_provider_url(state: &TuiState, bootstrap: &BootstrapView) -> Option<String> {
@@ -1797,14 +1832,17 @@ mod tests {
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
     use nakode_protocol::{
-        AgentSessionId, ModelConfigurationView, ModelId, ModelView, ProviderId, SessionActivity,
-        TurnId, TurnStatus, TurnView,
+        AgentSessionId, ConnectionView, ModelConfigurationView, ModelId, ModelView,
+        ProviderAuthenticationView, ProviderCapabilities, ProviderId, ProviderView,
+        SessionActivity, TurnId, TurnStatus, TurnView,
     };
 
     use super::{handle_terminal, insert_local_file_paths, open_model_picker};
     use crate::{
         api_projection::TuiAction as Command,
-        tui_state::{ModelPickerStage, ModelSelectionScope, SettingsView, TuiState},
+        tui_state::{
+            ModelPickerStage, ModelSelectionScope, ProviderDetailRow, SettingsView, TuiState,
+        },
     };
 
     fn bootstrap() -> nakode_protocol::BootstrapView {
@@ -1869,8 +1907,219 @@ mod tests {
         .expect("valid bootstrap")
     }
 
+    fn provider(
+        id: &str,
+        credential_configured: bool,
+        authentication: Option<ProviderAuthenticationView>,
+    ) -> ProviderView {
+        ProviderView {
+            id: ProviderId::from(id),
+            display_name: id.to_owned(),
+            enabled: false,
+            credential_configured,
+            credential_kind: credential_configured.then(|| "test".to_owned()),
+            connection: ConnectionView::Disabled,
+            capabilities: ProviderCapabilities::default(),
+            authentication,
+            model_filter_enabled: false,
+            selected_model_ids: Vec::new(),
+            model_candidates: Vec::new(),
+            supported_builtin_tools: Some(Vec::new()),
+            available_builtin_tools: Some(Vec::new()),
+            accounts: Vec::new(),
+        }
+    }
+
     fn state(view: &nakode_protocol::BootstrapView) -> TuiState {
         TuiState::from_bootstrap(view, 100)
+    }
+
+    #[test]
+    fn provider_credential_row_enter_and_space_begin_oauth_setup() {
+        for key in [KeyCode::Enter, KeyCode::Char(' ')] {
+            let mut view = bootstrap();
+            view.providers = vec![provider("openai-codex", false, None)];
+            let mut state = state(&view);
+            state.open_provider_picker();
+            state.open_provider_details();
+
+            let outcome = handle_terminal(
+                &mut state,
+                &view,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            );
+
+            assert_eq!(outcome.commands.len(), 1);
+            assert!(matches!(
+                &outcome.commands[0].command,
+                Command::BeginProviderAuthentication { provider_id }
+                    if provider_id.as_str() == "openai-codex"
+            ));
+            assert!(matches!(
+                state
+                    .client
+                    .provider_picker
+                    .as_ref()
+                    .and_then(|picker| picker.authentication.as_ref()),
+                Some(crate::tui_state::ProviderAuthentication::Starting)
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_credential_row_enter_and_space_focus_api_key_setup() {
+        for key in [KeyCode::Enter, KeyCode::Char(' ')] {
+            let mut view = bootstrap();
+            view.providers = vec![provider(
+                "cursor-acp",
+                false,
+                Some(ProviderAuthenticationView::ApiKeyRequired {
+                    dashboard_url: "https://cursor.example.test/api-keys".to_owned(),
+                    credential_kind: "api_key".to_owned(),
+                }),
+            )];
+            let mut state = state(&view);
+            state.open_provider_picker();
+            state.open_provider_details();
+
+            let outcome = handle_terminal(
+                &mut state,
+                &view,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            );
+
+            assert!(outcome.commands.is_empty());
+            assert!(state.provider_api_key_input_active());
+        }
+    }
+
+    #[test]
+    fn provider_model_filter_row_enter_and_space_only_toggle_the_filter() {
+        for key in [KeyCode::Enter, KeyCode::Char(' ')] {
+            let mut view = bootstrap();
+            view.providers = vec![provider(
+                "cursor-acp",
+                false,
+                Some(ProviderAuthenticationView::ApiKeyRequired {
+                    dashboard_url: "https://cursor.example.test/api-keys".to_owned(),
+                    credential_kind: "api_key".to_owned(),
+                }),
+            )];
+            let mut state = state(&view);
+            state.open_provider_picker();
+            state.open_provider_details();
+            let move_outcome = handle_terminal(
+                &mut state,
+                &view,
+                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            );
+            assert!(move_outcome.commands.is_empty());
+
+            let outcome = handle_terminal(
+                &mut state,
+                &view,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            );
+
+            assert_eq!(outcome.commands.len(), 1);
+            assert!(matches!(
+                &outcome.commands[0].command,
+                Command::SetProviderModelFilter {
+                    provider_id,
+                    enabled: true,
+                    selected_model_ids,
+                } if provider_id.as_str() == "cursor-acp" && selected_model_ids.is_empty()
+            ));
+            assert!(!state.provider_api_key_input_active());
+        }
+    }
+
+    #[test]
+    fn configured_provider_credential_row_enter_and_space_clear_credentials() {
+        for key in [KeyCode::Enter, KeyCode::Char(' ')] {
+            let mut view = bootstrap();
+            view.providers = vec![provider("configured", true, None)];
+            let mut state = state(&view);
+            state.open_provider_picker();
+            state.open_provider_details();
+            let move_outcome = handle_terminal(
+                &mut state,
+                &view,
+                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            );
+            assert!(move_outcome.commands.is_empty());
+
+            let outcome = handle_terminal(
+                &mut state,
+                &view,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            );
+
+            assert!(matches!(
+                &outcome.commands[0].command,
+                Command::ClearProviderCredential { provider_id }
+                    if provider_id.as_str() == "configured"
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_snapshot_removal_realigns_the_selected_detail_row() {
+        let mut view = bootstrap();
+        view.providers = vec![
+            provider("replacement", false, None),
+            provider("selected", true, None),
+        ];
+        let mut state = state(&view);
+        state.open_provider_picker();
+        state.provider_picker_move(1);
+        state.open_provider_details();
+        state.provider_detail_move(-1);
+        assert_eq!(
+            state
+                .client
+                .provider_picker
+                .as_ref()
+                .map(|picker| picker.detail_row),
+            Some(ProviderDetailRow::ModelFilter)
+        );
+
+        view.providers.remove(1);
+        state.install_bootstrap(&view);
+
+        let picker = state
+            .client
+            .provider_picker
+            .as_ref()
+            .expect("provider picker");
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.detail_row, ProviderDetailRow::Credential);
+    }
+
+    #[test]
+    fn provider_actions_follow_picker_provider_identity_after_snapshot_reordering() {
+        let mut view = bootstrap();
+        view.providers = vec![
+            provider("first", true, None),
+            provider("selected", true, None),
+        ];
+        let mut state = state(&view);
+        state.open_provider_picker();
+        state.provider_picker_move(1);
+        state.open_provider_details();
+        view.providers.swap(0, 1);
+
+        let outcome = handle_terminal(
+            &mut state,
+            &view,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert!(matches!(
+            &outcome.commands[0].command,
+            Command::SetProviderEnabled { provider_id, .. }
+                if provider_id.as_str() == "selected"
+        ));
     }
 
     #[test]
