@@ -17,6 +17,7 @@ use futures_util::{Stream, StreamExt};
 use nakode_api::v1::{
     self as api, activation_service_client::ActivationServiceClient,
     nakode_service_client::NakodeServiceClient,
+    remote_update_service_client::RemoteUpdateServiceClient,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -149,6 +150,88 @@ pub struct ActivationCursor {
 #[derive(Clone)]
 pub struct ActivationClient {
     transport: ActivationServiceClient<Channel>,
+}
+
+/// Cloneable authenticated client for one remote machine's narrow self-update authority.
+#[derive(Clone)]
+pub struct RemoteUpdateClient {
+    transport: RemoteUpdateServiceClient<ApiTransport>,
+}
+
+impl RemoteUpdateClient {
+    /// Connects to the remote update service through pinned TLS and the installation bearer key.
+    ///
+    /// # Errors
+    /// Returns when TLS setup, endpoint connection, or API-key metadata is invalid.
+    pub async fn connect_remote(
+        endpoint: impl AsRef<str>,
+        ca_certificate_pem: impl AsRef<[u8]>,
+        tls_server_name: impl Into<String>,
+        api_key: impl AsRef<str>,
+    ) -> Result<Self, SdkError> {
+        let (channel, key) =
+            remote_channel(endpoint, ca_certificate_pem, tls_server_name, api_key).await?;
+        Ok(Self {
+            transport: RemoteUpdateServiceClient::with_interceptor(channel, key),
+        })
+    }
+
+    /// Returns the complete authoritative update snapshot.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn get_status(&self) -> Result<api::RemoteUpdateStatus, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .get_remote_update_status(api::GetRemoteUpdateStatusRequest {})
+            .await?
+            .into_inner())
+    }
+
+    /// Starts or replays one update operation against an explicitly fenced installation.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn start(
+        &self,
+        idempotency_key: impl Into<String>,
+        expected_server_id: impl Into<String>,
+        expected_build_revision: Option<String>,
+    ) -> Result<api::StartRemoteUpdateResponse, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .start_remote_update(api::StartRemoteUpdateRequest {
+                idempotency_key: idempotency_key.into(),
+                expected_server_id: expected_server_id.into(),
+                expected_build_revision,
+            })
+            .await?
+            .into_inner())
+    }
+
+    /// Watches complete replacement snapshots from one remote service generation.
+    /// Reconnect after an unavailable transport using the same endpoint trust record and cursor.
+    ///
+    /// # Errors
+    /// Returns when the initial watch cannot be established.
+    pub async fn watch_status(
+        &self,
+        after_attempt_id: impl Into<String>,
+        after_revision: Option<u64>,
+    ) -> Result<Watch<api::RemoteUpdateStatus>, SdkError> {
+        let stream = self
+            .transport
+            .clone()
+            .watch_remote_update_status(api::WatchRemoteUpdateStatusRequest {
+                after_attempt_id: after_attempt_id.into(),
+                after_revision,
+            })
+            .await?
+            .into_inner();
+        Ok(Box::pin(stream.map(|result| result.map_err(Into::into))))
+    }
 }
 
 impl ActivationClient {
@@ -452,23 +535,10 @@ impl NakodeClient {
         tls_server_name: impl Into<String>,
         api_key: impl AsRef<str>,
     ) -> Result<Self, SdkError> {
-        let tls = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(ca_certificate_pem))
-            .domain_name(tls_server_name.into());
-        let channel = Endpoint::from_shared(endpoint.as_ref().to_owned())?
-            .tls_config(tls)?
-            .connect()
-            .await?;
-        let authorization = format!("Bearer {}", api_key.as_ref())
-            .parse()
-            .map_err(|_| SdkError::InvalidProjection("invalid remote API key".to_owned()))?;
+        let (channel, key) =
+            remote_channel(endpoint, ca_certificate_pem, tls_server_name, api_key).await?;
         Ok(Self {
-            transport: configured_transport(
-                channel,
-                ClientApiKey {
-                    authorization: Some(authorization),
-                },
-            ),
+            transport: configured_transport(channel, key),
         })
     }
 
@@ -2194,6 +2264,30 @@ impl NakodeClient {
         }
         Ok(())
     }
+}
+
+async fn remote_channel(
+    endpoint: impl AsRef<str>,
+    ca_certificate_pem: impl AsRef<[u8]>,
+    tls_server_name: impl Into<String>,
+    api_key: impl AsRef<str>,
+) -> Result<(Channel, ClientApiKey), SdkError> {
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca_certificate_pem))
+        .domain_name(tls_server_name.into());
+    let channel = Endpoint::from_shared(endpoint.as_ref().to_owned())?
+        .tls_config(tls)?
+        .connect()
+        .await?;
+    let authorization = format!("Bearer {}", api_key.as_ref())
+        .parse()
+        .map_err(|_| SdkError::InvalidProjection("invalid remote API key".to_owned()))?;
+    Ok((
+        channel,
+        ClientApiKey {
+            authorization: Some(authorization),
+        },
+    ))
 }
 
 fn configured_transport(

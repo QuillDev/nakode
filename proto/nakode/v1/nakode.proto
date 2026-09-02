@@ -120,6 +120,87 @@ service ActivationService {
   rpc ForceActivate(ForceActivateRequest) returns (ActivationStatus);
 }
 
+// RemoteUpdateService is the narrow authenticated machine-maintenance boundary. It is bound only
+// on an enabled remote listener. The dashboard cannot supply a command, path, environment, or
+// installer; the server selects its platform updater and durably owns the lifecycle.
+service RemoteUpdateService {
+  rpc GetRemoteUpdateStatus(GetRemoteUpdateStatusRequest) returns (RemoteUpdateStatus);
+  rpc WatchRemoteUpdateStatus(WatchRemoteUpdateStatusRequest) returns (stream RemoteUpdateStatus);
+  rpc StartRemoteUpdate(StartRemoteUpdateRequest) returns (StartRemoteUpdateResponse);
+}
+
+message GetRemoteUpdateStatusRequest {}
+message WatchRemoteUpdateStatusRequest {
+  string after_attempt_id = 1;
+  optional uint64 after_revision = 2;
+}
+message StartRemoteUpdateRequest {
+  // Stable across retries of one owner action. A replay returns the original attempt.
+  string idempotency_key = 1;
+  // Fences the profile-private dashboard target to this exact Nakode installation.
+  string expected_server_id = 2;
+  // When present, refuses if the connected service changed since confirmation was rendered.
+  optional string expected_build_revision = 3;
+}
+
+enum RemoteUpdateCapability {
+  REMOTE_UPDATE_CAPABILITY_UNSPECIFIED = 0;
+  REMOTE_UPDATE_CAPABILITY_SUPPORTED = 1;
+  REMOTE_UPDATE_CAPABILITY_UNSUPPORTED = 2;
+}
+
+enum RemoteUpdatePhase {
+  REMOTE_UPDATE_PHASE_UNSPECIFIED = 0;
+  REMOTE_UPDATE_PHASE_IDLE = 1;
+  REMOTE_UPDATE_PHASE_REQUESTED = 2;
+  REMOTE_UPDATE_PHASE_CHECKING = 3;
+  REMOTE_UPDATE_PHASE_DOWNLOADING = 4;
+  REMOTE_UPDATE_PHASE_INSTALLING = 5;
+  REMOTE_UPDATE_PHASE_RESTARTING = 6;
+  REMOTE_UPDATE_PHASE_RECONNECTED = 7;
+  REMOTE_UPDATE_PHASE_SUCCEEDED = 8;
+  REMOTE_UPDATE_PHASE_FAILED = 9;
+}
+
+enum StartRemoteUpdateOutcome {
+  START_REMOTE_UPDATE_OUTCOME_UNSPECIFIED = 0;
+  START_REMOTE_UPDATE_OUTCOME_ACCEPTED = 1;
+  START_REMOTE_UPDATE_OUTCOME_REPLAYED = 2;
+  START_REMOTE_UPDATE_OUTCOME_ALREADY_IN_PROGRESS = 3;
+  START_REMOTE_UPDATE_OUTCOME_UNSUPPORTED = 4;
+  START_REMOTE_UPDATE_OUTCOME_STALE_TARGET = 5;
+}
+
+message RemoteUpdateFailure {
+  string code = 1;
+  string message = 2;
+  string recovery = 3;
+  bool retryable = 4;
+}
+
+message RemoteUpdateStatus {
+  uint32 schema_version = 1;
+  string server_id = 2;
+  string attempt_id = 3;
+  uint64 revision = 4;
+  RemoteUpdateCapability capability = 5;
+  string unsupported_reason = 6;
+  RemoteUpdatePhase phase = 7;
+  string current_version = 8;
+  optional string current_build_revision = 9;
+  optional string target_version = 10;
+  optional string target_build_revision = 11;
+  bool update_available = 12;
+  optional uint64 started_at_unix_ms = 13;
+  uint64 updated_at_unix_ms = 14;
+  optional RemoteUpdateFailure failure = 15;
+}
+
+message StartRemoteUpdateResponse {
+  StartRemoteUpdateOutcome outcome = 1;
+  RemoteUpdateStatus status = 2;
+}
+
 message GetActivationStatusRequest {}
 message WatchActivationStatusRequest {
   optional uint64 after_revision = 1;

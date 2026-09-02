@@ -753,14 +753,19 @@ async fn run_remote_grpc_listener(
     );
     let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
     eprintln!("nakode remote API listening at {}", config.bind);
+    let update_service = crate::remote_update::RemoteUpdateService::new(server_id.clone())
+        .map_err(ControlError::ServiceRejected)?;
+    let api_key = config.api_key.clone();
     tonic::transport::Server::builder()
         .tls_config(tls)?
         .add_service(
             nakode_server::grpc::GrpcService::new(endpoint)
                 .with_server_id(server_id)
                 .with_nakode_service_only_lane_catalogue()
-                .into_authenticated_server(config.api_key),
+                .with_additional_capability("RemoteSelfUpdate")
+                .into_authenticated_server(api_key),
         )
+        .add_service(update_service.into_authenticated_server(config.api_key))
         .serve(config.bind)
         .await?;
     Ok(())
