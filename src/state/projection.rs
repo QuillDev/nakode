@@ -1486,6 +1486,9 @@ fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView
         available_builtin_tools: state
             .available_builtin_tools(&provider.provider)
             .map(<[String]>::to_vec),
+        remote_authentication_supported: crate::backend::remote_authentication_supported(
+            &provider.provider,
+        ),
         accounts: provider
             .accounts
             .iter()
@@ -2276,9 +2279,13 @@ fn authentication_view(authentication: &ProviderAuthenticationState) -> Provider
         ProviderAuthenticationState::Challenge {
             verification_url,
             user_code,
+            login_id,
+            callback_url,
         } => ProviderAuthenticationView::Challenge {
             verification_url: verification_url.clone(),
             user_code: user_code.clone(),
+            login_id: login_id.clone(),
+            callback_url: callback_url.clone(),
         },
     }
 }

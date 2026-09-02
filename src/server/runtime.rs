@@ -4290,8 +4290,24 @@ impl EffectExecutor {
             Effect::SetProviderEnabled { provider, enabled } => {
                 self.set_provider_enabled(state, &provider, enabled).await;
             }
-            Effect::AuthenticateProvider(provider) => {
-                authenticate_provider(state, &mut self.backends, &provider).await;
+            Effect::AuthenticateProvider {
+                provider,
+                client_context,
+            } => {
+                authenticate_provider(state, &mut self.backends, &provider, client_context).await;
+            }
+            Effect::SubmitProviderAuthenticationCallback {
+                provider,
+                account_id,
+                callback_url,
+            } => {
+                self.submit_provider_authentication_callback(
+                    state,
+                    &provider,
+                    account_id.as_deref(),
+                    callback_url,
+                )
+                .await;
             }
             Effect::AddProviderAccount { provider, label } => {
                 if label.trim().is_empty() {
@@ -4416,8 +4432,9 @@ impl EffectExecutor {
             Effect::AuthenticateProviderAccount {
                 provider,
                 account_id,
+                client_context,
             } => {
-                self.authenticate_provider_account(state, &provider, &account_id)
+                self.authenticate_provider_account(state, &provider, &account_id, client_context)
                     .await;
             }
             Effect::ReloadProviderAccount {
@@ -4562,6 +4579,7 @@ impl EffectExecutor {
         state: &mut DomainState,
         provider: &str,
         account_id: &str,
+        client_context: crate::backend::ClientContext,
     ) {
         if let Err(error) = self
             .backends
@@ -4573,7 +4591,11 @@ impl EffectExecutor {
         }
         if !self
             .backends
-            .send_account(provider, account_id, BackendCommand::BeginAuthentication)
+            .send_account(
+                provider,
+                account_id,
+                BackendCommand::BeginAuthentication { client_context },
+            )
             .await
         {
             state.provider_account_authentication_failed(
@@ -4581,6 +4603,48 @@ impl EffectExecutor {
                 account_id,
                 "provider account authentication channel closed",
             );
+        }
+    }
+
+    async fn submit_provider_authentication_callback(
+        &mut self,
+        state: &mut DomainState,
+        provider: &str,
+        account_id: Option<&str>,
+        callback_url: String,
+    ) {
+        let accepted = match account_id {
+            Some(account_id) => {
+                self.backends
+                    .send_account(
+                        provider,
+                        account_id,
+                        BackendCommand::SubmitAuthenticationCallback { callback_url },
+                    )
+                    .await
+            }
+            None => {
+                self.backends
+                    .send(
+                        provider,
+                        BackendCommand::SubmitAuthenticationCallback { callback_url },
+                    )
+                    .await
+            }
+        };
+        if !accepted {
+            if let Some(account_id) = account_id {
+                state.provider_account_authentication_failed(
+                    provider,
+                    account_id,
+                    "provider authentication channel closed",
+                );
+            } else {
+                state.provider_authentication_failed(
+                    provider,
+                    "provider authentication channel closed",
+                );
+            }
         }
     }
 
@@ -5288,11 +5352,15 @@ async fn authenticate_provider(
     state: &mut DomainState,
     backends: &mut BackendRegistry,
     provider: &str,
+    client_context: crate::backend::ClientContext,
 ) {
     if let Err(error) = backends.start_provider(provider).await {
         state.provider_authentication_failed(provider, &error.to_string());
     } else if !backends
-        .send(provider, BackendCommand::BeginAuthentication)
+        .send(
+            provider,
+            BackendCommand::BeginAuthentication { client_context },
+        )
         .await
     {
         state.provider_authentication_failed(provider, "provider authentication channel closed");
@@ -6118,7 +6186,9 @@ mod tests {
                 model: Some("model".to_owned()),
                 options: BackendModelOptions::default(),
             },
-            Effect::Backend(BackendCommand::BeginAuthentication),
+            Effect::Backend(BackendCommand::BeginAuthentication {
+                client_context: crate::backend::ClientContext::Unspecified,
+            }),
         ];
 
         persist_session_primary_transitions(&store, &mut effects)
@@ -6126,7 +6196,7 @@ mod tests {
 
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Backend(BackendCommand::BeginAuthentication)]
+            [Effect::Backend(BackendCommand::BeginAuthentication { .. })]
         ));
         assert_eq!(
             store
@@ -6152,7 +6222,9 @@ mod tests {
                 model: Some("model".to_owned()),
                 options: BackendModelOptions::default(),
             },
-            Effect::Backend(BackendCommand::BeginAuthentication),
+            Effect::Backend(BackendCommand::BeginAuthentication {
+                client_context: crate::backend::ClientContext::Unspecified,
+            }),
         ];
 
         persist_session_primary_transitions(&store, &mut effects)

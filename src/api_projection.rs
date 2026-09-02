@@ -77,6 +77,7 @@ pub(crate) enum TuiAction {
     },
     BeginProviderAuthentication {
         provider_id: view::ProviderId,
+        client_context: view::ClientContext,
     },
     SetProviderCredential {
         provider_id: view::ProviderId,
@@ -299,11 +300,15 @@ async fn execute_management_command(
         action @ TuiAction::SetProviderModelFilter { .. } => {
             execute_provider_model_filter(client, action).await
         }
-        TuiAction::BeginProviderAuthentication { provider_id } => {
+        TuiAction::BeginProviderAuthentication {
+            provider_id,
+            client_context,
+        } => {
             client
                 .begin_provider_authentication(api::BeginProviderAuthenticationRequest {
                     mutation: None,
                     provider_id: provider_id.to_string(),
+                    client_context: api_client_context(client_context),
                 })
                 .await
         }
@@ -330,6 +335,14 @@ async fn execute_management_command(
                 .await
         }
         other => execute_catalog_command(client, other).await,
+    }
+}
+
+fn api_client_context(context: view::ClientContext) -> i32 {
+    match context {
+        view::ClientContext::Local => api::ClientContext::Local as i32,
+        view::ClientContext::Remote => api::ClientContext::Remote as i32,
+        view::ClientContext::Unspecified => api::ClientContext::Unspecified as i32,
     }
 }
 
@@ -835,6 +848,7 @@ fn provider(value: api::Provider) -> Result<view::ProviderView, String> {
         available_builtin_tools: value
             .builtin_tool_availability_known
             .then_some(value.available_builtin_tools),
+        remote_authentication_supported: value.remote_authentication_supported,
         accounts: value
             .accounts
             .into_iter()
@@ -975,6 +989,8 @@ fn authentication(
         Kind::Challenge => Ok(view::ProviderAuthenticationView::Challenge {
             verification_url: value.verification_url.unwrap_or_default(),
             user_code: value.user_code.unwrap_or_default(),
+            login_id: value.login_id.unwrap_or_default(),
+            callback_url: value.callback_url,
         }),
         Kind::Unspecified => Err("unspecified provider authentication".into()),
     }

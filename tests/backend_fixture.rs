@@ -6,7 +6,7 @@ use std::{error::Error, ffi::OsString, io, path::PathBuf, time::Duration};
 use std::{fs::OpenOptions, io::Write, process::Command};
 
 use nakode::{
-    backend::{BackendCommand, BackendEvent, BackendHandle, DeltaKind},
+    backend::{BackendCommand, BackendEvent, BackendHandle, ClientContext, DeltaKind},
     codex::{self, CompatibilityBackendConfig as BackendConfig},
 };
 use tokio::time::timeout;
@@ -137,7 +137,9 @@ async fn codex_client_completes_device_authentication() -> TestResult {
     while !matches!(next_event(&mut backend).await?, BackendEvent::Ready(_)) {}
     backend
         .commands
-        .send(BackendCommand::BeginAuthentication)
+        .send(BackendCommand::BeginAuthentication {
+            client_context: ClientContext::Unspecified,
+        })
         .await?;
 
     let challenge = next_matching_event(&mut backend, |event| {

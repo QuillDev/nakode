@@ -893,6 +893,7 @@ fn install_ready_view(
         supported_builtin_tools: Some(Vec::new()),
         available_builtin_tools: Some(Vec::new()),
         accounts: Vec::new(),
+        remote_authentication_supported: false,
     };
     if let Some(existing) = view
         .providers
