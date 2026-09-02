@@ -1,4 +1,10 @@
-use std::{fs, net::SocketAddr, path::PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    net::SocketAddr,
+    path::PathBuf,
+};
+
+use fs2::FileExt as _;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore as _;
@@ -7,6 +13,7 @@ use thiserror::Error;
 
 const REMOTE_CONFIG_FILE: &str = "remote.json";
 const SERVER_ID_FILE: &str = "server-id";
+const REMOTE_LOCK_FILE: &str = "remote.lock";
 pub const TLS_SERVER_NAME: &str = "nakode.remote";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -34,6 +41,8 @@ pub enum RemoteConfigError {
     Malformed(String),
     #[error("invalid remote configuration JSON: {0}")]
     Invalid(#[from] serde_json::Error),
+    #[error("invalid enrollment endpoint: {0}")]
+    Endpoint(String),
     #[error("could not generate remote TLS identity: {0}")]
     Certificate(#[from] rcgen::Error),
 }
@@ -84,22 +93,30 @@ pub fn installation_server_id() -> Result<String, RemoteConfigError> {
     Ok(server_id)
 }
 
-/// Enables remote access with a fresh API key and TLS identity.
+/// Enables remote access, preserving an existing enrollment identity and credential.
 ///
 /// # Errors
 /// Returns when configuration or certificate generation fails.
 pub fn enable(bind: SocketAddr) -> Result<RemoteConfig, RemoteConfigError> {
-    let certified = rcgen::generate_simple_self_signed(vec![TLS_SERVER_NAME.to_owned()])?;
-    let config = RemoteConfig {
-        enabled: true,
-        bind,
-        server_id: installation_server_id()?,
-        api_key: generate_api_key(),
-        certificate_pem: certified.cert.pem(),
-        private_key_pem: certified.signing_key.serialize_pem(),
-    };
-    save(&config)?;
-    Ok(config)
+    with_config_lock(|| {
+        let config = if let Some(mut existing) = load()? {
+            existing.enabled = true;
+            existing.bind = bind;
+            existing
+        } else {
+            let certified = rcgen::generate_simple_self_signed(vec![TLS_SERVER_NAME.to_owned()])?;
+            RemoteConfig {
+                enabled: true,
+                bind,
+                server_id: installation_server_id()?,
+                api_key: generate_api_key(),
+                certificate_pem: certified.cert.pem(),
+                private_key_pem: certified.signing_key.serialize_pem(),
+            }
+        };
+        save(&config)?;
+        Ok(config)
+    })
 }
 
 /// Replaces the configured API key, invalidating the old key after service restart.
@@ -107,10 +124,28 @@ pub fn enable(bind: SocketAddr) -> Result<RemoteConfig, RemoteConfigError> {
 /// # Errors
 /// Returns when remote access is not configured or the private file cannot be updated.
 pub fn regenerate_key() -> Result<RemoteConfig, RemoteConfigError> {
-    let mut config = load()?.ok_or(RemoteConfigError::NotConfigured)?;
-    config.api_key = generate_api_key();
-    save(&config)?;
-    Ok(config)
+    with_config_lock(|| {
+        let mut config = load()?.ok_or(RemoteConfigError::NotConfigured)?;
+        config.api_key = generate_api_key();
+        save(&config)?;
+        Ok(config)
+    })
+}
+
+/// Replaces the configured API key and TLS certificate while preserving the server identity.
+///
+/// # Errors
+/// Returns when remote access is not configured or credentials cannot be generated or saved.
+pub fn rotate_credentials() -> Result<RemoteConfig, RemoteConfigError> {
+    with_config_lock(|| {
+        let mut config = load()?.ok_or(RemoteConfigError::NotConfigured)?;
+        let certified = rcgen::generate_simple_self_signed(vec![TLS_SERVER_NAME.to_owned()])?;
+        config.api_key = generate_api_key();
+        config.certificate_pem = certified.cert.pem();
+        config.private_key_pem = certified.signing_key.serialize_pem();
+        save(&config)?;
+        Ok(config)
+    })
 }
 
 /// Marks the remote listener disabled without deleting its identity.
@@ -118,17 +153,56 @@ pub fn regenerate_key() -> Result<RemoteConfig, RemoteConfigError> {
 /// # Errors
 /// Returns when the private configuration cannot be read or updated.
 pub fn disable() -> Result<Option<RemoteConfig>, RemoteConfigError> {
-    let Some(mut config) = load()? else {
-        return Ok(None);
+    with_config_lock(|| {
+        let Some(mut config) = load()? else {
+            return Ok(None);
+        };
+        config.enabled = false;
+        save(&config)?;
+        Ok(Some(config))
+    })
+}
+
+/// Resolves and validates the reachable HTTPS endpoint written into enrollment output.
+///
+/// # Errors
+/// Returns when the endpoint is not a plain HTTPS authority or only names a wildcard listener.
+pub fn enrollment_endpoint(
+    bind: SocketAddr,
+    requested: Option<&str>,
+) -> Result<String, RemoteConfigError> {
+    let candidate = requested.map_or_else(|| format!("https://{bind}"), ToOwned::to_owned);
+    let candidate = if candidate.contains("://") {
+        candidate
+    } else {
+        format!("https://{candidate}")
     };
-    config.enabled = false;
-    save(&config)?;
-    Ok(Some(config))
+    let parsed = reqwest::Url::parse(&candidate)
+        .map_err(|error| RemoteConfigError::Endpoint(error.to_string()))?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(RemoteConfigError::Endpoint(
+            "use an HTTPS hostname or IP and port with no credentials or path".to_owned(),
+        ));
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if matches!(host, "0.0.0.0" | "::") {
+        return Err(RemoteConfigError::Endpoint(
+            "a wildcard listener is not reachable; pass --endpoint with this machine's hostname or IP"
+                .to_owned(),
+        ));
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 #[must_use]
-pub fn public_connection(config: &RemoteConfig) -> serde_json::Value {
-    serde_json::json!({
+pub fn public_connection(config: &RemoteConfig, endpoint: Option<&str>) -> serde_json::Value {
+    let mut connection = serde_json::json!({
         "version": 1,
         "transport": "grpc+tls",
         "bind": config.bind,
@@ -136,7 +210,11 @@ pub fn public_connection(config: &RemoteConfig) -> serde_json::Value {
         "server_id": config.server_id,
         "api_key": config.api_key,
         "ca_certificate_pem": config.certificate_pem,
-    })
+    });
+    if let Some(endpoint) = endpoint {
+        connection["endpoint"] = serde_json::Value::String(endpoint.to_owned());
+    }
+    connection
 }
 
 fn validate(config: &RemoteConfig) -> Result<(), RemoteConfigError> {
@@ -168,6 +246,43 @@ fn generate_api_key() -> String {
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     format!("nk_{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn with_config_lock<T>(
+    operation: impl FnOnce() -> Result<T, RemoteConfigError>,
+) -> Result<T, RemoteConfigError> {
+    let home = crate::config::nakode_home()?;
+    fs::create_dir_all(&home).map_err(|source| RemoteConfigError::Io {
+        path: home.display().to_string(),
+        source,
+    })?;
+    let lock_path = home.join(REMOTE_LOCK_FILE);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| RemoteConfigError::Io {
+            path: lock_path.display().to_string(),
+            source,
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+            RemoteConfigError::Io {
+                path: lock_path.display().to_string(),
+                source,
+            }
+        })?;
+    }
+    lock.lock_exclusive()
+        .map_err(|source| RemoteConfigError::Io {
+            path: lock_path.display().to_string(),
+            source,
+        })?;
+    operation()
 }
 
 fn save(config: &RemoteConfig) -> Result<(), RemoteConfigError> {

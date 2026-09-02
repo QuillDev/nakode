@@ -205,16 +205,44 @@ pub enum NakodeCommand {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum RemoteAction {
-    /// Enable TLS remote access and generate a new API key.
+    /// Enable TLS remote access, preserving an existing identity and credential.
     Enable {
         /// TCP address the service will listen on after restart.
         #[arg(long, default_value = "127.0.0.1:7342")]
         bind: std::net::SocketAddr,
+        /// Permit listening on all network interfaces. Authentication and TLS remain required.
+        #[arg(long)]
+        allow_public_listen: bool,
+        /// Reachable HTTPS host and port to include in enrollment output.
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
+    /// Print the existing one-time enrollment descriptor without changing credentials.
+    Descriptor {
+        /// Reachable HTTPS host and port to include in enrollment output.
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
+    /// Verify TLS, authentication, API compatibility, and stable server identity.
+    Check {
+        /// Reachable HTTPS host and port. Defaults to the configured listener address.
+        #[arg(long)]
+        endpoint: Option<String>,
     },
     /// Disable the remote listener after restart.
     Disable,
     /// Revoke the current client key and print its replacement.
-    RegenerateKey,
+    RegenerateKey {
+        /// Reachable HTTPS host and port to include in enrollment output.
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
+    /// Rotate the API key and TLS certificate together.
+    RotateCredentials {
+        /// Reachable HTTPS host and port to include in enrollment output.
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
     /// Print non-secret remote listener status.
     Status {
         /// Emit machine-readable JSON.

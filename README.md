@@ -43,12 +43,20 @@ individual sessions and are supplied by the frontend creating them, never by lif
 Remote client access is opt-in and additive to the private Unix endpoint:
 
 ```sh
-nakode remote enable --bind 0.0.0.0:7342  # emits the TLS/enrollment descriptor
-nakode restart                             # applies listener or key changes
-nakode remote status
-nakode remote regenerate-key               # restart revokes the old key
+nakode remote enable --bind 10.0.0.8:7342 --endpoint executor.example:7342
+nakode restart                              # applies listener or credential changes
+nakode remote check --endpoint executor.example:7342
+nakode remote descriptor --endpoint executor.example:7342
+nakode remote regenerate-key --endpoint executor.example:7342
+nakode remote rotate-credentials --endpoint executor.example:7342
 nakode remote disable                       # restart removes the TCP listener
 ```
+
+`enable` is idempotent: reruns preserve the stable server ID, API key, and TLS certificate while
+repairing enablement or changing the bind address. `regenerate-key` revokes only the bearer key;
+`rotate-credentials` replaces both key and pinned certificate. Both require a service restart.
+`check` performs a real pinned-TLS and authenticated `GetServerInfo` call and rejects API/server-ID
+mismatch. A wildcard bind needs a separate reachable `--endpoint` in enrollment output.
 
 The descriptor contains a random 256-bit bearer key and pinned self-signed TLS identity; handle it as a secret. The installation keeps a stable server ID across key regeneration. Remote frontends use the same `nakode.v1` service, including read-only `InspectWorkspacePath` for server-side canonical path and Git placement checks. Nakode remains the sole session, provider, tool, persistence, lifecycle, and resumability authority.
 

@@ -63,7 +63,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NakodeCommand::Endpoint => service_cli::endpoint(&config).await?,
         NakodeCommand::ActivationEndpoint => service_cli::activation_endpoint(&config).await?,
         NakodeCommand::ActivationHelper => activation::run_helper(config).await?,
-        NakodeCommand::Remote { action } => run_remote(&action)?,
+        NakodeCommand::Remote { action } => run_remote(&action).await?,
         NakodeCommand::Diagnostics {
             days,
             sessions,
@@ -120,27 +120,68 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_remote(action: &RemoteAction) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_remote(action: &RemoteAction) -> Result<(), Box<dyn std::error::Error>> {
     match action {
-        RemoteAction::Enable { bind } => {
+        RemoteAction::Enable {
+            bind,
+            allow_public_listen,
+            endpoint,
+        } => {
+            if bind.ip().is_unspecified() && !allow_public_listen {
+                return Err("wildcard remote listeners require --allow-public-listen".into());
+            }
+            let endpoint = remote::enrollment_endpoint(*bind, endpoint.as_deref())?;
             let configured = remote::enable(*bind)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&remote::public_connection(&configured))?
+                serde_json::to_string_pretty(&remote::public_connection(
+                    &configured,
+                    Some(&endpoint)
+                ))?
             );
             eprintln!("Restart Nakode to apply the remote listener configuration.");
         }
+        RemoteAction::Descriptor { endpoint } => {
+            let configured = remote::load()?.ok_or(remote::RemoteConfigError::NotConfigured)?;
+            let endpoint = remote::enrollment_endpoint(configured.bind, endpoint.as_deref())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&remote::public_connection(
+                    &configured,
+                    Some(&endpoint)
+                ))?
+            );
+        }
+        RemoteAction::Check { endpoint } => check_remote(endpoint.as_deref()).await?,
         RemoteAction::Disable => {
             remote::disable()?;
             println!("Nakode remote access disabled. Restart Nakode to apply.");
         }
-        RemoteAction::RegenerateKey => {
+        RemoteAction::RegenerateKey { endpoint } => {
+            let existing = remote::load()?.ok_or(remote::RemoteConfigError::NotConfigured)?;
+            let endpoint = remote::enrollment_endpoint(existing.bind, endpoint.as_deref())?;
             let configured = remote::regenerate_key()?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&remote::public_connection(&configured))?
+                serde_json::to_string_pretty(&remote::public_connection(
+                    &configured,
+                    Some(&endpoint)
+                ))?
             );
             eprintln!("Restart Nakode to revoke the previous key.");
+        }
+        RemoteAction::RotateCredentials { endpoint } => {
+            let existing = remote::load()?.ok_or(remote::RemoteConfigError::NotConfigured)?;
+            let endpoint = remote::enrollment_endpoint(existing.bind, endpoint.as_deref())?;
+            let configured = remote::rotate_credentials()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&remote::public_connection(
+                    &configured,
+                    Some(&endpoint)
+                ))?
+            );
+            eprintln!("Restart Nakode to activate the replacement key and TLS certificate.");
         }
         RemoteAction::Status { json } => {
             let configured = remote::load()?;
@@ -169,5 +210,51 @@ fn run_remote(action: &RemoteAction) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    Ok(())
+}
+
+async fn check_remote(endpoint: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let configured = remote::load()?.ok_or(remote::RemoteConfigError::NotConfigured)?;
+    if !configured.enabled {
+        return Err("remote access is disabled".into());
+    }
+    let endpoint = remote::enrollment_endpoint(configured.bind, endpoint)?;
+    let client = nakode_sdk::NakodeClient::connect_remote(
+        &endpoint,
+        configured.certificate_pem.as_bytes(),
+        remote::TLS_SERVER_NAME,
+        &configured.api_key,
+    )
+    .await?;
+    let info = client.get_server_info().await?;
+    let missing_capabilities = [
+        "WorkspacePathInspection",
+        "Subscriptions",
+        "SessionWorkingDirectories",
+        "ExternalTools",
+        "InitialSessionTools",
+        "BuiltinToolAllowlists",
+    ]
+    .into_iter()
+    .filter(|required| !info.capabilities.iter().any(|value| value == *required))
+    .collect::<Vec<_>>();
+    if info.api_version != "nakode.v1"
+        || info.server_id != configured.server_id
+        || !missing_capabilities.is_empty()
+    {
+        return Err(format!(
+            "remote compatibility mismatch at {endpoint}: expected nakode.v1 server {} with Ticket Agent capabilities; got {} server {} missing {}",
+            configured.server_id,
+            info.api_version,
+            info.server_id,
+            missing_capabilities.join(", ")
+        )
+        .into());
+    }
+    println!(
+        "Nakode remote endpoint verified at {endpoint} (server {}, build {}).",
+        info.server_id,
+        info.build_revision.as_deref().unwrap_or("unknown")
+    );
     Ok(())
 }
