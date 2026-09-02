@@ -62,6 +62,8 @@ pub enum NativeRuntimeError {
     PromptAddenda(#[from] PromptAddendaError),
     #[error(transparent)]
     Soul(#[from] crate::soul::SoulError),
+    #[error("failed to identify the Nakode execution host: {0}")]
+    ExecutionHost(#[source] io::Error),
     #[error("failed to locate the running Nakode executable: {0}")]
     CurrentExecutable(#[source] io::Error),
 }
@@ -356,6 +358,10 @@ pub(crate) async fn prepare_runtime(
         PromptAddenda::load(config.personalities.as_deref(), config.soul.as_deref())?;
     let soul_store = crate::soul::SoulStore::configured(config.soul.as_deref())?;
     let mut state = initial_state(config, &providers, &backends, agents, skills.clone());
+    state.install_execution_host(
+        crate::execution_host::ExecutionHost::detect()
+            .map_err(NativeRuntimeError::ExecutionHost)?,
+    );
     state.install_prompt_addenda(prompt_addenda);
     let terminal_image_mode = session_repository.load_terminal_image_mode()?;
     state.install_terminal_image_mode(terminal_image_mode);

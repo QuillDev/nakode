@@ -263,6 +263,8 @@ The agent loop, inference stream, and tool contracts are provider-neutral.
 Provider adapters receive normalized inference requests and return normalized
 stream events and outputs. They must not own local file or process semantics.
 
+Every primary and delegated provider session receives the same execution-host context, containing only hostname, operating system, and architecture observed by the authoritative server process.
+
 Local tools must:
 
 - Resolve relative paths against the configured workspace.
