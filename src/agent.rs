@@ -7,12 +7,13 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::tools::NAKODE_AGENT_TOOL_NAME;
+use crate::tools::{NAKODE_AGENT_TOOL_NAME, SEARCH_SHARED_CONTEXT_TOOL_NAME};
 
 pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "read",
     "read_skill",
     "read_skill_component",
+    SEARCH_SHARED_CONTEXT_TOOL_NAME,
     "grep",
     "find",
     "ls",
@@ -273,11 +274,15 @@ impl AgentDefinition {
                 self.allowed_tools.clone()
             };
         if self.tool_profile != AgentToolProfile::None {
-            for skill_tool in ["read_skill", "read_skill_component"] {
-                if !configured.iter().any(|tool| tool == skill_tool)
-                    && !self.denied_tools.iter().any(|tool| tool == skill_tool)
+            for context_tool in [
+                "read_skill",
+                "read_skill_component",
+                SEARCH_SHARED_CONTEXT_TOOL_NAME,
+            ] {
+                if !configured.iter().any(|tool| tool == context_tool)
+                    && !self.denied_tools.iter().any(|tool| tool == context_tool)
                 {
-                    configured.push(skill_tool.to_owned());
+                    configured.push(context_tool.to_owned());
                 }
             }
         }
@@ -736,7 +741,7 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
         "vision" => Some("vision"),
         // Installed skills are Nakode-owned instruction context. These tools accept only exact
         // catalogued skill/component names and do not grant caller-selected filesystem access.
-        "read_skill" | "read_skill_component" => None,
+        "read_skill" | "read_skill_component" | SEARCH_SHARED_CONTEXT_TOOL_NAME => None,
         NAKODE_AGENT_TOOL_NAME => Some("delegation"),
         _ => None,
     }
@@ -1073,7 +1078,7 @@ mod tests {
 
     use super::{
         AgentCatalog, AgentCatalogError, AgentDefinition, AgentOwnership, AgentToolProfile,
-        calibrate_legacy_analytical_budget,
+        SEARCH_SHARED_CONTEXT_TOOL_NAME, calibrate_legacy_analytical_budget,
     };
 
     #[test]
@@ -1277,6 +1282,7 @@ description = "Research the requested topic and report concrete findings"
                 "read".to_owned(),
                 "read_skill".to_owned(),
                 "read_skill_component".to_owned(),
+                SEARCH_SHARED_CONTEXT_TOOL_NAME.to_owned(),
             ])
         );
 
@@ -1304,6 +1310,7 @@ description = "Research the requested topic and report concrete findings"
             vec![
                 "read_skill".to_owned(),
                 "read_skill_component".to_owned(),
+                SEARCH_SHARED_CONTEXT_TOOL_NAME.to_owned(),
                 "todo".to_owned()
             ]
         );
@@ -1341,6 +1348,7 @@ description = "Research the requested topic and report concrete findings"
                 "grep".to_owned(),
                 "read_skill".to_owned(),
                 "read_skill_component".to_owned(),
+                SEARCH_SHARED_CONTEXT_TOOL_NAME.to_owned(),
             ])
         );
         assert_eq!(
@@ -1364,6 +1372,7 @@ description = "Research the requested topic and report concrete findings"
                 "bash".to_owned(),
                 "read_skill".to_owned(),
                 "read_skill_component".to_owned(),
+                SEARCH_SHARED_CONTEXT_TOOL_NAME.to_owned(),
             ])
         );
         assert!(
@@ -1387,6 +1396,7 @@ description = "Research the requested topic and report concrete findings"
                 "read".to_owned(),
                 "read_skill".to_owned(),
                 "read_skill_component".to_owned(),
+                SEARCH_SHARED_CONTEXT_TOOL_NAME.to_owned(),
             ])
         );
         let context_denied = AgentDefinition {
@@ -1395,7 +1405,10 @@ description = "Research the requested topic and report concrete findings"
         };
         assert_eq!(
             context_denied.builtin_tool_allowlist(),
-            Some(vec!["read".to_owned()])
+            Some(vec![
+                "read".to_owned(),
+                SEARCH_SHARED_CONTEXT_TOOL_NAME.to_owned()
+            ])
         );
         assert_eq!(
             watcher.effective_capabilities(),
@@ -1460,6 +1473,7 @@ description = "Research the requested topic and report concrete findings"
                 "read".to_owned(),
                 "read_skill".to_owned(),
                 "read_skill_component".to_owned(),
+                "search_shared_context".to_owned(),
                 "nakode_agent".to_owned(),
             ])
         );

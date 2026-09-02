@@ -422,6 +422,8 @@ mod tests {
             interactions: vec![question()],
             todos: Vec::new(),
             runs: Vec::new(),
+            shared_context: Vec::new(),
+            shared_context_total: 0,
             runs_total: Some(0),
             runs_has_earlier: false,
             notices: Vec::new(),

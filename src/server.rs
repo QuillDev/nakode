@@ -893,6 +893,25 @@ impl ServerCore {
                 task,
                 parent_run_id,
             } => self.delegate_command(&session_id, &agent_slug, &task, parent_run_id.as_ref()),
+            Command::PublishSharedContext {
+                session_id,
+                author_run_id,
+                idempotency_key,
+                kind,
+                body,
+            } => {
+                self.ensure_session(&session_id)?;
+                let (entry_id, effects) = self
+                    .session_engine_mut(&session_id)?
+                    .state_mut()
+                    .publish_shared_context(
+                        author_run_id.as_ref().map(RunId::as_str),
+                        &idempotency_key,
+                        &kind,
+                        &body,
+                    )?;
+                Ok(Self::accepted(Some(entry_id), effects))
+            }
             Command::CancelRun { run_id } => self.cancel_run_command(&run_id),
             Command::ContinueRun {
                 run_id,
@@ -4088,6 +4107,7 @@ impl ServerCore {
             | Command::SteerQueuedPrompt { session_id, .. }
             | Command::CancelSessionWork { session_id }
             | Command::Delegate { session_id, .. }
+            | Command::PublishSharedContext { session_id, .. }
             | Command::RunShell { session_id, .. }
             | Command::ReloadWorkspace { session_id, .. }
             | Command::ConfigureSessionTools { session_id, .. }

@@ -3,7 +3,10 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolConcurrency, ToolContext, ToolFuture, ToolResult};
-use crate::{backend::NativeDelegationRequest, runtime::ToolDefinition};
+use crate::{
+    backend::{NativeAgentRequest, NativeDelegationRequest},
+    runtime::ToolDefinition,
+};
 
 pub(crate) const NAKODE_AGENT_TOOL_NAME: &str = "nakode_agent";
 
@@ -76,7 +79,7 @@ impl Tool for NakodeAgentTool {
                 );
             };
             let (respond, response) = tokio::sync::oneshot::channel();
-            let request = NativeDelegationRequest {
+            let request = NativeAgentRequest::Delegate(NativeDelegationRequest {
                 owner_session_id,
                 parent_run_id: context.session.parent_run_id.clone(),
                 invocation_turn_id: context.turn_id.to_owned(),
@@ -85,7 +88,7 @@ impl Tool for NakodeAgentTool {
                 task: arguments.task,
                 cancellation: cancellation.clone(),
                 respond,
-            };
+            });
             tokio::select! {
                 sent = requests.send(request) => {
                     if sent.is_err() {

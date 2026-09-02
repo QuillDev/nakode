@@ -214,6 +214,7 @@ mod tests {
             continuation_depth: 0,
             additional_turns: None,
             inherited_evidence: Vec::new(),
+            shared_context_utilization: nakode_protocol::SharedContextUtilizationView::default(),
             tool_denials_retained_total: 0,
             native_session_id: None,
             usage: nakode_protocol::TokenUsageView {

@@ -2535,6 +2535,8 @@ mod tests {
             interactions: Vec::new(),
             todos: Vec::new(),
             runs: Vec::new(),
+            shared_context: Vec::new(),
+            shared_context_total: 0,
             runs_total: Some(0),
             runs_has_earlier: false,
             notices: Vec::new(),
@@ -2627,6 +2629,7 @@ mod tests {
             continuation_depth: 0,
             additional_turns: None,
             inherited_evidence: Vec::new(),
+            shared_context_utilization: nakode_protocol::SharedContextUtilizationView::default(),
             tool_denials_retained_total: 0,
             native_session_id: None,
             usage: nakode_protocol::TokenUsageView {

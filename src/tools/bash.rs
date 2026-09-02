@@ -1,4 +1,9 @@
-use std::{borrow::Cow, collections::HashMap, ffi::OsString, io::Read, time::Duration};
+use std::{
+    borrow::Cow, collections::HashMap, ffi::OsString, fmt::Write as _, io::Read, process::Command,
+    time::Duration,
+};
+
+use sha2::{Digest, Sha256};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -11,7 +16,12 @@ use super::{
     process::{ProcessRequest, ProcessResult, run_process},
     required_string, resolve_workspace_path,
 };
-use crate::runtime::ToolDefinition;
+use crate::{
+    backend::{
+        NativeAgentRequest, NativeValidationEvidenceOperation, NativeValidationEvidenceRequest,
+    },
+    runtime::ToolDefinition,
+};
 
 pub struct BashTool;
 
@@ -27,7 +37,8 @@ impl Tool for BashTool {
                     "env": {"type": "object", "description": "Environment variables to set for the command", "additionalProperties": {"type": "string"}},
                     "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600, "description": "Optional timeout in seconds"},
                     "cwd": {"type": "string", "description": "Workspace-relative working directory"},
-                    "pty": {"type": "boolean", "description": "Use terminal semantics for commands that require a TTY; defaults to false"}
+                    "pty": {"type": "boolean", "description": "Use terminal semantics for commands that require a TTY; defaults to false"},
+                    "reason": {"type": "string", "description": "Concrete reason required only to repeat unchanged successful validation"}
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -52,13 +63,180 @@ impl Tool for BashTool {
         cancellation: &'a CancellationToken,
     ) -> ToolFuture<'a> {
         Box::pin(async move {
+            let command = arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let validation = validation_identity(context.workspace, &arguments, command);
+            let reason_supplied = arguments
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !reason.trim().is_empty());
+            if let Some(evidence) = validation.as_ref()
+                && !reason_supplied
+            {
+                let sequence = if let (Some(requests), Some(owner_session_id)) =
+                    (context.delegation, context.session.owner_session_id.clone())
+                {
+                    match request_validation_evidence(
+                        requests,
+                        owner_session_id,
+                        context.session.parent_run_id.clone(),
+                        evidence.relevant_state.clone(),
+                        NativeValidationEvidenceOperation::Check,
+                        cancellation,
+                    )
+                    .await
+                    {
+                        Ok(sequence) => sequence,
+                        Err(error) => return ToolResult::failure(error),
+                    }
+                } else {
+                    context
+                        .session
+                        .validation_evidence
+                        .contains(evidence)
+                        .then_some(0)
+                };
+                if let Some(sequence) = sequence {
+                    let reference = if sequence == 0 {
+                        "this provider session".to_owned()
+                    } else {
+                        format!("shared-context entry #{sequence}")
+                    };
+                    return ToolResult::success(format!(
+                        "Skipped unchanged validation: reusing successful evidence from {reference}. Supply a concrete `reason` only when rerunning is necessary."
+                    ));
+                }
+            }
             let result = run_shell(context.workspace, &arguments, cancellation).await;
             match result {
-                Ok(output) => output,
+                Ok(mut output) => {
+                    if !output.failed
+                        && let Some(evidence) = validation
+                    {
+                        context.session.validation_evidence.retain(|existing| {
+                            existing.command != evidence.command || existing.cwd != evidence.cwd
+                        });
+                        context.session.validation_evidence.push(evidence.clone());
+                        if context.session.validation_evidence.len() > 32 {
+                            context.session.validation_evidence.remove(0);
+                        }
+                        if let (Some(requests), Some(owner_session_id)) =
+                            (context.delegation, context.session.owner_session_id.clone())
+                        {
+                            let body = validation_evidence_body(&evidence);
+                            if let Err(error) = request_validation_evidence(
+                                requests,
+                                owner_session_id,
+                                context.session.parent_run_id.clone(),
+                                evidence.relevant_state,
+                                NativeValidationEvidenceOperation::Record { body },
+                                cancellation,
+                            )
+                            .await
+                            {
+                                let _ = write!(
+                                    output.output,
+                                    "\n\nWarning: validation succeeded but shared evidence could not be recorded: {error}"
+                                );
+                            }
+                        }
+                    }
+                    output
+                }
                 Err(error) => ToolResult::failure(error),
             }
         })
     }
+}
+
+async fn request_validation_evidence(
+    requests: &tokio::sync::mpsc::Sender<NativeAgentRequest>,
+    owner_session_id: String,
+    requester_run_id: Option<String>,
+    identity: String,
+    operation: NativeValidationEvidenceOperation,
+    cancellation: &CancellationToken,
+) -> Result<Option<u64>, String> {
+    let (respond, response) = tokio::sync::oneshot::channel();
+    requests
+        .send(NativeAgentRequest::ValidationEvidence(
+            NativeValidationEvidenceRequest {
+                owner_session_id,
+                requester_run_id,
+                identity,
+                operation,
+                respond,
+            },
+        ))
+        .await
+        .map_err(|_| "validation-evidence route closed before the request was sent".to_owned())?;
+    tokio::select! {
+        response = response => response.map_err(|_| "validation-evidence route closed before responding".to_owned())?,
+        () = cancellation.cancelled() => Err("validation-evidence request interrupted".to_owned()),
+    }
+}
+
+fn validation_evidence_body(evidence: &crate::runtime::ValidationEvidence) -> String {
+    let mut body = format!(
+        "Successful validation; reuse while repository state is unchanged.\ncommand: {}\ncwd: {}\nstate: {}",
+        evidence.command, evidence.cwd, evidence.relevant_state
+    );
+    if body.len() > 4 * 1024 {
+        let mut end = 4 * 1024;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+    }
+    body
+}
+
+fn validation_identity(
+    workspace: &std::path::Path,
+    arguments: &Value,
+    command: &str,
+) -> Option<crate::runtime::ValidationEvidence> {
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let validation = [
+        "cargo fmt",
+        "cargo check",
+        "cargo clippy",
+        "cargo test",
+        "./dxp check",
+        "./dxp build",
+        "bun test",
+        "tsc",
+        "eslint",
+        "prettier",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    if !validation {
+        return None;
+    }
+    let cwd = arguments.get("cwd").and_then(Value::as_str).map_or_else(
+        || workspace.to_path_buf(),
+        |path| resolve_workspace_path(workspace, path).unwrap_or_else(|_| workspace.to_path_buf()),
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    for args in [
+        ["rev-parse", "HEAD"].as_slice(),
+        ["status", "--porcelain=v1", "--untracked-files=all"].as_slice(),
+        ["diff", "--binary", "HEAD", "--"].as_slice(),
+    ] {
+        if let Ok(output) = Command::new("git").args(args).current_dir(&cwd).output() {
+            hasher.update(&output.stdout);
+            hasher.update(&output.stderr);
+        }
+    }
+    Some(crate::runtime::ValidationEvidence {
+        command: normalized,
+        cwd: cwd.to_string_lossy().into_owned(),
+        relevant_state: format!("{:x}", hasher.finalize()),
+    })
 }
 
 async fn run_shell(
