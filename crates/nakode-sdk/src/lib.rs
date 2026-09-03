@@ -1000,11 +1000,49 @@ impl NakodeClient {
         &self,
         session_id: impl Into<String>,
     ) -> Result<api::SessionState, SdkError> {
+        self.get_session_projection(session_id.into(), false, false)
+            .await
+    }
+
+    /// Returns launch-critical lifecycle and attribution state without transcript, shared-context,
+    /// artifact, or delegated-run detail bodies. Use the paged queries or [`Self::get_hydrated_session`]
+    /// only when a client actually presents those details.
+    ///
+    /// # Errors
+    /// Returns a transport, server status, or missing-state error.
+    pub async fn get_launch_critical_session(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<api::SessionState, SdkError> {
+        self.get_session_projection(session_id.into(), true, false)
+            .await
+    }
+
+    /// Returns a complete parent presentation while keeping delegated-run bodies demand-loaded.
+    ///
+    /// # Errors
+    /// Returns a transport, server status, or missing-state error.
+    pub async fn get_parent_presentation_session(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<api::SessionState, SdkError> {
+        self.get_session_projection(session_id.into(), false, true)
+            .await
+    }
+
+    async fn get_session_projection(
+        &self,
+        session_id: String,
+        launch_critical_only: bool,
+        parent_presentation_only: bool,
+    ) -> Result<api::SessionState, SdkError> {
         let response = self
             .transport
             .clone()
             .get_session(api::GetSessionRequest {
-                session_id: session_id.into(),
+                session_id,
+                launch_critical_only,
+                parent_presentation_only,
             })
             .await?
             .into_inner();
@@ -1732,7 +1770,25 @@ impl NakodeClient {
     /// Watches one already-attached logical session. This reconnects transport streams but does not
     /// mutate server attachment state; use [`Self::watch_attached_session`] across service cutovers.
     pub fn watch_session(&self, session_id: impl Into<String>) -> Watch<api::SessionState> {
-        self.watch_session_with_attachment(session_id.into(), None)
+        self.watch_session_with_attachment(session_id.into(), None, false, false)
+    }
+
+    /// Watches launch-critical replacements without transcript or detail-body hydration.
+    #[must_use]
+    pub fn watch_launch_critical_session(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Watch<api::SessionState> {
+        self.watch_session_with_attachment(session_id.into(), None, true, false)
+    }
+
+    /// Watches complete parent presentation while delegated-run bodies remain demand-loaded.
+    #[must_use]
+    pub fn watch_parent_presentation_session(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Watch<api::SessionState> {
+        self.watch_session_with_attachment(session_id.into(), None, false, true)
     }
 
     /// Watches one logical session and re-establishes its exact client-owned attachment if a new
@@ -1743,13 +1799,37 @@ impl NakodeClient {
         session_id: impl Into<String>,
         attachment: SessionAttachment,
     ) -> Watch<api::SessionState> {
-        self.watch_session_with_attachment(session_id.into(), Some(attachment))
+        self.watch_session_with_attachment(session_id.into(), Some(attachment), false, false)
+    }
+
+    /// Watches launch-critical replacements and restores the exact retained attachment after a
+    /// service-generation handoff.
+    #[must_use]
+    pub fn watch_attached_launch_critical_session(
+        &self,
+        session_id: impl Into<String>,
+        attachment: SessionAttachment,
+    ) -> Watch<api::SessionState> {
+        self.watch_session_with_attachment(session_id.into(), Some(attachment), true, false)
+    }
+
+    /// Watches complete parent presentation and restores the exact retained attachment while child
+    /// bodies remain demand-loaded.
+    #[must_use]
+    pub fn watch_attached_parent_presentation_session(
+        &self,
+        session_id: impl Into<String>,
+        attachment: SessionAttachment,
+    ) -> Watch<api::SessionState> {
+        self.watch_session_with_attachment(session_id.into(), Some(attachment), false, true)
     }
 
     fn watch_session_with_attachment(
         &self,
         session_id: String,
         attachment: Option<SessionAttachment>,
+        launch_critical_only: bool,
+        parent_presentation_only: bool,
     ) -> Watch<api::SessionState> {
         let client = self.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
@@ -1760,6 +1840,8 @@ impl NakodeClient {
                 let request = api::WatchSessionRequest {
                     session_id: session_id.clone(),
                     after: after.clone(),
+                    launch_critical_only,
+                    parent_presentation_only,
                 };
                 match client.transport.clone().watch_session(request).await {
                     Ok(response) => {

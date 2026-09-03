@@ -583,8 +583,27 @@ message ListSessionsResponse {
   // False covers bounded startup restoration, request truncation, and older servers.
   bool complete = 2;
 }
-message GetSessionRequest { string session_id = 1; }
-message WatchSessionRequest { string session_id = 1; optional Cursor after = 2; }
+enum SessionHydration {
+  // Backward-compatible complete bounded snapshot.
+  SESSION_HYDRATION_UNSPECIFIED = 0;
+  // Launch-critical lifecycle and attribution state; large bodies are explicitly omitted.
+  SESSION_HYDRATION_LAUNCH_CRITICAL = 1;
+  // Complete bounded snapshot used as the seed for paged body hydration.
+  SESSION_HYDRATION_FULL = 2;
+  // Complete bounded parent presentation with delegated-run bodies deferred for inspection.
+  SESSION_HYDRATION_PARENT_PRESENTATION = 3;
+}
+message GetSessionRequest {
+  string session_id = 1;
+  bool launch_critical_only = 3;
+  bool parent_presentation_only = 4;
+}
+message WatchSessionRequest {
+  string session_id = 1;
+  optional Cursor after = 2;
+  bool launch_critical_only = 3;
+  bool parent_presentation_only = 4;
+}
 message SessionSnapshot { Cursor cursor = 1; SessionState state = 2; }
 
 message PromptInput { string text = 1; repeated PromptAttachment attachments = 2; }
@@ -1178,6 +1197,8 @@ message SessionState {
   // Latest bounded projection of inert run-tree evidence, ordered by authoritative sequence.
   repeated SharedContextEntry shared_context = 35;
   uint64 shared_context_total = 36;
+  // Explicit body completeness for this replacement snapshot. Unspecified is full for compatibility.
+  SessionHydration hydration = 37;
 }
 message SharedContextEntry {
   uint64 sequence = 1;
