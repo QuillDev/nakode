@@ -16,6 +16,9 @@ use crate::{
     TimedServerResponse,
 };
 
+const LAUNCH_CRITICAL_RUN_TEXT_BYTES: usize = 512;
+const DEFERRED_RUN_SUMMARY_BYTES: usize = 1_024;
+
 #[derive(Clone, Debug)]
 pub struct ApiKeyInterceptor {
     expected: Arc<str>,
@@ -1060,9 +1063,12 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         &self,
         request: tonic::Request<api::GetSessionRequest>,
     ) -> Result<tonic::Response<api::SessionSnapshot>, tonic::Status> {
+        let input = request.into_inner();
+        let launch_critical_only = input.launch_critical_only;
+        let parent_presentation_only = input.parent_presentation_only;
         let (result, timing) = self
             .query(protocol::Query::GetSession {
-                session_id: protocol::SessionId::from(request.into_inner().session_id),
+                session_id: protocol::SessionId::from(input.session_id),
             })
             .await?;
         let protocol::QueryResult::Session(value) = result.value else {
@@ -1071,7 +1077,11 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         Ok(response_with_timing(
             api::SessionSnapshot {
                 cursor: Some(cursor(&result.cursor)),
-                state: Some(session(*value)),
+                state: Some(session_projection(
+                    *value,
+                    launch_critical_only,
+                    parent_presentation_only,
+                )),
             },
             &timing,
         ))
@@ -1082,8 +1092,11 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         &self,
         request: tonic::Request<api::WatchSessionRequest>,
     ) -> Result<tonic::Response<Self::WatchSessionStream>, tonic::Status> {
+        let input = request.into_inner();
+        let launch_critical_only = input.launch_critical_only;
+        let parent_presentation_only = input.parent_presentation_only;
         let scope = protocol::SubscriptionScope::Session {
-            session_id: protocol::SessionId::from(request.into_inner().session_id),
+            session_id: protocol::SessionId::from(input.session_id),
         };
         let publications = self.endpoint.subscribe_publications();
         let timed = self.subscription_timed(scope.clone()).await;
@@ -1100,13 +1113,24 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         sender
             .send(Ok(api::SessionSnapshot {
                 cursor: Some(cursor(&initial.cursor)),
-                state: Some(session(*value)),
+                state: Some(session_projection(
+                    *value,
+                    launch_critical_only,
+                    parent_presentation_only,
+                )),
             }))
             .await
             .map_err(|_| {
                 tonic_status_with_timing(tonic::Status::cancelled("watch closed"), &timed.timing)
             })?;
-        spawn_session_watch(self.clone(), scope, publications, sender);
+        spawn_session_watch(
+            self.clone(),
+            scope,
+            publications,
+            sender,
+            launch_critical_only,
+            parent_presentation_only,
+        );
         Ok(response_with_timing(
             Box::pin(ReceiverStream::new(receiver)),
             &timed.timing,
@@ -2044,6 +2068,8 @@ fn spawn_session_watch(
     scope: protocol::SubscriptionScope,
     mut publications: tokio::sync::broadcast::Receiver<PublishedEvent>,
     sender: tokio::sync::mpsc::Sender<Result<api::SessionSnapshot, tonic::Status>>,
+    launch_critical_only: bool,
+    parent_presentation_only: bool,
 ) {
     tokio::spawn(async move {
         loop {
@@ -2061,7 +2087,11 @@ fn spawn_session_watch(
                             };
                             Ok(api::SessionSnapshot {
                                 cursor: Some(cursor(&snapshot.cursor)),
-                                state: Some(session(*value)),
+                                state: Some(session_projection(
+                                    *value,
+                                    launch_critical_only,
+                                    parent_presentation_only,
+                                )),
                             })
                         });
                     if sender.send(update).await.is_err() {
@@ -2082,7 +2112,11 @@ fn spawn_session_watch(
                             };
                             Ok(api::SessionSnapshot {
                                 cursor: Some(cursor(&snapshot.cursor)),
-                                state: Some(session(*value)),
+                                state: Some(session_projection(
+                                    *value,
+                                    launch_critical_only,
+                                    parent_presentation_only,
+                                )),
                             })
                         });
                     if sender.send(update).await.is_err() {
@@ -2666,7 +2700,15 @@ pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSu
 }
 
 pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
-    api::SessionState {
+    session_projection(value, false, false)
+}
+
+fn session_projection(
+    value: protocol::SessionView,
+    launch_critical_only: bool,
+    parent_presentation_only: bool,
+) -> api::SessionState {
+    let mut state = api::SessionState {
         id: value.id.to_string(),
         revision: value.revision,
         workspace_id: value.workspace_id.to_string(),
@@ -2724,7 +2766,99 @@ pub(crate) fn session(value: protocol::SessionView) -> api::SessionState {
         selected_account_id: value.selected_account_id,
         routing_diagnostic: value.routing_diagnostic.map(routing_diagnostic),
         failure: value.failure.map(session_failure),
+        hydration: api::SessionHydration::Full as i32,
+    };
+    if launch_critical_only {
+        retain_launch_critical_session(&mut state);
+    } else if parent_presentation_only {
+        retain_parent_presentation_session(&mut state);
     }
+    state
+}
+
+fn retain_launch_critical_session(state: &mut api::SessionState) {
+    state.hydration = api::SessionHydration::LaunchCritical as i32;
+    if let Some(transcript) = state.transcript.as_mut() {
+        omit_transcript_bodies(transcript);
+    }
+    if let Some(agent) = state.active_agent_session.as_mut()
+        && let Some(transcript) = agent.transcript.as_mut()
+    {
+        omit_transcript_bodies(transcript);
+    }
+    state.shared_context.clear();
+    retain_deferred_run_details(state);
+}
+
+fn retain_parent_presentation_session(state: &mut api::SessionState) {
+    state.hydration = api::SessionHydration::ParentPresentation as i32;
+    retain_deferred_run_details(state);
+}
+
+fn retain_deferred_run_details(state: &mut api::SessionState) {
+    for run in &mut state.runs {
+        retain_text_tail(
+            &mut run.objective,
+            &mut run.objective_start_byte,
+            run.objective_total_bytes,
+            LAUNCH_CRITICAL_RUN_TEXT_BYTES,
+        );
+        retain_text_tail(
+            &mut run.latest_activity,
+            &mut run.latest_activity_start_byte,
+            run.latest_activity_total_bytes,
+            LAUNCH_CRITICAL_RUN_TEXT_BYTES,
+        );
+        if let Some(outcome) = run.outcome.as_mut() {
+            retain_text_tail(
+                &mut outcome.body,
+                &mut run.outcome_start_byte,
+                run.outcome_total_bytes,
+                DEFERRED_RUN_SUMMARY_BYTES,
+            );
+        }
+        if let Some(result) = run.result.as_mut() {
+            retain_text_tail(
+                result,
+                &mut run.result_start_byte,
+                run.result_total_bytes,
+                DEFERRED_RUN_SUMMARY_BYTES,
+            );
+        }
+        if let Some(transcript) = run.transcript.as_mut() {
+            omit_transcript_bodies(transcript);
+        }
+        if let Some(entry) = run.originating_owner_entry.as_mut() {
+            entry.body.clear();
+            entry.body_start_byte = entry.body_total_bytes;
+            entry.tool_audit_json = None;
+            entry.artifact_ids.clear();
+        }
+        run.policy = None;
+        run.tool_denials.clear();
+        run.salvage = None;
+        run.inherited_evidence.clear();
+        run.shared_context_briefing = None;
+    }
+}
+
+fn omit_transcript_bodies(transcript: &mut api::TranscriptPage) {
+    let omitted = !transcript.entries.is_empty() || transcript.current_owner_entry.is_some();
+    transcript.entries.clear();
+    transcript.current_owner_entry = None;
+    transcript.has_earlier |= omitted;
+}
+
+fn retain_text_tail(text: &mut String, start_byte: &mut u64, total_bytes: u64, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut retained_at = text.len().saturating_sub(limit);
+    while retained_at < text.len() && !text.is_char_boundary(retained_at) {
+        retained_at += 1;
+    }
+    *start_byte = total_bytes.saturating_sub((text.len() - retained_at) as u64);
+    text.drain(..retained_at);
 }
 
 fn session_failure(value: protocol::SessionFailureView) -> api::SessionFailure {
@@ -3757,9 +3891,8 @@ mod tests {
             }));
         };
         let (watch, ()) = tokio::join!(watch, reply);
-        let error = match watch {
-            Ok(_) => panic!("watch must fail"),
-            Err(error) => error,
+        let Err(error) = watch else {
+            panic!("watch must fail");
         };
         assert_timing_metadata(error.metadata(), "subscription");
     }
@@ -3946,6 +4079,118 @@ mod tests {
         let decoded = <api::RunState as prost::Message>::decode(encoded.as_slice())
             .expect("decode legacy run state");
         assert!(decoded.shared_context_briefing.is_none());
+    }
+
+    #[test]
+    fn launch_critical_session_omits_bodies_and_preserves_explicit_paging_metadata() {
+        let transcript = api::TranscriptPage {
+            entries: vec![api::TranscriptEntry {
+                id: "entry-1".to_owned(),
+                body: "large body".to_owned(),
+                body_total_bytes: 10,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut state = api::SessionState {
+            transcript: Some(transcript.clone()),
+            active_agent_session: Some(api::AgentSession {
+                transcript: Some(transcript.clone()),
+                ..Default::default()
+            }),
+            runs: vec![api::RunState {
+                id: "run-1".to_owned(),
+                status: api::RunStatus::Completed as i32,
+                objective: "é".repeat(600),
+                objective_total_bytes: 1_200,
+                latest_activity: "activity".repeat(100),
+                latest_activity_total_bytes: 800,
+                result: Some("complete result".to_owned()),
+                result_total_bytes: 15,
+                outcome: Some(api::RunOutcome {
+                    kind: api::run_outcome::Kind::Completed as i32,
+                    body: "complete result".to_owned(),
+                }),
+                outcome_total_bytes: 15,
+                transcript: Some(transcript),
+                policy: Some(api::RunPolicy::default()),
+                shared_context_briefing: Some(api::SharedContextBriefing::default()),
+                ..Default::default()
+            }],
+            shared_context: vec![api::SharedContextEntry {
+                body: "duplicate evidence".to_owned(),
+                ..Default::default()
+            }],
+            shared_context_total: 1,
+            external_tool_calls: vec![api::ExternalToolCall {
+                id: "call-1".to_owned(),
+                name: "ReadAssociatedTicket".to_owned(),
+                arguments_json: "{}".to_owned(),
+            }],
+            ..Default::default()
+        };
+
+        let full_bytes = prost::Message::encoded_len(&state);
+        let mut parent_state = state.clone();
+        retain_parent_presentation_session(&mut parent_state);
+        assert_eq!(
+            parent_state.hydration,
+            api::SessionHydration::ParentPresentation as i32
+        );
+        assert!(parent_state.transcript.as_ref().is_some_and(|page| {
+            page.entries.len() == 1 && page.entries[0].body == "large body"
+        }));
+        assert_eq!(parent_state.shared_context.len(), 1);
+        let parent_run = &parent_state.runs[0];
+        assert_eq!(parent_run.status, api::RunStatus::Completed as i32);
+        assert_eq!(parent_run.result.as_deref(), Some("complete result"));
+        assert!(
+            parent_run
+                .transcript
+                .as_ref()
+                .is_some_and(|page| page.entries.is_empty() && page.has_earlier)
+        );
+
+        retain_launch_critical_session(&mut state);
+        let launch_bytes = prost::Message::encoded_len(&state);
+
+        assert!(launch_bytes < full_bytes);
+        assert_eq!(
+            state.hydration,
+            api::SessionHydration::LaunchCritical as i32
+        );
+        assert!(state.transcript.as_ref().is_some_and(|page| {
+            page.entries.is_empty() && page.current_owner_entry.is_none() && page.has_earlier
+        }));
+        assert!(
+            state
+                .active_agent_session
+                .as_ref()
+                .and_then(|agent| agent.transcript.as_ref())
+                .is_some_and(|page| page.entries.is_empty() && page.has_earlier)
+        );
+        assert!(state.shared_context.is_empty());
+        assert_eq!(state.shared_context_total, 1);
+        assert_eq!(state.external_tool_calls.len(), 1);
+        let run = &state.runs[0];
+        assert_eq!(run.status, api::RunStatus::Completed as i32);
+        assert!(run.objective.len() <= 512);
+        assert_eq!(run.objective_start_byte + run.objective.len() as u64, 1_200);
+        assert!(run.latest_activity.len() <= 512);
+        assert_eq!(run.result.as_deref(), Some("complete result"));
+        assert_eq!(run.result_start_byte, 0);
+        assert!(run.outcome.as_ref().is_some_and(|outcome| {
+            outcome.kind == api::run_outcome::Kind::Completed as i32
+                && outcome.body == "complete result"
+        }));
+        assert_eq!(run.outcome_start_byte, 0);
+        assert!(run.policy.is_none());
+        assert!(run.shared_context_briefing.is_none());
+        assert!(
+            run.transcript
+                .as_ref()
+                .is_some_and(|page| page.entries.is_empty() && page.has_earlier)
+        );
     }
 
     #[test]

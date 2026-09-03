@@ -9243,6 +9243,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_delegation_completion_reaches_parent_without_any_session_subscription() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let (respond, response) = tokio::sync::oneshot::channel();
+        runtime.pending_native_delegations.insert(
+            41,
+            PendingNativeDelegation {
+                session_id,
+                run_id: "unobserved-child".to_owned(),
+                respond,
+                cancellation_task: tokio::spawn(std::future::pending()),
+            },
+        );
+
+        runtime.complete_native_delegations(&[Effect::CompleteAgentRequest {
+            request_id: 41,
+            result: "child result delivered to its waiting parent".to_owned(),
+            success: true,
+        }]);
+
+        assert_eq!(
+            response.await.expect("parent waiter remains available"),
+            Ok("child result delivered to its waiting parent".to_owned())
+        );
+        assert!(runtime.pending_native_delegations.is_empty());
+        runtime.effects.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn abandoned_quiescence_does_not_leave_runtime_fenced() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (persistence, _credentials) = test_persistence(workspace.path());
