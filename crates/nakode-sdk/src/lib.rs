@@ -46,6 +46,15 @@ pub enum SdkError {
     InvalidProjection(String),
 }
 
+impl SdkError {
+    /// Whether the server reported that the addressed resource is not loaded or does not exist.
+    /// Persisted sessions answer this way after a service restart until a client reopens them.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Status(status) if status.code() == tonic::Code::NotFound)
+    }
+}
+
 pub type Watch<T> = Pin<Box<dyn Stream<Item = Result<T, SdkError>> + Send + 'static>>;
 
 /// Receiver-backed watch whose reconnecting producer is cancelled with the consumer. Without this
@@ -499,6 +508,20 @@ macro_rules! send_mutation {
         .map(tonic::Response::into_inner)
         .map_err(SdkError::from)
     }};
+}
+
+fn structured_interaction_request(
+    interaction_id: String,
+    answers: Vec<api::InteractionAnswer>,
+    expected_revision: Option<u64>,
+) -> api::ResolveInteractionRequest {
+    api::ResolveInteractionRequest {
+        mutation: Some(mutation(expected_revision)),
+        interaction_id,
+        resolution: api::InteractionResolutionKind::Answer as i32,
+        option_ids: Vec::new(),
+        answers,
+    }
 }
 
 impl NakodeClient {
@@ -1161,6 +1184,27 @@ impl NakodeClient {
                 option_ids,
                 answers: Vec::new(),
             }
+        )
+    }
+
+    /// Resolves every item in one pending question interaction atomically.
+    ///
+    /// The caller must preserve the stable question and option identifiers from the authoritative
+    /// interaction snapshot. Free text belongs in `InteractionAnswer.text`; it must never be
+    /// flattened into a legacy option identifier.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn resolve_interaction_answers(
+        &self,
+        interaction_id: impl Into<String>,
+        answers: Vec<api::InteractionAnswer>,
+        expected_revision: Option<u64>,
+    ) -> Result<api::MutationResult, SdkError> {
+        send_mutation!(
+            self,
+            resolve_interaction,
+            structured_interaction_request(interaction_id.into(), answers, expected_revision)
         )
     }
 
@@ -2201,14 +2245,25 @@ impl NakodeClient {
             else {
                 break;
             };
-            let page = self
+            let page = match self
                 .get_transcript_page(api::GetTranscriptPageRequest {
                     owner_kind: owner_kind as i32,
                     owner_id: owner_id.to_owned(),
                     before_entry_id: Some(before_entry_id),
                     limit: bounded_limit(limit.saturating_sub(transcript.entries.len())),
                 })
-                .await?;
+                .await
+            {
+                Ok(page) => page,
+                // The snapshot's leading row can leave the authoritative transcript between the
+                // snapshot and this page request (compaction, a superseded reasoning summary). The
+                // rows already held are still authoritative; only the earlier window is unknown.
+                Err(error) if error.is_not_found() => {
+                    transcript.has_earlier = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             let previous_len = transcript.entries.len();
             let has_earlier = page.has_earlier;
             prepend_entries(&mut transcript.entries, page.entries, limit);
@@ -2587,8 +2642,41 @@ mod tests {
     use super::{
         ActivationClient, ActivationCursor, NakodeClient, SdkError, SessionAttachment,
         activation_cursor_changed, api, authoritative_remove_request, bridge_continuation_mutation,
-        managed_watch, retry_transport,
+        managed_watch, retry_transport, structured_interaction_request,
     };
+
+    #[test]
+    fn structured_interaction_answers_preserve_question_identity_and_text() {
+        let request = structured_interaction_request(
+            "interaction-1".to_owned(),
+            vec![api::InteractionAnswer {
+                question_id: "question-2".to_owned(),
+                option_ids: vec!["option-3".to_owned()],
+                text: Some("owner supplied detail".to_owned()),
+            }],
+            Some(19),
+        );
+
+        assert_eq!(request.interaction_id, "interaction-1");
+        assert_eq!(
+            request.resolution,
+            api::InteractionResolutionKind::Answer as i32
+        );
+        assert!(request.option_ids.is_empty());
+        assert_eq!(request.answers[0].question_id, "question-2");
+        assert_eq!(request.answers[0].option_ids, ["option-3"]);
+        assert_eq!(
+            request.answers[0].text.as_deref(),
+            Some("owner supplied detail")
+        );
+        assert_eq!(
+            request
+                .mutation
+                .expect("structured interaction mutation")
+                .expected_revision,
+            Some(19)
+        );
+    }
 
     #[test]
     fn queued_prompt_removal_preserves_identity_and_omits_the_revision_fence() {

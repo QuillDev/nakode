@@ -923,6 +923,18 @@ pub(crate) fn executable_identity(path: &Path) -> Result<ExecutableIdentity, Con
             path: canonical.display().to_string(),
             source,
         })?;
+    // The content digest is expensive — a debug build is hundreds of megabytes — and callers ask
+    // for it on every status read, recheck and watch tick. The bytes cannot change without the
+    // file's size, modification time or inode changing, so one digest per observed file version is
+    // remembered process-wide and reused until any of those move.
+    let fingerprint = executable_fingerprint(&canonical, &metadata);
+    if let Some(cached) = EXECUTABLE_IDENTITY_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&fingerprint).cloned())
+    {
+        return Ok(cached);
+    }
     let mut digest = Sha256::new();
     // Debug and instrumented builds can be hundreds of megabytes. Large buffered reads keep
     // endpoint discovery bounded on slower CI and installation filesystems without changing the
@@ -955,7 +967,7 @@ pub(crate) fn executable_identity(path: &Path) -> Result<ExecutableIdentity, Con
     };
     #[cfg(not(unix))]
     let (device, inode) = (None, None);
-    Ok(ExecutableIdentity {
+    let identity = ExecutableIdentity {
         path: canonical,
         sha256: format!("{:x}", digest.finalize()),
         size: metadata.len(),
@@ -963,7 +975,46 @@ pub(crate) fn executable_identity(path: &Path) -> Result<ExecutableIdentity, Con
         device,
         inode,
         build_revision: crate::BUILD_REVISION.map(str::to_owned),
-    })
+    };
+    if let Ok(mut cache) = EXECUTABLE_IDENTITY_CACHE.lock() {
+        if cache.len() >= EXECUTABLE_IDENTITY_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(fingerprint, identity.clone());
+    }
+    Ok(identity)
+}
+
+/// Bounded process-wide memo of content identities keyed by the file version that produced them.
+static EXECUTABLE_IDENTITY_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<ExecutableFingerprint, ExecutableIdentity>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const EXECUTABLE_IDENTITY_CACHE_CAPACITY: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExecutableFingerprint {
+    path: std::path::PathBuf,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    device: Option<u64>,
+    inode: Option<u64>,
+}
+
+fn executable_fingerprint(canonical: &Path, metadata: &std::fs::Metadata) -> ExecutableFingerprint {
+    #[cfg(unix)]
+    let (device, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        (Some(metadata.dev()), Some(metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let (device, inode) = (None, None);
+    ExecutableFingerprint {
+        path: canonical.to_path_buf(),
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        device,
+        inode,
+    }
 }
 
 /// Returns the process record published by this workspace's service.

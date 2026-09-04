@@ -8551,7 +8551,12 @@ impl DomainState {
         if item.kind == ItemKind::User || !self.turn_is_current(turn_id) {
             return;
         }
+        // Native delegation rows stay in the transcript: clients replace them with the attributed
+        // run card by call id, so hiding them would orphan every child from the parent timeline.
+        // Only the legacy in-band shell invocation (and its raw result) is hidden.
+        let native_delegation = is_native_delegation_item(&item);
         let hides_subagent_result = item.kind == ItemKind::Tool
+            && !native_delegation
             && (self.subagent_result_items.contains(&item.id)
                 || is_subagent_invocation(&item.title)
                 || is_subagent_invocation(&item.body)
@@ -8577,6 +8582,10 @@ impl DomainState {
         };
         let body = if self.reasoning_summaries.contains(turn_id, &item.id) {
             latest_reasoning_summary(&item.body).to_owned()
+        } else if native_delegation && item.body.starts_with("[Subagent Result]") {
+            // The attributed run carries the child's outcome; the raw result envelope is model
+            // input, not a second transcript copy.
+            String::new()
         } else {
             item.body
         };
@@ -8589,6 +8598,16 @@ impl DomainState {
         self.set_entry_turn_origin(&item_id, turn_id);
     }
 
+    fn is_native_delegation_entry(&self, item_id: &str) -> bool {
+        self.transcript.entries().iter().any(|entry| {
+            entry.key.as_deref() == Some(item_id)
+                && entry.kind == EntryKind::Tool
+                && entry
+                    .title
+                    .starts_with(&format!("{NAKODE_AGENT_TOOL_NAME} ·"))
+        })
+    }
+
     fn observe_delta(&mut self, turn_id: &str, item_id: &str, kind: DeltaKind, delta: &str) {
         if !self.turn_is_current(turn_id) {
             self.diagnostic_count += 1;
@@ -8597,7 +8616,9 @@ impl DomainState {
         self.item_turns
             .insert(item_id.to_owned(), turn_id.to_owned());
         if self.subagent_result_items.contains(item_id)
-            || (kind == DeltaKind::Tool && delta.contains("[Subagent Result]"))
+            || (kind == DeltaKind::Tool
+                && delta.contains("[Subagent Result]")
+                && !self.is_native_delegation_entry(item_id))
         {
             self.subagent_result_items.insert(item_id.to_owned());
             self.transcript.remove(item_id);
@@ -11062,8 +11083,21 @@ fn is_subagent_invocation(text: &str) -> bool {
     text.contains("nakode") && text.contains(" agent ")
 }
 
+/// A `nakode_agent` invocation issued through the provider's native tool surface. Its transcript row
+/// is the anchor clients use to place the attributed child run.
+fn is_native_delegation_item(item: &NormalizedItem) -> bool {
+    item.kind == ItemKind::Tool
+        && (item
+            .title
+            .starts_with(&format!("{NAKODE_AGENT_TOOL_NAME} ·"))
+            || item.tool_audit_json.as_deref().is_some_and(|audit| {
+                audit.contains(&format!("\"name\":\"{NAKODE_AGENT_TOOL_NAME}\""))
+            }))
+}
+
 fn hides_subagent_item(item: &NormalizedItem) -> bool {
     item.kind == ItemKind::Tool
+        && !is_native_delegation_item(item)
         && (is_subagent_invocation(&item.title)
             || is_subagent_invocation(&item.body)
             || item.body.contains("[Subagent Result]"))
@@ -14689,6 +14723,59 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .entries()
                 .iter()
                 .all(|entry| entry.key.as_deref() != Some("agent-command"))
+        );
+    }
+
+    #[test]
+    fn parent_transcript_keeps_native_delegation_invocation_rows() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("parent-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "parent-turn".to_owned(),
+            model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
+            cancelling: false,
+        });
+        let audit = Some(r#"{"version":1,"callId":"call-7","name":"nakode_agent"}"#.into());
+        state.handle_backend(BackendEvent::ItemStarted {
+            turn_id: "parent-turn".to_owned(),
+            item: NormalizedItem {
+                id: "call-7".to_owned(),
+                kind: ItemKind::Tool,
+                title: "nakode_agent · Delegate reviewer".to_owned(),
+                body: String::new(),
+                status: ItemStatus::Running,
+                tool_audit_json: audit.clone(),
+            },
+        });
+        state.handle_backend(BackendEvent::ItemCompleted {
+            turn_id: "parent-turn".to_owned(),
+            item: NormalizedItem {
+                id: "call-7".to_owned(),
+                kind: ItemKind::Tool,
+                title: "nakode_agent · Delegate reviewer".to_owned(),
+                body: "[Subagent Result] [run-1] [reviewer]\nsecret report".to_owned(),
+                status: ItemStatus::Complete,
+                tool_audit_json: audit,
+            },
+        });
+
+        let entry = state
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.key.as_deref() == Some("call-7"))
+            .expect("native delegation invocation row survives completion");
+        assert_eq!(entry.status, EntryStatus::Complete);
+        assert_eq!(
+            entry.body, "",
+            "the raw result envelope is model input, not transcript"
+        );
+        assert!(
+            entry
+                .tool_audit_json
+                .as_deref()
+                .is_some_and(|audit| audit.contains("call-7"))
         );
     }
 
