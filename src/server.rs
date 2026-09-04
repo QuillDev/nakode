@@ -2832,6 +2832,7 @@ impl ServerCore {
         provider_id: &ProviderId,
         enabled: bool,
     ) -> DomainCommandOutcome {
+        eprintln!("nakode providers: client command set {provider_id} enabled={enabled}");
         self.ensure_provider(provider_id)?;
         Ok(Self::accepted(
             Some(provider_id.to_string()),

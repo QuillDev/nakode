@@ -5630,6 +5630,7 @@ async fn clear_provider_credential(
         state.session_store_failed(format!("could not clear {provider} credentials: {error}"));
         return;
     }
+    eprintln!("nakode providers: clearing {provider} credential, which disables it");
     if let Err(error) = sessions.set_provider_enabled(provider, false) {
         state.session_store_failed(error.to_string());
         return;
