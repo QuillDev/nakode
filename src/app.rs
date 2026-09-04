@@ -40,10 +40,12 @@ pub enum AppError {
 #[allow(clippy::large_futures)]
 pub async fn run(config: Config) -> Result<(), AppError> {
     let nakode_executable = std::env::current_exe().map_err(AppError::CurrentExecutable)?;
-    let client = native_client::connect(&config)
+    let connection = native_client::connect_report(&config)
         .await
         .map_err(|error| AppError::NativeClientStart(error.to_string()))?;
-    let (workspace, session) = prepare(&client, &config).await?;
+    let client = connection.client;
+    let (workspace, session) =
+        prepare(&client, &connection.authoritative_workspace, &config).await?;
     let workspace_id = workspace.workspace_id.clone();
     let session_id = session.state.id.clone();
     let mut workspace_updates = client.watch_workspace(workspace_id);
@@ -97,10 +99,11 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 
 async fn prepare(
     client: &NakodeClient,
+    authoritative_workspace: &Path,
     config: &Config,
 ) -> Result<(api::WorkspaceState, HydratedSession), AppError> {
     let mut workspace = client
-        .get_workspace(config.workspace.to_string_lossy(), None)
+        .get_workspace(authoritative_workspace.to_string_lossy(), None)
         .await?;
     let session_id = if let Some(requested) = config.resume.clone() {
         client.open_session(requested).await?
