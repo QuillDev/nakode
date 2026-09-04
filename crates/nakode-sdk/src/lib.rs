@@ -55,6 +55,10 @@ impl SdkError {
     }
 }
 
+/// The transport status type carried by [`SdkError::Status`], re-exported so callers can match or
+/// construct one without pinning tonic themselves.
+pub use tonic;
+
 pub type Watch<T> = Pin<Box<dyn Stream<Item = Result<T, SdkError>> + Send + 'static>>;
 
 /// Receiver-backed watch whose reconnecting producer is cancelled with the consumer. Without this
@@ -840,6 +844,43 @@ impl NakodeClient {
                 mcp_grant: None,
                 bridge: None,
                 working_directory: None,
+                profile_id: None,
+                account_id: None,
+            }
+        )?;
+        result
+            .resource_id
+            .ok_or(SdkError::MissingState("created session identifier"))
+    }
+
+    /// Creates a logical session with everything a dashboard Host decides at open time: an optional
+    /// model, an optional working directory, and optional provider system instructions, committed
+    /// atomically so the first turn already runs under them.
+    ///
+    /// # Errors
+    /// Returns a transport, server validation, or missing-identifier error.
+    pub async fn create_session_configured(
+        &self,
+        workspace_id: impl Into<String>,
+        title: Option<String>,
+        model_id: Option<String>,
+        working_directory: Option<String>,
+        initial_instructions: Option<String>,
+    ) -> Result<String, SdkError> {
+        let result = send_mutation!(
+            self,
+            create_session,
+            api::CreateSessionRequest {
+                mutation: Some(mutation(None)),
+                workspace_id: workspace_id.into(),
+                title,
+                model_id,
+                options: None,
+                tools: None,
+                mcp_grant: None,
+                initial_instructions,
+                bridge: None,
+                working_directory,
                 profile_id: None,
                 account_id: None,
             }

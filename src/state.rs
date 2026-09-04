@@ -11079,8 +11079,22 @@ fn agent_model_target_label(target: &AgentModelTarget) -> String {
     )
 }
 
+/// Whether text carries the legacy in-band shell delegation, a `nakode agent …` CLI invocation.
+///
+/// Only that adjacency counts. Matching "nakode" and " agent " anywhere in a tool row also swallowed
+/// dashboard tools whose results merely mention both, such as "Started general agent … on nakode",
+/// leaving the owner transcript with no trace that the tool ran.
 fn is_subagent_invocation(text: &str) -> bool {
-    text.contains("nakode") && text.contains(" agent ")
+    text.match_indices("nakode").any(|(index, needle)| {
+        let rest = &text[index + needle.len()..];
+        let trimmed = rest.trim_start();
+        trimmed.len() != rest.len()
+            && trimmed.starts_with("agent")
+            && trimmed[5..]
+                .chars()
+                .next()
+                .is_none_or(|next| !next.is_alphanumeric())
+    })
 }
 
 /// A `nakode_agent` invocation issued through the provider's native tool surface. Its transcript row
@@ -14724,6 +14738,23 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 .iter()
                 .all(|entry| entry.key.as_deref() != Some("agent-command"))
         );
+    }
+
+    #[test]
+    fn subagent_invocation_filter_matches_only_the_cli_command() {
+        assert!(super::is_subagent_invocation(
+            "nakode agent run --archetype small"
+        ));
+        assert!(super::is_subagent_invocation(
+            "$ nakode  agent delegate 'task'"
+        ));
+        assert!(!super::is_subagent_invocation(
+            "Started general agent \"specs\" in the owner’s home directory on nakode / gpt"
+        ));
+        assert!(!super::is_subagent_invocation("nakode agentless"));
+        assert!(!super::is_subagent_invocation(
+            "the nakode service and an agent"
+        ));
     }
 
     #[test]
