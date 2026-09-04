@@ -1354,10 +1354,15 @@ pub enum Effect {
         title: String,
         model: Option<String>,
         options: ModelOptions,
+        tool_configuration: nakode_protocol::SessionToolConfiguration,
     },
     PersistSessionSkillSnapshot {
         session_id: String,
         enabled_skill_ids: Vec<String>,
+    },
+    PersistSessionToolConfiguration {
+        session_id: String,
+        configuration: nakode_protocol::SessionToolConfiguration,
     },
     PersistSessionCodeMode {
         session_id: String,
@@ -6433,24 +6438,52 @@ impl DomainState {
         )
     }
 
-    /// Verifies that an already-loaded session has the exact requested tool boundary.
+    fn session_tool_configuration(&self) -> nakode_protocol::SessionToolConfiguration {
+        nakode_protocol::SessionToolConfiguration {
+            tools: self.external_tools.clone(),
+            replace_builtin_tools: self.replace_builtin_tools,
+            code_mode: self.code_mode,
+            allowed_builtin_tools: self.allowed_builtin_tools.clone(),
+        }
+    }
+
+    /// Verifies that an already-loaded session preserves its established tool boundary.
+    ///
+    /// Exact external tools, replacement mode, and code mode are required. A client's requested
+    /// builtin allowlist may be broader because the established allowlist remains authoritative.
     ///
     /// # Errors
-    /// Rejects every attempt to mutate the table after the logical session was published, even when
-    /// no prompt has started yet. Atomic create/open is the only installation boundary.
+    /// Rejects attempts to mutate external tools or execution mode, and builtin requests that no
+    /// longer authorize every established tool.
     pub fn configure_or_validate_external_tools(
         &mut self,
         tools: &[nakode_protocol::ExternalToolDefinition],
         replace_builtin_tools: bool,
         code_mode: bool,
         allowed_builtin_tools: Option<&[String]>,
-    ) -> Result<Vec<Effect>, DomainCommandError> {
+    ) -> Result<nakode_protocol::SessionToolConfiguration, DomainCommandError> {
+        let builtin_policy_authorized =
+            match (self.allowed_builtin_tools.as_deref(), allowed_builtin_tools) {
+                (configured, requested) if configured == requested => true,
+                (Some(configured), Some(requested)) => {
+                    let requested_count = requested.len();
+                    let requested = requested.iter().map(String::as_str).collect::<HashSet<_>>();
+                    requested.len() == requested_count
+                        && requested
+                            .iter()
+                            .all(|name| crate::agent::CANONICAL_AGENT_TOOLS.contains(name))
+                        && configured
+                            .iter()
+                            .all(|name| requested.contains(name.as_str()))
+                }
+                _ => false,
+            };
         if self.external_tools == tools
             && self.replace_builtin_tools == replace_builtin_tools
             && self.code_mode == code_mode
-            && self.allowed_builtin_tools.as_deref() == allowed_builtin_tools
+            && builtin_policy_authorized
         {
-            return Ok(Vec::new());
+            return Ok(self.session_tool_configuration());
         }
         Err(DomainCommandError::Invalid(
             "the attached session already started with a different tool table".to_owned(),
@@ -7358,6 +7391,7 @@ impl DomainState {
                 title: prompt.text.clone(),
                 model: self.selected_model.clone(),
                 options: prompt.options.clone(),
+                tool_configuration: self.session_tool_configuration(),
             },
             |session_id| Effect::TransitionSessionPrimary {
                 session_id,
@@ -7987,6 +8021,7 @@ impl DomainState {
                 title: prompt.text.clone(),
                 model: self.selected_model.clone(),
                 options: prompt.options.clone(),
+                tool_configuration: self.session_tool_configuration(),
             });
             let mut effects = self.start_prompt_on_session(prompt, provider_session_id);
             effects.insert(
@@ -8026,6 +8061,7 @@ impl DomainState {
                     title: prompt.text.clone(),
                     model: self.selected_model.clone(),
                     options: prompt.options.clone(),
+                    tool_configuration: self.session_tool_configuration(),
                 },
                 Effect::PersistAcceptedOwnerPrompt {
                     session_id: self.nakode_session_id.clone(),
@@ -11620,6 +11656,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -11772,6 +11809,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -15274,6 +15312,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            tool_configuration: None,
             code_mode: true,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -15399,6 +15438,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -15458,6 +15498,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -15536,6 +15577,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -16745,6 +16787,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: Some(2),
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),

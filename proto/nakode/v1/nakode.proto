@@ -340,6 +340,8 @@ message MutationOptions {
 message MutationResult {
   optional string resource_id = 1;
   optional uint64 revision = 2;
+  // Present for OpenSession so clients retain the authoritative established tool boundary.
+  optional SessionToolConfiguration effective_session_tools = 3;
 }
 
 message Cursor { string server_epoch = 1; uint64 sequence = 2; }

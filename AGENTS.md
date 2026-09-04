@@ -162,13 +162,17 @@ shared behavior without inventing client-side domain policy.
 
 `CreateSession` applies an optional initial model, its options, and optional
 client-owned tools atomically before the logical session is published.
-`OpenSession` installs tools before closed-session provider restoration and
-accepts only an identical table when reattaching an already-loaded session. An
-omitted model keeps the server's workspace/provider default, options without a
-model are invalid, and clients must not emulate initial selection or tools with
-a follow-up mutation. The effective session-scoped options are projected on
-`SessionView`/`SessionState`; clients must not reconstruct them from a catalogue
-model's workspace defaults.
+`OpenSession` installs tools before closed-session provider restoration. Reattaching
+requires the same external tools, replacement mode, and code mode; Nakode
+preserves the session's durably established built-in allowlist when it is a
+subset of the client's current authorization and returns that effective
+configuration. Runtime-default (`None`) and explicit built-in policies are not
+interchangeable. Legacy persisted rows pin their first compatible exact tool
+configuration before provider restoration. An omitted model keeps the server's
+workspace/provider default, options without a model are invalid, and clients
+must not emulate initial selection or tools with a follow-up mutation. The
+effective session-scoped options are projected on `SessionView`/`SessionState`;
+clients must not reconstruct them from a catalogue model's workspace defaults.
 
 Client-owned tools use the session-scoped public external-tool contract. The
 server owns pending calls and turn suspension; clients only execute a call and

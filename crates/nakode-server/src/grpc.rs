@@ -170,6 +170,7 @@ impl GrpcService {
             api::MutationResult {
                 resource_id: result.resource_id,
                 revision: result.revision,
+                effective_session_tools: result.effective_session_tools.map(session_tools_api),
             },
             &timed.timing,
         ))
@@ -346,6 +347,23 @@ fn session_tools(
         allowed_builtin_tools: (!value.allowed_builtin_tools.is_empty())
             .then_some(value.allowed_builtin_tools),
     })
+}
+
+fn session_tools_api(value: protocol::SessionToolConfiguration) -> api::SessionToolConfiguration {
+    api::SessionToolConfiguration {
+        tools: value
+            .tools
+            .into_iter()
+            .map(|tool| api::ExternalToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                input_schema_json: tool.input_schema_json,
+            })
+            .collect(),
+        replace_builtin_tools: value.replace_builtin_tools,
+        code_mode: value.code_mode,
+        allowed_builtin_tools: value.allowed_builtin_tools.unwrap_or_default(),
+    }
 }
 
 fn bridge_lifecycle(value: i32) -> Result<protocol::BridgeLifecycle, tonic::Status> {
@@ -1020,6 +1038,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 mutation: Some(api::MutationResult {
                     resource_id: result.resource_id,
                     revision: result.revision,
+                    effective_session_tools: result.effective_session_tools.map(session_tools_api),
                 }),
                 disposition: disposition as i32,
                 replayed_disposition,
@@ -3797,6 +3816,12 @@ mod tests {
             let _ = respond.send(Ok(protocol::CommandAccepted {
                 resource_id: Some("entry-key".to_owned()),
                 revision: Some(10),
+                effective_session_tools: Some(protocol::SessionToolConfiguration {
+                    tools: Vec::new(),
+                    replace_builtin_tools: false,
+                    code_mode: false,
+                    allowed_builtin_tools: Some(vec!["read".to_owned()]),
+                }),
                 bridge_continuation: None,
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
@@ -3806,6 +3831,13 @@ mod tests {
         let response = publish.expect("publish must succeed").into_inner();
         assert_eq!(response.resource_id.as_deref(), Some("entry-key"));
         assert_eq!(response.revision, Some(10));
+        assert_eq!(
+            response
+                .effective_session_tools
+                .expect("effective tools")
+                .allowed_builtin_tools,
+            ["read"]
+        );
     }
 
     #[tokio::test]

@@ -125,6 +125,9 @@ pub struct SessionRecord {
     pub updated_at: i64,
     /// Latest accepted or terminal owner-turn boundary. Generic persistence touches never change it.
     pub last_owner_activity_at: Option<i64>,
+    /// Exact creation-time external and builtin tool boundary. `None` marks a legacy row whose
+    /// boundary is established once from the first compatible open after this field was introduced.
+    pub tool_configuration: Option<nakode_protocol::SessionToolConfiguration>,
     /// Whether the next owner turn exposes only the synthesized Code Mode tool.
     pub code_mode: bool,
     /// Immutable stable skill identities authorized for this logical session. `None` is a legacy
@@ -428,6 +431,8 @@ pub enum SessionError {
         session_id: String,
         account_id: String,
     },
+    #[error("session {session_id} already has a different persisted tool boundary")]
+    ToolConfigurationConflict { session_id: String },
     #[error("owner prompt {prompt_id:?} for session {session_id:?} was reused with different text")]
     OwnerPromptConflict {
         session_id: String,
@@ -706,6 +711,7 @@ pub trait SessionRepository: Send + Sync {
         enabled_skill_ids: Option<&[String]>,
         profile_id: Option<&str>,
         code_mode: Option<bool>,
+        tool_configuration: Option<&nakode_protocol::SessionToolConfiguration>,
         owner_prompt: Option<&PersistedOwnerPrompt>,
     ) -> Result<SessionRecord, SessionError> {
         let record = self.create_with_account_id(
@@ -725,6 +731,9 @@ pub trait SessionRepository: Send + Sync {
         }
         if let Some(code_mode) = code_mode {
             self.set_session_code_mode(&record.id, code_mode)?;
+        }
+        if let Some(tool_configuration) = tool_configuration {
+            self.set_session_tool_configuration(&record.id, tool_configuration)?;
         }
         if let Some(prompt) = owner_prompt {
             self.record_owner_prompt(&record.id, prompt)?;
@@ -749,6 +758,18 @@ pub trait SessionRepository: Send + Sync {
     /// # Errors
     /// Returns an error when the session is unknown or cannot be updated.
     fn set_session_code_mode(&self, _id: &str, _enabled: bool) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    /// Persists the exact tool boundary for a session that predates durable tool configuration.
+    ///
+    /// # Errors
+    /// Returns an error when the session is unknown, already has a different boundary, or cannot be updated.
+    fn set_session_tool_configuration(
+        &self,
+        _id: &str,
+        _configuration: &nakode_protocol::SessionToolConfiguration,
+    ) -> Result<(), SessionError> {
         Ok(())
     }
 
@@ -1204,6 +1225,7 @@ impl SqliteSessionRepository {
                last_owner_activity_at INTEGER,
                enabled_skill_ids_json TEXT,
                code_mode INTEGER NOT NULL DEFAULT 0,
+               tool_configuration_json TEXT,
                UNIQUE(provider, provider_session_id)
              );
              CREATE INDEX IF NOT EXISTS sessions_workspace_updated
@@ -1637,6 +1659,7 @@ impl SqliteSessionRepository {
             ("enabled_skill_ids_json", "TEXT"),
             ("account_id", "TEXT"),
             ("code_mode", "INTEGER NOT NULL DEFAULT 0"),
+            ("tool_configuration_json", "TEXT"),
         ] {
             if !session_columns.iter().any(|existing| existing == column) {
                 writeln!(
@@ -1966,6 +1989,16 @@ impl SqliteSessionRepository {
             })
             .transpose()
             .map_err(|error| stored_session_conversion_error(17, error))?;
+        let tool_configuration_json = row.get::<_, Option<String>>(20)?;
+        let tool_configuration = tool_configuration_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|source| SessionError::InvalidStoredJson {
+                    field: "sessions.tool_configuration_json",
+                    source,
+                })
+            })
+            .transpose()
+            .map_err(|error| stored_session_conversion_error(20, error))?;
         Ok(SessionRecord {
             id: row.get(0)?,
             provider: row.get(1)?,
@@ -1985,6 +2018,7 @@ impl SqliteSessionRepository {
             created_at: row.get(13)?,
             updated_at: row.get(14)?,
             last_owner_activity_at: row.get(16)?,
+            tool_configuration,
             code_mode: row.get::<_, i64>(19)? != 0,
             enabled_skill_ids,
             owned_provider_sessions: Vec::new(),
@@ -3056,7 +3090,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
@@ -3077,7 +3111,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let rows = statement.query_map([], Self::row)?;
@@ -3098,7 +3132,7 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode
+                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
                  FROM sessions WHERE id = ?1",
                 [id],
                 Self::row,
@@ -3111,7 +3145,7 @@ impl SessionRepository for SqliteSessionRepository {
             return Ok(Some(exact));
         }
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
              FROM sessions
              WHERE substr(id, 1, length(?1)) = ?1
              ORDER BY updated_at DESC LIMIT 2",
@@ -3195,7 +3229,7 @@ impl SessionRepository for SqliteSessionRepository {
             ],
         )?;
         connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -3230,10 +3264,11 @@ impl SessionRepository for SqliteSessionRepository {
             None,
             None,
             None,
+            None,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn create_with_account_id_and_skill_profile(
         &self,
         id: &str,
@@ -3248,6 +3283,7 @@ impl SessionRepository for SqliteSessionRepository {
         enabled_skill_ids: Option<&[String]>,
         profile_id: Option<&str>,
         code_mode: Option<bool>,
+        tool_configuration: Option<&nakode_protocol::SessionToolConfiguration>,
         owner_prompt: Option<&PersistedOwnerPrompt>,
     ) -> Result<SessionRecord, SessionError> {
         let now = unix_timestamp();
@@ -3262,6 +3298,13 @@ impl SessionRepository for SqliteSessionRepository {
             .transpose()
             .map_err(|source| SessionError::InvalidStoredJson {
                 field: "sessions.enabled_skill_ids_json",
+                source,
+            })?;
+        let tool_configuration_json = tool_configuration
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|source| SessionError::InvalidStoredJson {
+                field: "sessions.tool_configuration_json",
                 source,
             })?;
         let mut connection = self
@@ -3287,12 +3330,16 @@ impl SessionRepository for SqliteSessionRepository {
             "INSERT INTO sessions
              (id, provider, account_id, provider_session_id, workspace, working_directory,
               title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at,
-              last_owner_activity_at, enabled_skill_ids_json, code_mode)
+              last_owner_activity_at, enabled_skill_ids_json, code_mode, tool_configuration_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11, ?12,
-                     COALESCE(?13, 0))
+                     COALESCE(?13, 0), ?14)
              ON CONFLICT(provider, provider_session_id) DO UPDATE SET
                account_id = COALESCE(sessions.account_id, excluded.account_id),
                code_mode = COALESCE(?13, sessions.code_mode),
+               tool_configuration_json = COALESCE(
+                 sessions.tool_configuration_json,
+                 excluded.tool_configuration_json
+               ),
                model = excluded.model,
                model_reasoning_effort = excluded.model_reasoning_effort,
                model_fast_mode = excluded.model_fast_mode,
@@ -3321,6 +3368,7 @@ impl SessionRepository for SqliteSessionRepository {
                 now,
                 enabled_skill_ids_json,
                 code_mode.map(i64::from),
+                tool_configuration_json,
             ],
         )?;
         let record = transaction.query_row(
@@ -3328,7 +3376,7 @@ impl SessionRepository for SqliteSessionRepository {
                     model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model,
                     last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome,
                     created_at, updated_at, COALESCE(working_directory, workspace),
-                    last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode
+                    last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -3339,6 +3387,14 @@ impl SessionRepository for SqliteSessionRepository {
             return Err(SessionError::ProviderAccountAffinityConflict {
                 session_id: record.id.clone(),
                 account_id: persisted.to_owned(),
+            });
+        }
+        if let (Some(requested), Some(persisted)) =
+            (tool_configuration, record.tool_configuration.as_ref())
+            && requested != persisted
+        {
+            return Err(SessionError::ToolConfigurationConflict {
+                session_id: record.id.clone(),
             });
         }
         if let Some(profile_id) = profile_id {
@@ -3385,12 +3441,79 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
+        let encoded_configuration = connection
+            .query_row(
+                "SELECT tool_configuration_json FROM sessions WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| SessionError::SessionNotFound(id.to_owned()))?
+            .map(|json| {
+                let mut configuration: nakode_protocol::SessionToolConfiguration =
+                    serde_json::from_str(&json).map_err(|source| {
+                        SessionError::InvalidStoredJson {
+                            field: "sessions.tool_configuration_json",
+                            source,
+                        }
+                    })?;
+                configuration.code_mode = enabled;
+                serde_json::to_string(&configuration).map_err(|source| {
+                    SessionError::InvalidStoredJson {
+                        field: "sessions.tool_configuration_json",
+                        source,
+                    }
+                })
+            })
+            .transpose()?;
+        connection.execute(
+            "UPDATE sessions
+             SET code_mode = ?2, tool_configuration_json = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![
+                id,
+                i64::from(enabled),
+                encoded_configuration,
+                unix_timestamp()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn set_session_tool_configuration(
+        &self,
+        id: &str,
+        configuration: &nakode_protocol::SessionToolConfiguration,
+    ) -> Result<(), SessionError> {
+        let encoded = serde_json::to_string(configuration).map_err(|source| {
+            SessionError::InvalidStoredJson {
+                field: "sessions.tool_configuration_json",
+                source,
+            }
+        })?;
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
         let changed = connection.execute(
-            "UPDATE sessions SET code_mode = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, i64::from(enabled), unix_timestamp()],
+            "UPDATE sessions SET tool_configuration_json = ?2
+             WHERE id = ?1
+               AND (tool_configuration_json IS NULL OR tool_configuration_json = ?2)",
+            params![id, encoded],
         )?;
         if changed == 0 {
-            return Err(SessionError::SessionNotFound(id.to_owned()));
+            let exists = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            return if exists {
+                Err(SessionError::ToolConfigurationConflict {
+                    session_id: id.to_owned(),
+                })
+            } else {
+                Err(SessionError::SessionNotFound(id.to_owned()))
+            };
         }
         Ok(())
     }
@@ -6501,6 +6624,60 @@ mod tests {
     }
 
     #[test]
+    fn session_tool_configuration_is_pinned_and_round_trips() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("session-tools.db");
+        let store = SqliteSessionRepository::open(&path)?;
+        let configuration = nakode_protocol::SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            code_mode: false,
+            allowed_builtin_tools: Some(vec!["read".to_owned()]),
+        };
+        let created = store.create_with_account_id_and_skill_profile(
+            "session-tools",
+            crate::backend::CODEX_PROVIDER,
+            None,
+            "native-tools",
+            "/workspace",
+            "/workspace",
+            "Tools",
+            None,
+            &ModelOptions::default(),
+            None,
+            None,
+            Some(false),
+            Some(&configuration),
+            None,
+        )?;
+        assert_eq!(created.tool_configuration.as_ref(), Some(&configuration));
+        store.set_session_tool_configuration(&created.id, &configuration)?;
+        let conflict = store
+            .set_session_tool_configuration(
+                &created.id,
+                &nakode_protocol::SessionToolConfiguration {
+                    allowed_builtin_tools: Some(vec!["grep".to_owned()]),
+                    ..configuration.clone()
+                },
+            )
+            .expect_err("persisted tool configuration must be immutable");
+        assert!(matches!(
+            conflict,
+            SessionError::ToolConfigurationConflict { .. }
+        ));
+        store.set_session_code_mode(&created.id, true)?;
+        let mut configuration = configuration;
+        configuration.code_mode = true;
+        drop(store);
+
+        let restored = SqliteSessionRepository::open(&path)?
+            .find(&created.id)?
+            .expect("persisted session");
+        assert_eq!(restored.tool_configuration, Some(configuration));
+        Ok(())
+    }
+
+    #[test]
     fn session_code_mode_defaults_off_and_round_trips_across_restart() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("session-code-mode.db");
@@ -7825,6 +8002,7 @@ mod tests {
             Some("profile-a"),
             Some(true),
             None,
+            None,
         )?;
         assert_eq!(
             created.account_id.as_deref(),
@@ -7850,6 +8028,7 @@ mod tests {
                 None,
                 Some("profile-b"),
                 Some(false),
+                None,
                 None,
             )
             .expect_err("a conflicting profile must roll back the whole creation transaction");
@@ -7904,6 +8083,7 @@ mod tests {
                 None,
                 Some("profile-a"),
                 Some(false),
+                None,
                 Some(&prompt),
             )
             .expect_err("owner insert failure must abort the session creation transaction");
@@ -7966,6 +8146,7 @@ mod tests {
                     None,
                     Some("profile-a"),
                     Some(false),
+                    None,
                     Some(&prompt),
                 )
             }));
