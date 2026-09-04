@@ -2040,7 +2040,11 @@ impl NakodeClient {
         managed_watch(receiver, task)
     }
 
-    async fn hydrate_session_with_refresh(
+    /// Hydrates a raw session snapshot, re-reading it once when its transcript cursor lagged.
+    ///
+    /// # Errors
+    /// Returns a transport, server status, or inconsistent-projection error.
+    pub async fn hydrate_session_with_refresh(
         &self,
         state: api::SessionState,
         limit: usize,
