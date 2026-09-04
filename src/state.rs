@@ -8580,6 +8580,9 @@ impl DomainState {
         } else {
             EntryStatus::Running
         };
+        if !completed {
+            self.finish_superseded_messages(turn_id, &item.id);
+        }
         let body = if self.reasoning_summaries.contains(turn_id, &item.id) {
             latest_reasoning_summary(&item.body).to_owned()
         } else if native_delegation && item.body.starts_with("[Subagent Result]") {
@@ -8596,6 +8599,34 @@ impl DomainState {
         self.transcript
             .set_tool_audit(&item_id, tool_audit_json.map(Into::into));
         self.set_entry_turn_origin(&item_id, turn_id);
+    }
+
+    /// A provider streams one message at a time, so when a new item starts in a turn every
+    /// assistant or reasoning entry of that turn still marked running has in fact finished. Some
+    /// providers only report those completions at turn end; a long multi-step turn would otherwise
+    /// show every earlier message still streaming. Tool rows keep their own lifecycle.
+    fn finish_superseded_messages(&mut self, turn_id: &str, starting_item_id: &str) {
+        let superseded: Vec<String> = self
+            .transcript
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.status == EntryStatus::Running
+                    && matches!(entry.kind, EntryKind::Assistant | EntryKind::Reasoning)
+                    && entry.key.as_deref().is_some_and(|key| {
+                        key != starting_item_id
+                            && self
+                                .item_turns
+                                .get(key)
+                                .is_some_and(|owner| owner == turn_id)
+                    })
+            })
+            .filter_map(|entry| entry.key.clone())
+            .collect();
+        for key in superseded {
+            self.transcript
+                .finish_running_entry(&key, EntryStatus::Complete);
+        }
     }
 
     fn is_native_delegation_entry(&self, item_id: &str) -> bool {
@@ -14755,6 +14786,48 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert!(!super::is_subagent_invocation(
             "the nakode service and an agent"
         ));
+    }
+
+    #[test]
+    fn a_new_item_finishes_the_turns_still_streaming_messages() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
+            cancelling: false,
+        });
+        let started = |id: &str, kind: ItemKind| BackendEvent::ItemStarted {
+            turn_id: "turn-1".to_owned(),
+            item: NormalizedItem {
+                id: id.to_owned(),
+                kind,
+                title: String::new(),
+                body: "text".to_owned(),
+                status: ItemStatus::Running,
+                tool_audit_json: None,
+            },
+        };
+        state.handle_backend(started("reason-1", ItemKind::Reasoning));
+        state.handle_backend(started("message-1", ItemKind::Assistant));
+        state.handle_backend(started("tool-1", ItemKind::Tool));
+        state.handle_backend(started("message-2", ItemKind::Assistant));
+
+        let status = |state: &AppState, key: &str| {
+            state
+                .transcript
+                .entries()
+                .iter()
+                .find(|entry| entry.key.as_deref() == Some(key))
+                .map(|entry| entry.status)
+                .expect("entry present")
+        };
+        assert_eq!(status(&state, "reason-1"), EntryStatus::Complete);
+        assert_eq!(status(&state, "message-1"), EntryStatus::Complete);
+        // Only the latest message streams; tools keep their own lifecycle.
+        assert_eq!(status(&state, "message-2"), EntryStatus::Running);
+        assert_eq!(status(&state, "tool-1"), EntryStatus::Running);
     }
 
     #[test]
