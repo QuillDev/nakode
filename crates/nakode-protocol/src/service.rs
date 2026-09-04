@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArtifactView, BootstrapView, McpManagementView, RunId, RunTextWindow, RunView, ServerEpoch,
-    SessionId, SessionSummary, SessionView, TranscriptBodyWindow, WorkspaceId,
+    SessionId, SessionSummary, SessionToolConfiguration, SessionView, TranscriptBodyWindow,
+    WorkspaceId,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -115,6 +116,9 @@ pub enum BridgeContinuationDisposition {
 pub struct CommandAccepted {
     pub resource_id: Option<String>,
     pub revision: Option<u64>,
+    /// Effective established tool boundary returned by `OpenSession`.
+    #[serde(default)]
+    pub effective_session_tools: Option<SessionToolConfiguration>,
     /// Present only for `ContinueSessionFromBridge`; retained in idempotency replay results.
     #[serde(default)]
     pub bridge_continuation: Option<BridgeContinuationDisposition>,

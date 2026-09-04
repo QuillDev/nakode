@@ -110,6 +110,13 @@ pub struct SessionAttachment {
     pub account_id: Option<String>,
 }
 
+/// An opened logical session and the authoritative tool boundary retained by the server.
+#[derive(Clone, Debug)]
+pub struct OpenedSession {
+    pub id: String,
+    pub effective_session_tools: Option<api::SessionToolConfiguration>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct ClientApiKey {
     authorization: Option<AsciiMetadataValue>,
@@ -936,6 +943,21 @@ impl NakodeClient {
         session_id: impl Into<String>,
         attachment: SessionAttachment,
     ) -> Result<String, SdkError> {
+        Ok(self
+            .open_session_with_effective_attachment(session_id, attachment)
+            .await?
+            .id)
+    }
+
+    /// Opens or reattaches and returns the server's authoritative effective tool boundary.
+    ///
+    /// # Errors
+    /// Returns a transport, server status, or missing-identifier error.
+    pub async fn open_session_with_effective_attachment(
+        &self,
+        session_id: impl Into<String>,
+        attachment: SessionAttachment,
+    ) -> Result<OpenedSession, SdkError> {
         let result = send_mutation!(
             self,
             open_session,
@@ -948,9 +970,13 @@ impl NakodeClient {
                 account_id: attachment.account_id,
             }
         )?;
-        result
+        let id = result
             .resource_id
-            .ok_or(SdkError::MissingState("opened session identifier"))
+            .ok_or(SdkError::MissingState("opened session identifier"))?;
+        Ok(OpenedSession {
+            id,
+            effective_session_tools: result.effective_session_tools,
+        })
     }
 
     /// Lists logical sessions for a workspace.
@@ -2861,6 +2887,7 @@ mod tests {
                     respond,
                     ..
                 } => {
+                    let effective_session_tools = tools.clone();
                     *captured.lock().expect("captured attachment") = Some(CapturedAttachment {
                         session_id: session_id.to_string(),
                         tools,
@@ -2877,6 +2904,7 @@ mod tests {
                     let _ = respond.send(Ok(protocol::CommandAccepted {
                         resource_id: Some(resource_id),
                         revision: Some(1),
+                        effective_session_tools,
                         bridge_continuation: None,
                         replayed_bridge_continuation: None,
                         replayed_bridge_source_active: None,
@@ -3069,6 +3097,41 @@ mod tests {
                 && assignment.rule == i32::from(api::rpc_lane_definition::Rule::Hydration)
         }));
 
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn open_session_returns_the_effective_attachment() {
+        let directory = tempfile::tempdir().expect("SDK transport directory");
+        let socket = directory.path().join("nakode.sock");
+        let server = spawn_session_server(
+            &socket,
+            SessionServerMode::ReattachSame,
+            Arc::new(Mutex::new(None)),
+        );
+        let client = NakodeClient::connect_unix(&socket)
+            .await
+            .expect("connect fake Nakode API");
+        let tools = api::SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            code_mode: false,
+            allowed_builtin_tools: vec!["read".to_owned()],
+        };
+
+        let opened = client
+            .open_session_with_effective_attachment(
+                "session-a",
+                SessionAttachment {
+                    tools: Some(tools.clone()),
+                    ..SessionAttachment::default()
+                },
+            )
+            .await
+            .expect("open session");
+
+        assert_eq!(opened.id, "session-a");
+        assert_eq!(opened.effective_session_tools, Some(tools));
         server.stop().await;
     }
 

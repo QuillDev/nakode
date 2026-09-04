@@ -2027,16 +2027,17 @@ impl ServerCore {
                 {
                     return Err(DomainCommandError::NotFound(session_id.to_string()));
                 }
-                if let Some(tools) = tools {
-                    let provider = self
-                        .session_engine_mut(loaded)?
-                        .state()
-                        .active_provider_id()
-                        .to_owned();
-                    let tools = self
-                        .session_engine_mut(loaded)?
-                        .state()
-                        .reconcile_available_builtin_tools(&provider, tools);
+                let tools = tools.unwrap_or_else(Self::default_session_tools);
+                let provider = self
+                    .session_engine_mut(loaded)?
+                    .state()
+                    .active_provider_id()
+                    .to_owned();
+                let tools = self
+                    .session_engine_mut(loaded)?
+                    .state()
+                    .reconcile_available_builtin_tools(&provider, tools);
+                let effective_session_tools = Some(
                     self.session_engine_mut(loaded)?
                         .state_mut()
                         .configure_or_validate_external_tools(
@@ -2044,8 +2045,8 @@ impl ServerCore {
                             tools.replace_builtin_tools,
                             tools.code_mode,
                             tools.allowed_builtin_tools.as_deref(),
-                        )?;
-                }
+                        )?,
+                );
                 if let Some(profile_id) = profile_id {
                     let skills = self
                         .session_template
@@ -2058,7 +2059,11 @@ impl ServerCore {
                 // Opening an attached session is a reattachment, not a tool reconfiguration. The
                 // runtime already owns its installed MCP tools, so a caller's current grant must
                 // not make an otherwise valid reattach fail or mutate the active session.
-                return Ok(Self::accepted(Some(loaded.to_string()), Vec::new()));
+                return Ok(Self::accepted_with_session_tools(
+                    Some(loaded.to_string()),
+                    effective_session_tools,
+                    Vec::new(),
+                ));
             }
             [_, ..] => {
                 return Err(DomainCommandError::Conflict(format!(
@@ -2081,7 +2086,6 @@ impl ServerCore {
                 },
                 |session| vec![session.clone()],
             );
-        let requested_code_mode = tools.as_ref().map(|tools| tools.code_mode);
         let mut session = match matches.as_slice() {
             [session] => session.clone(),
             [] => return Err(DomainCommandError::NotFound(session_id.to_string())),
@@ -2106,11 +2110,6 @@ impl ServerCore {
                 session.account_id = Some(requested.to_owned());
             }
         }
-        let persisted_code_mode = session.code_mode;
-        if let Some(code_mode) = requested_code_mode {
-            session.code_mode = code_mode;
-        }
-        let code_mode_changed = session.code_mode != persisted_code_mode;
         let working_directory =
             canonical_working_directory(Some(&session.working_directory), &session.workspace)?;
         self.refresh_session_template_addenda()?;
@@ -2131,18 +2130,43 @@ impl ServerCore {
         // The workspace template may still carry the bootstrap provider/session identity. Reset that
         // clone before installing client-owned tools; restoration begins only after validation.
         let _discarded_template_effects = engine.state_mut().create_logical_session()?;
-        if let Some(tools) = tools {
-            let tools = engine
-                .state()
-                .reconcile_available_builtin_tools(&session.provider, tools);
-            Self::validate_provider_tool_projection(&session.provider, &tools)?;
+        let requested_tools_omitted = tools.is_none();
+        let mut requested_tools = engine.state().reconcile_available_builtin_tools(
+            &session.provider,
+            tools.unwrap_or_else(Self::default_session_tools),
+        );
+        if requested_tools_omitted && session.tool_configuration.is_none() {
+            requested_tools.code_mode = session.code_mode;
+        }
+        Self::validate_provider_tool_projection(&session.provider, &requested_tools)?;
+        if session.tool_configuration.is_none()
+            && !requested_tools_omitted
+            && requested_tools.code_mode != session.code_mode
+        {
+            return Err(DomainCommandError::Invalid(
+                "the attached session already started with a different tool table".to_owned(),
+            ));
+        }
+        let (established_tools, persist_legacy_tools) =
+            session.tool_configuration.clone().map_or_else(
+                || (requested_tools.clone(), !requested_tools_omitted),
+                |tools| (tools, false),
+            );
+        Self::validate_provider_tool_projection(&session.provider, &established_tools)?;
+        if established_tools != Self::default_session_tools() || !requested_tools_omitted {
             engine.state_mut().configure_session_tools(
-                tools.tools,
-                tools.replace_builtin_tools,
-                tools.code_mode,
-                tools.allowed_builtin_tools,
+                established_tools.tools.clone(),
+                established_tools.replace_builtin_tools,
+                established_tools.code_mode,
+                established_tools.allowed_builtin_tools.clone(),
             )?;
         }
+        let effective_session_tools = engine.state_mut().configure_or_validate_external_tools(
+            &requested_tools.tools,
+            requested_tools.replace_builtin_tools,
+            requested_tools.code_mode,
+            requested_tools.allowed_builtin_tools.as_deref(),
+        )?;
         if let Some(grant) = mcp_grant {
             let (mcp_tools, archetype_grants) =
                 self.mcp_tools_for_grant(grant, &session.workspace)?;
@@ -2152,26 +2176,23 @@ impl ServerCore {
                 .configure_mcp_archetype_grants(archetype_grants);
         }
         let mut effects = engine.state_mut().begin_resume(session.clone());
-        if code_mode_changed {
+        if persist_legacy_tools {
             effects.insert(
                 0,
-                Effect::PersistSessionCodeMode {
+                Effect::PersistSessionToolConfiguration {
                     session_id: session.id.clone(),
-                    enabled: session.code_mode,
+                    configuration: effective_session_tools.clone(),
                 },
             );
-            if let Some(stored) = self
-                .sessions
-                .iter_mut()
-                .find(|stored| stored.id == session.id)
-            {
-                stored.code_mode = session.code_mode;
-            }
         }
         Self::prepend_resume_hydration_effects(&session, &engine, &mut effects);
         let loaded_id = SessionId::from(session.id.clone());
         self.sessions_by_id.insert(loaded_id.clone(), engine);
-        Ok(Self::accepted(Some(session.id), effects))
+        Ok(Self::accepted_with_session_tools(
+            Some(session.id),
+            Some(effective_session_tools),
+            effects,
+        ))
     }
 
     fn prepend_resume_hydration_effects(
@@ -3083,12 +3104,32 @@ impl ServerCore {
             CommandAccepted {
                 resource_id,
                 revision: None,
+                effective_session_tools: None,
                 bridge_continuation: None,
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
             },
             effects,
         )
+    }
+
+    fn default_session_tools() -> nakode_protocol::SessionToolConfiguration {
+        nakode_protocol::SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            code_mode: false,
+            allowed_builtin_tools: None,
+        }
+    }
+
+    fn accepted_with_session_tools(
+        resource_id: Option<String>,
+        effective_session_tools: Option<nakode_protocol::SessionToolConfiguration>,
+        effects: Vec<Effect>,
+    ) -> (CommandAccepted, Vec<Effect>) {
+        let (mut accepted, effects) = Self::accepted(resource_id, effects);
+        accepted.effective_session_tools = effective_session_tools;
+        (accepted, effects)
     }
 
     fn accepted_bridge_continuation(
@@ -3100,6 +3141,7 @@ impl ServerCore {
             CommandAccepted {
                 resource_id: Some(session_id.to_string()),
                 revision: None,
+                effective_session_tools: None,
                 bridge_continuation: Some(disposition),
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
@@ -5615,6 +5657,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -5666,6 +5709,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -6943,7 +6987,7 @@ mod tests {
     }
 
     #[test]
-    fn attached_session_tool_validation_includes_builtin_allowlist() {
+    fn attached_session_preserves_a_builtin_allowlist_within_current_authorization() {
         let (mut core, _) = ready_external_tools_server();
         let workspace_id = core.workspace_bootstrap().workspace_id;
         let configured = SessionToolConfiguration {
@@ -6961,16 +7005,119 @@ mod tests {
             )
             .expect("create");
         let id = SessionId::from(created.resource_id.expect("session id"));
-        assert!(
-            core.open_session_command(
+
+        let (opened, effects) = core
+            .open_session_command(
+                &id,
+                Some(SessionToolConfiguration {
+                    allowed_builtin_tools: Some(vec!["read".to_owned(), "grep".to_owned()]),
+                    ..configured.clone()
+                }),
+            )
+            .expect("a broader current authorization must preserve the established subset");
+        assert!(effects.is_empty());
+        assert_eq!(opened.effective_session_tools, Some(configured.clone()));
+
+        let error = core
+            .open_session_command(
                 &id,
                 Some(SessionToolConfiguration {
                     allowed_builtin_tools: Some(vec!["grep".to_owned()]),
                     ..configured
-                })
+                }),
             )
-            .is_err()
-        );
+            .expect_err("a client that no longer authorizes an established tool must be rejected");
+        assert!(error.to_string().contains("different tool table"));
+    }
+
+    #[test]
+    fn restored_session_uses_persisted_builtin_subset_and_returns_it() {
+        let (mut core, _) = ready_external_tools_server();
+        install_available_tools(&mut core, CODEX_PROVIDER, &["read", "grep"]);
+        let id = SessionId::from("restored-builtin-subset");
+        let established = SessionToolConfiguration {
+            tools: Vec::new(),
+            replace_builtin_tools: false,
+            code_mode: false,
+            allowed_builtin_tools: Some(vec!["read".to_owned()]),
+        };
+        core.replace_session_records(vec![SessionRecord {
+            id: id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            account_id: None,
+            provider_session_id: "thread-restored-subset".to_owned(),
+            workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
+            title: "Persisted boundary".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            last_owner_activity_at: None,
+            tool_configuration: Some(established.clone()),
+            code_mode: false,
+            enabled_skill_ids: Some(Vec::new()),
+            owned_provider_sessions: Vec::new(),
+        }]);
+
+        for (label, request) in [
+            (
+                "external tools",
+                SessionToolConfiguration {
+                    tools: vec![ExternalToolDefinition {
+                        name: "ticket_lookup".to_owned(),
+                        description: "Look up a ticket".to_owned(),
+                        input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                    }],
+                    ..established.clone()
+                },
+            ),
+            (
+                "replacement mode",
+                SessionToolConfiguration {
+                    replace_builtin_tools: true,
+                    allowed_builtin_tools: None,
+                    ..established.clone()
+                },
+            ),
+            (
+                "Code Mode",
+                SessionToolConfiguration {
+                    code_mode: true,
+                    ..established.clone()
+                },
+            ),
+            (
+                "missing builtin authority",
+                SessionToolConfiguration {
+                    allowed_builtin_tools: Some(vec!["grep".to_owned()]),
+                    ..established.clone()
+                },
+            ),
+        ] {
+            let expectation = format!("restoration must reject mismatched {label}");
+            let error = core
+                .open_session_command(&id, Some(request))
+                .expect_err(&expectation);
+            assert!(error.to_string().contains("different tool table"));
+            assert!(core.engine_for(&id).is_none());
+        }
+
+        let (opened, _) = core
+            .open_session_command(
+                &id,
+                Some(SessionToolConfiguration {
+                    allowed_builtin_tools: Some(vec!["read".to_owned(), "grep".to_owned()]),
+                    ..established.clone()
+                }),
+            )
+            .expect(
+                "restoration must accept current authorization containing the persisted subset",
+            );
+        assert_eq!(opened.effective_session_tools, Some(established));
     }
 
     #[test]
@@ -7020,7 +7167,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_tools_and_code_mode_are_preserved_during_persisted_session_resume() {
+    fn disabled_tools_are_pinned_during_legacy_persisted_session_resume() {
         let (mut core, _) = ready_external_tools_server();
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-tools-session");
@@ -7040,12 +7187,12 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
         }]);
         let mut tools = dashboard_tools("DashboardRead", false);
-        tools.code_mode = true;
         tools.allowed_builtin_tools =
             Some(vec!["memory_search".to_owned(), "memory_store".to_owned()]);
 
@@ -7065,18 +7212,12 @@ mod tests {
         assert!(
             effects.iter().any(|effect| matches!(
                 effect,
-                crate::state::Effect::PersistSessionCodeMode {
+                crate::state::Effect::PersistSessionToolConfiguration {
                     session_id,
-                    enabled: true,
-                } if session_id == restored_id.as_str()
+                    configuration,
+                } if session_id == restored_id.as_str() && configuration == &tools
             )),
-            "an explicit attachment override must become durable: {effects:#?}"
-        );
-        assert!(
-            core.sessions
-                .iter()
-                .any(|session| session.id == restored_id.as_str() && session.code_mode),
-            "the authoritative persisted-session cache must reflect the accepted override"
+            "legacy rows must pin the first exact tool boundary: {effects:#?}"
         );
         assert!(
             effects.iter().any(|effect| matches!(
@@ -7085,7 +7226,7 @@ mod tests {
                     provider_session_id,
                     external_tools,
                     replace_builtin_tools: false,
-                    code_mode: true,
+                    code_mode: false,
                     allowed_builtin_tools: Some(allowed),
                     ..
                 }) if provider_session_id == "thread-restored"
@@ -7117,6 +7258,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: Some(Vec::new()),
             owned_provider_sessions: Vec::new(),
@@ -7223,6 +7365,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -7363,6 +7506,7 @@ mod tests {
             created_at: 1,
             updated_at: 2,
             last_owner_activity_at: None,
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -7396,6 +7540,7 @@ mod tests {
             created_at: 10,
             updated_at: 12,
             last_owner_activity_at: None,
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),
@@ -10316,6 +10461,7 @@ enabled = false
             created_at: 0,
             updated_at: 0,
             last_owner_activity_at: None,
+            tool_configuration: None,
             code_mode: false,
             enabled_skill_ids: None,
             owned_provider_sessions: Vec::new(),

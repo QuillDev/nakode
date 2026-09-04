@@ -1679,8 +1679,7 @@ impl NativeServerRuntime {
             }
             outcome.respond_with_error(ServiceError {
                 code: ErrorCode::Internal,
-                message: "the durable owner transcript checkpoint failed; retry the operation"
-                    .to_owned(),
+                message: "the durable command checkpoint failed; retry the operation".to_owned(),
                 retryable: true,
             });
             return;
@@ -4613,6 +4612,7 @@ impl EffectExecutor {
             Effect::ResolveSession(id) => resolve_session(state, sessions, pending, &id),
             effect @ (Effect::PersistSession { .. }
             | Effect::PersistSessionSkillSnapshot { .. }
+            | Effect::PersistSessionToolConfiguration { .. }
             | Effect::PersistSessionCodeMode { .. }
             | Effect::PersistSessionBridge(_)
             | Effect::PersistModels { .. }
@@ -4941,6 +4941,7 @@ fn persist_command_dispatch_effects(
     }
     let mut owner_prompts = Vec::new();
     let mut bridges = Vec::new();
+    let mut tool_configurations = Vec::new();
     let mut remaining = Vec::with_capacity(effects.len());
     for effect in effects.drain(..) {
         match effect {
@@ -4948,17 +4949,39 @@ fn persist_command_dispatch_effects(
                 owner_prompts.push((session_id, prompt));
             }
             Effect::PersistSessionBridge(bridge) => bridges.push(bridge),
+            Effect::PersistSessionToolConfiguration {
+                session_id,
+                configuration,
+            } => tool_configurations.push((session_id, configuration)),
             effect => remaining.push(effect),
         }
     }
     let inbound_event = inbound_event_to_claim.map(|(session_id, event_id, disposition)| {
         (session_id.as_str(), event_id.as_str(), *disposition)
     });
-    let result = if owner_prompts.is_empty() && bridges.is_empty() {
-        Ok(())
-    } else {
-        sessions.save_prompt_dispatch_checkpoint(&owner_prompts, &bridges, inbound_event)
-    };
+    let result = tool_configurations
+        .iter()
+        .try_for_each(|(session_id, configuration)| {
+            sessions.set_session_tool_configuration(session_id, configuration)
+        })
+        .and_then(|()| {
+            if owner_prompts.is_empty() && bridges.is_empty() {
+                Ok(())
+            } else {
+                sessions.save_prompt_dispatch_checkpoint(&owner_prompts, &bridges, inbound_event)
+            }
+        });
+    if result.is_ok() {
+        for (session_id, configuration) in &tool_configurations {
+            if let Some(record) = core
+                .sessions
+                .iter_mut()
+                .find(|record| record.id == session_id.as_str())
+            {
+                record.tool_configuration = Some(configuration.clone());
+            }
+        }
+    }
     *effects = remaining;
     result
 }
@@ -5001,6 +5024,7 @@ fn persist_owner_prompt_effects(
                     title,
                     model,
                     options,
+                    tool_configuration,
                 } => {
                     let enabled_skill_ids = state.enabled_skill_ids();
                     let record = sessions.create_with_account_id_and_skill_profile(
@@ -5015,7 +5039,8 @@ fn persist_owner_prompt_effects(
                         &options,
                         Some(&enabled_skill_ids),
                         state.skill_profile_id(),
-                        None,
+                        Some(tool_configuration.code_mode),
+                        Some(&tool_configuration),
                         creation_prompt.as_ref(),
                     )?;
                     creation_prompt_persisted = creation_prompt.is_some();
@@ -5149,6 +5174,7 @@ fn execute_persistence_effect(
             title,
             model,
             options,
+            tool_configuration,
         } => persist_session(
             state,
             sessions,
@@ -5160,12 +5186,22 @@ fn execute_persistence_effect(
             &title,
             model.as_deref(),
             &options,
+            &tool_configuration,
         ),
         Effect::PersistSessionSkillSnapshot {
             session_id,
             enabled_skill_ids,
         } => {
             if let Err(error) = sessions.set_session_skill_snapshot(&session_id, &enabled_skill_ids)
+            {
+                state.session_store_failed(error.to_string());
+            }
+        }
+        Effect::PersistSessionToolConfiguration {
+            session_id,
+            configuration,
+        } => {
+            if let Err(error) = sessions.set_session_tool_configuration(&session_id, &configuration)
             {
                 state.session_store_failed(error.to_string());
             }
@@ -5284,6 +5320,7 @@ fn persist_session(
     title: &str,
     model: Option<&str>,
     options: &crate::backend::ModelOptions,
+    tool_configuration: &nakode_protocol::SessionToolConfiguration,
 ) {
     let enabled_skill_ids = state.enabled_skill_ids();
     match sessions.create_with_account_id_and_skill_profile(
@@ -5298,7 +5335,8 @@ fn persist_session(
         options,
         Some(&enabled_skill_ids),
         state.skill_profile_id(),
-        Some(state.code_mode()),
+        Some(tool_configuration.code_mode),
+        Some(tool_configuration),
         None,
     ) {
         Ok(record) => state.session_persisted(&record),

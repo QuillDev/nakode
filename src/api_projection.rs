@@ -141,6 +141,7 @@ pub(crate) async fn execute_command(
             Ok(api::MutationResult {
                 resource_id: Some(resource_id),
                 revision: None,
+                effective_session_tools: None,
             })
         }
         TuiAction::OpenSession {
@@ -199,9 +200,9 @@ async fn open_session(
     session_id: view::SessionId,
     code_mode: bool,
 ) -> Result<api::MutationResult, nakode_sdk::SdkError> {
-    let session_id = if code_mode {
+    let opened = if code_mode {
         client
-            .open_session_with_attachment(
+            .open_session_with_effective_attachment(
                 session_id.to_string(),
                 nakode_sdk::SessionAttachment {
                     tools: Some(api::SessionToolConfiguration {
@@ -215,11 +216,17 @@ async fn open_session(
             )
             .await?
     } else {
-        client.open_session(session_id.to_string()).await?
+        client
+            .open_session_with_effective_attachment(
+                session_id.to_string(),
+                nakode_sdk::SessionAttachment::default(),
+            )
+            .await?
     };
     Ok(api::MutationResult {
-        resource_id: Some(session_id),
+        resource_id: Some(opened.id),
         revision: None,
+        effective_session_tools: opened.effective_session_tools,
     })
 }
 
