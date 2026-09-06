@@ -2148,6 +2148,30 @@ pub async fn restart_service(executable: &Path, config: &Config) -> Result<(), C
     restart_service_with_request(executable, config, LifecycleRequest::Shutdown).await
 }
 
+/// Waits for the actor-owned quiescent fence; never falls back to forced shutdown.
+///
+/// # Errors
+/// Returns transport, protocol, configuration and startup errors immediately.
+pub async fn restart_service_when_idle(
+    executable: &Path,
+    config: &Config,
+) -> Result<(), ControlError> {
+    loop {
+        match restart_service_quiescent(executable, config).await {
+            Err(ControlError::ServiceRejected(message)) if live_work_refusal(&message) => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+// Compatibility with the existing lifecycle protocol: this refusal is produced by the runtime
+// actor before it fences or stops anything. Unknown errors must never be treated as idle/busy.
+fn live_work_refusal(message: &str) -> bool {
+    message.starts_with("live work is still owned by session(s) ")
+}
+
 pub(crate) async fn restart_service_quiescent(
     executable: &Path,
     config: &Config,
@@ -3694,5 +3718,21 @@ mod tests {
             .await
             .expect("stale socket is reclaimed");
         drop(replacement);
+    }
+}
+
+#[cfg(test)]
+mod idle_restart_tests {
+    #[test]
+    fn only_explicit_live_work_refusals_are_retryable() {
+        assert!(super::live_work_refusal(
+            "live work is still owned by session(s) session@1"
+        ));
+        assert!(!super::live_work_refusal(
+            "atomic quiescent shutdown is unavailable"
+        ));
+        assert!(!super::live_work_refusal(
+            "timed out while atomically fencing the installation service"
+        ));
     }
 }

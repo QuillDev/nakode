@@ -59,6 +59,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NakodeCommand::Start => service_cli::start(&config).await?,
         NakodeCommand::Stop => service_cli::stop(&config).await?,
         NakodeCommand::Restart => service_cli::restart(&config).await?,
+        NakodeCommand::RestartWhenIdle => service_cli::restart_when_idle(&config).await?,
         NakodeCommand::Status { json } => service_cli::status(&config, json).await?,
         NakodeCommand::Logs { follow, lines } => service_cli::logs(&config, follow, lines).await?,
         NakodeCommand::Endpoint => service_cli::endpoint(&config).await?,

@@ -9319,6 +9319,25 @@ mod tests {
             },
         );
 
+        let (safe_response, safe_result) = tokio::sync::oneshot::channel();
+        runtime.handle_quiesce(QuiesceRequest {
+            mode: QuiesceMode::Safe,
+            respond: safe_response,
+        });
+        assert!(
+            safe_result
+                .await
+                .expect("safe response")
+                .expect_err("live delegation refuses idle restart")
+                .starts_with("live work is still owned by session(s) ")
+        );
+        assert!(runtime.accepting_work);
+        assert!(
+            !runtime.pending_native_delegations[&1]
+                .cancellation_task
+                .is_finished()
+        );
+
         let (changed_response, changed_result) = tokio::sync::oneshot::channel();
         runtime.handle_quiesce(QuiesceRequest {
             mode: QuiesceMode::Force {

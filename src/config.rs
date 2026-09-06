@@ -123,6 +123,8 @@ pub enum NakodeCommand {
     Stop,
     /// Restart the Nakode service in the background.
     Restart,
+    /// Wait for live work to finish, then atomically restart without cancelling sessions.
+    RestartWhenIdle,
     /// Report the service's state, endpoint, versions, and log location.
     Status {
         /// Emit machine-readable JSON.
