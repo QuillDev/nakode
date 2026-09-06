@@ -553,7 +553,7 @@ pub struct SlashControl {
     pub placement: CommandPlacement,
 }
 
-pub const SKILL_PREFIX: &str = "/skill:";
+pub use crate::skill::SKILL_PREFIX;
 
 const SLASH_CONTROLS: &[SlashControl] = &[
     SlashControl {

@@ -974,7 +974,7 @@ pub(crate) fn executable_identity(path: &Path) -> Result<ExecutableIdentity, Con
         modified_at_unix_ms,
         device,
         inode,
-        build_revision: crate::BUILD_REVISION.map(str::to_owned),
+        build_revision: crate::embedded::build_revision().map(str::to_owned),
     };
     if let Ok(mut cache) = EXECUTABLE_IDENTITY_CACHE.lock() {
         if cache.len() >= EXECUTABLE_IDENTITY_CACHE_CAPACITY {
@@ -1239,7 +1239,7 @@ async fn ensure_service_at_with_timeout(
 }
 
 fn service_command(executable: &Path, config: &Config) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(executable);
+    let mut command = crate::executable::command(executable);
     command.args(service_arguments(config)).stdin(Stdio::null());
     if let Ok(identity) = executable_identity(executable)
         && let Ok(encoded) = serde_json::to_string(&identity)

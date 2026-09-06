@@ -426,7 +426,7 @@ impl NativeServerRuntime {
         let capabilities = native_service_capabilities();
         let (endpoint, requests) = ServerEndpoint::channel_with_build_revision(
             env!("CARGO_PKG_VERSION"),
-            crate::BUILD_REVISION.map(str::to_owned),
+            crate::embedded::build_revision().map(str::to_owned),
             capabilities,
             256,
         );

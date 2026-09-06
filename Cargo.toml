@@ -5,11 +5,17 @@ edition = "2024"
 rust-version = "1.88"
 description = "A provider-neutral agent server with generated SDKs and thin clients"
 
+[[bin]]
+name = "nakode"
+path = "src/main.rs"
+required-features = ["tui"]
+
 [workspace]
 members = [
   "crates/nakode-protocol",
   "crates/nakode-sdk",
   "crates/nakode-server",
+  "crates/nakode-runtime",
 ]
 exclude = ["crates/nakode-api"]
 resolver = "3"
@@ -28,7 +34,8 @@ debug = 1
 incremental = true
 
 [features]
-default = []
+default = ["tui"]
+tui = ["dep:clipboard-rs", "dep:crossterm", "dep:ratatui", "dep:ratatui-image"]
 codex-process-adapter = []
 # Compiles a deterministic Codex process override exclusively for cross-repository E2E tests.
 # Production builds do not include or recognize the fixture-provider environment variable.
@@ -38,8 +45,8 @@ e2e-fixture-provider = ["codex-process-adapter"]
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
-clipboard-rs = "0.3.5"
-crossterm = { version = "0.29", features = ["event-stream"] }
+clipboard-rs = { version = "0.3.5", optional = true }
+crossterm = { version = "0.29", features = ["event-stream"], optional = true }
 directories = "6"
 futures-util = "0.3"
 fs2 = "0.4"
@@ -56,9 +63,9 @@ portable-pty = "0.9"
 prost = "0.14"
 pulldown-cmark = "0.13"
 rand = "0.9"
-ratatui = "0.30"
+ratatui = { version = "0.30", optional = true }
 rcgen = "0.14"
-ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "11.0.6", optional = true, default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 regex = "1"
 rpassword = "7"

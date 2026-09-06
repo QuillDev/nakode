@@ -13,7 +13,6 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::Command,
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
@@ -1376,7 +1375,7 @@ impl AgentRuntime {
         };
         let worker_directory = tempfile::tempdir()
             .map_err(|error| format!("could not create isolated codemode directory: {error}"))?;
-        let mut child = Command::new(executable)
+        let mut child = crate::executable::command(&executable)
             .arg("codemode-worker")
             .env_clear()
             .current_dir(worker_directory.path())

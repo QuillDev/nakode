@@ -7,7 +7,8 @@ use std::{
 use directories::BaseDirs;
 use thiserror::Error;
 
-use crate::controls::SKILL_PREFIX;
+/// Shared skill reference syntax, independent of frontend controls.
+pub const SKILL_PREFIX: &str = "/skill:";
 
 const SKILL_FILE: &str = "SKILL.md";
 const AVAILABILITY_EXPLANATION: &str = "Nakode marks a skill available only after the latest successful discovery finds and validates its inert SKILL.md and safe Markdown components in the machine-local or workspace-local skill roots. Provider, model, runtime, and tool prerequisites are not skill availability inputs.";
