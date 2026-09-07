@@ -205,6 +205,11 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     fixed("NakodeService", "SetSessionCodeMode", RequestLane::Control),
     fixed(
         "NakodeService",
+        "SetSessionEnvironment",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
         "SubmitExternalToolResult",
         RequestLane::Control,
     ),

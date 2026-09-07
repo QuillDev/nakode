@@ -428,6 +428,10 @@ pub enum Command {
         interaction_id: InteractionId,
         resolution: InteractionResolution,
     },
+    SetSessionEnvironment {
+        session_id: SessionId,
+        variables: std::collections::BTreeMap<String, CredentialInput>,
+    },
     ConfigureSessionTools {
         session_id: SessionId,
         tools: Vec<ExternalToolDefinition>,

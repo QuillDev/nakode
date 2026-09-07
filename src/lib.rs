@@ -56,6 +56,7 @@ pub mod service;
 pub mod service_cli;
 pub mod service_log;
 pub mod session;
+mod session_environment;
 pub mod settings;
 mod shell;
 pub mod skill;

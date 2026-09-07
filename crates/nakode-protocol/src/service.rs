@@ -28,6 +28,7 @@ pub enum ServiceCapability {
     InitialSessionModel,
     /// `CreateSession` accepts bounded client context merged into provider system instructions.
     InitialSessionInstructions,
+    SessionEnvironment,
     /// `DeleteSession` is served: a logical session and its persisted history can be removed.
     ///
     /// Declared rather than assumed so a client can degrade its own affordance instead of offering a

@@ -28,6 +28,7 @@ service NakodeService {
   rpc ClearMcpServerCredential(ClearMcpServerCredentialRequest) returns (MutationResult);
   rpc SetMcpServerGrants(SetMcpServerGrantsRequest) returns (MutationResult);
 
+  rpc SetSessionEnvironment(SetSessionEnvironmentRequest) returns (MutationResult);
   rpc CreateSession(CreateSessionRequest) returns (MutationResult);
   rpc OpenSession(OpenSessionRequest) returns (MutationResult);
   rpc SetSessionBridgeLifecycle(SetSessionBridgeLifecycleRequest) returns (MutationResult);
@@ -428,6 +429,12 @@ message SessionToolConfiguration {
 // the creation mutation. This prevents clients from exposing or sending a first turn through a
 // transient configuration. Omitted selection means the workspace/provider default; omitted tools
 // keep Nakode's built-ins.
+// Write-only ephemeral process environment. Never included in snapshots or session persistence.
+message SetSessionEnvironmentRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  map<string, string> variables = 3;
+}
 message CreateSessionRequest {
   MutationOptions mutation = 1;
   string workspace_id = 2;

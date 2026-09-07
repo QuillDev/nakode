@@ -1251,6 +1251,25 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         .await
     }
 
+    async fn set_session_environment(
+        &self,
+        request: tonic::Request<api::SetSessionEnvironmentRequest>,
+    ) -> Result<tonic::Response<api::MutationResult>, tonic::Status> {
+        let input = request.into_inner();
+        self.mutate(
+            input.mutation,
+            protocol::Command::SetSessionEnvironment {
+                session_id: protocol::SessionId::from(input.session_id),
+                variables: input
+                    .variables
+                    .into_iter()
+                    .map(|(name, value)| (name, protocol::CredentialInput(value)))
+                    .collect(),
+            },
+        )
+        .await
+    }
+
     async fn configure_session_tools(
         &self,
         request: tonic::Request<api::ConfigureSessionToolsRequest>,

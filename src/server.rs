@@ -852,6 +852,15 @@ impl ServerCore {
                 interaction_id,
                 resolution,
             } => self.resolve_interaction_command(&interaction_id, &resolution),
+            Command::SetSessionEnvironment {
+                session_id,
+                variables,
+            } => {
+                self.ensure_session(&session_id)?;
+                crate::session_environment::replace(session_id.as_str(), variables)
+                    .map_err(DomainCommandError::Invalid)?;
+                Ok(Self::accepted(Some(session_id.to_string()), Vec::new()))
+            }
             Command::ConfigureSessionTools {
                 session_id,
                 tools,
@@ -2486,6 +2495,7 @@ impl ServerCore {
             session_id, &self.default_session,
             "the default session runtime always exists"
         );
+        crate::session_environment::remove(session_id.as_str());
         self.sessions_by_id.remove(session_id);
         self.published_sessions.remove(session_id);
     }
@@ -4112,6 +4122,7 @@ impl ServerCore {
             | Command::PublishSharedContext { session_id, .. }
             | Command::RunShell { session_id, .. }
             | Command::ReloadWorkspace { session_id, .. }
+            | Command::SetSessionEnvironment { session_id, .. }
             | Command::ConfigureSessionTools { session_id, .. }
             | Command::SetSessionCodeMode { session_id, .. }
             | Command::SubmitExternalToolResult { session_id, .. }

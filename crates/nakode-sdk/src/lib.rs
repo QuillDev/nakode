@@ -1249,6 +1249,26 @@ impl NakodeClient {
         )
     }
 
+    /// Replaces the session's write-only, memory-only process environment.
+    ///
+    /// # Errors
+    /// Returns a transport or validation error.
+    pub async fn set_session_environment(
+        &self,
+        session_id: impl Into<String>,
+        variables: std::collections::HashMap<String, String>,
+    ) -> Result<api::MutationResult, SdkError> {
+        send_mutation!(
+            self,
+            set_session_environment,
+            api::SetSessionEnvironmentRequest {
+                mutation: Some(mutation(None)),
+                session_id: session_id.into(),
+                variables,
+            }
+        )
+    }
+
     /// Installs a client-owned tool surface before the session's first prompt.
     ///
     /// # Errors

@@ -2937,6 +2937,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::SessionWorkingDirectories,
             ServiceCapability::InitialSessionModel,
             ServiceCapability::InitialSessionInstructions,
+            ServiceCapability::SessionEnvironment,
             ServiceCapability::SessionDeletion,
             ServiceCapability::QuestionTextAnswers,
             ServiceCapability::QueuedPromptSteering,
@@ -4397,8 +4398,12 @@ impl EffectExecutor {
                     .await;
             }
             Effect::RunShell { id, command } => {
-                self.shell_processes
-                    .spawn(PathBuf::from(&state.working_directory), id, command);
+                self.shell_processes.spawn_with_environment(
+                    PathBuf::from(&state.working_directory),
+                    id,
+                    command,
+                    crate::session_environment::read(Some(session_id.as_str())),
+                );
             }
             Effect::CancelShell(id) => {
                 if !self.shell_processes.cancel(&id) {
