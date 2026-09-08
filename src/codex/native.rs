@@ -41,7 +41,7 @@ use crate::{
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
-const CODEX_CLIENT_VERSION: &str = "0.144.6";
+const CODEX_CLIENT_VERSION: &str = "0.153.2";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -2880,6 +2880,55 @@ mod tests {
         assert_eq!(models[0].info.id, "gpt-native");
         assert!(models[0].info.is_default);
         assert_eq!(models[0].context_window, Some(258_400));
+    }
+
+    #[tokio::test]
+    async fn newly_discovered_model_is_executable_over_the_native_transport() {
+        let response = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"response-astra\"}}\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n",
+            "data: [DONE]\n"
+        );
+        let (base_url, server) = serve_sequence(vec![
+            (
+                200,
+                "application/json",
+                r#"{"models":[{"slug":"gpt-6-astra","is_default":true}]}"#,
+            ),
+            (200, "text/event-stream", response),
+        ])
+        .await;
+        let config = BackendConfig::native(PathBuf::from(".")).with_base_url(base_url.clone());
+        let credential = test_credential();
+
+        let models = discover_models(&config, &credential)
+            .await
+            .expect("native model discovery");
+        let discovered = models
+            .iter()
+            .find(|model| model.info.id == "gpt-6-astra")
+            .expect("Astra should be discovered");
+        let provider = CodexProvider {
+            client: Client::new(),
+            base_url,
+            credential,
+        };
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let mut request = test_request();
+        request.model.clone_from(&discovered.info.id);
+
+        let output = provider
+            .infer_response(request, event_tx, CancellationToken::new())
+            .await
+            .expect("a discovered Astra model should use the native response transport");
+        let requests = server.await.expect("mock server task");
+
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /codex/models?client_version=0.153.2 HTTP/1.1"));
+        assert!(requests[1].starts_with("POST /codex/responses HTTP/1.1"));
+        assert!(requests[1].contains(r#""model":"gpt-6-astra""#));
+        assert_eq!(output.text, "ready");
+        assert_eq!(output.response_id.as_deref(), Some("response-astra"));
     }
 
     #[tokio::test]
