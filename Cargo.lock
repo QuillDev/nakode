@@ -1860,6 +1860,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nakode-runtime"
+version = "0.3.0"
+dependencies = [
+ "nakode",
+]
+
+[[package]]
 name = "nakode-sdk"
 version = "0.1.0"
 dependencies = [

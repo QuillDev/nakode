@@ -214,6 +214,7 @@ mod tests {
             "SetProviderCredential",
             "ClearProviderCredential",
             "ReloadProvider",
+            "SyncAgentCatalogue",
             "SaveAgent",
             "DeleteAgent",
             "UpdateSettings",

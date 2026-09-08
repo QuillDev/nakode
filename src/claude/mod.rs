@@ -449,20 +449,8 @@ async fn run_supervisor(
                     if let Some(bridge) = bridge.as_mut() { let _ = send(bridge, json!({"method":"shutdown"})).await; }
                     break;
                 }
-                if matches!(
-                    command,
-                    BackendCommand::BeginAuthentication {
-                        client_context: crate::backend::ClientContext::Remote
-                    }
-                ) {
-                    request_failed(
-                        &events,
-                        BackendOperation::Authenticate,
-                        "Claude remote authentication is unsupported; use a client on the Nakode server machine",
-                    )
-                    .await;
-                    continue;
-                }
+                // A remote client starts the same browser flow: the challenge carries the localhost
+                // redirect URI, and the client submits the callback URL its browser landed on.
                 if matches!(command, BackendCommand::BeginAuthentication { .. }) {
                     if let Some(task) = authentication_task.take() {
                         task.abort();

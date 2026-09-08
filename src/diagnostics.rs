@@ -1,6 +1,7 @@
+#[cfg(feature = "tui")]
+use std::fmt::Write as _;
 use std::{
     collections::BTreeMap,
-    fmt::Write as _,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -12,12 +13,9 @@ use nakode_protocol::{
 use rusqlite::Connection;
 use thiserror::Error;
 
-use crate::{
-    api_projection,
-    config::Config,
-    native_client,
-    runtime::{InferenceKind, RuntimeSession},
-};
+use crate::runtime::{InferenceKind, RuntimeSession};
+#[cfg(feature = "tui")]
+use crate::{api_projection, config::Config, native_client};
 
 type UsageTotals = DiagnosticsUsageTotals;
 type DailyUsage = DiagnosticsDailyUsage;
@@ -58,6 +56,7 @@ pub enum DiagnosticsError {
 /// # Errors
 /// Returns an error when the native server, protocol query, or report
 /// serialization fails.
+#[cfg(feature = "tui")]
 pub async fn run(
     config: &Config,
     options: &DiagnosticsOptions,
@@ -270,6 +269,7 @@ fn tool_totals(metric: &crate::runtime::ToolMetric) -> UsageTotals {
     }
 }
 
+#[cfg(feature = "tui")]
 fn render_text(report: &DiagnosticsReport) -> String {
     let mut output = String::new();
     writeln!(
@@ -345,6 +345,7 @@ fn render_text(report: &DiagnosticsReport) -> String {
     output
 }
 
+#[cfg(feature = "tui")]
 fn append_totals(output: &mut String, totals: &UsageTotals) {
     let cache_rate = totals
         .cache_rate_percent()
@@ -401,6 +402,7 @@ pub(crate) fn format_utc_day(day: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+#[cfg(feature = "tui")]
 fn compact_number(value: u64) -> String {
     if value >= 1_000_000_000 {
         format!("{}B", format_decimal(value, 1_000_000_000, 2))
@@ -413,6 +415,7 @@ fn compact_number(value: u64) -> String {
     }
 }
 
+#[cfg(feature = "tui")]
 fn format_bytes(value: u64) -> String {
     if value >= 1_073_741_824 {
         format!("{} GiB", format_decimal(value, 1_073_741_824, 2))
@@ -425,6 +428,7 @@ fn format_bytes(value: u64) -> String {
     }
 }
 
+#[cfg(feature = "tui")]
 fn format_duration(value_ms: u64) -> String {
     let seconds = value_ms / 1_000;
     if seconds >= 3_600 {
@@ -436,6 +440,7 @@ fn format_duration(value_ms: u64) -> String {
     }
 }
 
+#[cfg(feature = "tui")]
 fn format_decimal(value: u64, divisor: u64, precision: u32) -> String {
     let scale = 10_u128.pow(precision);
     let scaled = (u128::from(value) * scale + u128::from(divisor) / 2) / u128::from(divisor);
@@ -445,10 +450,12 @@ fn format_decimal(value: u64, divisor: u64, precision: u32) -> String {
     format!("{whole}.{fraction:0width$}")
 }
 
+#[cfg(feature = "tui")]
 fn short_id(value: &str) -> &str {
     value.get(..12).unwrap_or(value)
 }
 
+#[cfg(feature = "tui")]
 fn truncate(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let prefix = chars.by_ref().take(max_chars).collect::<String>();

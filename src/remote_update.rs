@@ -152,7 +152,7 @@ impl DurableStatus {
             revision: 1,
             phase: Phase::Requested,
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
-            current_build_revision: crate::BUILD_REVISION.map(str::to_owned),
+            current_build_revision: crate::embedded::build_revision().map(str::to_owned),
             target_version: None,
             target_build_revision: None,
             update_available: true,
@@ -188,6 +188,11 @@ struct Capability {
 
 impl Capability {
     fn detect(paths: &RemoteUpdatePaths) -> Self {
+        if crate::embedded::is_embedded() {
+            return Self::unsupported(
+                "This runtime is bundled with FStack. Update the machine from the FStack dashboard.",
+            );
+        }
         if !cfg!(target_os = "linux") {
             return Self::unsupported("Self-update is supported only for headless Linux installs.");
         }
@@ -262,7 +267,7 @@ impl RemoteUpdateService {
         };
         let verified_revision = match (
             status.target_build_revision.as_deref(),
-            crate::BUILD_REVISION,
+            crate::embedded::build_revision(),
         ) {
             (Some(target), Some(current)) if target == current => Some(current),
             _ => None,
@@ -410,7 +415,7 @@ impl RemoteUpdateService {
             || request
                 .expected_build_revision
                 .as_deref()
-                .is_some_and(|expected| Some(expected) != crate::BUILD_REVISION)
+                .is_some_and(|expected| Some(expected) != crate::embedded::build_revision())
         {
             return Ok(response(
                 api::StartRemoteUpdateOutcome::StaleTarget,
@@ -554,7 +559,7 @@ fn status_to_api(
             unsupported_reason: capability.reason.clone(),
             phase: status.phase.api().into(),
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
-            current_build_revision: crate::BUILD_REVISION.map(str::to_owned),
+            current_build_revision: crate::embedded::build_revision().map(str::to_owned),
             target_version: status.target_version.clone(),
             target_build_revision: status.target_build_revision.clone(),
             update_available: status.update_available,
@@ -579,7 +584,7 @@ fn status_to_api(
             unsupported_reason: capability.reason.clone(),
             phase: api::RemoteUpdatePhase::Idle.into(),
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
-            current_build_revision: crate::BUILD_REVISION.map(str::to_owned),
+            current_build_revision: crate::embedded::build_revision().map(str::to_owned),
             target_version: None,
             target_build_revision: None,
             update_available: false,
@@ -967,7 +972,7 @@ mod tests {
         api::StartRemoteUpdateRequest {
             idempotency_key: key.to_owned(),
             expected_server_id: server_id.to_owned(),
-            expected_build_revision: crate::BUILD_REVISION.map(str::to_owned),
+            expected_build_revision: crate::embedded::build_revision().map(str::to_owned),
         }
     }
 
@@ -1102,7 +1107,7 @@ mod tests {
 
     #[test]
     fn restarted_service_succeeds_only_after_matching_build_verification() {
-        let Some(revision) = crate::BUILD_REVISION else {
+        let Some(revision) = crate::embedded::build_revision() else {
             return;
         };
         let root = tempfile::tempdir().expect("tempdir");

@@ -8608,7 +8608,12 @@ impl DomainState {
         if item.kind == ItemKind::User || !self.turn_is_current(turn_id) {
             return;
         }
+        // Native delegation rows stay in the transcript: clients replace them with the attributed
+        // run card by call id, so hiding them would orphan every child from the parent timeline.
+        // Only the legacy in-band shell invocation (and its raw result) is hidden.
+        let native_delegation = is_native_delegation_item(&item);
         let hides_subagent_result = item.kind == ItemKind::Tool
+            && !native_delegation
             && (self.subagent_result_items.contains(&item.id)
                 || is_subagent_invocation(&item.title)
                 || is_subagent_invocation(&item.body)
@@ -8632,8 +8637,15 @@ impl DomainState {
         } else {
             EntryStatus::Running
         };
+        if !completed {
+            self.finish_superseded_messages(turn_id, &item.id);
+        }
         let body = if self.reasoning_summaries.contains(turn_id, &item.id) {
             latest_reasoning_summary(&item.body).to_owned()
+        } else if native_delegation && item.body.starts_with("[Subagent Result]") {
+            // The attributed run carries the child's outcome; the raw result envelope is model
+            // input, not a second transcript copy.
+            String::new()
         } else {
             item.body
         };
@@ -8646,6 +8658,44 @@ impl DomainState {
         self.set_entry_turn_origin(&item_id, turn_id);
     }
 
+    /// A provider streams one message at a time, so when a new item starts in a turn every
+    /// assistant or reasoning entry of that turn still marked running has in fact finished. Some
+    /// providers only report those completions at turn end; a long multi-step turn would otherwise
+    /// show every earlier message still streaming. Tool rows keep their own lifecycle.
+    fn finish_superseded_messages(&mut self, turn_id: &str, starting_item_id: &str) {
+        let superseded: Vec<String> = self
+            .transcript
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.status == EntryStatus::Running
+                    && matches!(entry.kind, EntryKind::Assistant | EntryKind::Reasoning)
+                    && entry.key.as_deref().is_some_and(|key| {
+                        key != starting_item_id
+                            && self
+                                .item_turns
+                                .get(key)
+                                .is_some_and(|owner| owner == turn_id)
+                    })
+            })
+            .filter_map(|entry| entry.key.clone())
+            .collect();
+        for key in superseded {
+            self.transcript
+                .finish_running_entry(&key, EntryStatus::Complete);
+        }
+    }
+
+    fn is_native_delegation_entry(&self, item_id: &str) -> bool {
+        self.transcript.entries().iter().any(|entry| {
+            entry.key.as_deref() == Some(item_id)
+                && entry.kind == EntryKind::Tool
+                && entry
+                    .title
+                    .starts_with(&format!("{NAKODE_AGENT_TOOL_NAME} ·"))
+        })
+    }
+
     fn observe_delta(&mut self, turn_id: &str, item_id: &str, kind: DeltaKind, delta: &str) {
         if !self.turn_is_current(turn_id) {
             self.diagnostic_count += 1;
@@ -8654,7 +8704,9 @@ impl DomainState {
         self.item_turns
             .insert(item_id.to_owned(), turn_id.to_owned());
         if self.subagent_result_items.contains(item_id)
-            || (kind == DeltaKind::Tool && delta.contains("[Subagent Result]"))
+            || (kind == DeltaKind::Tool
+                && delta.contains("[Subagent Result]")
+                && !self.is_native_delegation_entry(item_id))
         {
             self.subagent_result_items.insert(item_id.to_owned());
             self.transcript.remove(item_id);
@@ -8988,6 +9040,9 @@ impl DomainState {
                 "agent {agent_slug:?} is disabled; enable it before delegation"
             )));
         }
+        if definition.id.starts_with("cloud:") {
+            self.validate_cloud_agent_execution(definition)?;
+        }
         self.validate_subagent_concurrency(agent_slug, definition.max_concurrency)?;
         let task = task.trim();
         if task.is_empty() {
@@ -9010,6 +9065,60 @@ impl DomainState {
             return Err(DomainCommandError::Invalid(format!(
                 "security validator {validator_slug:?} must configure only Sonnet-tier models"
             )));
+        }
+        Ok(())
+    }
+
+    fn validate_cloud_agent_execution(
+        &self,
+        definition: &AgentDefinition,
+    ) -> Result<(), DomainCommandError> {
+        let model = definition.model.as_deref().ok_or_else(|| {
+            DomainCommandError::Invalid(
+                "cloud archetypes require an explicit provider/model".to_owned(),
+            )
+        })?;
+        let (provider, model_slug) = model.split_once('/').ok_or_else(|| {
+            DomainCommandError::Invalid(format!(
+                "invalid archetype model {model:?}; use provider/model"
+            ))
+        })?;
+        let reject = |reason: &str| {
+            DomainCommandError::Invalid(format!(
+                "archetype {:?} cannot execute {model} on this machine: {reason}. Configure this machine in Provider Auth or edit the profile definition; no fallback was used",
+                definition.slug
+            ))
+        };
+        match self.provider_connection(provider) {
+            None => return Err(reject("provider is unsupported, disabled, or unavailable")),
+            Some(ConnectionState::Failed(reason) | ConnectionState::Disconnected(reason)) => {
+                return Err(reject(reason));
+            }
+            Some(ConnectionState::Starting) => {
+                return Err(reject(
+                    "provider discovery is still starting; wait and retry",
+                ));
+            }
+            Some(ConnectionState::Ready { .. }) => {}
+        }
+        if !self
+            .models
+            .iter()
+            .any(|candidate| candidate.qualified_id() == model)
+        {
+            return Err(reject(
+                "model is not in this machine's current discovery; refresh the provider, check authentication and model filters",
+            ));
+        }
+        if let Some(effort) = definition.reasoning_effort.as_deref()
+            && !self.model_offers_reasoning_effort(provider, model_slug, effort)
+        {
+            return Err(reject(&format!(
+                "reasoning effort {effort:?} is unsupported"
+            )));
+        }
+        if definition.fast_mode && !self.model_offers_fast_mode(provider, model_slug) {
+            return Err(reject("fast mode is unsupported"));
         }
         Ok(())
     }
@@ -9380,8 +9489,8 @@ impl DomainState {
     }
 
     /// Starts one explicitly authorized, bounded successor for a terminal delegated run.
-    /// The successor inherits the source policy snapshot and retained evidence, but is a distinct
-    /// lifecycle event with immutable lineage rather than an implicit provider retry.
+    /// Local successors inherit the source policy snapshot. Cloud successors resolve the current
+    /// profile definition; retained evidence and immutable lineage still identify the source run.
     /// # Errors
     ///
     /// Returns an error when the source is ineligible, already continued, beyond depth limits,
@@ -9442,6 +9551,17 @@ impl DomainState {
                     "the delegated run's immutable policy snapshot is invalid: {error}"
                 ))
             })?;
+        if definition.id.starts_with("cloud:") {
+            self.validate_agent_request(
+                &definition.slug,
+                &salvage.continuation.follow_up_objective,
+            )?;
+            definition = self
+                .agents
+                .find(&definition.slug)
+                .cloned()
+                .ok_or_else(|| DomainCommandError::NotFound(definition.slug.clone()))?;
+        }
         definition.max_turns = Some(additional_turns);
         self.validate_subagent_concurrency(&definition.slug, definition.max_concurrency)?;
 
@@ -9758,6 +9878,12 @@ impl DomainState {
         }
         self.initial_client_instructions = instructions.map(ToOwned::to_owned);
         Ok(())
+    }
+
+    pub(crate) fn subagent_requires_local_auth(&self, run_id: &str) -> bool {
+        self.subagent_executions
+            .get(run_id)
+            .is_some_and(|execution| execution.definition.id.starts_with("cloud:"))
     }
 
     pub fn subagent_launch_failed(&mut self, run_id: &str, message: String) -> Vec<Effect> {
@@ -10183,6 +10309,34 @@ impl DomainState {
         }]
     }
 
+    fn validate_cloud_subagent_model(
+        &self,
+        run_id: &str,
+        reported_model: &str,
+    ) -> Result<(), String> {
+        let Some(execution) = self.subagent_executions.get(run_id) else {
+            return Ok(());
+        };
+        if !execution.definition.id.starts_with("cloud:") {
+            return Ok(());
+        }
+        self.validate_cloud_agent_execution(&execution.definition)
+            .map_err(|error| error.to_string())?;
+        let target = &execution.model_targets[execution.model_target_index];
+        if !reported_model.is_empty()
+            && target.model.as_deref().is_some_and(|requested| {
+                reported_model != requested
+                    && reported_model != format!("{}/{requested}", target.provider)
+            })
+        {
+            return Err(format!(
+                "provider {} selected model {reported_model:?} instead of {:?}; cloud archetypes prohibit substitution on this machine",
+                target.provider, target.model
+            ));
+        }
+        Ok(())
+    }
+
     fn start_subagent_turn(
         &mut self,
         run_id: &str,
@@ -10201,6 +10355,12 @@ impl DomainState {
             return Vec::new();
         };
         let model = target.model.clone();
+        if let Err(reason) = self.validate_cloud_subagent_model(run_id, reported_model) {
+            return self.fail_subagent(run_id, reason);
+        }
+        let reported_model = reported_model
+            .strip_prefix(&format!("{}/", target.provider))
+            .unwrap_or(reported_model);
         let options_model = (!reported_model.is_empty())
             .then_some(reported_model)
             .or(model.as_deref());
@@ -11104,12 +11264,13 @@ fn agent_model_targets(
             model: None,
         });
     }
-    let fallback_models: &[String] =
-        if definition.fallback_policy == AgentFallbackPolicy::ConfiguredOnly {
-            &definition.fallback_models
-        } else {
-            &[]
-        };
+    let fallback_models: &[String] = if !definition.id.starts_with("cloud:")
+        && definition.fallback_policy == AgentFallbackPolicy::ConfiguredOnly
+    {
+        &definition.fallback_models
+    } else {
+        &[]
+    };
     for model in fallback_models {
         push_agent_model_target(&mut targets, model);
     }
@@ -11136,12 +11297,39 @@ fn agent_model_target_label(target: &AgentModelTarget) -> String {
     )
 }
 
+/// Whether text carries the legacy in-band shell delegation, a `nakode agent …` CLI invocation.
+///
+/// Only that adjacency counts. Matching "nakode" and " agent " anywhere in a tool row also swallowed
+/// dashboard tools whose results merely mention both, such as "Started general agent … on nakode",
+/// leaving the owner transcript with no trace that the tool ran.
 fn is_subagent_invocation(text: &str) -> bool {
-    text.contains("nakode") && text.contains(" agent ")
+    text.match_indices("nakode").any(|(index, needle)| {
+        let rest = &text[index + needle.len()..];
+        let trimmed = rest.trim_start();
+        trimmed.len() != rest.len()
+            && trimmed.starts_with("agent")
+            && trimmed[5..]
+                .chars()
+                .next()
+                .is_none_or(|next| !next.is_alphanumeric())
+    })
+}
+
+/// A `nakode_agent` invocation issued through the provider's native tool surface. Its transcript row
+/// is the anchor clients use to place the attributed child run.
+fn is_native_delegation_item(item: &NormalizedItem) -> bool {
+    item.kind == ItemKind::Tool
+        && (item
+            .title
+            .starts_with(&format!("{NAKODE_AGENT_TOOL_NAME} ·"))
+            || item.tool_audit_json.as_deref().is_some_and(|audit| {
+                audit.contains(&format!("\"name\":\"{NAKODE_AGENT_TOOL_NAME}\""))
+            }))
 }
 
 fn hides_subagent_item(item: &NormalizedItem) -> bool {
     item.kind == ItemKind::Tool
+        && !is_native_delegation_item(item)
         && (is_subagent_invocation(&item.title)
             || is_subagent_invocation(&item.body)
             || item.body.contains("[Subagent Result]"))
@@ -14773,6 +14961,118 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    fn subagent_invocation_filter_matches_only_the_cli_command() {
+        assert!(super::is_subagent_invocation(
+            "nakode agent run --archetype small"
+        ));
+        assert!(super::is_subagent_invocation(
+            "$ nakode  agent delegate 'task'"
+        ));
+        assert!(!super::is_subagent_invocation(
+            "Started general agent \"specs\" in the owner’s home directory on nakode / gpt"
+        ));
+        assert!(!super::is_subagent_invocation("nakode agentless"));
+        assert!(!super::is_subagent_invocation(
+            "the nakode service and an agent"
+        ));
+    }
+
+    #[test]
+    fn a_new_item_finishes_the_turns_still_streaming_messages() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "turn-1".to_owned(),
+            model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
+            cancelling: false,
+        });
+        let started = |id: &str, kind: ItemKind| BackendEvent::ItemStarted {
+            turn_id: "turn-1".to_owned(),
+            item: NormalizedItem {
+                id: id.to_owned(),
+                kind,
+                title: String::new(),
+                body: "text".to_owned(),
+                status: ItemStatus::Running,
+                tool_audit_json: None,
+            },
+        };
+        state.handle_backend(started("reason-1", ItemKind::Reasoning));
+        state.handle_backend(started("message-1", ItemKind::Assistant));
+        state.handle_backend(started("tool-1", ItemKind::Tool));
+        state.handle_backend(started("message-2", ItemKind::Assistant));
+
+        let status = |state: &AppState, key: &str| {
+            state
+                .transcript
+                .entries()
+                .iter()
+                .find(|entry| entry.key.as_deref() == Some(key))
+                .map(|entry| entry.status)
+                .expect("entry present")
+        };
+        assert_eq!(status(&state, "reason-1"), EntryStatus::Complete);
+        assert_eq!(status(&state, "message-1"), EntryStatus::Complete);
+        // Only the latest message streams; tools keep their own lifecycle.
+        assert_eq!(status(&state, "message-2"), EntryStatus::Running);
+        assert_eq!(status(&state, "tool-1"), EntryStatus::Running);
+    }
+
+    #[test]
+    fn parent_transcript_keeps_native_delegation_invocation_rows() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("parent-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "parent-turn".to_owned(),
+            model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
+            cancelling: false,
+        });
+        let audit = Some(r#"{"version":1,"callId":"call-7","name":"nakode_agent"}"#.into());
+        state.handle_backend(BackendEvent::ItemStarted {
+            turn_id: "parent-turn".to_owned(),
+            item: NormalizedItem {
+                id: "call-7".to_owned(),
+                kind: ItemKind::Tool,
+                title: "nakode_agent · Delegate reviewer".to_owned(),
+                body: String::new(),
+                status: ItemStatus::Running,
+                tool_audit_json: audit.clone(),
+            },
+        });
+        state.handle_backend(BackendEvent::ItemCompleted {
+            turn_id: "parent-turn".to_owned(),
+            item: NormalizedItem {
+                id: "call-7".to_owned(),
+                kind: ItemKind::Tool,
+                title: "nakode_agent · Delegate reviewer".to_owned(),
+                body: "[Subagent Result] [run-1] [reviewer]\nsecret report".to_owned(),
+                status: ItemStatus::Complete,
+                tool_audit_json: audit,
+            },
+        });
+
+        let entry = state
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.key.as_deref() == Some("call-7"))
+            .expect("native delegation invocation row survives completion");
+        assert_eq!(entry.status, EntryStatus::Complete);
+        assert_eq!(
+            entry.body, "",
+            "the raw result envelope is model input, not transcript"
+        );
+        assert!(
+            entry
+                .tool_audit_json
+                .as_deref()
+                .is_some_and(|audit| audit.contains("call-7"))
+        );
+    }
+
+    #[test]
     fn settings_child_menus_restore_the_exact_parent_node() {
         let mut state = ready_state();
 
@@ -17012,6 +17312,79 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert_eq!(
             state.selected_model.as_deref(),
             Some("openai-codex/model-a")
+        );
+    }
+
+    #[test]
+    fn cloud_invocations_pin_accepted_definition_and_never_fallback() {
+        let mut state = AppState::new("/tmp/project", None, 100);
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Models(vec![ModelInfo {
+                provider: CODEX_PROVIDER.to_owned(),
+                id: "shared".to_owned(),
+                is_default: true,
+                capabilities: crate::codex::model_capabilities(),
+            }]),
+        );
+        let original = AgentDefinition {
+            id: "cloud:profile:worker".to_owned(),
+            slug: "worker".to_owned(),
+            description: "Worker".to_owned(),
+            model: Some(format!("{CODEX_PROVIDER}/shared")),
+            system_prompt: "Original instructions".to_owned(),
+            fallback_models: vec!["other/fallback".to_owned()],
+            ..AgentDefinition::default()
+        };
+        state.install_agents(AgentCatalog::from_definitions(vec![original.clone()]));
+        let (run_id, _) = state.delegate_agent("worker", "Inspect files").unwrap();
+        assert_eq!(state.subagent_executions[&run_id].model_targets.len(), 1);
+        let mut changed = original.clone();
+        changed.system_prompt = "Updated instructions".to_owned();
+        state.install_agents(AgentCatalog::from_definitions(vec![changed]));
+        assert_eq!(state.subagent_executions[&run_id].definition, original);
+        assert!(
+            state
+                .validate_cloud_subagent_model(&run_id, "substituted")
+                .unwrap_err()
+                .contains("prohibit substitution")
+        );
+        let effects = state.subagent_launch_failed(
+            &run_id,
+            "local authentication expired; sign in again".to_owned(),
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SpawnSubagent { .. }))
+        );
+        let (next_run, _) = state.delegate_agent("worker", "Inspect again").unwrap();
+        assert_eq!(
+            state.subagent_executions[&next_run]
+                .definition
+                .system_prompt,
+            "Updated instructions"
+        );
+        state.provider_start_failed(
+            CODEX_PROVIDER,
+            "Codex",
+            "local authentication is invalid; sign in again",
+        );
+        assert!(
+            state
+                .validate_agent_request("worker", "Inspect")
+                .unwrap_err()
+                .to_string()
+                .contains("authentication is invalid")
         );
     }
 

@@ -923,6 +923,18 @@ pub(crate) fn executable_identity(path: &Path) -> Result<ExecutableIdentity, Con
             path: canonical.display().to_string(),
             source,
         })?;
+    // The content digest is expensive — a debug build is hundreds of megabytes — and callers ask
+    // for it on every status read, recheck and watch tick. The bytes cannot change without the
+    // file's size, modification time or inode changing, so one digest per observed file version is
+    // remembered process-wide and reused until any of those move.
+    let fingerprint = executable_fingerprint(&canonical, &metadata);
+    if let Some(cached) = EXECUTABLE_IDENTITY_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&fingerprint).cloned())
+    {
+        return Ok(cached);
+    }
     let mut digest = Sha256::new();
     // Debug and instrumented builds can be hundreds of megabytes. Large buffered reads keep
     // endpoint discovery bounded on slower CI and installation filesystems without changing the
@@ -955,15 +967,54 @@ pub(crate) fn executable_identity(path: &Path) -> Result<ExecutableIdentity, Con
     };
     #[cfg(not(unix))]
     let (device, inode) = (None, None);
-    Ok(ExecutableIdentity {
+    let identity = ExecutableIdentity {
         path: canonical,
         sha256: format!("{:x}", digest.finalize()),
         size: metadata.len(),
         modified_at_unix_ms,
         device,
         inode,
-        build_revision: crate::BUILD_REVISION.map(str::to_owned),
-    })
+        build_revision: crate::embedded::build_revision().map(str::to_owned),
+    };
+    if let Ok(mut cache) = EXECUTABLE_IDENTITY_CACHE.lock() {
+        if cache.len() >= EXECUTABLE_IDENTITY_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(fingerprint, identity.clone());
+    }
+    Ok(identity)
+}
+
+/// Bounded process-wide memo of content identities keyed by the file version that produced them.
+static EXECUTABLE_IDENTITY_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<ExecutableFingerprint, ExecutableIdentity>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const EXECUTABLE_IDENTITY_CACHE_CAPACITY: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExecutableFingerprint {
+    path: std::path::PathBuf,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    device: Option<u64>,
+    inode: Option<u64>,
+}
+
+fn executable_fingerprint(canonical: &Path, metadata: &std::fs::Metadata) -> ExecutableFingerprint {
+    #[cfg(unix)]
+    let (device, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        (Some(metadata.dev()), Some(metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let (device, inode) = (None, None);
+    ExecutableFingerprint {
+        path: canonical.to_path_buf(),
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        device,
+        inode,
+    }
 }
 
 /// Returns the process record published by this workspace's service.
@@ -1188,7 +1239,7 @@ async fn ensure_service_at_with_timeout(
 }
 
 fn service_command(executable: &Path, config: &Config) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(executable);
+    let mut command = crate::executable::command(executable);
     command.args(service_arguments(config)).stdin(Stdio::null());
     if let Ok(identity) = executable_identity(executable)
         && let Ok(encoded) = serde_json::to_string(&identity)
@@ -2095,6 +2146,30 @@ async fn service_running_at(service_path: &Path) -> Result<bool, ControlError> {
 /// replacement cannot be started.
 pub async fn restart_service(executable: &Path, config: &Config) -> Result<(), ControlError> {
     restart_service_with_request(executable, config, LifecycleRequest::Shutdown).await
+}
+
+/// Waits for the actor-owned quiescent fence; never falls back to forced shutdown.
+///
+/// # Errors
+/// Returns transport, protocol, configuration and startup errors immediately.
+pub async fn restart_service_when_idle(
+    executable: &Path,
+    config: &Config,
+) -> Result<(), ControlError> {
+    loop {
+        match restart_service_quiescent(executable, config).await {
+            Err(ControlError::ServiceRejected(message)) if live_work_refusal(&message) => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+// Compatibility with the existing lifecycle protocol: this refusal is produced by the runtime
+// actor before it fences or stops anything. Unknown errors must never be treated as idle/busy.
+fn live_work_refusal(message: &str) -> bool {
+    message.starts_with("live work is still owned by session(s) ")
 }
 
 pub(crate) async fn restart_service_quiescent(
@@ -3643,5 +3718,21 @@ mod tests {
             .await
             .expect("stale socket is reclaimed");
         drop(replacement);
+    }
+}
+
+#[cfg(test)]
+mod idle_restart_tests {
+    #[test]
+    fn only_explicit_live_work_refusals_are_retryable() {
+        assert!(super::live_work_refusal(
+            "live work is still owned by session(s) session@1"
+        ));
+        assert!(!super::live_work_refusal(
+            "atomic quiescent shutdown is unavailable"
+        ));
+        assert!(!super::live_work_refusal(
+            "timed out while atomically fencing the installation service"
+        ));
     }
 }

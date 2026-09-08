@@ -46,6 +46,19 @@ pub enum SdkError {
     InvalidProjection(String),
 }
 
+impl SdkError {
+    /// Whether the server reported that the addressed resource is not loaded or does not exist.
+    /// Persisted sessions answer this way after a service restart until a client reopens them.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Status(status) if status.code() == tonic::Code::NotFound)
+    }
+}
+
+/// The transport status type carried by [`SdkError::Status`], re-exported so callers can match or
+/// construct one without pinning tonic themselves.
+pub use tonic;
+
 pub type Watch<T> = Pin<Box<dyn Stream<Item = Result<T, SdkError>> + Send + 'static>>;
 
 /// Receiver-backed watch whose reconnecting producer is cancelled with the consumer. Without this
@@ -508,6 +521,20 @@ macro_rules! send_mutation {
     }};
 }
 
+fn structured_interaction_request(
+    interaction_id: String,
+    answers: Vec<api::InteractionAnswer>,
+    expected_revision: Option<u64>,
+) -> api::ResolveInteractionRequest {
+    api::ResolveInteractionRequest {
+        mutation: Some(mutation(expected_revision)),
+        interaction_id,
+        resolution: api::InteractionResolutionKind::Answer as i32,
+        option_ids: Vec::new(),
+        answers,
+    }
+}
+
 impl NakodeClient {
     /// Connects to the native server's generated API over its private Unix
     /// socket. The channel reconnects by reopening this path.
@@ -824,6 +851,43 @@ impl NakodeClient {
                 mcp_grant: None,
                 bridge: None,
                 working_directory: None,
+                profile_id: None,
+                account_id: None,
+            }
+        )?;
+        result
+            .resource_id
+            .ok_or(SdkError::MissingState("created session identifier"))
+    }
+
+    /// Creates a logical session with everything a dashboard Host decides at open time: an optional
+    /// model, an optional working directory, and optional provider system instructions, committed
+    /// atomically so the first turn already runs under them.
+    ///
+    /// # Errors
+    /// Returns a transport, server validation, or missing-identifier error.
+    pub async fn create_session_configured(
+        &self,
+        workspace_id: impl Into<String>,
+        title: Option<String>,
+        model_id: Option<String>,
+        working_directory: Option<String>,
+        initial_instructions: Option<String>,
+    ) -> Result<String, SdkError> {
+        let result = send_mutation!(
+            self,
+            create_session,
+            api::CreateSessionRequest {
+                mutation: Some(mutation(None)),
+                workspace_id: workspace_id.into(),
+                title,
+                model_id,
+                options: None,
+                tools: None,
+                mcp_grant: None,
+                initial_instructions,
+                bridge: None,
+                working_directory,
                 profile_id: None,
                 account_id: None,
             }
@@ -1228,6 +1292,47 @@ impl NakodeClient {
         )
     }
 
+    /// Resolves every item in one pending question interaction atomically.
+    ///
+    /// The caller must preserve the stable question and option identifiers from the authoritative
+    /// interaction snapshot. Free text belongs in `InteractionAnswer.text`; it must never be
+    /// flattened into a legacy option identifier.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn resolve_interaction_answers(
+        &self,
+        interaction_id: impl Into<String>,
+        answers: Vec<api::InteractionAnswer>,
+        expected_revision: Option<u64>,
+    ) -> Result<api::MutationResult, SdkError> {
+        send_mutation!(
+            self,
+            resolve_interaction,
+            structured_interaction_request(interaction_id.into(), answers, expected_revision)
+        )
+    }
+
+    /// Replaces the session's write-only, memory-only process environment.
+    ///
+    /// # Errors
+    /// Returns a transport or validation error.
+    pub async fn set_session_environment(
+        &self,
+        session_id: impl Into<String>,
+        variables: std::collections::HashMap<String, String>,
+    ) -> Result<api::MutationResult, SdkError> {
+        send_mutation!(
+            self,
+            set_session_environment,
+            api::SetSessionEnvironmentRequest {
+                mutation: Some(mutation(None)),
+                session_id: session_id.into(),
+                variables,
+            }
+        )
+    }
+
     /// Installs a client-owned tool surface before the session's first prompt.
     ///
     /// # Errors
@@ -1553,6 +1658,7 @@ impl NakodeClient {
         api::ClearMcpServerCredentialRequest
     );
     typed_mutation!(set_mcp_server_grants, api::SetMcpServerGrantsRequest);
+    typed_mutation!(sync_agent_catalogue, api::SyncAgentCatalogueRequest);
     typed_mutation!(save_agent, api::SaveAgentRequest);
     typed_mutation!(delete_agent, api::DeleteAgentRequest);
     typed_mutation!(delete_session, api::DeleteSessionRequest);
@@ -2063,7 +2169,11 @@ impl NakodeClient {
         managed_watch(receiver, task)
     }
 
-    async fn hydrate_session_with_refresh(
+    /// Hydrates a raw session snapshot, re-reading it once when its transcript cursor lagged.
+    ///
+    /// # Errors
+    /// Returns a transport, server status, or inconsistent-projection error.
+    pub async fn hydrate_session_with_refresh(
         &self,
         state: api::SessionState,
         limit: usize,
@@ -2309,14 +2419,25 @@ impl NakodeClient {
             else {
                 break;
             };
-            let page = self
+            let page = match self
                 .get_transcript_page(api::GetTranscriptPageRequest {
                     owner_kind: owner_kind as i32,
                     owner_id: owner_id.to_owned(),
                     before_entry_id: Some(before_entry_id),
                     limit: bounded_limit(limit.saturating_sub(transcript.entries.len())),
                 })
-                .await?;
+                .await
+            {
+                Ok(page) => page,
+                // The snapshot's leading row can leave the authoritative transcript between the
+                // snapshot and this page request (compaction, a superseded reasoning summary). The
+                // rows already held are still authoritative; only the earlier window is unknown.
+                Err(error) if error.is_not_found() => {
+                    transcript.has_earlier = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             let previous_len = transcript.entries.len();
             let has_earlier = page.has_earlier;
             prepend_entries(&mut transcript.entries, page.entries, limit);
@@ -2695,8 +2816,41 @@ mod tests {
     use super::{
         ActivationClient, ActivationCursor, NakodeClient, SdkError, SessionAttachment,
         activation_cursor_changed, api, authoritative_remove_request, bridge_continuation_mutation,
-        managed_watch, retry_transport,
+        managed_watch, retry_transport, structured_interaction_request,
     };
+
+    #[test]
+    fn structured_interaction_answers_preserve_question_identity_and_text() {
+        let request = structured_interaction_request(
+            "interaction-1".to_owned(),
+            vec![api::InteractionAnswer {
+                question_id: "question-2".to_owned(),
+                option_ids: vec!["option-3".to_owned()],
+                text: Some("owner supplied detail".to_owned()),
+            }],
+            Some(19),
+        );
+
+        assert_eq!(request.interaction_id, "interaction-1");
+        assert_eq!(
+            request.resolution,
+            api::InteractionResolutionKind::Answer as i32
+        );
+        assert!(request.option_ids.is_empty());
+        assert_eq!(request.answers[0].question_id, "question-2");
+        assert_eq!(request.answers[0].option_ids, ["option-3"]);
+        assert_eq!(
+            request.answers[0].text.as_deref(),
+            Some("owner supplied detail")
+        );
+        assert_eq!(
+            request
+                .mutation
+                .expect("structured interaction mutation")
+                .expected_revision,
+            Some(19)
+        );
+    }
 
     #[test]
     fn queued_prompt_removal_preserves_identity_and_omits_the_revision_fence() {

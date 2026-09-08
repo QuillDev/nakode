@@ -54,7 +54,18 @@ impl ShellProcesses {
         }
     }
 
+    #[cfg(test)]
     pub fn spawn(&mut self, workspace: PathBuf, id: String, command: String) {
+        self.spawn_with_environment(workspace, id, command, HashMap::new());
+    }
+
+    pub fn spawn_with_environment(
+        &mut self,
+        workspace: PathBuf,
+        id: String,
+        command: String,
+        environment: HashMap<String, String>,
+    ) {
         let events = self.event_tx.clone();
         let cancellation = self.cancellation.child_token();
         let task_id = id.clone();
@@ -66,6 +77,7 @@ impl ShellProcesses {
                 command,
                 events.clone(),
                 task_cancellation,
+                environment,
             )
             .await
             {
@@ -124,11 +136,13 @@ async fn run_shell_command(
     command_text: String,
     events: mpsc::Sender<ShellEvent>,
     cancellation: CancellationToken,
+    environment: HashMap<String, String>,
 ) -> Result<(), String> {
     let (program, arguments) = shell_command(&command_text);
     let mut command = Command::new(program);
     command
         .args(arguments)
+        .envs(environment)
         .current_dir(workspace)
         .kill_on_drop(true)
         .stdin(Stdio::null())

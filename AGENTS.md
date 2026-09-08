@@ -576,3 +576,5 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Fix every reported warning before committing. A work-in-progress tree may
 temporarily have warnings, but a commit must not.
+
+Session process environment is write-only, memory-only server state keyed by logical session identity. Native Bash, PTY tools, delegated tools and owner shell commands inherit it without provider-context or snapshot serialization; deletion clears it.

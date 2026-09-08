@@ -688,7 +688,7 @@ async fn ensure_helper_process(
         return Ok(());
     }
     reclaim_unhealthy_helper_lock(paths).await;
-    let mut command = tokio::process::Command::new(executable);
+    let mut command = crate::executable::command(executable);
     command.arg("activation-helper").kill_on_drop(false);
     capture_service_output(&mut command, paths.activation_log());
     detach_service_process(&mut command);

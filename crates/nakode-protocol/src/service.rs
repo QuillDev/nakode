@@ -29,6 +29,7 @@ pub enum ServiceCapability {
     InitialSessionModel,
     /// `CreateSession` accepts bounded client context merged into provider system instructions.
     InitialSessionInstructions,
+    SessionEnvironment,
     /// `DeleteSession` is served: a logical session and its persisted history can be removed.
     ///
     /// Declared rather than assumed so a client can degrade its own affordance instead of offering a
@@ -46,6 +47,8 @@ pub enum ServiceCapability {
     SkillPruning,
     /// Owner-facing clients may inspect and atomically mutate the authoritative archetype catalogue.
     ArchetypeManagement,
+    /// Authenticated owner integrations can atomically apply a revisioned profile replica.
+    CloudArchetypeSynchronization,
     /// Owner-facing clients may inspect and atomically mutate Nakode's one configured SOUL.md.
     SoulManagement,
     /// Nakode owns MCP configuration, credentials, discovery, grants, invocation, and audit.

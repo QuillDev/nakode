@@ -433,6 +433,8 @@ impl AgentDefinition {
 
 #[derive(Debug, Error)]
 pub enum AgentCatalogError {
+    #[error("cloud archetype catalogue: {0}")]
+    CloudCatalogue(String),
     #[error("failed to read agent directory {path}: {source}")]
     ReadDirectory {
         path: String,
@@ -523,6 +525,33 @@ impl AgentCatalog {
     /// # Errors
     /// Returns an error when a definition cannot be read or validated.
     pub fn load(directory: &Path) -> Result<Self, AgentCatalogError> {
+        if let Some(cloud) =
+            crate::cloud_agents::load(directory).map_err(AgentCatalogError::CloudCatalogue)?
+        {
+            let mut local = Self::load_builtins(directory)?;
+            for definition in cloud.definitions {
+                if local.find(&definition.slug).is_some() {
+                    return Err(AgentCatalogError::ImmutableBuiltIn {
+                        slug: definition.slug,
+                    });
+                }
+                local.definitions.push(definition);
+            }
+            Ok(local)
+        } else {
+            Self::load_local(directory)
+        }
+    }
+
+    pub(crate) fn load_local(directory: &Path) -> Result<Self, AgentCatalogError> {
+        Self::load_filtered(directory, false)
+    }
+
+    pub(crate) fn load_builtins(directory: &Path) -> Result<Self, AgentCatalogError> {
+        Self::load_filtered(directory, true)
+    }
+
+    fn load_filtered(directory: &Path, builtins_only: bool) -> Result<Self, AgentCatalogError> {
         if !directory.exists() {
             return Ok(Self::default());
         }
@@ -557,6 +586,21 @@ impl AgentCatalog {
                     path: display_path.clone(),
                     source,
                 })?;
+            if builtins_only {
+                // Cloud cutover leaves old custom files inert, including malformed legacy data.
+                // Only an explicitly declared built-in participates in the local overlay.
+                let ownership = toml::from_str::<toml::Value>(&source)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("ownership")
+                            .and_then(toml::Value::as_str)
+                            .map(str::to_owned)
+                    });
+                if ownership.as_deref() != Some("built_in") {
+                    continue;
+                }
+            }
             let mut definition = toml::from_str::<AgentDefinition>(&source).map_err(|source| {
                 AgentCatalogError::ParseDefinition {
                     path: display_path.clone(),
@@ -608,6 +652,14 @@ impl AgentCatalog {
         definition: &AgentDefinition,
         previous_slug: Option<&str>,
     ) -> Result<(), AgentCatalogError> {
+        if crate::cloud_agents::load(directory)
+            .map_err(AgentCatalogError::CloudCatalogue)?
+            .is_some()
+        {
+            return Err(AgentCatalogError::CloudCatalogue(
+                "archetypes are profile-owned; edit them in FStack".to_owned(),
+            ));
+        }
         validate(definition, &directory.display().to_string())?;
         if let Some(previous) = previous_slug.and_then(|slug| self.find(slug))
             && previous.ownership == AgentOwnership::BuiltIn
@@ -666,6 +718,14 @@ impl AgentCatalog {
     /// # Errors
     /// Returns an error when the catalog cannot be materialized or the file removed.
     pub fn delete(&self, directory: &Path, slug: &str) -> Result<(), AgentCatalogError> {
+        if crate::cloud_agents::load(directory)
+            .map_err(AgentCatalogError::CloudCatalogue)?
+            .is_some()
+        {
+            return Err(AgentCatalogError::CloudCatalogue(
+                "archetypes are profile-owned; edit them in FStack".to_owned(),
+            ));
+        }
         if let Some(definition) = self.find(slug)
             && definition.ownership == AgentOwnership::BuiltIn
         {
