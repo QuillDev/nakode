@@ -852,6 +852,15 @@ impl ServerCore {
                 interaction_id,
                 resolution,
             } => self.resolve_interaction_command(&interaction_id, &resolution),
+            Command::SetSessionEnvironment {
+                session_id,
+                variables,
+            } => {
+                self.ensure_session(&session_id)?;
+                crate::session_environment::replace(session_id.as_str(), variables)
+                    .map_err(DomainCommandError::Invalid)?;
+                Ok(Self::accepted(Some(session_id.to_string()), Vec::new()))
+            }
             Command::ConfigureSessionTools {
                 session_id,
                 tools,
@@ -1127,6 +1136,30 @@ impl ServerCore {
                 server_id,
                 grants,
             } => self.set_mcp_server_grants_command(&workspace_id, &server_id, grants),
+            Command::SyncAgentCatalogue {
+                workspace_id,
+                profile_id,
+                revision,
+                definitions,
+            } => {
+                self.ensure_workspace(&workspace_id)?;
+                let definitions = definitions
+                    .into_iter()
+                    .map(Self::agent_definition_from_input)
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::cloud_agents::apply(
+                    self.engine().state().agent_directory(),
+                    crate::cloud_agents::CloudAgentCatalogue {
+                        profile_id,
+                        revision,
+                        definitions,
+                    },
+                )
+                .map_err(DomainCommandError::Invalid)?;
+                self.reload_global_agent_catalogue()
+                    .map_err(|error| DomainCommandError::Invalid(error.message))?;
+                Ok(Self::accepted(None, Vec::new()))
+            }
             Command::SaveAgent {
                 workspace_id,
                 definition,
@@ -2507,6 +2540,7 @@ impl ServerCore {
             session_id, &self.default_session,
             "the default session runtime always exists"
         );
+        crate::session_environment::remove(session_id.as_str());
         self.sessions_by_id.remove(session_id);
         self.published_sessions.remove(session_id);
     }
@@ -2622,6 +2656,7 @@ impl ServerCore {
         additional_turns: u32,
     ) -> DomainCommandOutcome {
         let session_id = self.session_for_run(run_id)?;
+        self.reload_agent_catalogue_for_session(&session_id)?;
         let (successor_run_id, effects) = self
             .session_engine_mut(&session_id)?
             .state_mut()
@@ -2853,6 +2888,7 @@ impl ServerCore {
         provider_id: &ProviderId,
         enabled: bool,
     ) -> DomainCommandOutcome {
+        eprintln!("nakode providers: client command set {provider_id} enabled={enabled}");
         self.ensure_provider(provider_id)?;
         Ok(Self::accepted(
             Some(provider_id.to_string()),
@@ -2953,14 +2989,9 @@ impl ServerCore {
         Ok(Self::accepted(Some(provider_id.to_string()), vec![effect]))
     }
 
-    fn save_agent_command(
-        &self,
-        workspace_id: &WorkspaceId,
+    fn agent_definition_from_input(
         definition: AgentDefinitionInput,
-        previous_slug: Option<String>,
-    ) -> DomainCommandOutcome {
-        self.ensure_workspace(workspace_id)?;
-        let slug = definition.slug.clone();
+    ) -> Result<AgentDefinition, DomainCommandError> {
         let definition = AgentDefinition {
             id: String::new(),
             slug: definition.slug,
@@ -3024,6 +3055,19 @@ impl ServerCore {
             max_delegation_depth: definition.max_delegation_depth,
             require_parent_attribution: definition.require_parent_attribution,
         };
+        Ok(definition)
+    }
+
+    fn save_agent_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        definition: AgentDefinitionInput,
+        previous_slug: Option<String>,
+    ) -> DomainCommandOutcome {
+        self.ensure_workspace(workspace_id)?;
+        self.ensure_local_agent_authority()?;
+        let definition = Self::agent_definition_from_input(definition)?;
+        let slug = definition.slug.clone();
         self.engine()
             .state()
             .validate_agent_definition(&definition, previous_slug.as_deref())?;
@@ -3036,12 +3080,25 @@ impl ServerCore {
         ))
     }
 
+    fn ensure_local_agent_authority(&self) -> Result<(), DomainCommandError> {
+        if crate::cloud_agents::load(self.engine().state().agent_directory())
+            .map_err(DomainCommandError::Invalid)?
+            .is_some()
+        {
+            return Err(DomainCommandError::Invalid(
+                "archetypes are cloud-owned; edit this profile's catalogue in FStack".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn delete_agent_command(
         &self,
         workspace_id: &WorkspaceId,
         slug: String,
     ) -> DomainCommandOutcome {
         self.ensure_workspace(workspace_id)?;
+        self.ensure_local_agent_authority()?;
         self.engine().state().validate_agent_deletion(&slug)?;
         Ok(Self::accepted(
             Some(slug.clone()),
@@ -4153,6 +4210,7 @@ impl ServerCore {
             | Command::PublishSharedContext { session_id, .. }
             | Command::RunShell { session_id, .. }
             | Command::ReloadWorkspace { session_id, .. }
+            | Command::SetSessionEnvironment { session_id, .. }
             | Command::ConfigureSessionTools { session_id, .. }
             | Command::SetSessionCodeMode { session_id, .. }
             | Command::SubmitExternalToolResult { session_id, .. }
@@ -4210,6 +4268,7 @@ impl ServerCore {
             | Command::SetMcpServerCredential { .. }
             | Command::ClearMcpServerCredential { .. }
             | Command::SetMcpServerGrants { .. }
+            | Command::SyncAgentCatalogue { .. }
             | Command::SaveAgent { .. }
             | Command::SaveSoul { .. }
             | Command::DeleteAgent { .. }
@@ -8791,6 +8850,59 @@ enabled = false
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].slug, "designer");
         assert!(!agents[0].enabled);
+    }
+
+    #[test]
+    fn cloud_catalogue_updates_existing_sessions_without_machine_model_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
+        state.set_agent_directory(directory.path().to_path_buf());
+        let workspace_id = crate::state::projection::workspace_id(&state.workspace);
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+        create_default_session(&mut core, &workspace_id).unwrap();
+        let definition = AgentDefinitionInput {
+            slug: "portable".to_owned(),
+            description: "Portable worker".to_owned(),
+            model: Some(nakode_protocol::ModelId::from("unknown/model")),
+            enabled: true,
+            ..AgentDefinitionInput::default()
+        };
+        let sync = |revision, definitions| Command::SyncAgentCatalogue {
+            workspace_id: workspace_id.clone(),
+            profile_id: "profile-a".to_owned(),
+            revision,
+            definitions,
+        };
+        core.try_execute_command(sync(1, vec![definition.clone()]))
+            .unwrap();
+        assert_eq!(core.sessions_by_id.len(), 2);
+        for engine in core.sessions_by_id.values() {
+            let state = engine.state();
+            let error = state
+                .validate_agent_request("portable", "Inspect the files")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("this machine"));
+            assert!(error.contains("unknown/model"));
+        }
+        assert!(core.ensure_local_agent_authority().is_err());
+        let mut disabled = definition;
+        disabled.enabled = false;
+        core.try_execute_command(sync(2, vec![disabled])).unwrap();
+        assert!(core.sessions_by_id.values().all(|engine| {
+            engine
+                .state()
+                .validate_agent_request("portable", "Inspect")
+                .unwrap_err()
+                .to_string()
+                .contains("disabled")
+        }));
+        core.try_execute_command(sync(3, vec![])).unwrap();
+        assert!(core.sessions_by_id.values().all(|engine| matches!(
+            engine.state().validate_agent_request("portable", "Inspect"),
+            Err(DomainCommandError::NotFound(_))
+        )));
+        assert!(core.try_execute_command(sync(2, vec![])).is_err());
     }
 
     #[test]

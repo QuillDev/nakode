@@ -486,3 +486,9 @@ and the pane identity is available, Nakode reports itself as `idle`, `working`,
 or `blocked`, includes its persisted logical session id when one exists, and
 releases its status authority on exit. Missing or failed Herdr reporting never
 prevents Nakode from starting or handling a turn.
+
+`nakode restart-when-idle` waits until the server atomically confirms no live session work or
+pending delegations remain, then restarts it. It never escalates to forced shutdown. New work
+can prolong the wait; unsupported quiescence protocols fail without stopping the server.
+
+Authenticated clients can replace a logical session’s ephemeral process environment through `SetSessionEnvironment`. Values never appear in snapshots or session persistence. Clients reinject them before work after a service restart. Native Bash and PTY tools (including delegates) inherit the logical owner’s variables.

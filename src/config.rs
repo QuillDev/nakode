@@ -123,6 +123,8 @@ pub enum NakodeCommand {
     Stop,
     /// Restart the Nakode service in the background.
     Restart,
+    /// Wait for live work to finish, then atomically restart without cancelling sessions.
+    RestartWhenIdle,
     /// Report the service's state, endpoint, versions, and log location.
     Status {
         /// Emit machine-readable JSON.
@@ -377,7 +379,7 @@ impl Config {
         config.validated()
     }
 
-    fn apply_legacy_environment(&mut self) {
+    pub(crate) fn apply_legacy_environment(&mut self) {
         if std::env::var_os("NAKODE_MODEL").is_none()
             && self.model.is_none()
             && let Some(model) = std::env::var_os("NAKO_AGENT_MODEL")

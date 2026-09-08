@@ -205,6 +205,11 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     fixed("NakodeService", "SetSessionCodeMode", RequestLane::Control),
     fixed(
         "NakodeService",
+        "SetSessionEnvironment",
+        RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
         "SubmitExternalToolResult",
         RequestLane::Control,
     ),
@@ -281,6 +286,7 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
         RequestLane::Control,
     ),
     fixed("NakodeService", "ReloadProvider", RequestLane::Control),
+    fixed("NakodeService", "SyncAgentCatalogue", RequestLane::Control),
     fixed("NakodeService", "SaveAgent", RequestLane::Control),
     fixed("NakodeService", "DeleteAgent", RequestLane::Control),
     fixed("NakodeService", "UpdateSettings", RequestLane::Control),

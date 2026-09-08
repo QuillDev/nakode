@@ -2643,12 +2643,24 @@ fn seed_provider_catalog(connection: &Connection) -> Result<(), SessionError> {
             params![provider.slug, provider.display_name, unix_timestamp()],
         )?;
     }
-    connection.execute(
+    // A provider stays enabled across a restart as long as it has any stored credential, whether
+    // the legacy provider-wide one or one of its accounts. Consulting only the legacy table
+    // switched off every multi-account login (a Codex ChatGPT sign-in) at every service start.
+    let disabled = connection.execute(
         "UPDATE providers SET enabled = 0
          WHERE enabled = 1
-           AND provider NOT IN (SELECT provider FROM provider_credentials)",
+           AND provider NOT IN (SELECT provider FROM provider_credentials)
+           AND provider NOT IN (
+             SELECT a.provider FROM provider_accounts a
+             JOIN provider_account_credentials c ON c.account_id = a.account_id
+           )",
         [],
     )?;
+    if disabled > 0 {
+        eprintln!(
+            "nakode providers: disabled {disabled} provider(s) without a stored credential at open"
+        );
+    }
     Ok(())
 }
 
@@ -4523,6 +4535,8 @@ impl SessionRepository for SqliteSessionRepository {
         if updated == 0 {
             return Err(SessionError::ProviderNotFound(provider.to_owned()));
         }
+        // Provider enablement is an owner decision; every write to it is worth a line in the log.
+        eprintln!("nakode providers: {provider} enabled={enabled}");
         Ok(())
     }
 
@@ -6817,6 +6831,52 @@ mod tests {
             restored
                 .list_skill_preferences("legacy-profile")?
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reopening_the_store_keeps_an_account_login_enabled() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("providers.db");
+        {
+            let store = SqliteSessionRepository::open(&path)?;
+            let credentials =
+                crate::credential::SqliteCredentialStore::open(&path).expect("credential store");
+            // A Codex ChatGPT sign-in is an account credential, never a provider-wide one.
+            let account = store.add_provider_account(CODEX_PROVIDER, "Default")?;
+            crate::credential::CredentialStore::put_account(
+                &credentials,
+                CODEX_PROVIDER,
+                &account.account_id,
+                &crate::credential::Credential {
+                    kind: "chatgpt_oauth".to_owned(),
+                    secret: crate::credential::SecretValue::new(serde_json::json!({
+                        "credential_store": "codex_managed",
+                    })),
+                },
+            )
+            .expect("save account credential");
+            store.set_provider_enabled(CODEX_PROVIDER, true)?;
+        }
+
+        // The service restarts: the owner's decision must survive the reopen.
+        let store = SqliteSessionRepository::open(&path)?;
+        let codex = store
+            .list_providers()?
+            .into_iter()
+            .find(|provider| provider.provider == CODEX_PROVIDER)
+            .expect("Codex provider");
+        assert!(
+            codex.enabled,
+            "an enabled provider with an account login stays enabled"
+        );
+        // A provider enabled with no credential of any kind is still reset.
+        assert!(
+            !store
+                .list_providers()?
+                .into_iter()
+                .any(|provider| provider.provider != CODEX_PROVIDER && provider.enabled)
         );
         Ok(())
     }

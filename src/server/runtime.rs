@@ -426,7 +426,7 @@ impl NativeServerRuntime {
         let capabilities = native_service_capabilities();
         let (endpoint, requests) = ServerEndpoint::channel_with_build_revision(
             env!("CARGO_PKG_VERSION"),
-            crate::BUILD_REVISION.map(str::to_owned),
+            crate::embedded::build_revision().map(str::to_owned),
             capabilities,
             256,
         );
@@ -2922,10 +2922,12 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::SessionWorkingDirectories,
             ServiceCapability::InitialSessionModel,
             ServiceCapability::InitialSessionInstructions,
+            ServiceCapability::SessionEnvironment,
             ServiceCapability::SessionDeletion,
             ServiceCapability::QuestionTextAnswers,
             ServiceCapability::QueuedPromptSteering,
             ServiceCapability::ArchetypeManagement,
+            ServiceCapability::CloudArchetypeSynchronization,
             ServiceCapability::InvocationTelemetry,
             ServiceCapability::SkillAvailability,
             ServiceCapability::SkillPruning,
@@ -3766,6 +3768,7 @@ impl BackendRegistry {
         run_id: String,
         provider: &str,
         working_directory: &Path,
+        require_local_auth: bool,
     ) -> Result<(), BackendError> {
         if let Some(account_id) = self.default_account_id(provider)
             && let Some(cooldown) = self.active_cooldown(provider, &account_id)
@@ -3781,9 +3784,19 @@ impl BackendRegistry {
                 provider: provider.to_owned(),
             });
         }
-        let handle = self
-            .spawn_provider_handle(provider, working_directory)
-            .await?;
+        let handle = if require_local_auth {
+            let selection = self.select_account(provider, None)?;
+            self.spawn_provider_handle_for_account(
+                provider,
+                Some(&selection.account_id),
+                working_directory,
+                false,
+            )
+            .await?
+        } else {
+            self.spawn_provider_handle(provider, working_directory)
+                .await?
+        };
         let (commands, mut events, task) = handle.into_parts();
         self.subagent_commands.insert(run_id.clone(), commands);
         self.subagent_providers
@@ -4382,8 +4395,12 @@ impl EffectExecutor {
                     .await;
             }
             Effect::RunShell { id, command } => {
-                self.shell_processes
-                    .spawn(PathBuf::from(&state.working_directory), id, command);
+                self.shell_processes.spawn_with_environment(
+                    PathBuf::from(&state.working_directory),
+                    id,
+                    command,
+                    crate::session_environment::read(Some(session_id.as_str())),
+                );
             }
             Effect::CancelShell(id) => {
                 if !self.shell_processes.cancel(&id) {
@@ -5507,6 +5524,7 @@ async fn spawn_subagent(
             run_id.to_owned(),
             provider,
             Path::new(&state.working_directory),
+            state.subagent_requires_local_auth(run_id),
         )
         .await
     {
@@ -5654,6 +5672,7 @@ async fn clear_provider_credential(
         state.session_store_failed(format!("could not clear {provider} credentials: {error}"));
         return;
     }
+    eprintln!("nakode providers: clearing {provider} credential, which disables it");
     if let Err(error) = sessions.set_provider_enabled(provider, false) {
         state.session_store_failed(error.to_string());
         return;
@@ -9385,6 +9404,25 @@ mod tests {
                 respond: delegation_response,
                 cancellation_task,
             },
+        );
+
+        let (safe_response, safe_result) = tokio::sync::oneshot::channel();
+        runtime.handle_quiesce(QuiesceRequest {
+            mode: QuiesceMode::Safe,
+            respond: safe_response,
+        });
+        assert!(
+            safe_result
+                .await
+                .expect("safe response")
+                .expect_err("live delegation refuses idle restart")
+                .starts_with("live work is still owned by session(s) ")
+        );
+        assert!(runtime.accepting_work);
+        assert!(
+            !runtime.pending_native_delegations[&1]
+                .cancellation_task
+                .is_finished()
         );
 
         let (changed_response, changed_result) = tokio::sync::oneshot::channel();

@@ -60,6 +60,21 @@ pub async fn restart(config: &Config) -> Result<(), ControlError> {
     Ok(())
 }
 
+/// Waits for an atomic idle fence before restarting the installation service.
+/// New work may prolong the wait; it is never cancelled to meet an update deadline.
+///
+/// # Errors
+/// Returns any lifecycle error other than the explicit live-work refusal.
+pub async fn restart_when_idle(config: &Config) -> Result<(), ControlError> {
+    let executable = current_executable()?;
+    control_service::restart_service_when_idle(&executable, config).await?;
+    println!(
+        "Nakode service: restarted after live work completed{}",
+        pid_suffix(config)
+    );
+    Ok(())
+}
+
 /// Refreshes every stale workspace service after installation.
 ///
 /// # Errors

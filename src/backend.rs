@@ -147,9 +147,11 @@ pub fn api_key_provider_setup(provider: &str) -> Option<ApiKeyProviderSetup> {
 
 #[must_use]
 pub fn remote_authentication_supported(provider: &str) -> bool {
-    // Codex's device-code flow is safe to complete when the client and server are on
-    // different machines. Other interactive providers currently require a localhost callback.
-    matches!(provider, CODEX_PROVIDER)
+    // Codex's device-code flow completes with the client and server on different machines.
+    // Claude's browser flow returns to a localhost listener on this machine, and a remote client
+    // hands that callback URL back over `SubmitAuthenticationCallback`, which relays it to the
+    // listener. Other interactive providers still require a client on this machine.
+    matches!(provider, CODEX_PROVIDER | CLAUDE_PROVIDER)
 }
 
 pub(crate) async fn request_failed(

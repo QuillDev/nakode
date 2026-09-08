@@ -109,7 +109,15 @@ impl Tool for BashTool {
                     ));
                 }
             }
-            let result = run_shell(context.workspace, &arguments, cancellation).await;
+            let environment =
+                crate::session_environment::read(context.session.owner_session_id.as_deref());
+            let result = run_shell_with_environment(
+                context.workspace,
+                &arguments,
+                cancellation,
+                environment,
+            )
+            .await;
             match result {
                 Ok(mut output) => {
                     if !output.failed
@@ -239,10 +247,11 @@ fn validation_identity(
     })
 }
 
-async fn run_shell(
+async fn run_shell_with_environment(
     workspace: &std::path::Path,
     arguments: &Value,
     cancellation: &CancellationToken,
+    mut environment: HashMap<String, String>,
 ) -> Result<ToolResult, String> {
     let requested_command = required_string(arguments, "command")?;
     let requested_timeout = arguments
@@ -259,7 +268,7 @@ async fn run_shell(
         || Ok(workspace.to_path_buf()),
         |path| resolve_workspace_path(workspace, path),
     )?;
-    let environment = parse_environment(arguments)?;
+    environment.extend(parse_environment(arguments)?);
     let use_pty = arguments
         .get("pty")
         .and_then(Value::as_bool)
@@ -462,4 +471,17 @@ fn shell_command(command: &str) -> (&'static str, Vec<OsString>) {
         "cmd.exe",
         vec!["/D".into(), "/S".into(), "/C".into(), command.into()],
     )
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+    #[tokio::test]
+    async fn injected_environment_reaches_both_shell_paths_without_changing_process_environment() {
+        for pty in [false, true] {
+            let result = run_shell_with_environment(&std::env::temp_dir(), &serde_json::json!({"command": "test \"$FSTACK_TEST_SECRET_VALUE\" = example-value", "pty": pty}), &CancellationToken::new(), HashMap::from([("FSTACK_TEST_SECRET_VALUE".to_owned(), "example-value".to_owned())])).await.unwrap();
+            assert!(!result.failed, "{}", result.output);
+        }
+        assert!(std::env::var_os("FSTACK_TEST_SECRET_VALUE").is_none());
+    }
 }

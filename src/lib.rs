@@ -1,16 +1,23 @@
 pub mod activation;
 pub mod agent;
+#[cfg(feature = "tui")]
 pub mod agent_cli;
+#[cfg(feature = "tui")]
 pub(crate) mod api_projection;
+#[cfg(feature = "tui")]
 pub mod app;
 pub mod backend;
 pub mod claude;
+#[cfg(feature = "tui")]
 pub mod clipboard;
+mod cloud_agents;
 pub mod codemode_worker;
 pub mod codex;
+#[cfg(feature = "tui")]
 pub mod commands;
 pub mod config;
 pub mod control_service;
+#[cfg(feature = "tui")]
 pub mod controls;
 pub mod credential;
 pub mod cursor;
@@ -18,42 +25,58 @@ pub mod devin;
 pub mod diagnostics;
 pub mod domain_transcript;
 pub mod editor;
+pub mod embedded;
+mod executable;
 pub mod execution_host;
 pub mod glm;
 pub mod handoff;
+#[cfg(feature = "tui")]
 mod herdr;
 pub mod kimi;
+#[cfg(feature = "tui")]
 mod markdown;
 pub mod mcp;
 mod media;
 pub mod memory;
+#[cfg(feature = "tui")]
 mod native_client;
 pub mod personality;
 pub mod pty;
 pub mod purge;
 pub mod remote;
+pub mod remote_cli;
 pub mod remote_update;
+#[cfg(feature = "tui")]
 pub mod render;
 pub mod runtime;
 pub mod searchable_dropdown;
+#[cfg(feature = "tui")]
 pub mod selection;
 pub mod server;
 pub mod service;
 pub mod service_cli;
 pub mod service_log;
 pub mod session;
+mod session_environment;
 pub mod settings;
 mod shell;
 pub mod skill;
 pub mod soul;
 pub mod state;
+#[cfg(feature = "tui")]
 pub mod terminal;
+#[cfg(feature = "tui")]
 pub mod terminal_image;
 pub mod tools;
+#[cfg(feature = "tui")]
 pub mod transcript;
+#[cfg(feature = "tui")]
 mod tui_client;
+#[cfg(feature = "tui")]
 pub mod tui_eval;
+#[cfg(feature = "tui")]
 mod tui_input;
+#[cfg(feature = "tui")]
 pub mod tui_state;
 pub mod update;
 pub mod vision;

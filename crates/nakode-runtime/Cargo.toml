@@ -1,0 +1,10 @@
+[package]
+name = "nakode-runtime"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Embeddable headless Nakode agent runtime"
+repository = "https://github.com/QuillDev/nakode"
+
+[dependencies]
+nakode = { path = "../..", version = "0.3.0", default-features = false }

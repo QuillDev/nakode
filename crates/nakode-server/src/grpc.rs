@@ -1294,6 +1294,25 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         .await
     }
 
+    async fn set_session_environment(
+        &self,
+        request: tonic::Request<api::SetSessionEnvironmentRequest>,
+    ) -> Result<tonic::Response<api::MutationResult>, tonic::Status> {
+        let input = request.into_inner();
+        self.mutate(
+            input.mutation,
+            protocol::Command::SetSessionEnvironment {
+                session_id: protocol::SessionId::from(input.session_id),
+                variables: input
+                    .variables
+                    .into_iter()
+                    .map(|(name, value)| (name, protocol::CredentialInput(value)))
+                    .collect(),
+            },
+        )
+        .await
+    }
+
     async fn configure_session_tools(
         &self,
         request: tonic::Request<api::ConfigureSessionToolsRequest>,
@@ -1573,6 +1592,22 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             provider_id: protocol::ProviderId::from(input.provider_id),
             account_id: input.account_id,
         }
+    );
+    try_command_rpc!(
+        sync_agent_catalogue,
+        api::SyncAgentCatalogueRequest,
+        input,
+        input
+            .definitions
+            .into_iter()
+            .map(|definition| agent_input(Some(definition)))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|definitions| protocol::Command::SyncAgentCatalogue {
+                workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+                profile_id: input.profile_id,
+                revision: input.revision,
+                definitions,
+            })
     );
     try_command_rpc!(
         save_agent,
