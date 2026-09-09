@@ -4,6 +4,13 @@
 //! [`ServerEndpoint`]. The application server remains the sole owner of
 //! canonical state, persistence, policy, and execution.
 
+use nakode_telemetry::{
+    Scope,
+    opentelemetry::{
+        Context as TraceContext,
+        trace::{FutureExt, SpanKind},
+    },
+};
 use std::{
     collections::HashMap,
     future::Future,
@@ -183,6 +190,26 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
         "NakodeService",
         "ContinueSessionFromBridge",
         RequestLane::Control,
+    ),
+    fixed(
+        "NakodeService",
+        "PublishSharedContext",
+        RequestLane::Control,
+    ),
+    fixed(
+        "RemoteUpdateService",
+        "GetRemoteUpdateStatus",
+        RequestLane::Control,
+    ),
+    fixed(
+        "RemoteUpdateService",
+        "StartRemoteUpdate",
+        RequestLane::Control,
+    ),
+    fixed(
+        "RemoteUpdateService",
+        "WatchRemoteUpdateStatus",
+        RequestLane::Subscription,
     ),
     fixed("NakodeService", "ListSessions", RequestLane::Query),
     fixed("NakodeService", "DeleteSession", RequestLane::Control),
@@ -371,6 +398,8 @@ pub struct RequestTiming {
     lane: RequestLane,
     lane_sequence: u64,
     dequeued_at: Arc<OnceLock<Instant>>,
+    trace: TraceContext,
+    queue: Arc<std::sync::Mutex<Option<Scope>>>,
 }
 
 impl RequestTiming {
@@ -382,11 +411,23 @@ impl RequestTiming {
             lane,
             lane_sequence: 0,
             dequeued_at: Arc::new(OnceLock::new()),
+            trace: TraceContext::current(),
+            queue: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
 
 impl ServerRequest {
+    /// Request context follows the authoritative broker queue into runtime execution.
+    #[must_use]
+    pub fn trace_context(&self) -> TraceContext {
+        match self {
+            Self::Command { timing, .. }
+            | Self::Query { timing, .. }
+            | Self::Subscribe { timing, .. } => timing.trace.clone(),
+        }
+    }
+
     /// Records when the authoritative runtime dequeues this request.
     #[doc(hidden)]
     pub fn mark_dequeued(&self) {
@@ -396,6 +437,9 @@ impl ServerRequest {
             | Self::Subscribe { timing, .. } => timing,
         };
         let _ = timing.dequeued_at.set(Instant::now());
+        if let Ok(mut queue) = timing.queue.lock() {
+            queue.take();
+        }
     }
 }
 
@@ -651,7 +695,16 @@ impl ServerEndpoint {
     ) -> TimedServerResponse<T> {
         let started_at = Instant::now();
         let lane_sequence = self.next_lane_sequence(lane);
-        let Ok(permit) = sender.reserve().await else {
+        let admission_scope = Scope::new(
+            "nakode.admission",
+            SpanKind::Internal,
+            &TraceContext::current(),
+        );
+        let Ok(permit) = sender
+            .reserve()
+            .with_context(admission_scope.context())
+            .await
+        else {
             let admission = started_at.elapsed();
             return TimedServerResponse {
                 result: Err(server_unavailable()),
@@ -665,11 +718,18 @@ impl ServerEndpoint {
                 },
             };
         };
+        drop(admission_scope);
         let admitted_at = Instant::now();
         let pending = RequestTiming {
             lane,
             lane_sequence,
             dequeued_at: Arc::new(OnceLock::new()),
+            trace: TraceContext::current(),
+            queue: Arc::new(std::sync::Mutex::new(Some(Scope::new(
+                "nakode.queue",
+                SpanKind::Internal,
+                &TraceContext::current(),
+            )))),
         };
         let (respond, receive) = oneshot::channel();
         permit.send(make_request(pending.clone(), respond));

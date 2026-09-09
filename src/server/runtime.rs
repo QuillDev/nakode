@@ -4,6 +4,7 @@
 //! dependencies. The native server actor will become the sole owner of these
 //! resources. Frontends reach this owner only through the service protocol.
 
+use nakode_telemetry::opentelemetry::trace::FutureExt;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io,
@@ -512,7 +513,8 @@ impl NativeServerRuntime {
                     let Some(request) = request else {
                         break;
                     };
-                    self.handle_request(request).await;
+                    let context = request.trace_context();
+                    Box::pin(nakode_telemetry::operation("nakode.execute", self.handle_request(request)).with_context(context)).await;
                 }
                 request = self.quiesce.recv() => {
                     if let Some(request) = request {

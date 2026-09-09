@@ -3117,6 +3117,12 @@ impl SessionRepository for SqliteSessionRepository {
         workspace: &str,
         limit: usize,
     ) -> Result<Vec<SessionRecord>, SessionError> {
+        let scope = nakode_telemetry::Scope::new(
+            "nakode.storage.list_recent",
+            nakode_telemetry::opentelemetry::trace::SpanKind::Internal,
+            &nakode_telemetry::opentelemetry::Context::current(),
+        );
+        let _trace_context = scope.context().attach();
         let connection = self
             .connection
             .lock()
@@ -3138,6 +3144,12 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     fn list_recent_all(&self) -> Result<Vec<SessionRecord>, SessionError> {
+        let scope = nakode_telemetry::Scope::new(
+            "nakode.storage.list_recent_all",
+            nakode_telemetry::opentelemetry::trace::SpanKind::Internal,
+            &nakode_telemetry::opentelemetry::Context::current(),
+        );
+        let _trace_context = scope.context().attach();
         let connection = self
             .connection
             .lock()
@@ -3158,6 +3170,12 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     fn find(&self, id: &str) -> Result<Option<SessionRecord>, SessionError> {
+        let scope = nakode_telemetry::Scope::new(
+            "nakode.storage.find",
+            nakode_telemetry::opentelemetry::trace::SpanKind::Internal,
+            &nakode_telemetry::opentelemetry::Context::current(),
+        );
+        let _trace_context = scope.context().attach();
         let connection = self
             .connection
             .lock()

@@ -3257,6 +3257,12 @@ impl ServerCore {
     }
 
     fn query(&self, query: Query) -> Result<QueryResult, ServiceError> {
+        let trace_scope = nakode_telemetry::Scope::new(
+            "nakode.query",
+            nakode_telemetry::opentelemetry::trace::SpanKind::Internal,
+            &nakode_telemetry::opentelemetry::Context::current(),
+        );
+        let _trace_context = trace_scope.context().attach();
         let bootstrap = || self.workspace_bootstrap();
         match query {
             Query::InspectWorkspacePath {

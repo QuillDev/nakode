@@ -725,6 +725,7 @@ async fn run_grpc_listener(
 ) -> Result<(), ControlError> {
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     tonic::transport::Server::builder()
+        .layer(nakode_telemetry::RpcLayer(false))
         .add_service(
             nakode_server::grpc::GrpcService::new(endpoint)
                 .with_server_id(server_id)
@@ -757,6 +758,7 @@ async fn run_remote_grpc_listener(
         .map_err(ControlError::ServiceRejected)?;
     let api_key = config.api_key.clone();
     tonic::transport::Server::builder()
+        .layer(nakode_telemetry::RpcLayer(false))
         .tls_config(tls)?
         .add_service(
             nakode_server::grpc::GrpcService::new(endpoint)
