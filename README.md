@@ -398,6 +398,9 @@ to the count. Entry bodies, audits, redaction and truncation retain their existi
 
 ## Optional web browsing
 
+For CLI setup, server-side capability diagnostics, and VPS sandbox troubleshooting,
+see [Visual tools on headless hosts](docs/visual-tools-headless.md).
+
 Nakode's portable runtime can expose a `browser` tool when a browser add-on is
 enabled under `/settings` → **Add-ons** → **Web browsing**. Browsing is disabled by default and
 neither backend is required to run Nakode:
