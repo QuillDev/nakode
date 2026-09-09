@@ -189,6 +189,7 @@ mod tests {
             .expect("image fixture");
         let config = Arc::new(RwLock::new(VisionConfig {
             model: Some("openai-codex/vision-test".to_owned()),
+            ..VisionConfig::default()
         }));
         let tool = VisionTool::new(config, Some(Arc::new(RecordingVision)));
         assert!(tool.available());
@@ -221,6 +222,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let config = Arc::new(RwLock::new(VisionConfig {
             model: Some("openai-codex/vision-test".to_owned()),
+            ..VisionConfig::default()
         }));
         let tool = VisionTool::new(config, None);
         assert!(!tool.available());

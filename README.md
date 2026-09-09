@@ -398,8 +398,9 @@ to the count. Entry bodies, audits, redaction and truncation retain their existi
 
 ## Optional web browsing
 
-For CLI setup, server-side capability diagnostics, and VPS sandbox troubleshooting,
-see [Visual tools on headless hosts](docs/visual-tools-headless.md).
+For installation, service-user configuration, safe validation, and maintenance,
+see [Linux provisioning](docs/linux-provisioning.md). Recorded VPS diagnostics
+and sandbox repairs are in [Visual tools on headless hosts](docs/visual-tools-headless.md).
 
 Nakode's portable runtime can expose a `browser` tool when a browser add-on is
 enabled under `/settings` → **Add-ons** → **Web browsing**. Browsing is disabled by default and
@@ -415,6 +416,21 @@ neither backend is required to run Nakode:
 Changes apply to the portable browser tool without restarting Nakode. Provider
 or tool functionality unrelated to web browsing remains available when either
 add-on is absent or disabled.
+
+## Optional vision
+
+The `vision` tool analyzes workspace images using its own configured provider/model.
+Under `/settings` → **Add-ons** → **Vision**, select a model and its reasoning
+**effort**. The picker uses that model's advertised values; vision does not inherit
+the calling agent's effort or fast mode. Existing installations retain `low` until
+changed. Saved effort applies to subsequent vision calls without restarting the
+server.
+
+Headless integrations can use the public `SelectModel` operation with the Vision
+target and reasoning options, or `UpdateSettings` with a vision model and optional
+`reasoning_effort`. See [vision provisioning](docs/linux-provisioning.md#3-configure-vision-and-its-effort)
+for compatibility and deployment details. The browser tool returns text; capture
+screenshots separately before passing them to vision.
 
 ## Optional memory
 

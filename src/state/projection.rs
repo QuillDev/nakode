@@ -1570,8 +1570,10 @@ fn provider_view(state: &DomainState, provider: &ProviderRecord) -> ProviderView
 }
 
 fn vision_settings_view(state: &DomainState, providers: &[ProviderRecord]) -> VisionSettingsView {
+    let reasoning_effort = Some(state.vision_config.reasoning_effort.clone());
     let Some(configured_id) = state.vision_config.model.as_deref() else {
         return VisionSettingsView {
+            reasoning_effort,
             model_id: None,
             availability: VisionAvailabilityView::Disabled,
             diagnostic: "The callable vision add-on is disabled.".to_owned(),
@@ -1584,6 +1586,7 @@ fn vision_settings_view(state: &DomainState, providers: &[ProviderRecord]) -> Vi
         .find(|model| model.qualified_id() == configured_id)
     else {
         return VisionSettingsView {
+            reasoning_effort,
             model_id,
             availability: VisionAvailabilityView::ModelUnavailable,
             diagnostic: "The selected vision model is no longer in the live provider catalogue. Choose an available vision model.".to_owned(),
@@ -1591,9 +1594,18 @@ fn vision_settings_view(state: &DomainState, providers: &[ProviderRecord]) -> Vi
     };
     if !model_configuration(model, true).vision_eligible {
         return VisionSettingsView {
+            reasoning_effort,
             model_id,
             availability: VisionAvailabilityView::ModelUnsupported,
             diagnostic: "The selected model does not support the callable vision service. Choose a vision-eligible model.".to_owned(),
+        };
+    }
+    if DomainState::validate_vision_options(model, &state.vision_config.reasoning_effort).is_err() {
+        return VisionSettingsView {
+            reasoning_effort,
+            model_id,
+            availability: VisionAvailabilityView::ModelUnsupported,
+            diagnostic: "The selected vision effort is not advertised by this model. Choose a supported effort.".to_owned(),
         };
     }
     let provider = providers
@@ -1607,6 +1619,7 @@ fn vision_settings_view(state: &DomainState, providers: &[ProviderRecord]) -> Vi
     });
     if !provider_ready {
         return VisionSettingsView {
+            reasoning_effort,
             model_id,
             availability: VisionAvailabilityView::ProviderUnavailable,
             diagnostic:
@@ -1619,12 +1632,14 @@ fn vision_settings_view(state: &DomainState, providers: &[ProviderRecord]) -> Vi
         .is_some_and(|tools| tools.iter().any(|tool| tool == "vision"))
     {
         VisionSettingsView {
+            reasoning_effort,
             model_id,
             availability: VisionAvailabilityView::Ready,
             diagnostic: "The callable vision service is ready.".to_owned(),
         }
     } else {
         VisionSettingsView {
+            reasoning_effort,
             model_id,
             availability: VisionAvailabilityView::ServiceUnavailable,
             diagnostic: "The selected model has no live provider-backed callable vision service. Reload its provider or choose another vision model.".to_owned(),
@@ -2581,6 +2596,7 @@ mod tests {
         let mut state = AppState::new_unconfigured("/tmp/project", None, 100);
         state.install_vision_config(crate::vision::VisionConfig {
             model: Some("openai-codex/gpt-5.6-luna".to_owned()),
+            ..crate::vision::VisionConfig::default()
         });
 
         assert_eq!(
@@ -2590,6 +2606,7 @@ mod tests {
 
         state.install_vision_config(crate::vision::VisionConfig {
             model: Some(format!("{CURSOR_PROVIDER}/composer-2")),
+            ..crate::vision::VisionConfig::default()
         });
         state.install_cached_models(vec![model(CURSOR_PROVIDER, "composer-2")]);
         let cursor_provider = ProviderRecord {
@@ -2608,6 +2625,7 @@ mod tests {
 
         state.install_vision_config(crate::vision::VisionConfig {
             model: Some("openai-codex/gpt-5.6-luna".to_owned()),
+            ..crate::vision::VisionConfig::default()
         });
         state.install_cached_models(vec![model(CODEX_PROVIDER, "gpt-5.6-luna")]);
         assert_eq!(

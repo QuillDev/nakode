@@ -1054,6 +1054,15 @@ fn settings_vision_lines(settings: &SettingsState) -> Vec<Line<'static>> {
         Line::styled("Vision", Style::default().fg(TEXT).bold()),
         Line::default(),
         settings_row("Model", model, true),
+        settings_status_row(
+            "Effort",
+            settings
+                .vision
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("Unknown"),
+            TEXT,
+        ),
         Line::default(),
         settings_status_row(
             "Status",
@@ -2236,8 +2245,9 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             &picker.options,
             picker.option_selected,
             !picker.options_fast_only,
-            true,
+            picker.scope != ModelSelectionScope::Vision,
             match (picker.scope, picker.options_fast_only) {
+                (ModelSelectionScope::Vision, _) => "Configure vision effort",
                 (ModelSelectionScope::Session, true) => "Configure this session's Cursor model",
                 (ModelSelectionScope::Session, false) => "Configure this session's OpenAI model",
                 (_, true) => "Configure the Cursor model default",
@@ -2494,6 +2504,7 @@ mod tests {
                 },
                 vision: VisionSettingsView {
                     model_id: None,
+                    reasoning_effort: Some("low".to_owned()),
                     availability: nakode_protocol::VisionAvailabilityView::Disabled,
                     diagnostic: String::new(),
                 },

@@ -562,9 +562,13 @@ fn api_settings_patch(value: view::SettingsPatch) -> api::SettingsPatch {
                 global_bank,
                 data_directory,
             }),
-            view::SettingsPatch::Vision { model_id } => Patch::Vision(api::VisionSettingsPatch {
+            view::SettingsPatch::Vision {
+                model_id,
+                reasoning_effort,
+            } => Patch::Vision(api::VisionSettingsPatch {
                 clear_model: model_id.is_none(),
                 model_id: model_id.map(|id| id.to_string()),
+                reasoning_effort,
             }),
             view::SettingsPatch::TerminalImages { mode } => {
                 Patch::TerminalImages(api::TerminalImagesSettingsPatch { mode })
@@ -1098,6 +1102,7 @@ fn settings(value: api::Settings) -> Result<view::SettingsView, String> {
         },
         vision: view::VisionSettingsView {
             model_id: vision.model_id.map(view::ModelId::from),
+            reasoning_effort: vision.reasoning_effort,
             availability: match api::VisionAvailability::try_from(vision.availability)
                 .map_err(invalid_enum)?
             {

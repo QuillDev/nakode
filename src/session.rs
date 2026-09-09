@@ -1877,6 +1877,19 @@ impl SqliteSessionRepository {
             )?;
         }
         seed_provider_catalog(&connection)?;
+        let has_vision_effort = {
+            let mut statement = connection.prepare("PRAGMA table_info(addon_vision_settings)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns.iter().any(|column| column == "reasoning_effort")
+        };
+        if !has_vision_effort {
+            execute_batch_with_busy_retry(
+                &connection,
+                "ALTER TABLE addon_vision_settings ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'low';",
+            )?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
             path: path.to_path_buf(),
@@ -4992,15 +5005,20 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
-        let model = connection
+        let config = connection
             .query_row(
-                "SELECT model FROM addon_vision_settings WHERE singleton = 1",
+                "SELECT model, reasoning_effort FROM addon_vision_settings WHERE singleton = 1",
                 [],
-                |row| row.get::<_, Option<String>>(0),
+                |row| {
+                    Ok(VisionConfig {
+                        model: row.get(0)?,
+                        reasoning_effort: row.get(1)?,
+                    })
+                },
             )
             .optional()?
-            .flatten();
-        Ok(VisionConfig { model })
+            .unwrap_or_default();
+        Ok(config)
     }
 
     fn save_vision_config(&self, config: &VisionConfig) -> Result<(), SessionError> {
@@ -5009,9 +5027,9 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         connection.execute(
-            "INSERT INTO addon_vision_settings (singleton, model) VALUES (1, ?1)
-             ON CONFLICT(singleton) DO UPDATE SET model = excluded.model",
-            params![config.model],
+            "INSERT INTO addon_vision_settings (singleton, model, reasoning_effort) VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET model = excluded.model, reasoning_effort = excluded.reasoning_effort",
+            params![config.model, config.reasoning_effort],
         )?;
         Ok(())
     }
@@ -5808,9 +5826,32 @@ mod tests {
 
         let configured = VisionConfig {
             model: Some("openai-codex/gpt-5.4".to_owned()),
+            reasoning_effort: "high".to_owned(),
         };
         store.save_vision_config(&configured)?;
         assert_eq!(store.load_vision_config()?, configured);
+        drop(store);
+        let reopened = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
+        assert_eq!(reopened.load_vision_config()?, configured);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_vision_settings_migrate_without_losing_model() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("sessions.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE addon_vision_settings (singleton INTEGER PRIMARY KEY, model TEXT);
+             INSERT INTO addon_vision_settings VALUES (1, 'openai-codex/gpt-5.4');",
+        )?;
+        drop(connection);
+        for _ in 0..2 {
+            let store = SqliteSessionRepository::open(&path)?;
+            let config = store.load_vision_config()?;
+            assert_eq!(config.model.as_deref(), Some("openai-codex/gpt-5.4"));
+            assert_eq!(config.reasoning_effort, "low");
+        }
         Ok(())
     }
 

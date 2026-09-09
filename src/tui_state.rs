@@ -64,6 +64,7 @@ fn settings_state(settings: &nakode_protocol::SettingsView) -> SettingsState {
         },
         vision: VisionSettingsState {
             model: settings.vision.model_id.as_ref().map(ToString::to_string),
+            reasoning_effort: settings.vision.reasoning_effort.clone(),
         },
         memory: MemorySettingsState {
             backend: if settings.memory.backend == "mnemosyne" {
@@ -368,6 +369,7 @@ mod tests {
                 },
                 vision: VisionSettingsView {
                     model_id: None,
+                    reasoning_effort: Some("low".to_owned()),
                     availability: nakode_protocol::VisionAvailabilityView::Disabled,
                     diagnostic: String::new(),
                 },
@@ -1061,6 +1063,7 @@ impl MemorySettingsState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VisionSettingsState {
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl VisionSettingsState {
@@ -2339,7 +2342,12 @@ impl TuiState {
         if let Some(picker) = &mut self.client.model_picker
             && picker.stage == ModelPickerStage::Options
         {
-            let option_count = if picker.options_fast_only { 1 } else { 2 };
+            let option_count =
+                if picker.options_fast_only || picker.scope == ModelSelectionScope::Vision {
+                    1
+                } else {
+                    2
+                };
             picker.option_selected = offset_index(picker.option_selected, option_count, delta);
             return;
         }

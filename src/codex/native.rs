@@ -300,33 +300,12 @@ impl crate::vision::VisionService for CodexVisionService {
         cancellation: &'a CancellationToken,
     ) -> crate::vision::VisionFuture<'a> {
         Box::pin(async move {
-            let model = self
-                .config
-                .read()
-                .map_err(|_| "vision settings lock is unavailable".to_owned())?
-                .model_id()
-                .map(str::to_owned)
-                .ok_or_else(|| "vision add-on has no selected model".to_owned())?;
-            let attachments = images
-                .into_iter()
-                .enumerate()
-                .map(|(index, image)| crate::backend::PromptAttachment {
-                    label: format!("Image {}", index + 1),
-                    path: None,
-                    image: Some(image),
-                })
-                .collect();
-            let request = InferenceRequest {
-                session_id: Uuid::now_v7().to_string(),
-                model,
-                instructions: "Analyze images accurately. Return only the requested visual analysis; do not use tools or continue the caller's coding task.".to_owned(),
-                history: vec![ConversationItem::User {
-                    text: prompt.to_owned(),
-                    attachments,
-                }],
-                tools: Vec::new(),
-                reasoning_effort: Some("low".to_owned()),
-                fast_mode: false,
+            let request = {
+                let config = self
+                    .config
+                    .read()
+                    .map_err(|_| "vision settings lock is unavailable".to_owned())?;
+                vision_request(&config, prompt, images)?
             };
             let (events, mut event_rx) = mpsc::channel(32);
             let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
@@ -340,6 +319,38 @@ impl crate::vision::VisionService for CodexVisionService {
             result
         })
     }
+}
+
+fn vision_request(
+    config: &crate::vision::VisionConfig,
+    prompt: &str,
+    images: Vec<crate::backend::PromptImage>,
+) -> Result<InferenceRequest, String> {
+    let model = config
+        .model_id()
+        .map(str::to_owned)
+        .ok_or_else(|| "vision add-on has no selected model".to_owned())?;
+    let attachments = images
+        .into_iter()
+        .enumerate()
+        .map(|(index, image)| crate::backend::PromptAttachment {
+            label: format!("Image {}", index + 1),
+            path: None,
+            image: Some(image),
+        })
+        .collect();
+    Ok(InferenceRequest {
+        session_id: Uuid::now_v7().to_string(),
+        model,
+        instructions: "Analyze images accurately. Return only the requested visual analysis; do not use tools or continue the caller's coding task.".to_owned(),
+        history: vec![ConversationItem::User {
+            text: prompt.to_owned(),
+            attachments,
+        }],
+        tools: Vec::new(),
+        reasoning_effort: Some(config.reasoning_effort.clone()),
+        fast_mode: false,
+    })
 }
 
 /// Creates the shared OpenAI-backed vision service when its credential exists.
@@ -3533,6 +3544,28 @@ mod tests {
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["text"], "Hi");
         assert!(!body["input"].to_string().contains("Be direct."));
+    }
+
+    #[test]
+    fn vision_requests_use_the_independent_configured_effort() {
+        for effort in ["low", "medium", "high", "none"] {
+            let config = crate::vision::VisionConfig {
+                model: Some("openai-codex/vision-test".to_owned()),
+                reasoning_effort: effort.to_owned(),
+            };
+            let image = crate::backend::PromptImage {
+                mime_type: "image/png".to_owned(),
+                data: vec![1, 2, 3],
+            };
+            let request = super::vision_request(&config, "Read the heading", vec![image]).unwrap();
+            assert_eq!(request.model, "vision-test");
+            assert_eq!(request.reasoning_effort.as_deref(), Some(effort));
+            assert!(request.tools.is_empty());
+            assert!(!request.fast_mode);
+            let body = codex_request_body(&request);
+            assert_eq!(body["reasoning"]["effort"], effort);
+            assert!(body["input"].to_string().contains("input_image"));
+        }
     }
 
     #[test]
