@@ -866,6 +866,24 @@ impl NakodeClient {
             .ok_or(SdkError::MissingState("created session identifier"))
     }
 
+    /// Creates a logical session from the complete public creation contract atomically.
+    ///
+    /// The SDK supplies a fresh mutation identity before transport retry; all retries of this
+    /// invocation retain that identity. Caller-supplied mutation metadata is replaced.
+    ///
+    /// # Errors
+    /// Returns a transport, server validation, or missing-identifier error.
+    pub async fn create_session_request(
+        &self,
+        mut request: api::CreateSessionRequest,
+    ) -> Result<String, SdkError> {
+        request.mutation = Some(mutation(None));
+        let result = send_mutation!(self, create_session, request)?;
+        result
+            .resource_id
+            .ok_or(SdkError::MissingState("created session identifier"))
+    }
+
     /// Creates a logical session with everything a dashboard Host decides at open time: an optional
     /// model, an optional working directory, and optional provider system instructions, committed
     /// atomically so the first turn already runs under them.
@@ -880,27 +898,15 @@ impl NakodeClient {
         working_directory: Option<String>,
         initial_instructions: Option<String>,
     ) -> Result<String, SdkError> {
-        let result = send_mutation!(
-            self,
-            create_session,
-            api::CreateSessionRequest {
-                mutation: Some(mutation(None)),
-                workspace_id: workspace_id.into(),
-                title,
-                model_id,
-                options: None,
-                tools: None,
-                mcp_grant: None,
-                initial_instructions,
-                bridge: None,
-                working_directory,
-                profile_id: None,
-                account_id: None,
-            }
-        )?;
-        result
-            .resource_id
-            .ok_or(SdkError::MissingState("created session identifier"))
+        self.create_session_request(api::CreateSessionRequest {
+            workspace_id: workspace_id.into(),
+            title,
+            model_id,
+            initial_instructions,
+            working_directory,
+            ..Default::default()
+        })
+        .await
     }
 
     /// Creates a logical session with model/options, client-owned tools, and optional provider
@@ -3331,6 +3337,91 @@ mod tests {
             nakode_telemetry::opentelemetry::trace::Status::Error { .. }
         )));
         provider.shutdown().expect("shutdown tracing");
+    }
+
+    #[tokio::test]
+    async fn complete_creation_preserves_directory_instructions_and_model_options() {
+        let directory = tempfile::tempdir().expect("SDK transport directory");
+        let socket = directory.path().join("nakode.sock");
+        let listener = UnixListener::bind(&socket).expect("bind fake Nakode API");
+        let (endpoint, mut requests) = ServerEndpoint::channel_with_build_revision(
+            "sdk-test",
+            None,
+            protocol::ServiceCapabilities::default(),
+            8,
+        );
+        let (captured, received) = tokio::sync::oneshot::channel();
+        let actor = tokio::spawn(async move {
+            if let Some(ServerRequest::Command {
+                command, respond, ..
+            }) = requests.recv().await
+            {
+                let _ = captured.send(command);
+                let _ = respond.send(Ok(protocol::CommandAccepted {
+                    resource_id: Some("created-session".to_owned()),
+                    revision: Some(1),
+                    effective_session_tools: None,
+                    bridge_continuation: None,
+                    replayed_bridge_continuation: None,
+                    replayed_bridge_source_active: None,
+                }));
+            }
+        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(nakode_server::grpc::GrpcService::new(endpoint).into_server())
+                .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("serve fake API");
+        });
+        let client = NakodeClient::connect_unix(&socket)
+            .await
+            .expect("connect fake API");
+        let id = client
+            .create_session_request(api::CreateSessionRequest {
+                workspace_id: "workspace".to_owned(),
+                title: Some("Inspect execution host".to_owned()),
+                model_id: Some("provider/model".to_owned()),
+                options: Some(api::ModelOptions {
+                    reasoning_effort: Some("high".to_owned()),
+                    fast_mode: true,
+                }),
+                working_directory: Some("~".to_owned()),
+                initial_instructions: Some("Use the selected host.".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("atomic creation");
+        assert_eq!(id, "created-session");
+        let protocol::Command::CreateSession {
+            title,
+            model_id,
+            options,
+            working_directory,
+            initial_instructions,
+            ..
+        } = received.await.expect("captured creation")
+        else {
+            panic!("expected one CreateSession command");
+        };
+        assert_eq!(title.as_deref(), Some("Inspect execution host"));
+        assert_eq!(
+            model_id.map(|id| id.to_string()).as_deref(),
+            Some("provider/model")
+        );
+        assert_eq!(working_directory.as_deref(), Some("~"));
+        assert_eq!(
+            initial_instructions.as_deref(),
+            Some("Use the selected host.")
+        );
+        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+        assert!(options.fast_mode);
+        let _ = shutdown.send(());
+        server.await.expect("server task");
+        actor.await.expect("actor task");
     }
 
     #[tokio::test]
