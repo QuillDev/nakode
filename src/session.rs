@@ -109,6 +109,8 @@ pub struct SessionRecord {
     pub workspace: String,
     /// Canonical filesystem/provider process root. Legacy rows inherit `workspace`.
     pub working_directory: String,
+    /// Immutable client instructions, separate from the owner transcript.
+    pub initial_instructions: Option<String>,
     pub title: String,
     pub model: Option<String>,
     /// Authoritative session-local configuration for the next owner turn.
@@ -346,6 +348,8 @@ pub struct SharedContextBriefingSnapshot {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SubagentObservability {
+    /// Explicit creation title; legacy runs have no title.
+    pub title: Option<String>,
     pub parent_run_id: Option<String>,
     /// Stable source invocation identity in the parent transcript.
     pub invocation_turn_id: Option<String>,
@@ -392,6 +396,8 @@ pub struct SubagentRecord {
 
 #[derive(Debug, Error)]
 pub enum SessionError {
+    #[error("session repository does not support durable initial instructions")]
+    InitialInstructionsUnsupported,
     #[error("could not determine Nakode's application-data directory")]
     MissingDataDirectory,
     #[error("failed to create session database directory {path}: {source}")]
@@ -713,7 +719,11 @@ pub trait SessionRepository: Send + Sync {
         code_mode: Option<bool>,
         tool_configuration: Option<&nakode_protocol::SessionToolConfiguration>,
         owner_prompt: Option<&PersistedOwnerPrompt>,
+        initial_instructions: Option<&str>,
     ) -> Result<SessionRecord, SessionError> {
+        if initial_instructions.is_some() {
+            return Err(SessionError::InitialInstructionsUnsupported);
+        }
         let record = self.create_with_account_id(
             id,
             provider,
@@ -1639,13 +1649,15 @@ impl SqliteSessionRepository {
             )?;
             transaction.commit()?;
         }
+        let session_transaction =
+            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let session_columns = {
-            let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+            let mut statement = session_transaction.prepare("PRAGMA table_info(sessions)")?;
             statement
                 .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let mut session_migration = String::from("BEGIN IMMEDIATE;\n");
+        let mut session_migration = String::new();
         for (column, definition) in [
             ("model_reasoning_effort", "TEXT"),
             ("model_fast_mode", "INTEGER NOT NULL DEFAULT 0"),
@@ -1660,6 +1672,7 @@ impl SqliteSessionRepository {
             ("account_id", "TEXT"),
             ("code_mode", "INTEGER NOT NULL DEFAULT 0"),
             ("tool_configuration_json", "TEXT"),
+            ("initial_instructions", "TEXT"),
         ] {
             if !session_columns.iter().any(|existing| existing == column) {
                 writeln!(
@@ -1669,8 +1682,8 @@ impl SqliteSessionRepository {
                 .expect("writing to a String cannot fail");
             }
         }
-        session_migration.push_str("COMMIT;");
-        execute_batch_with_busy_retry(&connection, &session_migration)?;
+        session_transaction.execute_batch(&session_migration)?;
+        session_transaction.commit()?;
         execute_batch_with_busy_retry(
             &connection,
             "BEGIN IMMEDIATE;
@@ -1695,13 +1708,16 @@ impl SqliteSessionRepository {
              CREATE INDEX IF NOT EXISTS sessions_account ON sessions(account_id);
              COMMIT;",
         )?;
+        let orchestration_transaction =
+            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let orchestration_columns = {
-            let mut statement = connection.prepare("PRAGMA table_info(orchestration_runs)")?;
+            let mut statement =
+                orchestration_transaction.prepare("PRAGMA table_info(orchestration_runs)")?;
             statement
                 .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let mut orchestration_migration = String::from("BEGIN IMMEDIATE;\n");
+        let mut orchestration_migration = String::new();
         if !orchestration_columns.iter().any(|column| column == "model") {
             orchestration_migration
                 .push_str("ALTER TABLE orchestration_runs ADD COLUMN model TEXT;\n");
@@ -1734,6 +1750,7 @@ impl SqliteSessionRepository {
                 "TEXT NOT NULL DEFAULT '{}'",
             ),
             ("transcript_has_earlier", "INTEGER NOT NULL DEFAULT 0"),
+            ("title", "TEXT"),
         ] {
             if !orchestration_columns
                 .iter()
@@ -1746,8 +1763,8 @@ impl SqliteSessionRepository {
                 .expect("writing to a String cannot fail");
             }
         }
-        orchestration_migration.push_str("COMMIT;");
-        execute_batch_with_busy_retry(&connection, &orchestration_migration)?;
+        orchestration_transaction.execute_batch(&orchestration_migration)?;
+        orchestration_transaction.commit()?;
         apply_subagent_transcript_boundary_migration(&mut connection)?;
         let agent_turn_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(agent_turns)")?;
@@ -2006,6 +2023,7 @@ impl SqliteSessionRepository {
             provider_session_id: row.get(2)?,
             workspace: row.get(3)?,
             working_directory: row.get(15)?,
+            initial_instructions: row.get(21)?,
             title: row.get(4)?,
             model: row.get(5)?,
             model_options: ModelOptions {
@@ -2680,10 +2698,10 @@ fn save_subagent_transaction(
             termination_detail, objective_mismatch_handoff, salvage_json,
             continued_from_run_id, continued_by_run_id, continuation_depth, additional_turns,
             inherited_evidence_json, shared_context_utilization_json, transcript_has_earlier,
-            created_at, updated_at)
+            created_at, updated_at, title)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                 ?30, ?31, ?32, ?33, ?34, ?34)
+                 ?30, ?31, ?32, ?33, ?34, ?34, ?35)
          ON CONFLICT(parent_session_id, id) DO UPDATE SET
            agent_slug = excluded.agent_slug,
            provider = excluded.provider,
@@ -2716,6 +2734,7 @@ fn save_subagent_transaction(
            inherited_evidence_json = excluded.inherited_evidence_json,
            shared_context_utilization_json = excluded.shared_context_utilization_json,
            transcript_has_earlier = excluded.transcript_has_earlier,
+           title = excluded.title,
            updated_at = excluded.updated_at",
         params![
             record.parent_session_id,
@@ -2761,6 +2780,7 @@ fn save_subagent_transaction(
                 .expect("shared context utilization serializes"),
             i64::from(record.transcript_has_earlier),
             now,
+            record.observability.title,
         ],
     )?;
     transaction.execute(
@@ -3102,7 +3122,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
@@ -3123,7 +3143,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let rows = statement.query_map([], Self::row)?;
@@ -3144,7 +3164,7 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
+                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
                  FROM sessions WHERE id = ?1",
                 [id],
                 Self::row,
@@ -3157,7 +3177,7 @@ impl SessionRepository for SqliteSessionRepository {
             return Ok(Some(exact));
         }
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
              FROM sessions
              WHERE substr(id, 1, length(?1)) = ?1
              ORDER BY updated_at DESC LIMIT 2",
@@ -3241,7 +3261,7 @@ impl SessionRepository for SqliteSessionRepository {
             ],
         )?;
         connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -3277,6 +3297,7 @@ impl SessionRepository for SqliteSessionRepository {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -3297,6 +3318,7 @@ impl SessionRepository for SqliteSessionRepository {
         code_mode: Option<bool>,
         tool_configuration: Option<&nakode_protocol::SessionToolConfiguration>,
         owner_prompt: Option<&PersistedOwnerPrompt>,
+        initial_instructions: Option<&str>,
     ) -> Result<SessionRecord, SessionError> {
         let now = unix_timestamp();
         let title = title.lines().next().unwrap_or("New session").trim();
@@ -3342,9 +3364,9 @@ impl SessionRepository for SqliteSessionRepository {
             "INSERT INTO sessions
              (id, provider, account_id, provider_session_id, workspace, working_directory,
               title, model, model_reasoning_effort, model_fast_mode, created_at, updated_at,
-              last_owner_activity_at, enabled_skill_ids_json, code_mode, tool_configuration_json)
+              last_owner_activity_at, enabled_skill_ids_json, code_mode, tool_configuration_json, initial_instructions)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11, ?12,
-                     COALESCE(?13, 0), ?14)
+                     COALESCE(?13, 0), ?14, ?15)
              ON CONFLICT(provider, provider_session_id) DO UPDATE SET
                account_id = COALESCE(sessions.account_id, excluded.account_id),
                code_mode = COALESCE(?13, sessions.code_mode),
@@ -3381,6 +3403,7 @@ impl SessionRepository for SqliteSessionRepository {
                 enabled_skill_ids_json,
                 code_mode.map(i64::from),
                 tool_configuration_json,
+                initial_instructions,
             ],
         )?;
         let record = transaction.query_row(
@@ -3388,7 +3411,7 @@ impl SessionRepository for SqliteSessionRepository {
                     model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model,
                     last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome,
                     created_at, updated_at, COALESCE(working_directory, workspace),
-                    last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json
+                    last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -4605,7 +4628,7 @@ impl SessionRepository for SqliteSessionRepository {
                     termination_kind, termination_detail, objective_mismatch_handoff,
                     salvage_json, continued_from_run_id, continued_by_run_id, continuation_depth,
                     additional_turns, inherited_evidence_json, shared_context_utilization_json,
-                    transcript_has_earlier
+                    transcript_has_earlier, title
              FROM orchestration_runs
              WHERE parent_session_id = ?1
              ORDER BY started_at_ms, id",
@@ -4646,6 +4669,7 @@ impl SessionRepository for SqliteSessionRepository {
                 row.get::<_, String>(29)?,
                 row.get::<_, String>(30)?,
                 row.get::<_, i64>(31)? != 0,
+                row.get::<_, Option<String>>(32)?,
             ))
         })?;
         let stored_runs = rows.collect::<Result<Vec<_>, _>>()?;
@@ -4683,6 +4707,7 @@ impl SessionRepository for SqliteSessionRepository {
             inherited_evidence_json,
             shared_context_utilization_json,
             transcript_has_earlier,
+            title,
         ) in stored_runs
         {
             let salvage = salvage_json
@@ -4721,6 +4746,7 @@ impl SessionRepository for SqliteSessionRepository {
                 status: SubagentStatus::from_database(&status)?,
                 latest_activity,
                 observability: SubagentObservability {
+                    title,
                     parent_run_id,
                     invocation_turn_id,
                     invocation_call_id,
@@ -6663,6 +6689,7 @@ mod tests {
             Some(false),
             Some(&configuration),
             None,
+            None,
         )?;
         assert_eq!(created.tool_configuration.as_ref(), Some(&configuration));
         store.set_session_tool_configuration(&created.id, &configuration)?;
@@ -7249,6 +7276,7 @@ mod tests {
                 },
             ],
             observability: SubagentObservability {
+                title: Some("Audit persistence".to_owned()),
                 parent_run_id: Some("agent-root".to_owned()),
                 invocation_turn_id: Some("turn-owner".to_owned()),
                 invocation_call_id: Some("call-delegate".to_owned()),
@@ -8042,6 +8070,79 @@ mod tests {
     }
 
     #[test]
+    fn instructions_and_owner_text_persist_separately_across_reopen_and_provider_switch()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("sessions.db");
+        let repository = SqliteSessionRepository::open(&path)?;
+        let instructions = "Operate within the attached stack.\nPreserve existing work.";
+        let prompt = PersistedOwnerPrompt {
+            prompt_id: "owner-1".to_owned(),
+            raw_text: "Investigate the routing defect.".to_owned(),
+            source_transport: None,
+            dispatch_pending: true,
+        };
+        let created = repository.create_with_account_id_and_skill_profile(
+            "instruction-session",
+            crate::backend::CODEX_PROVIDER,
+            None,
+            "native-instructions",
+            "/workspace",
+            "/workspace",
+            "Audit routing",
+            None,
+            &ModelOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            Some(&prompt),
+            Some(instructions),
+        )?;
+        assert_eq!(created.initial_instructions.as_deref(), Some(instructions));
+        // Retried creation cannot replace established instructions with another caller's prose.
+        repository.create_with_account_id_and_skill_profile(
+            "ignored-retry-id",
+            crate::backend::CODEX_PROVIDER,
+            None,
+            "native-instructions",
+            "/workspace",
+            "/workspace",
+            "Ignored title",
+            None,
+            &ModelOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("replacement"),
+        )?;
+        repository.transition_primary_with_account(
+            &created.id,
+            crate::backend::DEVIN_PROVIDER,
+            None,
+            "other-native-session",
+            None,
+            &ModelOptions::default(),
+        )?;
+        drop(repository);
+        let reopened = SqliteSessionRepository::open(&path)?;
+        let restored = reopened.find(&created.id)?.expect("durable session");
+        assert_eq!(restored.initial_instructions.as_deref(), Some(instructions));
+        assert_eq!(restored.title, "Audit routing");
+        assert_eq!(restored.owner_prompts, vec![prompt]);
+        assert_eq!(restored.provider, crate::backend::DEVIN_PROVIDER);
+        assert_eq!(
+            reopened.list_recent("/workspace", 10)?[0]
+                .initial_instructions
+                .as_deref(),
+            Some(instructions)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn account_profile_and_code_mode_creation_is_atomic() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let repository = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
@@ -8061,6 +8162,7 @@ mod tests {
             None,
             Some("profile-a"),
             Some(true),
+            None,
             None,
             None,
         )?;
@@ -8088,6 +8190,7 @@ mod tests {
                 None,
                 Some("profile-b"),
                 Some(false),
+                None,
                 None,
                 None,
             )
@@ -8145,6 +8248,7 @@ mod tests {
                 Some(false),
                 None,
                 Some(&prompt),
+                None,
             )
             .expect_err("owner insert failure must abort the session creation transaction");
         assert!(matches!(error, SessionError::Database(_)));
@@ -8208,6 +8312,7 @@ mod tests {
                     Some(false),
                     None,
                     Some(&prompt),
+                    None,
                 )
             }));
         }

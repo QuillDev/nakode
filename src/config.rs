@@ -194,6 +194,9 @@ pub enum NakodeCommand {
         agent_slug: String,
         #[arg(long)]
         session_id: String,
+        /// A concise title for this specific delegated task (1–120 characters).
+        #[arg(long)]
+        title: String,
         #[arg(long, default_value = "Complete your predefined assignment.")]
         task: String,
         /// Attributed parent run for policy-bounded recursive delegation.
@@ -851,6 +854,7 @@ mod tests {
             "agent",
             "reviewer",
             "--session-id=session-7",
+            "--title=Audit authentication",
             "--task=Review auth",
         ])
         .expect("agent command");
@@ -860,9 +864,10 @@ mod tests {
             Some(NakodeCommand::Agent {
                 agent_slug,
                 session_id,
+                title,
                 task,
                 parent_run_id: None,
-            }) if agent_slug == "reviewer" && session_id == "session-7" && task == "Review auth"
+            }) if agent_slug == "reviewer" && session_id == "session-7" && title == "Audit authentication" && task == "Review auth"
         ));
         assert!(Config::try_parse_from(["nakode", "agent", "explorer"]).is_err());
     }

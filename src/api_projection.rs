@@ -1478,6 +1478,7 @@ fn todo_phase(value: api::TodoPhase) -> Result<view::TodoPhaseView, String> {
 
 pub(crate) fn run(value: api::RunState) -> Result<view::RunView, String> {
     Ok(view::RunView {
+        title: value.title,
         id: view::RunId::from(value.id),
         parent_run_id: value.parent_run_id.map(view::RunId::from),
         agent_slug: value.agent_slug,

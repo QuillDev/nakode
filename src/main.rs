@@ -87,11 +87,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NakodeCommand::Agent {
             agent_slug,
             session_id,
+            title,
             task,
             parent_run_id,
         } => {
             let result =
-                agent_cli::run(&config, agent_slug, session_id, task, parent_run_id).await?;
+                agent_cli::run(&config, agent_slug, session_id, title, task, parent_run_id).await?;
             println!("{}", result.output);
             if !result.success {
                 return Err("agent invocation failed".into());
@@ -111,9 +112,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NakodeCommand::PurgeUnsafe => {
             purge::run().await?;
         }
-        NakodeCommand::RestartStale => {
-            service_cli::restart_stale().await?;
-        }
+        NakodeCommand::RestartStale => service_cli::restart_stale().await?,
         NakodeCommand::RemoteUpdateHelper { state, attempt } => {
             remote_update::run_helper(&state, &attempt)?;
         }

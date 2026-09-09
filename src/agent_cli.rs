@@ -27,25 +27,27 @@ pub async fn run(
     config: &Config,
     agent_slug: String,
     session_id: String,
+    title: String,
     task: String,
     parent_run_id: Option<String>,
 ) -> Result<AgentCommandResult, AgentCliError> {
     let client = native_client::connect(config)
         .await
         .map_err(|error| AgentCliError::NativeClientStart(error.to_string()))?;
-    delegate_and_wait(&client, agent_slug, session_id, task, parent_run_id).await
+    delegate_and_wait(&client, agent_slug, session_id, title, task, parent_run_id).await
 }
 
 async fn delegate_and_wait(
     client: &nakode_sdk::NakodeClient,
     agent_slug: String,
     session_id: String,
+    title: String,
     task: String,
     parent_run_id: Option<String>,
 ) -> Result<AgentCommandResult, AgentCliError> {
     client.get_session(session_id.clone()).await?;
     let run_id = client
-        .delegate_attributed(session_id, agent_slug, task, parent_run_id, None)
+        .delegate_attributed(session_id, agent_slug, title, task, parent_run_id, None)
         .await?;
     let mut updates = client.watch_run(run_id.clone());
     while let Some(update) = updates.next().await {
@@ -192,6 +194,7 @@ mod tests {
 
     fn run(status: RunStatus) -> RunView {
         RunView {
+            title: None,
             id: RunId::from("run-7"),
             parent_run_id: None,
             agent_slug: "reviewer".to_owned(),

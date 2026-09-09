@@ -688,6 +688,8 @@ pub struct SharedContextBriefingView {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunView {
+    #[serde(default)]
+    pub title: Option<String>,
     pub id: RunId,
     #[serde(default)]
     pub parent_run_id: Option<RunId>,
@@ -780,6 +782,8 @@ pub struct RunPage {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunMetadataView {
+    #[serde(default)]
+    pub title: Option<String>,
     pub id: RunId,
     pub agent_slug: String,
     pub provider_id: ProviderId,

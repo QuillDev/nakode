@@ -3526,6 +3526,16 @@ mod tests {
     }
 
     #[test]
+    fn codex_request_keeps_operating_instructions_out_of_user_history() {
+        let request = test_request();
+        let body = codex_request_body(&request);
+        assert_eq!(body["instructions"], "Be direct.");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["text"], "Hi");
+        assert!(!body["input"].to_string().contains("Be direct."));
+    }
+
+    #[test]
     fn codex_requests_disable_provider_storage() {
         let body = codex_request_body(&test_request());
 

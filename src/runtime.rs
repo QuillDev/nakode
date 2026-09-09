@@ -4052,6 +4052,7 @@ mod tests {
                 name: crate::tools::NAKODE_AGENT_TOOL_NAME.to_owned(),
                 arguments: json!({
                     "agent": "repo-explorer",
+                    "title": "Audit runtime boundaries",
                     "task": "Inspect the runtime boundary."
                 }),
             },

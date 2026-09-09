@@ -1410,12 +1410,14 @@ impl NakodeClient {
         &self,
         session_id: impl Into<String>,
         agent_slug: impl Into<String>,
+        title: impl Into<String>,
         task: impl Into<String>,
         expected_revision: Option<u64>,
     ) -> Result<String, SdkError> {
         self.delegate_attributed(
             session_id,
             agent_slug,
+            title,
             task,
             None::<String>,
             expected_revision,
@@ -1431,6 +1433,7 @@ impl NakodeClient {
         &self,
         session_id: impl Into<String>,
         agent_slug: impl Into<String>,
+        title: impl Into<String>,
         task: impl Into<String>,
         parent_run_id: Option<impl Into<String>>,
         expected_revision: Option<u64>,
@@ -1442,6 +1445,7 @@ impl NakodeClient {
                 mutation: Some(mutation(expected_revision)),
                 session_id: session_id.into(),
                 agent_slug: agent_slug.into(),
+                title: title.into(),
                 task: task.into(),
                 parent_run_id: parent_run_id.map(Into::into),
             }

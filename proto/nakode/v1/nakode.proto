@@ -874,7 +874,7 @@ message SettingsPatch {
 }
 message UpdateSettingsRequest { MutationOptions mutation = 1; SettingsPatch patch = 2; }
 
-message DelegateRequest { MutationOptions mutation = 1; string session_id = 2; string agent_slug = 3; string task = 4; optional string parent_run_id = 5; }
+message DelegateRequest { MutationOptions mutation = 1; string session_id = 2; string agent_slug = 3; string task = 4; optional string parent_run_id = 5; string title = 6; }
 message PublishSharedContextRequest {
   MutationOptions mutation = 1;
   string session_id = 2;
@@ -1460,6 +1460,8 @@ message RunState {
   optional TranscriptEntry originating_owner_entry = 42;
   SharedContextUtilization shared_context_utilization = 43;
   optional SharedContextBriefing shared_context_briefing = 44;
+  // Explicit task title; absent on legacy runs.
+  optional string title = 45;
 }
 message RunTextWindow { string run_id = 1; RunTextField field = 2; string text = 3; uint64 start_byte = 4; uint64 total_bytes = 5; bool has_earlier = 6; }
 message Artifact { string id = 1; string label = 2; string media_type = 3; uint64 byte_length = 4; bytes data = 5; }

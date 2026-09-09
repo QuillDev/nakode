@@ -245,6 +245,29 @@ only when the discovered model advertises it. `false` does not request a slow ti
 provider behaviour unchanged. An inherited or fallback model is checked after it resolves, before
 Nakode projects options onto the delegated session.
 
+`CreateSession.initial_instructions` is stored separately from accepted user prompts in logical
+session metadata. Pending-session recovery restores the creation-time instructions, and logical
+provider transitions preserve them. A new logical session clears the previous session's client
+instructions. Legacy rows without this metadata remain absent: Nakode does not infer instructions
+from old user messages or silently rewrite transcript history. Provider-native resume continues to
+use that adapter's persisted context.
+
+New delegations require a concise, task-specific title (1–120 characters) separate from the full
+assignment. The native `nakode_agent` tool and compatibility delegation tool require `title`;
+`DelegateRequest.title` and the SDK delegation methods carry it to the server. The CLI requires
+`--title`, for example:
+
+```bash
+nakode agent repo-explorer --session-id SESSION_ID \
+  --title 'Audit session persistence' --task 'Trace session creation and report persistence gaps.'
+```
+
+The server validates and persists the title independently of the objective and exposes it as
+`RunState.title`. Legacy runs retain an absent title; continuation runs inherit their source title.
+An explicit `CreateSession.title` also remains the logical session title instead of being replaced
+by its first prompt. Callers using the updated delegation API must supply titles; old calls without
+one are rejected rather than assigned a task-derived title.
+
 Owner-defined definitions additionally carry ownership and availability, canonical capability/tool
 allow and deny lists, a tool profile (`none`, `read_only`, `command_runner`, `bounded_watcher`, or
 `custom`), task/output contracts, bounded lifecycle values, fallback policy, and delegation/parent

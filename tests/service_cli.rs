@@ -248,6 +248,7 @@ fn nakode(workspace: &Path, control: &Path) -> Command {
     command
         .env("NAKODE_CONTROL_DIR", control)
         .env("HOME", workspace)
+        .env("NAKODE_HOME", workspace.join(".nakode"))
         .current_dir(workspace);
     command
 }

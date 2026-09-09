@@ -1272,7 +1272,10 @@ mod tests {
             .expect("native delegation tool")
             .definition();
         assert_eq!(definition.name, "nakode_agent");
-        assert_eq!(definition.parameters["required"], json!(["agent", "task"]));
+        assert_eq!(
+            definition.parameters["required"],
+            json!(["agent", "title", "task"])
+        );
         assert_eq!(definition.parameters["additionalProperties"], false);
     }
 
@@ -1302,7 +1305,7 @@ mod tests {
                 questions: &questions,
                 delegation: Some(&requests),
             },
-            json!({"agent":"repo-explorer","task":"Inspect routing"}),
+            json!({"agent":"repo-explorer","title":"Audit routing","task":"Inspect routing"}),
             &cancellation,
         );
         let server = async {
@@ -1315,6 +1318,7 @@ mod tests {
             assert_eq!(request.invocation_turn_id, "turn-native");
             assert_eq!(request.invocation_call_id, "call-native");
             assert_eq!(request.agent, "repo-explorer");
+            assert_eq!(request.title, "Audit routing");
             assert_eq!(request.task, "Inspect routing");
             request
                 .respond

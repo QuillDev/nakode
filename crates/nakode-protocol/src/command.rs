@@ -451,6 +451,7 @@ pub enum Command {
     Delegate {
         session_id: SessionId,
         agent_slug: String,
+        title: String,
         task: String,
         parent_run_id: Option<RunId>,
     },

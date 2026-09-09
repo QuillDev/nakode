@@ -900,9 +900,16 @@ impl ServerCore {
             Command::Delegate {
                 session_id,
                 agent_slug,
+                title,
                 task,
                 parent_run_id,
-            } => self.delegate_command(&session_id, &agent_slug, &task, parent_run_id.as_ref()),
+            } => self.delegate_command(
+                &session_id,
+                &agent_slug,
+                &title,
+                &task,
+                parent_run_id.as_ref(),
+            ),
             Command::PublishSharedContext {
                 session_id,
                 author_run_id,
@@ -1270,10 +1277,11 @@ impl ServerCore {
         engine.state_mut().set_working_directory(working_directory);
         engine.state_mut().set_skill_profile(profile_id);
         engine.state_mut().install_skill_snapshot(skills, None);
+        let mut effects = engine.state_mut().create_logical_session()?;
         engine
             .state_mut()
             .set_initial_client_instructions(initial_instructions)?;
-        let mut effects = engine.state_mut().create_logical_session()?;
+        engine.state_mut().set_creation_title(title);
         engine.state_mut().set_provider_account_override(account_id);
         let session_id = SessionId::from(engine.state().nakode_session_id.clone());
         if let Some(model_id) = model_id {
@@ -2577,6 +2585,7 @@ impl ServerCore {
         &mut self,
         session_id: &SessionId,
         agent_slug: &str,
+        title: &str,
         task: &str,
         parent_run_id: Option<&str>,
         request_id: u64,
@@ -2594,11 +2603,11 @@ impl ServerCore {
             .state_mut()
             .delegate_agent_attributed_for_request(
                 agent_slug,
+                title,
                 task,
                 parent_run_id,
                 request_id,
-                invocation_turn_id,
-                invocation_call_id,
+                (invocation_turn_id, invocation_call_id),
             )
     }
 
@@ -2606,6 +2615,7 @@ impl ServerCore {
         &mut self,
         session_id: &SessionId,
         agent_slug: &str,
+        title: &str,
         task: &str,
         parent_run_id: Option<&RunId>,
     ) -> DomainCommandOutcome {
@@ -2624,6 +2634,7 @@ impl ServerCore {
             .state_mut()
             .delegate_agent_attributed(
                 agent_slug,
+                title,
                 task,
                 parent_run_id.map(nakode_protocol::RunId::as_str),
             )?;
@@ -4833,6 +4844,7 @@ fn session_metadata(view: &SessionView) -> SessionMetadataView {
 
 fn run_metadata(view: &RunView) -> RunMetadataView {
     RunMetadataView {
+        title: view.title.clone(),
         id: view.id.clone(),
         agent_slug: view.agent_slug.clone(),
         provider_id: view.provider_id.clone(),
@@ -5701,6 +5713,7 @@ mod tests {
         let canonical = directory.path().canonicalize().expect("canonical cwd");
         let restored_id = SessionId::from("restored-cwd-session");
         core.replace_session_records(vec![SessionRecord {
+            initial_instructions: None,
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-restored-cwd".to_owned(),
@@ -5748,6 +5761,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("persisted cwd");
         let restored_id = SessionId::from("resume-unsupported-session");
         core.replace_session_records(vec![SessionRecord {
+            initial_instructions: None,
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-resume-unsupported".to_owned(),
@@ -5786,6 +5800,42 @@ mod tests {
                 .status_message
                 .contains("does not support session resume")
         );
+    }
+
+    #[test]
+    fn explicit_creation_title_is_not_replaced_by_the_first_prompt() {
+        let (mut core, _) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let (created, _) = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                None,
+                Some("Audit session persistence"),
+                None,
+                &ModelOptions::default(),
+                None,
+                Some("Standing operating instructions"),
+                None,
+                None,
+            )
+            .expect("created session");
+        let session_id = SessionId::from(created.resource_id.expect("session id"));
+        let (_, effects) = core
+            .try_execute_command(Command::SendPrompt {
+                session_id: session_id.clone(),
+                prompt: PromptInput {
+                    text:
+                        "You are working inside the fstack dashboard.\n\nInvestigate persistence."
+                            .to_owned(),
+                    attachments: Vec::new(),
+                },
+            })
+            .expect("first owner turn");
+        let persisted_title = effects.iter().find_map(|effect| match effect {
+            crate::state::Effect::PersistSession { title, .. } => Some(title.as_str()),
+            _ => None,
+        });
+        assert_eq!(persisted_title, Some("Audit session persistence"));
     }
 
     #[test]
@@ -7101,6 +7151,7 @@ mod tests {
             allowed_builtin_tools: Some(vec!["read".to_owned()]),
         };
         core.replace_session_records(vec![SessionRecord {
+            initial_instructions: None,
             id: id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             account_id: None,
@@ -7231,6 +7282,7 @@ mod tests {
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-tools-session");
         core.replace_session_records(vec![SessionRecord {
+            initial_instructions: None,
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-restored".to_owned(),
@@ -7302,6 +7354,7 @@ mod tests {
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-unavailable-memory");
         core.replace_session_records(vec![SessionRecord {
+            initial_instructions: None,
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-unavailable-memory".to_owned(),
@@ -7409,6 +7462,7 @@ mod tests {
         install_available_tools(&mut core, CLAUDE_PROVIDER, &["read", "ask"]);
         let restored_id = SessionId::from("restored-claude-session");
         core.replace_session_records(vec![SessionRecord {
+            initial_instructions: None,
             id: restored_id.to_string(),
             provider: CLAUDE_PROVIDER.to_owned(),
             provider_session_id: "claude-thread".to_owned(),
@@ -7550,6 +7604,7 @@ mod tests {
         assert_eq!(core.sessions_by_id.len(), session_count);
 
         core.replace_session_records(vec![SessionRecord {
+            initial_instructions: None,
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-old".to_owned(),
@@ -7584,6 +7639,7 @@ mod tests {
     fn persisted_initial_engine_is_discoverable_after_restart_reconciliation() {
         let (mut core, initial_id) = ready_codex_server();
         core.replace_session_records(vec![SessionRecord {
+            initial_instructions: None,
             id: initial_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "thread-1".to_owned(),
@@ -8757,12 +8813,18 @@ mod tests {
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
 
         let empty = core
-            .delegate_command(&session_id, "missing", "   ", None)
+            .delegate_command(&session_id, "missing", "Audit authentication", "   ", None)
             .expect_err("blank delegation must be rejected");
         assert!(empty.to_string().contains("non-empty task"));
 
         let unknown = core
-            .delegate_command(&session_id, "missing", "Inspect authentication", None)
+            .delegate_command(
+                &session_id,
+                "missing",
+                "Audit authentication",
+                "Inspect authentication",
+                None,
+            )
             .expect_err("unknown agent must be rejected");
         assert!(unknown.to_string().contains("predefined agent"));
         assert!(
@@ -8795,7 +8857,13 @@ enabled = false
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
 
         let error = core
-            .delegate_command(&session_id, "designer", "Inspect the interface", None)
+            .delegate_command(
+                &session_id,
+                "designer",
+                "Audit interface",
+                "Inspect the interface",
+                None,
+            )
             .expect_err("stale direct invocation must honor disabled state");
         assert!(error.to_string().contains("is disabled"));
         assert!(
@@ -8819,7 +8887,13 @@ enabled = true
         .expect("re-enabled agent definition");
 
         let (accepted, effects) = core
-            .delegate_command(&session_id, "designer", "Inspect the interface", None)
+            .delegate_command(
+                &session_id,
+                "designer",
+                "Audit interface",
+                "Inspect the interface",
+                None,
+            )
             .expect("re-enabled global agent is available");
 
         assert!(accepted.resource_id.is_some());
@@ -10558,6 +10632,7 @@ enabled = false
             .expect("first delete rotates the role");
         let successor = core.default_session_id().clone();
         core.replace_session_records(vec![SessionRecord {
+            initial_instructions: None,
             id: former_initial.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
             provider_session_id: "stale-thread".to_owned(),
