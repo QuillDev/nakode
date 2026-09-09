@@ -1,0 +1,17 @@
+[package]
+name = "nakode-telemetry"
+version = "0.1.0"
+edition = "2024"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+opentelemetry = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-json", "reqwest-blocking-client", "reqwest-rustls"] }
+http = "1"
+http-body = "1"
+pin-project-lite = "0.2"
+tonic = "0.14.6"
+tower = "0.5"

@@ -2009,7 +2009,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             rpc_lanes: RPC_LANE_CATALOGUE
                 .iter()
                 .filter(|assignment| {
-                    self.include_activation_rpc_lanes || assignment.service != "ActivationService"
+                    self.include_activation_rpc_lanes || assignment.service == "NakodeService"
                 })
                 .map(|assignment| api::RpcLaneDefinition {
                     service: assignment.service.to_owned(),
@@ -4151,8 +4151,7 @@ mod tests {
         assert!(decoded.shared_context_briefing.is_none());
     }
 
-    #[test]
-    fn launch_critical_session_omits_bodies_and_preserves_explicit_paging_metadata() {
+    fn session_with_full_paging_bodies() -> api::SessionState {
         let transcript = api::TranscriptPage {
             entries: vec![api::TranscriptEntry {
                 id: "entry-1".to_owned(),
@@ -4162,7 +4161,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let mut state = api::SessionState {
+        api::SessionState {
             transcript: Some(transcript.clone()),
             active_agent_session: Some(api::AgentSession {
                 transcript: Some(transcript.clone()),
@@ -4198,7 +4197,12 @@ mod tests {
                 arguments_json: "{}".to_owned(),
             }],
             ..Default::default()
-        };
+        }
+    }
+
+    #[test]
+    fn launch_critical_session_omits_bodies_and_preserves_explicit_paging_metadata() {
+        let mut state = session_with_full_paging_bodies();
 
         let full_bytes = prost::Message::encoded_len(&state);
         let mut parent_state = state.clone();

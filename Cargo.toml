@@ -16,6 +16,7 @@ members = [
   "crates/nakode-sdk",
   "crates/nakode-server",
   "crates/nakode-runtime",
+  "crates/nakode-telemetry",
 ]
 exclude = ["crates/nakode-api"]
 resolver = "3"
@@ -42,6 +43,7 @@ codex-process-adapter = []
 e2e-fixture-provider = ["codex-process-adapter"]
 
 [dependencies]
+nakode-telemetry = { path = "crates/nakode-telemetry" }
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }

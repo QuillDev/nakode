@@ -9,6 +9,7 @@ description = "Authoritative request broker and gRPC transport for Nakode"
 pedantic = { level = "warn", priority = -1 }
 
 [dependencies]
+nakode-telemetry = { path = "../nakode-telemetry" }
 futures-util = "0.3"
 nakode-api = { path = "../nakode-api" }
 nakode-protocol = { path = "../nakode-protocol" }

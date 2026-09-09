@@ -19,6 +19,9 @@ use nakode_api::v1::{
     nakode_service_client::NakodeServiceClient,
     remote_update_service_client::RemoteUpdateServiceClient,
 };
+pub use nakode_telemetry as telemetry;
+use nakode_telemetry::opentelemetry::trace::FutureExt;
+use nakode_telemetry::{RpcLayer, RpcService};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_stream::wrappers::ReceiverStream;
@@ -27,7 +30,7 @@ use tonic::{
     service::{Interceptor, interceptor::InterceptedService},
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
-use tower::service_fn;
+use tower::{Layer, service_fn};
 
 pub use nakode_api::v1;
 
@@ -149,7 +152,7 @@ impl Interceptor for ClientApiKey {
     }
 }
 
-type ApiTransport = InterceptedService<Channel, ClientApiKey>;
+type ApiTransport = InterceptedService<RpcService<Channel>, ClientApiKey>;
 
 /// Cloneable high-level client. A clone shares the reconnecting HTTP/2
 /// channel but each request and watch has independent generated client state.
@@ -169,7 +172,7 @@ pub struct ActivationCursor {
 /// Cloneable client for installation-scoped update activation status and mutations.
 #[derive(Clone)]
 pub struct ActivationClient {
-    transport: ActivationServiceClient<Channel>,
+    transport: ActivationServiceClient<RpcService<Channel>>,
 }
 
 /// Cloneable authenticated client for one remote machine's narrow self-update authority.
@@ -192,7 +195,10 @@ impl RemoteUpdateClient {
         let (channel, key) =
             remote_channel(endpoint, ca_certificate_pem, tls_server_name, api_key).await?;
         Ok(Self {
-            transport: RemoteUpdateServiceClient::with_interceptor(channel, key),
+            transport: RemoteUpdateServiceClient::with_interceptor(
+                RpcLayer(true).layer(channel),
+                key,
+            ),
         })
     }
 
@@ -363,7 +369,7 @@ impl ActivationClient {
         Discovery: Future<Output = Result<Self, SdkError>> + Send + 'static,
     {
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
-        let task = tokio::spawn(async move {
+        let task = spawn_traced(async move {
             let mut cursor = after;
             let mut reconnect_reported = false;
             loop {
@@ -1850,7 +1856,7 @@ impl NakodeClient {
         let client = self.clone();
         let workspace_id = workspace_id.into();
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
-        let task = tokio::spawn(async move {
+        let task = spawn_traced(async move {
             let mut after = None;
             let mut reconnect_reported = false;
             loop {
@@ -1969,7 +1975,7 @@ impl NakodeClient {
     ) -> Watch<api::SessionState> {
         let client = self.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
-        let task = tokio::spawn(async move {
+        let task = spawn_traced(async move {
             let mut after = None;
             let mut reconnect_reported = false;
             loop {
@@ -2076,7 +2082,7 @@ impl NakodeClient {
         let client = self.clone();
         let mut source = self.watch_session(session_id);
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
-        let task = tokio::spawn(async move {
+        let task = spawn_traced(async move {
             while let Some(update) = source.next().await {
                 let hydrated = match update {
                     Ok(state) => client.hydrate_session_with_refresh(state, limit).await,
@@ -2102,7 +2108,7 @@ impl NakodeClient {
         let client = self.clone();
         let mut source = self.watch_attached_session(session_id, attachment);
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
-        let task = tokio::spawn(async move {
+        let task = spawn_traced(async move {
             while let Some(update) = source.next().await {
                 let hydrated = match update {
                     Ok(state) => client.hydrate_session_with_refresh(state, limit).await,
@@ -2120,7 +2126,7 @@ impl NakodeClient {
         let client = self.clone();
         let run_id = run_id.into();
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
-        let task = tokio::spawn(async move {
+        let task = spawn_traced(async move {
             let mut after = None;
             let mut reconnect_reported = false;
             loop {
@@ -2564,13 +2570,15 @@ fn configured_transport(
     channel: Channel,
     interceptor: ClientApiKey,
 ) -> NakodeServiceClient<ApiTransport> {
-    NakodeServiceClient::with_interceptor(channel, interceptor)
+    NakodeServiceClient::with_interceptor(RpcLayer(true).layer(channel), interceptor)
         .max_decoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
         .max_encoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
 }
 
-fn configured_activation_transport(channel: Channel) -> ActivationServiceClient<Channel> {
-    ActivationServiceClient::new(channel)
+fn configured_activation_transport(
+    channel: Channel,
+) -> ActivationServiceClient<RpcService<Channel>> {
+    ActivationServiceClient::new(RpcLayer(true).layer(channel))
         .max_decoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
         .max_encoding_message_size(nakode_api::MAX_API_MESSAGE_BYTES)
 }
@@ -2797,8 +2805,17 @@ fn session_artifact_ids(session: &api::SessionState) -> HashSet<String> {
         .collect()
 }
 
+fn spawn_traced<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(future.with_current_context())
+}
+
 #[cfg(test)]
 mod tests {
+    use nakode_telemetry::{RpcLayer, opentelemetry::trace::FutureExt};
     use std::{
         path::{Path, PathBuf},
         pin::Pin,
@@ -3108,6 +3125,7 @@ mod tests {
         let incoming = UnixListenerStream::new(listener);
         let server = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
+                .layer(RpcLayer(false))
                 .add_service(nakode_server::grpc::GrpcService::new(endpoint).into_server())
                 .serve_with_incoming_shutdown(incoming, async {
                     let _ = stopped.await;
@@ -3202,6 +3220,7 @@ mod tests {
         let incoming = UnixListenerStream::new(listener);
         let server = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
+                .layer(RpcLayer(false))
                 .add_service(api::activation_service_server::ActivationServiceServer::new(service))
                 .serve_with_incoming_shutdown(incoming, async {
                     let _ = stopped.await;
@@ -3226,6 +3245,92 @@ mod tests {
             phase: phase as i32,
             ..api::ActivationStatus::default()
         }
+    }
+
+    #[tokio::test]
+    async fn native_rpc_traces_cross_unix_transport_and_broker_without_context_leaks() {
+        use nakode_telemetry::{
+            Scope,
+            opentelemetry::{
+                Context, global,
+                trace::{SpanKind, TraceContextExt},
+            },
+        };
+        use opentelemetry_sdk::{
+            propagation::TraceContextPropagator,
+            trace::{InMemorySpanExporter, SdkTracerProvider},
+        };
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        global::set_tracer_provider(provider.clone());
+        let directory = tempfile::tempdir().expect("trace fixture directory");
+        let socket = directory.path().join("nakode.sock");
+        let server = spawn_session_server(
+            &socket,
+            SessionServerMode::ReattachSame,
+            Arc::new(Mutex::new(None)),
+        );
+        let client = NakodeClient::connect_unix(&socket)
+            .await
+            .expect("connect fixture");
+        let success = Scope::new("host.success", SpanKind::Server, &Context::new());
+        let failure = Scope::new("host.failure", SpanKind::Server, &Context::new());
+        let success_id = success.context().span().span_context().trace_id();
+        let failure_id = failure.context().span().span_context().trace_id();
+        let (ok, error) = tokio::join!(
+            client.get_server_info().with_context(success.context()),
+            client
+                .get_session("private-session")
+                .with_context(failure.context()),
+        );
+        assert!(ok.is_ok());
+        assert!(error.is_err());
+        drop(success);
+        drop(failure);
+        server.stop().await;
+        provider.force_flush().expect("flush traces");
+        let spans = exporter.get_finished_spans().expect("read spans");
+        assert_ne!(success_id, failure_id);
+        for id in [success_id, failure_id] {
+            let linked: Vec<_> = spans
+                .iter()
+                .filter(|span| span.span_context.trace_id() == id)
+                .collect();
+            assert!(linked.iter().any(|span| span.span_kind == SpanKind::Client));
+            assert!(linked.iter().any(|span| span.span_kind == SpanKind::Server && span.name.starts_with("rpc ")));
+            assert_eq!(
+                linked
+                    .iter()
+                    .filter(|span| span.parent_span_id
+                        == nakode_telemetry::opentelemetry::trace::SpanId::INVALID)
+                    .count(),
+                1
+            );
+            for span in &linked {
+                if span.parent_span_id != nakode_telemetry::opentelemetry::trace::SpanId::INVALID {
+                    assert!(
+                        linked
+                            .iter()
+                            .any(|parent| parent.span_context.span_id() == span.parent_span_id)
+                    );
+                }
+                assert!(!span.name.contains("private-session"));
+            }
+        }
+        let failed: Vec<_> = spans
+            .iter()
+            .filter(|span| span.span_context.trace_id() == failure_id)
+            .collect();
+        assert!(failed.iter().any(|span| span.name == "nakode.queue"));
+        assert!(failed.iter().any(|span| span.name == "nakode.admission"));
+        assert!(failed.iter().any(|span| matches!(
+            span.status,
+            nakode_telemetry::opentelemetry::trace::Status::Error { .. }
+        )));
+        provider.shutdown().expect("shutdown tracing");
     }
 
     #[tokio::test]

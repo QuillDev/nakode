@@ -944,6 +944,7 @@ pub async fn run_helper(config: Config) -> Result<(), ActivationError> {
     let incoming = UnixListenerStream::new(listener);
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
+            .layer(nakode_telemetry::RpcLayer(false))
             .add_service(service.into_server())
             .serve_with_incoming_shutdown(incoming, async {
                 let _ = stop_rx.await;
