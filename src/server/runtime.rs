@@ -796,6 +796,7 @@ impl NativeServerRuntime {
         let delegated = self.core.delegate_agent_attributed(
             &session_id,
             &request.agent,
+            &request.title,
             &request.task,
             request.parent_run_id.as_deref(),
             request_id,
@@ -5059,6 +5060,7 @@ fn persist_owner_prompt_effects(
                         Some(tool_configuration.code_mode),
                         Some(&tool_configuration),
                         creation_prompt.as_ref(),
+                        state.initial_client_instructions(),
                     )?;
                     creation_prompt_persisted = creation_prompt.is_some();
                     state.session_persisted(&record);
@@ -5355,6 +5357,7 @@ fn persist_session(
         Some(tool_configuration.code_mode),
         Some(tool_configuration),
         None,
+        state.initial_client_instructions(),
     ) {
         Ok(record) => state.session_persisted(&record),
         Err(error) => state.session_store_failed(error.to_string()),
@@ -6510,6 +6513,9 @@ mod tests {
             model: "model".to_owned(),
         });
         state.provider_account_id = Some(account_id.clone());
+        state
+            .set_initial_client_instructions(Some("Operate only in the attached stack."))
+            .expect("initial instructions");
         let session_id = SessionId::from(state.nakode_session_id.clone());
         let mut initial_effects = state
             .submit_prompt_with_id_and_source(
@@ -6555,6 +6561,16 @@ mod tests {
             mpsc::channel(1).1,
         );
         runtime.fence_owner_prompt_dispatch(&session_id, &mut initial_effects);
+        let stored = SqliteSessionRepository::open(&database)
+            .expect("reopen durable database")
+            .find(session_id.as_str())
+            .expect("read session")
+            .expect("persisted session");
+        assert_eq!(
+            stored.initial_instructions.as_deref(),
+            Some("Operate only in the attached stack.")
+        );
+        assert_eq!(stored.owner_prompts[0].raw_text, "initial");
         assert!(
             initial_effects
                 .iter()

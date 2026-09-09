@@ -939,6 +939,7 @@ pub struct NativeDelegationRequest {
     /// Stable provider tool-call identity shared with the parent audit envelope.
     pub invocation_call_id: String,
     pub agent: String,
+    pub title: String,
     pub task: String,
     /// Provider turn cancellation, observed by the server before and after child creation.
     pub cancellation: tokio_util::sync::CancellationToken,

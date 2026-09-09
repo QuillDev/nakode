@@ -416,6 +416,9 @@ fn session_title(state: &DomainState, sessions: &[SessionRecord]) -> String {
         .find(|session| session.id == state.nakode_session_id)
         .map_or_else(
             || {
+                if let Some(title) = state.creation_title.as_deref() {
+                    return first_line(title);
+                }
                 state
                     .transcript
                     .entries()
@@ -877,6 +880,7 @@ fn project_run(state: &DomainState, run: &SubagentRun, body_budget: usize) -> Ru
     let ended_at_ms = run.observability.ended_at_ms;
     let originating_owner_entry = originating_owner_entry(state, run);
     RunView {
+        title: run.observability.title.clone(),
         id: RunId::from(run.id.clone()),
         parent_run_id: run.observability.parent_run_id.clone().map(RunId::from),
         agent_slug: run.agent.clone(),

@@ -18,6 +18,7 @@ pub struct NakodeAgentTool;
 #[derive(Deserialize)]
 struct Arguments {
     agent: String,
+    title: String,
     task: String,
 }
 
@@ -34,13 +35,19 @@ impl Tool for NakodeAgentTool {
                         "minLength": 1,
                         "description": "Configured agent slug from the current Nakode catalogue."
                     },
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 120,
+                        "description": "Required concise title describing this agent's specific goal, not its role or setup instructions."
+                    },
                     "task": {
                         "type": "string",
                         "minLength": 1,
                         "description": "Concrete bounded task for the delegated agent."
                     }
                 },
-                "required": ["agent", "task"],
+                "required": ["agent", "title", "task"],
                 "additionalProperties": false
             }),
         }
@@ -85,6 +92,7 @@ impl Tool for NakodeAgentTool {
                 invocation_turn_id: context.turn_id.to_owned(),
                 invocation_call_id: context.call_id.to_owned(),
                 agent: arguments.agent,
+                title: arguments.title,
                 task: arguments.task,
                 cancellation: cancellation.clone(),
                 respond,

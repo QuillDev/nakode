@@ -1657,6 +1657,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         protocol::Command::Delegate {
             session_id: protocol::SessionId::from(input.session_id),
             agent_slug: input.agent_slug,
+            title: input.title,
             task: input.task,
             parent_run_id: input.parent_run_id.map(protocol::RunId::from)
         }
@@ -3239,6 +3240,7 @@ fn notice(value: protocol::NoticeView) -> api::Notice {
 
 pub(crate) fn run(value: protocol::RunView) -> api::RunState {
     api::RunState {
+        title: value.title,
         id: value.id.to_string(),
         parent_run_id: value.parent_run_id.map(|id| id.to_string()),
         agent_slug: value.agent_slug,
@@ -3573,6 +3575,7 @@ mod tests {
         briefing: Option<protocol::SharedContextBriefingView>,
     ) -> protocol::RunView {
         protocol::RunView {
+            title: Some("Audit authentication".to_owned()),
             id: protocol::RunId::from("run-briefed"),
             parent_run_id: None,
             agent_slug: "repo-explorer".to_owned(),

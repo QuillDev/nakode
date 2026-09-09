@@ -2607,6 +2607,7 @@ mod tests {
 
     fn run(id: &str, objective: &str, status: RunStatus) -> RunView {
         RunView {
+            title: None,
             id: RunId::from(id),
             parent_run_id: None,
             agent_slug: "explorer".to_owned(),

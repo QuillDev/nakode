@@ -46,6 +46,7 @@ async function delegate(ownerSessionId, task, parentRunId = null) {
         "agent",
         task.archetype,
         `--session-id=${ownerSessionId}`,
+        `--title=${task.title}`,
         `--task=${task.task}`,
         ...(parentRunId ? [`--parent-run-id=${parentRunId}`] : []),
       ],
@@ -96,6 +97,7 @@ function nakodeServer(ownerSessionId, parentRunId) {
         "Delegate one concrete bounded task to a configured Nakode archetype and wait for its result.",
         {
           archetype: z.string().describe("Configured Nakode archetype slug."),
+          title: z.string().trim().min(1).max(120).describe("Required title for this agent's specific goal, not its role or setup instructions."),
           task: z
             .string()
             .describe("Concrete bounded assignment and expected result."),
