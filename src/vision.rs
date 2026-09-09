@@ -5,10 +5,26 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::PromptImage;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VisionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Independent of the calling agent's model options.
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
+}
+
+fn default_reasoning_effort() -> String {
+    "low".to_owned()
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            reasoning_effort: default_reasoning_effort(),
+        }
+    }
 }
 
 impl VisionConfig {
@@ -52,9 +68,17 @@ mod tests {
     use super::VisionConfig;
 
     #[test]
+    fn legacy_configuration_keeps_low_effort() {
+        let config: VisionConfig =
+            serde_json::from_str(r#"{"model":"openai-codex/gpt-5.4"}"#).unwrap();
+        assert_eq!(config.reasoning_effort, "low");
+    }
+
+    #[test]
     fn parses_provider_qualified_model() {
         let config = VisionConfig {
             model: Some("openai-codex/gpt-5.4".to_owned()),
+            ..VisionConfig::default()
         };
 
         assert!(config.is_enabled());

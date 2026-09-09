@@ -958,6 +958,9 @@ pub enum VisionAvailabilityView {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VisionSettingsView {
     pub model_id: Option<ModelId>,
+    /// Absent only when communicating with an older server.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub availability: VisionAvailabilityView,
     #[serde(default)]

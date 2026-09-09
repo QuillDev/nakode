@@ -235,6 +235,9 @@ pub enum SettingsPatch {
     },
     Vision {
         model_id: Option<ModelId>,
+        /// Omission preserves the current vision effort.
+        #[serde(default)]
+        reasoning_effort: Option<String>,
     },
     TerminalImages {
         mode: String,

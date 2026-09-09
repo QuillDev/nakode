@@ -1251,15 +1251,36 @@ fn select_model_intent(state: &mut TuiState, bootstrap: &BootstrapView) -> Input
         return InputOutcome::default();
     };
     if picker_stage == ModelPickerStage::Models
-        && scope != ModelSelectionScope::Vision
-        && model_supports_options(&model)
+        && if scope == ModelSelectionScope::Vision {
+            model.configuration.reasoning_is_configurable()
+        } else {
+            model_supports_options(&model)
+        }
     {
+        let vision_effort = bootstrap.settings.vision.reasoning_effort.clone();
         if let Some(picker) = &mut state.client.model_picker {
             picker.stage = ModelPickerStage::Options;
             picker.option_selected = 0;
-            picker.options = ModelOptions {
-                reasoning_effort: model.reasoning_effort.clone(),
-                fast_mode: model.fast_mode,
+            picker.options = if scope == ModelSelectionScope::Vision {
+                ModelOptions {
+                    reasoning_effort: vision_effort
+                        .filter(|effort| model.configuration.reasoning_efforts.contains(effort))
+                        .or_else(|| {
+                            model
+                                .configuration
+                                .reasoning_efforts
+                                .iter()
+                                .find(|value| value.as_str() == "low")
+                                .cloned()
+                        })
+                        .or_else(|| model.configuration.reasoning_efforts.first().cloned()),
+                    fast_mode: false,
+                }
+            } else {
+                ModelOptions {
+                    reasoning_effort: model.reasoning_effort.clone(),
+                    fast_mode: model.fast_mode,
+                }
             };
             picker.options_fast_only = model_supports_fast_mode(&model)
                 && !model.configuration.reasoning_is_configurable();
@@ -1448,7 +1469,10 @@ fn clear_setting(state: &mut TuiState) -> InputOutcome {
     settings.vision.model = None;
     InputOutcome {
         commands: vec![CommandIntent::new(Command::UpdateSettings {
-            patch: SettingsPatch::Vision { model_id: None },
+            patch: SettingsPatch::Vision {
+                model_id: None,
+                reasoning_effort: None,
+            },
         })],
         ..InputOutcome::default()
     }
@@ -1484,6 +1508,7 @@ fn save_settings_view(state: &TuiState, view: SettingsView) -> InputOutcome {
         },
         SettingsView::Vision => SettingsPatch::Vision {
             model_id: settings.vision.model.clone().map(ModelId::from),
+            reasoning_effort: None,
         },
         SettingsView::Menu | SettingsView::Addons => return InputOutcome::default(),
     };
@@ -1833,12 +1858,12 @@ mod tests {
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
     use nakode_protocol::{
-        AgentSessionId, ConnectionView, ModelConfigurationView, ModelId, ModelView,
+        AgentSessionId, ConnectionView, ModelConfigurationView, ModelId, ModelTarget, ModelView,
         ProviderAuthenticationView, ProviderCapabilities, ProviderId, ProviderView,
         SessionActivity, TurnId, TurnStatus, TurnView,
     };
 
-    use super::{handle_terminal, insert_local_file_paths, open_model_picker};
+    use super::{handle_terminal, insert_local_file_paths, open_model_picker, select_model_intent};
     use crate::{
         api_projection::TuiAction as Command,
         tui_state::{
@@ -2485,6 +2510,23 @@ mod tests {
         open_model_picker(&mut state, ModelSelectionScope::Vision);
         assert_eq!(state.filtered_models().len(), 1);
         assert_eq!(state.filtered_models()[0].id.as_str(), "custom/capable");
+        view.settings.vision.reasoning_effort = Some("large".to_owned());
+        let first = select_model_intent(&mut state, &view);
+        assert!(first.commands.is_empty());
+        let picker = state.client.model_picker.as_ref().unwrap();
+        assert_eq!(picker.options.reasoning_effort.as_deref(), Some("large"));
+        assert!(!picker.options.fast_mode);
+        state.picker_move(1);
+        assert_eq!(
+            state.client.model_picker.as_ref().unwrap().option_selected,
+            0
+        );
+        state.picker_adjust(-1);
+        let selected = select_model_intent(&mut state, &view);
+        assert!(matches!(&selected.commands[0].command,
+            Command::SelectModel { target: ModelTarget::Vision, options, .. }
+                if options.reasoning_effort.as_deref() == Some("small") && !options.fast_mode
+        ));
     }
 
     /// The wheel moves the open catalogue's selection — which is its scroll position — and only reaches

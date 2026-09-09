@@ -860,7 +860,12 @@ message CheckAgentBrowserRequest { MutationOptions mutation = 1; string workspac
 
 message WebSettingsPatch { string backend = 1; optional string credential = 2; }
 message MemorySettingsPatch { string backend = 1; optional string executable = 2; optional string global_bank = 3; optional string data_directory = 4; }
-message VisionSettingsPatch { optional string model_id = 1; bool clear_model = 2; }
+message VisionSettingsPatch {
+  optional string model_id = 1;
+  bool clear_model = 2;
+  // Omission preserves the current effort, including when disabling vision.
+  optional string reasoning_effort = 3;
+}
 message TerminalImagesSettingsPatch { string mode = 1; }
 message InvocationTelemetrySettingsPatch { bool enabled = 1; }
 message SettingsPatch {
@@ -1105,6 +1110,7 @@ message VisionSettings {
   optional string model_id = 1;
   VisionAvailability availability = 2;
   string diagnostic = 3;
+  optional string reasoning_effort = 4;
 }
 enum TerminalImageMode { TERMINAL_IMAGE_MODE_UNSPECIFIED = 0; TERMINAL_IMAGE_MODE_AUTO = 1; TERMINAL_IMAGE_MODE_ON = 2; TERMINAL_IMAGE_MODE_OFF = 3; }
 message Settings {

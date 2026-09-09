@@ -5126,7 +5126,19 @@ impl DomainState {
                 Ok(self.apply_default_model_selection(&selected, options))
             }
             ModelSelectionTarget::Session => self.apply_session_model_selection(&selected, options),
-            ModelSelectionTarget::Vision => Ok(self.apply_vision_model_selection(&selected)),
+            ModelSelectionTarget::Vision => {
+                if options.fast_mode {
+                    return Err(DomainCommandError::Unsupported(
+                        "vision does not support fast mode".to_owned(),
+                    ));
+                }
+                let effort = options
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or(&self.vision_config.reasoning_effort);
+                Self::validate_vision_options(&selected, effort)?;
+                Ok(self.apply_vision_model_selection(&selected, effort.to_owned()))
+            }
         }
     }
 
@@ -5375,8 +5387,36 @@ impl DomainState {
             && self.context_compaction.is_none()
     }
 
-    fn apply_vision_model_selection(&mut self, selected: &ModelInfo) -> Vec<Effect> {
+    fn validate_vision_options(
+        selected: &ModelInfo,
+        effort: &str,
+    ) -> Result<(), DomainCommandError> {
+        let configuration = projection::model_configuration(selected, true);
+        if !configuration.vision_eligible {
+            return Err(DomainCommandError::Unsupported(
+                "model does not support the callable vision service".to_owned(),
+            ));
+        }
+        if !configuration
+            .reasoning_efforts
+            .iter()
+            .any(|value| value == effort)
+        {
+            return Err(DomainCommandError::Unsupported(format!(
+                "vision model {} does not advertise reasoning effort {effort:?}",
+                selected.qualified_id()
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_vision_model_selection(
+        &mut self,
+        selected: &ModelInfo,
+        effort: String,
+    ) -> Vec<Effect> {
         self.vision_config.model = Some(selected.qualified_id());
+        self.vision_config.reasoning_effort = effort;
         self.status_message = format!("Vision model: {}.", selected.display_name());
         vec![Effect::SaveVisionConfig(self.vision_config.clone())]
     }
@@ -5443,10 +5483,32 @@ impl DomainState {
                 }
                 Ok(vec![Effect::SaveMemoryConfig(config)])
             }
-            nakode_protocol::SettingsPatch::Vision { model_id } => {
-                let config = crate::vision::VisionConfig {
-                    model: model_id.as_ref().map(ToString::to_string),
-                };
+            nakode_protocol::SettingsPatch::Vision {
+                model_id,
+                reasoning_effort,
+            } => {
+                let mut config = self.vision_config.clone();
+                config.model = model_id.as_ref().map(ToString::to_string);
+                if let Some(effort) = reasoning_effort {
+                    config.reasoning_effort.clone_from(effort);
+                }
+                if config.reasoning_effort.trim().is_empty() {
+                    return Err(DomainCommandError::Invalid(
+                        "vision reasoning effort must not be empty".to_owned(),
+                    ));
+                }
+                if let Some(model_id) = model_id {
+                    let selected = self
+                        .models
+                        .iter()
+                        .find(|model| model.qualified_id() == model_id.as_str())
+                        .ok_or_else(|| DomainCommandError::NotFound(model_id.to_string()))?;
+                    Self::validate_vision_options(selected, &config.reasoning_effort)?;
+                } else if reasoning_effort.is_some() {
+                    return Err(DomainCommandError::Invalid(
+                        "select a vision model when changing its effort".to_owned(),
+                    ));
+                }
                 Ok(vec![Effect::SaveVisionConfig(config)])
             }
             nakode_protocol::SettingsPatch::TerminalImages { mode } => {
@@ -16551,6 +16613,59 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         assert_eq!(
             transcript.entries()[0].body,
             "The session store owns orchestration metadata."
+        );
+    }
+
+    #[test]
+    fn vision_effort_settings_validate_and_preserve_independent_options() {
+        let mut state = ready_state();
+        let model_id = nakode_protocol::ModelId::from("openai-codex/vision-model");
+        state.models.push(ModelInfo {
+            provider: CODEX_PROVIDER.to_owned(),
+            id: "vision-model".to_owned(),
+            is_default: false,
+            capabilities: crate::codex::model_capabilities(),
+        });
+        let session_model = state.selected_model.clone();
+        let patch = |effort: Option<&str>| nakode_protocol::SettingsPatch::Vision {
+            model_id: Some(model_id.clone()),
+            reasoning_effort: effort.map(str::to_owned),
+        };
+        let effects = state.update_settings_intent(&patch(Some("high"))).unwrap();
+        let [Effect::SaveVisionConfig(config)] = effects.as_slice() else {
+            panic!("save vision")
+        };
+        assert_eq!(config.reasoning_effort, "high");
+        state.install_vision_config(config.clone());
+        let effects = state.update_settings_intent(&patch(None)).unwrap();
+        assert!(
+            matches!(effects.as_slice(), [Effect::SaveVisionConfig(config)] if config.reasoning_effort == "high")
+        );
+        for effort in ["", "bogus", "HIGH"] {
+            assert!(state.update_settings_intent(&patch(Some(effort))).is_err());
+        }
+        let effects = state
+            .select_model_intent(
+                &nakode_protocol::ModelTarget::Vision,
+                &model_id,
+                &nakode_protocol::ModelOptions {
+                    reasoning_effort: Some("medium".to_owned()),
+                    fast_mode: false,
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(effects.as_slice(), [Effect::SaveVisionConfig(config)] if config.reasoning_effort == "medium")
+        );
+        assert_eq!(state.selected_model, session_model);
+        let effects = state
+            .update_settings_intent(&nakode_protocol::SettingsPatch::Vision {
+                model_id: None,
+                reasoning_effort: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(effects.as_slice(), [Effect::SaveVisionConfig(config)] if config.model.is_none() && config.reasoning_effort == "medium")
         );
     }
 

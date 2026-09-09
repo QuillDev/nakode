@@ -540,6 +540,7 @@ fn settings_patch(
             data_directory: value.data_directory,
         }),
         Patch::Vision(value) => Ok(protocol::SettingsPatch::Vision {
+            reasoning_effort: value.reasoning_effort,
             model_id: if value.clear_model {
                 None
             } else {
@@ -2683,6 +2684,7 @@ fn settings(value: protocol::SettingsView) -> api::Settings {
         }),
         vision: Some(api::VisionSettings {
             model_id: value.vision.model_id.map(|id| id.to_string()),
+            reasoning_effort: value.vision.reasoning_effort,
             availability: match value.vision.availability {
                 protocol::VisionAvailabilityView::Unknown => api::VisionAvailability::Unspecified,
                 protocol::VisionAvailabilityView::Disabled => api::VisionAvailability::Disabled,
@@ -3570,6 +3572,29 @@ fn diagnostics_totals(value: &protocol::DiagnosticsUsageTotals) -> api::Diagnost
 mod tests {
     use super::*;
     use crate::ServerRequest;
+
+    #[test]
+    fn vision_settings_patch_preserves_optional_effort_on_the_wire() {
+        for effort in [None, Some("high".to_owned())] {
+            let patch = settings_patch(Some(api::SettingsPatch {
+                patch: Some(api::settings_patch::Patch::Vision(
+                    api::VisionSettingsPatch {
+                        model_id: Some("openai-codex/vision-test".to_owned()),
+                        clear_model: false,
+                        reasoning_effort: effort.clone(),
+                    },
+                )),
+            }))
+            .unwrap();
+            assert_eq!(
+                patch,
+                protocol::SettingsPatch::Vision {
+                    model_id: Some(protocol::ModelId::from("openai-codex/vision-test")),
+                    reasoning_effort: effort,
+                }
+            );
+        }
+    }
 
     fn run_view_with_briefing(
         briefing: Option<protocol::SharedContextBriefingView>,
