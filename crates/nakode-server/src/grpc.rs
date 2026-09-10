@@ -1114,6 +1114,29 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         ))
     }
 
+    async fn list_active_sessions(
+        &self,
+        request: tonic::Request<api::ListActiveSessionsRequest>,
+    ) -> Result<tonic::Response<api::ListActiveSessionsResponse>, tonic::Status> {
+        let (result, timing) = self
+            .query(protocol::Query::ListActiveSessions {
+                workspace_id: protocol::WorkspaceId::from(request.into_inner().workspace_id),
+            })
+            .await?;
+        let protocol::QueryResult::ActiveSessions(sessions) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected active sessions response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            api::ListActiveSessionsResponse {
+                sessions: sessions.into_iter().map(session_overview).collect(),
+            },
+            &timing,
+        ))
+    }
+
     async fn get_session(
         &self,
         request: tonic::Request<api::GetSessionRequest>,
@@ -2806,6 +2829,7 @@ fn session_projection(
         workspace_id: value.workspace_id.to_string(),
         working_directory: value.working_directory,
         title: value.title,
+        first_prompt_preview: value.first_prompt_preview,
         code_mode: value.code_mode,
         status_message: value.status_message,
         diagnostic_count: value.diagnostic_count,
@@ -2866,6 +2890,36 @@ fn session_projection(
         retain_parent_presentation_session(&mut state);
     }
     state
+}
+
+// An overview is not a detail replacement. Retain control-plane work so unattended clients can
+// execute pending tools, but never include owner/provider conversation history or child bodies.
+fn session_overview(value: protocol::SessionView) -> api::SessionState {
+    let mut state = session(value);
+    retain_overview(&mut state);
+    state
+}
+
+fn retain_overview(state: &mut api::SessionState) {
+    state.hydration = api::SessionHydration::Overview as i32;
+    state.transcript = None;
+    state.active_agent_session = None;
+    state.recoverable_prompt = None;
+    state.queue.clear();
+    state
+        .interactions
+        .retain(|interaction| interaction.status == api::InteractionStatus::Pending as i32);
+    state.interactions.truncate(1);
+    for interaction in &mut state.interactions {
+        interaction.title.clear();
+        interaction.detail.clear();
+        interaction.questions.clear();
+        interaction.options.clear();
+    }
+    state.todos.clear();
+    state.runs.clear();
+    state.shared_context.clear();
+    state.notices.clear();
 }
 
 fn retain_launch_critical_session(state: &mut api::SessionState) {
@@ -4258,6 +4312,40 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn overview_omits_transcripts_and_child_context() {
+        let mut state = session_with_full_paging_bodies();
+        state.first_prompt_preview = "First owner prompt".to_owned();
+        state.interactions = vec![
+            api::Interaction {
+                id: "resolved".to_owned(),
+                status: api::InteractionStatus::Resolved as i32,
+                ..Default::default()
+            },
+            api::Interaction {
+                id: "pending".to_owned(),
+                status: api::InteractionStatus::Pending as i32,
+                title: "Private question".to_owned(),
+                detail: "Private context".to_owned(),
+                ..Default::default()
+            },
+        ];
+        let identity = (state.id.clone(), state.revision, state.activity);
+        retain_overview(&mut state);
+        assert_eq!((state.id.clone(), state.revision, state.activity), identity);
+        assert_eq!(state.hydration, api::SessionHydration::Overview as i32);
+        assert!(state.transcript.is_none());
+        assert_eq!(state.first_prompt_preview, "First owner prompt");
+        assert!(state.active_agent_session.is_none());
+        assert!(state.runs.is_empty());
+        assert!(state.shared_context.is_empty());
+        assert!(state.queue.is_empty());
+        assert_eq!(state.interactions.len(), 1);
+        assert_eq!(state.interactions[0].id, "pending");
+        assert!(state.interactions[0].title.is_empty());
+        assert!(state.interactions[0].detail.is_empty());
     }
 
     #[test]

@@ -1076,6 +1076,9 @@ pub struct SessionView {
     #[serde(default)]
     pub working_directory: String,
     pub title: String,
+    /// Bounded first owner prompt for discovery, independent from the explicit title.
+    #[serde(default)]
+    pub first_prompt_preview: String,
     /// Whether this logical session exposes only the synthesized Code Mode tool to its model.
     #[serde(default)]
     pub code_mode: bool,

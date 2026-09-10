@@ -188,6 +188,7 @@ pub enum QueryResult {
     McpManagement(McpManagementView),
     Skills(SkillCatalogueView),
     Sessions(SessionInventory),
+    ActiveSessions(Vec<SessionView>),
     SessionStatuses(crate::SessionStatusInventory),
     Session(Box<SessionView>),
     Transcript(Box<crate::TranscriptPage>),

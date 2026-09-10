@@ -1110,6 +1110,27 @@ impl NakodeClient {
         })
     }
 
+    /// Lists all currently readable sessions, including idle sessions, in one request.
+    /// Saved-only history remains in `list_session_inventory`. Overview snapshots contain status
+    /// and pending external tools, never transcript/context bodies, and must not replace details.
+    ///
+    /// # Errors
+    /// Returns a transport/server error; older servers explicitly refuse this operation.
+    pub async fn list_active_sessions(
+        &self,
+        workspace_id: impl Into<String>,
+    ) -> Result<Vec<api::SessionState>, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .list_active_sessions(api::ListActiveSessionsRequest {
+                workspace_id: workspace_id.into(),
+            })
+            .await?
+            .into_inner()
+            .sessions)
+    }
+
     /// Returns authoritative state for one session.
     ///
     /// # Errors

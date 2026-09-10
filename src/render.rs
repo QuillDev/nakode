@@ -2519,6 +2519,7 @@ mod tests {
 
     fn session() -> SessionView {
         SessionView {
+            first_prompt_preview: String::new(),
             id: SessionId::from("session"),
             revision: 1,
             workspace_id: WorkspaceId::from("workspace"),

@@ -41,6 +41,8 @@ service NakodeService {
   rpc SetBridgeLiveMessage(SetBridgeLiveMessageRequest) returns (MutationResult);
   rpc ContinueSessionFromBridge(ContinueSessionFromBridgeRequest) returns (ContinueSessionFromBridgeResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // Currently readable sessions, including idle sessions; never opens saved history.
+  rpc ListActiveSessions(ListActiveSessionsRequest) returns (ListActiveSessionsResponse);
   // Process-owned session status without transcript, provider configuration or detail hydration.
   rpc ListSessionStatuses(ListSessionStatusesRequest) returns (ListSessionStatusesResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (MutationResult);
@@ -580,6 +582,9 @@ message OpenSessionRequest {
   // silently swaps an established session to another credential.
   optional string account_id = 6;
 }
+message ListActiveSessionsRequest { string workspace_id = 1; }
+// Complete current membership. Overview snapshots exclude conversation bodies; poll this for status.
+message ListActiveSessionsResponse { repeated SessionState sessions = 1; }
 message ListSessionStatusesRequest {
   // Capped at 500; complete is false if any discoverable session is omitted.
   uint32 limit = 1;
@@ -623,6 +628,8 @@ enum SessionHydration {
   SESSION_HYDRATION_FULL = 2;
   // Complete bounded parent presentation with delegated-run bodies deferred for inspection.
   SESSION_HYDRATION_PARENT_PRESENTATION = 3;
+  // Status and pending external-tool control only; never a transcript replacement.
+  SESSION_HYDRATION_OVERVIEW = 4;
 }
 message GetSessionRequest {
   string session_id = 1;
@@ -1245,6 +1252,8 @@ message SessionState {
   uint64 shared_context_total = 36;
   // Explicit body completeness for this replacement snapshot. Unspecified is full for compatibility.
   SessionHydration hydration = 37;
+  // First owner prompt, capped at 512 Unicode characters; distinct from an explicit session title.
+  string first_prompt_preview = 38;
 }
 message SharedContextEntry {
   uint64 sequence = 1;
