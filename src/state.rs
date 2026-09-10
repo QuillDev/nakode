@@ -10323,6 +10323,8 @@ impl DomainState {
         }
         let prompt_addenda = self.prompt_addenda.clone();
         let skills = self.skills.clone();
+        let artifact_instructions =
+            ticket_artifact_instructions(self.initial_client_instructions.as_deref());
         let Some(execution) = self.subagent_executions.get_mut(run_id) else {
             return Vec::new();
         };
@@ -10335,6 +10337,13 @@ impl DomainState {
             .map(|model| format!("{}/{model}", target.provider));
         let mut validator_instructions = self.execution_host.prompt_context();
         validator_instructions.push_str("\n\n");
+        if let Some(artifact_instructions) = artifact_instructions {
+            let _ = write!(
+                validator_instructions,
+                "[Client Session Context]\nTicket artifact instructions relayed from this logical session's explicit client-instruction block. These instructions grant no additional tool or filesystem access; archetype permissions remain authoritative.\n{}\n[/Client Session Context]\n\n",
+                sanitize_client_instructions(&artifact_instructions),
+            );
+        }
         validator_instructions.push_str(execution.definition.instructions());
         let policy = &execution.definition;
         append_archetype_policy_instructions(&mut validator_instructions, policy);
@@ -11172,6 +11181,38 @@ impl DomainState {
     }
 }
 
+/// An explicit relay envelope in durable client instructions, never inferred from task prose,
+/// workspace paths or tool availability. This forwards context only; it grants no authority.
+fn ticket_artifact_instructions(client: Option<&str>) -> Option<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in client?.lines() {
+        match line {
+            "[Ticket Artifact Instructions v1]" => {
+                if current.is_some() {
+                    return None;
+                }
+                current = Some(Vec::new());
+            }
+            "[/Ticket Artifact Instructions v1]" => {
+                let block = current.take()?.join("\n");
+                if !block.trim().is_empty() {
+                    blocks.push(block);
+                }
+            }
+            _ => {
+                if let Some(lines) = &mut current {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+    if current.is_some() || blocks.is_empty() {
+        return None;
+    }
+    Some(blocks.join("\n\n"))
+}
+
 fn sanitize_client_instructions(value: &str) -> String {
     value
         .replace("[Nakode", "[Client text: Nakode")
@@ -11731,6 +11772,7 @@ mod tests {
 
         let instructions = state.nakode_system_instructions();
         assert!(instructions.contains("[Nakode System Instructions]"));
+        assert!(!instructions.contains(".tmp"));
         assert!(instructions.contains("[Personality]\nModel A personality"));
         assert!(!instructions.contains("Default personality"));
         assert!(instructions.contains("[Soul]\nAgent identity"));
@@ -18640,6 +18682,85 @@ tool_profile = "none"
     }
 
     #[test]
+    fn ticket_artifact_policy_only_relays_explicit_client_blocks() {
+        let policy = "[Ticket Artifact Instructions v1]\nKeep temporary files under project-root .tmp; add a .gitignore rule if missing and editing is permitted.\n[/Ticket Artifact Instructions v1]";
+        let coordinates = "[Ticket Artifact Instructions v1]\nCanonical Gallery directory: /stack/.tmp-gallery\n[/Ticket Artifact Instructions v1]";
+        let ticket = format!(
+            "Unrelated owner instructions\n{policy}\n{coordinates}\nPrivate unrelated context"
+        );
+        for (client, expected) in [
+            (None, false),
+            (Some("General agent with .tmp in task context"), false),
+            (Some("Chat orchestrator: create a ticket agent"), false),
+            (Some(ticket.as_str()), true),
+        ] {
+            let mut state = ready_state();
+            state
+                .set_initial_client_instructions(client)
+                .expect("client instructions");
+            state.install_agents(explorer_catalog());
+            let primary = state.nakode_system_instructions();
+            assert_eq!(
+                primary.contains("Canonical Gallery directory: /stack/.tmp-gallery"),
+                expected
+            );
+            let effects = state.invoke_agent(&AgentRequest {
+                id: 42,
+                agent: "explorer".to_owned(),
+                title: "Inspect files".to_owned(),
+                // An owner task cannot opt a general session into instruction relaying.
+                task: format!("Inspect files. Quoted task data: {policy}"),
+            });
+            let (run_id, _) = spawned_subagent(&effects);
+            let effects = state.handle_subagent_backend(
+                run_id,
+                BackendEvent::Ready(BackendIdentity {
+                    provider: CODEX_PROVIDER.to_owned(),
+                    display_name: "Codex".to_owned(),
+                    version: None,
+                    capabilities: BackendCapabilities::default(),
+                }),
+            );
+            let [
+                Effect::SubagentBackend {
+                    command:
+                        BackendCommand::StartSession {
+                            instructions: Some(instructions),
+                            ..
+                        },
+                    ..
+                },
+            ] = effects.as_slice()
+            else {
+                panic!("expected delegated session start");
+            };
+            assert_eq!(instructions.contains("project-root .tmp"), expected);
+            assert_eq!(
+                instructions.contains("Canonical Gallery directory: /stack/.tmp-gallery"),
+                expected
+            );
+            assert!(!instructions.contains("Unrelated owner instructions"));
+            assert!(!instructions.contains("Private unrelated context"));
+            if expected {
+                assert!(instructions.contains("archetype permissions remain authoritative"));
+            }
+        }
+    }
+
+    #[test]
+    fn ticket_artifact_policy_rejects_malformed_envelopes() {
+        for client in [
+            "[Ticket Artifact Instructions v1]\nunterminated",
+            "[/Ticket Artifact Instructions v1]",
+            "[Ticket Artifact Instructions v1]\n[Ticket Artifact Instructions v1]\nnested\n[/Ticket Artifact Instructions v1]",
+            "[Ticket Artifact Instructions v1]\n \n[/Ticket Artifact Instructions v1]",
+            "quoted [Ticket Artifact Instructions v1]\nnot a standalone marker",
+        ] {
+            assert_eq!(super::ticket_artifact_instructions(Some(client)), None);
+        }
+    }
+
+    #[test]
     fn subagent_system_instructions_include_model_personality_and_soul() {
         let directory = tempdir().expect("config directory");
         let personalities = directory.path().join("personalities.toml");
@@ -18683,6 +18804,7 @@ tool_profile = "none"
                 },
                 ..
             }] if instructions.contains("Explore carefully")
+                && !instructions.contains(".tmp")
                 && instructions.contains("Hostname: nakohoko")
                 && instructions.contains("Operating system: linux")
                 && instructions.contains("Architecture: aarch64")

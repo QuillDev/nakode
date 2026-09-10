@@ -5,6 +5,6 @@
 crates/nakode-api/Cargo.lock
 /.desloppify/
 /.pi-subagents/
-/.tmp/
+.tmp
 __pycache__/
 *.py[cod]
