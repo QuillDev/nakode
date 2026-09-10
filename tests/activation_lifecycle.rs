@@ -10,7 +10,7 @@ use std::{
     ffi::CString,
     fs::{self, OpenOptions},
     io::Write,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -357,7 +357,6 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
     let helper_lock = runtime_directory.join("activation-helper.lock");
     let helper_journal = runtime_directory.join("activation.json");
     let first_helper_pid = wait_for_helper_pid(&helper_lock).await?;
-    let first_socket_inode = fs::metadata(&helper_socket)?.ino();
 
     let activation = ActivationClient::connect_unix(&helper_socket).await?;
     let blocked = wait_for_status(&activation, api::ActivationPhase::Blocked).await?;
@@ -424,10 +423,17 @@ async fn deferred_activation_recovers_its_singleton_helper_and_preserves_session
         replacement_helper_pid, first_helper_pid,
         "helper crash reused the dead owner"
     );
-    wait_for(WAIT_LIMIT, || async {
-        fs::metadata(&helper_socket).is_ok_and(|metadata| metadata.ino() != first_socket_inode)
-    })
-    .await?;
+    // A rebound Unix socket may reuse the old inode. Verify the replacement's
+    // service and recovered authority rather than filesystem allocation identity.
+    let replacement_activation = ActivationClient::connect_unix(&helper_socket).await?;
+    let recovered = wait_for_status(&replacement_activation, api::ActivationPhase::Blocked).await?;
+    assert!(
+        recovered
+            .blockers
+            .iter()
+            .any(|blocker| blocker.session_id == active_session),
+        "replacement helper lost the active session blocker"
+    );
     eprintln!("activation lifecycle: replacement helper reclaimed stale socket");
 
     // Crash the recovered helper while the blocker is still authoritative. This leaves the durable

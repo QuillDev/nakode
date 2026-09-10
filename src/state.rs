@@ -18949,6 +18949,40 @@ tool_profile = "none"
     }
 
     #[test]
+    fn attached_ticket_tools_remain_primary_session_authority() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        state.configure_external_tools(
+            vec![nakode_protocol::ExternalToolDefinition {
+                name: "AddAssociatedTicketNote".to_owned(),
+                description: "Append a note to the attached ticket".to_owned(),
+                input_schema_json: r#"{"type":"object","properties":{"body":{"type":"string"}},"required":["body"],"additionalProperties":false}"#.to_owned(),
+            }], false,
+        ).expect("primary ticket tools");
+        let (run_id, _) = state
+            .delegate_agent(
+                "explorer",
+                "Inspect ticket implementation",
+                "Read the code without updating the ticket",
+            )
+            .expect("delegate");
+        let effects = state.handle_subagent_backend(
+            &run_id,
+            BackendEvent::Ready(BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: BackendCapabilities::default(),
+            }),
+        );
+        assert!(matches!(effects.as_slice(), [Effect::SubagentBackend {
+            command: BackendCommand::StartSession { external_tools, parent_run_id: Some(parent), .. },
+            ..
+        }] if external_tools.is_empty() && parent == &run_id));
+        assert_eq!(state.external_tools[0].name, "AddAssociatedTicketNote");
+    }
+
+    #[test]
     fn native_delegation_request_id_survives_to_terminal_effect() {
         let mut state = ready_state();
         state.install_agents(explorer_catalog());
