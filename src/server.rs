@@ -3300,6 +3300,7 @@ impl ServerCore {
                     complete,
                 }))
             }
+            Query::ListActiveSessions { workspace_id } => self.active_sessions(&workspace_id),
             Query::GetSession { session_id } => Ok(QueryResult::Session(Box::new(
                 self.session_view(&session_id)?,
             ))),
@@ -4003,6 +4004,25 @@ impl ServerCore {
             .collect();
         bootstrap.active_session = None;
         bootstrap
+    }
+
+    fn active_sessions(&self, workspace_id: &WorkspaceId) -> Result<QueryResult, ServiceError> {
+        self.ensure_workspace(workspace_id).map_err(domain_error)?;
+        let mut ids: Vec<_> = self.sessions_by_id.keys().collect();
+        ids.sort();
+        let sessions = ids
+            .into_iter()
+            .filter(|id| {
+                **id != self.default_session
+                    || self.sessions.iter().any(|record| record.id == id.as_str())
+            })
+            .map(|id| {
+                let mut view = self.session_view(id)?;
+                view.id = id.clone();
+                Ok(view)
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?;
+        Ok(QueryResult::ActiveSessions(sessions))
     }
 
     fn session_view(
@@ -6755,6 +6775,95 @@ mod tests {
         assert_eq!(discovered.sessions.len(), 1);
         assert_eq!(discovered.sessions[0].id, created_id);
         assert_eq!(discovered.sessions[0].updated_at_ms, 0);
+    }
+
+    #[test]
+    fn active_inventory_returns_only_readable_sessions_and_keeps_saved_history() {
+        let (mut core, initial_id) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let mut ids = Vec::new();
+        for _ in 0..234 {
+            let (created, _) = core
+                .create_session_command(&workspace_id, None, &ModelOptions::default(), None)
+                .expect("create");
+            ids.push(SessionId::from(created.resource_id.expect("id")));
+        }
+        let QueryResult::ActiveSessions(all_loaded) = core
+            .query(Query::ListActiveSessions {
+                workspace_id: workspace_id.clone(),
+            })
+            .expect("all loaded")
+        else {
+            panic!("active result")
+        };
+        assert_eq!(
+            all_loaded.len(),
+            234,
+            "active inventory is not truncated to a recent-page limit"
+        );
+        core.replace_session_records(
+            ids.iter()
+                .map(|id| SessionRecord {
+                    initial_instructions: None,
+                    id: id.to_string(),
+                    provider: CODEX_PROVIDER.to_owned(),
+                    provider_session_id: format!("provider-{id}"),
+                    account_id: None,
+                    workspace: "/tmp/project".to_owned(),
+                    working_directory: "/tmp/project".to_owned(),
+                    title: "Saved".to_owned(),
+                    model: None,
+                    model_options: crate::backend::ModelOptions::default(),
+                    last_turn: None,
+                    owner_turns: Vec::new(),
+                    owner_prompts: Vec::new(),
+                    created_at: 10,
+                    updated_at: 12,
+                    last_owner_activity_at: None,
+                    tool_configuration: None,
+                    code_mode: false,
+                    enabled_skill_ids: None,
+                    owned_provider_sessions: Vec::new(),
+                })
+                .collect(),
+        );
+        // Persisted inventory survives a runtime being unloaded; it is deliberately not active.
+        for id in ids.iter().take(232) {
+            core.sessions_by_id.remove(id);
+        }
+        let QueryResult::ActiveSessions(active) = core
+            .query(Query::ListActiveSessions {
+                workspace_id: workspace_id.clone(),
+            })
+            .expect("active query")
+        else {
+            panic!("active result")
+        };
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().all(|row| row.id != initial_id));
+        for row in &active {
+            assert!(matches!(
+                core.query(Query::GetSession {
+                    session_id: row.id.clone()
+                }),
+                Ok(QueryResult::Session(_))
+            ));
+        }
+        let QueryResult::Sessions(history) = core
+            .query(Query::ListSessions {
+                workspace_id,
+                limit: 500,
+            })
+            .expect("history query")
+        else {
+            panic!("history result")
+        };
+        assert_eq!(history.sessions.len(), 234);
+        assert_eq!(
+            core.sessions_by_id.len(),
+            3,
+            "discovery must not reopen history"
+        );
     }
 
     #[test]

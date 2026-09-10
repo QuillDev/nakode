@@ -180,6 +180,7 @@ pub enum QueryResult {
     McpManagement(McpManagementView),
     Skills(SkillCatalogueView),
     Sessions(SessionInventory),
+    ActiveSessions(Vec<SessionView>),
     Session(Box<SessionView>),
     Transcript(Box<crate::TranscriptPage>),
     TranscriptBody(TranscriptBodyWindow),

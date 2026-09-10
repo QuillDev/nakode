@@ -665,6 +665,10 @@ pub enum Query {
         workspace_id: WorkspaceId,
         limit: u32,
     },
+    /// Complete membership of currently readable logical sessions, including idle engines.
+    ListActiveSessions {
+        workspace_id: WorkspaceId,
+    },
     GetSession {
         session_id: SessionId,
     },

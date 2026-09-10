@@ -41,6 +41,8 @@ service NakodeService {
   rpc SetBridgeLiveMessage(SetBridgeLiveMessageRequest) returns (MutationResult);
   rpc ContinueSessionFromBridge(ContinueSessionFromBridgeRequest) returns (ContinueSessionFromBridgeResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // Currently readable sessions, including idle sessions; never opens saved history.
+  rpc ListActiveSessions(ListActiveSessionsRequest) returns (ListActiveSessionsResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (MutationResult);
   rpc GetSession(GetSessionRequest) returns (SessionSnapshot);
   rpc WatchSession(WatchSessionRequest) returns (stream SessionSnapshot);
@@ -578,6 +580,9 @@ message OpenSessionRequest {
   // silently swaps an established session to another credential.
   optional string account_id = 6;
 }
+message ListActiveSessionsRequest { string workspace_id = 1; }
+// Complete current membership. Overview snapshots exclude conversation bodies; poll this for status.
+message ListActiveSessionsResponse { repeated SessionState sessions = 1; }
 message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // Removes a logical session and its persisted history. Deletion is AUTHORITATIVE: a
 // session still attached is closed and released by the service, because there is no
@@ -602,6 +607,8 @@ enum SessionHydration {
   SESSION_HYDRATION_FULL = 2;
   // Complete bounded parent presentation with delegated-run bodies deferred for inspection.
   SESSION_HYDRATION_PARENT_PRESENTATION = 3;
+  // Status and pending external-tool control only; never a transcript replacement.
+  SESSION_HYDRATION_OVERVIEW = 4;
 }
 message GetSessionRequest {
   string session_id = 1;
