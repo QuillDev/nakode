@@ -2377,6 +2377,24 @@ fn authentication_view(authentication: &ProviderAuthenticationState) -> Provider
     }
 }
 
+pub(crate) fn session_status(
+    state: &DomainState,
+    revision: u64,
+) -> nakode_protocol::SessionStatusSummary {
+    nakode_protocol::SessionStatusSummary {
+        id: SessionId::from(state.nakode_session_id.clone()),
+        revision,
+        activity: activity(state),
+        // Same presence as turn_view, without constructing an AgentSessionView/transcript page.
+        owner_turn_running: !state.backend_provider.is_empty()
+            && (state.active_turn.is_some()
+                || state.starting_turn.is_some()
+                || state.pending_session_prompt.is_some()),
+        has_interactions: !state.approvals.is_empty() || !state.questions.is_empty(),
+        has_failure: state.latest_failure.is_some(),
+    }
+}
+
 fn activity(state: &DomainState) -> SessionActivity {
     if state.context_compaction.is_some() {
         SessionActivity::CompactingContext

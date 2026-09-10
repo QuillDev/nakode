@@ -264,6 +264,17 @@ pub struct SessionBridgeView {
     pub active_source_message_id: Option<String>,
 }
 
+/// Scalar status only; no transcript, interaction questions, error bodies or provider metadata.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionStatusSummary {
+    pub id: SessionId,
+    pub revision: u64,
+    pub activity: SessionActivity,
+    pub owner_turn_running: bool,
+    pub has_interactions: bool,
+    pub has_failure: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionSummary {
     pub id: SessionId,

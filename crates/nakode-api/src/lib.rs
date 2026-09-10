@@ -179,6 +179,7 @@ mod tests {
             "SetBridgeLiveMessage",
             "ContinueSessionFromBridge",
             "ListSessions",
+            "ListSessionStatuses",
             "DeleteSession",
             "GetSession",
             "WatchSession",

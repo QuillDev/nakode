@@ -39,8 +39,9 @@ pub use mcp::{
 };
 pub use service::{
     BridgeContinuationDisposition, CommandAccepted, Cursor, ManageableSkillView, QueryResult,
-    ServiceCapabilities, ServiceCapability, SessionInventory, SkillCatalogueView, Snapshot,
-    SoulDocumentView, SubscriptionScope, SubscriptionView, WorkspacePathInspectionView,
+    ServiceCapabilities, ServiceCapability, SessionInventory, SessionStatusInventory,
+    SkillCatalogueView, Snapshot, SoulDocumentView, SubscriptionScope, SubscriptionView,
+    WorkspacePathInspectionView,
 };
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,
@@ -54,12 +55,12 @@ pub use view::{
     ProviderView, QueueItemView, RecoverablePromptView, RunMetadataView, RunOutcome, RunPage,
     RunPolicyView, RunSalvageView, RunStatus, RunTextWindow, RunToolDenialView, RunView,
     SalvagedEvidenceView, SessionActivity, SessionBridgeView, SessionFailureClassification,
-    SessionFailurePhase, SessionFailureView, SessionMetadataView, SessionSummary, SessionView,
-    SettingsView, SharedContextBriefingEntryView, SharedContextBriefingView,
-    SharedContextEntryView, SharedContextUtilizationView, SkillView, TerminalImageModeView,
-    TodoItemView, TodoPhaseView, TodoStatusView, TokenUsageView, TranscriptBodyWindow,
-    TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView, TranscriptPage,
-    TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionAvailabilityView,
+    SessionFailurePhase, SessionFailureView, SessionMetadataView, SessionStatusSummary,
+    SessionSummary, SessionView, SettingsView, SharedContextBriefingEntryView,
+    SharedContextBriefingView, SharedContextEntryView, SharedContextUtilizationView, SkillView,
+    TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TokenUsageView,
+    TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView,
+    TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionAvailabilityView,
     VisionSettingsView, WebSettingsView,
 };
 

@@ -1079,6 +1079,41 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         ))
     }
 
+    async fn list_session_statuses(
+        &self,
+        request: tonic::Request<api::ListSessionStatusesRequest>,
+    ) -> Result<tonic::Response<api::ListSessionStatusesResponse>, tonic::Status> {
+        let (result, timing) = self
+            .query(protocol::Query::ListSessionStatuses {
+                limit: request.into_inner().limit,
+            })
+            .await?;
+        let protocol::QueryResult::SessionStatuses(inventory) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected session statuses response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            api::ListSessionStatusesResponse {
+                complete: inventory.complete,
+                sessions: inventory
+                    .sessions
+                    .into_iter()
+                    .map(|status| api::SessionStatusSummary {
+                        id: status.id.to_string(),
+                        revision: status.revision,
+                        activity: session_activity(status.activity),
+                        owner_turn_running: status.owner_turn_running,
+                        has_interactions: status.has_interactions,
+                        has_failure: status.has_failure,
+                    })
+                    .collect(),
+            },
+            &timing,
+        ))
+    }
+
     async fn get_session(
         &self,
         request: tonic::Request<api::GetSessionRequest>,
