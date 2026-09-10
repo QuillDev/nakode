@@ -106,7 +106,7 @@ unicode-segmentation = "1.13.3"
 uuid = { version = "1", features = ["v5", "v7"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["process", "signal"] }
+nix = { version = "0.30", features = ["fs", "process", "signal"] }
 
 [dev-dependencies]
 libc = "0.2"

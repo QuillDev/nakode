@@ -9339,6 +9339,58 @@ enabled = false
     }
 
     #[test]
+    fn assistant_image_event_projects_an_empty_message_and_public_artifact() {
+        let (mut core, session_id, _) = busy_server_with_stale_revision("image-turn");
+        let data = b"\x89PNG\r\n\x1a\n".to_vec();
+        core.engine_for_mut(&session_id)
+            .expect("session")
+            .state_mut()
+            .handle_provider_backend(
+                CODEX_PROVIDER,
+                BackendEvent::ImageReturned(crate::runtime::ReturnedImage {
+                    id: "assistant-image".into(),
+                    turn_id: "image-turn".into(),
+                    provider_id: CODEX_PROVIDER.into(),
+                    model_id: "test".into(),
+                    history_index: 0,
+                    sequence: 0,
+                    attachment: crate::backend::PromptAttachment {
+                        label: "reply.png".into(),
+                        path: None,
+                        image: Some(PromptImage {
+                            mime_type: "image/png".into(),
+                            data: data.clone(),
+                        }),
+                    },
+                }),
+            );
+        let QueryResult::Session(session) = core
+            .query(Query::GetSession { session_id })
+            .expect("session projection")
+        else {
+            panic!("expected session");
+        };
+        let entry = session
+            .transcript
+            .entries
+            .iter()
+            .find(|entry| !entry.artifacts.is_empty())
+            .expect("image-only assistant row");
+        assert!(entry.body.is_empty());
+        assert_eq!(entry.artifacts.len(), 1);
+        let QueryResult::Artifact(artifact) = core
+            .query(Query::GetArtifact {
+                artifact_id: entry.artifacts[0].clone(),
+            })
+            .expect("artifact")
+        else {
+            panic!("expected artifact");
+        };
+        assert_eq!(artifact.data, data);
+        assert_eq!(artifact.label, "reply.png");
+    }
+
+    #[test]
     fn artifact_queries_search_every_loaded_session_and_enforce_the_bound() {
         let state = AppState::new_unconfigured("/tmp/project", None, 100);
         let workspace_id = crate::state::projection::workspace_id(&state.workspace);
@@ -9464,6 +9516,43 @@ enabled = false
             crate::state::DomainCommandError::Invalid(message)
                 if message.contains("maximum")
         ));
+    }
+
+    #[test]
+    fn image_only_prompt_reaches_provider_without_fabricated_text_and_can_queue() {
+        let (mut core, session_id) = ready_codex_server();
+        let mut prompt = prompt_with_image_and_file();
+        prompt.text.clear();
+        prompt.attachments.truncate(1);
+        let (_, effects) = core
+            .prompt_command(&session_id, prompt.clone(), false, None)
+            .expect("image-only prompt");
+        assert!(
+            effects.iter().any(|effect| matches!(effect,
+                crate::state::Effect::Backend(BackendCommand::StartTurn { prompt, attachments, .. })
+                // Existing turn-fresh catalogue instructions remain, but no user prose is invented.
+            if prompt.trim_start().starts_with("[Nakode Current Agent Catalogue]") && attachments.len() == 1
+            )),
+            "{effects:#?}"
+        );
+        assert!(effects.iter().any(|effect| matches!(effect,
+            crate::state::Effect::PersistAcceptedOwnerPrompt { prompt, .. }
+                if prompt.raw_text.is_empty()
+        )));
+        core.prompt_command(&session_id, prompt, true, None)
+            .expect("image-only queue");
+        assert!(
+            core.prompt_command(
+                &session_id,
+                PromptInput {
+                    text: "  ".into(),
+                    attachments: vec![]
+                },
+                true,
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]

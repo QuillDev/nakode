@@ -4224,7 +4224,7 @@ impl DomainState {
         suppress_settled_identity: bool,
     ) -> Result<Vec<Effect>, DomainCommandError> {
         Self::validate_prompt_operation_id(&prompt_id)?;
-        self.validate_prompt(&text)?;
+        self.validate_prompt(&text, !attachments.is_empty())?;
         let retrying_blocked_replay = if let Some(blocked) = self
             .replay_blocked_prompt
             .as_ref()
@@ -4328,7 +4328,7 @@ impl DomainState {
         attachments: Vec<PromptAttachment>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
         Self::validate_prompt_operation_id(&prompt_id)?;
-        self.validate_prompt(&text)?;
+        self.validate_prompt(&text, !attachments.is_empty())?;
         if let Some(blocked) = self
             .replay_blocked_prompt
             .as_ref()
@@ -4600,7 +4600,7 @@ impl DomainState {
         provider_turn_id: &str,
         text: &str,
     ) -> Result<Vec<Effect>, DomainCommandError> {
-        self.validate_prompt(text)?;
+        self.validate_prompt(text, false)?;
         if !self.backend_capabilities.steering.is_supported() {
             return Err(DomainCommandError::Unsupported(format!(
                 "{} does not support steering",
@@ -4782,8 +4782,8 @@ impl DomainState {
         Ok(self.compress_session_context())
     }
 
-    fn validate_prompt(&self, text: &str) -> Result<(), DomainCommandError> {
-        if text.trim().is_empty() {
+    fn validate_prompt(&self, text: &str, has_attachments: bool) -> Result<(), DomainCommandError> {
+        if text.trim().is_empty() && !has_attachments {
             return Err(DomainCommandError::Invalid(
                 "prompt cannot be empty".to_owned(),
             ));
@@ -7212,6 +7212,14 @@ impl DomainState {
             }
             BackendEvent::ItemStarted { turn_id, item } => {
                 self.observe_item(&turn_id, item, false);
+            }
+            BackendEvent::ImageReturned(image) => {
+                let history = image.history_item();
+                self.observe_item(&image.turn_id, history.item, true);
+                if let Some(data) = image.attachment.image {
+                    self.transcript
+                        .set_labeled_images(&image.id, vec![(image.attachment.label, data)]);
+                }
             }
             BackendEvent::ItemCompleted { turn_id, item } => {
                 self.observe_item(&turn_id, item, true);
@@ -10054,6 +10062,22 @@ impl DomainState {
         Vec::new()
     }
 
+    fn record_subagent_image(
+        &mut self,
+        run_id: &str,
+        image: crate::runtime::ReturnedImage,
+    ) -> Vec<Effect> {
+        let history = image.history_item();
+        self.observe_subagent_item(run_id, history.item);
+        if let Some(chat) = self.subagent_chats.get_mut(run_id)
+            && let Some(data) = image.attachment.image
+        {
+            chat.transcript
+                .set_labeled_images(&image.id, vec![(image.attachment.label, data)]);
+        }
+        Vec::new()
+    }
+
     fn reduce_subagent_backend(&mut self, run_id: &str, event: BackendEvent) -> Vec<Effect> {
         let event = match self.reduce_subagent_compaction_event(run_id, event) {
             Ok(effects) => return effects,
@@ -10077,6 +10101,7 @@ impl DomainState {
                 kind,
                 delta,
             } => self.handle_subagent_delta(run_id, &turn_id, &item_id, kind, &delta),
+            BackendEvent::ImageReturned(image) => self.record_subagent_image(run_id, image),
             BackendEvent::ItemStarted { turn_id, item }
             | BackendEvent::ItemCompleted { turn_id, item } => {
                 self.record_subagent_item(run_id, &turn_id, &item);

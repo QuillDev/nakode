@@ -15,6 +15,7 @@ mod process;
 mod read;
 mod read_skill;
 mod read_skill_component;
+mod return_image;
 mod shared_context;
 mod todo;
 mod truncate;
@@ -119,6 +120,7 @@ impl ToolRegistry {
         Self {
             tools: vec![
                 Arc::new(read::ReadTool),
+                Arc::new(return_image::ReturnImageTool),
                 Arc::new(read_skill::ReadSkillTool),
                 Arc::new(read_skill_component::ReadSkillComponentTool),
                 Arc::new(write::WriteTool),
@@ -623,6 +625,8 @@ mod tests {
             names,
             [
                 "read",
+                #[cfg(unix)]
+                "return_image",
                 "read_skill",
                 "read_skill_component",
                 "write",

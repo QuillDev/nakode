@@ -13,6 +13,17 @@ Alternative interfaces can use the same native server through the
 [generated API and SDK](docs/frontend-development.md);
 the TUI is one renderer of server-owned semantic state.
 
+## Existing image replies
+
+Native tool sessions on Linux/macOS can use `return_image({"path":"relative/image.png"})`
+to attach an existing workspace image to the assistant transcript. This is not image generation.
+The tool requires filesystem-read permission and accepts PNG, JPEG, GIF and WebP, up to 5 MiB
+per image, eight images and 20 MiB per turn. Nakode retains the bytes in native-session history
+and exposes them through public transcript artifacts; deleting the source file does not remove
+the retained reply. Image bytes are not echoed into provider tool-result text. Compatibility
+harness adapters are not guaranteed to expose this native tool. Image-input support still
+belongs to the selected model. Prompt input may contain images without text.
+
 ## Architecture boundary
 
 The background Nakode service manages every session, turn, queue, provider,
