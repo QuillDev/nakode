@@ -669,6 +669,10 @@ pub enum Query {
     ListActiveSessions {
         workspace_id: WorkspaceId,
     },
+    /// Compact status of this service's discoverable logical sessions, without hydration.
+    ListSessionStatuses {
+        limit: u32,
+    },
     GetSession {
         session_id: SessionId,
     },

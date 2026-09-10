@@ -683,6 +683,7 @@ pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, Str
         workspace_id: view::WorkspaceId::from(value.workspace_id),
         working_directory: value.working_directory,
         title: value.title,
+        first_prompt_preview: value.first_prompt_preview,
         code_mode: value.code_mode,
         status_message: value.status_message,
         diagnostic_count: value.diagnostic_count,

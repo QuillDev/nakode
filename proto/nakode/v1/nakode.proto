@@ -43,6 +43,8 @@ service NakodeService {
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   // Currently readable sessions, including idle sessions; never opens saved history.
   rpc ListActiveSessions(ListActiveSessionsRequest) returns (ListActiveSessionsResponse);
+  // Process-owned session status without transcript, provider configuration or detail hydration.
+  rpc ListSessionStatuses(ListSessionStatusesRequest) returns (ListSessionStatusesResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (MutationResult);
   rpc GetSession(GetSessionRequest) returns (SessionSnapshot);
   rpc WatchSession(WatchSessionRequest) returns (stream SessionSnapshot);
@@ -583,6 +585,25 @@ message OpenSessionRequest {
 message ListActiveSessionsRequest { string workspace_id = 1; }
 // Complete current membership. Overview snapshots exclude conversation bodies; poll this for status.
 message ListActiveSessionsResponse { repeated SessionState sessions = 1; }
+message ListSessionStatusesRequest {
+  // Capped at 500; complete is false if any discoverable session is omitted.
+  uint32 limit = 1;
+}
+
+message SessionStatusSummary {
+  string id = 1;
+  uint64 revision = 2;
+  SessionActivity activity = 3;
+  bool owner_turn_running = 4;
+  bool has_interactions = 5;
+  bool has_failure = 6;
+}
+
+message ListSessionStatusesResponse {
+  repeated SessionStatusSummary sessions = 1;
+  bool complete = 2;
+}
+
 message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // Removes a logical session and its persisted history. Deletion is AUTHORITATIVE: a
 // session still attached is closed and released by the service, because there is no
@@ -1231,6 +1252,8 @@ message SessionState {
   uint64 shared_context_total = 36;
   // Explicit body completeness for this replacement snapshot. Unspecified is full for compatibility.
   SessionHydration hydration = 37;
+  // First owner prompt, capped at 512 Unicode characters; distinct from an explicit session title.
+  string first_prompt_preview = 38;
 }
 message SharedContextEntry {
   uint64 sequence = 1;

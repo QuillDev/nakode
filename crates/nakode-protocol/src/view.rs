@@ -264,6 +264,17 @@ pub struct SessionBridgeView {
     pub active_source_message_id: Option<String>,
 }
 
+/// Scalar status only; no transcript, interaction questions, error bodies or provider metadata.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionStatusSummary {
+    pub id: SessionId,
+    pub revision: u64,
+    pub activity: SessionActivity,
+    pub owner_turn_running: bool,
+    pub has_interactions: bool,
+    pub has_failure: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionSummary {
     pub id: SessionId,
@@ -1065,6 +1076,9 @@ pub struct SessionView {
     #[serde(default)]
     pub working_directory: String,
     pub title: String,
+    /// Bounded first owner prompt for discovery, independent from the explicit title.
+    #[serde(default)]
+    pub first_prompt_preview: String,
     /// Whether this logical session exposes only the synthesized Code Mode tool to its model.
     #[serde(default)]
     pub code_mode: bool,

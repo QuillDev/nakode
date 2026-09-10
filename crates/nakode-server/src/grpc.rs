@@ -1079,6 +1079,41 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         ))
     }
 
+    async fn list_session_statuses(
+        &self,
+        request: tonic::Request<api::ListSessionStatusesRequest>,
+    ) -> Result<tonic::Response<api::ListSessionStatusesResponse>, tonic::Status> {
+        let (result, timing) = self
+            .query(protocol::Query::ListSessionStatuses {
+                limit: request.into_inner().limit,
+            })
+            .await?;
+        let protocol::QueryResult::SessionStatuses(inventory) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected session statuses response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            api::ListSessionStatusesResponse {
+                complete: inventory.complete,
+                sessions: inventory
+                    .sessions
+                    .into_iter()
+                    .map(|status| api::SessionStatusSummary {
+                        id: status.id.to_string(),
+                        revision: status.revision,
+                        activity: session_activity(status.activity),
+                        owner_turn_running: status.owner_turn_running,
+                        has_interactions: status.has_interactions,
+                        has_failure: status.has_failure,
+                    })
+                    .collect(),
+            },
+            &timing,
+        ))
+    }
+
     async fn list_active_sessions(
         &self,
         request: tonic::Request<api::ListActiveSessionsRequest>,
@@ -2794,6 +2829,7 @@ fn session_projection(
         workspace_id: value.workspace_id.to_string(),
         working_directory: value.working_directory,
         title: value.title,
+        first_prompt_preview: value.first_prompt_preview,
         code_mode: value.code_mode,
         status_message: value.status_message,
         diagnostic_count: value.diagnostic_count,
@@ -4281,6 +4317,7 @@ mod tests {
     #[test]
     fn overview_omits_transcripts_and_child_context() {
         let mut state = session_with_full_paging_bodies();
+        state.first_prompt_preview = "First owner prompt".to_owned();
         state.interactions = vec![
             api::Interaction {
                 id: "resolved".to_owned(),
@@ -4300,6 +4337,7 @@ mod tests {
         assert_eq!((state.id.clone(), state.revision, state.activity), identity);
         assert_eq!(state.hydration, api::SessionHydration::Overview as i32);
         assert!(state.transcript.is_none());
+        assert_eq!(state.first_prompt_preview, "First owner prompt");
         assert!(state.active_agent_session.is_none());
         assert!(state.runs.is_empty());
         assert!(state.shared_context.is_empty());

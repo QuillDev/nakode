@@ -149,6 +149,14 @@ pub struct SessionInventory {
     pub complete: bool,
 }
 
+/// A bounded replacement over this service's discoverable sessions. Inactive persisted rows have
+/// revision zero and idle process-owned status; this query never restores provider sessions.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionStatusInventory {
+    pub sessions: Vec<crate::SessionStatusSummary>,
+    pub complete: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ManageableSkillView {
     pub id: String,
@@ -181,6 +189,7 @@ pub enum QueryResult {
     Skills(SkillCatalogueView),
     Sessions(SessionInventory),
     ActiveSessions(Vec<SessionView>),
+    SessionStatuses(crate::SessionStatusInventory),
     Session(Box<SessionView>),
     Transcript(Box<crate::TranscriptPage>),
     TranscriptBody(TranscriptBodyWindow),

@@ -242,6 +242,13 @@ fn session_view(
         workspace_id: workspace_id.clone(),
         working_directory: state.working_directory.clone(),
         title: session_title(state, sessions),
+        first_prompt_preview: state
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.kind == EntryKind::User)
+            .map(|entry| entry.body.trim().chars().take(512).collect())
+            .unwrap_or_default(),
         code_mode: state.code_mode(),
         status_message: state.status_message.clone(),
         diagnostic_count: u64::try_from(state.diagnostic_count).unwrap_or(u64::MAX),
@@ -2377,6 +2384,24 @@ fn authentication_view(authentication: &ProviderAuthenticationState) -> Provider
     }
 }
 
+pub(crate) fn session_status(
+    state: &DomainState,
+    revision: u64,
+) -> nakode_protocol::SessionStatusSummary {
+    nakode_protocol::SessionStatusSummary {
+        id: SessionId::from(state.nakode_session_id.clone()),
+        revision,
+        activity: activity(state),
+        // Same presence as turn_view, without constructing an AgentSessionView/transcript page.
+        owner_turn_running: !state.backend_provider.is_empty()
+            && (state.active_turn.is_some()
+                || state.starting_turn.is_some()
+                || state.pending_session_prompt.is_some()),
+        has_interactions: !state.approvals.is_empty() || !state.questions.is_empty(),
+        has_failure: state.latest_failure.is_some(),
+    }
+}
+
 fn activity(state: &DomainState) -> SessionActivity {
     if state.context_compaction.is_some() {
         SessionActivity::CompactingContext
@@ -2479,6 +2504,39 @@ mod tests {
         session::{ProviderAccountRecord, ProviderRecord, SubagentObservability, SubagentRecord},
         state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
     };
+
+    #[test]
+    fn first_prompt_preview_survives_transcript_paging_and_bounds_unicode() {
+        let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
+        state.transcript.upsert(
+            "first",
+            EntryKind::User,
+            "YOU",
+            format!("  {}  ", "界".repeat(600)),
+            EntryStatus::Complete,
+        );
+        for index in 0..600 {
+            state.transcript.upsert(
+                format!("later-{index}"),
+                EntryKind::User,
+                "YOU",
+                "Later prompt",
+                EntryStatus::Complete,
+            );
+        }
+        let session = bootstrap(&state, 7, &[], &[])
+            .active_session
+            .expect("active session");
+        assert_eq!(session.first_prompt_preview, "界".repeat(512));
+        assert!(session.transcript.has_earlier);
+        assert!(
+            session
+                .transcript
+                .entries
+                .iter()
+                .all(|entry| !entry.body.contains('界'))
+        );
+    }
 
     #[test]
     fn nested_runtime_audit_projects_the_code_mode_parent_entry() {
