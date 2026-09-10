@@ -1070,6 +1070,22 @@ impl NakodeClient {
             .sessions)
     }
 
+    /// Reads one bounded scalar status inventory; never hydrates transcript or provider detail.
+    ///
+    /// # Errors
+    /// Returns a transport/server error, including Unimplemented from older servers.
+    pub async fn list_session_statuses(
+        &self,
+        limit: u32,
+    ) -> Result<api::ListSessionStatusesResponse, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .list_session_statuses(api::ListSessionStatusesRequest { limit })
+            .await?
+            .into_inner())
+    }
+
     /// Lists logical sessions and preserves the server's explicit completeness boundary.
     ///
     /// # Errors
@@ -3337,6 +3353,80 @@ mod tests {
             nakode_telemetry::opentelemetry::trace::Status::Error { .. }
         )));
         provider.shutdown().expect("shutdown tracing");
+    }
+
+    #[tokio::test]
+    async fn scalar_status_inventory_uses_one_query_without_workspace_or_session_hydration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test address");
+        let (endpoint, mut requests) = ServerEndpoint::channel_with_build_revision(
+            "sdk-test",
+            None,
+            protocol::ServiceCapabilities::default(),
+            8,
+        );
+        let cursor = endpoint.cursor();
+        let actor = tokio::spawn(async move {
+            let Some(ServerRequest::Query { query, respond, .. }) = requests.recv().await else {
+                panic!("expected status query");
+            };
+            assert_eq!(query, protocol::Query::ListSessionStatuses { limit: 500 });
+            let _ = respond.send(Ok(protocol::Snapshot {
+                cursor,
+                value: protocol::QueryResult::SessionStatuses(protocol::SessionStatusInventory {
+                    complete: false,
+                    sessions: vec![protocol::SessionStatusSummary {
+                        id: protocol::SessionId::from("session"),
+                        revision: 17,
+                        activity: protocol::SessionActivity::RunningDelegates,
+                        owner_turn_running: false,
+                        has_interactions: true,
+                        has_failure: true,
+                    }],
+                }),
+            }));
+        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(nakode_server::grpc::GrpcService::new(endpoint).into_server())
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+                .expect("serve test API");
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let client = NakodeClient {
+            transport: super::configured_transport(channel, super::ClientApiKey::default()),
+        };
+        let result = client
+            .list_session_statuses(500)
+            .await
+            .expect("status response");
+        assert!(!result.complete);
+        assert_eq!(result.sessions.len(), 1);
+        let status = &result.sessions[0];
+        assert_eq!(status.id, "session");
+        assert_eq!(status.revision, 17);
+        assert_eq!(
+            status.activity,
+            api::SessionActivity::RunningDelegates as i32
+        );
+        assert!(!status.owner_turn_running);
+        assert!(status.has_interactions && status.has_failure);
+        let _ = shutdown.send(());
+        server.await.expect("server task");
+        actor.await.expect("actor task");
     }
 
     #[tokio::test]

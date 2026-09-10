@@ -41,6 +41,8 @@ service NakodeService {
   rpc SetBridgeLiveMessage(SetBridgeLiveMessageRequest) returns (MutationResult);
   rpc ContinueSessionFromBridge(ContinueSessionFromBridgeRequest) returns (ContinueSessionFromBridgeResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // Process-owned session status without transcript, provider configuration or detail hydration.
+  rpc ListSessionStatuses(ListSessionStatusesRequest) returns (ListSessionStatusesResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (MutationResult);
   rpc GetSession(GetSessionRequest) returns (SessionSnapshot);
   rpc WatchSession(WatchSessionRequest) returns (stream SessionSnapshot);
@@ -578,6 +580,25 @@ message OpenSessionRequest {
   // silently swaps an established session to another credential.
   optional string account_id = 6;
 }
+message ListSessionStatusesRequest {
+  // Capped at 500; complete is false if any discoverable session is omitted.
+  uint32 limit = 1;
+}
+
+message SessionStatusSummary {
+  string id = 1;
+  uint64 revision = 2;
+  SessionActivity activity = 3;
+  bool owner_turn_running = 4;
+  bool has_interactions = 5;
+  bool has_failure = 6;
+}
+
+message ListSessionStatusesResponse {
+  repeated SessionStatusSummary sessions = 1;
+  bool complete = 2;
+}
+
 message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // Removes a logical session and its persisted history. Deletion is AUTHORITATIVE: a
 // session still attached is closed and released by the service, because there is no

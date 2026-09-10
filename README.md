@@ -12,6 +12,8 @@ the deterministic JSON Lines [TUI evaluation harness](docs/tui-evaluation.md).
 Alternative interfaces can use the same native server through the
 [generated API and SDK](docs/frontend-development.md);
 the TUI is one renderer of server-owned semantic state.
+Background clients can read a bounded [scalar session status inventory](docs/session-status.md)
+through one SDK query without keeping a renderer or transcript subscription alive.
 
 ## Existing image replies
 

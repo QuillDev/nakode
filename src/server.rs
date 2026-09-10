@@ -5,6 +5,7 @@
 //! provider commands, persistence handles, or process objects.
 
 pub(crate) mod runtime;
+mod status;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -3263,6 +3264,10 @@ impl ServerCore {
             &nakode_telemetry::opentelemetry::Context::current(),
         );
         let _trace_context = trace_scope.context().attach();
+        self.query_view(query)
+    }
+
+    fn query_view(&self, query: Query) -> Result<QueryResult, ServiceError> {
         let bootstrap = || self.workspace_bootstrap();
         match query {
             Query::InspectWorkspacePath {
@@ -3299,6 +3304,9 @@ impl ServerCore {
                     sessions,
                     complete,
                 }))
+            }
+            Query::ListSessionStatuses { limit } => {
+                Ok(QueryResult::SessionStatuses(self.session_statuses(limit)))
             }
             Query::GetSession { session_id } => Ok(QueryResult::Session(Box::new(
                 self.session_view(&session_id)?,

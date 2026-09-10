@@ -2839,18 +2839,18 @@ impl NativeServerRuntime {
                 .state_mut()
                 .session_store_failed(error.to_string()),
         }
-        match self
-            .effects
-            .persistence
-            .sessions
-            .list_recent(&workspace, 100)
-        {
-            Ok(sessions) => self.core.replace_session_records(sessions),
-            Err(error) => self
-                .core
-                .engine_mut()
-                .state_mut()
-                .session_store_failed(error.to_string()),
+        match self.effects.persistence.sessions.list_recent_all() {
+            Ok(sessions) => {
+                self.core.replace_session_records(sessions);
+                self.core.set_session_inventory_complete(true);
+            }
+            Err(error) => {
+                self.core.set_session_inventory_complete(false);
+                self.core
+                    .engine_mut()
+                    .state_mut()
+                    .session_store_failed(error.to_string());
+            }
         }
     }
 }
@@ -7771,6 +7771,56 @@ mod tests {
             },
             credentials,
         )
+    }
+
+    #[tokio::test]
+    async fn status_inventory_refresh_retains_all_workspaces_and_more_than_recent_page() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp");
+        std::fs::create_dir_all(&root).expect("project temporary directory");
+        let workspace = tempfile::tempdir_in(root).expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let own = workspace.path().to_str().expect("workspace path");
+        for index in 0..102 {
+            let id = format!("status-session-{index}");
+            persistence
+                .sessions
+                .create_with_account_id(
+                    &id,
+                    CODEX_PROVIDER,
+                    None,
+                    &format!("native-{index}"),
+                    if index == 101 {
+                        "/other-workspace"
+                    } else {
+                        own
+                    },
+                    own,
+                    "Status test",
+                    None,
+                    &BackendModelOptions::default(),
+                    None,
+                )
+                .expect("persist session");
+        }
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(DomainState::new(own, None, 100)),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        runtime.core.set_session_inventory_complete(false);
+        runtime.refresh_catalogs();
+        let inventory = runtime.core.session_statuses(500);
+        assert!(inventory.complete);
+        assert_eq!(inventory.sessions.len(), 102);
+        assert!(
+            inventory
+                .sessions
+                .iter()
+                .any(|session| session.id.as_str() == "status-session-101")
+        );
     }
 
     #[tokio::test]
