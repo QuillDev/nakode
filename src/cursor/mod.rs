@@ -463,6 +463,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         | BackendCommand::ResolveExternalTool { .. }
         | BackendCommand::BeginAuthentication { .. }
         | BackendCommand::SubmitAuthenticationCallback { .. }
+        | BackendCommand::UpdateCredential { .. }
         | BackendCommand::Shutdown => return Ok(None),
     };
     Ok(Some(BridgeRequest { method, payload }))

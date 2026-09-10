@@ -662,6 +662,7 @@ async fn handle_command(
         | BackendCommand::SetSessionOptions { .. }
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::ResolveExternalTool { .. }
+        | BackendCommand::UpdateCredential { .. }
         | BackendCommand::Shutdown => Ok(()),
     }
 }

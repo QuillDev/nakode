@@ -533,7 +533,7 @@ async fn run_supervisor(
             capabilities,
         }))
         .await;
-    let credential = refresh_if_needed(&config, credential, &events).await;
+    let mut credential = refresh_if_needed(&config, credential, &events).await;
     let provider = credential.clone().map(|credential| {
         Arc::new(CodexProvider {
             client: config.client.clone(),
@@ -541,27 +541,7 @@ async fn run_supervisor(
             credential,
         }) as Arc<dyn InferenceProvider>
     });
-    let runtime = provider.map(|provider| {
-        let mut runtime = AgentRuntime::new(config.workspace.clone(), provider)
-            .with_compaction_threshold_percent(config.compaction_threshold_percent);
-        if let Some(requests) = &config.native_delegation {
-            runtime = runtime.with_native_delegation(requests.clone());
-        }
-        if let Some(web_config) = &config.web_config {
-            runtime = runtime.with_web_config(Arc::clone(web_config));
-        }
-        if let Some(memory_service) = &config.memory_service {
-            runtime = runtime.with_memory(Arc::clone(memory_service));
-        }
-        if let Some(vision_config) = &config.vision_config {
-            runtime = runtime.with_vision(
-                Arc::clone(vision_config),
-                config.vision_service.clone(),
-                true,
-            );
-        }
-        runtime
-    });
+    let mut runtime = provider.map(|provider| native_runtime(&config, provider));
     let session_store = config
         .session_database
         .clone()
@@ -585,10 +565,35 @@ async fn run_supervisor(
                     }
                     break;
                 }
+                if let BackendCommand::UpdateCredential { credential: replacement } = command {
+                    match replacement.map(|value| serde_json::from_value::<CodexCredential>(value.into_inner())).transpose() {
+                        Ok(replacement) => {
+                            credential = replacement;
+                            if let Some(credential) = credential.clone() {
+                                let provider = Arc::new(CodexProvider {
+                                    client: config.client.clone(),
+                                    base_url: config.base_url.clone(),
+                                    credential,
+                                }) as Arc<dyn InferenceProvider>;
+                                if let Some(runtime) = runtime.as_mut() {
+                                    runtime.replace_provider(provider);
+                                } else {
+                                    runtime = Some(native_runtime(&config, provider));
+                                }
+                            } else if let Some(active) = active.as_ref() {
+                                active.cancellation.cancel();
+                            }
+                        }
+                        Err(_) => {
+                            request_failed(&events, BackendOperation::Authenticate, "invalid replacement credential").await;
+                        }
+                    }
+                    continue;
+                }
                 let mut context = CommandContext {
                     config: &config,
                     credential: credential.as_ref(),
-                    runtime: runtime.as_ref(),
+                    runtime: credential.as_ref().and(runtime.as_ref()),
                     sessions: &mut sessions,
                     pending_options: &mut pending_options,
                     active: &mut active,
@@ -617,6 +622,28 @@ async fn run_supervisor(
         task.abort();
         let _ = task.await;
     }
+}
+
+fn native_runtime(config: &BackendConfig, provider: Arc<dyn InferenceProvider>) -> AgentRuntime {
+    let mut runtime = AgentRuntime::new(config.workspace.clone(), provider)
+        .with_compaction_threshold_percent(config.compaction_threshold_percent);
+    if let Some(requests) = &config.native_delegation {
+        runtime = runtime.with_native_delegation(requests.clone());
+    }
+    if let Some(web_config) = &config.web_config {
+        runtime = runtime.with_web_config(Arc::clone(web_config));
+    }
+    if let Some(memory_service) = &config.memory_service {
+        runtime = runtime.with_memory(Arc::clone(memory_service));
+    }
+    if let Some(vision_config) = &config.vision_config {
+        runtime = runtime.with_vision(
+            Arc::clone(vision_config),
+            config.vision_service.clone(),
+            true,
+        );
+    }
+    runtime
 }
 
 async fn handle_completed_turn(
@@ -930,7 +957,9 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                     .await;
             }
         }
-        BackendCommand::ResolveApproval { .. } | BackendCommand::Shutdown => {}
+        BackendCommand::UpdateCredential { .. }
+        | BackendCommand::ResolveApproval { .. }
+        | BackendCommand::Shutdown => {}
     }
 }
 
@@ -1282,7 +1311,7 @@ async fn resume_session(
         request_failed(
             context.events,
             BackendOperation::ResumeSession,
-            "native session is not loaded",
+            "saved provider continuation is unavailable; the logical session has not been deleted. Check the original execution machine and Nakode data location before retrying",
         )
         .await;
     }
@@ -2787,6 +2816,155 @@ mod tests {
 
         assert_eq!(error, "[redacted credential-bearing diagnostic]");
         assert!(!error.contains("secret-token"));
+    }
+
+    async fn wait_for_event(
+        handle: &mut BackendHandle,
+        predicate: impl Fn(&BackendEvent) -> bool,
+    ) -> BackendEvent {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = handle.events.recv().await.expect("adapter event");
+                if predicate(&event) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("bounded adapter event")
+    }
+
+    fn retained_session_start() -> BackendCommand {
+        BackendCommand::StartSession {
+            model: None,
+            instructions: Some("retained instructions".to_owned()),
+            owner_session_id: Some("logical-retained".to_owned()),
+            parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
+            code_mode: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            finalization_reserve_turns: 0,
+            timeout_seconds: None,
+        }
+    }
+
+    fn retained_session_resume(native_id: &str) -> BackendCommand {
+        BackendCommand::ResumeSession {
+            provider_session_id: native_id.to_owned(),
+            owner_session_id: Some("logical-retained".to_owned()),
+            enabled_skill_ids: Vec::new(),
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
+            code_mode: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_changes_keep_native_sessions_and_use_new_token() {
+        let (base_url, server) = serve_sequence(vec![
+            (
+                200,
+                "application/json",
+                r#"{"models":[{"slug":"gpt-native","is_default":true,"context_window":272000}]}"#,
+            ),
+            (
+                200,
+                "application/json",
+                r#"{"models":[{"slug":"gpt-native","is_default":true,"context_window":272000}]}"#,
+            ),
+        ])
+        .await;
+        let config = BackendConfig::native(PathBuf::from("."))
+            .with_base_url(base_url)
+            .with_credential(Some(
+                serde_json::to_value(test_credential()).expect("credential"),
+            ));
+        let mut handle = spawn(config).await.expect("adapter");
+        handle
+            .commands
+            .send(retained_session_start())
+            .await
+            .expect("start");
+        let BackendEvent::SessionCreated {
+            provider_session_id: native_id,
+            ..
+        } = wait_for_event(&mut handle, |event| {
+            matches!(event, BackendEvent::SessionCreated { .. })
+        })
+        .await
+        else {
+            unreachable!()
+        };
+        handle
+            .commands
+            .send(BackendCommand::UpdateCredential { credential: None })
+            .await
+            .expect("sign out");
+        handle
+            .commands
+            .send(BackendCommand::Reload {
+                provider_session_id: None,
+            })
+            .await
+            .expect("refresh");
+        wait_for_event(&mut handle, |event| {
+            matches!(
+                event,
+                BackendEvent::RequestFailed {
+                    operation: BackendOperation::Reload,
+                    ..
+                }
+            )
+        })
+        .await;
+        let mut credential = test_credential();
+        credential.access_token = "replacement-fixture-token".to_owned();
+        handle
+            .commands
+            .send(BackendCommand::UpdateCredential {
+                credential: Some(crate::credential::SecretValue::new(
+                    serde_json::to_value(credential).expect("credential"),
+                )),
+            })
+            .await
+            .expect("sign in");
+        handle
+            .commands
+            .send(BackendCommand::Reload {
+                provider_session_id: None,
+            })
+            .await
+            .expect("check new token");
+        handle
+            .commands
+            .send(retained_session_resume(&native_id))
+            .await
+            .expect("resume same session");
+        let BackendEvent::SessionResumed {
+            provider_session_id,
+            ..
+        } = wait_for_event(&mut handle, |event| {
+            matches!(event, BackendEvent::SessionResumed { .. })
+        })
+        .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(provider_session_id, native_id);
+        let requests = server.await.expect("mock server");
+        assert!(requests[1].contains("replacement-fixture-token"));
+        handle
+            .commands
+            .send(BackendCommand::Shutdown)
+            .await
+            .expect("shutdown");
+        handle.join().await.expect("joined");
     }
 
     #[tokio::test]

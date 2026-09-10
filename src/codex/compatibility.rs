@@ -423,6 +423,7 @@ async fn handle_command(
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::ResolveExternalTool { .. }
         | BackendCommand::SubmitAuthenticationCallback { .. }
+        | BackendCommand::UpdateCredential { .. }
         | BackendCommand::Shutdown => return Ok(()),
         _ => {}
     }
@@ -529,6 +530,7 @@ fn command_request(
         | BackendCommand::ResolveQuestion { .. }
         | BackendCommand::ResolveExternalTool { .. }
         | BackendCommand::SubmitAuthenticationCallback { .. }
+        | BackendCommand::UpdateCredential { .. }
         | BackendCommand::Shutdown => unreachable!(),
     }
 }
