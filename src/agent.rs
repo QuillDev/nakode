@@ -792,7 +792,7 @@ fn remove_if_present(path: &Path) -> Result<(), AgentCatalogError> {
 #[must_use]
 pub fn required_capability(tool: &str) -> Option<&'static str> {
     match tool {
-        "read" | "grep" | "find" | "ls" => Some("filesystem_read"),
+        "read" | "grep" | "find" | "ls" | "return_image" => Some("filesystem_read"),
         "write" | "edit" => Some("filesystem_write"),
         "bash" => Some("command_execution"),
         "eval" | "ask" => Some("interaction"),

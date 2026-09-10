@@ -817,6 +817,7 @@ pub enum BackendEvent {
         turn_id: String,
         item: NormalizedItem,
     },
+    ImageReturned(crate::runtime::ReturnedImage),
     /// Privacy-minimal accepted exact skill load. The invocation key survives provider replay.
     SkillInvoked {
         invocation_key: String,

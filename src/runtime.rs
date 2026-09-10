@@ -2068,6 +2068,37 @@ pub struct ValidationEvidence {
     pub relevant_state: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReturnedImage {
+    pub id: String,
+    pub turn_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub attachment: PromptAttachment,
+    pub history_index: usize,
+    pub sequence: usize,
+}
+
+impl ReturnedImage {
+    #[must_use]
+    pub fn history_item(&self) -> SessionHistoryItem {
+        SessionHistoryItem {
+            turn_id: self.turn_id.clone(),
+            provider_id: Some(self.provider_id.clone()),
+            model_id: Some(self.model_id.clone()),
+            attachments: vec![self.attachment.clone()],
+            item: NormalizedItem {
+                id: self.id.clone(),
+                kind: ItemKind::Assistant,
+                title: self.attachment.label.clone(),
+                body: String::new(),
+                status: ItemStatus::Complete,
+                tool_audit_json: None,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeSession {
     pub id: String,
@@ -2104,6 +2135,8 @@ pub struct RuntimeSession {
     /// Successful routine validation keyed by exact command/cwd and relevant Git state.
     #[serde(default)]
     pub validation_evidence: Vec<ValidationEvidence>,
+    #[serde(default)]
+    pub returned_images: HashMap<String, ReturnedImage>,
 }
 
 impl RuntimeSession {
@@ -2126,6 +2159,7 @@ impl RuntimeSession {
             owner_session_id: None,
             parent_run_id: None,
             validation_evidence: Vec::new(),
+            returned_images: HashMap::new(),
         }
     }
 
@@ -2195,16 +2229,38 @@ impl RuntimeSession {
         })
     }
 
-    #[must_use]
-    pub fn normalized_history(&self) -> Vec<SessionHistoryItem> {
+    fn history_items(&self) -> impl Iterator<Item = &ConversationItem> {
         self.compactions
             .iter()
             .flat_map(|compaction| compaction.compacted_history.iter())
             .chain(self.history.iter())
             .filter(|item| !matches!(item, ConversationItem::Compaction { .. }))
-            .enumerate()
-            .flat_map(|(index, item)| normalize_history_item(&self.id, index, item))
-            .collect()
+    }
+
+    #[must_use]
+    pub fn history_position(&self) -> usize {
+        self.history_items().count()
+    }
+
+    #[must_use]
+    pub fn normalized_history(&self) -> Vec<SessionHistoryItem> {
+        let mut images = self.returned_images.values().collect::<Vec<_>>();
+        images.sort_by_key(|image| (image.history_index, image.sequence));
+        let mut images = images.into_iter().peekable();
+        let mut entries = Vec::new();
+        for (index, item) in self.history_items().enumerate() {
+            while images
+                .peek()
+                .is_some_and(|image| image.history_index <= index)
+            {
+                if let Some(image) = images.next() {
+                    entries.push(image.history_item());
+                }
+            }
+            entries.extend(normalize_history_item(&self.id, index, item));
+        }
+        entries.extend(images.map(ReturnedImage::history_item));
+        entries
     }
 }
 
