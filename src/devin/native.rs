@@ -551,6 +551,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
         }
         BackendCommand::ResolveApproval { .. }
         | BackendCommand::SetSessionOptions { .. }
+        | BackendCommand::UpdateCredential { .. }
         | BackendCommand::Shutdown => {}
     }
 }

@@ -368,6 +368,11 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Changes inference credentials for subsequent work while retaining tool brokers and sessions.
+    pub(crate) fn replace_provider(&mut self, provider: Arc<dyn InferenceProvider>) {
+        self.provider = provider;
+    }
+
     #[must_use]
     pub fn new(workspace: PathBuf, provider: Arc<dyn InferenceProvider>) -> Self {
         Self {

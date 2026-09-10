@@ -3689,6 +3689,21 @@ impl DomainState {
         ));
     }
 
+    pub(crate) fn provider_refreshing(&mut self, provider: &str, account_id: Option<&str>) {
+        if let Some(account_id) = account_id {
+            self.provider_account_health.insert(
+                (provider.to_owned(), account_id.to_owned()),
+                nakode_protocol::ProviderAccountHealthView {
+                    state: nakode_protocol::ProviderAccountHealthState::Unknown,
+                    safe_reason: Some("Checking account readiness.".to_owned()),
+                    cooldown_until_ms: None,
+                },
+            );
+        } else if let Some(context) = self.provider_contexts.get_mut(provider) {
+            context.connection = ConnectionState::Starting;
+        }
+    }
+
     pub fn provider_account_recovered(&mut self, provider: &str, account_id: &str) {
         let key = (provider.to_owned(), account_id.to_owned());
         self.provider_account_authentication.remove(&key);
@@ -3705,9 +3720,16 @@ impl DomainState {
     }
 
     pub fn provider_authentication_failed(&mut self, provider: &str, message: &str) {
-        self.provider_contexts.remove(provider);
+        if let Some(context) = self.provider_contexts.get_mut(provider) {
+            context.connection = ConnectionState::Failed(
+                "provider authentication failed; sign in and retry".to_owned(),
+            );
+        }
         self.provider_authentication.remove(provider);
         if provider == self.backend_provider {
+            self.connection = ConnectionState::Failed(
+                "provider authentication failed; sign in and retry".to_owned(),
+            );
             self.context_usage = None;
         }
         self.set_status(&format!("Authentication failed for {provider}: {message}"));
@@ -3758,6 +3780,18 @@ impl DomainState {
     }
 
     pub fn provider_disabled(&mut self, provider: &str) {
+        // Codex retains its session adapter across auth changes. Preserve the matching
+        // identity here too; other providers still stop their adapters on disablement.
+        if provider == CODEX_PROVIDER
+            && provider == self.backend_provider
+            && self.provider_session_id.is_some()
+        {
+            self.provider_authentication.remove(provider);
+            self.connection =
+                ConnectionState::Disconnected("provider unavailable; sign in and retry".to_owned());
+            self.sync_active_provider_context();
+            return;
+        }
         self.provider_contexts.remove(provider);
         self.provider_authentication.remove(provider);
         let model_prefix = format!("{provider}/");
@@ -6889,12 +6923,29 @@ impl DomainState {
                     metadata: metadata.clone(),
                 }]
             }
+            BackendEvent::Models(_) => {
+                self.provider_account_health.remove(&key);
+                Vec::new()
+            }
             BackendEvent::RequestFailed {
                 operation: BackendOperation::Authenticate | BackendOperation::Reload,
                 message,
+                detail,
                 ..
             } => {
-                self.provider_account_authentication_failed(provider, account_id, message);
+                let authentication_required = detail.as_ref().is_some_and(|detail| {
+                    detail.classification
+                        == crate::backend::BackendFailureClassification::Authentication
+                });
+                self.provider_account_authentication_failed(
+                    provider,
+                    account_id,
+                    if authentication_required {
+                        "authentication required"
+                    } else {
+                        message
+                    },
+                );
                 Vec::new()
             }
             // Account controls exist only to authenticate and refresh one account. Readiness,
@@ -6918,6 +6969,24 @@ impl DomainState {
                 ..
             } => self.handle_provider_account_control_backend(provider, account_id, &event),
             _ => self.handle_provider_backend(provider, event),
+        }
+    }
+
+    fn provider_refresh_finished(&mut self, provider: &str, success: bool) {
+        let connection = if success {
+            ConnectionState::Ready {
+                server: self.provider_display_name(provider),
+            }
+        } else {
+            ConnectionState::Failed(
+                "provider refresh failed; check authentication and retry".to_owned(),
+            )
+        };
+        if let Some(context) = self.provider_contexts.get_mut(provider) {
+            context.connection = connection.clone();
+        }
+        if provider == self.backend_provider {
+            self.connection = connection;
         }
     }
 
@@ -6953,11 +7022,18 @@ impl DomainState {
                     };
                 }
             }
+            BackendEvent::RequestFailed {
+                operation: BackendOperation::Reload,
+                ..
+            } => {
+                self.provider_refresh_finished(provider, false);
+            }
             BackendEvent::Models(models) => {
                 if models.iter().any(|model| model.provider != provider) {
                     self.diagnostic_count += 1;
                     return Vec::new();
                 }
+                self.provider_refresh_finished(provider, true);
                 let models = models.clone();
                 if !models.is_empty() {
                     self.install_models(models.clone());
@@ -11912,6 +11988,36 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected subagent launch, got {effects:?}"))
+    }
+
+    #[test]
+    fn auth_unavailability_preserves_logical_and_native_identity() {
+        let mut state = ready_state();
+        state.session_id = Some("logical-auth".to_owned());
+        state.provider_session_id = Some("native-auth".to_owned());
+        state.provider_account_id = Some("original-account".to_owned());
+        let model = state.selected_model.clone();
+        state.provider_disabled(CODEX_PROVIDER);
+        assert_eq!(state.session_id.as_deref(), Some("logical-auth"));
+        assert_eq!(state.provider_session_id.as_deref(), Some("native-auth"));
+        assert_eq!(
+            state.provider_account_id.as_deref(),
+            Some("original-account")
+        );
+        assert_eq!(state.selected_model, model);
+        state.provider_authentication_failed(CODEX_PROVIDER, "expired");
+        assert_eq!(state.provider_session_id.as_deref(), Some("native-auth"));
+        assert!(!state.connection.is_ready());
+    }
+
+    #[test]
+    fn non_codex_disablement_does_not_retain_a_stopped_adapter_identity() {
+        let mut state = AppState::new_for_backend("/tmp/project", None, 100, "kimi", "Kimi");
+        state.session_id = Some("logical-kimi".to_owned());
+        state.provider_session_id = Some("native-kimi".to_owned());
+        state.provider_disabled("kimi");
+        assert!(state.provider_session_id.is_none());
+        assert!(state.session_id.is_none());
     }
 
     fn ready_state() -> AppState {

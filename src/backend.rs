@@ -951,6 +951,10 @@ pub struct NativeDelegationRequest {
 /// Provider-neutral commands understood by an agent backend adapter.
 #[derive(Clone, Debug)]
 pub enum BackendCommand {
+    /// Replace credentials without replacing logical or native sessions.
+    UpdateCredential {
+        credential: Option<crate::credential::SecretValue>,
+    },
     BeginAuthentication {
         client_context: ClientContext,
     },
