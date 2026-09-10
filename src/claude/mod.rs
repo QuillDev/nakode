@@ -1132,14 +1132,13 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             instructions,
             owner_session_id,
             parent_run_id,
-            enabled_skill_ids: _,
             external_tools,
             replace_builtin_tools,
-            code_mode: _,
             allowed_builtin_tools,
             max_turns,
             finalization_reserve_turns,
             timeout_seconds,
+            ..
         } => (
             "create",
             json!({"model":model,"instructions":instructions,"ownerSessionId":owner_session_id,"parentRunId":parent_run_id,"maxTurns":max_turns,"finalizationReserveTurns":finalization_reserve_turns,"timeoutSeconds":timeout_seconds,"externalTools":external_tools,"replaceBuiltinTools":replace_builtin_tools,"allowedBuiltinTools":allowed_builtin_tools}),
@@ -1223,6 +1222,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
         | BackendCommand::SetSessionCodeMode { .. }
         | BackendCommand::BeginAuthentication { .. }
         | BackendCommand::SubmitAuthenticationCallback { .. }
+        | BackendCommand::UpdateCredential { .. }
         | BackendCommand::Shutdown => return Ok(None),
     };
     Ok(Some(BridgeRequest { method, payload }))

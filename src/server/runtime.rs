@@ -2839,12 +2839,7 @@ impl NativeServerRuntime {
                 .state_mut()
                 .session_store_failed(error.to_string()),
         }
-        match self
-            .effects
-            .persistence
-            .sessions
-            .list_recent(&workspace, 100)
-        {
+        match self.effects.persistence.sessions.list_recent_all() {
             Ok(sessions) => self.core.replace_session_records(sessions),
             Err(error) => self
                 .core
@@ -3642,7 +3637,32 @@ impl BackendRegistry {
         // completed login cannot leave an unauthenticated supervisor serving later reloads.
         self.stop_provider_account_control(provider, account_id)
             .await;
+        self.update_codex_session_credentials(provider, account_id, Some(metadata.clone()))
+            .await;
         self.set_provider_account_credential(provider, account_id, metadata);
+    }
+
+    async fn update_codex_session_credentials(
+        &self,
+        provider: &str,
+        account_id: &str,
+        metadata: Option<serde_json::Value>,
+    ) {
+        if provider != crate::backend::CODEX_PROVIDER {
+            return;
+        }
+        for (key, selected_account) in &self.session_accounts {
+            if key.1 == provider
+                && selected_account == account_id
+                && let Some(commands) = self.session_commands.get(key)
+            {
+                let _ = commands
+                    .send(BackendCommand::UpdateCredential {
+                        credential: metadata.clone().map(SecretValue::new),
+                    })
+                    .await;
+            }
+        }
     }
 
     pub(crate) async fn clear_provider_account_credential(
@@ -3660,10 +3680,14 @@ impl BackendRegistry {
             })
             .map(|((session_id, _), _)| session_id.clone())
             .collect::<Vec<_>>();
+        self.update_codex_session_credentials(provider, account_id, None)
+            .await;
         for session_id in session_ids {
-            let _ = self
-                .stop_session_backend((session_id, provider.to_owned()))
-                .await;
+            if provider != crate::backend::CODEX_PROVIDER {
+                let _ = self
+                    .stop_session_backend((session_id, provider.to_owned()))
+                    .await;
+            }
         }
         self.provider_account_credentials
             .remove(&(provider.to_owned(), account_id.to_owned()));
@@ -4281,7 +4305,20 @@ impl BackendRegistry {
     }
 
     pub(crate) async fn clear_provider_credential(&mut self, provider: &str) -> io::Result<()> {
-        self.stop_provider(provider).await;
+        if provider == crate::backend::CODEX_PROVIDER {
+            self.stop_provider_control(provider).await;
+            let accounts = self
+                .provider_accounts
+                .get(provider)
+                .cloned()
+                .unwrap_or_default();
+            for account in accounts {
+                self.clear_provider_account_credential(provider, &account.account_id)
+                    .await;
+            }
+        } else {
+            self.stop_provider(provider).await;
+        }
         let run_ids = self
             .subagent_providers
             .iter()
@@ -4850,6 +4887,7 @@ impl EffectExecutor {
         provider: &str,
         account_id: &str,
     ) {
+        state.provider_refreshing(provider, Some(account_id));
         if let Err(error) = self
             .backends
             .start_provider_account(provider, account_id)
@@ -4878,6 +4916,7 @@ impl EffectExecutor {
     }
 
     async fn reload_provider(&mut self, state: &mut DomainState, provider: &str) {
+        state.provider_refreshing(provider, None);
         if let Err(error) = self.backends.start_provider(provider).await {
             state.provider_authentication_failed(provider, &error.to_string());
             return;
@@ -5646,14 +5685,28 @@ async fn save_provider_credential(
         }
     };
     backends.update_provider_accounts(&providers);
+    if credential.provider == crate::backend::CODEX_PROVIDER {
+        backends
+            .update_codex_session_credentials(
+                &credential.provider,
+                &account_id,
+                Some(credential.metadata.clone()),
+            )
+            .await;
+    }
     backends.set_provider_account_credential(
         &credential.provider,
         &account_id,
         credential.metadata,
     );
     match origin {
-        EffectOrigin::ClientCommand => backends.stop_provider(&credential.provider).await,
-        EffectOrigin::ProviderControl | EffectOrigin::PrimarySession | EffectOrigin::Subagent => {
+        EffectOrigin::ClientCommand if credential.provider != crate::backend::CODEX_PROVIDER => {
+            backends.stop_provider(&credential.provider).await;
+        }
+        EffectOrigin::ClientCommand
+        | EffectOrigin::ProviderControl
+        | EffectOrigin::PrimarySession
+        | EffectOrigin::Subagent => {
             // Provider events can carry a refreshed token from a live session adapter.
             // Replace only the catalog/auth control handle; the adapter that owns an
             // active logical session already has the refreshed token and must continue.
@@ -5716,7 +5769,11 @@ async fn apply_provider_enablement(
         .find(|record| record.provider == provider)
         .map_or_else(|| provider.to_owned(), |record| record.display_name.clone());
     if !enabled {
-        backends.stop_provider(provider).await;
+        if provider == crate::backend::CODEX_PROVIDER {
+            backends.stop_provider_control(provider).await;
+        } else {
+            backends.stop_provider(provider).await;
+        }
         state.provider_disabled(provider);
         return;
     }
@@ -10991,6 +11048,103 @@ mod tests {
             "supervisor handles accumulated across session churn: {} handles",
             registry.tasks.len()
         );
+    }
+
+    #[tokio::test]
+    async fn codex_reauthentication_retains_session_adapter_and_account_affinity() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let session = SessionId::from("reauth-session");
+        let (backend, mut commands, _events) = fake_backend();
+        registry.insert_session(
+            session.clone(),
+            CODEX_PROVIDER.to_owned(),
+            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            backend,
+        );
+        registry
+            .clear_provider_account_credential(CODEX_PROVIDER, CODEX_TEST_ACCOUNT_ID)
+            .await;
+        assert!(matches!(
+            commands.recv().await,
+            Some(BackendCommand::UpdateCredential { credential: None })
+        ));
+        registry
+            .replace_provider_account_credential(
+                CODEX_PROVIDER,
+                CODEX_TEST_ACCOUNT_ID,
+                serde_json::json!({"fixture": "replacement"}),
+            )
+            .await;
+        assert!(matches!(
+            commands.recv().await,
+            Some(BackendCommand::UpdateCredential {
+                credential: Some(_)
+            })
+        ));
+        let key = (session, CODEX_PROVIDER.to_owned());
+        assert!(registry.session_commands.contains_key(&key));
+        assert_eq!(
+            registry.session_accounts.get(&key).map(String::as_str),
+            Some(CODEX_TEST_ACCOUNT_ID)
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "reauth must not shut down the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_refresh_keeps_durable_sessions_across_workspaces_and_page_limit() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        for index in 0..105 {
+            persistence
+                .sessions
+                .create_with_id(
+                    &format!("durable-{index}"),
+                    CODEX_PROVIDER,
+                    &format!("native-{index}"),
+                    if index == 0 {
+                        "other-workspace"
+                    } else {
+                        workspace.path().to_str().expect("path")
+                    },
+                    workspace.path().to_str().expect("path"),
+                    "saved history",
+                    None,
+                    &BackendModelOptions::default(),
+                    None,
+                )
+                .expect("persist session");
+        }
+        let registry = empty_registry(workspace.path()).await;
+        let effects = EffectExecutor::new(registry, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        runtime.refresh_catalogs();
+        assert_eq!(runtime.core.sessions.len(), 105);
+        assert!(
+            runtime
+                .core
+                .sessions
+                .iter()
+                .any(|session| session.id == "durable-0")
+        );
+        runtime.refresh_catalogs();
+        assert_eq!(runtime.core.sessions.len(), 105);
     }
 
     #[tokio::test]
