@@ -35,6 +35,7 @@ pub enum ServiceCapability {
     /// Declared rather than assumed so a client can degrade its own affordance instead of offering a
     /// delete that an older server answers with `Unimplemented`.
     SessionDeletion,
+    SessionOrphanCleanup,
     /// Structured, atomic per-question answers, including free text.
     QuestionTextAnswers,
     /// `SteerQueuedPrompt` atomically redirects active work to a server-owned follow-up.

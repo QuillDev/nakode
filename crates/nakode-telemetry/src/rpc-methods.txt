@@ -25,6 +25,8 @@
 /nakode.v1.NakodeService/SetBridgeLiveMessage
 /nakode.v1.NakodeService/ContinueSessionFromBridge
 /nakode.v1.NakodeService/ListSessions
+/nakode.v1.NakodeService/ListOrphanedSessions
+/nakode.v1.NakodeService/PruneSession
 /nakode.v1.NakodeService/ListActiveSessions
 /nakode.v1.NakodeService/DeleteSession
 /nakode.v1.NakodeService/GetSession

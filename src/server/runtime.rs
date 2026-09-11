@@ -204,6 +204,7 @@ impl BridgeMutationRollback {
             | Command::EnqueuePrompt { .. }
             | Command::ContinueSessionFromBridge { .. }
             | Command::DeleteSession { .. }
+            | Command::PruneSession { .. }
             | Command::OpenSession {
                 profile_id: Some(_),
                 ..
@@ -2927,6 +2928,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::InitialSessionInstructions,
             ServiceCapability::SessionEnvironment,
             ServiceCapability::SessionDeletion,
+            ServiceCapability::SessionOrphanCleanup,
             ServiceCapability::QuestionTextAnswers,
             ServiceCapability::QueuedPromptSteering,
             ServiceCapability::ArchetypeManagement,

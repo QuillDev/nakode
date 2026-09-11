@@ -1051,6 +1051,36 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         ))
     }
 
+    async fn list_orphaned_sessions(
+        &self,
+        request: tonic::Request<api::ListSessionsRequest>,
+    ) -> Result<tonic::Response<api::ListSessionsResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let (result, timing) = self
+            .query(protocol::Query::ListOrphanedSessions {
+                workspace_id: protocol::WorkspaceId::from(request.workspace_id),
+                limit: request.limit,
+            })
+            .await?;
+        let protocol::QueryResult::Sessions(inventory) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected sessions response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            api::ListSessionsResponse {
+                sessions: inventory
+                    .sessions
+                    .into_iter()
+                    .map(session_summary)
+                    .collect(),
+                complete: inventory.complete,
+            },
+            &timing,
+        ))
+    }
+
     async fn list_sessions(
         &self,
         request: tonic::Request<api::ListSessionsRequest>,
@@ -1687,6 +1717,14 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         protocol::Command::DeleteAgent {
             workspace_id: protocol::WorkspaceId::from(input.workspace_id),
             slug: input.slug
+        }
+    );
+    command_rpc!(
+        prune_session,
+        api::DeleteSessionRequest,
+        input,
+        protocol::Command::PruneSession {
+            session_id: protocol::SessionId::from(input.session_id)
         }
     );
     command_rpc!(
