@@ -2060,7 +2060,11 @@ impl ServerCore {
                             .to_owned(),
                     ));
                 }
-                canonical_working_directory(Some(&loaded_working_directory), &loaded_workspace)?;
+                canonical_open_session_working_directory(
+                    loaded,
+                    &loaded_working_directory,
+                    &loaded_workspace,
+                )?;
                 if *loaded == self.default_session
                     && !self
                         .sessions
@@ -2155,8 +2159,11 @@ impl ServerCore {
                 session.account_id = Some(requested.to_owned());
             }
         }
-        let working_directory =
-            canonical_working_directory(Some(&session.working_directory), &session.workspace)?;
+        let working_directory = canonical_open_session_working_directory(
+            session_id,
+            &session.working_directory,
+            &session.workspace,
+        )?;
         self.refresh_session_template_addenda()?;
         let authoritative_ids = profile_id
             .as_ref()
@@ -4540,6 +4547,19 @@ fn canonical_working_directory(
     canonical_working_directory_with_home(requested, workspace, runtime_home.as_deref())
 }
 
+fn canonical_open_session_working_directory(
+    session_id: &SessionId,
+    working_directory: &str,
+    workspace: &str,
+) -> Result<String, DomainCommandError> {
+    canonical_working_directory(Some(working_directory), workspace).map_err(|error| match error {
+        DomainCommandError::Invalid(_) => DomainCommandError::NotFound(format!(
+            "session {session_id}: backing working directory is unavailable"
+        )),
+        other => other,
+    })
+}
+
 fn canonical_working_directory_with_home(
     requested: Option<&str>,
     workspace: &str,
@@ -5845,7 +5865,12 @@ mod tests {
         let error = core
             .open_session_command(&restored_id, None)
             .expect_err("deleted cwd must not fall back to workspace");
-        assert!(error.to_string().contains("working_directory"));
+        assert_eq!(
+            error,
+            DomainCommandError::NotFound(
+                "session restored-cwd-session: backing working directory is unavailable".to_owned()
+            )
+        );
     }
 
     #[test]
