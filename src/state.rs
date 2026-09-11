@@ -12115,6 +12115,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn code_mode_toggle_rejects_a_resume_in_flight() {
         let mut state = ready_state();
         let effects = state.begin_resume(SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: "resume-in-flight".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -12269,6 +12270,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         state.backend_capabilities.external_tools = CapabilitySupport::Unsupported;
         state.backend_capabilities.mcp = CapabilitySupport::Supported;
         let session = SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: "01950000-0000-7000-8000-000000000001".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -15872,6 +15874,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             },
         );
         let session = SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: "01950000-0000-7000-8000-000000000000".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -16007,6 +16010,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn resumed_pending_normal_owner_prompt_replays_with_stable_identity_and_acknowledges() {
         let mut state = ready_state();
         let session = SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: "resume-pending-owner".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -16068,6 +16072,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     fn failed_pending_resume_replay_keeps_later_queue_blocked() {
         let mut state = ready_state();
         let session = SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: "resume-invalid-pending-owner".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -16158,6 +16163,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         let mut state = ready_state();
         let session_id = "resume-pending-creation";
         let session = SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: Some(
                 "Keep operating instructions separate from task text.".to_owned(),
             ),
@@ -17414,6 +17420,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             }]),
         );
         let session = SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: "logical-restored".to_owned(),
             provider: CODEX_PROVIDER.to_owned(),

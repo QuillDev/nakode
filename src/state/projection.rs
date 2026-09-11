@@ -70,6 +70,7 @@ pub fn bootstrap(
         session_summaries.insert(
             0,
             SessionSummary {
+                first_prompt_preview: active_session.first_prompt_preview.clone(),
                 id: SessionId::from(state.nakode_session_id.clone()),
                 workspace_id: workspace_id.clone(),
                 working_directory: state.working_directory.clone(),
@@ -88,6 +89,7 @@ pub fn bootstrap(
     }
 
     BootstrapView {
+        session_inventory_complete: false,
         workspace_id: workspace_id.clone(),
         workspace_path: state.workspace.clone(),
         session_bridges: Vec::new(),
@@ -242,13 +244,7 @@ fn session_view(
         workspace_id: workspace_id.clone(),
         working_directory: state.working_directory.clone(),
         title: session_title(state, sessions),
-        first_prompt_preview: state
-            .transcript
-            .entries()
-            .iter()
-            .find(|entry| entry.kind == EntryKind::User)
-            .map(|entry| entry.body.trim().chars().take(512).collect())
-            .unwrap_or_default(),
+        first_prompt_preview: first_prompt_preview(state, sessions),
         code_mode: state.code_mode(),
         status_message: state.status_message.clone(),
         diagnostic_count: u64::try_from(state.diagnostic_count).unwrap_or(u64::MAX),
@@ -2216,6 +2212,7 @@ pub(crate) fn active_session_summary(
         .iter()
         .find(|session| session.id == state.nakode_session_id);
     Some(SessionSummary {
+        first_prompt_preview: first_prompt_preview(state, sessions),
         id: SessionId::from(state.nakode_session_id.clone()),
         workspace_id,
         working_directory: state.working_directory.clone(),
@@ -2238,8 +2235,38 @@ pub(crate) fn active_session_summary(
     })
 }
 
+fn first_prompt_preview(state: &DomainState, sessions: &[SessionRecord]) -> String {
+    let persisted = sessions
+        .iter()
+        .find(|session| session.id == state.nakode_session_id)
+        .and_then(|session| session.owner_prompts.first())
+        .map(|prompt| prompt.raw_text.as_str())
+        .or_else(|| {
+            sessions
+                .iter()
+                .find(|session| session.id == state.nakode_session_id)
+                .map(|session| session.first_prompt_preview.as_str())
+                .filter(|preview| !preview.is_empty())
+        });
+    persisted
+        .or_else(|| {
+            state
+                .transcript
+                .entries()
+                .iter()
+                .find(|entry| entry.kind == EntryKind::User)
+                .map(|entry| entry.body.as_str())
+        })
+        .map(|body| body.trim().chars().take(512).collect())
+        .unwrap_or_default()
+}
+
 fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> SessionSummary {
     SessionSummary {
+        first_prompt_preview: session.owner_prompts.first().map_or_else(
+            || session.first_prompt_preview.clone(),
+            |prompt| prompt.raw_text.trim().chars().take(512).collect(),
+        ),
         id: SessionId::from(session.id.clone()),
         workspace_id: workspace_id.clone(),
         working_directory: session.working_directory.clone(),
