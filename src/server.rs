@@ -2234,6 +2234,14 @@ impl ServerCore {
                 .configure_mcp_archetype_grants(archetype_grants);
         }
         let mut effects = engine.state_mut().begin_resume(session.clone());
+        if effects.is_empty() {
+            // A rejected resume leaves the engine without a logical session identity. Registering
+            // it anyway would advertise an empty epoch-dated `New session` in the inventory, so the
+            // rejection travels as an error instead.
+            return Err(DomainCommandError::Conflict(
+                engine.state().status_message.clone(),
+            ));
+        }
         if persist_legacy_tools {
             effects.insert(
                 0,
@@ -5934,6 +5942,61 @@ mod tests {
     }
 
     #[test]
+    fn restored_session_from_another_service_root_resumes() {
+        // The session store is shared per user; the root a service was launched from is not a
+        // session boundary. A session recorded under another root must still resume here.
+        let (mut core, _) = ready_external_tools_server();
+        let directory = tempfile::tempdir().expect("persisted cwd");
+        let restored_id = SessionId::from("cross-root-session");
+        core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
+            initial_instructions: None,
+            id: restored_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-cross-root".to_owned(),
+            account_id: None,
+            workspace: "/somewhere/else/entirely".to_owned(),
+            working_directory: directory
+                .path()
+                .canonicalize()
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            title: "Cross root".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            last_owner_activity_at: None,
+            tool_configuration: None,
+            code_mode: false,
+            enabled_skill_ids: Some(Vec::new()),
+            owned_provider_sessions: Vec::new(),
+        }]);
+
+        let (_, effects) = core
+            .open_session_command(&restored_id, None)
+            .expect("a session from another service root opens");
+
+        assert!(
+            !effects.is_empty(),
+            "resume must be accepted, not reported as a rejection: {effects:#?}"
+        );
+        let status = &core
+            .engine_for(&restored_id)
+            .expect("restored engine")
+            .state()
+            .status_message;
+        assert!(
+            status.contains("Resuming session"),
+            "unexpected status after cross-root resume: {status}"
+        );
+    }
+
+    #[test]
     fn rejected_restored_open_does_not_load_subagents() {
         let (mut core, _) = ready_codex_server();
         let directory = tempfile::tempdir().expect("persisted cwd");
@@ -5967,17 +6030,21 @@ mod tests {
             owned_provider_sessions: Vec::new(),
         }]);
 
-        let (_, effects) = core
+        let error = core
             .open_session_command(&restored_id, None)
-            .expect("open reports the resume rejection in session state");
+            .expect_err("a rejected resume is an error, not a registered engine");
 
-        assert!(effects.is_empty());
         assert!(
-            core.engine_for(&restored_id)
-                .expect("restored engine")
-                .state()
-                .status_message
-                .contains("does not support session resume")
+            matches!(
+                &error,
+                DomainCommandError::Conflict(message)
+                    if message.contains("does not support session resume")
+            ),
+            "unexpected rejection: {error:?}"
+        );
+        assert!(
+            core.engine_for(&restored_id).is_none(),
+            "a rejected resume must not leave an engine in the inventory"
         );
     }
 
