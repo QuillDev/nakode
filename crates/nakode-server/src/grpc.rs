@@ -91,7 +91,9 @@ impl GrpcService {
     /// Adds a capability implemented by another typed service bound on the same listener.
     #[must_use]
     pub fn with_additional_capability(mut self, capability: impl Into<String>) -> Self {
-        self.additional_capabilities = Arc::from([capability.into()]);
+        let mut capabilities = self.additional_capabilities.to_vec();
+        capabilities.push(capability.into());
+        self.additional_capabilities = Arc::from(capabilities);
         self
     }
 

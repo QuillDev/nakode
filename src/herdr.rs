@@ -157,6 +157,7 @@ async fn run_worker(
     while let Some(report) = reports.recv().await {
         let arguments = report_arguments(&pane_id, &report);
         let mut command = Command::new(&program);
+        command.envs(crate::machine_path::environment());
         command
             .args(arguments)
             .stdin(Stdio::null())

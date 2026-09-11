@@ -138,8 +138,9 @@ async fn run_shell_command(
     cancellation: CancellationToken,
     environment: HashMap<String, String>,
 ) -> Result<(), String> {
-    let (program, arguments) = shell_command(&command_text);
+    let (program, arguments) = shell_command(&command_text, environment.contains_key("PATH"));
     let mut command = Command::new(program);
+    command.envs(crate::machine_path::environment());
     command
         .args(arguments)
         .envs(environment)
@@ -251,12 +252,16 @@ async fn output_text(output: &Mutex<Vec<u8>>) -> String {
 }
 
 #[cfg(unix)]
-fn shell_command(command: &str) -> (&'static str, Vec<OsString>) {
-    ("sh", vec!["-lc".into(), command.into()])
+fn shell_command(command: &str, explicit_path: bool) -> (&'static str, Vec<OsString>) {
+    if explicit_path {
+        ("/bin/sh", vec!["-c".into(), command.into()])
+    } else {
+        ("sh", vec!["-lc".into(), command.into()])
+    }
 }
 
 #[cfg(windows)]
-fn shell_command(command: &str) -> (&'static str, Vec<OsString>) {
+fn shell_command(command: &str, _explicit_path: bool) -> (&'static str, Vec<OsString>) {
     (
         "cmd.exe",
         vec!["/D".into(), "/S".into(), "/C".into(), command.into()],

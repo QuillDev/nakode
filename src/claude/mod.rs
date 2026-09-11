@@ -285,6 +285,7 @@ async fn prepare_bridge_directory() -> Result<PathBuf, BackendError> {
         })?;
     if !claude_sdk_is_current(&directory).await {
         let output = Command::new("npm")
+            .envs(crate::machine_path::environment())
             .args([
                 "install",
                 "--omit=dev",
@@ -331,6 +332,7 @@ fn launch_bridge(
         detail: error.to_string(),
     })?;
     let mut child = Command::new("node")
+        .envs(crate::machine_path::environment())
         .arg(directory.join("bridge.mjs"))
         .current_dir(directory)
         .env("NAKODE_WORKSPACE", workspace)
@@ -395,6 +397,7 @@ fn launch_bridge(
 
 async fn ensure_node_version() -> Result<(), BackendError> {
     let output = Command::new("node")
+        .envs(crate::machine_path::environment())
         .arg("--version")
         .output()
         .await
@@ -1813,6 +1816,7 @@ process.stdout.write(output);
             .expect("runner module");
 
         let output = Command::new("node")
+            .envs(crate::machine_path::environment())
             .arg("runner.mjs")
             .current_dir(directory.path())
             .output()
@@ -2125,6 +2129,7 @@ assert.equal(replacementSent, true, "replacement did not send after child close"
         .expect("lifecycle test script");
 
         let output = std::process::Command::new("node")
+            .envs(crate::machine_path::environment())
             .arg(&test)
             .current_dir(directory.path())
             .output()
@@ -2273,6 +2278,7 @@ assert.deepEqual(
         .expect("native history test script");
 
         let output = std::process::Command::new("node")
+            .envs(crate::machine_path::environment())
             .arg(&test)
             .arg(&bridge)
             .output()
@@ -2347,6 +2353,7 @@ assert.equal(streamMessageIds.size, 0);
         .expect("stream identity test script");
 
         let output = std::process::Command::new("node")
+            .envs(crate::machine_path::environment())
             .arg(&test)
             .arg(&bridge)
             .output()

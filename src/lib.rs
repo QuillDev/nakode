@@ -33,6 +33,7 @@ pub mod handoff;
 #[cfg(feature = "tui")]
 mod herdr;
 pub mod kimi;
+mod machine_path;
 #[cfg(feature = "tui")]
 mod markdown;
 pub mod mcp;

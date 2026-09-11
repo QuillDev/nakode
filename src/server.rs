@@ -4398,6 +4398,7 @@ fn inspect_workspace_path(
         canonical_working_directory(Some(requested), requested).map_err(domain_error)?;
     let git = |arguments: &[&str]| -> Option<String> {
         let output = std::process::Command::new("git")
+            .envs(crate::machine_path::environment())
             .args(["-C", canonical_path.as_str()])
             .args(arguments)
             .env("GIT_TERMINAL_PROMPT", "0")

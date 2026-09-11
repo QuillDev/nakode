@@ -118,6 +118,17 @@ const fn fixed(
 
 /// Complete public RPC lane catalogue. The descriptor conformance test rejects omissions.
 pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
+    fixed("MachinePathService", "GetMachinePath", RequestLane::Query),
+    fixed(
+        "MachinePathService",
+        "SaveMachinePath",
+        RequestLane::Control,
+    ),
+    fixed(
+        "MachinePathService",
+        "SyncMachinePath",
+        RequestLane::Control,
+    ),
     RpcLaneAssignment {
         service: "NakodeService",
         method: "GetWorkspace",

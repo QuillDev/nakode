@@ -235,7 +235,12 @@ fn validation_identity(
         ["status", "--porcelain=v1", "--untracked-files=all"].as_slice(),
         ["diff", "--binary", "HEAD", "--"].as_slice(),
     ] {
-        if let Ok(output) = Command::new("git").args(args).current_dir(&cwd).output() {
+        if let Ok(output) = Command::new("git")
+            .envs(crate::machine_path::environment())
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+        {
             hasher.update(&output.stdout);
             hasher.update(&output.stderr);
         }
@@ -292,7 +297,7 @@ async fn run_shell_with_environment(
             }
         }
     };
-    let (program, shell_arguments) = shell_command(&command);
+    let (program, shell_arguments) = shell_command(&command, environment.contains_key("PATH"));
     let result = if use_pty {
         run_pty_process(
             program,
@@ -461,12 +466,16 @@ fn parse_environment(arguments: &Value) -> Result<HashMap<String, String>, Strin
 }
 
 #[cfg(unix)]
-fn shell_command(command: &str) -> (&'static str, Vec<OsString>) {
-    ("sh", vec!["-lc".into(), command.into()])
+fn shell_command(command: &str, explicit_path: bool) -> (&'static str, Vec<OsString>) {
+    if explicit_path {
+        ("/bin/sh", vec!["-c".into(), command.into()])
+    } else {
+        ("sh", vec!["-lc".into(), command.into()])
+    }
 }
 
 #[cfg(windows)]
-fn shell_command(command: &str) -> (&'static str, Vec<OsString>) {
+fn shell_command(command: &str, _explicit_path: bool) -> (&'static str, Vec<OsString>) {
     (
         "cmd.exe",
         vec!["/D".into(), "/S".into(), "/C".into(), command.into()],
@@ -477,9 +486,107 @@ fn shell_command(command: &str) -> (&'static str, Vec<OsString>) {
 mod environment_tests {
     use super::*;
     #[tokio::test]
+    async fn synced_machine_path_reaches_future_shells_in_an_isolated_service_process() {
+        use nakode_sdk::v1::{self as api, machine_path_service_server::MachinePathService as _};
+        const CHILD: &str = "NAKODE_PATH_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(".tmp")
+                .join(format!("path-propagation-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&root).unwrap();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tools::bash::environment_tests::synced_machine_path_reaches_future_shells_in_an_isolated_service_process", "--nocapture"])
+                .env(CHILD, "1").env("NAKODE_HOME", &root).output().await.unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::machine_path::initialize().await.unwrap();
+        let service = crate::machine_path::service();
+        service
+            .save_machine_path(tonic::Request::new(api::SaveMachinePathRequest {
+                command: "printf /machine/path".into(),
+                expected_revision: 0,
+                idempotency_key: "save".into(),
+            }))
+            .await
+            .unwrap();
+        service
+            .sync_machine_path(tonic::Request::new(api::SyncMachinePathRequest {
+                expected_revision: 1,
+                idempotency_key: "sync".into(),
+            }))
+            .await
+            .unwrap();
+        let workspace = crate::config::nakode_home().unwrap();
+        for pty in [false, true] {
+            let result = run_shell_with_environment(
+                &workspace,
+                &serde_json::json!({"command": "printf '%s' \"$PATH\"", "pty": pty}),
+                &CancellationToken::new(),
+                crate::session_environment::read(None),
+            )
+            .await
+            .unwrap();
+            assert!(!result.failed, "{}", result.output);
+            assert_eq!(result.output.trim(), "/machine/path");
+        }
+        crate::session_environment::replace(
+            "owner",
+            std::collections::BTreeMap::from([(
+                "PATH".into(),
+                nakode_protocol::CredentialInput("/session/path".into()),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::session_environment::read(Some("owner"))
+                .get("PATH")
+                .unwrap(),
+            "/session/path"
+        );
+        assert_eq!(
+            crate::session_environment::read(Some("other"))
+                .get("PATH")
+                .unwrap(),
+            "/machine/path"
+        );
+        let arguments = vec!["-c".into(), "printf '%s' \"$PATH\"".into()];
+        let captured = super::super::process::capture_process(
+            &workspace,
+            ProcessRequest {
+                program: "/bin/sh",
+                arguments: &arguments,
+                input: None,
+                environment: None,
+                timeout: Some(Duration::from_secs(2)),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(captured.stdout, b"/machine/path");
+    }
+    #[tokio::test]
+    async fn explicit_path_survives_shell_startup_and_tool_override_in_both_modes() {
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp");
+        std::fs::create_dir_all(&workspace).unwrap();
+        for pty in [false, true] {
+            let result = run_shell_with_environment(&workspace,
+                &serde_json::json!({"command": "printf '%s' \"$PATH\"", "pty": pty, "env": { "PATH": "/explicit/tool" }}),
+                &CancellationToken::new(), HashMap::from([("PATH".into(), "/machine/baseline".into())])).await.unwrap();
+            assert!(!result.failed, "{}", result.output);
+            assert_eq!(result.output.trim(), "/explicit/tool");
+        }
+    }
+    #[tokio::test]
     async fn injected_environment_reaches_both_shell_paths_without_changing_process_environment() {
         for pty in [false, true] {
-            let result = run_shell_with_environment(&std::env::temp_dir(), &serde_json::json!({"command": "test \"$FSTACK_TEST_SECRET_VALUE\" = example-value", "pty": pty}), &CancellationToken::new(), HashMap::from([("FSTACK_TEST_SECRET_VALUE".to_owned(), "example-value".to_owned())])).await.unwrap();
+            let result = run_shell_with_environment(&std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp"), &serde_json::json!({"command": "test \"$FSTACK_TEST_SECRET_VALUE\" = example-value", "pty": pty}), &CancellationToken::new(), HashMap::from([("FSTACK_TEST_SECRET_VALUE".to_owned(), "example-value".to_owned())])).await.unwrap();
             assert!(!result.failed, "{}", result.output);
         }
         assert!(std::env::var_os("FSTACK_TEST_SECRET_VALUE").is_none());

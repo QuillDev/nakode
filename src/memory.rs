@@ -143,9 +143,14 @@ pub fn executable_available(executable: &str) -> bool {
     if path.components().count() > 1 {
         return executable_file(path);
     }
-    env::var_os("PATH").is_some_and(|paths| {
-        env::split_paths(&paths).any(|directory| executable_in_directory(&directory, executable))
-    })
+    crate::machine_path::environment()
+        .remove("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| env::var_os("PATH"))
+        .is_some_and(|paths| {
+            env::split_paths(&paths)
+                .any(|directory| executable_in_directory(&directory, executable))
+        })
 }
 
 fn executable_in_directory(directory: &Path, executable: &str) -> bool {
@@ -306,6 +311,7 @@ struct McpProcess {
 impl McpProcess {
     async fn start(config: MemoryConfig, bank: String) -> Result<Self, MemoryError> {
         let mut command = Command::new(config.executable.trim());
+        command.envs(crate::machine_path::environment());
         command
             .args(["mcp", "--bank", bank.trim()])
             .stdin(Stdio::piped())

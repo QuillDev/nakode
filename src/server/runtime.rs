@@ -6170,6 +6170,7 @@ async fn check_agent_browser(state: &mut DomainState) {
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::process::Command::new("agent-browser")
+            .envs(crate::machine_path::environment())
             .arg("--version")
             .kill_on_drop(true)
             .output(),

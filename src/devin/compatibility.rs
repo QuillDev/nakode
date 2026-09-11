@@ -181,6 +181,7 @@ struct SessionModelOption {
 /// streams are unavailable.
 pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError> {
     let mut child = Command::new(&config.program)
+        .envs(crate::machine_path::environment())
         .args(&config.args)
         .envs(config.environment.iter().cloned())
         .current_dir(&config.workspace)

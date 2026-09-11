@@ -161,6 +161,7 @@ impl EvalKernel {
     fn spawn(language: EvalLanguage, workspace: &std::path::Path) -> Result<Self, String> {
         let (program, arguments) = language.command();
         let mut child = Command::new(program)
+            .envs(crate::machine_path::environment())
             .args(arguments)
             .current_dir(workspace)
             .kill_on_drop(true)
