@@ -3876,10 +3876,6 @@ impl DomainState {
             self.set_status("Cannot switch sessions while a turn is active.");
             return Vec::new();
         }
-        if session.workspace != self.workspace {
-            self.set_status("That session belongs to a different workspace.");
-            return Vec::new();
-        }
         if !self.activate_provider(&session.provider) {
             return Vec::new();
         }
