@@ -30,7 +30,7 @@ use crate::backend::{
 
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
-const SDK_VERSION: &str = "0.3.220";
+const SDK_VERSION: &str = "0.3.268";
 const BRIDGE_SOURCE: &str = include_str!("bridge.mjs");
 const PROCESS_LIFECYCLE_SOURCE: &str = include_str!("process_lifecycle.mjs");
 const TOOL_POLICY_SOURCE: &str = include_str!("tool_policy.mjs");
