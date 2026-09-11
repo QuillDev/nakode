@@ -2267,7 +2267,7 @@ impl NakodeClient {
         managed_watch(receiver, task)
     }
 
-    /// Hydrates a raw session snapshot, re-reading it once when its transcript cursor lagged.
+    /// Hydrates a raw session snapshot, re-reading it once when a cursor or body window went stale.
     ///
     /// # Errors
     /// Returns a transport, server status, or inconsistent-projection error.
@@ -2278,9 +2278,22 @@ impl NakodeClient {
     ) -> Result<HydratedSession, SdkError> {
         let session_id = state.id.clone();
         match self.hydrate_session(state, limit).await {
-            Err(SdkError::InvalidProjection(_)) => {
+            Err(error)
+                if matches!(error, SdkError::InvalidProjection(_)) || error.is_not_found() =>
+            {
+                // A transcript entry can disappear during hydration. Re-read the owning session
+                // instead of treating an entry-only NotFound as proof that the session is gone.
+                // Refresh only once; a genuinely missing session or a second failure stays explicit.
                 let fresh = self.get_session(session_id).await?;
-                self.hydrate_session(fresh, limit).await
+                self.hydrate_session(fresh, limit).await.map_err(|error| {
+                    if error.is_not_found() {
+                        SdkError::InvalidProjection(format!(
+                            "session hydration changed again after refresh: {error}"
+                        ))
+                    } else {
+                        error
+                    }
+                })
             }
             result => result,
         }
@@ -3091,6 +3104,10 @@ mod tests {
         ReattachSame,
         ReattachDifferent,
         SnapshotDifferent,
+        HydrationFresh,
+        HydrationRepeated,
+        HydrationMissing,
+        HydrationDenied,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -3189,7 +3206,14 @@ mod tests {
                 retryable: false,
             });
         };
-        if !attached && !matches!(mode, SessionServerMode::SnapshotDifferent) {
+        if !attached
+            && !matches!(
+                mode,
+                SessionServerMode::SnapshotDifferent
+                    | SessionServerMode::HydrationFresh
+                    | SessionServerMode::HydrationRepeated
+            )
+        {
             return Err(protocol::ServiceError {
                 code: protocol::ErrorCode::NotFound,
                 message: "session is persisted but not attached".to_owned(),
@@ -3201,9 +3225,32 @@ mod tests {
         } else {
             session_id.as_str()
         };
+        let mut view = session_view(projected_id);
+        if matches!(mode, SessionServerMode::HydrationRepeated) {
+            view.transcript.entries.push(protocol::TranscriptEntryView {
+                id: protocol::EntryId::from("still-stale"),
+                kind: protocol::TranscriptEntryKind::Assistant,
+                title: String::new(),
+                body: "tail".to_owned(),
+                body_start_byte: 4,
+                body_total_bytes: 8,
+                status: protocol::TranscriptEntryStatus::Complete,
+                artifacts: Vec::new(),
+                created_at_ms: None,
+                provider_id: None,
+                model_id: None,
+                owner_turn_id: None,
+                resolved_reasoning_effort: None,
+                resolved_fast_mode: None,
+                source_transport: None,
+                source_prompt_id: None,
+                tool_audit_json: None,
+                parent_tool_entry_id: None,
+            });
+        }
         Ok(protocol::Snapshot {
             cursor: endpoint.cursor(),
-            value: protocol::SubscriptionView::Session(Box::new(session_view(projected_id))),
+            value: protocol::SubscriptionView::Session(Box::new(view)),
         })
     }
 
@@ -3267,10 +3314,41 @@ mod tests {
                         retryable: false,
                     }));
                 }
+                ServerRequest::Query {
+                    query: protocol::Query::GetSession { session_id },
+                    respond,
+                    ..
+                } if matches!(
+                    mode,
+                    SessionServerMode::HydrationFresh | SessionServerMode::HydrationRepeated
+                ) =>
+                {
+                    let snapshot = session_server_snapshot(
+                        &actor_endpoint,
+                        protocol::SubscriptionScope::Session { session_id },
+                        false,
+                        mode,
+                    )
+                    .expect("hydration snapshot");
+                    let protocol::SubscriptionView::Session(view) = snapshot.value else {
+                        unreachable!();
+                    };
+                    let _ = respond.send(Ok(protocol::Snapshot {
+                        cursor: snapshot.cursor,
+                        value: protocol::QueryResult::Session(view),
+                    }));
+                }
                 ServerRequest::Query { respond, .. } => {
+                    let code = match mode {
+                        SessionServerMode::HydrationFresh
+                        | SessionServerMode::HydrationRepeated
+                        | SessionServerMode::HydrationMissing => protocol::ErrorCode::NotFound,
+                        SessionServerMode::HydrationDenied => protocol::ErrorCode::PermissionDenied,
+                        _ => protocol::ErrorCode::InvalidRequest,
+                    };
                     let _ = respond.send(Err(protocol::ServiceError {
-                        code: protocol::ErrorCode::InvalidRequest,
-                        message: "unexpected query".to_owned(),
+                        code,
+                        message: "transcript body unavailable".to_owned(),
                         retryable: false,
                     }));
                 }
@@ -3311,6 +3389,80 @@ mod tests {
             shutdown: Some(shutdown),
             server,
             actor: Some(actor),
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_body_not_found_refreshes_the_owning_session_once() {
+        std::fs::create_dir_all("../../.tmp").expect("project test scratch");
+        for mode in [
+            SessionServerMode::HydrationFresh,
+            SessionServerMode::HydrationRepeated,
+            SessionServerMode::HydrationMissing,
+            SessionServerMode::HydrationDenied,
+        ] {
+            let directory = tempfile::tempdir_in("../../.tmp").expect("SDK transport directory");
+            // tempfile returns an absolute path; use its relative equivalent for sockaddr_un's
+            // small path limit while keeping the socket inside this project's scratch directory.
+            let socket = Path::new("../../.tmp")
+                .join(
+                    directory
+                        .path()
+                        .file_name()
+                        .expect("scratch directory name"),
+                )
+                .join("api.sock");
+            let captured = Arc::new(Mutex::new(None));
+            let server = spawn_session_server(&socket, mode, captured.clone());
+            let client = NakodeClient::connect_unix(&socket)
+                .await
+                .expect("connect SDK");
+            let stale = api::SessionState {
+                id: "session-1".to_owned(),
+                transcript: Some(api::TranscriptPage {
+                    entries: vec![api::TranscriptEntry {
+                        id: "superseded-entry".to_owned(),
+                        body: "tail".to_owned(),
+                        body_start_byte: 4,
+                        body_total_bytes: 8,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let result = client.hydrate_session_with_refresh(stale, 128).await;
+            match mode {
+                SessionServerMode::HydrationFresh => {
+                    let hydrated = result.expect("fresh authoritative transcript");
+                    assert_eq!(hydrated.state.id, "session-1");
+                    assert!(
+                        hydrated
+                            .state
+                            .transcript
+                            .expect("transcript")
+                            .entries
+                            .is_empty()
+                    );
+                }
+                SessionServerMode::HydrationRepeated => {
+                    assert!(matches!(result, Err(SdkError::InvalidProjection(_))));
+                }
+                SessionServerMode::HydrationMissing => {
+                    assert!(
+                        result
+                            .expect_err("missing owner stays missing")
+                            .is_not_found()
+                    );
+                }
+                SessionServerMode::HydrationDenied => {
+                    assert!(matches!(result, Err(SdkError::Status(status))
+                        if status.code() == tonic::Code::PermissionDenied));
+                }
+                _ => unreachable!(),
+            }
+            assert!(captured.lock().expect("attachment record").is_none());
+            server.stop().await;
         }
     }
 
