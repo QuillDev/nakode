@@ -2630,6 +2630,7 @@ impl DomainState {
                 provider: provider.to_owned(),
                 id: id.to_owned(),
                 is_default: false,
+                display_name: None,
                 capabilities: crate::backend::ModelCapabilities::default(),
             }));
         }
@@ -12046,6 +12047,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-a".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         }]));
         state
@@ -12428,6 +12430,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CURSOR_PROVIDER.to_owned(),
             id: "composer-2.5".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: crate::backend::ModelCapabilities::default(),
         });
         state.open_agent_picker();
@@ -12894,12 +12897,14 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 provider: DEVIN_PROVIDER.to_owned(),
                 id: "model-a".to_owned(),
                 is_default: true,
+                display_name: None,
                 capabilities: crate::backend::ModelCapabilities::default(),
             },
             ModelInfo {
                 provider: DEVIN_PROVIDER.to_owned(),
                 id: "model-b".to_owned(),
                 is_default: false,
+                display_name: None,
                 capabilities: crate::backend::ModelCapabilities::default(),
             },
         ]));
@@ -13987,6 +13992,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CLAUDE_PROVIDER.to_owned(),
             id: "opus".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: ModelCapabilities {
                 reasoning_efforts: ["low", "medium", "high"]
                     .into_iter()
@@ -14030,6 +14036,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CLAUDE_PROVIDER.to_owned(),
             id: "haiku".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: ModelCapabilities {
                 reasoning_efforts: vec!["low".to_owned()],
             },
@@ -14070,6 +14077,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CLAUDE_PROVIDER.to_owned(),
             id: "haiku".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: ModelCapabilities::default(),
         }];
         state.selected_model = Some(format!("{CLAUDE_PROVIDER}/haiku"));
@@ -15686,6 +15694,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "gpt-test".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         }]);
 
@@ -16803,6 +16812,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "vision-model".to_owned(),
             is_default: false,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         });
         let session_model = state.selected_model.clone();
@@ -16855,6 +16865,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "vision-model".to_owned(),
             is_default: false,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         });
         let session_model = state.selected_model.clone();
@@ -16876,6 +16887,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-b".to_owned(),
             is_default: false,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         });
         state.active_turn = Some(super::ActiveTurn {
@@ -16915,6 +16927,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-b".to_owned(),
             is_default: false,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         });
         state.client.editor.set_text("/models");
@@ -16970,6 +16983,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CURSOR_PROVIDER.to_owned(),
             id: id.to_owned(),
             is_default: false,
+            display_name: None,
             capabilities: crate::backend::ModelCapabilities::default(),
         };
 
@@ -16987,6 +17001,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CURSOR_PROVIDER.to_owned(),
             id: "composer-2.5".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: crate::backend::ModelCapabilities::default(),
         }];
         state.selected_model = Some("cursor-sdk/composer-2.5".to_owned());
@@ -17028,6 +17043,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CURSOR_PROVIDER.to_owned(),
             id: "composer-2.5".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: crate::backend::ModelCapabilities::default(),
         }];
         state.selected_model = Some("cursor-sdk/composer-2.5".to_owned());
@@ -17068,6 +17084,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-b".to_owned(),
             is_default: false,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         });
         state.install_model_options(
@@ -17105,6 +17122,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 provider: CODEX_PROVIDER.to_owned(),
                 id: "model-b".to_owned(),
                 is_default: false,
+                display_name: None,
                 capabilities: crate::codex::model_capabilities(),
             });
             state.backend_capabilities.session_model_config = CapabilitySupport::Supported;
@@ -17256,6 +17274,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 provider: DEVIN_PROVIDER.to_owned(),
                 id: "devin-model".to_owned(),
                 is_default: true,
+                display_name: None,
                 capabilities: ModelCapabilities::default(),
             }]),
         );
@@ -17396,6 +17415,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn restored_source_session_retains_a_persisted_cross_provider_next_turn_intent() {
         let mut state = ready_state();
         state.handle_provider_backend(
@@ -17416,6 +17436,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 provider: DEVIN_PROVIDER.to_owned(),
                 id: "devin-model".to_owned(),
                 is_default: true,
+                display_name: None,
                 capabilities: ModelCapabilities::default(),
             }]),
         );
@@ -17530,6 +17551,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CLAUDE_PROVIDER.to_owned(),
             id: "claude-opus".to_owned(),
             is_default: false,
+            display_name: None,
             capabilities: ModelCapabilities {
                 reasoning_efforts: vec!["low".to_owned(), "high".to_owned()],
             },
@@ -17561,6 +17583,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-b".to_owned(),
             is_default: false,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         });
         state.handle_backend(BackendEvent::SessionCreated {
@@ -17622,6 +17645,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: CODEX_PROVIDER.to_owned(),
             id: "model-b".to_owned(),
             is_default: false,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         });
         state.backend_capabilities.session_model_config = CapabilitySupport::Supported;
@@ -17699,6 +17723,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 provider: CODEX_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
+                display_name: None,
                 capabilities: crate::codex::model_capabilities(),
             }]),
         );
@@ -17781,6 +17806,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 provider: CODEX_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
+                display_name: None,
                 capabilities: crate::codex::model_capabilities(),
             }]),
         );
@@ -17790,6 +17816,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                 provider: DEVIN_PROVIDER.to_owned(),
                 id: "shared".to_owned(),
                 is_default: true,
+                display_name: None,
                 capabilities: crate::backend::ModelCapabilities::default(),
             }]),
         );
@@ -17831,6 +17858,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                     provider: provider.to_owned(),
                     id: "shared".to_owned(),
                     is_default: true,
+                    display_name: None,
                     capabilities: crate::backend::ModelCapabilities::default(),
                 }]),
             );
@@ -17916,6 +17944,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             provider: "zai-coding".to_owned(),
             id: "model-standard".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: ModelCapabilities::default(),
         });
         let unsupported = AgentDefinition {
@@ -18013,6 +18042,7 @@ fast_mode = true
             provider: CURSOR_PROVIDER.to_owned(),
             id: "composer-2.5".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: ModelCapabilities::default(),
         });
         state.install_agents(AgentCatalog::load(directory.path()).expect("agent catalog"));
@@ -18091,6 +18121,7 @@ fast_mode = true
                 provider: CURSOR_PROVIDER.to_owned(),
                 id: id.to_owned(),
                 is_default: id == "composer-2.5",
+                display_name: None,
                 capabilities: ModelCapabilities::default(),
             });
         }
@@ -18162,6 +18193,7 @@ model = "cursor-sdk/basic"
             provider: CURSOR_PROVIDER.to_owned(),
             id: "basic".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: ModelCapabilities::default(),
         });
         state.model_options.insert(

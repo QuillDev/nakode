@@ -1518,6 +1518,23 @@ impl SqliteSessionRepository {
              );",
         )?;
         apply_invocation_telemetry_migration(&mut connection)?;
+        let provider_model_columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(provider_models)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !provider_model_columns
+            .iter()
+            .any(|column| column == "display_name")
+        {
+            execute_batch_with_busy_retry(
+                &connection,
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE provider_models ADD COLUMN display_name TEXT;
+                 COMMIT;",
+            )?;
+        }
         let owner_prompt_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(accepted_owner_prompts)")?;
             statement
@@ -4061,7 +4078,7 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT model_id, is_default, capabilities
+            "SELECT model_id, is_default, capabilities, display_name
              FROM provider_models WHERE provider = ?1
              ORDER BY is_default DESC, model_id COLLATE NOCASE",
         )?;
@@ -4071,6 +4088,9 @@ impl SessionRepository for SqliteSessionRepository {
                 provider: model_provider.clone(),
                 id: row.get(0)?,
                 is_default: row.get::<_, i64>(1)? != 0,
+                display_name: row
+                    .get::<_, Option<String>>(3)?
+                    .filter(|name| !name.trim().is_empty()),
                 capabilities: row
                     .get::<_, String>(2)
                     .ok()
@@ -4103,8 +4123,8 @@ impl SessionRepository for SqliteSessionRepository {
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO provider_models
-                 (provider, model_id, is_default, cached_at, capabilities)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (provider, model_id, is_default, cached_at, capabilities, display_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for model in models {
                 statement.execute(params![
@@ -4118,6 +4138,7 @@ impl SessionRepository for SqliteSessionRepository {
                     now,
                     serde_json::to_string(&model.capabilities)
                         .expect("model capabilities serialize"),
+                    model.display_name,
                 ])?;
             }
         }
@@ -6659,6 +6680,7 @@ mod tests {
                 provider: CODEX_PROVIDER.to_owned(),
                 id: "model-a".to_owned(),
                 is_default: true,
+                display_name: None,
                 capabilities: crate::backend::ModelCapabilities {
                     reasoning_efforts: vec!["low".to_owned(), "high".to_owned()],
                 },
@@ -6667,6 +6689,7 @@ mod tests {
                 provider: CODEX_PROVIDER.to_owned(),
                 id: "model-b".to_owned(),
                 is_default: false,
+                display_name: None,
                 capabilities: crate::codex::model_capabilities(),
             },
         ];
@@ -7723,6 +7746,7 @@ mod tests {
                 provider: CODEX_PROVIDER.to_owned(),
                 id: "legacy-model".to_owned(),
                 is_default: true,
+                display_name: None,
                 capabilities: crate::backend::ModelCapabilities::default(),
             }]
         );

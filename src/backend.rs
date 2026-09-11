@@ -243,6 +243,9 @@ pub struct ModelInfo {
     pub id: String,
     pub is_default: bool,
     pub capabilities: ModelCapabilities,
+    /// The provider's own human-readable name, when it reports one; otherwise the name is
+    /// derived from the identifier.
+    pub display_name: Option<String>,
 }
 
 impl ModelInfo {
@@ -253,7 +256,14 @@ impl ModelInfo {
 
     #[must_use]
     pub fn display_name(&self) -> String {
-        display_model_name(&self.provider, &self.id)
+        self.display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or_else(
+                || display_model_name(&self.provider, &self.id),
+                str::to_owned,
+            )
     }
 }
 
