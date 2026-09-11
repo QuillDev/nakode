@@ -2416,20 +2416,43 @@ fn parse_bridge_continuation_disposition(
     }
 }
 
+const LEGACY_OWNER_MESSAGE_MARKER: &str = "\n\n## Owner message\n\n";
+const LEGACY_DASHBOARD_PROMPT_PREFIXES: [&str; 2] = [
+    "You are the assistant built into the fstack dashboard",
+    "You are working inside the fstack dashboard",
+];
+
+/// Older dashboard clients prepended their instructions to the first owner prompt.
+/// Only unwrap that known envelope; raw transcript authority remains unchanged.
+pub(crate) fn owner_prompt_preview(body: &str) -> String {
+    let body = body.trim();
+    let owner = if LEGACY_DASHBOARD_PROMPT_PREFIXES
+        .iter()
+        .any(|prefix| body.starts_with(prefix))
+    {
+        body.split_once(LEGACY_OWNER_MESSAGE_MARKER)
+            .map_or(body, |(_, owner)| owner)
+    } else {
+        body
+    };
+    owner.trim().chars().take(512).collect()
+}
+
 /// Reads bounded label metadata only; never restores or runs the saved provider session.
 fn load_first_prompt_preview(
     connection: &Connection,
     record: &SessionRecord,
 ) -> Result<String, SessionError> {
     if let Some(prompt) = record.owner_prompts.first() {
-        return Ok(prompt.raw_text.trim().chars().take(512).collect());
+        return Ok(owner_prompt_preview(&prompt.raw_text));
     }
     // Pre-acceptance-ledger sessions retain normalized user messages in their runtime history.
     // The earliest compaction holds the original prefix. Instructions, assistant and tool text
     // cannot become labels, and only the bounded result leaves SQLite.
     let preview = connection
         .query_row(
-            "SELECT substr(trim(json_extract(entry.value, '$.User.text')), 1, 512)
+            "WITH first_user AS (
+         SELECT trim(json_extract(entry.value, '$.User.text')) AS body
          FROM native_runtime_sessions AS saved,
               json_each(COALESCE(
                 json_extract(saved.session_json, '$.compactions[0].compacted_history'),
@@ -2437,8 +2460,20 @@ fn load_first_prompt_preview(
               )) AS entry
          WHERE saved.provider = ?1 AND saved.session_id = ?2
            AND json_type(entry.value, '$.User.text') = 'text'
-         ORDER BY CAST(entry.key AS INTEGER) LIMIT 1",
-            params![record.provider, record.provider_session_id],
+         ORDER BY CAST(entry.key AS INTEGER) LIMIT 1)
+         SELECT substr(trim(CASE
+           WHEN (substr(body, 1, length(?4)) = ?4 OR substr(body, 1, length(?5)) = ?5)
+             AND instr(body, ?3) > 0
+           THEN substr(body, instr(body, ?3) + length(?3))
+           ELSE body END), 1, 512)
+         FROM first_user",
+            params![
+                record.provider,
+                record.provider_session_id,
+                LEGACY_OWNER_MESSAGE_MARKER,
+                LEGACY_DASHBOARD_PROMPT_PREFIXES[0],
+                LEGACY_DASHBOARD_PROMPT_PREFIXES[1]
+            ],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
@@ -6379,6 +6414,65 @@ mod tests {
 
         assert!(store.save_session_bridges(&[first, second]).is_err());
         assert!(store.list_session_bridges("/tmp/project")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn saved_preview_unwraps_legacy_dashboard_prompt_before_bounding() -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("previews.db"))?;
+        let session = store.create(CODEX_PROVIDER, "wrapped", "/tmp/project", "Chat", None)?;
+        let owner = format!(
+            "{}\n\n## Owner message\n\nKeep this literal heading",
+            "界".repeat(520)
+        );
+        let wrapped = format!(
+            "{} — {}{}{}",
+            LEGACY_DASHBOARD_PROMPT_PREFIXES[0],
+            "injected instructions ".repeat(500),
+            LEGACY_OWNER_MESSAGE_MARKER,
+            owner
+        );
+        let payload = serde_json::json!({
+            "history": [{"User": {"text": "Recent message"}}],
+            "compactions": [{"compacted_history": [{"User": {"text": wrapped}}]}]
+        });
+        store.connection.lock().expect("connection").execute(
+            "INSERT INTO native_runtime_sessions (provider, session_id, session_json, updated_at) VALUES (?1, ?2, ?3, 1)",
+            params![CODEX_PROVIDER, "wrapped", payload.to_string()],
+        )?;
+        assert_eq!(
+            store
+                .find(&session.id)?
+                .expect("saved")
+                .first_prompt_preview,
+            "界".repeat(512)
+        );
+        let raw = format!(
+            "{}{}Real owner request",
+            LEGACY_DASHBOARD_PROMPT_PREFIXES[0], LEGACY_OWNER_MESSAGE_MARKER
+        );
+        store.record_owner_prompt(
+            &session.id,
+            &PersistedOwnerPrompt {
+                prompt_id: "owner".to_owned(),
+                raw_text: raw.clone(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+        )?;
+        let saved = store.find(&session.id)?.expect("saved");
+        assert_eq!(saved.first_prompt_preview, "Real owner request");
+        assert_eq!(saved.owner_prompts[0].raw_text, raw);
+        let literal = format!("Explain this heading{LEGACY_OWNER_MESSAGE_MARKER}Keep all of this");
+        assert_eq!(owner_prompt_preview(&literal), literal);
+        assert_eq!(
+            owner_prompt_preview(&format!(
+                "{} without a marker",
+                LEGACY_DASHBOARD_PROMPT_PREFIXES[0]
+            )),
+            format!("{} without a marker", LEGACY_DASHBOARD_PROMPT_PREFIXES[0])
+        );
         Ok(())
     }
 

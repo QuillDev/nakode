@@ -35,7 +35,7 @@ use crate::{
     },
     domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
     memory::MemoryBackend,
-    session::{ProviderAccountRecord, ProviderRecord, SessionRecord},
+    session::{ProviderAccountRecord, ProviderRecord, SessionRecord, owner_prompt_preview},
     settings::TerminalImageMode,
     web::WebBackend,
 };
@@ -2257,7 +2257,7 @@ fn first_prompt_preview(state: &DomainState, sessions: &[SessionRecord]) -> Stri
                 .find(|entry| entry.kind == EntryKind::User)
                 .map(|entry| entry.body.as_str())
         })
-        .map(|body| body.trim().chars().take(512).collect())
+        .map(owner_prompt_preview)
         .unwrap_or_default()
 }
 
@@ -2265,7 +2265,7 @@ fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> Sessi
     SessionSummary {
         first_prompt_preview: session.owner_prompts.first().map_or_else(
             || session.first_prompt_preview.clone(),
-            |prompt| prompt.raw_text.trim().chars().take(512).collect(),
+            |prompt| owner_prompt_preview(&prompt.raw_text),
         ),
         id: SessionId::from(session.id.clone()),
         workspace_id: workspace_id.clone(),
