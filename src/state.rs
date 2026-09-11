@@ -6550,7 +6550,7 @@ impl DomainState {
         )
     }
 
-    fn session_tool_configuration(&self) -> nakode_protocol::SessionToolConfiguration {
+    pub(crate) fn session_tool_configuration(&self) -> nakode_protocol::SessionToolConfiguration {
         nakode_protocol::SessionToolConfiguration {
             tools: self.external_tools.clone(),
             replace_builtin_tools: self.replace_builtin_tools,

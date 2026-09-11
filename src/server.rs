@@ -2069,17 +2069,16 @@ impl ServerCore {
                 {
                     return Err(DomainCommandError::NotFound(session_id.to_string()));
                 }
-                let tools = tools.unwrap_or_else(Self::default_session_tools);
-                let provider = self
-                    .session_engine_mut(loaded)?
-                    .state()
-                    .active_provider_id()
-                    .to_owned();
-                let tools = self
-                    .session_engine_mut(loaded)?
-                    .state()
-                    .reconcile_available_builtin_tools(&provider, tools);
-                let effective_session_tools = Some(
+                let effective_session_tools = Some(if let Some(tools) = tools {
+                    let provider = self
+                        .session_engine_mut(loaded)?
+                        .state()
+                        .active_provider_id()
+                        .to_owned();
+                    let tools = self
+                        .session_engine_mut(loaded)?
+                        .state()
+                        .reconcile_available_builtin_tools(&provider, tools);
                     self.session_engine_mut(loaded)?
                         .state_mut()
                         .configure_or_validate_external_tools(
@@ -2087,8 +2086,12 @@ impl ServerCore {
                             tools.replace_builtin_tools,
                             tools.code_mode,
                             tools.allowed_builtin_tools.as_deref(),
-                        )?,
-                );
+                        )?
+                } else {
+                    self.session_engine_mut(loaded)?
+                        .state()
+                        .session_tool_configuration()
+                });
                 if let Some(profile_id) = profile_id {
                     let skills = self
                         .session_template
@@ -2203,11 +2206,16 @@ impl ServerCore {
                 established_tools.allowed_builtin_tools.clone(),
             )?;
         }
+        let attachment_tools = if requested_tools_omitted {
+            &established_tools
+        } else {
+            &requested_tools
+        };
         let effective_session_tools = engine.state_mut().configure_or_validate_external_tools(
-            &requested_tools.tools,
-            requested_tools.replace_builtin_tools,
-            requested_tools.code_mode,
-            requested_tools.allowed_builtin_tools.as_deref(),
+            &attachment_tools.tools,
+            attachment_tools.replace_builtin_tools,
+            attachment_tools.code_mode,
+            attachment_tools.allowed_builtin_tools.as_deref(),
         )?;
         if let Some(grant) = mcp_grant {
             let (mcp_tools, archetype_grants) =
@@ -7527,6 +7535,52 @@ mod tests {
     }
 
     #[test]
+    fn omitted_tools_reuse_the_persisted_tool_table_during_resume() {
+        let (mut core, _) = ready_external_tools_server();
+        let restored_id = SessionId::from("restored-dashboard-session");
+        let tools = dashboard_tools("ReadAssociatedTicket", false);
+        core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
+            initial_instructions: None,
+            id: restored_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-restored-dashboard".to_owned(),
+            account_id: None,
+            workspace: "/tmp/project".to_owned(),
+            working_directory: "/tmp/project".to_owned(),
+            title: "Saved dashboard session".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            last_owner_activity_at: None,
+            tool_configuration: Some(tools.clone()),
+            code_mode: false,
+            enabled_skill_ids: None,
+            owned_provider_sessions: Vec::new(),
+        }]);
+
+        let (_, effects) = core
+            .open_session_command(&restored_id, None)
+            .expect("omitted tools preserve the saved attachment");
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::state::Effect::Backend(BackendCommand::ResumeSession {
+                provider_session_id,
+                external_tools,
+                replace_builtin_tools: false,
+                code_mode: false,
+                ..
+            }) if provider_session_id == "thread-restored-dashboard"
+                && external_tools == &tools.tools
+        )));
+    }
+
+    #[test]
     fn enabled_but_runtime_unavailable_memory_remains_authorized() {
         let (mut core, _) = ready_external_tools_server();
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
@@ -8961,6 +9015,29 @@ mod tests {
             effects.as_slice(),
             [crate::state::Effect::ReloadProvider(provider)] if provider == CODEX_PROVIDER
         ));
+    }
+
+    #[test]
+    fn omitted_tools_reuse_the_attached_session_tool_table() {
+        let (mut core, _) = ready_external_tools_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let tools = dashboard_tools("ReadAssociatedTicket", false);
+        let (created, _) = core
+            .create_session_command(
+                &workspace_id,
+                None,
+                &ModelOptions::default(),
+                Some(tools.clone()),
+            )
+            .expect("create session with dashboard tools");
+        let session_id = SessionId::from(created.resource_id.expect("session id"));
+
+        let (opened, effects) = core
+            .open_session_command(&session_id, None)
+            .expect("omitted tools preserve the attached session configuration");
+
+        assert!(effects.is_empty());
+        assert_eq!(opened.effective_session_tools, Some(tools));
     }
 
     #[test]
