@@ -1071,6 +1071,8 @@ async function modelCatalogue(command) {
       models: models.map((model, index) => ({
         id: model.value,
         isDefault: index === 0,
+        displayName: model.displayName || "",
+        description: model.description || "",
         supportedEffortLevels: model.supportedEffortLevels || [],
       })),
     });

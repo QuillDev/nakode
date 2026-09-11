@@ -1033,6 +1033,7 @@ async fn discover_models(
                         .get("is_default")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    display_name: None,
                     capabilities: crate::backend::ModelCapabilities::default(),
                 },
                 context_window,

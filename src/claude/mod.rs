@@ -30,7 +30,7 @@ use crate::backend::{
 
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
-const SDK_VERSION: &str = "0.3.220";
+const SDK_VERSION: &str = "0.3.268";
 const BRIDGE_SOURCE: &str = include_str!("bridge.mjs");
 const PROCESS_LIFECYCLE_SOURCE: &str = include_str!("process_lifecycle.mjs");
 const TOOL_POLICY_SOURCE: &str = include_str!("tool_policy.mjs");
@@ -1462,6 +1462,16 @@ fn models_event(message: &Value) -> BackendEvent {
                     .get("isDefault")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                display_name: claude_model_display_name(
+                    model
+                        .get("displayName")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    model
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                ),
                 capabilities: crate::backend::ModelCapabilities {
                     reasoning_efforts: model
                         .get("supportedEffortLevels")
@@ -1478,6 +1488,61 @@ fn models_event(message: &Value) -> BackendEvent {
         })
         .collect();
     BackendEvent::Models(models)
+}
+
+/// Claude Code's picker rows carry the family as the display name ("Fable", "Sonnet",
+/// "Opus (1M context)") and the versioned name as the first segment of the description
+/// ("Fable 5.1 · Most capable …", "Opus 5 with 1M context · Best for …"). People know the models
+/// by the versioned name, so that segment wins whenever it clearly names the same family;
+/// otherwise the display name stands, and an empty display name defers to the identifier. The
+/// context window is a property of the row's identifier, not part of the name, so a trailing
+/// "with 1M context" or "(1M context)" is dropped either way.
+fn claude_model_display_name(display_name: &str, description: &str) -> Option<String> {
+    let display_name = without_context_window(display_name.trim());
+    if display_name.is_empty() {
+        return None;
+    }
+    let family = display_name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .find(|part| !part.is_empty())
+        .unwrap_or(display_name);
+    let versioned = description
+        .split(" · ")
+        .next()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty() && segment.len() <= 48)
+        .filter(|segment| {
+            segment
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .find(|part| !part.is_empty())
+                .is_some_and(|first| first.eq_ignore_ascii_case(family))
+        });
+    Some(without_context_window(versioned.unwrap_or(display_name)).to_owned())
+}
+
+/// "Opus 5 with 1M context" → "Opus 5"; "Opus (1M context)" → "Opus".
+fn without_context_window(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    let Some(position) = lower.rfind("context") else {
+        return name;
+    };
+    let head = &lower[..position];
+    let marker = [" with ", " ("]
+        .iter()
+        .filter_map(|marker| head.rfind(marker).map(|index| (index, *marker)))
+        .max_by_key(|(index, _)| *index);
+    let Some((index, marker)) = marker else {
+        return name;
+    };
+    let window = head[index + marker.len()..].trim();
+    let is_window = !window.is_empty()
+        && window
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, 'k' | 'm' | '.'));
+    if !is_window {
+        return name;
+    }
+    name[..index].trim_end()
 }
 
 fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
@@ -2188,6 +2253,48 @@ assert.equal(replacementSent, true, "replacement did not send after child close"
         assert_eq!(
             models[0].capabilities.reasoning_efforts,
             ["low", "medium", "high"]
+        );
+        assert_eq!(models[0].display_name, None);
+    }
+
+    #[test]
+    fn claude_models_read_as_their_versioned_names() {
+        let event = models_event(&json!({
+            "models": [
+                {"id": "default", "isDefault": true, "displayName": "Default (recommended)",
+                 "description": "Use the default model (currently Opus 5 (1M context)) · $5/$25 per Mtok"},
+                {"id": "opus[1m]", "displayName": "Opus (1M context)",
+                 "description": "Opus 5 with 1M context · Best for everyday, complex tasks · $5/$25 per Mtok"},
+                {"id": "claude-fable-5-1[1m]", "displayName": "Fable",
+                 "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks"},
+                {"id": "sonnet", "displayName": "Sonnet", "description": "Sonnet 5 · Efficient for routine tasks"},
+                {"id": "haiku", "displayName": "Haiku", "description": "Haiku 4.5 · Fastest for quick answers"},
+                {"id": "mystery", "displayName": "", "description": "Whatever · text"}
+            ]
+        }));
+        let BackendEvent::Models(models) = event else {
+            panic!("expected models event");
+        };
+        let names: Vec<String> = models.iter().map(ModelInfo::display_name).collect();
+        assert_eq!(
+            names,
+            [
+                "Default (recommended)",
+                "Opus 5",
+                "Fable 5.1",
+                "Sonnet 5",
+                "Haiku 4.5",
+                "Mystery"
+            ]
+        );
+        assert_eq!(without_context_window("Opus (1M context)"), "Opus");
+        assert_eq!(
+            without_context_window("Sonnet 5 with 200k context"),
+            "Sonnet 5"
+        );
+        assert_eq!(
+            without_context_window("Context Engine 2"),
+            "Context Engine 2"
         );
     }
 

@@ -1575,6 +1575,7 @@ fn parse_model_options(result: &Value) -> Option<SessionModelOption> {
                 provider: DEVIN_PROVIDER.to_owned(),
                 is_default: id == current_value,
                 id,
+                display_name: None,
                 capabilities: crate::backend::ModelCapabilities::default(),
             }
         })
@@ -1585,6 +1586,7 @@ fn parse_model_options(result: &Value) -> Option<SessionModelOption> {
             provider: DEVIN_PROVIDER.to_owned(),
             id: current_value.clone(),
             is_default: true,
+            display_name: None,
             capabilities: crate::backend::ModelCapabilities::default(),
         });
     }

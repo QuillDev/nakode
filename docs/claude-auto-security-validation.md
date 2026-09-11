@@ -1,7 +1,7 @@
 # Claude automatic permissions and security validation
 
 Nakode's Claude adapter uses the authoritative Claude Code/Agent SDK setting
-`permissionMode: "auto"` (Claude Code 2.1.212; `@anthropic-ai/claude-agent-sdk` 0.3.220) when the
+`permissionMode: "auto"` (Claude Code 2.1.268; `@anthropic-ai/claude-agent-sdk` 0.3.268) when the
 resolved Claude settings do not name a mode. The adapter calls the SDK's `resolveSettings` and
 `filterEscalatingDefaultMode`, so valid managed/user/project/local `permissions.defaultMode` values
 remain explicit owner overrides. This policy is Claude-specific. The Codex adapter and its existing

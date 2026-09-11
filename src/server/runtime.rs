@@ -6571,6 +6571,7 @@ mod tests {
             provider: CODEX_PROVIDER.to_owned(),
             id: "model".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         }]));
         state.handle_backend(BackendEvent::SessionCreated {
@@ -6787,6 +6788,7 @@ mod tests {
             provider: CODEX_PROVIDER.to_owned(),
             id: "model".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         }]));
         state.handle_backend(BackendEvent::SessionCreated {
@@ -10276,6 +10278,7 @@ mod tests {
             provider: CODEX_PROVIDER.to_owned(),
             id: "model".to_owned(),
             is_default: true,
+            display_name: None,
             capabilities: crate::codex::model_capabilities(),
         }]));
         state.handle_backend(BackendEvent::SessionCreated {

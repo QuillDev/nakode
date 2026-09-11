@@ -632,6 +632,7 @@ fn models_event(message: &Value) -> BackendEvent {
                     .get("isDefault")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                display_name: None,
                 capabilities: crate::backend::ModelCapabilities::default(),
             })
         })

@@ -3712,6 +3712,7 @@ mod tests {
             provider: provider.to_owned(),
             id: id.to_owned(),
             is_default: false,
+            display_name: None,
             capabilities: crate::backend::ModelCapabilities {
                 reasoning_efforts: if provider == CODEX_PROVIDER {
                     ["none", "low", "medium", "high", "xhigh", "max"]
