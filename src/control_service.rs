@@ -500,6 +500,9 @@ pub async fn run_service(config: Config) -> Result<(), ControlError> {
         tokio::spawn(crate::service_log::supervise_size(PathBuf::from(log)));
     }
     let configuration = service_configuration_fingerprint(&config);
+    crate::machine_path::initialize()
+        .await
+        .map_err(ControlError::ServiceRejected)?;
     let prepared = crate::server::runtime::prepare_runtime(&config).await?;
     let (runtime, handle) = prepared.into_actor();
     eprintln!(
@@ -729,8 +732,10 @@ async fn run_grpc_listener(
         .add_service(
             nakode_server::grpc::GrpcService::new(endpoint)
                 .with_server_id(server_id)
+                .with_additional_capability("MachinePath")
                 .into_server(),
         )
+        .add_service(crate::machine_path::service().into_server())
         .add_service(
             crate::activation::ActivationGrpcService::read_only(paths, executable).into_server(),
         )
@@ -763,10 +768,12 @@ async fn run_remote_grpc_listener(
         .add_service(
             nakode_server::grpc::GrpcService::new(endpoint)
                 .with_server_id(server_id)
+                .with_additional_capability("MachinePath")
                 .with_nakode_service_only_lane_catalogue()
                 .with_additional_capability("RemoteSelfUpdate")
                 .into_authenticated_server(api_key),
         )
+        .add_service(crate::machine_path::service().authenticated(config.api_key.clone()))
         .add_service(update_service.into_authenticated_server(config.api_key))
         .serve(config.bind)
         .await?;

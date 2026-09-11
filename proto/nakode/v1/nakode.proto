@@ -1534,3 +1534,22 @@ message InvocationTimeline {
   uint64 bucket_width_ms = 3;
   repeated InvocationBucket buckets = 4;
 }
+
+// Machine-local owner-authorized arbitrary command execution. Save/Get never resolve.
+service MachinePathService {
+  rpc GetMachinePath(GetMachinePathRequest) returns (MachinePathState);
+  rpc SaveMachinePath(SaveMachinePathRequest) returns (MachinePathState);
+  rpc SyncMachinePath(SyncMachinePathRequest) returns (MachinePathState);
+}
+message GetMachinePathRequest {}
+message SaveMachinePathRequest { string command = 1; uint64 expected_revision = 2; string idempotency_key = 3; }
+message SyncMachinePathRequest { uint64 expected_revision = 1; string idempotency_key = 2; }
+message MachinePathState {
+  string command = 1;
+  uint64 revision = 2;
+  optional string effective_path = 3;
+  string source = 4;
+  optional string resolved_command = 5;
+  optional string resolved_at = 6;
+  optional string error = 7;
+}

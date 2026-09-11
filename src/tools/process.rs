@@ -59,6 +59,7 @@ pub async fn capture_process(
     cancellation: &CancellationToken,
 ) -> Result<CapturedProcessResult, String> {
     let mut command = Command::new(request.program);
+    command.envs(crate::machine_path::environment());
     command
         .args(request.arguments)
         .current_dir(workspace)

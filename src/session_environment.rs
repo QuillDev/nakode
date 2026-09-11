@@ -53,9 +53,13 @@ pub fn remove(session_id: &str) {
     }
 }
 pub fn read(session_id: Option<&str>) -> HashMap<String, String> {
-    session_id
-        .and_then(|id| store().read().ok()?.get(id).cloned())
-        .unwrap_or_default()
+    let mut environment = crate::machine_path::environment();
+    environment.extend(
+        session_id
+            .and_then(|id| store().read().ok()?.get(id).cloned())
+            .unwrap_or_default(),
+    );
+    environment
 }
 #[cfg(test)]
 mod tests {

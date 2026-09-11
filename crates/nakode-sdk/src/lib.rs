@@ -158,6 +158,7 @@ type ApiTransport = InterceptedService<RpcService<Channel>, ClientApiKey>;
 /// channel but each request and watch has independent generated client state.
 #[derive(Clone)]
 pub struct NakodeClient {
+    machine_path: api::machine_path_service_client::MachinePathServiceClient<ApiTransport>,
     transport: NakodeServiceClient<ApiTransport>,
 }
 
@@ -561,6 +562,11 @@ impl NakodeClient {
             }))
             .await?;
         Ok(Self {
+            machine_path:
+                api::machine_path_service_client::MachinePathServiceClient::with_interceptor(
+                    RpcLayer(true).layer(channel.clone()),
+                    ClientApiKey::default(),
+                ),
             transport: configured_transport(channel, ClientApiKey::default()),
         })
     }
@@ -578,6 +584,11 @@ impl NakodeClient {
         let (channel, key) =
             remote_channel(endpoint, ca_certificate_pem, tls_server_name, api_key).await?;
         Ok(Self {
+            machine_path:
+                api::machine_path_service_client::MachinePathServiceClient::with_interceptor(
+                    RpcLayer(true).layer(channel.clone()),
+                    key.clone(),
+                ),
             transport: configured_transport(channel, key),
         })
     }
@@ -595,6 +606,11 @@ impl NakodeClient {
     #[must_use]
     pub fn from_channel(channel: Channel) -> Self {
         Self {
+            machine_path:
+                api::machine_path_service_client::MachinePathServiceClient::with_interceptor(
+                    RpcLayer(true).layer(channel.clone()),
+                    ClientApiKey::default(),
+                ),
             transport: configured_transport(channel, ClientApiKey::default()),
         }
     }
@@ -2856,6 +2872,48 @@ where
     tokio::spawn(future.with_current_context())
 }
 
+impl NakodeClient {
+    /// Reads this execution service's PATH without executing a command.
+    /// # Errors
+    /// Returns transport or service errors, including unsupported older services.
+    pub async fn get_machine_path(&self) -> Result<api::MachinePathState, SdkError> {
+        Ok(self
+            .machine_path
+            .clone()
+            .get_machine_path(api::GetMachinePathRequest {})
+            .await?
+            .into_inner())
+    }
+    /// Saves the exact command without resolving it. Empty disables the overlay.
+    /// # Errors
+    /// Returns transport, revision conflict or persistence errors.
+    pub async fn save_machine_path(
+        &self,
+        input: api::SaveMachinePathRequest,
+    ) -> Result<api::MachinePathState, SdkError> {
+        Ok(self
+            .machine_path
+            .clone()
+            .save_machine_path(input)
+            .await?
+            .into_inner())
+    }
+    /// Resolves the saved command for future launches only; failure retains fallback state.
+    /// # Errors
+    /// Returns transport, revision conflict or persistence errors.
+    pub async fn sync_machine_path(
+        &self,
+        input: api::SyncMachinePathRequest,
+    ) -> Result<api::MachinePathState, SdkError> {
+        Ok(self
+            .machine_path
+            .clone()
+            .sync_machine_path(input)
+            .await?
+            .into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nakode_telemetry::{RpcLayer, opentelemetry::trace::FutureExt};
@@ -3003,6 +3061,7 @@ mod tests {
             workspace_id: protocol::WorkspaceId::from("workspace-a"),
             working_directory: "/tmp/workspace-a".to_owned(),
             title: "Attached session".to_owned(),
+            first_prompt_preview: String::new(),
             code_mode: false,
             status_message: "Ready".to_owned(),
             diagnostic_count: 0,
@@ -3427,9 +3486,7 @@ mod tests {
             .connect()
             .await
             .expect("connect");
-        let client = NakodeClient {
-            transport: super::configured_transport(channel, super::ClientApiKey::default()),
-        };
+        let client = NakodeClient::from_channel(channel);
         let result = client
             .list_session_statuses(500)
             .await

@@ -74,6 +74,7 @@ struct PendingRequest {
 /// streams are unavailable.
 pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError> {
     let mut command = Command::new(&config.program);
+    command.envs(crate::machine_path::environment());
     command.args(&config.args).current_dir(&config.workspace);
     if let Some(credential_home) = &config.credential_home {
         command.env("CODEX_HOME", credential_home);

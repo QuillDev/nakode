@@ -547,3 +547,7 @@ pending delegations remain, then restarts it. It never escalates to forced shutd
 can prolong the wait; unsupported quiescence protocols fail without stopping the server.
 
 Authenticated clients can replace a logical session’s ephemeral process environment through `SetSessionEnvironment`. Values never appear in snapshots or session persistence. Clients reinject them before work after a service restart. Native Bash and PTY tools (including delegates) inherit the logical owner’s variables.
+
+## Machine PATH
+
+Owner clients can save a shell command and explicitly Sync the execution service’s PATH through the public SDK. Startup resolves it before runtime preparation; failures retain the last-good/inherited value. See [machine PATH](docs/machine-path.md) for precedence, shell initialization, security bounds and platform limitations.

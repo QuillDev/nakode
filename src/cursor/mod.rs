@@ -147,6 +147,7 @@ async fn prepare_bridge_directory() -> Result<PathBuf, BackendError> {
         })?;
     if !cursor_sdk_is_current(&directory).await {
         let output = Command::new("npm")
+            .envs(crate::machine_path::environment())
             .args([
                 "install",
                 "--omit=dev",
@@ -194,6 +195,7 @@ fn launch_bridge(
         detail: error.to_string(),
     })?;
     let mut child = Command::new("node")
+        .envs(crate::machine_path::environment())
         .arg(directory.join("bridge.mjs"))
         .current_dir(directory)
         .env("NAKODE_WORKSPACE", workspace)
@@ -255,6 +257,7 @@ fn launch_bridge(
 
 async fn ensure_node_version() -> Result<(), BackendError> {
     let output = Command::new("node")
+        .envs(crate::machine_path::environment())
         .arg("--version")
         .output()
         .await

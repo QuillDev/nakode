@@ -24,6 +24,7 @@ pub(crate) fn initialize(prefix: &[OsString]) -> std::io::Result<()> {
 
 pub(crate) fn command(executable: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(executable);
+    command.envs(crate::machine_path::environment());
     if let Some((registered, prefix)) = EXECUTABLE.get()
         && executable == registered
     {
