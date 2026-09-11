@@ -100,6 +100,8 @@ pub fn is_pending_provider_session_id(provider_session_id: &str) -> bool {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
+    /// Bounded display metadata from accepted prompts or normalized legacy runtime history.
+    pub first_prompt_preview: String,
     pub id: String,
     pub provider: String,
     /// Stable credential account pinned to this provider-native session.
@@ -2030,6 +2032,7 @@ impl SqliteSessionRepository {
             .transpose()
             .map_err(|error| stored_session_conversion_error(20, error))?;
         Ok(SessionRecord {
+            first_prompt_preview: String::new(),
             id: row.get(0)?,
             provider: row.get(1)?,
             account_id: row.get(18)?,
@@ -2411,6 +2414,35 @@ fn parse_bridge_continuation_disposition(
             value: value.to_owned(),
         }),
     }
+}
+
+/// Reads bounded label metadata only; never restores or runs the saved provider session.
+fn load_first_prompt_preview(
+    connection: &Connection,
+    record: &SessionRecord,
+) -> Result<String, SessionError> {
+    if let Some(prompt) = record.owner_prompts.first() {
+        return Ok(prompt.raw_text.trim().chars().take(512).collect());
+    }
+    // Pre-acceptance-ledger sessions retain normalized user messages in their runtime history.
+    // The earliest compaction holds the original prefix. Instructions, assistant and tool text
+    // cannot become labels, and only the bounded result leaves SQLite.
+    let preview = connection
+        .query_row(
+            "SELECT substr(trim(json_extract(entry.value, '$.User.text')), 1, 512)
+         FROM native_runtime_sessions AS saved,
+              json_each(COALESCE(
+                json_extract(saved.session_json, '$.compactions[0].compacted_history'),
+                json_extract(saved.session_json, '$.history')
+              )) AS entry
+         WHERE saved.provider = ?1 AND saved.session_id = ?2
+           AND json_type(entry.value, '$.User.text') = 'text'
+         ORDER BY CAST(entry.key AS INTEGER) LIMIT 1",
+            params![record.provider, record.provider_session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(preview.unwrap_or_default())
 }
 
 fn load_owner_prompts(
@@ -3151,6 +3183,7 @@ impl SessionRepository for SqliteSessionRepository {
         for record in &mut records {
             record.owner_turns = load_owner_turns(&connection, &record.id)?;
             record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
+            record.first_prompt_preview = load_first_prompt_preview(&connection, record)?;
             record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
         }
         Ok(records)
@@ -3177,6 +3210,7 @@ impl SessionRepository for SqliteSessionRepository {
         for record in &mut records {
             record.owner_turns = load_owner_turns(&connection, &record.id)?;
             record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
+            record.first_prompt_preview = load_first_prompt_preview(&connection, record)?;
             record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
         }
         Ok(records)
@@ -3204,6 +3238,7 @@ impl SessionRepository for SqliteSessionRepository {
         if let Some(mut exact) = exact {
             exact.owner_turns = load_owner_turns(&connection, &exact.id)?;
             exact.owner_prompts = load_owner_prompts(&connection, &exact.id)?;
+            exact.first_prompt_preview = load_first_prompt_preview(&connection, &exact)?;
             exact.owned_provider_sessions = load_owned_provider_sessions(&connection, &exact.id)?;
             return Ok(Some(exact));
         }
@@ -3222,6 +3257,7 @@ impl SessionRepository for SqliteSessionRepository {
                 let mut record = record.clone();
                 record.owner_turns = load_owner_turns(&connection, &record.id)?;
                 record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
+                record.first_prompt_preview = load_first_prompt_preview(&connection, &record)?;
                 record.owned_provider_sessions =
                     load_owned_provider_sessions(&connection, &record.id)?;
                 Ok(Some(record))
@@ -6343,6 +6379,61 @@ mod tests {
 
         assert!(store.save_session_bridges(&[first, second]).is_err());
         assert!(store.list_session_bridges("/tmp/project")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn saved_preview_reads_legacy_history_and_prefers_raw_accepted_prompt()
+    -> Result<(), SessionError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteSessionRepository::open(directory.path().join("previews.db"))?;
+        let session = store.create(
+            CODEX_PROVIDER,
+            "native-preview",
+            "/tmp/project",
+            "Owner title",
+            None,
+        )?;
+        let payload = serde_json::json!({
+            "instructions": "Never display these instructions",
+            "history": [{"User": {"text": "Recent prompt"}}],
+            "compactions": [{"compacted_history": [
+                {"Assistant": {"text": "Never display assistant text"}},
+                {"User": {"text": format!("  {}  ", "界".repeat(600))}}
+            ]}]
+        });
+        store.connection.lock().expect("connection").execute(
+            "INSERT INTO native_runtime_sessions (provider, session_id, session_json, updated_at) VALUES (?1, ?2, ?3, 1)",
+            params![CODEX_PROVIDER, "native-preview", payload.to_string()],
+        )?;
+        let saved = store.find(&session.id)?.expect("saved session");
+        assert_eq!(saved.first_prompt_preview, "界".repeat(512));
+        assert_eq!(saved.title, "Owner title");
+        assert!(saved.owner_prompts.is_empty());
+        assert_eq!(
+            store.list_recent_all()?[0].first_prompt_preview,
+            saved.first_prompt_preview
+        );
+        assert_eq!(
+            store.list_recent("/tmp/project", 10)?[0].first_prompt_preview,
+            saved.first_prompt_preview
+        );
+        store.record_owner_prompt(
+            &session.id,
+            &PersistedOwnerPrompt {
+                prompt_id: "owner".to_owned(),
+                raw_text: "Exact raw owner prompt".to_owned(),
+                source_transport: None,
+                dispatch_pending: false,
+            },
+        )?;
+        assert_eq!(
+            store
+                .find(&session.id)?
+                .expect("saved")
+                .first_prompt_preview,
+            "Exact raw owner prompt"
+        );
         Ok(())
     }
 

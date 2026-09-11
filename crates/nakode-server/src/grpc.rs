@@ -2374,6 +2374,7 @@ pub(crate) fn mcp_management(value: protocol::McpManagementView) -> api::McpMana
 
 pub(crate) fn workspace(value: protocol::BootstrapView) -> api::WorkspaceState {
     api::WorkspaceState {
+        session_inventory_complete: value.session_inventory_complete,
         workspace_id: value.workspace_id.to_string(),
         workspace_path: value.workspace_path,
         providers: value.providers.into_iter().map(provider).collect(),
@@ -2791,6 +2792,7 @@ fn agent_browser(value: protocol::AgentBrowserView) -> api::AgentBrowser {
 
 pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSummary {
     api::SessionSummary {
+        first_prompt_preview: value.first_prompt_preview,
         id: value.id.to_string(),
         workspace_id: value.workspace_id.to_string(),
         title: value.title,
@@ -4424,5 +4426,31 @@ mod tests {
 
         assert_eq!(projected.reasoning_effort.as_deref(), Some("high"));
         assert!(projected.fast_mode);
+    }
+}
+
+#[cfg(test)]
+mod saved_summary_tests {
+    #[test]
+    fn summary_preserves_first_prompt_preview_on_wire() {
+        let summary = nakode_protocol::SessionSummary {
+            id: nakode_protocol::SessionId::from("saved"),
+            workspace_id: nakode_protocol::WorkspaceId::from("workspace"),
+            title: "Owner title".to_owned(),
+            first_prompt_preview: "First owner prompt".to_owned(),
+            working_directory: String::new(),
+            active_provider_id: None,
+            active_model_id: None,
+            updated_at_ms: 123,
+            created_at_ms: 0,
+            last_owner_activity_at_ms: 0,
+            owned_provider_sessions: Vec::new(),
+            running: false,
+            selected_account_id: None,
+            routing_diagnostic: None,
+        };
+        let wire = super::session_summary(summary);
+        assert_eq!(wire.first_prompt_preview, "First owner prompt");
+        assert_eq!(wire.title, "Owner title");
     }
 }

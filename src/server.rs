@@ -3978,6 +3978,7 @@ impl ServerCore {
                     })
                 }));
                 nakode_protocol::SessionSummary {
+                    first_prompt_preview: session.first_prompt_preview,
                     id: session.id,
                     workspace_id: session.workspace_id,
                     working_directory: session.working_directory,
@@ -4011,6 +4012,7 @@ impl ServerCore {
             .map(session_bridge_view)
             .collect();
         bootstrap.active_session = None;
+        bootstrap.session_inventory_complete = self.session_inventory_complete;
         bootstrap
     }
 
@@ -5741,12 +5743,60 @@ mod tests {
     }
 
     #[test]
+    fn saved_session_inventory_has_bounded_preview_without_opening_session() {
+        let (mut core, _) = ready_external_tools_server();
+        let restored_id = SessionId::from("saved-preview");
+        core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
+            initial_instructions: None,
+            id: restored_id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "thread-restored-cwd".to_owned(),
+            account_id: None,
+            workspace: "/tmp/project".to_owned(),
+            working_directory: "/no/longer/present".to_owned(),
+            title: "Restored cwd".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            owner_prompts: vec![crate::session::PersistedOwnerPrompt {
+                prompt_id: "first".to_owned(),
+                raw_text: format!("  {}  ", "界".repeat(600)),
+                source_transport: None,
+                dispatch_pending: false,
+            }],
+            created_at: 10,
+            updated_at: 12,
+            last_owner_activity_at: None,
+            tool_configuration: None,
+            code_mode: false,
+            enabled_skill_ids: None,
+            owned_provider_sessions: Vec::new(),
+        }]);
+        let inventory = core.workspace_bootstrap();
+        assert!(inventory.session_inventory_complete);
+        core.set_session_inventory_complete(false);
+        assert!(!core.workspace_bootstrap().session_inventory_complete);
+        let saved = inventory
+            .sessions
+            .iter()
+            .find(|session| session.id == restored_id)
+            .expect("saved summary");
+        assert_eq!(saved.first_prompt_preview, "界".repeat(512));
+        assert_eq!(saved.title, "Restored cwd");
+        assert_eq!(saved.created_at_ms, 10_000);
+        assert!(core.engine_for(&restored_id).is_none());
+    }
+
+    #[test]
     fn open_restores_persisted_cwd_and_fails_after_it_is_deleted() {
         let (mut core, _) = ready_external_tools_server();
         let directory = tempfile::tempdir().expect("persisted cwd");
         let canonical = directory.path().canonicalize().expect("canonical cwd");
         let restored_id = SessionId::from("restored-cwd-session");
         core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -5795,6 +5845,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("persisted cwd");
         let restored_id = SessionId::from("resume-unsupported-session");
         core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -6812,6 +6863,7 @@ mod tests {
         core.replace_session_records(
             ids.iter()
                 .map(|id| SessionRecord {
+                    first_prompt_preview: String::new(),
                     initial_instructions: None,
                     id: id.to_string(),
                     provider: CODEX_PROVIDER.to_owned(),
@@ -7274,6 +7326,7 @@ mod tests {
             allowed_builtin_tools: Some(vec!["read".to_owned()]),
         };
         core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -7405,6 +7458,7 @@ mod tests {
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-tools-session");
         core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -7477,6 +7531,7 @@ mod tests {
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-unavailable-memory");
         core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -7585,6 +7640,7 @@ mod tests {
         install_available_tools(&mut core, CLAUDE_PROVIDER, &["read", "ask"]);
         let restored_id = SessionId::from("restored-claude-session");
         core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: restored_id.to_string(),
             provider: CLAUDE_PROVIDER.to_owned(),
@@ -7727,6 +7783,7 @@ mod tests {
         assert_eq!(core.sessions_by_id.len(), session_count);
 
         core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: restored_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -7762,6 +7819,7 @@ mod tests {
     fn persisted_initial_engine_is_discoverable_after_restart_reconciliation() {
         let (mut core, initial_id) = ready_codex_server();
         core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: initial_id.to_string(),
             provider: CODEX_PROVIDER.to_owned(),
@@ -10844,6 +10902,7 @@ enabled = false
             .expect("first delete rotates the role");
         let successor = core.default_session_id().clone();
         core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
             initial_instructions: None,
             id: former_initial.to_string(),
             provider: CODEX_PROVIDER.to_owned(),

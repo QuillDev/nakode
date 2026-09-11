@@ -347,6 +347,7 @@ mod tests {
 
     fn bootstrap() -> nakode_protocol::BootstrapView {
         nakode_protocol::BootstrapView {
+            session_inventory_complete: true,
             workspace_id: WorkspaceId::from("workspace"),
             workspace_path: "/workspace".to_owned(),
             providers: Vec::new(),

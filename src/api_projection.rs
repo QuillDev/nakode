@@ -582,6 +582,7 @@ fn api_settings_patch(value: view::SettingsPatch) -> api::SettingsPatch {
 
 pub(crate) fn workspace(value: api::WorkspaceState) -> Result<view::BootstrapView, String> {
     Ok(view::BootstrapView {
+        session_inventory_complete: value.session_inventory_complete,
         workspace_id: view::WorkspaceId::from(value.workspace_id),
         workspace_path: value.workspace_path,
         providers: value
@@ -1153,6 +1154,7 @@ fn agent_browser(value: api::AgentBrowser) -> Result<view::AgentBrowserView, Str
 
 fn session_summary(value: api::SessionSummary) -> view::SessionSummary {
     view::SessionSummary {
+        first_prompt_preview: value.first_prompt_preview,
         id: view::SessionId::from(value.id),
         workspace_id: view::WorkspaceId::from(value.workspace_id),
         working_directory: value.working_directory,

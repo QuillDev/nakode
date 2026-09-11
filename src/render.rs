@@ -2482,6 +2482,7 @@ mod tests {
 
     fn bootstrap() -> BootstrapView {
         BootstrapView {
+            session_inventory_complete: true,
             workspace_id: WorkspaceId::from("workspace"),
             workspace_path: "/tmp/project".to_owned(),
             providers: Vec::new(),

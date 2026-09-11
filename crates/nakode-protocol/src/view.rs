@@ -277,6 +277,9 @@ pub struct SessionStatusSummary {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionSummary {
+    /// First accepted owner prompt, bounded to 512 Unicode characters.
+    #[serde(default)]
+    pub first_prompt_preview: String,
     pub id: SessionId,
     pub workspace_id: WorkspaceId,
     pub title: String,
@@ -1176,6 +1179,9 @@ pub struct SessionMetadataView {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BootstrapView {
+    /// Whether the full saved inventory was read successfully.
+    #[serde(default)]
+    pub session_inventory_complete: bool,
     pub workspace_id: WorkspaceId,
     pub workspace_path: String,
     /// Durable external-thread bridge records, including archived and currently unbound intents.

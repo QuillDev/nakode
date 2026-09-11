@@ -950,6 +950,8 @@ message WorkspaceState {
   repeated SessionSummary sessions = 8;
   optional SessionState active_session = 9;
   repeated SessionBridge session_bridges = 10;
+  // Complete saved-session inventory with bounded preview metadata. False on storage failure.
+  bool session_inventory_complete = 11;
 }
 
 enum BridgeProjectionKind {
@@ -1172,6 +1174,8 @@ message SessionSummary {
   int64 last_owner_activity_at_ms = 11;
   optional string selected_account_id = 12;
   optional ProviderAccountRoutingDiagnostic routing_diagnostic = 13;
+  // First accepted owner prompt, bounded to 512 Unicode characters; no session activation.
+  string first_prompt_preview = 14;
 }
 enum SessionActivity { SESSION_ACTIVITY_UNSPECIFIED = 0; SESSION_ACTIVITY_IDLE = 1; SESSION_ACTIVITY_CREATING_AGENT_SESSION = 2; SESSION_ACTIVITY_STARTING_TURN = 3; SESSION_ACTIVITY_RUNNING_TURN = 4; SESSION_ACTIVITY_COMPACTING_CONTEXT = 5; SESSION_ACTIVITY_RUNNING_DELEGATES = 6; SESSION_ACTIVITY_RUNNING_SHELL = 7; }
 message TokenUsage { uint64 input_tokens = 1; uint64 output_tokens = 2; uint64 cached_input_tokens = 3; uint64 cache_write_tokens = 4; }
