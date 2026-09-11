@@ -620,6 +620,10 @@ pub enum Command {
     DeleteSession {
         session_id: SessionId,
     },
+    /// Exact-ID, missing-directory-only canonical deletion; never restores or cancels work.
+    PruneSession {
+        session_id: SessionId,
+    },
     UpdateSettings {
         patch: SettingsPatch,
     },
@@ -662,6 +666,10 @@ pub enum Query {
         workspace_id: WorkspaceId,
     },
     ListSessions {
+        workspace_id: WorkspaceId,
+        limit: u32,
+    },
+    ListOrphanedSessions {
         workspace_id: WorkspaceId,
         limit: u32,
     },

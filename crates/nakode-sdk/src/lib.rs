@@ -1126,6 +1126,31 @@ impl NakodeClient {
         })
     }
 
+    /// Lists confirmed missing-directory cleanup candidates without opening sessions.
+    /// Active/attached sessions and uncertain filesystem observations are excluded.
+    ///
+    /// # Errors
+    /// Returns transport/server errors; older servers refuse with Unimplemented.
+    pub async fn list_orphaned_sessions(
+        &self,
+        workspace_id: impl Into<String>,
+        limit: u32,
+    ) -> Result<LogicalSessionInventory, SdkError> {
+        let response = self
+            .transport
+            .clone()
+            .list_orphaned_sessions(api::ListSessionsRequest {
+                workspace_id: workspace_id.into(),
+                limit,
+            })
+            .await?
+            .into_inner();
+        Ok(LogicalSessionInventory {
+            sessions: response.sessions,
+            complete: response.complete,
+        })
+    }
+
     /// Lists all currently readable sessions, including idle sessions, in one request.
     /// Saved-only history remains in `list_session_inventory`. Overview snapshots contain status
     /// and pending external tools, never transcript/context bodies, and must not replace details.
@@ -1731,6 +1756,7 @@ impl NakodeClient {
     typed_mutation!(save_agent, api::SaveAgentRequest);
     typed_mutation!(delete_agent, api::DeleteAgentRequest);
     typed_mutation!(delete_session, api::DeleteSessionRequest);
+    typed_mutation!(prune_session, api::DeleteSessionRequest);
     typed_mutation!(update_settings, api::UpdateSettingsRequest);
     typed_mutation!(check_agent_browser, api::CheckAgentBrowserRequest);
     typed_mutation!(cancel_run, api::CancelRunRequest);

@@ -841,6 +841,7 @@ impl ServerCore {
                 self.cancel_session_work_command(&session_id)
             }
             Command::DeleteSession { session_id } => self.delete_session_command(&session_id),
+            Command::PruneSession { session_id } => self.prune_session_command(&session_id),
             Command::CompactContext { agent_session_id } => {
                 self.compact_context_command(&agent_session_id)
             }
@@ -2540,6 +2541,40 @@ impl ServerCore {
         Ok(Self::accepted(Some(session_id.to_string()), effects))
     }
 
+    // Cleanup deliberately protects every attached engine, including idle provider resources.
+    // Only a real ENOENT from an absolute canonical path is proof; permission, I/O and other
+    // inspection failures, files replacing directories, and legacy empty paths remain untouched.
+    fn orphan_eligible(&self, session_id: &SessionId, directory: &str) -> bool {
+        !self.sessions_by_id.contains_key(session_id) && confirmed_missing_directory(directory)
+    }
+
+    fn prune_session_command(&mut self, session_id: &SessionId) -> DomainCommandOutcome {
+        if uuid::Uuid::parse_str(session_id.as_str()).is_err() {
+            return Err(DomainCommandError::Invalid(
+                "cleanup requires an exact session UUID".to_owned(),
+            ));
+        }
+        if self.sessions_by_id.contains_key(session_id) {
+            return Err(DomainCommandError::Conflict(
+                "attached sessions cannot be pruned; close the session first".to_owned(),
+            ));
+        }
+        if let Some(record) = self
+            .sessions
+            .iter()
+            .find(|record| record.id == session_id.as_str())
+        {
+            if !self.orphan_eligible(session_id, &record.working_directory) {
+                return Err(DomainCommandError::Conflict("session directory is present or could not be confirmed missing; nothing was removed".to_owned()));
+            }
+        } else if !self.session_inventory_complete {
+            return Err(DomainCommandError::Conflict(
+                "session inventory is incomplete; cannot verify cleanup eligibility".to_owned(),
+            ));
+        }
+        self.delete_session_command(session_id)
+    }
+
     /// Installs the successor for a closed initial session before its engine is removed.
     fn replace_default_session(&mut self) -> Result<(), DomainCommandError> {
         self.refresh_session_template_addenda()?;
@@ -3282,8 +3317,24 @@ impl ServerCore {
         self.query_view(query)
     }
 
+    fn orphaned_session_inventory(
+        &self,
+        workspace_id: &WorkspaceId,
+        limit: u32,
+    ) -> Result<QueryResult, ServiceError> {
+        self.ensure_workspace(workspace_id).map_err(domain_error)?;
+        let mut sessions = self.workspace_bootstrap().sessions;
+        sessions.retain(|session| self.orphan_eligible(&session.id, &session.working_directory));
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX).clamp(1, 500);
+        let complete = self.session_inventory_complete && sessions.len() <= limit;
+        sessions.truncate(limit);
+        Ok(QueryResult::Sessions(nakode_protocol::SessionInventory {
+            sessions,
+            complete,
+        }))
+    }
+
     fn query_view(&self, query: Query) -> Result<QueryResult, ServiceError> {
-        let bootstrap = || self.workspace_bootstrap();
         match query {
             Query::InspectWorkspacePath {
                 path,
@@ -3295,7 +3346,7 @@ impl ServerCore {
                 workspace: _,
                 session_id,
             } => {
-                let mut view = bootstrap();
+                let mut view = self.workspace_bootstrap();
                 if let Some(session_id) = session_id {
                     view.active_session = Some(self.session_view(&session_id)?);
                 }
@@ -3311,7 +3362,7 @@ impl ServerCore {
                 limit,
             } => {
                 self.ensure_workspace(&workspace_id).map_err(domain_error)?;
-                let mut sessions = bootstrap().sessions;
+                let mut sessions = self.workspace_bootstrap().sessions;
                 let limit = usize::try_from(limit).unwrap_or(usize::MAX).min(500);
                 let complete = self.session_inventory_complete && sessions.len() <= limit;
                 sessions.truncate(limit);
@@ -3320,6 +3371,10 @@ impl ServerCore {
                     complete,
                 }))
             }
+            Query::ListOrphanedSessions {
+                workspace_id,
+                limit,
+            } => self.orphaned_session_inventory(&workspace_id, limit),
             Query::ListActiveSessions { workspace_id } => self.active_sessions(&workspace_id),
             Query::ListSessionStatuses { limit } => {
                 Ok(QueryResult::SessionStatuses(self.session_statuses(limit)))
@@ -4338,7 +4393,7 @@ impl ServerCore {
             | Command::CheckAgentBrowser { .. } => Some(self.default_session.clone()),
             // Run deletion effects through whichever control-plane engine is default AFTER command
             // acceptance. This matters when deleting a closed initial session rotates that role.
-            Command::DeleteSession { .. } => None,
+            Command::DeleteSession { .. } | Command::PruneSession { .. } => None,
         }
     }
 
@@ -4537,6 +4592,11 @@ fn canonical_repository_path(value: &str) -> Option<String> {
         return None;
     }
     Some(path.to_owned())
+}
+
+fn confirmed_missing_directory(directory: &str) -> bool {
+    std::path::Path::new(directory).is_absolute()
+        && matches!(std::fs::metadata(directory), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn canonical_working_directory(
@@ -11044,6 +11104,109 @@ enabled = false
             ));
             assert_eq!(core.default_session_id(), &successor);
         }
+    }
+
+    #[test]
+    fn orphan_cleanup_lists_without_restore_and_revalidates_paths() {
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp");
+        std::fs::create_dir_all(&scratch).expect("test scratch directory");
+        let root = tempfile::tempdir_in(scratch).expect("isolated directory");
+        let missing = root.path().join("missing");
+        let id = SessionId::from(uuid::Uuid::now_v7().to_string());
+        let (mut core, _) = ready_codex_server();
+        core.session_inventory_complete = true;
+        core.replace_session_records(vec![SessionRecord {
+            id: id.to_string(),
+            working_directory: missing.to_string_lossy().into_owned(),
+            workspace: core.workspace_bootstrap().workspace_path,
+            title: "Orphan fixture".to_owned(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "fixture-only".to_owned(),
+            first_prompt_preview: String::new(),
+            initial_instructions: None,
+            account_id: None,
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+            last_owner_activity_at: None,
+            tool_configuration: None,
+            code_mode: false,
+            enabled_skill_ids: None,
+            owned_provider_sessions: Vec::new(),
+        }]);
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let engines = core.sessions_by_id.len();
+        let QueryResult::Sessions(inventory) = core
+            .query_view(Query::ListOrphanedSessions {
+                workspace_id: workspace_id.clone(),
+                limit: 500,
+            })
+            .expect("list without restore")
+        else {
+            panic!("inventory expected")
+        };
+        assert!(inventory.complete);
+        assert_eq!(inventory.sessions.len(), 1);
+        assert_eq!(inventory.sessions[0].id, id);
+        assert_eq!(core.sessions_by_id.len(), engines);
+        assert!(
+            core.query_view(Query::ListOrphanedSessions {
+                workspace_id: WorkspaceId::from("foreign-workspace"),
+                limit: 500,
+            })
+            .is_err()
+        );
+        std::fs::create_dir(&missing).expect("restore path between preview and mutation");
+        assert!(core.prune_session_command(&id).is_err());
+        std::fs::remove_dir(&missing).expect("remove isolated fixture only");
+        let (_, effects) = core
+            .prune_session_command(&id)
+            .expect("missing path eligible");
+        assert!(
+            matches!(effects.as_slice(), [crate::state::Effect::DeleteSession(value)] if value == id.as_str())
+        );
+        core.replace_session_records(Vec::new());
+        assert!(
+            core.prune_session_command(&id).is_ok(),
+            "already removed converges"
+        );
+        assert!(
+            core.prune_session_command(&SessionId::from(&id.as_str()[..8]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn orphan_cleanup_protects_attached_sessions_and_uncertain_paths() {
+        let (mut core, active) = ready_codex_server();
+        assert!(core.prune_session_command(&active).is_err());
+        let idle = attached_session(&mut core);
+        assert!(core.prune_session_command(&idle).is_err());
+        assert!(!super::confirmed_missing_directory(""));
+        assert!(!super::confirmed_missing_directory("relative/missing"));
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp");
+        std::fs::create_dir_all(&scratch).expect("test scratch directory");
+        let root = tempfile::tempdir_in(scratch).expect("isolated fixture");
+        assert!(!super::confirmed_missing_directory(
+            root.path().to_str().expect("path")
+        ));
+        let file = root.path().join("file");
+        std::fs::write(&file, "fixture").expect("fixture file");
+        assert!(!super::confirmed_missing_directory(
+            file.to_str().expect("path")
+        ));
+        assert!(!super::confirmed_missing_directory(
+            file.join("child").to_str().expect("path")
+        ));
+        core.session_inventory_complete = false;
+        assert!(
+            core.prune_session_command(&SessionId::from(uuid::Uuid::now_v7().to_string()))
+                .is_err()
+        );
     }
 
     /// Session creation continues through the successor after the old initial session is gone.

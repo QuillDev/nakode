@@ -41,6 +41,12 @@ service NakodeService {
   rpc SetBridgeLiveMessage(SetBridgeLiveMessageRequest) returns (MutationResult);
   rpc ContinueSessionFromBridge(ContinueSessionFromBridgeRequest) returns (ContinueSessionFromBridgeResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // Only confirmed missing canonical directories; never opens sessions. Active sessions and
+  // uncertain filesystem observations are excluded. Completeness describes the candidate set.
+  rpc ListOrphanedSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // Rechecks exact identity, missing directory and inactivity before canonical history deletion.
+  // Already removed identities succeed. Never removes workspace files or provider-owned history.
+  rpc PruneSession(DeleteSessionRequest) returns (MutationResult);
   // Currently readable sessions, including idle sessions; never opens saved history.
   rpc ListActiveSessions(ListActiveSessionsRequest) returns (ListActiveSessionsResponse);
   // Process-owned session status without transcript, provider configuration or detail hydration.

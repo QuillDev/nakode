@@ -223,6 +223,8 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
         RequestLane::Subscription,
     ),
     fixed("NakodeService", "ListSessions", RequestLane::Query),
+    fixed("NakodeService", "ListOrphanedSessions", RequestLane::Query),
+    fixed("NakodeService", "PruneSession", RequestLane::Control),
     fixed("NakodeService", "ListActiveSessions", RequestLane::Query),
     fixed("NakodeService", "ListSessionStatuses", RequestLane::Query),
     fixed("NakodeService", "DeleteSession", RequestLane::Control),
@@ -492,6 +494,7 @@ fn query_lane(query: &Query) -> QueryLane {
         | Query::GetSoul { .. }
         | Query::GetMcpManagement { .. }
         | Query::ListSessions { .. }
+        | Query::ListOrphanedSessions { .. }
         | Query::ListActiveSessions { .. }
         | Query::ListSessionStatuses { .. }
         | Query::GetDiagnostics { .. }
