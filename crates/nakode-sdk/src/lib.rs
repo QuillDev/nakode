@@ -1454,13 +1454,16 @@ impl NakodeClient {
         failed: bool,
         expected_revision: Option<u64>,
     ) -> Result<api::MutationResult, SdkError> {
+        let session_id = session_id.into();
+        let call_id = call_id.into();
+        let options = external_tool_result_mutation(&session_id, &call_id, expected_revision);
         send_mutation!(
             self,
             submit_external_tool_result,
             api::SubmitExternalToolResultRequest {
-                mutation: Some(mutation(expected_revision)),
-                session_id: session_id.into(),
-                call_id: call_id.into(),
+                mutation: Some(options),
+                session_id,
+                call_id,
                 output: output.into(),
                 failed,
             }
@@ -2674,6 +2677,24 @@ fn authoritative_remove_request(
     request
 }
 
+fn external_tool_result_mutation(
+    session_id: &str,
+    call_id: &str,
+    expected_revision: Option<u64>,
+) -> api::MutationOptions {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for part in [session_id.as_bytes(), call_id.as_bytes()] {
+        digest.update(part.len().to_be_bytes());
+        digest.update(part);
+    }
+    api::MutationOptions {
+        // The server fingerprints the full command, so a different result still conflicts.
+        idempotency_key: format!("external-tool-result-{:x}", digest.finalize()),
+        expected_revision,
+    }
+}
+
 fn mutation(expected_revision: Option<u64>) -> api::MutationOptions {
     api::MutationOptions {
         idempotency_key: uuid::Uuid::now_v7().to_string(),
@@ -2938,8 +2959,34 @@ mod tests {
     use super::{
         ActivationClient, ActivationCursor, NakodeClient, SdkError, SessionAttachment,
         activation_cursor_changed, api, authoritative_remove_request, bridge_continuation_mutation,
-        managed_watch, retry_transport, structured_interaction_request,
+        external_tool_result_mutation, managed_watch, retry_transport,
+        structured_interaction_request,
     };
+
+    #[test]
+    fn external_tool_result_retries_keep_the_call_identity() {
+        let first = external_tool_result_mutation("session-a", "call-a", None);
+        assert_eq!(
+            first,
+            external_tool_result_mutation("session-a", "call-a", None)
+        );
+        assert_ne!(
+            first.idempotency_key,
+            external_tool_result_mutation("session-b", "call-a", None).idempotency_key
+        );
+        assert_ne!(
+            first.idempotency_key,
+            external_tool_result_mutation("session-a", "call-b", None).idempotency_key
+        );
+        assert_ne!(
+            external_tool_result_mutation("ab", "c", None).idempotency_key,
+            external_tool_result_mutation("a", "bc", None).idempotency_key
+        );
+        assert_eq!(
+            external_tool_result_mutation("session-a", "call-a", Some(7)).expected_revision,
+            Some(7)
+        );
+    }
 
     #[test]
     fn structured_interaction_answers_preserve_question_identity_and_text() {
@@ -3369,7 +3416,8 @@ mod tests {
         global::set_text_map_propagator(TraceContextPropagator::new());
         global::set_tracer_provider(provider.clone());
         let directory = tempfile::tempdir().expect("trace fixture directory");
-        let socket = directory.path().join("nakode.sock");
+        // Short socket names leave room for project-local TMPDIR in long worktree paths.
+        let socket = directory.path().join("n");
         let server = spawn_session_server(
             &socket,
             SessionServerMode::ReattachSame,
@@ -3510,7 +3558,7 @@ mod tests {
     #[tokio::test]
     async fn complete_creation_preserves_directory_instructions_and_model_options() {
         let directory = tempfile::tempdir().expect("SDK transport directory");
-        let socket = directory.path().join("nakode.sock");
+        let socket = directory.path().join("n");
         let listener = UnixListener::bind(&socket).expect("bind fake Nakode API");
         let (endpoint, mut requests) = ServerEndpoint::channel_with_build_revision(
             "sdk-test",
@@ -3595,7 +3643,7 @@ mod tests {
     #[tokio::test]
     async fn server_info_preserves_the_live_build_revision() {
         let directory = tempfile::tempdir().expect("SDK transport directory");
-        let socket = directory.path().join("nakode.sock");
+        let socket = directory.path().join("n");
         let server = spawn_session_server(
             &socket,
             SessionServerMode::ReattachSame,
@@ -3625,7 +3673,7 @@ mod tests {
     #[tokio::test]
     async fn open_session_returns_the_effective_attachment() {
         let directory = tempfile::tempdir().expect("SDK transport directory");
-        let socket = directory.path().join("nakode.sock");
+        let socket = directory.path().join("n");
         let server = spawn_session_server(
             &socket,
             SessionServerMode::ReattachSame,
@@ -3660,7 +3708,7 @@ mod tests {
     #[tokio::test]
     async fn attached_watch_reopens_same_id_and_forwards_every_attachment() {
         let directory = tempfile::tempdir().expect("SDK transport directory");
-        let socket = directory.path().join("nakode.sock");
+        let socket = directory.path().join("n");
         let captured = Arc::new(Mutex::new(None));
         let server = spawn_session_server(
             &socket,
@@ -3727,7 +3775,7 @@ mod tests {
             ("snapshot", SessionServerMode::SnapshotDifferent),
         ] {
             let directory = tempfile::tempdir().expect("SDK transport directory");
-            let socket = directory.path().join(format!("nakode-{name}.sock"));
+            let socket = directory.path().join("n");
             let server = spawn_session_server(&socket, mode, Arc::new(Mutex::new(None)));
             let client = NakodeClient::connect_unix(&socket)
                 .await
@@ -3757,8 +3805,8 @@ mod tests {
     #[tokio::test]
     async fn activation_watch_rediscovery_hands_off_sockets_and_sends_attempt_cursor() {
         let directory = tempfile::tempdir().expect("activation transport directory");
-        let helper_socket = directory.path().join("helper.sock");
-        let service_socket = directory.path().join("service.sock");
+        let helper_socket = directory.path().join("h");
+        let service_socket = directory.path().join("s");
         let helper_requests = Arc::new(Mutex::new(Vec::new()));
         let service_requests = Arc::new(Mutex::new(Vec::new()));
         let helper = spawn_activation_server(
@@ -3837,7 +3885,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_rediscovering_activation_watch_cancels_real_transport_stream() {
         let directory = tempfile::tempdir().expect("activation transport directory");
-        let socket = directory.path().join("activation.sock");
+        let socket = directory.path().join("a");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let dropped = Arc::new(AtomicUsize::new(0));
         let server = spawn_activation_server(
