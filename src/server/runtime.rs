@@ -1148,6 +1148,98 @@ impl NativeServerRuntime {
         Ok(())
     }
 
+    fn retained_query_session(&self, query: &Query) -> Option<&crate::session::SessionRecord> {
+        let (Query::GetSession { session_id }
+        | Query::GetTranscriptPage { session_id, .. }
+        | Query::ListRuns { session_id, .. }
+        | Query::GetTranscriptBodyWindow {
+            owner: nakode_protocol::TranscriptOwner::Session { session_id },
+            ..
+        }) = query
+        else {
+            return None;
+        };
+        if self.core.engine_for(session_id).is_some() {
+            return None;
+        }
+        self.core
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id.as_str())
+    }
+
+    fn retained_run_query<'a>(&self, query: &'a Query) -> Option<&'a nakode_protocol::RunId> {
+        let (Query::GetRun { run_id }
+        | Query::GetRunTranscriptPage { run_id, .. }
+        | Query::GetRunTextWindow { run_id, .. }
+        | Query::GetTranscriptBodyWindow {
+            owner: nakode_protocol::TranscriptOwner::Run { run_id },
+            ..
+        }) = query
+        else {
+            return None;
+        };
+        self.core
+            .session_for_run_id(run_id.as_str())
+            .is_none()
+            .then_some(run_id)
+    }
+
+    fn read_retained_query(&self, query: Query) -> Result<QueryResult, ServiceError> {
+        let parent = if let Some(run_id) = self.retained_run_query(&query) {
+            self.effects
+                .persistence
+                .sessions
+                .find_subagent_parent(run_id.as_str())
+                .map_err(|error| ServiceError {
+                    code: ErrorCode::Internal,
+                    message: error.to_string(),
+                    retryable: true,
+                })?
+        } else {
+            None
+        };
+        let session = self
+            .retained_query_session(&query)
+            .or_else(|| {
+                self.core
+                    .sessions
+                    .iter()
+                    .find(|session| Some(&session.id) == parent.as_ref())
+            })
+            .ok_or_else(|| super::not_found("session", ""))?;
+        let store = crate::runtime::RuntimeSessionStore::new(
+            self.effects.persistence.database.clone(),
+            session.provider.clone(),
+        );
+        let history = store.load(&session.provider_session_id)
+            .and_then(|native| match native {
+                Some(native) => Ok(native.normalized_history()),
+                None if crate::session::is_pending_provider_session_id(&session.provider_session_id) => Ok(Vec::new()),
+                None => Err("Retained provider history is unavailable; the logical session is preserved. Explicitly reopen on its execution machine to recover provider-owned history.".to_owned()),
+            })
+            .map_err(|message| ServiceError {
+                code: ErrorCode::CapabilityUnsupported, message, retryable: false,
+            })?;
+        let repository = &self.effects.persistence.sessions;
+        let children = repository
+            .list_subagents(&session.id)
+            .map_err(|error| ServiceError {
+                code: ErrorCode::Internal,
+                message: error.to_string(),
+                retryable: true,
+            })?;
+        let shared_context = repository
+            .list_shared_context(&session.id)
+            .map_err(|error| ServiceError {
+                code: ErrorCode::Internal,
+                message: error.to_string(),
+                retryable: true,
+            })?;
+        self.core
+            .query_retained_session(query, session, history, children, shared_context)
+    }
+
     #[allow(clippy::too_many_lines)]
     // The request dispatcher keeps fencing, typed routing, persistence rollback, and response
     // completion in one exhaustive match so a newly added public request cannot bypass a guard.
@@ -1595,6 +1687,50 @@ impl NativeServerRuntime {
                 ..
             } => Some((workspace_id.clone(), profile_id.clone(), skill_id.clone())),
             _ => None,
+        };
+        let request = match request {
+            nakode_server::ServerRequest::Subscribe {
+                scope: nakode_protocol::SubscriptionScope::Session { session_id },
+                respond,
+                ..
+            } if self
+                .retained_query_session(&Query::GetSession {
+                    session_id: session_id.clone(),
+                })
+                .is_some() =>
+            {
+                let result = self
+                    .read_retained_query(Query::GetSession { session_id })
+                    .and_then(|value| {
+                        if let QueryResult::Session(session) = value {
+                            Ok(Snapshot {
+                                cursor: self.endpoint.cursor(),
+                                value: nakode_protocol::SubscriptionView::Session(session),
+                            })
+                        } else {
+                            Err(ServiceError {
+                                code: ErrorCode::Internal,
+                                message: "retained session query returned a different resource"
+                                    .into(),
+                                retryable: false,
+                            })
+                        }
+                    });
+                let _ = respond.send(result);
+                return;
+            }
+            nakode_server::ServerRequest::Query { query, respond, .. }
+                if self.retained_query_session(&query).is_some()
+                    || self.retained_run_query(&query).is_some() =>
+            {
+                let result = self.read_retained_query(query).map(|value| Snapshot {
+                    cursor: self.endpoint.cursor(),
+                    value,
+                });
+                let _ = respond.send(result);
+                return;
+            }
+            request => request,
         };
         let mut rollback = BridgeMutationRollback::capture(&request, &self.core);
         let mut outcome = self.core.handle(&self.endpoint, request);
@@ -10016,6 +10152,340 @@ mod tests {
 
         handle.shutdown().await;
         runtime.await.expect("runtime task");
+    }
+
+    async fn retained_history_runtime(
+        root: &std::path::Path,
+    ) -> (NativeServerRuntime, super::NativeServerHandle) {
+        let (persistence, _credentials) = test_persistence(root);
+        let records = persistence
+            .sessions
+            .list_recent_all()
+            .expect("retained inventory");
+        let effects = EffectExecutor::new(empty_registry(root).await, persistence);
+        let mut state = DomainState::new_for_backend(
+            root.to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        state.handle_provider_backend(
+            CODEX_PROVIDER,
+            BackendEvent::Ready(crate::backend::BackendIdentity {
+                provider: CODEX_PROVIDER.to_owned(),
+                display_name: "Codex".to_owned(),
+                version: None,
+                capabilities: crate::backend::BackendCapabilities {
+                    resume: crate::backend::CapabilitySupport::Supported,
+                    ..crate::backend::BackendCapabilities::default()
+                },
+            }),
+        );
+        NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            records,
+            effects,
+            mpsc::channel(1).1,
+        )
+    }
+
+    #[tokio::test]
+    async fn retained_run_queries_preserve_evidence_without_resuming_or_writing_corrections() {
+        let root = tempfile::tempdir().expect("isolated history");
+        let id = save_retained_history(root.path());
+        let (runtime, _handle) = retained_history_runtime(root.path()).await;
+        let repository = &runtime.effects.persistence.sessions;
+        repository
+            .save_subagent(&SubagentRecord {
+                parent_session_id: id.to_string(),
+                id: "retained-run".into(),
+                agent: "repo-explorer".into(),
+                provider: CODEX_PROVIDER.into(),
+                model: None,
+                provider_session_id: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                objective: "Retained objective".into(),
+                status: SubagentStatus::Working,
+                latest_activity: "Working".into(),
+                transcript: vec![TranscriptEntry {
+                    id: "retained-child-entry".into(),
+                    key: None,
+                    kind: EntryKind::Tool,
+                    title: "read".into(),
+                    body: "Original child evidence".into(),
+                    status: EntryStatus::Complete,
+                    created_at_ms: Some(101),
+                    provider_id: Some(CODEX_PROVIDER.into()),
+                    model_id: None,
+                    owner_turn_id: None,
+                    reasoning_effort: None,
+                    fast_mode: None,
+                    source_transport: None,
+                    tool_audit_json: None,
+                }],
+                observability: SubagentObservability {
+                    started_at_ms: 100,
+                    ..SubagentObservability::default()
+                },
+                transcript_has_earlier: false,
+            })
+            .expect("retained child");
+        let run_id = nakode_protocol::RunId::from("retained-run");
+        for query in [
+            Query::GetSession {
+                session_id: id.clone(),
+            },
+            Query::ListRuns {
+                session_id: id.clone(),
+                before: None,
+                limit: 128,
+            },
+            Query::GetRun {
+                run_id: run_id.clone(),
+            },
+            Query::GetRunTranscriptPage {
+                run_id: run_id.clone(),
+                before: None,
+                limit: 128,
+            },
+            Query::GetTranscriptBodyWindow {
+                owner: nakode_protocol::TranscriptOwner::Run {
+                    run_id: run_id.clone(),
+                },
+                entry_id: nakode_protocol::EntryId::from("retained-child-entry"),
+                before_byte: None,
+                limit_bytes: 1024,
+            },
+            Query::GetRunTextWindow {
+                run_id,
+                field: nakode_protocol::RunTextField::Objective,
+                before_byte: None,
+                limit_bytes: 1024,
+            },
+        ] {
+            runtime
+                .read_retained_query(query)
+                .expect("read-only retained projection");
+        }
+        assert!(runtime.core.engine_for(&id).is_none());
+        let child = repository
+            .list_subagents(id.as_str())
+            .expect("persisted children")
+            .remove(0);
+        assert_eq!(
+            child.status,
+            SubagentStatus::Working,
+            "inspection must not persist restart corrections"
+        );
+        assert_eq!(child.transcript[0].body, "Original child evidence");
+    }
+
+    fn save_retained_history(root: &std::path::Path) -> SessionId {
+        let (persistence, _credentials) = test_persistence(root);
+        let id = SessionId::from("retained-logical-session");
+        let mut native = crate::runtime::RuntimeSession::new(
+            "gpt-test".to_owned(),
+            "retained instructions".to_owned(),
+        )
+        .with_provider(CODEX_PROVIDER);
+        native.history.push(crate::runtime::ConversationItem::User {
+            text: "Original owner history".to_owned(),
+            attachments: Vec::new(),
+        });
+        let store =
+            crate::runtime::RuntimeSessionStore::new(persistence.database.clone(), CODEX_PROVIDER);
+        store.save(&native).expect("native history");
+        persistence
+            .sessions
+            .create_with_id(
+                id.as_str(),
+                CODEX_PROVIDER,
+                &native.id,
+                &root.to_string_lossy(),
+                &root.join("unavailable-workspace").to_string_lossy(),
+                "Retained title",
+                None,
+                &crate::backend::ModelOptions::default(),
+                None,
+            )
+            .expect("logical identity");
+        persistence
+            .sessions
+            .save_session_bridge(&SessionBridgeRecord {
+                session_id: id.to_string(),
+                workspace: root.to_string_lossy().into_owned(),
+                kind: OrchestratorKind::Agent,
+                lifecycle: BridgeLifecycle::Open,
+                display_title: "Retained title".to_owned(),
+                revision: 1,
+                transport: None,
+                external_parent_id: None,
+                external_thread_id: None,
+                last_projected: None,
+                delivery: None,
+                live_turn_id: None,
+                live_external_message_id: None,
+                active_source_message_id: None,
+                recent_inbound_event_ids: Vec::new(),
+                pending_inbound: None,
+                inbound_turn_origins: Vec::new(),
+                updated_at_ms: 1,
+            })
+            .expect("bridge");
+        id
+    }
+
+    #[tokio::test]
+    async fn close_retains_identity_and_read_only_history_across_restart() {
+        let workspace = tempfile::tempdir().expect("isolated workspace");
+        let id = save_retained_history(workspace.path());
+        let (runtime, handle) = retained_history_runtime(workspace.path()).await;
+        let endpoint = runtime.endpoint.clone();
+        let running = tokio::spawn(runtime.run());
+        endpoint
+            .execute_command(
+                ClientId::from("test"),
+                IdempotencyKey::from("close"),
+                None,
+                false,
+                Command::SetSessionBridgeLifecycle {
+                    session_id: id.clone(),
+                    lifecycle: BridgeLifecycle::Archived,
+                },
+            )
+            .await
+            .expect("durable close");
+        let QueryResult::Session(view) = endpoint
+            .execute_query(
+                ClientId::from("test"),
+                Query::GetSession {
+                    session_id: id.clone(),
+                },
+            )
+            .await
+            .expect("read without opening")
+            .value
+        else {
+            panic!("session view")
+        };
+        assert_eq!(view.id, id);
+        assert!(
+            view.transcript
+                .entries
+                .iter()
+                .any(|entry| entry.body.contains("Original owner history"))
+        );
+        handle.shutdown().await;
+        running.await.expect("stopped runtime");
+
+        let (mut restarted, _handle) = retained_history_runtime(workspace.path()).await;
+        assert_retained_restart(&mut restarted, id, &view, workspace.path());
+    }
+
+    fn assert_retained_restart(
+        restarted: &mut NativeServerRuntime,
+        id: SessionId,
+        view: &nakode_protocol::SessionView,
+        workspace: &std::path::Path,
+    ) {
+        let bridge = restarted
+            .effects
+            .persistence
+            .sessions
+            .list_session_bridges_all()
+            .expect("bridges");
+        assert_eq!(bridge[0].lifecycle, BridgeLifecycle::Archived);
+        assert!(restarted.core.engine_for(&id).is_none());
+        let QueryResult::Session(after) = restarted
+            .read_retained_query(Query::GetSession {
+                session_id: id.clone(),
+            })
+            .expect("restart history")
+        else {
+            panic!("session")
+        };
+        assert_eq!(after.id, id);
+        assert_eq!(after.title, view.title);
+        assert_eq!(after.transcript.entries, view.transcript.entries);
+        let entry = after.transcript.entries.first().expect("retained entry");
+        let page = restarted
+            .read_retained_query(Query::GetTranscriptPage {
+                session_id: id.clone(),
+                before: Some(entry.id.clone()),
+                limit: 10,
+            })
+            .expect("stable retained cursor");
+        assert!(matches!(page, QueryResult::Transcript(page) if page.entries.is_empty()));
+        let body = restarted
+            .read_retained_query(Query::GetTranscriptBodyWindow {
+                owner: nakode_protocol::TranscriptOwner::Session {
+                    session_id: id.clone(),
+                },
+                entry_id: entry.id.clone(),
+                before_byte: None,
+                limit_bytes: 1024,
+            })
+            .expect("stable retained body cursor");
+        assert!(matches!(body, QueryResult::TranscriptBody(_)));
+        assert!(
+            restarted.core.engine_for(&id).is_none(),
+            "history must not attach a provider engine"
+        );
+        assert!(
+            restarted.core.open_session_command(&id, None).is_err(),
+            "missing workspace blocks explicit resume only"
+        );
+        std::fs::create_dir(workspace.join("unavailable-workspace")).expect("restore test cwd");
+        let (_, effects) = restarted
+            .core
+            .open_session_command(&id, None)
+            .expect("explicit same-session resume");
+        assert!(effects.iter().any(|effect| matches!(effect,
+            Effect::Backend(BackendCommand::ResumeSession { owner_session_id: Some(owner), .. }) if owner == id.as_str()
+        )));
+        assert_eq!(
+            restarted
+                .core
+                .engine_for(&id)
+                .expect("original engine")
+                .state()
+                .nakode_session_id,
+            id.as_str()
+        );
+        assert!(
+            restarted
+                .effects
+                .persistence
+                .sessions
+                .find(id.as_str())
+                .expect("retained")
+                .is_some()
+        );
+        restarted
+            .effects
+            .persistence
+            .sessions
+            .delete(id.as_str())
+            .expect("explicit destructive delete");
+        assert!(
+            restarted
+                .effects
+                .persistence
+                .sessions
+                .find(id.as_str())
+                .expect("deleted")
+                .is_none()
+        );
+        assert!(
+            restarted
+                .read_retained_query(Query::GetSession { session_id: id })
+                .is_err()
+        );
     }
 
     #[tokio::test]
