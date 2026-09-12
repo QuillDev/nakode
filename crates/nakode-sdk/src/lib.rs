@@ -2976,6 +2976,7 @@ impl NakodeClient {
 
 #[cfg(test)]
 mod tests {
+    mod hydration_cost;
     use nakode_telemetry::{RpcLayer, opentelemetry::trace::FutureExt};
     use std::{
         path::{Path, PathBuf},
