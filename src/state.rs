@@ -3870,6 +3870,47 @@ impl DomainState {
         self.begin_resume(session)
     }
 
+    /// Installs retained evidence without activating a provider, validating a workspace, or
+    /// recovering pending prompts. This state is a query projection, never a live engine.
+    pub(crate) fn install_retained_session(
+        &mut self,
+        session: &SessionRecord,
+        history: Vec<SessionHistoryItem>,
+    ) {
+        self.session_id = Some(session.id.clone());
+        self.nakode_session_id.clone_from(&session.id);
+        self.provider_session_id = None;
+        self.resuming_session = None;
+        self.backend_provider.clone_from(&session.provider);
+        self.code_mode = session.code_mode;
+        self.working_directory
+            .clone_from(&session.working_directory);
+        self.selected_model.clone_from(&session.model);
+        self.session_model_options_override = session
+            .model
+            .clone()
+            .map(|model| (model, session.model_options.clone()));
+        self.initial_client_instructions
+            .clone_from(&session.initial_instructions);
+        self.provider_account_id.clone_from(&session.account_id);
+        self.owner_turns = session
+            .owner_turns
+            .iter()
+            .cloned()
+            .map(|turn| (turn.id.clone(), turn))
+            .collect();
+        self.owner_prompts.clone_from(&session.owner_prompts);
+        self.last_turn = session.last_turn.as_ref().map(|turn| LastTurn {
+            id: turn.id.clone(),
+            model: turn.model.clone(),
+            options: turn.options.clone(),
+            outcome: turn.outcome,
+        });
+        self.connection = ConnectionState::Disconnected("Retained history".to_owned());
+        self.install_history(history);
+        self.transcript.retain_entry_ids(&session.id);
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn begin_resume(&mut self, session: SessionRecord) -> Vec<Effect> {
         if self.is_busy() {

@@ -266,6 +266,19 @@ impl DomainTranscript {
         });
     }
 
+    /// Stable query cursors for evidence rebuilt without attaching a live engine.
+    pub(crate) fn retain_entry_ids(&mut self, session_id: &str) {
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            entry.id = format!(
+                "retained:{session_id}:{}",
+                entry
+                    .key
+                    .as_deref()
+                    .map_or_else(|| index.to_string(), str::to_owned)
+            );
+        }
+    }
+
     pub fn upsert(
         &mut self,
         key: impl Into<String>,

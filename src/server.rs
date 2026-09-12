@@ -4133,6 +4133,105 @@ impl ServerCore {
         Ok(QueryResult::ActiveSessions(sessions))
     }
 
+    /// Query retained native evidence without attaching an engine or restoring provider work.
+    pub(crate) fn query_retained_session(
+        &self,
+        query: Query,
+        session: &SessionRecord,
+        history: Vec<crate::backend::SessionHistoryItem>,
+        children: Vec<crate::session::SubagentRecord>,
+        shared_context: Vec<crate::session::SharedContextEntry>,
+    ) -> Result<QueryResult, ServiceError> {
+        let mut state = self.session_template.clone();
+        state.create_logical_session().map_err(domain_error)?;
+        state.install_retained_session(session, history);
+        // Installation may normalize interrupted runs in memory, but inspection never writes
+        // those corrections back or resumes a child.
+        let _corrections = state.install_subagents(children);
+        state.install_shared_context(shared_context);
+        state.transcript.retain_entry_ids(&session.id);
+        let engine = ServiceEngine::new(state);
+        let state = engine.state();
+        match query {
+            Query::GetSession { .. } => engine
+                .bootstrap_view(&self.providers, std::slice::from_ref(session))
+                .active_session
+                .map(|view| QueryResult::Session(Box::new(view)))
+                .ok_or_else(|| not_found("session", &session.id)),
+            Query::GetTranscriptPage { before, limit, .. } => {
+                crate::state::projection::session_transcript_page(
+                    state,
+                    before.as_ref(),
+                    usize::try_from(limit).unwrap_or(usize::MAX),
+                )
+                .map(|page| QueryResult::Transcript(Box::new(page)))
+                .ok_or_else(|| {
+                    not_found(
+                        "transcript entry",
+                        before.as_ref().map_or("", EntryId::as_str),
+                    )
+                })
+            }
+            Query::GetTranscriptBodyWindow {
+                owner,
+                entry_id,
+                before_byte,
+                limit_bytes,
+            } => crate::state::projection::transcript_body_window(
+                state,
+                match &owner {
+                    TranscriptOwner::Session { .. } => None,
+                    TranscriptOwner::Run { run_id } => Some(run_id),
+                },
+                &entry_id,
+                before_byte,
+                usize::try_from(limit_bytes).unwrap_or(usize::MAX),
+            )
+            .map(QueryResult::TranscriptBody)
+            .map_err(|error| transcript_body_window_error(error, &entry_id)),
+            query => Self::query_retained_detail(state, query),
+        }
+    }
+
+    fn query_retained_detail(
+        state: &crate::state::DomainState,
+        query: Query,
+    ) -> Result<QueryResult, ServiceError> {
+        use crate::state::projection;
+        match query {
+            Query::GetRun { run_id } => projection::run_view(state, &run_id)
+                .map(|run| QueryResult::Run(Box::new(run)))
+                .ok_or_else(|| not_found("run", run_id.as_str())),
+            Query::ListRuns { before, limit, .. } => {
+                projection::run_page(state, before.as_ref(), limit as usize)
+                    .map(QueryResult::Runs)
+                    .ok_or_else(|| not_found("run", ""))
+            }
+            Query::GetRunTranscriptPage {
+                run_id,
+                before,
+                limit,
+            } => projection::run_transcript_page(state, &run_id, before.as_ref(), limit as usize)
+                .map(|page| QueryResult::Transcript(Box::new(page)))
+                .ok_or_else(|| not_found("run transcript", run_id.as_str())),
+            Query::GetRunTextWindow {
+                run_id,
+                field,
+                before_byte,
+                limit_bytes,
+            } => projection::run_text_window(
+                state,
+                &run_id,
+                field,
+                before_byte,
+                limit_bytes as usize,
+            )
+            .map(QueryResult::RunText)
+            .map_err(|error| run_text_window_error(error, &run_id, field)),
+            _ => Err(not_found("retained query", "")),
+        }
+    }
+
     fn session_view(
         &self,
         session_id: &SessionId,

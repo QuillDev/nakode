@@ -1050,6 +1050,12 @@ pub trait SessionRepository: Send + Sync {
         source: &SubagentRecord,
         successor: &SubagentRecord,
     ) -> Result<(), SessionError>;
+    /// Returns the logical session owning one persisted run.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be queried.
+    fn find_subagent_parent(&self, run_id: &str) -> Result<Option<String>, SessionError>;
+
     /// Lists the sub-agent runs associated with a logical parent session.
     ///
     /// # Errors
@@ -4704,6 +4710,20 @@ impl SessionRepository for SqliteSessionRepository {
         save_subagent_transaction(&transaction, successor, now)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    fn find_subagent_parent(&self, run_id: &str) -> Result<Option<String>, SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        Ok(connection
+            .query_row(
+                "SELECT parent_session_id FROM orchestration_runs WHERE id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     #[allow(clippy::too_many_lines)]

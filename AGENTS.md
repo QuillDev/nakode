@@ -187,6 +187,7 @@ different providers, models, and roles.
 - Creation-time client instructions persist with the logical session, independently of owner prompts, and restore before pending creation recovery or provider handoff. New logical sessions must not inherit another session’s instructions; legacy records remain absent rather than reconstructed from transcript prose.
 - Explicit session creation titles remain distinct from first-prompt text.
 - Delegation tools, the public Delegate operation, and the agent CLI require a task-specific title of 1–120 characters; titles persist separately from objectives, and legacy runs remain explicitly untitled.
+- Archived session bridges retain logical identity, native history and workspace associations; retained session/run queries and session subscriptions never activate providers or persist restart corrections. Explicit `OpenSession` restores execution; deletion remains distinct. `src/server/runtime.rs`, `src/server.rs`.
 - Nakode assigns and persists its own logical identities.
 - Provider session and response IDs are opaque adapter data.
 - In-process sessions persist the normalized history and provider state needed
