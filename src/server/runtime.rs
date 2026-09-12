@@ -2826,13 +2826,9 @@ impl NativeServerRuntime {
                 .state_mut()
                 .session_store_failed(error.to_string()),
         }
-        let workspace = self.core.engine().state().workspace.clone();
-        match self
-            .effects
-            .persistence
-            .sessions
-            .list_session_bridges(&workspace)
-        {
+        // Workspace snapshots expose the global saved-session inventory below, so bridge
+        // lifecycle must cover that same inventory instead of only the active directory.
+        match self.effects.persistence.sessions.list_session_bridges_all() {
             Ok(bridges) => self.core.replace_session_bridges(bridges),
             Err(error) => self
                 .core
@@ -11179,6 +11175,29 @@ mod tests {
                 )
                 .expect("persist session");
         }
+        persistence
+            .sessions
+            .save_session_bridge(&SessionBridgeRecord {
+                session_id: "durable-0".to_owned(),
+                workspace: "other-workspace".to_owned(),
+                kind: OrchestratorKind::Agent,
+                lifecycle: BridgeLifecycle::Archived,
+                display_title: "Archived elsewhere".to_owned(),
+                revision: 1,
+                transport: None,
+                external_parent_id: None,
+                external_thread_id: None,
+                last_projected: None,
+                delivery: None,
+                live_turn_id: None,
+                live_external_message_id: None,
+                active_source_message_id: None,
+                recent_inbound_event_ids: Vec::new(),
+                pending_inbound: None,
+                inbound_turn_origins: Vec::new(),
+                updated_at_ms: 1,
+            })
+            .expect("persist cross-workspace bridge");
         let registry = empty_registry(workspace.path()).await;
         let effects = EffectExecutor::new(registry, persistence);
         let state = DomainState::new_for_backend(
@@ -11206,6 +11225,31 @@ mod tests {
         );
         runtime.refresh_catalogs();
         assert_eq!(runtime.core.sessions.len(), 105);
+        let endpoint = runtime.endpoint.clone();
+        let runtime = tokio::spawn(runtime.run());
+        let snapshot = endpoint
+            .execute_query(
+                ClientId::from("cross-workspace-refresh-test"),
+                Query::Bootstrap {
+                    workspace: workspace.path().to_string_lossy().into_owned(),
+                    session_id: None,
+                },
+            )
+            .await
+            .expect("bootstrap after catalogue refresh");
+        let QueryResult::Bootstrap(bootstrap) = snapshot.value else {
+            panic!("expected bootstrap response");
+        };
+        assert_eq!(bootstrap.session_bridges.len(), 1);
+        assert_eq!(
+            bootstrap.session_bridges[0].session_id.as_str(),
+            "durable-0"
+        );
+        assert_eq!(
+            bootstrap.session_bridges[0].lifecycle,
+            BridgeLifecycle::Archived
+        );
+        runtime.abort();
     }
 
     #[tokio::test]
