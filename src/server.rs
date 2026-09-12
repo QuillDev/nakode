@@ -5,6 +5,7 @@
 //! provider commands, persistence handles, or process objects.
 
 pub(crate) mod runtime;
+pub mod session_sync;
 mod status;
 
 use std::{
@@ -107,6 +108,7 @@ pub struct ServerCore {
     command_order: VecDeque<IdempotencyKey>,
     published_workspace: Option<nakode_protocol::BootstrapView>,
     published_sessions: HashMap<SessionId, PublishedSessionProjection>,
+    session_histories: session_sync::SessionHistories,
     soul_store: Option<SoulStore>,
 }
 
@@ -134,6 +136,7 @@ impl ServerCore {
             command_order: VecDeque::new(),
             published_workspace: None,
             published_sessions: HashMap::new(),
+            session_histories: session_sync::SessionHistories::default(),
             soul_store: SoulStore::user_default().ok(),
         };
         core.published_workspace = Some(core.workspace_bootstrap());
@@ -2610,6 +2613,7 @@ impl ServerCore {
         crate::session_environment::remove(session_id.as_str());
         self.sessions_by_id.remove(session_id);
         self.published_sessions.remove(session_id);
+        self.session_histories.remove(session_id);
     }
 
     fn compact_context_command(
@@ -3637,9 +3641,25 @@ impl ServerCore {
     fn publish_session_state(&mut self, endpoint: &ServerEndpoint, session_id: &SessionId) {
         let mut publications = Vec::new();
         if let Some(session) = self.published_session(session_id) {
-            publications.extend(
-                self.session_publications(self.published_sessions.get(session_id), &session),
-            );
+            let previous = self.published_sessions.get(session_id);
+            publications.extend(self.session_publications(previous, &session));
+            // Record the entire authoritative revision before broadcasting any invalidation.
+            // Only explicitly established experimental observers retain history. Legacy watches
+            // still receive exactly their existing events and replacement snapshots.
+            if self.session_histories.observes(session_id)
+                && previous.is_none_or(|previous| previous.view != session.view)
+            {
+                self.session_histories.record(
+                    session_id,
+                    previous.map(|previous| previous.view.revision),
+                    session.view.revision,
+                    &publications
+                        .iter()
+                        .map(|publication| &publication.event)
+                        .collect::<Vec<_>>(),
+                    std::time::Instant::now(),
+                );
+            }
             self.published_sessions.insert(session_id.clone(), session);
         }
 
