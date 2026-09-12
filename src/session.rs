@@ -1896,19 +1896,24 @@ impl SqliteSessionRepository {
             )?;
         }
         seed_provider_catalog(&connection)?;
+        // Acquire the write lock before inspecting the schema. Concurrent openers must not
+        // both observe the missing column and then race their ALTER TABLE statements.
+        let vision_transaction =
+            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_vision_effort = {
-            let mut statement = connection.prepare("PRAGMA table_info(addon_vision_settings)")?;
+            let mut statement =
+                vision_transaction.prepare("PRAGMA table_info(addon_vision_settings)")?;
             let columns = statement
                 .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<Result<Vec<_>, _>>()?;
             columns.iter().any(|column| column == "reasoning_effort")
         };
         if !has_vision_effort {
-            execute_batch_with_busy_retry(
-                &connection,
+            vision_transaction.execute_batch(
                 "ALTER TABLE addon_vision_settings ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'low';",
             )?;
         }
+        vision_transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
             path: path.to_path_buf(),
