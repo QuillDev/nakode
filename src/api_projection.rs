@@ -782,6 +782,8 @@ pub(crate) fn artifact(value: api::Artifact) -> view::ArtifactView {
         media_type: value.media_type,
         byte_length: value.byte_length,
         data: value.data,
+        width: value.width,
+        height: value.height,
     }
 }
 

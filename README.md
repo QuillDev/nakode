@@ -15,6 +15,10 @@ the TUI is one renderer of server-owned semantic state.
 Background clients can read a bounded [scalar session status inventory](docs/session-status.md)
 through one SDK query without keeping a renderer or transcript subscription alive.
 
+## Explicit image handoffs
+
+Use `prepare_image` to inspect or explicitly crop/downscale conversation images, then select their references in `nakode_agent.image_references`. Images accompany the first delegated task and remain visible after transcript restoration. Public SDK clients use `GetSessionImage` and `Delegate`. See [usage, limits and provider constraints](docs/image-handoffs.md).
+
 ## Existing image replies
 
 Native tool sessions on Linux/macOS can use `return_image({"path":"relative/image.png"})`

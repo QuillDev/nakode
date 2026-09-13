@@ -32,6 +32,7 @@ pub mod glm;
 pub mod handoff;
 #[cfg(feature = "tui")]
 mod herdr;
+pub mod image_handoff;
 pub mod kimi;
 mod machine_path;
 #[cfg(feature = "tui")]

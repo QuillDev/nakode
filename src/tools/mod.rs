@@ -11,6 +11,7 @@ mod memory;
 mod nakode_agent;
 pub(crate) use nakode_agent::NAKODE_AGENT_TOOL_NAME;
 pub(crate) use shared_context::SEARCH_SHARED_CONTEXT_TOOL_NAME;
+mod prepare_image;
 mod process;
 mod read;
 mod read_skill;
@@ -121,6 +122,7 @@ impl ToolRegistry {
             tools: vec![
                 Arc::new(read::ReadTool),
                 Arc::new(return_image::ReturnImageTool),
+                Arc::new(prepare_image::PrepareImageTool),
                 Arc::new(read_skill::ReadSkillTool),
                 Arc::new(read_skill_component::ReadSkillComponentTool),
                 Arc::new(write::WriteTool),
@@ -627,6 +629,7 @@ mod tests {
                 "read",
                 #[cfg(unix)]
                 "return_image",
+                "prepare_image",
                 "read_skill",
                 "read_skill_component",
                 "write",

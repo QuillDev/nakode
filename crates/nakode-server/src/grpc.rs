@@ -1758,7 +1758,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             agent_slug: input.agent_slug,
             title: input.title,
             task: input.task,
-            parent_run_id: input.parent_run_id.map(protocol::RunId::from)
+            parent_run_id: input.parent_run_id.map(protocol::RunId::from),
+            image_references: input.image_references,
         }
     );
 
@@ -2019,6 +2020,33 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 "unexpected artifact response",
                 &timing,
             ));
+        };
+        Ok(response_with_timing(artifact(value), &timing))
+    }
+
+    async fn get_session_image(
+        &self,
+        request: tonic::Request<api::GetSessionImageRequest>,
+    ) -> Result<tonic::Response<api::Artifact>, tonic::Status> {
+        let request = request.into_inner();
+        let (result, timing) = self
+            .query(protocol::Query::GetSessionImage {
+                session_id: protocol::SessionId::from(request.session_id),
+                image_reference: request.image_reference,
+                transform: request.transform.map(|transform| protocol::ImageTransform {
+                    crop: transform.crop.map(|crop| protocol::ImageCrop {
+                        x: crop.x,
+                        y: crop.y,
+                        width: crop.width,
+                        height: crop.height,
+                    }),
+                    max_width: transform.max_width,
+                    max_height: transform.max_height,
+                }),
+            })
+            .await?;
+        let protocol::QueryResult::Artifact(value) = result.value else {
+            return Err(internal_with_timing("unexpected image response", &timing));
         };
         Ok(response_with_timing(artifact(value), &timing))
     }
@@ -3589,6 +3617,8 @@ pub(crate) fn artifact(value: protocol::ArtifactView) -> api::Artifact {
         media_type: value.media_type,
         byte_length: value.byte_length,
         data: value.data,
+        width: value.width,
+        height: value.height,
     }
 }
 

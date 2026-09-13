@@ -3661,6 +3661,7 @@ mod tests {
                 "read",
                 #[cfg(unix)]
                 "return_image",
+                "prepare_image",
                 "read_skill",
                 "read_skill_component",
                 "write",

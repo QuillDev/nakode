@@ -4090,6 +4090,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_handoff_previews_keep_turn_limits_and_provider_attribution() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (route, mut requests) = mpsc::channel::<NativeAgentRequest>(1);
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider)
+            .with_native_delegation(route);
+        assert_eq!(
+            runtime.tools.find("prepare_image").unwrap().concurrency(),
+            ToolConcurrency::Exclusive
+        );
+        let mut session = RuntimeSession::new("test-model".to_owned(), String::new())
+            .with_provider("test-provider")
+            .with_owner(
+                Some("logical-session".to_owned()),
+                Some("child-run".to_owned()),
+            );
+        let original = crate::image_handoff::tests::png(64, 32);
+        let service = tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let NativeAgentRequest::Image(request) = request else {
+                    panic!("expected image request")
+                };
+                assert_eq!(request.owner_session_id, "logical-session");
+                assert_eq!(request.requester_run_id.as_deref(), Some("child-run"));
+                let artifact = nakode_protocol::ArtifactView {
+                    id: nakode_protocol::ArtifactId::from(request.reference),
+                    label: "fixture.png".to_owned(),
+                    media_type: "image/png".to_owned(),
+                    byte_length: u64::try_from(original.len()).unwrap(),
+                    data: original.clone(),
+                    width: Some(64),
+                    height: Some(32),
+                };
+                request.respond.send(Ok(artifact)).expect("image response");
+            }
+        });
+        let (events, mut receiver) = mpsc::channel(64);
+        let cancellation = CancellationToken::new();
+        let calls = (0..9)
+            .map(|index| ToolCall {
+                id: format!("preview-{index}"),
+                parent_call_id: None,
+                name: "prepare_image".to_owned(),
+                arguments: json!({"image_reference":"original", "inspect":true}),
+            })
+            .collect();
+        let failures = runtime
+            .execute_tool_calls(&mut session, "turn-one", calls, &events, &cancellation)
+            .await
+            .expect("preview batch");
+        assert_eq!(failures.get("prepare_image"), Some(&1));
+        assert_eq!(session.returned_images.len(), 8);
+        let mut previews = 0;
+        while let Ok(event) = receiver.try_recv() {
+            if let BackendEvent::ImageReturned(image) = event {
+                previews += 1;
+                assert_eq!(image.provider_id, "test-provider");
+                assert_eq!(image.model_id, "test-model");
+                assert_eq!(image.turn_id, "turn-one");
+            }
+        }
+        assert_eq!(previews, 8);
+        let restored: RuntimeSession =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(restored.returned_images.len(), 8);
+        let next = runtime
+            .execute_tool_calls(
+                &mut session,
+                "turn-two",
+                vec![ToolCall {
+                    id: "next-preview".to_owned(),
+                    parent_call_id: None,
+                    name: "prepare_image".to_owned(),
+                    arguments: json!({"image_reference":"original", "inspect":true}),
+                }],
+                &events,
+                &cancellation,
+            )
+            .await
+            .expect("next turn");
+        assert!(next.is_empty());
+        assert_eq!(session.returned_images.len(), 9);
+        drop(runtime);
+        service.await.expect("image service");
+    }
+
+    #[tokio::test]
     async fn read_only_native_delegation_preserves_session_owner_context() {
         let directory = tempfile::tempdir().expect("workspace");
         let provider = Arc::new(ExternalToolProvider {

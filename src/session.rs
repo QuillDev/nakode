@@ -1,3 +1,5 @@
+mod transcript_images;
+
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
@@ -393,6 +395,7 @@ pub struct SubagentRecord {
     pub latest_activity: String,
     pub observability: SubagentObservability,
     pub transcript: Vec<TranscriptEntry>,
+    pub images: Vec<crate::domain_transcript::StoredTranscriptImage>,
     pub transcript_has_earlier: bool,
 }
 
@@ -1791,6 +1794,7 @@ impl SqliteSessionRepository {
         orchestration_transaction.execute_batch(&orchestration_migration)?;
         orchestration_transaction.commit()?;
         apply_subagent_transcript_boundary_migration(&mut connection)?;
+        transcript_images::migrate(&connection)?;
         let agent_turn_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(agent_turns)")?;
             statement
@@ -2856,6 +2860,7 @@ fn save_subagent_transaction(
             record.observability.title,
         ],
     )?;
+    transcript_images::save(transaction, record)?;
     transaction.execute(
         "DELETE FROM agent_turns WHERE parent_session_id = ?1 AND run_id = ?2",
         params![record.parent_session_id, record.id],
@@ -4844,6 +4849,7 @@ impl SessionRepository for SqliteSessionRepository {
                     source,
                 })?;
             let transcript = load_subagent_transcript(&connection, parent_session_id, &id)?;
+            let images = transcript_images::load(&connection, parent_session_id, &id)?;
             records.push(SubagentRecord {
                 parent_session_id: parent_session_id.to_owned(),
                 id,
@@ -4881,6 +4887,7 @@ impl SessionRepository for SqliteSessionRepository {
                     shared_context_utilization,
                 },
                 transcript,
+                images,
                 transcript_has_earlier,
             });
         }
@@ -7334,6 +7341,7 @@ mod tests {
             Some("model-a"),
         )?;
         store.save_subagent(&SubagentRecord {
+            images: Vec::new(),
             parent_session_id: doomed.id.clone(),
             id: "agent-1".to_owned(),
             agent: "explorer".to_owned(),
@@ -7424,6 +7432,10 @@ mod tests {
             Some("model-a"),
         )?;
         let record = SubagentRecord {
+            images: vec![crate::domain_transcript::StoredTranscriptImage {
+                entry_key: "assistant-1".to_owned(), label: "Persisted image".to_owned(),
+                image: crate::media::ImageData { mime_type: "image/png".to_owned(), data: crate::image_handoff::tests::png(32, 16) },
+            }],
             parent_session_id: parent.id.clone(),
             id: "agent-1".to_owned(),
             agent: "explorer".to_owned(),
@@ -7644,6 +7656,7 @@ mod tests {
             Some("model-a"),
         )?;
         let record = SubagentRecord {
+            images: Vec::new(),
             parent_session_id: parent.id.clone(),
             id: "agent-migrated".to_owned(),
             agent: "explorer".to_owned(),
@@ -7702,6 +7715,7 @@ mod tests {
             Some("model-a"),
         )?;
         let source = SubagentRecord {
+            images: Vec::new(),
             parent_session_id: parent.id.clone(),
             id: "source".to_owned(),
             agent: "explorer".to_owned(),
@@ -7806,6 +7820,7 @@ mod tests {
             None,
         )?;
         store.save_subagent(&SubagentRecord {
+            images: Vec::new(),
             parent_session_id: first.id,
             id: "run-1".to_owned(),
             agent: "explorer".to_owned(),

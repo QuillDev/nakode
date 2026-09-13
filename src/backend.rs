@@ -910,6 +910,7 @@ pub enum NativeAgentRequest {
     Delegate(NativeDelegationRequest),
     SearchSharedContext(NativeSharedContextSearchRequest),
     ValidationEvidence(NativeValidationEvidenceRequest),
+    Image(NativeImageRequest),
 }
 
 pub enum NativeValidationEvidenceOperation {
@@ -940,6 +941,13 @@ pub struct NativeSharedContextSearchRequest {
     pub respond: oneshot::Sender<Result<String, String>>,
 }
 
+pub struct NativeImageRequest {
+    pub owner_session_id: String,
+    pub requester_run_id: Option<String>,
+    pub reference: String,
+    pub respond: oneshot::Sender<Result<nakode_protocol::ArtifactView, String>>,
+}
+
 pub struct NativeDelegationRequest {
     /// Logical Nakode session owning the provider tool invocation.
     pub owner_session_id: String,
@@ -952,6 +960,7 @@ pub struct NativeDelegationRequest {
     pub agent: String,
     pub title: String,
     pub task: String,
+    pub image_references: Vec<String>,
     /// Provider turn cancellation, observed by the server before and after child creation.
     pub cancellation: tokio_util::sync::CancellationToken,
     /// Completion is terminal and carries the same durable result projected to the dashboard.

@@ -1178,12 +1178,20 @@ struct ApiKeyInputHitRegion {
     bottom_right: ScreenPoint,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DelegationInvocation<'a> {
+    pub turn_id: Option<&'a str>,
+    pub call_id: Option<&'a str>,
+    pub image_references: &'a [String],
+}
+
 #[derive(Clone, Debug)]
 struct SubagentExecution {
     run: SubagentRun,
     definition: AgentDefinition,
     request_id: u64,
     initial_prompt: String,
+    initial_attachments: Vec<PromptAttachment>,
     parent_run_id: Option<String>,
     remaining_delegation_depth: u32,
     session_id: Option<String>,
@@ -3211,6 +3219,7 @@ impl DomainState {
             for entry in record.transcript {
                 transcript.restore(entry);
             }
+            transcript.restore_images(record.images);
             if transcript_has_earlier {
                 transcript.mark_history_truncated();
             }
@@ -8342,7 +8351,12 @@ impl DomainState {
         prompt: OutgoingPrompt,
         provider_session_id: String,
     ) -> Vec<Effect> {
-        let wire_text = prompt.wire_text();
+        let mut wire_text = prompt.wire_text();
+        let user_key = format!("user:{}", prompt.id);
+        wire_text.push_str(&crate::image_handoff::reference_briefing(
+            &self.transcript,
+            &user_key,
+        ));
         self.starting_turn = Some(prompt.clone());
         self.set_status("Starting turn…");
         vec![Effect::Backend(BackendCommand::StartTurn {
@@ -9398,8 +9412,73 @@ impl DomainState {
             task,
             parent_run_id,
             0,
-            (None, None),
+            DelegationInvocation::default(),
         )
+    }
+
+    fn resolve_delegated_images(
+        &self,
+        parent_run_id: Option<&str>,
+        references: &[String],
+    ) -> Result<Vec<PromptAttachment>, DomainCommandError> {
+        if references.len() > 8 {
+            return Err(DomainCommandError::Invalid(
+                "at most eight images may be delegated".to_owned(),
+            ));
+        }
+        let mut total = 0_usize;
+        references
+            .iter()
+            .map(|reference| {
+                let artifact = self
+                    .resolve_run_image(parent_run_id, reference)
+                    .map_err(DomainCommandError::Invalid)?;
+                total = total.saturating_add(artifact.data.len());
+                if total > 20 * 1024 * 1024 {
+                    return Err(DomainCommandError::Invalid(
+                        "delegated images exceed 20 MiB".to_owned(),
+                    ));
+                }
+                Ok(PromptAttachment {
+                    label: artifact.label,
+                    path: None,
+                    image: Some(crate::backend::PromptImage {
+                        mime_type: artifact.media_type,
+                        data: artifact.data,
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    fn model_supports_images(&self, provider: &str, model: Option<&str>) -> bool {
+        self.models
+            .iter()
+            .find(|candidate| {
+                candidate.provider == provider
+                    && model.map_or(candidate.is_default, |model| {
+                        candidate.id == model || candidate.qualified_id() == model
+                    })
+            })
+            .is_some_and(|model| projection::model_configuration(model, false).accepts_image_input)
+    }
+
+    pub(crate) fn resolve_run_image(
+        &self,
+        run_id: Option<&str>,
+        reference: &str,
+    ) -> Result<nakode_protocol::ArtifactView, String> {
+        let transcript = match run_id {
+            Some(id) => {
+                &self
+                    .subagent_chats
+                    .get(id)
+                    .ok_or_else(|| "unknown image requester run".to_owned())?
+                    .transcript
+            }
+            None => &self.transcript,
+        };
+        crate::image_handoff::resolve_transcript(transcript, reference)
     }
 
     fn originating_owner_entry_id(&self, invocation_turn_id: Option<&str>) -> Option<String> {
@@ -9433,9 +9512,10 @@ impl DomainState {
         task: &str,
         parent_run_id: Option<&str>,
         request_id: u64,
-        invocation: (Option<&str>, Option<&str>),
+        invocation: DelegationInvocation<'_>,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
-        let (invocation_turn_id, invocation_call_id) = invocation;
+        let invocation_turn_id = invocation.turn_id;
+        let invocation_call_id = invocation.call_id;
         let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
         if title.is_empty() || title.chars().count() > 120 {
             return Err(DomainCommandError::Invalid(
@@ -9452,10 +9532,17 @@ impl DomainState {
         let (parent_run_id, remaining_delegation_depth) =
             self.delegation_context(parent_run_id, &definition)?;
         let originating_owner_entry_id = self.originating_owner_entry_id(invocation_turn_id);
+        let initial_attachments =
+            self.resolve_delegated_images(parent_run_id.as_deref(), invocation.image_references)?;
 
         let run_id = Self::next_id("agent");
         let model_targets = agent_model_targets(&definition, &self.backend_provider);
         let provider = model_targets[0].provider.clone();
+        if !initial_attachments.is_empty()
+            && !self.model_supports_images(&provider, model_targets[0].model.as_deref())
+        {
+            return Err(DomainCommandError::Unsupported("the delegated provider/model does not advertise native image input; no text-only fallback".to_owned()));
+        }
         let shared_context = shared_context_briefing(&self.shared_context, task);
         let task_packet = definition.initial_prompt(task);
         let briefing_entries = u32::try_from(shared_context.entries.len()).unwrap_or(u32::MAX);
@@ -9524,11 +9611,28 @@ impl DomainState {
                 .unwrap_or_else(|| definition.slug.clone()),
         );
         transcript.set_stream_active(true);
-        transcript.push(
+        transcript.upsert(
+            format!("{run_id}-initial"),
             EntryKind::User,
             "PARENT",
             initial_prompt.clone(),
             EntryStatus::Complete,
+        );
+        transcript.set_labeled_images(
+            format!("{run_id}-initial"),
+            initial_attachments
+                .iter()
+                .filter_map(|attachment| {
+                    attachment
+                        .image
+                        .clone()
+                        .map(|image| (attachment.label.clone(), image))
+                })
+                .collect(),
+        );
+        let initial_prompt = format!(
+            "{initial_prompt}{}",
+            crate::image_handoff::reference_briefing(&transcript, &format!("{run_id}-initial"))
         );
         self.subagent_chats.insert(
             run_id.clone(),
@@ -9547,6 +9651,7 @@ impl DomainState {
                 definition,
                 request_id,
                 initial_prompt,
+                initial_attachments,
                 parent_run_id,
                 remaining_delegation_depth,
                 session_id: None,
@@ -9890,6 +9995,7 @@ impl DomainState {
                 definition,
                 request_id: 0,
                 initial_prompt,
+                initial_attachments: Vec::new(),
                 parent_run_id: source.observability.parent_run_id,
                 remaining_delegation_depth: source.observability.remaining_delegation_depth,
                 session_id: None,
@@ -9972,7 +10078,7 @@ impl DomainState {
             &request.task,
             None,
             request.id,
-            (None, None),
+            DelegationInvocation::default(),
         ) {
             Ok((_, effects)) => effects,
             Err(error) => vec![Effect::CompleteAgentRequest {
@@ -10598,23 +10704,35 @@ impl DomainState {
         Ok(())
     }
 
+    fn validate_subagent_images(
+        &self,
+        run_id: &str,
+        provider: &str,
+        model: Option<&str>,
+    ) -> Result<(), String> {
+        if self
+            .subagent_executions
+            .get(run_id)
+            .is_some_and(|execution| !execution.initial_attachments.is_empty())
+            && !self.model_supports_images(provider, model)
+        {
+            return Err("The delegated provider/model cannot accept the selected images; no text-only fallback.".to_owned());
+        }
+        Ok(())
+    }
+
     fn start_subagent_turn(
         &mut self,
         run_id: &str,
         provider_session_id: String,
         reported_model: &str,
     ) -> Vec<Effect> {
-        let Some((target, agent_fast_mode, agent_effort)) =
-            self.subagent_executions.get(run_id).map(|execution| {
-                (
-                    execution.model_targets[execution.model_target_index].clone(),
-                    execution.definition.fast_mode,
-                    execution.definition.reasoning_effort.clone(),
-                )
-            })
-        else {
+        let Some(execution) = self.subagent_executions.get(run_id) else {
             return Vec::new();
         };
+        let target = execution.model_targets[execution.model_target_index].clone();
+        let agent_fast_mode = execution.definition.fast_mode;
+        let agent_effort = execution.definition.reasoning_effort.clone();
         let model = target.model.clone();
         if let Err(reason) = self.validate_cloud_subagent_model(run_id, reported_model) {
             return self.fail_subagent(run_id, reason);
@@ -10625,6 +10743,10 @@ impl DomainState {
         let options_model = (!reported_model.is_empty())
             .then_some(reported_model)
             .or(model.as_deref());
+        if let Err(reason) = self.validate_subagent_images(run_id, &target.provider, options_model)
+        {
+            return self.fail_subagent(run_id, reason);
+        }
         let mut options = options_model
             .map(|model| self.model_options_for_discovered(&target.provider, model))
             .unwrap_or_default();
@@ -10690,6 +10812,7 @@ impl DomainState {
         execution.run.status = SubagentStatus::Working;
         "Working…".clone_into(&mut execution.run.latest_activity);
         let prompt = execution.initial_prompt.clone();
+        let attachments = execution.initial_attachments.clone();
         self.sync_subagent(run_id);
         let mut effects = Vec::new();
         // Cursor as before, plus either performance option explicitly defined by this archetype.
@@ -10711,7 +10834,7 @@ impl DomainState {
                 provider_session_id,
                 client_id: format!("{run_id}-prompt"),
                 prompt,
-                attachments: Vec::new(),
+                attachments,
                 model,
                 skill_catalogue: self.skill_catalogue(),
             },
@@ -11135,6 +11258,7 @@ impl DomainState {
         let run = self.subagents.iter().find(|run| run.id == run_id)?;
         let chat = self.subagent_chats.get(run_id)?;
         Some(SubagentRecord {
+            images: chat.transcript.stored_images(),
             parent_session_id,
             id: run.id.clone(),
             agent: run.agent.clone(),
@@ -12088,6 +12212,142 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             capabilities: crate::codex::model_capabilities(),
         }]));
         state
+    }
+
+    #[test]
+    fn image_handoff_delegates_first_turn_and_restores_visible_images() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        state.session_id = Some("logical-parent".to_owned());
+        let bytes = crate::image_handoff::tests::png(256, 128);
+        state.transcript.upsert(
+            "owner-image",
+            EntryKind::User,
+            "YOU",
+            "Inspect the small text",
+            EntryStatus::Complete,
+        );
+        state.transcript.set_labeled_images(
+            "owner-image",
+            vec![(
+                "Document".to_owned(),
+                crate::media::ImageData {
+                    mime_type: "image/png".to_owned(),
+                    data: bytes.clone(),
+                },
+            )],
+        );
+        let entry = state
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.key.as_deref() == Some("owner-image"))
+            .unwrap();
+        let original = super::projection::transcript_artifact_id(&entry.id, 0).to_string();
+        let derived = crate::image_handoff::Recipe {
+            source: original.clone(),
+            crop: Some(crate::image_handoff::Crop {
+                x: 32,
+                y: 16,
+                width: 128,
+                height: 64,
+            }),
+            max_width: Some(64),
+            max_height: None,
+        }
+        .reference()
+        .unwrap();
+        for reference in [original, derived] {
+            let (run_id, _) = state
+                .delegate_agent_attributed_for_request(
+                    "explorer",
+                    "Inspect document",
+                    "Read the highlighted text precisely",
+                    None,
+                    7,
+                    super::DelegationInvocation {
+                        image_references: &[reference],
+                        ..super::DelegationInvocation::default()
+                    },
+                )
+                .unwrap();
+            let effects = state.start_subagent_turn(&run_id, "native-child".to_owned(), "model-a");
+            let attachments = effects
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::SubagentBackend {
+                        command:
+                            BackendCommand::StartTurn {
+                                prompt,
+                                attachments,
+                                ..
+                            },
+                        ..
+                    } => {
+                        assert!(prompt.contains("Read the highlighted text precisely"));
+                        assert!(prompt.contains("Nakode Image References"));
+                        Some(attachments)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(attachments.len(), 1);
+            let record = state
+                .subagent_record_with_parent(&run_id, "logical-parent".to_owned())
+                .unwrap();
+            assert_eq!(record.images.len(), 1);
+            let image = record.images[0].image.clone();
+            assert_eq!(attachments[0].image.as_ref(), Some(&image));
+            assert_restored_child_image(record, &run_id, &image);
+        }
+        assert_eq!(
+            state.transcript.image("owner-image", 0).unwrap().data,
+            bytes
+        );
+    }
+
+    fn assert_restored_child_image(
+        record: crate::session::SubagentRecord,
+        run_id: &str,
+        image: &crate::media::ImageData,
+    ) {
+        let mut restored = ready_state();
+        restored.install_subagents(vec![record]);
+        let chat = &restored.subagent_chats[run_id];
+        let entry = &chat.transcript.entries()[0];
+        let reference = super::projection::transcript_artifact_id(&entry.id, 0).to_string();
+        assert_eq!(
+            restored
+                .resolve_run_image(Some(run_id), &reference)
+                .unwrap()
+                .data,
+            image.data
+        );
+        assert!(
+            restored.resolve_run_image(None, &reference).is_err(),
+            "child images are not implicitly authorized in another run"
+        );
+    }
+
+    #[test]
+    fn image_handoff_refuses_inaccessible_images_without_creating_children() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        let error = state
+            .delegate_agent_attributed_for_request(
+                "explorer",
+                "Inspect document",
+                "Read image",
+                None,
+                1,
+                super::DelegationInvocation {
+                    image_references: &["foreign-image".to_owned()],
+                    ..super::DelegationInvocation::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("inaccessible"));
+        assert!(state.subagents.is_empty());
     }
 
     #[test]
@@ -16762,6 +17022,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
         let mut state = ready_state();
         state.session_id = Some("parent-session".to_owned());
         let _ = state.install_subagents(vec![SubagentRecord {
+            images: Vec::new(),
             parent_session_id: "parent-session".to_owned(),
             id: "agent-1".to_owned(),
             agent: "explorer".to_owned(),
@@ -19093,7 +19354,11 @@ tool_profile = "none"
                 "Inspect native routing",
                 None,
                 77,
-                (Some("turn-native"), Some("call-native")),
+                super::DelegationInvocation {
+                    turn_id: Some("turn-native"),
+                    call_id: Some("call-native"),
+                    ..super::DelegationInvocation::default()
+                },
             )
             .expect("native delegation");
         let run = state

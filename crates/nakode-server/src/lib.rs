@@ -347,6 +347,7 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     ),
     fixed("NakodeService", "GetRunTextWindow", RequestLane::Hydration),
     fixed("NakodeService", "GetArtifact", RequestLane::Hydration),
+    fixed("NakodeService", "GetSessionImage", RequestLane::Hydration),
     fixed("NakodeService", "GetDiagnostics", RequestLane::Query),
     fixed("NakodeService", "GetInvocationSummary", RequestLane::Query),
     fixed("NakodeService", "GetInvocationTimeline", RequestLane::Query),
@@ -488,7 +489,8 @@ fn query_lane(query: &Query) -> QueryLane {
         | Query::GetTranscriptBodyWindow { .. }
         | Query::ListRuns { .. }
         | Query::GetRunTextWindow { .. }
-        | Query::GetArtifact { .. } => QueryLane::Hydration,
+        | Query::GetArtifact { .. }
+        | Query::GetSessionImage { .. } => QueryLane::Hydration,
         Query::InspectWorkspacePath { .. }
         | Query::ListSkills { .. }
         | Query::GetSoul { .. }

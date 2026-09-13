@@ -29,9 +29,8 @@ use super::{
 use crate::{
     agent::{AgentDefinition, AgentToolProfile},
     backend::{
-        BackendCapabilities, BackendFailureClassification, BackendFailurePhase, CLAUDE_PROVIDER,
-        CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, GLM_PROVIDER, KIMI_PROVIDER, ModelInfo,
-        TodoStatus,
+        BackendCapabilities, BackendFailureClassification, BackendFailurePhase, CODEX_PROVIDER,
+        CURSOR_PROVIDER, CapabilitySupport, GLM_PROVIDER, KIMI_PROVIDER, ModelInfo, TodoStatus,
     },
     domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
     memory::MemoryBackend,
@@ -194,7 +193,7 @@ pub(crate) fn model_configuration(
         accepts_image_input: vision_add_on_enabled
             || matches!(
                 model.provider.as_str(),
-                CODEX_PROVIDER | CLAUDE_PROVIDER | CURSOR_PROVIDER | KIMI_PROVIDER | GLM_PROVIDER
+                CODEX_PROVIDER | CURSOR_PROVIDER | KIMI_PROVIDER | GLM_PROVIDER
             ),
         ..ModelConfigurationView::default()
     };
@@ -2150,7 +2149,7 @@ pub(crate) fn artifact_view(
     Ok(None)
 }
 
-fn transcript_artifact_view(
+pub(crate) fn transcript_artifact_view(
     transcript: &DomainTranscript,
     artifact_id: &ArtifactId,
 ) -> Result<Option<ArtifactView>, ArtifactTooLarge> {
@@ -2172,13 +2171,15 @@ fn transcript_artifact_view(
                 media_type: image.mime_type.clone(),
                 byte_length: u64::try_from(image.data.len()).unwrap_or(u64::MAX),
                 data: image.data.clone(),
+                width: None,
+                height: None,
             }));
         }
     }
     Ok(None)
 }
 
-fn transcript_artifact_id(entry_id: &str, index: usize) -> ArtifactId {
+pub(crate) fn transcript_artifact_id(entry_id: &str, index: usize) -> ArtifactId {
     ArtifactId::from(scoped_id("artifact", &format!("{entry_id}:{index}")))
 }
 
@@ -2765,7 +2766,7 @@ mod tests {
             model_configuration(&claude, false).reasoning_efforts,
             ["low", "medium", "high"]
         );
-        assert!(model_configuration(&claude, false).accepts_image_input);
+        assert!(!model_configuration(&claude, false).accepts_image_input);
 
         let cursor = model_configuration(&model(CURSOR_PROVIDER, "composer-2"), false);
         assert!(cursor.reasoning_efforts.is_empty());
@@ -3254,6 +3255,7 @@ mod tests {
         (0..count)
             .rev()
             .map(|index| SubagentRecord {
+                images: Vec::new(),
                 parent_session_id: parent_session_id.to_owned(),
                 id: format!("run-{index:03}"),
                 agent: "reviewer".to_owned(),
@@ -3367,6 +3369,7 @@ mod tests {
         })
         .to_string();
         let _ = state.install_subagents(vec![SubagentRecord {
+            images: Vec::new(),
             parent_session_id: state.nakode_session_id.clone(),
             id: "run-large".to_owned(),
             agent: "reviewer".to_owned(),

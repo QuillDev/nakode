@@ -835,6 +835,10 @@ pub struct ArtifactView {
     pub byte_length: u64,
     #[serde(with = "crate::base64_bytes")]
     pub data: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1334,6 +1338,8 @@ mod tests {
             media_type: "image/png".to_owned(),
             byte_length: 4,
             data: vec![0, 1, 2, 255],
+            width: None,
+            height: None,
         };
 
         let encoded = serde_json::to_value(&artifact).expect("serialize artifact");
