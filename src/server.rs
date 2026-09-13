@@ -666,8 +666,14 @@ impl ServerCore {
         command: Command,
         prompt_id: Option<&str>,
     ) -> (Result<CommandAccepted, ServiceError>, Vec<Effect>) {
+        let opening = matches!(&command, Command::OpenSession { .. });
         match self.try_execute_command_with_prompt_id(command, prompt_id) {
             Ok((accepted, effects)) => (Ok(accepted), effects),
+            Err(DomainCommandError::NotFound(id))
+                if opening && !self.session_inventory_complete =>
+            {
+                (Err(self.unobserved_resource("session", &id)), Vec::new())
+            }
             Err(error) => (Err(domain_error(error)), Vec::new()),
         }
     }
@@ -3421,7 +3427,7 @@ impl ServerCore {
             } => {
                 let state = self
                     .engine_for(&session_id)
-                    .ok_or_else(|| not_found("session", session_id.as_str()))?
+                    .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))?
                     .state();
                 let page = crate::state::projection::run_page(
                     state,
@@ -3481,7 +3487,7 @@ impl ServerCore {
     ) -> Result<QueryResult, ServiceError> {
         let state = self
             .engine_for(session_id)
-            .ok_or_else(|| not_found("session", session_id.as_str()))?
+            .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))?
             .state();
         let page = crate::state::projection::session_transcript_page(
             state,
@@ -3503,10 +3509,12 @@ impl ServerCore {
         before: Option<&EntryId>,
         limit: u32,
     ) -> Result<QueryResult, ServiceError> {
-        let session_id = self.session_for_run(run_id).map_err(domain_error)?;
+        let session_id = self
+            .session_for_run(run_id)
+            .map_err(|_| self.unobserved_resource("run", run_id.as_str()))?;
         let state = self
             .engine_for(&session_id)
-            .ok_or_else(|| not_found("session", session_id.as_str()))?
+            .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))?
             .state();
         let page = crate::state::projection::run_transcript_page(
             state,
@@ -3533,15 +3541,17 @@ impl ServerCore {
         let (state, run_id) = match owner {
             TranscriptOwner::Session { session_id } => (
                 self.engine_for(session_id)
-                    .ok_or_else(|| not_found("session", session_id.as_str()))?
+                    .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))?
                     .state(),
                 None,
             ),
             TranscriptOwner::Run { run_id } => {
-                let session_id = self.session_for_run(run_id).map_err(domain_error)?;
+                let session_id = self
+                    .session_for_run(run_id)
+                    .map_err(|_| self.unobserved_resource("run", run_id.as_str()))?;
                 (
                     self.engine_for(&session_id)
-                        .ok_or_else(|| not_found("session", session_id.as_str()))?
+                        .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))?
                         .state(),
                     Some(run_id),
                 )
@@ -3590,10 +3600,12 @@ impl ServerCore {
         before_byte: Option<u64>,
         limit_bytes: u32,
     ) -> Result<QueryResult, ServiceError> {
-        let session_id = self.session_for_run(run_id).map_err(domain_error)?;
+        let session_id = self
+            .session_for_run(run_id)
+            .map_err(|_| self.unobserved_resource("run", run_id.as_str()))?;
         let state = self
             .engine_for(&session_id)
-            .ok_or_else(|| not_found("session", session_id.as_str()))?
+            .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))?
             .state();
         let window = crate::state::projection::run_text_window(
             state,
@@ -4232,6 +4244,18 @@ impl ServerCore {
         }
     }
 
+    fn unobserved_resource(&self, kind: &str, id: &str) -> ServiceError {
+        if self.session_inventory_complete {
+            not_found(kind, id)
+        } else {
+            ServiceError {
+                code: ErrorCode::Internal,
+                message: "Session inventory is unavailable; resource absence cannot be established. Retry after the service recovers.".to_owned(),
+                retryable: true,
+            }
+        }
+    }
+
     fn session_view(
         &self,
         session_id: &SessionId,
@@ -4242,14 +4266,14 @@ impl ServerCore {
                     .bootstrap_view(&self.providers, &self.sessions)
                     .active_session
             })
-            .ok_or_else(|| not_found("session", session_id.as_str()))
+            .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))
     }
 
     fn run_view(&self, run_id: &RunId) -> Result<nakode_protocol::RunView, ServiceError> {
         self.sessions_by_id
             .values()
             .find_map(|engine| crate::state::projection::run_view(engine.state(), run_id))
-            .ok_or_else(|| not_found("run", run_id.as_str()))
+            .ok_or_else(|| self.unobserved_resource("run", run_id.as_str()))
     }
 
     fn synchronize_workspace_state_from(&mut self, session_id: &SessionId) {
@@ -12026,6 +12050,73 @@ enabled = false
             SoulSource::File,
             SoulStore::new(path).read().expect("persisted").source
         );
+    }
+
+    #[test]
+    fn missing_session_requires_complete_inventory() {
+        let state = AppState::new_unconfigured("/tmp/project", None, 100);
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+        let id = SessionId::from("unknown-session");
+        let queries = [
+            Query::GetSession {
+                session_id: id.clone(),
+            },
+            Query::GetTranscriptPage {
+                session_id: id.clone(),
+                before: None,
+                limit: 10,
+            },
+            Query::ListRuns {
+                session_id: id.clone(),
+                before: None,
+                limit: 10,
+            },
+            Query::GetTranscriptBodyWindow {
+                owner: TranscriptOwner::Session {
+                    session_id: id.clone(),
+                },
+                entry_id: nakode_protocol::EntryId::from("entry"),
+                before_byte: None,
+                limit_bytes: 100,
+            },
+            Query::GetRun {
+                run_id: RunId::from("unknown-run"),
+            },
+            Query::GetRunTranscriptPage {
+                run_id: RunId::from("unknown-run"),
+                before: None,
+                limit: 10,
+            },
+        ];
+        for complete in [false, true] {
+            core.session_inventory_complete = complete;
+            for query in &queries {
+                let error = core.query(query.clone()).expect_err("unknown identity");
+                assert_eq!(
+                    error.code,
+                    if complete {
+                        ErrorCode::NotFound
+                    } else {
+                        ErrorCode::Internal
+                    }
+                );
+                assert_eq!(error.retryable, !complete);
+            }
+            let (result, effects) = core.execute_command(
+                Command::OpenSession {
+                    session_id: id.clone(),
+                    tools: None,
+                    mcp_grant: None,
+                    profile_id: None,
+                    enabled_skill_ids: Vec::new(),
+                    account_id: None,
+                },
+                None,
+            );
+            let error = result.expect_err("unknown identity cannot open");
+            assert_eq!(error.retryable, !complete);
+            assert!(effects.is_empty());
+        }
     }
 
     #[tokio::test]

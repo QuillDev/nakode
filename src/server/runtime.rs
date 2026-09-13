@@ -1207,17 +1207,23 @@ impl NativeServerRuntime {
                     .iter()
                     .find(|session| Some(&session.id) == parent.as_ref())
             })
-            .ok_or_else(|| super::not_found("session", ""))?;
+            .ok_or_else(|| self.core.unobserved_resource("session", ""))?;
         let store = crate::runtime::RuntimeSessionStore::new(
             self.effects.persistence.database.clone(),
             session.provider.clone(),
         );
-        let history = store.load(&session.provider_session_id)
-            .and_then(|native| match native {
+        let native = store
+            .load(&session.provider_session_id)
+            .map_err(|message| ServiceError {
+                code: ErrorCode::Internal,
+                message,
+                retryable: true,
+            })?;
+        let history = match native {
                 Some(native) => Ok(native.normalized_history()),
                 None if crate::session::is_pending_provider_session_id(&session.provider_session_id) => Ok(Vec::new()),
                 None => Err("Retained provider history is unavailable; the logical session is preserved. Explicitly reopen on its execution machine to recover provider-owned history.".to_owned()),
-            })
+            }
             .map_err(|message| ServiceError {
                 code: ErrorCode::CapabilityUnsupported, message, retryable: false,
             })?;
@@ -10338,6 +10344,54 @@ mod tests {
             })
             .expect("bridge");
         id
+    }
+
+    #[tokio::test]
+    async fn retained_history_storage_failure_is_not_permanent_unavailability() {
+        let root = tempfile::tempdir().expect("isolated history");
+        let id = save_retained_history(root.path());
+        let (mut runtime, _handle) = retained_history_runtime(root.path()).await;
+        // A directory cannot be opened as SQLite. Do not change or delete retained evidence.
+        runtime.effects.persistence.database = root.path().to_path_buf();
+        let error = runtime
+            .read_retained_query(Query::GetSession { session_id: id })
+            .expect_err("storage read must fail");
+        assert_eq!(error.code, nakode_protocol::ErrorCode::Internal);
+        assert!(error.retryable);
+    }
+
+    #[tokio::test]
+    async fn missing_native_history_preserves_logical_identity_and_reopen_guidance() {
+        let root = tempfile::tempdir().expect("isolated history");
+        let id = save_retained_history(root.path());
+        let (mut runtime, _handle) = retained_history_runtime(root.path()).await;
+        runtime
+            .core
+            .sessions
+            .iter_mut()
+            .find(|row| row.id == id.as_str())
+            .expect("logical record")
+            .provider_session_id = "absent-native-history".to_owned();
+        let error = runtime
+            .read_retained_query(Query::GetSession {
+                session_id: id.clone(),
+            })
+            .expect_err("native history missing");
+        assert_eq!(
+            error.code,
+            nakode_protocol::ErrorCode::CapabilityUnsupported
+        );
+        assert!(!error.retryable);
+        assert!(error.message.contains("Explicitly reopen"));
+        assert!(
+            runtime
+                .effects
+                .persistence
+                .sessions
+                .find(id.as_str())
+                .expect("identity query")
+                .is_some()
+        );
     }
 
     #[tokio::test]
