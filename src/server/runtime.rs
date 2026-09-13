@@ -10229,6 +10229,7 @@ mod tests {
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_write_tokens: 0,
+                images: Vec::new(),
                 objective: "Retained objective".into(),
                 status: SubagentStatus::Working,
                 latest_activity: "Working".into(),
