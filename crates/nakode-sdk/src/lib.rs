@@ -1172,7 +1172,8 @@ impl NakodeClient {
             .sessions)
     }
 
-    /// Returns authoritative state for one session.
+    /// Returns live or retained native session history without attaching a provider or
+    /// recovering pending inference. Use `open_session` only for explicit resume intent.
     ///
     /// # Errors
     /// Returns a transport, server status, or missing-state error.
