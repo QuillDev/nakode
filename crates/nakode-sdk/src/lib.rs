@@ -1541,8 +1541,27 @@ impl NakodeClient {
                 title: title.into(),
                 task: task.into(),
                 parent_run_id: parent_run_id.map(Into::into),
+                image_references: Vec::new(),
             }
         )?;
+        result
+            .resource_id
+            .ok_or(SdkError::MissingState("delegated run identifier"))
+    }
+
+    /// Starts a bounded delegation with explicitly selected image references.
+    /// The server validates every image against the initiating run before creating its child.
+    ///
+    /// # Errors
+    /// Returns transport, image authorization/limit, provider capability, or delegation-policy errors.
+    pub async fn delegate_with_images(
+        &self,
+        mut request: api::DelegateRequest,
+    ) -> Result<String, SdkError> {
+        if request.mutation.is_none() {
+            request.mutation = Some(mutation(None));
+        }
+        let result = send_mutation!(self, delegate, request)?;
         result
             .resource_id
             .ok_or(SdkError::MissingState("delegated run identifier"))
@@ -1608,6 +1627,44 @@ impl NakodeClient {
             .get_artifact(api::GetArtifactRequest {
                 artifact_id: artifact_id.into(),
             })
+            .await?
+            .into_inner())
+    }
+
+    /// Resolves an original or bounded derived image in its authoritative session.
+    ///
+    /// # Errors
+    /// Returns a transport error or a clear authorization, format, or image-limit refusal.
+    pub async fn get_session_image(
+        &self,
+        session_id: impl Into<String>,
+        image_reference: impl Into<String>,
+    ) -> Result<api::Artifact, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .get_session_image(api::GetSessionImageRequest {
+                session_id: session_id.into(),
+                image_reference: image_reference.into(),
+                transform: None,
+            })
+            .await?
+            .into_inner())
+    }
+
+    /// Resolves an explicitly requested crop/downscale without modifying its source.
+    /// Reuse the returned artifact id with `get_session_image` or delegated image selection.
+    ///
+    /// # Errors
+    /// Returns a transport, authorization, format, crop-bound, or decode/output-limit error.
+    pub async fn transform_image(
+        &self,
+        request: api::GetSessionImageRequest,
+    ) -> Result<api::Artifact, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .get_session_image(request)
             .await?
             .into_inner())
     }

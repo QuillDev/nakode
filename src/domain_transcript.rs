@@ -55,6 +55,13 @@ pub struct TranscriptEntry {
     pub tool_audit_json: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredTranscriptImage {
+    pub entry_key: String,
+    pub label: String,
+    pub image: ImageData,
+}
+
 #[derive(Clone, Debug)]
 struct TranscriptImageArtifact {
     label: String,
@@ -201,6 +208,33 @@ impl DomainTranscript {
                     .map(|(label, image)| TranscriptImageArtifact { label, image })
                     .collect(),
             );
+        }
+    }
+
+    pub(crate) fn stored_images(&self) -> Vec<StoredTranscriptImage> {
+        self.entries
+            .iter()
+            .flat_map(|entry| {
+                self.image_artifacts(entry).filter_map(|(label, image)| {
+                    Some(StoredTranscriptImage {
+                        entry_key: entry.key.clone()?,
+                        label: label.to_owned(),
+                        image: image.clone(),
+                    })
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_images(&mut self, images: Vec<StoredTranscriptImage>) {
+        for image in images {
+            self.images
+                .entry(image.entry_key)
+                .or_default()
+                .push(TranscriptImageArtifact {
+                    label: image.label,
+                    image: image.image,
+                });
         }
     }
 

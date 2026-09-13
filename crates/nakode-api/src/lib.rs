@@ -230,6 +230,7 @@ mod tests {
             "GetTranscriptBodyWindow",
             "GetRunTextWindow",
             "GetArtifact",
+            "GetSessionImage",
             "GetDiagnostics",
             "GetInvocationSummary",
             "GetInvocationTimeline",

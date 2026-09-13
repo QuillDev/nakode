@@ -80,6 +80,7 @@
 /nakode.v1.NakodeService/GetTranscriptBodyWindow
 /nakode.v1.NakodeService/GetRunTextWindow
 /nakode.v1.NakodeService/GetArtifact
+/nakode.v1.NakodeService/GetSessionImage
 /nakode.v1.NakodeService/GetDiagnostics
 /nakode.v1.NakodeService/GetInvocationSummary
 /nakode.v1.NakodeService/GetInvocationTimeline

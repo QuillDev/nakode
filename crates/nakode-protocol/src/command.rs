@@ -16,6 +16,23 @@ pub struct SessionBridgeIntent {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageCrop {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageTransform {
+    pub crop: Option<ImageCrop>,
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PromptInput {
     pub text: String,
     #[serde(default)]
@@ -457,6 +474,8 @@ pub enum Command {
         title: String,
         task: String,
         parent_run_id: Option<RunId>,
+        #[serde(default)]
+        image_references: Vec<String>,
     },
     /// Publishes one inert, bounded finding to the logical session's delegation run tree.
     PublishSharedContext {
@@ -729,6 +748,12 @@ pub enum Query {
     },
     GetArtifact {
         artifact_id: ArtifactId,
+    },
+    /// Resolve an original or deterministic derived image within its owning session.
+    GetSessionImage {
+        session_id: SessionId,
+        image_reference: String,
+        transform: Option<ImageTransform>,
     },
     /// Returns privacy-preserving runtime telemetry aggregated by the server.
     GetDiagnostics {

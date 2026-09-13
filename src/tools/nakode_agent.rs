@@ -20,6 +20,8 @@ struct Arguments {
     agent: String,
     title: String,
     task: String,
+    #[serde(default)]
+    image_references: Vec<String>,
 }
 
 impl Tool for NakodeAgentTool {
@@ -40,6 +42,11 @@ impl Tool for NakodeAgentTool {
                         "minLength": 1,
                         "maxLength": 120,
                         "description": "Required concise title describing this agent's specific goal, not its role or setup instructions."
+                    },
+                    "image_references": {
+                        "type": "array", "maxItems": 8,
+                        "items": {"type":"string","minLength":1,"maxLength":4096},
+                        "description": "Explicit originals or prepare_image derived references from this run, delivered with the first task. Omitted means no images; owner/session attribution is server-bound."
                     },
                     "task": {
                         "type": "string",
@@ -94,6 +101,7 @@ impl Tool for NakodeAgentTool {
                 agent: arguments.agent,
                 title: arguments.title,
                 task: arguments.task,
+                image_references: arguments.image_references,
                 cancellation: cancellation.clone(),
                 respond,
             });

@@ -116,6 +116,8 @@ service NakodeService {
   rpc GetTranscriptBodyWindow(GetTranscriptBodyWindowRequest) returns (TranscriptBodyWindow);
   rpc GetRunTextWindow(GetRunTextWindowRequest) returns (RunTextWindow);
   rpc GetArtifact(GetArtifactRequest) returns (Artifact);
+  // Resolves only images owned by this logical session, including bounded image-v1 recipes.
+  rpc GetSessionImage(GetSessionImageRequest) returns (Artifact);
   rpc GetDiagnostics(GetDiagnosticsRequest) returns (DiagnosticsReport);
   // Local-only owner-opted capability invocation usage. Summary joins current catalogue entries;
   // timeline is server-bucketed and bounded, never an unbounded raw event stream.
@@ -913,7 +915,7 @@ message SettingsPatch {
 }
 message UpdateSettingsRequest { MutationOptions mutation = 1; SettingsPatch patch = 2; }
 
-message DelegateRequest { MutationOptions mutation = 1; string session_id = 2; string agent_slug = 3; string task = 4; optional string parent_run_id = 5; string title = 6; }
+message DelegateRequest { MutationOptions mutation = 1; string session_id = 2; string agent_slug = 3; string task = 4; optional string parent_run_id = 5; string title = 6; repeated string image_references = 7; }
 message PublishSharedContextRequest {
   MutationOptions mutation = 1;
   string session_id = 2;
@@ -937,6 +939,9 @@ message GetTranscriptBodyWindowRequest { TranscriptOwnerKind owner_kind = 1; str
 enum RunTextField { RUN_TEXT_FIELD_UNSPECIFIED = 0; RUN_TEXT_FIELD_OBJECTIVE = 1; RUN_TEXT_FIELD_LATEST_ACTIVITY = 2; RUN_TEXT_FIELD_OUTCOME = 3; RUN_TEXT_FIELD_RESULT = 4; }
 message GetRunTextWindowRequest { string run_id = 1; RunTextField field = 2; optional uint64 before_byte = 3; uint32 limit_bytes = 4; }
 message GetArtifactRequest { string artifact_id = 1; }
+message ImageCrop { uint32 x = 1; uint32 y = 2; uint32 width = 3; uint32 height = 4; }
+message ImageTransform { optional ImageCrop crop = 1; optional uint32 max_width = 2; optional uint32 max_height = 3; }
+message GetSessionImageRequest { string session_id = 1; string image_reference = 2; optional ImageTransform transform = 3; }
 message GetDiagnosticsRequest { uint32 days = 1; uint32 session_limit = 2; optional string provider_id = 3; }
 message GetInvocationSummaryRequest {}
 message GetInvocationTimelineRequest {
@@ -1510,7 +1515,7 @@ message RunState {
   optional string title = 45;
 }
 message RunTextWindow { string run_id = 1; RunTextField field = 2; string text = 3; uint64 start_byte = 4; uint64 total_bytes = 5; bool has_earlier = 6; }
-message Artifact { string id = 1; string label = 2; string media_type = 3; uint64 byte_length = 4; bytes data = 5; }
+message Artifact { string id = 1; string label = 2; string media_type = 3; uint64 byte_length = 4; bytes data = 5; optional uint32 width = 6; optional uint32 height = 7; }
 
 message DiagnosticsUsageTotals { uint64 inference_rounds = 1; uint64 compaction_rounds = 2; uint64 failed_rounds = 3; uint64 retry_count = 4; uint64 estimated_input_tokens = 5; uint64 reported_input_tokens = 6; uint64 reported_cached_input_tokens = 7; uint64 reported_cache_write_tokens = 8; uint64 reported_output_tokens = 9; uint64 request_bytes = 10; uint64 response_bytes = 11; uint64 inference_duration_ms = 12; uint64 requested_tool_calls = 13; uint64 executed_tool_calls = 14; uint64 failed_tool_calls = 15; uint64 full_tool_output_bytes = 16; uint64 model_tool_output_bytes = 17; uint64 tool_duration_ms = 18; }
 message DiagnosticsDailyUsage { string date_utc = 1; string provider_id = 2; DiagnosticsUsageTotals totals = 3; }

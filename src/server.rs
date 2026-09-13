@@ -392,10 +392,12 @@ impl ServerCore {
                 };
                 let result = if let Err(error) = refresh {
                     Err(error)
-                } else if matches!(&query, Query::GetArtifact { .. })
-                    && !endpoint
-                        .capabilities()
-                        .supports(ServiceCapability::ArtifactTransfer)
+                } else if matches!(
+                    &query,
+                    Query::GetArtifact { .. } | Query::GetSessionImage { .. }
+                ) && !endpoint
+                    .capabilities()
+                    .supports(ServiceCapability::ArtifactTransfer)
                 {
                     Err(service_error(
                         ErrorCode::CapabilityUnsupported,
@@ -908,12 +910,14 @@ impl ServerCore {
                 title,
                 task,
                 parent_run_id,
+                image_references,
             } => self.delegate_command(
                 &session_id,
                 &agent_slug,
                 &title,
                 &task,
                 parent_run_id.as_ref(),
+                &image_references,
             ),
             Command::PublishSharedContext {
                 session_id,
@@ -2652,8 +2656,7 @@ impl ServerCore {
         task: &str,
         parent_run_id: Option<&str>,
         request_id: u64,
-        invocation_turn_id: Option<&str>,
-        invocation_call_id: Option<&str>,
+        invocation: crate::state::DelegationInvocation<'_>,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
         self.ensure_session(session_id)?;
         if task.trim().is_empty() {
@@ -2670,7 +2673,7 @@ impl ServerCore {
                 task,
                 parent_run_id,
                 request_id,
-                (invocation_turn_id, invocation_call_id),
+                invocation,
             )
     }
 
@@ -2681,6 +2684,7 @@ impl ServerCore {
         title: &str,
         task: &str,
         parent_run_id: Option<&RunId>,
+        image_references: &[String],
     ) -> DomainCommandOutcome {
         self.ensure_session(session_id)?;
         if task.trim().is_empty() {
@@ -2695,11 +2699,16 @@ impl ServerCore {
         let (run_id, effects) = self
             .session_engine_mut(session_id)?
             .state_mut()
-            .delegate_agent_attributed(
+            .delegate_agent_attributed_for_request(
                 agent_slug,
                 title,
                 task,
                 parent_run_id.map(nakode_protocol::RunId::as_str),
+                0,
+                crate::state::DelegationInvocation {
+                    image_references,
+                    ..crate::state::DelegationInvocation::default()
+                },
             )?;
         Ok(Self::accepted(Some(run_id), effects))
     }
@@ -3372,17 +3381,7 @@ impl ServerCore {
             Query::ListSessions {
                 workspace_id,
                 limit,
-            } => {
-                self.ensure_workspace(&workspace_id).map_err(domain_error)?;
-                let mut sessions = self.workspace_bootstrap().sessions;
-                let limit = usize::try_from(limit).unwrap_or(usize::MAX).min(500);
-                let complete = self.session_inventory_complete && sessions.len() <= limit;
-                sessions.truncate(limit);
-                Ok(QueryResult::Sessions(nakode_protocol::SessionInventory {
-                    sessions,
-                    complete,
-                }))
-            }
+            } => self.query_session_inventory(&workspace_id, limit),
             Query::ListOrphanedSessions {
                 workspace_id,
                 limit,
@@ -3438,6 +3437,11 @@ impl ServerCore {
                 limit_bytes,
             } => self.query_run_text_window(&run_id, field, before_byte, limit_bytes),
             Query::GetArtifact { artifact_id } => self.query_artifact(&artifact_id),
+            Query::GetSessionImage {
+                session_id,
+                image_reference,
+                transform,
+            } => self.query_session_image(&session_id, image_reference, transform),
             Query::GetDiagnostics { .. }
             | Query::ListSkills { .. }
             | Query::GetInvocationSummary
@@ -3447,6 +3451,49 @@ impl ServerCore {
                 false,
             )),
         }
+    }
+
+    fn query_session_inventory(
+        &self,
+        workspace_id: &WorkspaceId,
+        limit: u32,
+    ) -> Result<QueryResult, ServiceError> {
+        self.ensure_workspace(workspace_id).map_err(domain_error)?;
+        let mut sessions = self.workspace_bootstrap().sessions;
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX).min(500);
+        let complete = self.session_inventory_complete && sessions.len() <= limit;
+        sessions.truncate(limit);
+        Ok(QueryResult::Sessions(nakode_protocol::SessionInventory {
+            sessions,
+            complete,
+        }))
+    }
+
+    fn query_session_image(
+        &self,
+        session_id: &SessionId,
+        image_reference: String,
+        transform: Option<nakode_protocol::ImageTransform>,
+    ) -> Result<QueryResult, ServiceError> {
+        let reference = if let Some(transform) = transform {
+            crate::image_handoff::Recipe {
+                source: image_reference,
+                crop: transform.crop,
+                max_width: transform.max_width,
+                max_height: transform.max_height,
+            }
+            .reference()
+            .map_err(|error| service_error(ErrorCode::InvalidRequest, &error, false))?
+        } else {
+            image_reference
+        };
+        let state = self
+            .engine_for(session_id)
+            .ok_or_else(|| not_found("session", session_id.as_str()))?
+            .state();
+        let artifact = crate::image_handoff::resolve(state, &reference)
+            .map_err(|error| service_error(ErrorCode::InvalidRequest, &error, false))?;
+        Ok(QueryResult::Artifact(artifact))
     }
 
     fn query_soul(&self, workspace_id: WorkspaceId) -> Result<QueryResult, ServiceError> {
@@ -4439,14 +4486,16 @@ impl ServerCore {
             .into_iter()
             .map(|attachment| match attachment {
                 nakode_protocol::PromptAttachment::Artifact { artifact_id, label } => {
-                    let artifact = crate::state::projection::artifact_view(state, &artifact_id)
+                    let artifact = if crate::image_handoff::Recipe::parse(artifact_id.as_str()).map_err(DomainCommandError::Invalid)?.is_some() {
+                        crate::image_handoff::resolve(state, artifact_id.as_str()).map_err(DomainCommandError::Invalid)?
+                    } else { crate::state::projection::artifact_view(state, &artifact_id)
                         .map_err(|error| {
                             DomainCommandError::Invalid(format!(
                                 "artifact {artifact_id:?} is {} bytes; maximum is {} bytes",
                                 error.actual, error.maximum
                             ))
                         })?
-                        .ok_or_else(|| DomainCommandError::NotFound(artifact_id.to_string()))?;
+                        .ok_or_else(|| DomainCommandError::NotFound(artifact_id.to_string()))? };
                     Ok(PromptAttachment {
                         label,
                         path: None,
@@ -4486,6 +4535,34 @@ impl ServerCore {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let images = attachments
+            .iter()
+            .filter_map(|attachment| attachment.image.as_ref())
+            .collect::<Vec<_>>();
+        if !images.is_empty() {
+            if images.len() > 8
+                || images.iter().map(|image| image.data.len()).sum::<usize>() > 20 * 1024 * 1024
+            {
+                return Err(DomainCommandError::Invalid(
+                    "prompt image limits are eight images and 20 MiB total".to_owned(),
+                ));
+            }
+            for image in &images {
+                crate::image_handoff::validate_image(&image.data, &image.mime_type)
+                    .map_err(DomainCommandError::Invalid)?;
+            }
+            let model = state.models.iter().find(|model| {
+                state.selected_model.as_ref().map_or(
+                    model.is_default && model.provider == state.backend_provider,
+                    |selected| model.qualified_id() == *selected,
+                )
+            });
+            if !model.is_some_and(|model| {
+                crate::state::projection::model_configuration(model, false).accepts_image_input
+            }) {
+                return Err(DomainCommandError::Invalid("the selected provider/model does not advertise native image input; choose a vision-capable model (no text-only fallback)".to_owned()));
+            }
+        }
         Ok((prompt.text, attachments))
     }
 }
@@ -5457,6 +5534,21 @@ mod tests {
             ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new()),
             session_id,
         )
+    }
+
+    fn ready_vision_server() -> (ServerCore, SessionId) {
+        let (mut core, id) = ready_codex_server();
+        core.engine_for_mut(&id)
+            .unwrap()
+            .state_mut()
+            .handle_backend(BackendEvent::Models(vec![ModelInfo {
+                provider: CODEX_PROVIDER.to_owned(),
+                id: "vision-model".to_owned(),
+                is_default: true,
+                display_name: None,
+                capabilities: crate::codex::model_capabilities(),
+            }]));
+        (core, id)
     }
 
     fn ready_external_tools_server() -> (ServerCore, SessionId) {
@@ -9117,7 +9209,7 @@ mod tests {
                 ProtocolPromptAttachment::InlineImage {
                     label: "screen.png".to_owned(),
                     media_type: "image/png".to_owned(),
-                    data: vec![1, 2, 3, 4],
+                    data: crate::image_handoff::tests::png(32, 16),
                 },
                 ProtocolPromptAttachment::LocalFile {
                     label: "notes.md".to_owned(),
@@ -9246,7 +9338,14 @@ mod tests {
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
 
         let empty = core
-            .delegate_command(&session_id, "missing", "Audit authentication", "   ", None)
+            .delegate_command(
+                &session_id,
+                "missing",
+                "Audit authentication",
+                "   ",
+                None,
+                &[],
+            )
             .expect_err("blank delegation must be rejected");
         assert!(empty.to_string().contains("non-empty task"));
 
@@ -9257,6 +9356,7 @@ mod tests {
                 "Audit authentication",
                 "Inspect authentication",
                 None,
+                &[],
             )
             .expect_err("unknown agent must be rejected");
         assert!(unknown.to_string().contains("predefined agent"));
@@ -9296,6 +9396,7 @@ enabled = false
                 "Audit interface",
                 "Inspect the interface",
                 None,
+                &[],
             )
             .expect_err("stale direct invocation must honor disabled state");
         assert!(error.to_string().contains("is disabled"));
@@ -9326,6 +9427,7 @@ enabled = true
                 "Audit interface",
                 "Inspect the interface",
                 None,
+                &[],
             )
             .expect("re-enabled global agent is available");
 
@@ -9946,8 +10048,155 @@ enabled = false
     }
 
     #[test]
-    fn image_only_prompt_reaches_provider_without_fabricated_text_and_can_queue() {
+    fn image_handoff_requires_declared_provider_vision_support() {
         let (mut core, session_id) = ready_codex_server();
+        let error = core
+            .prompt_command(&session_id, prompt_with_image_and_file(), false, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("no text-only fallback"));
+    }
+
+    #[test]
+    fn image_handoff_public_transform_reaches_a_new_agents_first_task() {
+        let (mut source, source_id) = ready_vision_server();
+        let original = crate::image_handoff::tests::png(4096, 3072);
+        source
+            .prompt_command(
+                &source_id,
+                PromptInput {
+                    text: "Inspect this detailed document".to_owned(),
+                    attachments: vec![ProtocolPromptAttachment::InlineImage {
+                        label: "Document".to_owned(),
+                        media_type: "image/png".to_owned(),
+                        data: original.clone(),
+                    }],
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let QueryResult::Session(session) = source
+            .query(Query::GetSession {
+                session_id: source_id.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("session")
+        };
+        let reference = session
+            .transcript
+            .entries
+            .iter()
+            .find_map(|entry| entry.artifacts.first())
+            .unwrap()
+            .to_string();
+        let QueryResult::Artifact(derived) = source
+            .query(Query::GetSessionImage {
+                session_id: source_id.clone(),
+                image_reference: reference.clone(),
+                transform: Some(nakode_protocol::ImageTransform {
+                    crop: Some(nakode_protocol::ImageCrop {
+                        x: 128,
+                        y: 96,
+                        width: 2048,
+                        height: 1024,
+                    }),
+                    max_width: Some(1024),
+                    max_height: Some(1024),
+                }),
+            })
+            .unwrap()
+        else {
+            panic!("image")
+        };
+        assert_eq!((derived.width, derived.height), (Some(1024), Some(512)));
+        let QueryResult::Artifact(unchanged) = source
+            .query(Query::GetSessionImage {
+                session_id: source_id.clone(),
+                image_reference: reference,
+                transform: None,
+            })
+            .unwrap()
+        else {
+            panic!("original")
+        };
+        assert_eq!(unchanged.data, original);
+        let QueryResult::Artifact(reused) = source
+            .query(Query::GetSessionImage {
+                session_id: source_id.clone(),
+                image_reference: derived.id.to_string(),
+                transform: None,
+            })
+            .unwrap()
+        else {
+            panic!("reused image")
+        };
+        assert_eq!(reused, derived);
+        assert_new_agent_receives_image(&derived);
+        let (text, images) = source
+            .convert_prompt(
+                &source_id,
+                PromptInput {
+                    text: "Reuse crop".to_owned(),
+                    attachments: vec![ProtocolPromptAttachment::Artifact {
+                        artifact_id: derived.id,
+                        label: "crop".to_owned(),
+                    }],
+                },
+            )
+            .unwrap();
+        assert_eq!(text, "Reuse crop");
+        assert_eq!(images[0].image.as_ref().unwrap().data, derived.data);
+    }
+
+    fn assert_new_agent_receives_image(derived: &nakode_protocol::ArtifactView) {
+        let (mut target, target_id) = ready_vision_server();
+        assert!(
+            target
+                .query(Query::GetSessionImage {
+                    session_id: target_id.clone(),
+                    image_reference: derived.id.to_string(),
+                    transform: None
+                })
+                .is_err()
+        );
+        // FStack transfers its authorized read through the existing public attachment input.
+        let (_, effects) = target
+            .prompt_command(
+                &target_id,
+                PromptInput {
+                    text: "Read the selected document detail.".to_owned(),
+                    attachments: vec![ProtocolPromptAttachment::InlineImage {
+                        label: derived.label.clone(),
+                        media_type: derived.media_type.clone(),
+                        data: derived.data.clone(),
+                    }],
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let images = effects
+            .iter()
+            .find_map(|effect| match effect {
+                crate::state::Effect::Backend(BackendCommand::StartTurn {
+                    prompt,
+                    attachments,
+                    ..
+                }) => {
+                    assert!(prompt.starts_with("Read the selected document detail."));
+                    Some(attachments)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].image.as_ref().unwrap().data, derived.data);
+    }
+
+    #[test]
+    fn image_only_prompt_reaches_provider_without_fabricated_text_and_can_queue() {
+        let (mut core, session_id) = ready_vision_server();
         let mut prompt = prompt_with_image_and_file();
         prompt.text.clear();
         prompt.attachments.truncate(1);
@@ -9984,7 +10233,7 @@ enabled = false
 
     #[test]
     fn failed_prompt_recovery_round_trips_images_as_session_artifacts() {
-        let (mut core, session_id) = ready_codex_server();
+        let (mut core, session_id) = ready_vision_server();
 
         let (_, effects) = core
             .prompt_command(&session_id, prompt_with_image_and_file(), false, None)
@@ -10038,7 +10287,7 @@ enabled = false
         else {
             panic!("artifact result");
         };
-        assert_eq!(artifact.data, [1, 2, 3, 4]);
+        assert_eq!(artifact.data, crate::image_handoff::tests::png(32, 16));
 
         let (_, effects) = core
             .prompt_command(
@@ -10067,7 +10316,7 @@ enabled = false
                 image: Some(image),
             } if label == "screen.png"
                 && image.mime_type == "image/png"
-                && image.data == [1, 2, 3, 4]
+                && image.data == crate::image_handoff::tests::png(32, 16)
         ));
         assert!(matches!(
             &attachments[1],
@@ -10156,27 +10405,33 @@ enabled = false
         let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
         let (endpoint, mut requests) =
             ServerEndpoint::channel("test", ServiceCapabilities::default(), 1);
-        let query_endpoint = endpoint.clone();
-        let result = tokio::spawn(async move {
-            query_endpoint
-                .execute_query(
-                    ClientId::from("plain"),
-                    Query::GetArtifact {
-                        artifact_id: nakode_protocol::ArtifactId::from("artifact-1"),
-                    },
-                )
+        let queries = [
+            Query::GetArtifact {
+                artifact_id: nakode_protocol::ArtifactId::from("artifact-1"),
+            },
+            Query::GetSessionImage {
+                session_id: core.default_session_id().clone(),
+                image_reference: "artifact-1".to_owned(),
+                transform: None,
+            },
+        ];
+        for query in queries {
+            let query_endpoint = endpoint.clone();
+            let result = tokio::spawn(async move {
+                query_endpoint
+                    .execute_query(ClientId::from("plain"), query)
+                    .await
+            });
+            let request = requests.recv().await.expect("queued artifact query");
+            let outcome = core.handle(&endpoint, request);
+            assert!(!outcome.changed);
+            let error = result
                 .await
-        });
-        let request = requests.recv().await.expect("queued artifact query");
-
-        let outcome = core.handle(&endpoint, request);
-        assert!(!outcome.changed);
-        let error = result
-            .await
-            .expect("query task")
-            .expect_err("capability is not advertised");
-        assert_eq!(error.code, ErrorCode::CapabilityUnsupported);
-        assert!(error.message.contains("artifact transfer"));
+                .expect("query task")
+                .expect_err("capability is not advertised");
+            assert_eq!(error.code, ErrorCode::CapabilityUnsupported);
+            assert!(error.message.contains("artifact transfer"));
+        }
     }
 
     #[test]
@@ -10223,6 +10478,7 @@ enabled = false
         let _ = state.install_subagents(
             (0..130)
                 .map(|index| SubagentRecord {
+                    images: Vec::new(),
                     parent_session_id: session_id.to_string(),
                     id: format!("run-{index:03}"),
                     agent: "reviewer".to_owned(),
@@ -10281,6 +10537,7 @@ enabled = false
         let latest_activity = "activity-🦀".repeat(MAX_RUN_TEXT_BYTES / 4);
         let result = "result-λ".repeat(MAX_RUN_TEXT_BYTES / 4);
         let _ = state.install_subagents(vec![SubagentRecord {
+            images: Vec::new(),
             parent_session_id: session_id.to_string(),
             id: "run-long-text".to_owned(),
             agent: "reviewer".to_owned(),
@@ -10339,6 +10596,7 @@ enabled = false
         let mut state = AppState::new_unconfigured("/tmp/project", None, 500);
         let session_id = SessionId::from(state.nakode_session_id.clone());
         let _ = state.install_subagents(vec![SubagentRecord {
+            images: Vec::new(),
             parent_session_id: session_id.to_string(),
             id: "run-history".to_owned(),
             agent: "reviewer".to_owned(),
@@ -10585,6 +10843,7 @@ enabled = false
         let mut state = AppState::new_unconfigured("/tmp/project", None, 5_000);
         let session_id = SessionId::from(state.nakode_session_id.clone());
         let _ = state.install_subagents(vec![SubagentRecord {
+            images: Vec::new(),
             parent_session_id: session_id.to_string(),
             id: "run-stream".to_owned(),
             agent: "reviewer".to_owned(),

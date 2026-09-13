@@ -16,9 +16,9 @@ mod view;
 
 pub use command::{
     AgentDefinitionInput, ClientContext, Command, CredentialInput, ExternalToolDefinition,
-    InteractionResolution, ModelOptions, ModelTarget, PromptAttachment, PromptInput, Query,
-    QuestionResponse, RunTextField, SessionBridgeIntent, SessionToolConfiguration, SettingsPatch,
-    TranscriptOwner,
+    ImageCrop, ImageTransform, InteractionResolution, ModelOptions, ModelTarget, PromptAttachment,
+    PromptInput, Query, QuestionResponse, RunTextField, SessionBridgeIntent,
+    SessionToolConfiguration, SettingsPatch, TranscriptOwner,
 };
 pub use diagnostics::{
     DiagnosticsDailyUsage, DiagnosticsReport, DiagnosticsSessionUsage, DiagnosticsToolUsage,

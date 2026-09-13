@@ -655,6 +655,20 @@ impl NativeServerRuntime {
             NativeAgentRequest::SearchSharedContext(request) => {
                 self.handle_shared_context_search(request).await;
             }
+            NativeAgentRequest::Image(request) => {
+                let session_id = nakode_protocol::SessionId::from(request.owner_session_id);
+                let result = self
+                    .core
+                    .engine_for(&session_id)
+                    .ok_or_else(|| "image owner session is not open".to_owned())
+                    .and_then(|engine| {
+                        engine.state().resolve_run_image(
+                            request.requester_run_id.as_deref(),
+                            &request.reference,
+                        )
+                    });
+                let _ = request.respond.send(result);
+            }
             NativeAgentRequest::ValidationEvidence(request) => {
                 self.handle_validation_evidence(request).await;
             }
@@ -803,8 +817,11 @@ impl NativeServerRuntime {
             &request.task,
             request.parent_run_id.as_deref(),
             request_id,
-            Some(&request.invocation_turn_id),
-            Some(&request.invocation_call_id),
+            crate::state::DelegationInvocation {
+                turn_id: Some(&request.invocation_turn_id),
+                call_id: Some(&request.invocation_call_id),
+                image_references: &request.image_references,
+            },
         );
         let (run_id, effects) = match delegated {
             Ok(delegated) => delegated,
@@ -6990,6 +7007,7 @@ mod tests {
             .expect("parent session");
         sessions
             .save_subagent(&SubagentRecord {
+                images: Vec::new(),
                 parent_session_id: parent.id.clone(),
                 id: "run-active".to_owned(),
                 agent: "repo-explorer".to_owned(),
@@ -7050,6 +7068,7 @@ mod tests {
             .expect("parent session");
         sessions
             .save_subagent(&SubagentRecord {
+                images: Vec::new(),
                 parent_session_id: parent.id.clone(),
                 id: "run-active-evidence".to_owned(),
                 agent: "repo-explorer".to_owned(),
@@ -9883,6 +9902,7 @@ mod tests {
             .expect("persist session before deletion");
         sessions
             .save_subagent(&SubagentRecord {
+                images: Vec::new(),
                 parent_session_id: session_id.to_string(),
                 id: run_id.to_owned(),
                 agent: "reviewer".to_owned(),

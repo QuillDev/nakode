@@ -1128,7 +1128,22 @@ async fn emit_refreshed_credential(
     }
 }
 
+fn validate_bridge_images(command: &BackendCommand) -> Result<(), UnsupportedCommand> {
+    if let BackendCommand::StartTurn { attachments, .. } = command
+        && attachments
+            .iter()
+            .any(|attachment| attachment.image.is_some())
+    {
+        return Err(UnsupportedCommand {
+            operation: BackendOperation::StartTurn,
+            message: "Claude compatibility adapter does not support image attachments; choose a native vision-capable provider (no text-only fallback)",
+        });
+    }
+    Ok(())
+}
+
 fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, UnsupportedCommand> {
+    validate_bridge_images(&command)?;
     let (method, payload) = match command {
         BackendCommand::StartSession {
             model,
@@ -1174,10 +1189,7 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             "send",
             json!({"sessionId":provider_session_id,"turnId":client_id,"prompt":prompt,"model":model}),
         ),
-        BackendCommand::InterruptTurn {
-            provider_session_id: _,
-            turn_id,
-        } => ("cancel", json!({"turnId":turn_id})),
+        BackendCommand::InterruptTurn { turn_id, .. } => ("cancel", json!({"turnId":turn_id})),
         BackendCommand::Reload {
             provider_session_id,
         } => ("reload", json!({"sessionId":provider_session_id})),
@@ -1806,6 +1818,35 @@ fn capabilities() -> BackendCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_handoff_is_refused_instead_of_silently_dropped_by_claude_bridge() {
+        let command = |attachments| BackendCommand::StartTurn {
+            provider_session_id: "session".to_owned(),
+            client_id: "turn".to_owned(),
+            prompt: "Inspect the selected image".to_owned(),
+            attachments,
+            model: None,
+            skill_catalogue: crate::skill::SkillCatalog::default(),
+        };
+        let result = bridge_request(command(vec![crate::backend::PromptAttachment {
+            label: "fixture.png".to_owned(),
+            path: None,
+            image: Some(crate::backend::PromptImage {
+                mime_type: "image/png".to_owned(),
+                data: crate::image_handoff::tests::png(16, 8),
+            }),
+        }]));
+        assert!(
+            matches!(result, Err(error) if error.operation == BackendOperation::StartTurn
+            && error.message.contains("no text-only fallback"))
+        );
+        let text = bridge_request(command(Vec::new()))
+            .expect("text-only remains supported")
+            .expect("send request");
+        assert_eq!(text.method, "send");
+        assert_eq!(text.payload["prompt"], "Inspect the selected image");
+    }
 
     #[test]
     fn bridge_uses_the_official_agent_sdk_with_fd_scoped_oauth() {
