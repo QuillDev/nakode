@@ -1,5 +1,17 @@
 # Scalar session status
 
+## Retained-query uncertainty
+
+Unknown session, transcript and run identities are not confirmed absent while the session inventory
+is incomplete. These reads return retryable `Internal`; unknown `OpenSession` follows the same rule
+without running effects. Complete inventories retain ordinary `NotFound` behavior.
+
+Retained native-history loading distinguishes storage/deserialization errors (`Internal`, retryable)
+from a missing native row (`CapabilityUnsupported`, with same-identity explicit reopen guidance).
+Neither path deletes the logical session, edits its workspace or restores a provider during a read.
+
+## Scalar inventory
+
 `NakodeClient::list_session_statuses(limit)` calls `NakodeService.ListSessionStatuses` once.
 It reads the installation service's discoverable logical sessions without constructing workspace,
 transcript, interaction-question, provider-configuration, failure-detail or delegated transcript views.
