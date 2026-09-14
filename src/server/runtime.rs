@@ -10313,6 +10313,10 @@ mod tests {
     }
 
     fn save_retained_history(root: &std::path::Path) -> SessionId {
+        save_retained_history_for_kind(root, OrchestratorKind::Agent)
+    }
+
+    fn save_retained_history_for_kind(root: &std::path::Path, kind: OrchestratorKind) -> SessionId {
         let (persistence, _credentials) = test_persistence(root);
         let id = SessionId::from("retained-logical-session");
         let mut native = crate::runtime::RuntimeSession::new(
@@ -10346,7 +10350,7 @@ mod tests {
             .save_session_bridge(&SessionBridgeRecord {
                 session_id: id.to_string(),
                 workspace: root.to_string_lossy().into_owned(),
-                kind: OrchestratorKind::Agent,
+                kind,
                 lifecycle: BridgeLifecycle::Open,
                 display_title: "Retained title".to_owned(),
                 revision: 1,
@@ -10365,6 +10369,65 @@ mod tests {
             })
             .expect("bridge");
         id
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_open_chat_and_ticket_agent_bridges_and_history_readable() {
+        for kind in [OrchestratorKind::Chat, OrchestratorKind::Agent] {
+            let root = tempfile::tempdir().expect("isolated workspace");
+            let id = save_retained_history_for_kind(root.path(), kind);
+            let (runtime, handle) = retained_history_runtime(root.path()).await;
+            let endpoint = runtime.endpoint.clone();
+            let running = tokio::spawn(runtime.run());
+            let before = endpoint
+                .execute_query(
+                    ClientId::from("before"),
+                    Query::GetSession {
+                        session_id: id.clone(),
+                    },
+                )
+                .await
+                .expect("history")
+                .value;
+            handle.shutdown().await;
+            running.await.expect("isolated runtime stopped");
+            let (restarted, handle) = retained_history_runtime(root.path()).await;
+            let bridges = restarted
+                .effects
+                .persistence
+                .sessions
+                .list_session_bridges_all()
+                .expect("bridges");
+            assert_eq!(bridges.len(), 1);
+            assert_eq!(bridges[0].session_id, id.as_str());
+            assert_eq!(bridges[0].kind, kind);
+            assert_eq!(bridges[0].lifecycle, BridgeLifecycle::Open);
+            assert!(
+                restarted.core.engine_for(&id).is_none(),
+                "discovery never activates execution"
+            );
+            let endpoint = restarted.endpoint.clone();
+            let running = tokio::spawn(restarted.run());
+            let after = endpoint
+                .execute_query(
+                    ClientId::from("after"),
+                    Query::GetSession { session_id: id },
+                )
+                .await
+                .expect("restart history")
+                .value;
+            let (QueryResult::Session(before), QueryResult::Session(after)) = (before, after)
+            else {
+                panic!("session snapshots")
+            };
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.title, after.title);
+            assert_eq!(before.transcript.entries, after.transcript.entries);
+            assert!(after.active_turn.is_none());
+            assert!(after.interactions.is_empty());
+            handle.shutdown().await;
+            running.await.expect("replacement stopped");
+        }
     }
 
     #[tokio::test]

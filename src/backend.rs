@@ -373,7 +373,7 @@ pub enum DeltaKind {
     Tool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TurnOutcome {
     Completed,
     Interrupted,

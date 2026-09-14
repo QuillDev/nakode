@@ -352,6 +352,37 @@ pub trait InferenceProvider: Send + Sync {
     ) -> InferenceFuture<'_>;
 }
 
+/// Owns every provider turn task, including when its supervisor itself is aborted.
+#[derive(Default)]
+pub(crate) struct NativeTurnTask(Option<tokio::task::JoinHandle<()>>);
+
+impl NativeTurnTask {
+    pub(crate) fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(task))
+    }
+
+    pub(crate) async fn stop(mut self, cancellation: &CancellationToken) {
+        cancellation.cancel();
+        if let Some(task) = self.0.as_mut()
+            && tokio::time::timeout(Duration::from_secs(2), &mut *task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        self.0 = None;
+    }
+}
+
+impl Drop for NativeTurnTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentRuntime {
     workspace: PathBuf,
@@ -364,6 +395,7 @@ pub struct AgentRuntime {
     direct_image_input: bool,
     external_tools: Arc<ExternalToolBroker>,
     native_delegation: Option<mpsc::Sender<crate::backend::NativeAgentRequest>>,
+    session_store: Option<RuntimeSessionStore>,
     code_mode_worker_executable: Option<PathBuf>,
 }
 
@@ -386,8 +418,22 @@ impl AgentRuntime {
             direct_image_input: true,
             external_tools: Arc::new(ExternalToolBroker::default()),
             native_delegation: None,
+            session_store: None,
             code_mode_worker_executable: None,
         }
+    }
+
+    /// Installs canonical checkpoints before inference and tool side effects.
+    #[must_use]
+    pub fn with_session_store(mut self, store: RuntimeSessionStore) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
+    fn checkpoint(&self, session: &RuntimeSession) -> Result<(), String> {
+        self.session_store
+            .as_ref()
+            .map_or(Ok(()), |store| store.save(session))
     }
 
     /// Overrides the trusted Nakode executable used for the isolated Code Mode worker.
@@ -663,6 +709,47 @@ impl AgentRuntime {
         backend_events: &mpsc::Sender<BackendEvent>,
         cancellation: CancellationToken,
     ) -> Result<(), TurnError> {
+        // The checkpoint can precede the server's durable TurnStarted acknowledgement.
+        // A replay of that same accepted ID must not append a second prompt or rerun tools.
+        if session.completed_turns.iter().any(|id| id == turn_id) {
+            return Ok(());
+        }
+        if session.pending_turn.as_deref() == Some(turn_id)
+            || session
+                .interrupted_turns
+                .iter()
+                .any(|turn| turn.id == turn_id)
+        {
+            session.recover_interrupted_turn();
+            self.checkpoint(session)?;
+            return Err(TurnError::Interrupted);
+        }
+        session.recover_interrupted_turn();
+        session.pending_turn = Some(turn_id.to_owned());
+        session.checkpointed_turn = Some(crate::session::PersistedTurnConfiguration {
+            id: turn_id.to_owned(),
+            model: Some(
+                if session.provider_id.is_empty()
+                    || session
+                        .model
+                        .starts_with(&format!("{}/", session.provider_id))
+                {
+                    session.model.clone()
+                } else {
+                    format!("{}/{}", session.provider_id, session.model)
+                },
+            ),
+            options: crate::backend::ModelOptions {
+                reasoning_effort: session.reasoning_effort.clone(),
+                fast_mode: session.fast_mode,
+            },
+            outcome: crate::backend::TurnOutcome::Interrupted,
+        });
+        session.history.push(ConversationItem::User {
+            text: prompt.clone(),
+            attachments: attachments.clone(),
+        });
+        self.checkpoint(session)?;
         let policy = self
             .external_tools
             .sessions
@@ -685,18 +772,34 @@ impl AgentRuntime {
             policy.max_turns,
             policy.finalization_reserve_turns,
         );
-        let Some(timeout) = timeout else {
-            return turn.await;
-        };
-        if let Ok(result) = tokio::time::timeout(timeout, turn).await {
-            result
+        let result = if let Some(timeout) = timeout {
+            if let Ok(result) = tokio::time::timeout(timeout, turn).await {
+                result
+            } else {
+                on_timeout.cancel();
+                Err(TurnError::Failed(format!(
+                    "archetype runtime exceeded its configured {} second timeout",
+                    timeout.as_secs()
+                )))
+            }
         } else {
-            on_timeout.cancel();
-            Err(TurnError::Failed(format!(
-                "archetype runtime exceeded its configured {} second timeout",
-                timeout.as_secs()
-            )))
+            turn.await
+        };
+        if let Some(turn) = session.checkpointed_turn.as_mut() {
+            turn.outcome = match &result {
+                Ok(()) => crate::backend::TurnOutcome::Completed,
+                Err(TurnError::Interrupted) => crate::backend::TurnOutcome::Interrupted,
+                Err(_) => crate::backend::TurnOutcome::Failed,
+            };
         }
+        if result.is_ok() {
+            session.pending_turn = None;
+            session.completed_turns.push(turn_id.to_owned());
+        } else {
+            session.recover_interrupted_turn();
+        }
+        self.checkpoint(session)?;
+        result
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -715,10 +818,13 @@ impl AgentRuntime {
     ) -> Result<(), TurnError> {
         self.prepare_image_fallback(&mut prompt, &mut attachments, &cancellation)
             .await?;
-        session.history.push(ConversationItem::User {
-            text: prompt,
-            attachments,
-        });
+        if let Some(owner) = session.history.last_mut() {
+            *owner = ConversationItem::User {
+                text: prompt,
+                attachments,
+            };
+        }
+        self.checkpoint(session)?;
         backend_events
             .send(BackendEvent::TurnStarted {
                 turn_id: turn_id.to_owned(),
@@ -825,6 +931,7 @@ impl AgentRuntime {
                 signature: output.signature,
                 provider_state: output.provider_state,
             });
+            self.checkpoint(session)?;
             send_context_usage(session, backend_events).await?;
             if output.tool_calls.is_empty() {
                 return Ok(());
@@ -848,6 +955,7 @@ impl AgentRuntime {
                         duration_ms: Some(0),
                     });
                 }
+                self.checkpoint(session)?;
                 continue;
             }
             warn_about_long_turn(backend_events, inference_round).await;
@@ -1177,6 +1285,7 @@ impl AgentRuntime {
                     *failures.entry(executed.name.clone()).or_default() += 1;
                 }
                 record_tool_result(session, executed, turn_id, backend_events).await?;
+                self.checkpoint(session)?;
                 continue;
             }
 
@@ -1203,6 +1312,7 @@ impl AgentRuntime {
                     *failures.entry(executed.name.clone()).or_default() += 1;
                 }
                 record_tool_result(session, executed, turn_id, backend_events).await?;
+                self.checkpoint(session)?;
             }
         }
         Ok(failures)
@@ -2105,6 +2215,12 @@ impl ReturnedImage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InterruptedRuntimeTurn {
+    pub id: String,
+    pub history_position: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeSession {
     pub id: String,
     #[serde(default)]
@@ -2140,6 +2256,17 @@ pub struct RuntimeSession {
     /// Successful routine validation keyed by exact command/cwd and relevant Git state.
     #[serde(default)]
     pub validation_evidence: Vec<ValidationEvidence>,
+    /// A checkpointed turn has no safe automatic replay after process loss.
+    #[serde(default)]
+    pub pending_turn: Option<String>,
+    #[serde(default)]
+    pub interrupted_turns: Vec<InterruptedRuntimeTurn>,
+    /// Completed turn IDs also fence redelivery after a lost completion acknowledgement.
+    #[serde(default)]
+    pub completed_turns: Vec<String>,
+    /// The latest accepted turn is interrupted unless a terminal checkpoint proves otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpointed_turn: Option<crate::session::PersistedTurnConfiguration>,
     #[serde(default)]
     pub returned_images: HashMap<String, ReturnedImage>,
 }
@@ -2164,8 +2291,57 @@ impl RuntimeSession {
             owner_session_id: None,
             parent_run_id: None,
             validation_evidence: Vec::new(),
+            pending_turn: None,
+            interrupted_turns: Vec::new(),
+            completed_turns: Vec::new(),
+            checkpointed_turn: None,
             returned_images: HashMap::new(),
         }
+    }
+
+    /// Settles unknown tool outcomes as unknown, never by re-executing the call.
+    /// Only explicit execution restoration writes this correction; history queries are read-only.
+    pub fn recover_interrupted_turn(&mut self) {
+        let Some(turn_id) = self.pending_turn.take() else {
+            return;
+        };
+        let settled = self
+            .history
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let pending = self
+            .history
+            .iter()
+            .flat_map(|item| match item {
+                ConversationItem::Assistant { tool_calls, .. } => tool_calls.as_slice(),
+                _ => &[],
+            })
+            .filter(|call| !settled.contains(&call.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for call in pending {
+            self.history.push(ConversationItem::ToolResult {
+                call_id: call.id,
+                name: Some(call.name),
+                arguments: Some(call.arguments),
+                audit_kind: Some("native".to_owned()),
+                title: Some("Interrupted tool · outcome unknown".to_owned()),
+                output: "Execution was interrupted before a durable result was recorded. The operation may have happened. Verify its effects before deciding whether to try again; it was not automatically replayed.".to_owned(),
+                model_output: None,
+                failed: true,
+                denied: false,
+                denial_reason: None,
+                duration_ms: None,
+            });
+        }
+        self.interrupted_turns.push(InterruptedRuntimeTurn {
+            id: turn_id,
+            history_position: self.history_position(),
+        });
     }
 
     #[must_use]
@@ -2249,11 +2425,26 @@ impl RuntimeSession {
 
     #[must_use]
     pub fn normalized_history(&self) -> Vec<SessionHistoryItem> {
+        if self.pending_turn.is_some() {
+            // Read-only recovery projection: never writes or activates execution.
+            let mut retained = self.clone();
+            retained.recover_interrupted_turn();
+            return retained.normalized_history();
+        }
+        let mut interruptions = self.interrupted_turns.iter().peekable();
         let mut images = self.returned_images.values().collect::<Vec<_>>();
         images.sort_by_key(|image| (image.history_index, image.sequence));
         let mut images = images.into_iter().peekable();
         let mut entries = Vec::new();
         for (index, item) in self.history_items().enumerate() {
+            while interruptions
+                .peek()
+                .is_some_and(|turn| turn.history_position <= index)
+            {
+                if let Some(turn) = interruptions.next() {
+                    entries.push(self.interruption_notice(&turn.id));
+                }
+            }
             while images
                 .peek()
                 .is_some_and(|image| image.history_index <= index)
@@ -2265,7 +2456,25 @@ impl RuntimeSession {
             entries.extend(normalize_history_item(&self.id, index, item));
         }
         entries.extend(images.map(ReturnedImage::history_item));
+        entries.extend(interruptions.map(|turn| self.interruption_notice(&turn.id)));
         entries
+    }
+
+    fn interruption_notice(&self, turn_id: &str) -> SessionHistoryItem {
+        SessionHistoryItem {
+            turn_id: turn_id.to_owned(),
+            provider_id: Some(self.provider_id.clone()),
+            model_id: None,
+            attachments: Vec::new(),
+            item: NormalizedItem {
+                id: format!("interrupted:{turn_id}"),
+                kind: ItemKind::System,
+                title: "Turn interrupted".to_owned(),
+                body: "Execution was interrupted before this turn completed. Retained history is available. Review any tool effects, then send a new message to continue; no operations were automatically replayed.".to_owned(),
+                status: ItemStatus::Failed,
+                tool_audit_json: None,
+            },
+        }
     }
 }
 
@@ -2982,10 +3191,17 @@ impl RuntimeSessionStore {
     }
 
     fn connection(&self) -> Result<Connection, String> {
-        Connection::open(&self.database)
-            .map_err(|error| format!("failed to open native session store: {error}"))
+        let connection = Connection::open(&self.database)
+            .map_err(|error| format!("failed to open native session store: {error}"))?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("failed to configure native session store: {error}"))?;
+        Ok(connection)
     }
 }
+
+#[cfg(test)]
+mod restart_tests;
 
 #[cfg(test)]
 mod tests {

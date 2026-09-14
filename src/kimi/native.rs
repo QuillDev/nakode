@@ -292,6 +292,10 @@ async fn run_supervisor(
     let runtime = provider.map(|provider| {
         let mut runtime = AgentRuntime::new(config.workspace.clone(), provider)
             .with_compaction_threshold_percent(config.compaction_threshold_percent);
+        if let Some(database) = &config.session_database {
+            runtime = runtime
+                .with_session_store(RuntimeSessionStore::new(database.clone(), KIMI_PROVIDER));
+        }
         if let Some(requests) = &config.native_delegation {
             runtime = runtime.with_native_delegation(requests.clone());
         }
@@ -322,7 +326,6 @@ async fn run_supervisor(
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 if matches!(command, BackendCommand::Shutdown) {
-                    if let Some(active) = active.take() { active.cancellation.cancel(); }
                     break;
                 }
                 let mut context = CommandContext {
@@ -365,9 +368,13 @@ async fn run_supervisor(
             }
         }
     }
+    if let Some(active) = active.take() {
+        active.task.stop(&active.cancellation).await;
+    }
 }
 
 struct ActiveTurn {
+    task: crate::runtime::NativeTurnTask,
     turn_id: String,
     cancellation: CancellationToken,
 }
@@ -622,6 +629,7 @@ async fn resume_session(
         .cloned()
         .or(persisted)
     {
+        session.recover_interrupted_turn();
         session.owner_session_id = owner_session_id;
         session.parent_run_id = None;
         session.enabled_skill_ids = Some(enabled_skill_ids);
@@ -705,13 +713,14 @@ async fn compact_session(
     };
     let cancellation = CancellationToken::new();
     *context.active = Some(ActiveTurn {
+        task: crate::runtime::NativeTurnTask::default(),
         turn_id: compaction_id.clone(),
         cancellation: cancellation.clone(),
     });
     let completed = context.completed.clone();
     let events = context.events.clone();
     let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let result = runtime
             .force_compact(&mut session, &compaction_id, &events, cancellation)
             .await
@@ -725,6 +734,9 @@ async fn compact_session(
             })
             .await;
     });
+    if let Some(active) = context.active.as_mut() {
+        active.task = crate::runtime::NativeTurnTask::new(task);
+    }
 }
 
 async fn start_turn(
@@ -783,6 +795,7 @@ async fn start_turn(
     }
     let cancellation = CancellationToken::new();
     *context.active = Some(ActiveTurn {
+        task: crate::runtime::NativeTurnTask::default(),
         turn_id: client_id.clone(),
         cancellation: cancellation.clone(),
     });
@@ -795,7 +808,7 @@ async fn start_turn(
     let runtime = runtime.clone();
     let completed = context.completed.clone();
     let events = context.events.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let result = runtime
             .run_turn(
                 &mut session,
@@ -815,6 +828,9 @@ async fn start_turn(
             })
             .await;
     });
+    if let Some(active) = context.active.as_mut() {
+        active.task = crate::runtime::NativeTurnTask::new(task);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
