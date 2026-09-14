@@ -558,11 +558,6 @@ async fn run_supervisor(
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 if matches!(command, BackendCommand::Shutdown) {
-                    if let Some(active) = active.take() { active.cancellation.cancel(); }
-                    if let Some(task) = authentication_task.take() {
-                        task.abort();
-                        let _ = task.await;
-                    }
                     break;
                 }
                 if let BackendCommand::UpdateCredential { credential: replacement } = command {
@@ -618,6 +613,9 @@ async fn run_supervisor(
             }
         }
     }
+    if let Some(active) = active.take() {
+        active.task.stop(&active.cancellation).await;
+    }
     if let Some(task) = authentication_task {
         task.abort();
         let _ = task.await;
@@ -627,6 +625,10 @@ async fn run_supervisor(
 fn native_runtime(config: &BackendConfig, provider: Arc<dyn InferenceProvider>) -> AgentRuntime {
     let mut runtime = AgentRuntime::new(config.workspace.clone(), provider)
         .with_compaction_threshold_percent(config.compaction_threshold_percent);
+    if let Some(database) = &config.session_database {
+        runtime =
+            runtime.with_session_store(RuntimeSessionStore::new(database.clone(), CODEX_PROVIDER));
+    }
     if let Some(requests) = &config.native_delegation {
         runtime = runtime.with_native_delegation(requests.clone());
     }
@@ -691,6 +693,7 @@ async fn handle_completed_turn(
 }
 
 struct ActiveTurn {
+    task: crate::runtime::NativeTurnTask,
     session_id: String,
     turn_id: String,
     cancellation: CancellationToken,
@@ -1020,6 +1023,7 @@ async fn compact_session(
     };
     let cancellation = CancellationToken::new();
     *context.active = Some(ActiveTurn {
+        task: crate::runtime::NativeTurnTask::default(),
         session_id: session.id.clone(),
         turn_id: compaction_id.clone(),
         cancellation: cancellation.clone(),
@@ -1027,7 +1031,7 @@ async fn compact_session(
     let completed = context.completed.clone();
     let events = context.events.clone();
     let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let result = runtime
             .force_compact(&mut session, &compaction_id, &events, cancellation)
             .await
@@ -1041,6 +1045,9 @@ async fn compact_session(
             })
             .await;
     });
+    if let Some(active) = context.active.as_mut() {
+        active.task = crate::runtime::NativeTurnTask::new(task);
+    }
 }
 
 async fn start_turn(
@@ -1099,6 +1106,7 @@ async fn start_turn(
     }
     let cancellation = CancellationToken::new();
     *context.active = Some(ActiveTurn {
+        task: crate::runtime::NativeTurnTask::default(),
         session_id: session.id.clone(),
         turn_id: client_id.clone(),
         cancellation: cancellation.clone(),
@@ -1112,7 +1120,7 @@ async fn start_turn(
     let completed = context.completed.clone();
     let events = context.events.clone();
     let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let result = runtime
             .run_turn(
                 &mut session,
@@ -1132,6 +1140,9 @@ async fn start_turn(
             })
             .await;
     });
+    if let Some(active) = context.active.as_mut() {
+        active.task = crate::runtime::NativeTurnTask::new(task);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1268,6 +1279,7 @@ async fn resume_session(
         .cloned()
         .or(persisted)
     {
+        session.recover_interrupted_turn();
         session.owner_session_id = owner_session_id;
         session.parent_run_id = None;
         session.enabled_skill_ids = Some(enabled_skill_ids);
@@ -3792,6 +3804,7 @@ mod tests {
 
         let active_session = sessions.remove(&session_id).expect("active session");
         let active = ActiveTurn {
+            task: crate::runtime::NativeTurnTask::default(),
             session_id: session_id.clone(),
             turn_id: "turn-1".to_owned(),
             cancellation: CancellationToken::new(),

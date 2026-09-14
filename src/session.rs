@@ -67,7 +67,7 @@ struct ProviderCatalogEntry {
     display_name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistedTurnConfiguration {
     pub id: String,
     pub model: Option<String>,
@@ -2528,6 +2528,29 @@ fn load_owner_turns(
         .map_err(Into::into)
 }
 
+fn project_checkpointed_turn(
+    connection: &Connection,
+    record: &mut SessionRecord,
+) -> Result<(), SessionError> {
+    // Native checkpoints can outlive the supervisor's terminal event. Project the retained
+    // outcome without opening a provider or writing restart corrections during a query.
+    let json: Option<String> = connection.query_row(
+        "SELECT CASE WHEN json_valid(session_json) THEN json_extract(session_json, '$.checkpointed_turn') END FROM native_runtime_sessions WHERE provider = ?1 AND session_id = ?2",
+        params![record.provider, record.provider_session_id], |row| row.get(0),
+    ).optional()?.flatten();
+    let Some(json) = json else { return Ok(()) };
+    let turn: PersistedTurnConfiguration =
+        serde_json::from_str(&json).map_err(|source| SessionError::InvalidStoredJson {
+            field: "native checkpointed turn",
+            source,
+        })?;
+    if !record.owner_turns.iter().any(|known| known.id == turn.id) {
+        record.last_turn = Some(turn.clone());
+        record.owner_turns.push(turn);
+    }
+    Ok(())
+}
+
 fn load_owned_provider_sessions(
     connection: &Connection,
     parent_session_id: &str,
@@ -3215,6 +3238,7 @@ impl SessionRepository for SqliteSessionRepository {
         drop(statement);
         for record in &mut records {
             record.owner_turns = load_owner_turns(&connection, &record.id)?;
+            project_checkpointed_turn(&connection, record)?;
             record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
             record.first_prompt_preview = load_first_prompt_preview(&connection, record)?;
             record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
@@ -3242,6 +3266,7 @@ impl SessionRepository for SqliteSessionRepository {
         drop(statement);
         for record in &mut records {
             record.owner_turns = load_owner_turns(&connection, &record.id)?;
+            project_checkpointed_turn(&connection, record)?;
             record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
             record.first_prompt_preview = load_first_prompt_preview(&connection, record)?;
             record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
@@ -3270,6 +3295,7 @@ impl SessionRepository for SqliteSessionRepository {
             .optional()?;
         if let Some(mut exact) = exact {
             exact.owner_turns = load_owner_turns(&connection, &exact.id)?;
+            project_checkpointed_turn(&connection, &mut exact)?;
             exact.owner_prompts = load_owner_prompts(&connection, &exact.id)?;
             exact.first_prompt_preview = load_first_prompt_preview(&connection, &exact)?;
             exact.owned_provider_sessions = load_owned_provider_sessions(&connection, &exact.id)?;
@@ -3289,6 +3315,7 @@ impl SessionRepository for SqliteSessionRepository {
             [record] => {
                 let mut record = record.clone();
                 record.owner_turns = load_owner_turns(&connection, &record.id)?;
+                project_checkpointed_turn(&connection, &mut record)?;
                 record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
                 record.first_prompt_preview = load_first_prompt_preview(&connection, &record)?;
                 record.owned_provider_sessions =
