@@ -2459,11 +2459,19 @@ impl ServerCore {
     }
 
     fn cancel_session_work_command(&mut self, session_id: &SessionId) -> DomainCommandOutcome {
-        self.ensure_session(session_id)?;
-        let effects = self
-            .session_engine_mut(session_id)?
-            .state_mut()
-            .cancel_session_work()?;
+        let effects = if let Some(engine) = self.sessions_by_id.get_mut(session_id) {
+            engine.state_mut().cancel_session_work()?
+        } else if self
+            .sessions
+            .iter()
+            .any(|record| record.id == session_id.as_str())
+        {
+            // Retained sessions survive restart without an execution engine. There is no
+            // runtime work to cancel; do not restore a provider or alter durable history.
+            Vec::new()
+        } else {
+            return Err(DomainCommandError::NotFound(session_id.to_string()));
+        };
         Ok(Self::accepted(Some(session_id.to_string()), effects))
     }
 
