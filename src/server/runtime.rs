@@ -10408,6 +10408,33 @@ mod tests {
             );
             let endpoint = restarted.endpoint.clone();
             let running = tokio::spawn(restarted.run());
+            for attempt in 0..2 {
+                endpoint
+                    .execute_command(
+                        ClientId::from("after"),
+                        IdempotencyKey::from(format!("cancel-retained-{attempt}")),
+                        None,
+                        false,
+                        Command::CancelSessionWork {
+                            session_id: id.clone(),
+                        },
+                    )
+                    .await
+                    .expect("retained cancellation is an accepted no-op");
+            }
+            let missing = endpoint
+                .execute_command(
+                    ClientId::from("after"),
+                    IdempotencyKey::from("cancel-missing"),
+                    None,
+                    false,
+                    Command::CancelSessionWork {
+                        session_id: SessionId::from("missing-session"),
+                    },
+                )
+                .await
+                .expect_err("unknown identity is not successful cancellation");
+            assert_eq!(missing.code, nakode_protocol::ErrorCode::NotFound);
             let after = endpoint
                 .execute_query(
                     ClientId::from("after"),
