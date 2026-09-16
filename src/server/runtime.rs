@@ -1960,6 +1960,7 @@ impl NativeServerRuntime {
                 });
                 return;
             }
+            crate::session_environment::remove(&delete_session_id);
         }
         self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);
@@ -10411,6 +10412,21 @@ mod tests {
             for attempt in 0..2 {
                 endpoint
                     .execute_command(
+                        ClientId::from("replacement-worker"),
+                        IdempotencyKey::from(format!("environment-before-open-{attempt}")),
+                        None,
+                        false,
+                        Command::SetSessionEnvironment {
+                            session_id: id.clone(),
+                            variables: std::collections::BTreeMap::new(),
+                        },
+                    )
+                    .await
+                    .expect("retained logical identity accepts even empty environment before open");
+            }
+            for attempt in 0..2 {
+                endpoint
+                    .execute_command(
                         ClientId::from("after"),
                         IdempotencyKey::from(format!("cancel-retained-{attempt}")),
                         None,
@@ -10700,6 +10716,22 @@ mod tests {
         );
         let endpoint = handle.endpoint().clone();
         let runtime = tokio::spawn(runtime.run());
+        endpoint
+            .execute_command(
+                ClientId::from("durable-delete-test"),
+                IdempotencyKey::from("durable-delete-environment"),
+                None,
+                false,
+                Command::SetSessionEnvironment {
+                    session_id: session_id.clone(),
+                    variables: std::collections::BTreeMap::from([(
+                        "DELETE_REGRESSION_TOKEN".to_owned(),
+                        nakode_protocol::CredentialInput("private-value".to_owned()),
+                    )]),
+                },
+            )
+            .await
+            .expect("environment installed");
         let key = IdempotencyKey::from("durable-delete-retry");
         let command = Command::DeleteSession {
             session_id: session_id.clone(),
@@ -10739,6 +10771,12 @@ mod tests {
             panic!("session query result")
         };
         assert_eq!(restored.id, session_id);
+        assert_eq!(
+            crate::session_environment::read(Some(session_id.as_str()))
+                .get("DELETE_REGRESSION_TOKEN")
+                .map(String::as_str),
+            Some("private-value")
+        );
 
         breaker
             .execute_batch("DROP TRIGGER fail_session_delete;")
@@ -10753,6 +10791,10 @@ mod tests {
             )
             .await
             .expect("same-key retry executes after rollback");
+        assert!(
+            !crate::session_environment::read(Some(session_id.as_str()))
+                .contains_key("DELETE_REGRESSION_TOKEN")
+        );
         assert_eq!(
             sessions
                 .find(session_id.as_str())
