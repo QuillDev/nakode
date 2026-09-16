@@ -408,6 +408,9 @@ mod tests {
             next_turn_transition: None,
             context_usage: None,
             transcript: TranscriptPage {
+                prefix_before: String::new(),
+                prefix_through: String::new(),
+                next_before_entry_id: None,
                 entries: Vec::new(),
                 has_earlier: false,
                 stream_active: false,

@@ -6,6 +6,7 @@ use super::{
 
 fn entry(index: usize) -> protocol::TranscriptEntryView {
     protocol::TranscriptEntryView {
+        body_sha256: String::new(),
         id: protocol::EntryId::from(format!("entry-{index}")),
         kind: protocol::TranscriptEntryKind::Assistant,
         title: String::new(),
@@ -59,6 +60,9 @@ fn spawn_history_server(
                         .expect("index");
                     let start = end.saturating_sub((limit as usize).min(64));
                     protocol::QueryResult::Transcript(Box::new(protocol::TranscriptPage {
+                        prefix_before: String::new(),
+                        prefix_through: String::new(),
+                        next_before_entry_id: None,
                         entries: (start..end).map(entry).collect(),
                         has_earlier: start > 0,
                         stream_active: false,
@@ -76,6 +80,7 @@ fn spawn_history_server(
                     assert_eq!(before_byte, Some(4));
                     protocol::QueryResult::TranscriptBody(protocol::TranscriptBodyWindow {
                         entry_id,
+                        body_sha256: String::new(),
                         body: "head".to_owned(),
                         start_byte: 0,
                         total_bytes: 8,
@@ -126,6 +131,9 @@ async fn repeated_full_history_hydration_cost_scales_with_history() {
             id: "history-session".to_owned(),
             revision: 1,
             transcript: Some(api::TranscriptPage {
+                prefix_before: String::new(),
+                prefix_through: String::new(),
+                next_before_entry_id: None,
                 entries: vec![api::TranscriptEntry {
                     id: format!("entry-{}", count - 1),
                     kind: api::TranscriptEntryKind::Assistant as i32,

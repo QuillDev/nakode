@@ -244,6 +244,9 @@ mod tests {
             invocation_call_id: None,
             originating_owner_entry: None,
             transcript: TranscriptPage {
+                prefix_before: String::new(),
+                prefix_through: String::new(),
+                next_before_entry_id: None,
                 entries: Vec::new(),
                 has_earlier: false,
                 stream_active: false,
@@ -260,6 +263,7 @@ mod tests {
         status: TranscriptEntryStatus,
     ) -> TranscriptEntryView {
         TranscriptEntryView {
+            body_sha256: String::new(),
             id: EntryId::from(format!("entry-{body}")),
             kind,
             title: String::new(),

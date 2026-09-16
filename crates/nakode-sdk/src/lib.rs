@@ -2581,38 +2581,41 @@ impl NakodeClient {
                 .unwrap_or(u64::MAX);
             }
             transcript.entries.drain(..remove_count);
+            // A trimmed page no longer describes its original prefix boundary.
+            transcript.prefix_before.clear();
+            transcript.next_before_entry_id =
+                transcript.entries.first().map(|entry| entry.id.clone());
             transcript.has_earlier = true;
         }
         while transcript.has_earlier && transcript.entries.len() < limit {
+            if !transcript.prefix_before.is_empty() && transcript.next_before_entry_id.is_none() {
+                break; // Explicit retained-stream end; has_earlier may mean unavailable source data.
+            }
             let Some(before_entry_id) = transcript.entries.first().map(|entry| entry.id.clone())
             else {
-                break;
+                return Err(SdkError::InvalidProjection(
+                    "transcript cursor made no progress".into(),
+                ));
             };
-            let page = match self
+            let page = self
                 .get_transcript_page(api::GetTranscriptPageRequest {
                     owner_kind: owner_kind as i32,
                     owner_id: owner_id.to_owned(),
                     before_entry_id: Some(before_entry_id),
                     limit: bounded_limit(limit.saturating_sub(transcript.entries.len())),
                 })
-                .await
-            {
-                Ok(page) => page,
-                // The snapshot's leading row can leave the authoritative transcript between the
-                // snapshot and this page request (compaction, a superseded reasoning summary). The
-                // rows already held are still authoritative; only the earlier window is unknown.
-                Err(error) if error.is_not_found() => {
-                    transcript.has_earlier = false;
-                    break;
-                }
-                Err(error) => return Err(error),
-            };
+                .await?;
+            validate_transcript_page(&transcript, &page)?;
             let previous_len = transcript.entries.len();
             let has_earlier = page.has_earlier;
+            transcript.prefix_before = page.prefix_before;
+            transcript.next_before_entry_id = page.next_before_entry_id;
             prepend_entries(&mut transcript.entries, page.entries, limit);
             transcript.has_earlier = has_earlier;
             if transcript.entries.len() == previous_len {
-                break;
+                return Err(SdkError::InvalidProjection(
+                    "transcript cursor made no progress".into(),
+                ));
             }
         }
         for entry in &mut transcript.entries {
@@ -2673,6 +2676,7 @@ impl NakodeClient {
                 .await?;
             let returned_end = window.start_byte.saturating_add(window.body.len() as u64);
             if window.entry_id != entry.id
+                || (!entry.body_sha256.is_empty() && window.body_sha256 != entry.body_sha256)
                 || window.total_bytes != entry.body_total_bytes
                 || returned_end != expected_end
                 || window.start_byte >= expected_end
@@ -2699,6 +2703,33 @@ impl NakodeClient {
         }
         Ok(())
     }
+}
+
+fn validate_transcript_page(
+    current: &api::TranscriptPage,
+    previous: &api::TranscriptPage,
+) -> Result<(), SdkError> {
+    let mut ids = current
+        .entries
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<HashSet<_>>();
+    if (!current.prefix_before.is_empty() && previous.prefix_through != current.prefix_before)
+        || previous.entries.is_empty()
+        || previous
+            .entries
+            .iter()
+            .any(|entry| !ids.insert(entry.id.as_str()))
+        || previous
+            .next_before_entry_id
+            .as_ref()
+            .is_some_and(|id| previous.entries.first().is_none_or(|entry| &entry.id != id))
+    {
+        return Err(SdkError::InvalidProjection(
+            "transcript page is not contiguous".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn remote_channel(
@@ -3035,6 +3066,7 @@ impl NakodeClient {
 #[cfg(test)]
 mod tests {
     mod hydration_cost;
+    mod transcript_hydration;
     use nakode_telemetry::{RpcLayer, opentelemetry::trace::FutureExt};
     use std::{
         path::{Path, PathBuf},
@@ -3225,6 +3257,9 @@ mod tests {
             next_turn_transition: None,
             context_usage: None,
             transcript: protocol::TranscriptPage {
+                prefix_before: String::new(),
+                prefix_through: String::new(),
+                next_before_entry_id: None,
                 entries: Vec::new(),
                 has_earlier: false,
                 stream_active: false,
@@ -3287,6 +3322,7 @@ mod tests {
         let mut view = session_view(projected_id);
         if matches!(mode, SessionServerMode::HydrationRepeated) {
             view.transcript.entries.push(protocol::TranscriptEntryView {
+                body_sha256: String::new(),
                 id: protocol::EntryId::from("still-stale"),
                 kind: protocol::TranscriptEntryKind::Assistant,
                 title: String::new(),
@@ -3479,6 +3515,9 @@ mod tests {
             let stale = api::SessionState {
                 id: "session-1".to_owned(),
                 transcript: Some(api::TranscriptPage {
+                    prefix_before: String::new(),
+                    prefix_through: String::new(),
+                    next_before_entry_id: None,
                     entries: vec![api::TranscriptEntry {
                         id: "superseded-entry".to_owned(),
                         body: "tail".to_owned(),

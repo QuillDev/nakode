@@ -1150,6 +1150,7 @@ mod tests {
         parent: Option<&str>,
     ) -> TranscriptEntryView {
         TranscriptEntryView {
+            body_sha256: String::new(),
             id: EntryId::from(id.to_owned()),
             kind: TranscriptEntryKind::Tool,
             title: title.to_owned(),
@@ -1174,6 +1175,9 @@ mod tests {
     #[test]
     fn code_mode_children_remain_nested_after_projection_reinstall() {
         let page = TranscriptPage {
+            prefix_before: String::new(),
+            prefix_through: String::new(),
+            next_before_entry_id: None,
             entries: vec![
                 projected_tool(
                     "parent",
@@ -1241,6 +1245,9 @@ mod tests {
     #[test]
     fn child_without_its_projected_parent_is_not_indented_as_an_orphan() {
         let page = TranscriptPage {
+            prefix_before: String::new(),
+            prefix_through: String::new(),
+            next_before_entry_id: None,
             entries: vec![projected_tool(
                 "child",
                 "read · src/runtime.rs",

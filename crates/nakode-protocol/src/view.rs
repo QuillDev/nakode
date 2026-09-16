@@ -401,6 +401,8 @@ pub enum TranscriptEntryStatus {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TranscriptEntryView {
+    #[serde(default)]
+    pub body_sha256: String,
     pub id: EntryId,
     pub kind: TranscriptEntryKind,
     pub title: String,
@@ -446,6 +448,12 @@ pub struct TranscriptEntryView {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TranscriptPage {
+    #[serde(default)]
+    pub prefix_before: String,
+    #[serde(default)]
+    pub prefix_through: String,
+    #[serde(default)]
+    pub next_before_entry_id: Option<EntryId>,
     pub entries: Vec<TranscriptEntryView>,
     pub has_earlier: bool,
     pub stream_active: bool,
@@ -461,6 +469,8 @@ pub struct TranscriptPage {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TranscriptBodyWindow {
+    #[serde(default)]
+    pub body_sha256: String,
     pub entry_id: EntryId,
     pub body: String,
     pub start_byte: u64,
@@ -1458,6 +1468,7 @@ mod tests {
     #[test]
     fn transcript_body_windows_are_explicit() {
         let entry = TranscriptEntryView {
+            body_sha256: String::new(),
             id: EntryId::from("entry-1"),
             kind: TranscriptEntryKind::Assistant,
             title: "Nakode".to_owned(),

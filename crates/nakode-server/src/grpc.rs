@@ -3220,6 +3220,9 @@ fn context_usage(value: protocol::ContextUsageView) -> api::ContextUsage {
 
 pub(crate) fn transcript(value: protocol::TranscriptPage) -> api::TranscriptPage {
     api::TranscriptPage {
+        prefix_before: value.prefix_before,
+        prefix_through: value.prefix_through,
+        next_before_entry_id: value.next_before_entry_id.map(|id| id.to_string()),
         entries: value.entries.into_iter().map(transcript_entry).collect(),
         has_earlier: value.has_earlier,
         stream_active: value.stream_active,
@@ -3248,6 +3251,7 @@ fn transcript_entry(value: protocol::TranscriptEntryView) -> api::TranscriptEntr
         protocol::TranscriptEntryStatus::Interrupted => api::TranscriptEntryStatus::Interrupted,
     };
     api::TranscriptEntry {
+        body_sha256: value.body_sha256,
         id: value.id.to_string(),
         kind: kind as i32,
         title: value.title,
@@ -3586,6 +3590,7 @@ fn run_outcome(value: protocol::RunOutcome) -> api::RunOutcome {
 
 pub(crate) fn transcript_body(value: protocol::TranscriptBodyWindow) -> api::TranscriptBodyWindow {
     api::TranscriptBodyWindow {
+        body_sha256: value.body_sha256,
         entry_id: value.entry_id.to_string(),
         body: value.body,
         start_byte: value.start_byte,
@@ -3818,6 +3823,9 @@ mod tests {
             invocation_call_id: None,
             originating_owner_entry: None,
             transcript: protocol::TranscriptPage {
+                prefix_before: String::new(),
+                prefix_through: String::new(),
+                next_before_entry_id: None,
                 entries: Vec::new(),
                 has_earlier: false,
                 stream_active: false,
@@ -4339,6 +4347,9 @@ mod tests {
 
     fn session_with_full_paging_bodies() -> api::SessionState {
         let transcript = api::TranscriptPage {
+            prefix_before: String::new(),
+            prefix_through: String::new(),
+            next_before_entry_id: None,
             entries: vec![api::TranscriptEntry {
                 id: "entry-1".to_owned(),
                 body: "large body".to_owned(),

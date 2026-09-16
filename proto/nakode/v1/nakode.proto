@@ -1348,6 +1348,8 @@ message TranscriptEntry {
   optional string source_prompt_id = 17;
   // Parent tool transcript entry for one server-attributed nested invocation.
   optional string parent_tool_entry_id = 18;
+  // SHA-256 of the complete UTF-8 body; windows must match even for same-length edits.
+  string body_sha256 = 19;
 }
 message TranscriptPage {
   repeated TranscriptEntry entries = 1;
@@ -1359,8 +1361,14 @@ message TranscriptPage {
   optional TranscriptEntry current_owner_entry = 5;
   // Exact tool/diff rows from that owner turn omitted from entries.
   uint64 current_owner_omitted_tool_calls = 6;
+  // Content validators for the authoritative prefixes before and through this page.
+  // They cover order, identity, bodies, audits and lifecycle, not just entry IDs.
+  string prefix_before = 7;
+  string prefix_through = 8;
+  // Absent at the end of retained history, even when has_earlier reports unavailable source history.
+  optional string next_before_entry_id = 9;
 }
-message TranscriptBodyWindow { string entry_id = 1; string body = 2; uint64 start_byte = 3; uint64 total_bytes = 4; bool has_earlier = 5; }
+message TranscriptBodyWindow { string entry_id = 1; string body = 2; uint64 start_byte = 3; uint64 total_bytes = 4; bool has_earlier = 5; string body_sha256 = 6; }
 message QueueItem { string id = 1; string summary = 2; uint32 attachment_count = 3; string text = 4; bool redirecting = 5; }
 message RecoverablePrompt { string id = 1; string text = 2; repeated PromptAttachment attachments = 3; }
 

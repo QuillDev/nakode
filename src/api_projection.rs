@@ -1311,6 +1311,9 @@ fn turn(value: api::Turn) -> Result<view::TurnView, String> {
 
 fn transcript(value: api::TranscriptPage) -> Result<view::TranscriptPage, String> {
     Ok(view::TranscriptPage {
+        prefix_before: value.prefix_before,
+        prefix_through: value.prefix_through,
+        next_before_entry_id: value.next_before_entry_id.map(view::EntryId::from),
         entries: value
             .entries
             .into_iter()
@@ -1329,6 +1332,7 @@ fn transcript(value: api::TranscriptPage) -> Result<view::TranscriptPage, String
 
 fn transcript_entry(value: api::TranscriptEntry) -> Result<view::TranscriptEntryView, String> {
     Ok(view::TranscriptEntryView {
+        body_sha256: value.body_sha256,
         id: view::EntryId::from(value.id),
         kind: match api::TranscriptEntryKind::try_from(value.kind).map_err(invalid_enum)? {
             api::TranscriptEntryKind::System => view::TranscriptEntryKind::System,
