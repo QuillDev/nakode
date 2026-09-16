@@ -1033,6 +1033,7 @@ fn install_created_session_view(
             .transcript
             .entries
             .push(nakode_protocol::TranscriptEntryView {
+                body_sha256: String::new(),
                 id: nakode_protocol::EntryId::from(format!("user-{}", session.revision + 1)),
                 kind: nakode_protocol::TranscriptEntryKind::User,
                 title: "YOU".to_owned(),
@@ -1100,6 +1101,7 @@ fn install_item_view(
 ) -> Result<(), String> {
     let session = active_session_mut(view)?;
     let entry = nakode_protocol::TranscriptEntryView {
+        body_sha256: String::new(),
         id: nakode_protocol::EntryId::from(id.to_owned()),
         kind: match kind {
             "user" => nakode_protocol::TranscriptEntryKind::User,

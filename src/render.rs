@@ -2562,6 +2562,9 @@ mod tests {
 
     fn empty_transcript() -> TranscriptPage {
         TranscriptPage {
+            prefix_before: String::new(),
+            prefix_through: String::new(),
+            next_before_entry_id: None,
             entries: Vec::new(),
             has_earlier: false,
             stream_active: false,
@@ -2670,7 +2673,11 @@ mod tests {
             invocation_call_id: None,
             originating_owner_entry: None,
             transcript: TranscriptPage {
+                prefix_before: String::new(),
+                prefix_through: String::new(),
+                next_before_entry_id: None,
                 entries: vec![TranscriptEntryView {
+                    body_sha256: String::new(),
                     id: "parent-entry".into(),
                     kind: TranscriptEntryKind::User,
                     title: "PARENT".to_owned(),

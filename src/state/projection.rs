@@ -1892,12 +1892,51 @@ pub(crate) fn transcript_body_window(
         return Err(TranscriptBodyWindowError::LimitTooSmallForCharacter { minimum });
     }
     Ok(TranscriptBodyWindow {
+        body_sha256: transcript_body_digest(body),
         entry_id: entry_id.clone(),
         body: body[start..end].to_owned(),
         start_byte: u64::try_from(start).unwrap_or(u64::MAX),
         total_bytes: u64::try_from(body.len()).unwrap_or(u64::MAX),
         has_earlier: start > 0,
     })
+}
+
+fn transcript_body_digest(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(body.as_bytes()))
+}
+
+fn transcript_prefixes(transcript: &DomainTranscript) -> Option<Vec<String>> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"nakode.transcript.prefix.v1");
+    digest.update([u8::from(transcript.has_earlier_entries())]);
+    let mut prefixes = vec![format!("{:x}", digest.clone().finalize())];
+    for entry in transcript
+        .entries()
+        .iter()
+        .filter(|entry| visible_transcript_entry(entry))
+    {
+        // Length framing covers full canonical content plus derived entry references, not bounded
+        // bodies. Cache all checkpoints once per domain mutation, not once per fetched page.
+        let bytes = serde_json::to_vec(&(
+            entry,
+            transcript.image_artifacts(entry).count(),
+            parent_tool_entry_id(transcript, entry),
+        ))
+        .ok()?;
+        digest.update(u64::try_from(bytes.len()).ok()?.to_le_bytes());
+        digest.update(bytes);
+        prefixes.push(format!("{:x}", digest.clone().finalize()));
+    }
+    Some(prefixes)
+}
+
+fn visible_transcript_entry(entry: &TranscriptEntry) -> bool {
+    !entry
+        .key
+        .as_deref()
+        .is_some_and(|key| key.starts_with("subagent:"))
 }
 
 fn projected_transcript_page(
@@ -1909,12 +1948,7 @@ fn projected_transcript_page(
     let entries = transcript
         .entries()
         .iter()
-        .filter(|entry| {
-            !entry
-                .key
-                .as_deref()
-                .is_some_and(|key| key.starts_with("subagent:"))
-        })
+        .filter(|entry| visible_transcript_entry(entry))
         .collect::<Vec<_>>();
     let end = before.map_or(entries.len(), |before| {
         entries
@@ -1958,8 +1992,13 @@ fn projected_transcript_page(
         // each payload field before it reaches here; the page keeps an envelope whole so a client is
         // never handed valid-looking partial JSON.
         let audit_bytes = entry.tool_audit_json.as_ref().map_or(0, String::len);
-        let include_audit =
-            delegated_invocation_entry(entry) || audit_bytes <= remaining_body_bytes;
+        if !projected.is_empty()
+            && (audit_bytes > remaining_body_bytes
+                || (remaining_body_bytes == 0 && !entry.body.is_empty()))
+        {
+            break;
+        }
+        let include_audit = audit_bytes <= remaining_body_bytes;
         if include_audit {
             remaining_body_bytes = remaining_body_bytes.saturating_sub(audit_bytes);
         }
@@ -1975,13 +2014,44 @@ fn projected_transcript_page(
     }
     projected.reverse();
     let omitted_entries = projected.len() < end;
+    let current_owner_omitted_tool_calls =
+        omitted_owner_tool_calls(&entries, current_owner, &projected);
+    let start = end - projected.len();
+    let prefixes = transcript.cached_prefixes(|| transcript_prefixes(transcript))?;
+    let prefix_before = prefixes.get(start)?.clone();
+    let prefix_through = prefixes.get(end)?.clone();
+    let next_before_entry_id = (start > 0)
+        .then(|| projected.first().map(|entry| entry.id.clone()))
+        .flatten();
+    Some(TranscriptPage {
+        prefix_before,
+        prefix_through,
+        next_before_entry_id,
+        current_owner_entry: projected_current_owner(
+            transcript,
+            current_owner,
+            &projected,
+            reserved_owner_body,
+        ),
+        entries: projected,
+        has_earlier: transcript.has_earlier_entries() || omitted_entries,
+        stream_active: before.is_none() && transcript.stream_active(),
+        stream_label: transcript.stream_label().to_owned(),
+        current_owner_omitted_tool_calls: u64::try_from(current_owner_omitted_tool_calls)
+            .unwrap_or(u64::MAX),
+    })
+}
+
+fn omitted_owner_tool_calls(
+    entries: &[&TranscriptEntry],
+    current_owner: Option<&TranscriptEntry>,
+    projected: &[TranscriptEntryView],
+) -> usize {
     let projected_ids = projected
         .iter()
         .map(|entry| entry.id.as_str())
         .collect::<BTreeSet<_>>();
-    let current_owner_entry =
-        projected_current_owner(transcript, current_owner, &projected, reserved_owner_body);
-    let current_owner_omitted_tool_calls = current_owner
+    current_owner
         .and_then(|entry| entry.owner_turn_id.as_deref())
         .map_or(0, |turn_id| {
             entries
@@ -1992,16 +2062,7 @@ fn projected_transcript_page(
                         && !projected_ids.contains(entry.id.as_str())
                 })
                 .count()
-        });
-    Some(TranscriptPage {
-        entries: projected,
-        has_earlier: transcript.has_earlier_entries() || omitted_entries,
-        stream_active: before.is_none() && transcript.stream_active(),
-        stream_label: transcript.stream_label().to_owned(),
-        current_owner_entry,
-        current_owner_omitted_tool_calls: u64::try_from(current_owner_omitted_tool_calls)
-            .unwrap_or(u64::MAX),
-    })
+        })
 }
 
 fn projected_current_owner(
@@ -2031,18 +2092,6 @@ fn projected_current_owner(
                 },
             )
     })
-}
-
-fn delegated_invocation_entry(entry: &TranscriptEntry) -> bool {
-    entry.kind == EntryKind::Tool
-        && (["nakode_agent", "mcp__nakode__delegate"]
-            .iter()
-            .any(|name| entry.title.starts_with(name))
-            || entry.tool_audit_json.as_deref().is_some_and(|audit| {
-                ["nakode_agent", "mcp__nakode__delegate"]
-                    .iter()
-                    .any(|name| audit.contains(&format!("\"name\":\"{name}\"")))
-            }))
 }
 
 fn tool_audit_identity(entry: &TranscriptEntry, field: &str) -> Option<String> {
@@ -2082,6 +2131,7 @@ fn transcript_entry_view(
     include_audit: bool,
 ) -> TranscriptEntryView {
     TranscriptEntryView {
+        body_sha256: transcript_body_digest(&entry.body),
         id: EntryId::from(entry.id.clone()),
         kind: entry_kind(entry.kind),
         title: entry.title.clone(),
@@ -2185,6 +2235,9 @@ pub(crate) fn transcript_artifact_id(entry_id: &str, index: usize) -> ArtifactId
 
 fn empty_transcript_page() -> TranscriptPage {
     TranscriptPage {
+        prefix_before: String::new(),
+        prefix_through: String::new(),
+        next_before_entry_id: None,
         entries: Vec::new(),
         has_earlier: false,
         stream_active: false,
@@ -2532,6 +2585,163 @@ mod tests {
         session::{ProviderAccountRecord, ProviderRecord, SubagentObservability, SubagentRecord},
         state::{AppState, ReasoningSummaryTracker, SubagentChat, SubagentRun, SubagentStatus},
     };
+
+    #[test]
+    fn pages_cover_entry_and_byte_limited_history_without_dropping_audits() {
+        let mut transcript = DomainTranscript::new(1);
+        for index in 0..350 {
+            let key = format!("tool-{index}");
+            transcript.upsert(
+                &key,
+                EntryKind::Tool,
+                "edit",
+                "body".repeat(1024),
+                EntryStatus::Complete,
+            );
+            transcript.set_tool_audit(
+                &key,
+                Some(format!("{{\"input\":\"{}\"}}", "x".repeat(32 * 1024))),
+            );
+        }
+        let mut page = transcript_page(&transcript);
+        let mut ids = std::collections::HashSet::new();
+        loop {
+            assert!(!page.entries.is_empty());
+            let bytes: usize = page
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry.body.len() + entry.tool_audit_json.as_ref().map_or(0, String::len)
+                })
+                .sum();
+            assert!(bytes <= MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES);
+            for entry in &page.entries {
+                assert!(entry.tool_audit_json.is_some());
+                assert!(ids.insert(entry.id.clone()));
+            }
+            let Some(before) = page.next_before_entry_id else {
+                break;
+            };
+            let previous = super::projected_transcript_page(
+                &transcript,
+                Some(&before),
+                64,
+                nakode_protocol::MAX_TRANSCRIPT_PAGE_BODY_BYTES,
+            )
+            .expect("page");
+            assert_eq!(previous.prefix_through, page.prefix_before);
+            page = previous;
+        }
+        assert_eq!(ids.len(), 350);
+        assert!(!page.has_earlier);
+    }
+
+    #[test]
+    fn prefix_proofs_allow_appends_but_reject_same_id_edits_and_removal() {
+        let mut transcript = DomainTranscript::new(1);
+        for index in 0..10 {
+            transcript.upsert(
+                format!("row-{index}"),
+                EntryKind::Tool,
+                "edit",
+                "old",
+                EntryStatus::Complete,
+            );
+        }
+        let page = super::projected_transcript_page(&transcript, None, 3, 1024).expect("tail");
+        let before = page.next_before_entry_id.as_ref().expect("cursor");
+        transcript.upsert(
+            "new",
+            EntryKind::Assistant,
+            "answer",
+            "live",
+            EntryStatus::Running,
+        );
+        let previous =
+            super::projected_transcript_page(&transcript, Some(before), 3, 1024).expect("prefix");
+        assert_eq!(previous.prefix_through, page.prefix_before);
+        transcript.replace_body("row-0", "new", EntryStatus::Complete);
+        let changed = super::projected_transcript_page(&transcript, Some(before), 3, 1024)
+            .expect("changed prefix");
+        assert_ne!(changed.prefix_through, page.prefix_before);
+        transcript.remove("row-0");
+        let removed = super::projected_transcript_page(&transcript, Some(before), 3, 1024)
+            .expect("removed prefix");
+        assert_ne!(removed.prefix_through, changed.prefix_through);
+    }
+
+    #[test]
+    fn cached_prefixes_invalidate_for_canonical_metadata_and_derived_references() {
+        type Mutation = fn(&mut DomainTranscript);
+        let mutations: [Mutation; 14] = [
+            |t| t.set_created_at_ms("row", Some(42)),
+            |t| t.set_origin("row", Some("provider"), Some("provider/model")),
+            |t| t.set_model_options("row", Some("high"), true),
+            |t| t.set_turn_attribution("row", "turn", None, false),
+            |t| t.set_source_transport("row", Some("sdk")),
+            |t| t.set_tool_audit("row", Some("{}".into())),
+            |t| t.set_status("row", EntryStatus::Failed),
+            |t| t.finish_running_entry("row", EntryStatus::Complete),
+            |t| t.append_delta("row", EntryKind::Tool, "tool", "delta"),
+            |t| t.finish_running(EntryStatus::Interrupted),
+            DomainTranscript::mark_history_truncated,
+            DomainTranscript::clear,
+            |t| t.retain_entry_ids("retained-session"),
+            |t| {
+                t.set_images(
+                    "row",
+                    vec![crate::media::ImageData {
+                        mime_type: "image/png".into(),
+                        data: vec![1],
+                    }],
+                );
+            },
+        ];
+        for mutate in mutations {
+            let mut transcript = DomainTranscript::new(1);
+            transcript.upsert("row", EntryKind::Tool, "tool", "body", EntryStatus::Running);
+            let before = transcript_page(&transcript).prefix_through;
+            assert!(
+                transcript
+                    .cached_prefixes(|| panic!("proof must be cached"))
+                    .is_some()
+            );
+            mutate(&mut transcript);
+            assert_ne!(before, transcript_page(&transcript).prefix_through);
+        }
+    }
+
+    #[test]
+    fn retained_stream_end_is_distinct_from_unavailable_source_history() {
+        let mut transcript = DomainTranscript::new(1);
+        transcript.upsert(
+            "row",
+            EntryKind::User,
+            "YOU",
+            "hello",
+            EntryStatus::Complete,
+        );
+        transcript.mark_history_truncated();
+        let page = transcript_page(&transcript);
+        assert!(page.has_earlier);
+        assert!(page.next_before_entry_id.is_none());
+        assert!(!page.prefix_through.is_empty());
+    }
+
+    #[test]
+    fn body_digest_changes_for_equal_length_replacements() {
+        let mut transcript = DomainTranscript::new(1);
+        transcript.upsert(
+            "row",
+            EntryKind::Assistant,
+            "answer",
+            "old",
+            EntryStatus::Complete,
+        );
+        let old = transcript_page(&transcript).entries[0].body_sha256.clone();
+        transcript.replace_body("row", "new", EntryStatus::Complete);
+        assert_ne!(old, transcript_page(&transcript).entries[0].body_sha256);
+    }
 
     #[test]
     fn first_prompt_preview_survives_transcript_paging_and_bounds_unicode() {
@@ -3202,7 +3412,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_invocation_audit_identity_survives_a_zero_body_budget() {
+    fn delegated_invocation_audit_obeys_the_byte_budget() {
         let mut transcript = DomainTranscript::new(100);
         transcript.upsert(
             "delegate-1",
@@ -3219,6 +3429,9 @@ mod tests {
         let page = super::projected_transcript_page(&transcript, None, 10, 0)
             .expect("delegated audit projection");
         assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].tool_audit_json, None);
+        let page = super::projected_transcript_page(&transcript, None, 10, 128)
+            .expect("delegated audit with room");
         assert_eq!(
             page.entries[0].tool_audit_json.as_deref(),
             Some(r#"{"callId":"call-1","name":"nakode_agent"}"#)
@@ -3674,6 +3887,9 @@ mod tests {
 
     fn transcript<const N: usize>(entries: [TranscriptEntryView; N]) -> TranscriptPage {
         TranscriptPage {
+            prefix_before: String::new(),
+            prefix_through: String::new(),
+            next_before_entry_id: None,
             entries: entries.into(),
             has_earlier: false,
             stream_active: false,
@@ -3689,6 +3905,7 @@ mod tests {
         status: TranscriptEntryStatus,
     ) -> TranscriptEntryView {
         TranscriptEntryView {
+            body_sha256: String::new(),
             id: EntryId::from(format!("entry-{body}")),
             kind,
             title: String::new(),

@@ -28,6 +28,7 @@
 /nakode.v1.NakodeService/ListOrphanedSessions
 /nakode.v1.NakodeService/PruneSession
 /nakode.v1.NakodeService/ListActiveSessions
+/nakode.v1.NakodeService/ListSessionStatuses
 /nakode.v1.NakodeService/DeleteSession
 /nakode.v1.NakodeService/GetSession
 /nakode.v1.NakodeService/WatchSession
@@ -92,3 +93,6 @@
 /nakode.v1.RemoteUpdateService/GetRemoteUpdateStatus
 /nakode.v1.RemoteUpdateService/WatchRemoteUpdateStatus
 /nakode.v1.RemoteUpdateService/StartRemoteUpdate
+/nakode.v1.MachinePathService/GetMachinePath
+/nakode.v1.MachinePathService/SaveMachinePath
+/nakode.v1.MachinePathService/SyncMachinePath
