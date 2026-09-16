@@ -581,6 +581,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 Fix every reported warning before committing. A work-in-progress tree may
 temporarily have warnings, but a commit must not.
 
-Session process environment is write-only, memory-only server state keyed by logical session identity. Native Bash, PTY tools, delegated tools and owner shell commands inherit it without provider-context or snapshot serialization; deletion clears it.
+Session process environment is write-only, memory-only server state keyed by exact live or retained logical session identity. Injection never activates providers and precedes explicit restoration. Native Bash, PTY tools, delegated tools and owner shell commands inherit it without provider-context or snapshot serialization; successful durable deletion clears it, while failed deletion retains it.
 
 Machine PATH is installation-scoped Nakode authority through `MachinePathService`. Reads/saves never resolve; startup and explicit Sync do. The machine overlay is below session Environment and explicit tool overrides, and never mutates the service process environment. `src/machine_path.rs`, `docs/machine-path.md`.

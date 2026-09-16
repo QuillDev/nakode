@@ -668,11 +668,14 @@ impl ServerCore {
         command: Command,
         prompt_id: Option<&str>,
     ) -> (Result<CommandAccepted, ServiceError>, Vec<Effect>) {
-        let opening = matches!(&command, Command::OpenSession { .. });
+        let retained_identity_command = matches!(
+            &command,
+            Command::OpenSession { .. } | Command::SetSessionEnvironment { .. }
+        );
         match self.try_execute_command_with_prompt_id(command, prompt_id) {
             Ok((accepted, effects)) => (Ok(accepted), effects),
             Err(DomainCommandError::NotFound(id))
-                if opening && !self.session_inventory_complete =>
+                if retained_identity_command && !self.session_inventory_complete =>
             {
                 (Err(self.unobserved_resource("session", &id)), Vec::new())
             }
@@ -869,7 +872,16 @@ impl ServerCore {
                 session_id,
                 variables,
             } => {
-                self.ensure_session(&session_id)?;
+                // Environment must be installed before OpenSession can restore provider work.
+                // A retained logical identity is sufficient; this must not activate an engine.
+                if !self.sessions_by_id.contains_key(&session_id)
+                    && !self
+                        .sessions
+                        .iter()
+                        .any(|record| record.id == session_id.as_str())
+                {
+                    return Err(DomainCommandError::NotFound(session_id.to_string()));
+                }
                 crate::session_environment::replace(session_id.as_str(), variables)
                     .map_err(DomainCommandError::Invalid)?;
                 Ok(Self::accepted(Some(session_id.to_string()), Vec::new()))
@@ -2628,7 +2640,6 @@ impl ServerCore {
             session_id, &self.default_session,
             "the default session runtime always exists"
         );
-        crate::session_environment::remove(session_id.as_str());
         self.sessions_by_id.remove(session_id);
         self.published_sessions.remove(session_id);
         self.session_histories.remove(session_id);
@@ -6220,10 +6231,41 @@ mod tests {
             owned_provider_sessions: Vec::new(),
         }]);
 
+        assert!(core.engine_for(&restored_id).is_none());
+        let environment = Command::SetSessionEnvironment {
+            session_id: restored_id.clone(),
+            variables: std::collections::BTreeMap::from([(
+                "RESUME_REGRESSION_TOKEN".to_owned(),
+                nakode_protocol::CredentialInput("private-value".to_owned()),
+            )]),
+        };
+        for _ in 0..2 {
+            let (accepted, effects, _, _) = core.execute_idempotent(
+                IdempotencyKey::from("restore-environment"),
+                None,
+                false,
+                environment.clone(),
+            );
+            accepted.expect("environment injection before open, including retry");
+            assert!(effects.is_empty(), "injection never starts provider work");
+            assert!(core.engine_for(&restored_id).is_none());
+        }
         let (_, effects) = core
             .open_session_command(&restored_id, None)
             .expect("a session from another service root opens");
-
+        assert_eq!(
+            crate::session_environment::read(Some(restored_id.as_str()))
+                .get("RESUME_REGRESSION_TOKEN")
+                .map(String::as_str),
+            Some("private-value"),
+        );
+        let (_, reattach_effects) = core
+            .open_session_command(&restored_id, None)
+            .expect("replacement connection reattaches the same identity");
+        assert!(
+            reattach_effects.is_empty(),
+            "reattach must not repeat restoration"
+        );
         assert!(
             !effects.is_empty(),
             "resume must be accepted, not reported as a rejection: {effects:#?}"
@@ -6235,8 +6277,38 @@ mod tests {
             .status_message;
         assert!(
             status.contains("Resuming session"),
-            "unexpected status after cross-root resume: {status}"
+            "unexpected resume status: {status}"
         );
+        assert_resumed_prompt_retry(&mut core, &restored_id);
+        crate::session_environment::remove(restored_id.as_str());
+    }
+
+    fn assert_resumed_prompt_retry(core: &mut ServerCore, session_id: &SessionId) {
+        let prompt = Command::SendPrompt {
+            session_id: session_id.clone(),
+            prompt: PromptInput {
+                text: "Continue existing work".to_owned(),
+                attachments: Vec::new(),
+            },
+        };
+        let (first, _, _, _) = core.execute_idempotent(
+            IdempotencyKey::from("resumed-owner-intent"),
+            None,
+            false,
+            prompt.clone(),
+        );
+        let (retry, retry_effects, _, changed) = core.execute_idempotent(
+            IdempotencyKey::from("resumed-owner-intent"),
+            None,
+            true,
+            prompt,
+        );
+        assert_eq!(
+            first.expect("send after open"),
+            retry.expect("same-key retry")
+        );
+        assert!(retry_effects.is_empty());
+        assert!(!changed, "retry cannot append a second owner turn");
     }
 
     #[test]
@@ -12369,6 +12441,24 @@ enabled = false
                 );
                 assert_eq!(error.retryable, !complete);
             }
+            let (environment, effects) = core.execute_command(
+                Command::SetSessionEnvironment {
+                    session_id: id.clone(),
+                    variables: std::collections::BTreeMap::new(),
+                },
+                None,
+            );
+            let error = environment.expect_err("unknown identity cannot receive environment");
+            assert_eq!(
+                error.code,
+                if complete {
+                    ErrorCode::NotFound
+                } else {
+                    ErrorCode::Internal
+                }
+            );
+            assert_eq!(error.retryable, !complete);
+            assert!(effects.is_empty());
             let (result, effects) = core.execute_command(
                 Command::OpenSession {
                     session_id: id.clone(),

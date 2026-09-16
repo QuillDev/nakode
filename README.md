@@ -550,7 +550,7 @@ prevents Nakode from starting or handling a turn.
 pending delegations remain, then restarts it. It never escalates to forced shutdown. New work
 can prolong the wait; unsupported quiescence protocols fail without stopping the server.
 
-Authenticated clients can replace a logical session’s ephemeral process environment through `SetSessionEnvironment`. Values never appear in snapshots or session persistence. Clients reinject them before work after a service restart. Native Bash and PTY tools (including delegates) inherit the logical owner’s variables.
+Authenticated clients can replace a logical session’s ephemeral process environment through `SetSessionEnvironment`. Values never appear in snapshots or session persistence. Clients reinject them before work after a service restart. Injection accepts exact retained logical identities without activating a provider, so it can precede `OpenSession`; incomplete inventory is not proof of absence. Environment values are cleared only after successful durable session deletion. Native Bash and PTY tools (including delegates) inherit the logical owner’s variables.
 
 ## Machine PATH
 
