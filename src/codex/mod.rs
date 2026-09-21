@@ -1,6 +1,9 @@
 #[cfg(feature = "codex-process-adapter")]
 mod compatibility;
+mod image_tokens;
 mod native;
+
+pub(crate) use image_tokens::estimate as estimate_image_tokens;
 #[cfg(feature = "codex-process-adapter")]
 pub mod protocol;
 

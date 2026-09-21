@@ -1,3 +1,5 @@
+mod context_estimate;
+
 use std::{
     collections::{BTreeSet, HashMap},
     future::Future,
@@ -1163,7 +1165,9 @@ impl AgentRuntime {
         cancellation: &CancellationToken,
         backend_events: &mpsc::Sender<BackendEvent>,
     ) -> Result<(), String> {
-        let Some(cut_index) = compaction_cut_index(&session.history) else {
+        let Some(cut_index) =
+            compaction_cut_index(&session.history, &session.provider_id, &session.model)
+        else {
             return Err("not enough completed context is available to compact".to_owned());
         };
         let estimated_tokens_before = session.estimated_context_tokens();
@@ -2387,7 +2391,12 @@ impl RuntimeSession {
 
     #[must_use]
     pub fn estimated_context_tokens(&self) -> usize {
-        self.estimated_context_bytes().div_ceil(4)
+        context_estimate::history_tokens(
+            &self.instructions,
+            &self.history,
+            &self.provider_id,
+            &self.model,
+        )
     }
 
     #[must_use]
@@ -2857,52 +2866,29 @@ fn truncate_telemetry_error(error: &str) -> String {
 }
 
 fn estimate_history_bytes(history: &[ConversationItem]) -> usize {
-    history.iter().map(estimate_item_bytes).sum()
-}
-
-fn estimate_item_tokens(item: &ConversationItem) -> usize {
-    estimate_item_bytes(item).div_ceil(4)
+    history
+        .iter()
+        .map(estimate_item_bytes)
+        .fold(0, usize::saturating_add)
 }
 
 fn estimate_item_bytes(item: &ConversationItem) -> usize {
-    match item {
-        ConversationItem::User { text, attachments } => {
-            text.len()
-                + attachments
-                    .iter()
-                    .filter_map(|attachment| attachment.image.as_ref())
-                    .map(|image| image.data.len())
-                    .sum::<usize>()
-        }
-        ConversationItem::Assistant {
-            text,
-            reasoning,
-            tool_calls,
-            provider_state,
-            ..
-        } => {
-            text.len()
-                + reasoning.len()
-                + tool_calls
-                    .iter()
-                    .map(|call| call.name.len() + call.arguments.to_string().len())
-                    .sum::<usize>()
-                + provider_state
-                    .iter()
-                    .map(|state| state.to_string().len())
-                    .sum::<usize>()
-        }
-        ConversationItem::ToolResult {
-            output,
-            model_output,
-            ..
-        } => model_output.as_deref().unwrap_or(output).len(),
-        ConversationItem::Compaction { summary } => summary.len(),
-        ConversationItem::CompactionEvent { .. } => 0,
-    }
+    let image_bytes = match item {
+        ConversationItem::User { attachments, .. } => attachments
+            .iter()
+            .filter_map(|attachment| attachment.image.as_ref())
+            .map(|image| image.data.len())
+            .fold(0, usize::saturating_add),
+        _ => 0,
+    };
+    context_estimate::text_bytes(item).saturating_add(image_bytes)
 }
 
-fn compaction_cut_index(history: &[ConversationItem]) -> Option<usize> {
+fn compaction_cut_index(
+    history: &[ConversationItem],
+    provider: &str,
+    model: &str,
+) -> Option<usize> {
     let valid_cut_points = history
         .iter()
         .enumerate()
@@ -2923,7 +2909,11 @@ fn compaction_cut_index(history: &[ConversationItem]) -> Option<usize> {
     }
     let mut recent_tokens = 0_usize;
     for index in (0..history.len()).rev() {
-        recent_tokens = recent_tokens.saturating_add(estimate_item_tokens(&history[index]));
+        recent_tokens = recent_tokens.saturating_add(context_estimate::item_tokens(
+            &history[index],
+            provider,
+            model,
+        ));
         if recent_tokens >= COMPACTION_KEEP_RECENT_TOKENS {
             return valid_cut_points
                 .iter()
@@ -5041,7 +5031,10 @@ mod tests {
             },
         ];
 
-        assert_eq!(super::compaction_cut_index(&history), Some(1));
+        assert_eq!(
+            super::compaction_cut_index(&history, "test-provider", "test-model"),
+            Some(1)
+        );
     }
 
     #[tokio::test]
@@ -5184,7 +5177,9 @@ mod tests {
     fn compaction_archive_preserves_visible_history() {
         let mut session = large_session(Some(50_000));
         let original_items = session.normalized_history().len();
-        let cut_index = super::compaction_cut_index(&session.history).expect("cut point");
+        let cut_index =
+            super::compaction_cut_index(&session.history, &session.provider_id, &session.model)
+                .expect("cut point");
         let compacted_history = session.history[..cut_index].to_vec();
         session.history.drain(..cut_index);
         session.history.insert(

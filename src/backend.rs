@@ -35,6 +35,20 @@ pub const CLAUDE_PROVIDER: &str = "claude-agent";
 pub const KIMI_PROVIDER: &str = "kimi-coding";
 pub const GLM_PROVIDER: &str = "zai-coding";
 
+/// Adapter-owned estimates for the image detail currently sent by native inference.
+/// Unknown provider/model combinations use the runtime's explicit fallback instead.
+pub(crate) fn estimate_image_tokens(
+    provider: &str,
+    model: &str,
+    width: u32,
+    height: u32,
+) -> Option<usize> {
+    match provider {
+        CODEX_PROVIDER => crate::codex::estimate_image_tokens(model, width, height),
+        _ => None,
+    }
+}
+
 /// Exact provider-call identities projected from Nakode's canonical built-ins.
 ///
 /// This table is deliberately case-sensitive and exhaustive. Custom and MCP tools never enter it;
