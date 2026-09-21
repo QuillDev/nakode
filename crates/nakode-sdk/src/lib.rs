@@ -35,6 +35,7 @@ use tower::{Layer, service_fn};
 pub use nakode_api::v1;
 
 const RETRY_DELAY: Duration = Duration::from_millis(100);
+const MAX_TRANSPORT_ATTEMPTS: usize = 4;
 const WATCH_BUFFER: usize = 32;
 
 #[derive(Debug, Error)]
@@ -2925,15 +2926,16 @@ where
     Call: FnMut(Request) -> CallFuture,
     CallFuture: Future<Output = Result<Response, tonic::Status>>,
 {
-    loop {
+    for attempt in 0..MAX_TRANSPORT_ATTEMPTS {
         match call(request.clone()).await {
             Ok(response) => return Ok(response),
-            Err(error) if retryable_status(&error) => {
-                tokio::time::sleep(RETRY_DELAY).await;
+            Err(error) if retryable_status(&error) && attempt + 1 < MAX_TRANSPORT_ATTEMPTS => {
+                tokio::time::sleep(RETRY_DELAY * (1 << attempt)).await;
             }
             Err(error) => return Err(error),
         }
     }
+    unreachable!("the final attempt always returns its result")
 }
 
 fn bounded_limit(remaining: usize) -> u32 {
@@ -4324,6 +4326,21 @@ mod tests {
                     ["stable-key", "stable-key"]
                 );
             });
+    }
+
+    #[tokio::test]
+    async fn persistent_transport_failure_returns_after_bounded_retries() {
+        let mut attempts = 0;
+        let error = retry_transport("stable-key", |key| {
+            attempts += 1;
+            assert_eq!(key, "stable-key");
+            async { Err::<(), _>(tonic::Status::unavailable("still unavailable")) }
+        })
+        .await
+        .expect_err("persistent transport failure is returned");
+        assert_eq!(attempts, super::MAX_TRANSPORT_ATTEMPTS);
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(error.message(), "still unavailable");
     }
 
     #[test]
