@@ -393,8 +393,6 @@ message GetWorkspaceRequest { string workspace = 1; optional string session_id =
 message InspectWorkspacePathRequest {
   string path = 1;
   optional string expected_git_repository = 2;
-  // Validate a directory scope without executing Git or inspecting repository metadata.
-  bool directory_scope = 3;
 }
 message WorkspacePathInspection {
   string canonical_path = 1;
@@ -402,10 +400,6 @@ message WorkspacePathInspection {
   optional string branch = 3;
   optional string revision = 4;
   bool dirty = 5;
-  // Facts observed by the authoritative Nakode server, never the frontend device.
-  string hostname = 6;
-  string operating_system = 7;
-  string architecture = 8;
 }
 // `after` is a resume hint. The server may always answer with a newer full
 // replacement snapshot, so clients never need to reduce replay events.
@@ -444,9 +438,6 @@ message SessionToolConfiguration {
   // When enabled, providers receive only Nakode's synthesized codemode tool. Its nested calls are
   // still constrained by tools, replace_builtin_tools, allowed_builtin_tools, and the MCP grant.
   bool code_mode = 4;
-  // Canonical owner-approved root; portable structured file tools only, not an OS sandbox.
-  // Requires DirectoryScopedSessions. The server refuses escape-capable tools and providers.
-  optional string directory_scope = 5;
 }
 
 // A fresh session may carry its provider-qualified model, options, and client-owned tool surface in
@@ -1278,8 +1269,6 @@ message SessionState {
   SessionHydration hydration = 37;
   // First owner prompt, capped at 512 Unicode characters; distinct from an explicit session title.
   string first_prompt_preview = 38;
-  // Persisted canonical structured-tool scope. Absent retains the legacy access policy.
-  optional string directory_scope = 39;
 }
 message SharedContextEntry {
   uint64 sequence = 1;

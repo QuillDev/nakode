@@ -183,10 +183,6 @@ pub struct ExternalToolDefinition {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionToolConfiguration {
-    /// Canonical, owner-approved directory. Enforces the portable structured-file-tool policy;
-    /// this is not an OS sandbox. Omission preserves the existing session policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub directory_scope: Option<String>,
     pub tools: Vec<ExternalToolDefinition>,
     pub replace_builtin_tools: bool,
     /// When true, the model sees only the synthesized `codemode` tool. Nested operations still use
@@ -674,8 +670,6 @@ pub enum Query {
     InspectWorkspacePath {
         path: String,
         expected_git_repository: Option<String>,
-        #[serde(default)]
-        directory_scope: bool,
     },
     ListSkills {
         workspace_id: WorkspaceId,

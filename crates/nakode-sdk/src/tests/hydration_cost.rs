@@ -128,7 +128,6 @@ async fn repeated_full_history_hydration_cost_scales_with_history() {
         .expect("connect SDK");
     for count in [16, 128, 512] {
         let snapshot = api::SessionState {
-            directory_scope: None,
             id: "history-session".to_owned(),
             revision: 1,
             transcript: Some(api::TranscriptPage {

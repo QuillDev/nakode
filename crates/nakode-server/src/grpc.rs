@@ -335,7 +335,6 @@ fn session_tools(
     value: Option<api::SessionToolConfiguration>,
 ) -> Option<protocol::SessionToolConfiguration> {
     value.map(|value| protocol::SessionToolConfiguration {
-        directory_scope: value.directory_scope,
         tools: value
             .tools
             .into_iter()
@@ -354,7 +353,6 @@ fn session_tools(
 
 fn session_tools_api(value: protocol::SessionToolConfiguration) -> api::SessionToolConfiguration {
     api::SessionToolConfiguration {
-        directory_scope: value.directory_scope,
         tools: value
             .tools
             .into_iter()
@@ -656,7 +654,6 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             .query(protocol::Query::InspectWorkspacePath {
                 path: request.path,
                 expected_git_repository: request.expected_git_repository,
-                directory_scope: request.directory_scope,
             })
             .await?;
         let protocol::QueryResult::WorkspacePathInspection(value) = result.value else {
@@ -667,9 +664,6 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         };
         Ok(response_with_timing(
             api::WorkspacePathInspection {
-                hostname: value.hostname,
-                operating_system: value.operating_system,
-                architecture: value.architecture,
                 canonical_path: value.canonical_path,
                 git_repository: value.git_repository,
                 branch: value.branch,
@@ -2900,7 +2894,6 @@ fn session_projection(
     parent_presentation_only: bool,
 ) -> api::SessionState {
     let mut state = api::SessionState {
-        directory_scope: value.directory_scope,
         id: value.id.to_string(),
         revision: value.revision,
         workspace_id: value.workspace_id.to_string(),
@@ -4056,7 +4049,6 @@ mod tests {
                 resource_id: Some("entry-key".to_owned()),
                 revision: Some(10),
                 effective_session_tools: Some(protocol::SessionToolConfiguration {
-                    directory_scope: None,
                     tools: Vec::new(),
                     replace_builtin_tools: false,
                     code_mode: false,

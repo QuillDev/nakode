@@ -630,28 +630,6 @@ impl NakodeClient {
             .inspect_workspace_path(api::InspectWorkspacePathRequest {
                 path: path.into(),
                 expected_git_repository,
-                directory_scope: false,
-            })
-            .await?
-            .into_inner())
-    }
-
-    /// Resolves a directory on the execution host without running Git or creating a session.
-    ///
-    /// # Errors
-    /// Rejects unsupported servers, relative paths, missing or inaccessible directories.
-    pub async fn inspect_directory_scope(
-        &self,
-        path: impl Into<String>,
-    ) -> Result<api::WorkspacePathInspection, SdkError> {
-        self.require_directory_scope_capability().await?;
-        Ok(self
-            .transport
-            .clone()
-            .inspect_workspace_path(api::InspectWorkspacePathRequest {
-                path: path.into(),
-                expected_git_repository: None,
-                directory_scope: true,
             })
             .await?
             .into_inner())
@@ -881,7 +859,6 @@ impl NakodeClient {
         options: Option<api::ModelOptions>,
         tools: Option<api::SessionToolConfiguration>,
     ) -> Result<String, SdkError> {
-        self.require_directory_scope_support(tools.as_ref()).await?;
         let result = send_mutation!(
             self,
             create_session,
@@ -916,8 +893,6 @@ impl NakodeClient {
         &self,
         mut request: api::CreateSessionRequest,
     ) -> Result<String, SdkError> {
-        self.require_directory_scope_support(request.tools.as_ref())
-            .await?;
         request.mutation = Some(mutation(None));
         let result = send_mutation!(self, create_session, request)?;
         result
@@ -964,7 +939,6 @@ impl NakodeClient {
         tools: Option<api::SessionToolConfiguration>,
         initial_instructions: Option<String>,
     ) -> Result<String, SdkError> {
-        self.require_directory_scope_support(tools.as_ref()).await?;
         let result = send_mutation!(
             self,
             create_session,
@@ -1076,8 +1050,6 @@ impl NakodeClient {
         session_id: impl Into<String>,
         attachment: SessionAttachment,
     ) -> Result<OpenedSession, SdkError> {
-        self.require_directory_scope_support(attachment.tools.as_ref())
-            .await?;
         let result = send_mutation!(
             self,
             open_session,
@@ -2011,29 +1983,6 @@ impl NakodeClient {
             })
             .await?
             .into_inner())
-    }
-
-    async fn require_directory_scope_support(
-        &self,
-        tools: Option<&api::SessionToolConfiguration>,
-    ) -> Result<(), SdkError> {
-        if tools.is_some_and(|tools| tools.directory_scope.is_some()) {
-            self.require_directory_scope_capability().await?;
-        }
-        Ok(())
-    }
-
-    async fn require_directory_scope_capability(&self) -> Result<(), SdkError> {
-        if !self
-            .get_server_info()
-            .await?
-            .capabilities
-            .iter()
-            .any(|capability| capability == "DirectoryScopedSessions")
-        {
-            return Err(tonic::Status::failed_precondition("update the execution host: directory-scoped sessions are unsupported; refusing unrestricted fallback").into());
-        }
-        Ok(())
     }
 
     /// Returns API version and capability metadata.
@@ -3288,7 +3237,6 @@ mod tests {
 
     fn session_view(id: &str) -> protocol::SessionView {
         protocol::SessionView {
-            directory_scope: None,
             id: protocol::SessionId::from(id),
             revision: 1,
             workspace_id: protocol::WorkspaceId::from("workspace-a"),
@@ -3565,7 +3513,6 @@ mod tests {
                 .await
                 .expect("connect SDK");
             let stale = api::SessionState {
-                directory_scope: None,
                 id: "session-1".to_owned(),
                 transcript: Some(api::TranscriptPage {
                     prefix_before: String::new(),
@@ -4012,7 +3959,6 @@ mod tests {
             .await
             .expect("connect fake Nakode API");
         let tools = api::SessionToolConfiguration {
-            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,
@@ -4050,7 +3996,6 @@ mod tests {
             .expect("connect fake Nakode API");
         let attachment = SessionAttachment {
             tools: Some(api::SessionToolConfiguration {
-                directory_scope: None,
                 tools: vec![api::ExternalToolDefinition {
                     name: "ticket_lookup".to_owned(),
                     description: "Look up one ticket".to_owned(),

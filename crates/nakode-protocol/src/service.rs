@@ -25,8 +25,6 @@ pub enum ServiceCapability {
     VisionAvailability,
     /// Session creation persists a filesystem/provider root independent from logical workspace ownership.
     SessionWorkingDirectories,
-    /// Persisted canonical directory scope enforced by Nakode's portable structured tools.
-    DirectoryScopedSessions,
     /// `CreateSession` can validate and apply an initial model/options before publication.
     InitialSessionModel,
     /// `CreateSession` accepts bounded client context merged into provider system instructions.
@@ -139,9 +137,6 @@ pub struct CommandAccepted {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspacePathInspectionView {
-    pub hostname: String,
-    pub operating_system: String,
-    pub architecture: String,
     pub canonical_path: String,
     pub git_repository: Option<String>,
     pub branch: Option<String>,
