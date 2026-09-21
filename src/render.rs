@@ -2520,6 +2520,7 @@ mod tests {
 
     fn session() -> SessionView {
         SessionView {
+            directory_scope: None,
             first_prompt_preview: String::new(),
             id: SessionId::from("session"),
             revision: 1,

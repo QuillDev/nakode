@@ -1086,6 +1086,9 @@ pub struct SharedContextEntryView {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionView {
+    /// Persisted canonical structured-tool scope. Absent means the legacy policy, not a sandbox.
+    #[serde(default)]
+    pub directory_scope: Option<String>,
     pub id: SessionId,
     pub revision: u64,
     pub workspace_id: WorkspaceId,

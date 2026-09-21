@@ -238,6 +238,7 @@ fn session_view(
         .and_then(|session| session.last_owner_activity_at)
         .map_or(0, unix_seconds_to_milliseconds);
     SessionView {
+        directory_scope: state.directory_scope.clone(),
         id: session_id.clone(),
         revision,
         workspace_id: workspace_id.clone(),

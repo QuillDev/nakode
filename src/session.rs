@@ -6901,6 +6901,7 @@ mod tests {
         let path = directory.path().join("session-tools.db");
         let store = SqliteSessionRepository::open(&path)?;
         let configuration = nakode_protocol::SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,
@@ -6929,6 +6930,7 @@ mod tests {
             .set_session_tool_configuration(
                 &created.id,
                 &nakode_protocol::SessionToolConfiguration {
+                    directory_scope: None,
                     allowed_builtin_tools: Some(vec!["grep".to_owned()]),
                     ..configuration.clone()
                 },

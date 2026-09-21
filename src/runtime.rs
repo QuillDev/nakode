@@ -407,6 +407,8 @@ impl AgentRuntime {
 
     #[must_use]
     pub fn new(workspace: PathBuf, provider: Arc<dyn InferenceProvider>) -> Self {
+        // Keep the authority-supplied spelling. Recanonicalizing here could silently adopt a
+        // retargeted directory between logical-session approval and provider startup.
         Self {
             workspace,
             provider,
@@ -604,10 +606,16 @@ impl AgentRuntime {
             .get(session_id)
             .is_none_or(|config| {
                 !config.replace_builtin_tools
-                    && config
-                        .allowed_builtin_tools
-                        .as_ref()
-                        .is_none_or(|allowed| allowed.contains(name))
+                    && config.allowed_builtin_tools.as_ref().is_none_or(|allowed| {
+                        allowed.contains(name)
+                            && (!allowed.iter().all(|tool| {
+                                crate::state::directory_scope::DIRECTORY_TOOLS
+                                    .contains(&tool.as_str())
+                            }) || self
+                                .workspace
+                                .canonicalize()
+                                .is_ok_and(|resolved| resolved == self.workspace))
+                    })
             })
     }
 
@@ -3670,7 +3678,11 @@ mod tests {
         let provider = Arc::new(ExternalToolProvider {
             calls: AtomicUsize::new(0),
         });
-        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider);
+        let workspace = directory
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let runtime = AgentRuntime::new(workspace, provider);
 
         runtime
             .configure_external_tools(
@@ -4767,6 +4779,64 @@ mod tests {
             .expect_err("configured rounds must stop the loop");
         assert!(error.to_string().contains("maximum of 2 turn(s)"));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_scope_runtime_refuses_traversal_symlinks_and_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let base = directory.path().canonicalize().expect("canonical base");
+        let root = base.join("approved");
+        let outside = base.join("outside");
+        std::fs::create_dir(&root).expect("approved directory");
+        std::fs::create_dir(&outside).expect("outside directory");
+        std::fs::write(outside.join("secret"), "outside").expect("outside file");
+        symlink(&outside, root.join("escape")).expect("external symlink");
+        assert!(crate::tools::resolve_workspace_path(&root, "../outside/secret").is_err());
+        assert!(crate::tools::resolve_workspace_path(&root, "escape/secret").is_err());
+        let runtime = AgentRuntime::new(root.clone(), Arc::new(ClassifiedFailureProvider));
+        runtime
+            .configure_external_tools(
+                "scoped",
+                Vec::new(),
+                false,
+                false,
+                Some(
+                    crate::state::directory_scope::DIRECTORY_TOOLS
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                ),
+                None,
+                0,
+                None,
+            )
+            .await
+            .expect("directory policy");
+        assert!(runtime.builtin_tool_allowed("scoped", "read").await);
+        assert!(!runtime.builtin_tool_allowed("scoped", "bash").await);
+        assert!(!runtime.builtin_tool_allowed("scoped", "eval").await);
+        std::fs::rename(&root, base.join("original")).expect("retain original directory");
+        symlink(&outside, &root).expect("retarget root");
+        assert!(!runtime.builtin_tool_allowed("scoped", "read").await);
+        // Starting the adapter after retargeting must not adopt the new canonical destination.
+        let restarted = AgentRuntime::new(root, Arc::new(ClassifiedFailureProvider));
+        restarted
+            .configure_external_tools(
+                "scoped",
+                Vec::new(),
+                false,
+                false,
+                Some(vec!["read".to_owned()]),
+                None,
+                0,
+                None,
+            )
+            .await
+            .expect("restored policy");
+        assert!(!restarted.builtin_tool_allowed("scoped", "read").await);
     }
 
     #[tokio::test]

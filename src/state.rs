@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(crate) mod directory_scope;
 pub(crate) mod projection;
 
 pub use crate::{backend::ApprovalDecision, session::SubagentStatus};
@@ -1520,6 +1521,7 @@ pub struct DomainState {
     mcp_archetype_grants: HashMap<String, HashSet<String>>,
     replace_builtin_tools: bool,
     code_mode: bool,
+    directory_scope: Option<String>,
     allowed_builtin_tools: Option<Vec<String>>,
     pub todo_phases: Vec<TodoPhase>,
     pub status_message: String,
@@ -2335,6 +2337,7 @@ impl DomainState {
             replace_builtin_tools: false,
             code_mode: false,
             allowed_builtin_tools: None,
+            directory_scope: None,
             todo_phases: Vec::new(),
             status_message: format!("Connecting to {backend_name}…"),
             diagnostic_count: 0,
@@ -3891,6 +3894,10 @@ impl DomainState {
         self.provider_session_id = None;
         self.resuming_session = None;
         self.backend_provider.clone_from(&session.provider);
+        self.directory_scope = session
+            .tool_configuration
+            .as_ref()
+            .and_then(|tools| tools.directory_scope.clone());
         self.code_mode = session.code_mode;
         self.working_directory
             .clone_from(&session.working_directory);
@@ -4653,6 +4660,7 @@ impl DomainState {
         &mut self,
         command: String,
     ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.require_unrestricted_session("Shell execution")?;
         if command.trim().is_empty() {
             return Err(DomainCommandError::Invalid(
                 "shell command cannot be empty".to_owned(),
@@ -5074,6 +5082,7 @@ impl DomainState {
         }
         let previous = self.provider_session_id.take();
         self.nakode_session_id = uuid::Uuid::now_v7().to_string();
+        self.directory_scope = None;
         self.creation_title = None;
         self.initial_client_instructions = None;
         self.session_id = None;
@@ -5332,6 +5341,9 @@ impl DomainState {
         selected: &ModelInfo,
         options: ModelOptions,
     ) -> Result<Vec<Effect>, DomainCommandError> {
+        if self.directory_scope.is_some() {
+            self.validate_directory_provider(&selected.provider)?;
+        }
         let provider_changed = selected.provider != self.backend_provider;
         if provider_changed && !self.provider_contexts.contains_key(&selected.provider) {
             return Err(DomainCommandError::NotFound(format!(
@@ -6599,6 +6611,7 @@ impl DomainState {
 
     pub(crate) fn session_tool_configuration(&self) -> nakode_protocol::SessionToolConfiguration {
         nakode_protocol::SessionToolConfiguration {
+            directory_scope: self.directory_scope.clone(),
             tools: self.external_tools.clone(),
             replace_builtin_tools: self.replace_builtin_tools,
             code_mode: self.code_mode,
@@ -6649,13 +6662,7 @@ impl DomainState {
         ))
     }
 
-    fn validate_and_install_external_tools(
-        &mut self,
-        tools: Vec<nakode_protocol::ExternalToolDefinition>,
-        replace_builtin_tools: bool,
-        code_mode: bool,
-        allowed_builtin_tools: Option<Vec<String>>,
-    ) -> Result<Vec<Effect>, DomainCommandError> {
+    fn validate_initial_code_mode(&self, code_mode: bool) -> Result<(), DomainCommandError> {
         if code_mode
             && !matches!(
                 self.backend_provider.as_str(),
@@ -6670,6 +6677,23 @@ impl DomainState {
                 self.backend_provider
             )));
         }
+        Ok(())
+    }
+
+    fn validate_and_install_external_tools(
+        &mut self,
+        tools: Vec<nakode_protocol::ExternalToolDefinition>,
+        replace_builtin_tools: bool,
+        code_mode: bool,
+        allowed_builtin_tools: Option<Vec<String>>,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.validate_directory_tools(
+            &tools,
+            replace_builtin_tools,
+            code_mode,
+            allowed_builtin_tools.as_deref(),
+        )?;
+        self.validate_initial_code_mode(code_mode)?;
         if tools.is_empty()
             && allowed_builtin_tools.is_none()
             && !replace_builtin_tools
@@ -6766,6 +6790,9 @@ impl DomainState {
     /// Returns an error when work is pending or the selected provider cannot expose the required
     /// external-tool boundary.
     pub fn set_code_mode(&mut self, enabled: bool) -> Result<Vec<Effect>, DomainCommandError> {
+        if enabled {
+            self.require_unrestricted_session("Code Mode")?;
+        }
         if self.is_busy()
             || self.resuming_session.is_some()
             || !self.active_shells.is_empty()
@@ -6842,6 +6869,7 @@ impl DomainState {
         &mut self,
         tools: Vec<nakode_protocol::ExternalToolDefinition>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
+        self.require_unrestricted_session("MCP grants")?;
         if self.is_busy() || self.provider_session_id.is_some() {
             return Err(DomainCommandError::Invalid(
                 "MCP tools must be granted before the first prompt".to_owned(),
@@ -7221,6 +7249,14 @@ impl DomainState {
     }
 
     fn activate_provider(&mut self, provider: &str) -> bool {
+        if self.directory_scope.is_some()
+            && let Err(error) = self.validate_directory_provider(provider)
+        {
+            self.set_status(&format!(
+                "Directory scope refused provider activation: {error:?}"
+            ));
+            return false;
+        }
         if provider == self.backend_provider {
             return true;
         }
@@ -9514,6 +9550,7 @@ impl DomainState {
         request_id: u64,
         invocation: DelegationInvocation<'_>,
     ) -> Result<(String, Vec<Effect>), DomainCommandError> {
+        self.require_unrestricted_session("Delegation")?;
         let invocation_turn_id = invocation.turn_id;
         let invocation_call_id = invocation.call_id;
         let title = title.split_whitespace().collect::<Vec<_>>().join(" ");

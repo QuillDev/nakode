@@ -126,6 +126,7 @@ pub(crate) async fn execute_command(
                         None,
                         None,
                         Some(api::SessionToolConfiguration {
+                            directory_scope: None,
                             tools: Vec::new(),
                             replace_builtin_tools: false,
                             allowed_builtin_tools: Vec::new(),
@@ -206,6 +207,7 @@ async fn open_session(
                 session_id.to_string(),
                 nakode_sdk::SessionAttachment {
                     tools: Some(api::SessionToolConfiguration {
+                        directory_scope: None,
                         tools: Vec::new(),
                         replace_builtin_tools: false,
                         allowed_builtin_tools: Vec::new(),
@@ -679,6 +681,7 @@ fn bridge_projection_kind(value: i32) -> Result<view::BridgeProjectionKind, Stri
 
 pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, String> {
     Ok(view::SessionView {
+        directory_scope: value.directory_scope,
         id: view::SessionId::from(value.id),
         revision: value.revision,
         workspace_id: view::WorkspaceId::from(value.workspace_id),

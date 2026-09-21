@@ -1320,8 +1320,19 @@ impl ServerCore {
                 options,
             )?);
         }
-        if let Some(tools) = tools {
+        if let Some(mut tools) = tools {
             let provider = engine.state().active_provider_id().to_owned();
+            engine
+                .state_mut()
+                .install_directory_scope(tools.directory_scope.as_deref(), &provider)?;
+            if tools.directory_scope.is_some() && tools.allowed_builtin_tools.is_none() {
+                tools.allowed_builtin_tools = Some(
+                    crate::state::directory_scope::DIRECTORY_TOOLS
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect(),
+                );
+            }
             let tools = engine
                 .state()
                 .reconcile_available_builtin_tools(&provider, tools);
@@ -2070,12 +2081,13 @@ impl ServerCore {
         );
         match loaded.as_slice() {
             [loaded] => {
-                let (loaded_workspace, loaded_working_directory, loaded_account_id) = {
+                let (loaded_workspace, loaded_working_directory, loaded_account_id, loaded_scope) = {
                     let state = self.session_engine_mut(loaded)?.state();
                     (
                         state.workspace.clone(),
                         state.working_directory.clone(),
                         state.provider_account_id.clone(),
+                        state.session_tool_configuration().directory_scope,
                     )
                 };
                 if account_id
@@ -2090,6 +2102,7 @@ impl ServerCore {
                     loaded,
                     &loaded_working_directory,
                     &loaded_workspace,
+                    loaded_scope.as_deref(),
                 )?;
                 if *loaded == self.default_session
                     && !self
@@ -2100,6 +2113,9 @@ impl ServerCore {
                     return Err(DomainCommandError::NotFound(session_id.to_string()));
                 }
                 let effective_session_tools = Some(if let Some(tools) = tools {
+                    self.session_engine_mut(loaded)?
+                        .state()
+                        .validate_directory_attachment(tools.directory_scope.as_deref())?;
                     let provider = self
                         .session_engine_mut(loaded)?
                         .state()
@@ -2189,6 +2205,10 @@ impl ServerCore {
             session_id,
             &session.working_directory,
             &session.workspace,
+            session
+                .tool_configuration
+                .as_ref()
+                .and_then(|tools| tools.directory_scope.as_deref()),
         )?;
         self.refresh_session_template_addenda()?;
         let authoritative_ids = profile_id
@@ -2231,6 +2251,13 @@ impl ServerCore {
                 |tools| (tools, false),
             );
         Self::validate_provider_tool_projection(&session.provider, &established_tools)?;
+        engine.state_mut().install_directory_scope(
+            established_tools.directory_scope.as_deref(),
+            &session.provider,
+        )?;
+        engine
+            .state()
+            .validate_directory_attachment(requested_tools.directory_scope.as_deref())?;
         if established_tools != Self::default_session_tools() || !requested_tools_omitted {
             engine.state_mut().configure_session_tools(
                 established_tools.tools.clone(),
@@ -3280,6 +3307,7 @@ impl ServerCore {
 
     fn default_session_tools() -> nakode_protocol::SessionToolConfiguration {
         nakode_protocol::SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,
@@ -3385,8 +3413,9 @@ impl ServerCore {
             Query::InspectWorkspacePath {
                 path,
                 expected_git_repository,
+                directory_scope,
             } => Ok(QueryResult::WorkspacePathInspection(
-                inspect_workspace_path(&path, expected_git_repository.as_deref())?,
+                inspect_requested_path(&path, expected_git_repository.as_deref(), directory_scope)?,
             )),
             Query::Bootstrap {
                 workspace: _,
@@ -4751,12 +4780,71 @@ fn inspect_workspace_path(
     let revision = git(&["rev-parse", "HEAD"]).filter(|value| !value.is_empty());
     let dirty = git(&["status", "--porcelain=v1", "--untracked-files=normal"])
         .is_some_and(|value| !value.is_empty());
+    let host = crate::execution_host::ExecutionHost::detect().map_err(|error| {
+        service_error(
+            ErrorCode::Internal,
+            &format!("execution host identity unavailable: {error}"),
+            false,
+        )
+    })?;
     Ok(nakode_protocol::WorkspacePathInspectionView {
+        hostname: host.hostname,
+        operating_system: host.operating_system,
+        architecture: host.architecture,
         canonical_path,
         git_repository,
         branch,
         revision,
         dirty,
+    })
+}
+
+fn inspect_requested_path(
+    path: &str,
+    expected_git_repository: Option<&str>,
+    directory_scope: bool,
+) -> Result<nakode_protocol::WorkspacePathInspectionView, ServiceError> {
+    if !directory_scope {
+        return inspect_workspace_path(path, expected_git_repository);
+    }
+    if expected_git_repository.is_some() {
+        return Err(service_error(
+            ErrorCode::InvalidRequest,
+            "directory scope cannot require a Git repository",
+            false,
+        ));
+    }
+    inspect_directory_scope(path)
+}
+
+fn inspect_directory_scope(
+    requested: &str,
+) -> Result<nakode_protocol::WorkspacePathInspectionView, ServiceError> {
+    if !(Path::new(requested).is_absolute() || requested == "~" || requested.starts_with("~/")) {
+        return Err(service_error(
+            ErrorCode::InvalidRequest,
+            "directory scope requires an absolute path or server-home-relative ~/ path",
+            false,
+        ));
+    }
+    let canonical_path =
+        canonical_working_directory(Some(requested), requested).map_err(domain_error)?;
+    let host = crate::execution_host::ExecutionHost::detect().map_err(|error| {
+        service_error(
+            ErrorCode::Internal,
+            &format!("execution host identity unavailable: {error}"),
+            false,
+        )
+    })?;
+    Ok(nakode_protocol::WorkspacePathInspectionView {
+        canonical_path,
+        hostname: host.hostname,
+        operating_system: host.operating_system,
+        architecture: host.architecture,
+        git_repository: None,
+        branch: None,
+        revision: None,
+        dirty: false,
     })
 }
 
@@ -4858,13 +4946,22 @@ fn canonical_open_session_working_directory(
     session_id: &SessionId,
     working_directory: &str,
     workspace: &str,
+    approved_scope: Option<&str>,
 ) -> Result<String, DomainCommandError> {
-    canonical_working_directory(Some(working_directory), workspace).map_err(|error| match error {
-        DomainCommandError::Invalid(_) => DomainCommandError::NotFound(format!(
-            "session {session_id}: backing working directory is unavailable"
-        )),
-        other => other,
-    })
+    let canonical = canonical_working_directory(Some(working_directory), workspace).map_err(
+        |error| match error {
+            DomainCommandError::Invalid(_) => DomainCommandError::NotFound(format!(
+                "session {session_id}: backing working directory is unavailable"
+            )),
+            other => other,
+        },
+    )?;
+    if approved_scope.is_some_and(|root| canonical != root) {
+        return Err(DomainCommandError::Conflict(format!(
+            "session {session_id}: backing working directory now resolves to a different location; start a new session after reviewing the new scope"
+        )));
+    }
+    Ok(canonical)
 }
 
 fn canonical_working_directory_with_home(
@@ -4919,6 +5016,12 @@ fn canonical_working_directory_with_home(
             "working_directory {location} is not a directory"
         )));
     }
+    std::fs::read_dir(&canonical).map_err(|error| {
+        DomainCommandError::Invalid(format!(
+            "working_directory {} cannot be listed by the Nakode server: {error}",
+            canonical.display()
+        ))
+    })?;
     Ok(canonical.to_string_lossy().into_owned())
 }
 
@@ -5624,6 +5727,7 @@ mod tests {
 
     fn dashboard_tools(name: &str, replace_builtin_tools: bool) -> SessionToolConfiguration {
         SessionToolConfiguration {
+            directory_scope: None,
             tools: vec![ExternalToolDefinition {
                 name: name.to_owned(),
                 description: format!("Run {name}"),
@@ -5705,6 +5809,7 @@ mod tests {
                 capabilities: BackendCapabilities {
                     external_tools: CapabilitySupport::Supported,
                     resume: CapabilitySupport::Supported,
+                    scoped_runtime_policy: CapabilitySupport::Supported,
                     ..BackendCapabilities::default()
                 },
             }),
@@ -7450,6 +7555,165 @@ mod tests {
     }
 
     #[test]
+    fn directory_scope_preview_is_repository_free_and_host_authoritative() {
+        let directory = tempfile::tempdir().expect("directory");
+        let preview =
+            super::inspect_directory_scope(directory.path().to_str().unwrap()).expect("preview");
+        assert_eq!(
+            preview.canonical_path,
+            directory.path().canonicalize().unwrap().to_string_lossy()
+        );
+        assert!(!preview.hostname.is_empty());
+        assert_eq!(preview.operating_system, std::env::consts::OS);
+        assert!(preview.git_repository.is_none());
+        assert!(super::inspect_directory_scope("relative/path").is_err());
+        assert!(
+            super::inspect_directory_scope(directory.path().join("missing").to_str().unwrap())
+                .is_err()
+        );
+        let file = directory.path().join("file");
+        fs::write(&file, "content").unwrap();
+        assert!(super::inspect_directory_scope(file.to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_scope_resume_refuses_retargeted_canonical_root() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let elsewhere = base.path().join("elsewhere");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        let canonical = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        fs::rename(&root, base.path().join("retained")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+        assert!(
+            super::canonical_open_session_working_directory(
+                &SessionId::from("scoped"),
+                &canonical,
+                &canonical,
+                Some(&canonical)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn directory_scope_is_installed_atomically_and_blocks_escape_tools() {
+        let (mut core, _) = ready_external_tools_server();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let mut tools = ServerCore::default_session_tools();
+        tools.directory_scope = Some(root.clone());
+        let (created, _) = core
+            .create_session_command_with_mcp(
+                &workspace_id,
+                Some(&root),
+                Some("Directory investigation"),
+                None,
+                &ModelOptions::default(),
+                Some(tools),
+                None,
+                None,
+                None,
+            )
+            .expect("scoped creation");
+        let id = SessionId::from(created.resource_id.unwrap());
+        let state = core.session_engine_mut(&id).unwrap().state_mut();
+        let installed = state.session_tool_configuration();
+        assert_eq!(installed.directory_scope.as_deref(), Some(root.as_str()));
+        assert!(matches!(
+            state.set_code_mode(true),
+            Err(DomainCommandError::Unsupported(_))
+        ));
+        assert!(state.run_shell_command("pwd".into()).is_err());
+        assert!(state.configure_mcp_tools(Vec::new()).is_err());
+        assert!(
+            state
+                .configure_session_tools(Vec::new(), false, false, Some(vec!["bash".into()]))
+                .is_err()
+        );
+        assert!(state.validate_directory_attachment(Some("/")).is_err());
+        assert!(
+            state
+                .configure_session_tools(Vec::new(), false, true, Some(vec!["read".into()]))
+                .is_err()
+        );
+        assert!(
+            state
+                .validate_directory_provider(crate::backend::CLAUDE_PROVIDER)
+                .is_err()
+        );
+        let encoded = serde_json::to_string(&installed).unwrap();
+        let restored: SessionToolConfiguration = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored, installed);
+        assert_eq!(
+            core.session_view(&id).unwrap().directory_scope.as_deref(),
+            Some(root.as_str())
+        );
+    }
+
+    #[test]
+    fn directory_scope_cold_resume_restores_cwd_and_policy() {
+        let (mut core, _) = ready_external_tools_server();
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical directory")
+            .to_string_lossy()
+            .into_owned();
+        let id = SessionId::from("saved-directory-session");
+        let mut tools = ServerCore::default_session_tools();
+        tools.directory_scope = Some(root.clone());
+        tools.allowed_builtin_tools = Some(vec!["read".to_owned()]);
+        core.replace_session_records(vec![SessionRecord {
+            first_prompt_preview: String::new(),
+            initial_instructions: None,
+            id: id.to_string(),
+            provider: CODEX_PROVIDER.to_owned(),
+            provider_session_id: "saved-directory-provider".to_owned(),
+            account_id: None,
+            workspace: "/tmp/project".to_owned(),
+            working_directory: root.clone(),
+            title: "Directory task".to_owned(),
+            model: None,
+            model_options: crate::backend::ModelOptions::default(),
+            last_turn: None,
+            owner_turns: Vec::new(),
+            owner_prompts: Vec::new(),
+            created_at: 10,
+            updated_at: 12,
+            last_owner_activity_at: None,
+            tool_configuration: Some(tools.clone()),
+            code_mode: false,
+            enabled_skill_ids: None,
+            owned_provider_sessions: Vec::new(),
+        }]);
+        let (opened, _) = core
+            .open_session_command(&id, None)
+            .expect("cold scoped resume");
+        assert_eq!(opened.effective_session_tools, Some(tools));
+        let state = core
+            .session_engine_mut(&id)
+            .expect("restored engine")
+            .state_mut();
+        assert_eq!(state.working_directory, root);
+        assert_eq!(
+            state.session_tool_configuration().directory_scope,
+            Some(root)
+        );
+        assert!(state.run_shell_command("pwd".to_owned()).is_err());
+        assert!(state.set_code_mode(true).is_err());
+    }
+
+    #[test]
     fn fresh_session_tools_are_installed_before_the_first_provider_effect() {
         let (mut core, _) = ready_external_tools_server();
         let workspace_id = core.workspace_bootstrap().workspace_id;
@@ -7501,6 +7765,7 @@ mod tests {
         let (mut core, _) = ready_external_tools_server();
         let workspace_id = core.workspace_bootstrap().workspace_id;
         let tools = SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: true,
@@ -7613,6 +7878,7 @@ mod tests {
             input_schema_json: r#"{"type":"object"}"#.to_owned(),
         };
         let tools = SessionToolConfiguration {
+            directory_scope: None,
             tools: vec![client_tool],
             replace_builtin_tools: false,
             code_mode: true,
@@ -7713,6 +7979,7 @@ mod tests {
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let workspace_id = core.workspace_bootstrap().workspace_id;
         let tools = SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,
@@ -7751,6 +8018,7 @@ mod tests {
         let (mut core, _) = ready_external_tools_server();
         let workspace_id = core.workspace_bootstrap().workspace_id;
         let configured = SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,
@@ -7770,6 +8038,7 @@ mod tests {
             .open_session_command(
                 &id,
                 Some(SessionToolConfiguration {
+                    directory_scope: None,
                     allowed_builtin_tools: Some(vec!["read".to_owned(), "grep".to_owned()]),
                     ..configured.clone()
                 }),
@@ -7782,6 +8051,7 @@ mod tests {
             .open_session_command(
                 &id,
                 Some(SessionToolConfiguration {
+                    directory_scope: None,
                     allowed_builtin_tools: Some(vec!["grep".to_owned()]),
                     ..configured
                 }),
@@ -7796,6 +8066,7 @@ mod tests {
         install_available_tools(&mut core, CODEX_PROVIDER, &["read", "grep"]);
         let id = SessionId::from("restored-builtin-subset");
         let established = SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,
@@ -7829,6 +8100,7 @@ mod tests {
             (
                 "external tools",
                 SessionToolConfiguration {
+                    directory_scope: None,
                     tools: vec![ExternalToolDefinition {
                         name: "ticket_lookup".to_owned(),
                         description: "Look up a ticket".to_owned(),
@@ -7840,6 +8112,7 @@ mod tests {
             (
                 "replacement mode",
                 SessionToolConfiguration {
+                    directory_scope: None,
                     replace_builtin_tools: true,
                     allowed_builtin_tools: None,
                     ..established.clone()
@@ -7848,6 +8121,7 @@ mod tests {
             (
                 "Code Mode",
                 SessionToolConfiguration {
+                    directory_scope: None,
                     code_mode: true,
                     ..established.clone()
                 },
@@ -7855,6 +8129,7 @@ mod tests {
             (
                 "missing builtin authority",
                 SessionToolConfiguration {
+                    directory_scope: None,
                     allowed_builtin_tools: Some(vec!["grep".to_owned()]),
                     ..established.clone()
                 },
@@ -7872,6 +8147,7 @@ mod tests {
             .open_session_command(
                 &id,
                 Some(SessionToolConfiguration {
+                    directory_scope: None,
                     allowed_builtin_tools: Some(vec!["read".to_owned(), "grep".to_owned()]),
                     ..established.clone()
                 }),
@@ -7891,6 +8167,7 @@ mod tests {
             &["read", "memory_search", "memory_store", "browser", "vision"],
         );
         let requested = SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,
@@ -7919,6 +8196,7 @@ mod tests {
             None,
             &ModelOptions::default(),
             Some(SessionToolConfiguration {
+                directory_scope: None,
                 tools: Vec::new(),
                 replace_builtin_tools: false,
                 code_mode: false,
@@ -8076,6 +8354,7 @@ mod tests {
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,
@@ -8122,6 +8401,7 @@ mod tests {
         let workspace_id = core.workspace_bootstrap().workspace_id;
         let session_count = core.sessions_by_id.len();
         let tools = SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,
@@ -8185,6 +8465,7 @@ mod tests {
             owned_provider_sessions: Vec::new(),
         }]);
         let tools = SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,
@@ -8290,6 +8571,7 @@ mod tests {
         let workspace_id = core.workspace_bootstrap().workspace_id;
         let session_count = core.sessions_by_id.len();
         let invalid = SessionToolConfiguration {
+            directory_scope: None,
             tools: Vec::new(),
             replace_builtin_tools: false,
             code_mode: false,

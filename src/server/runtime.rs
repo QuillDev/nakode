@@ -3084,6 +3084,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::CodeMode,
             ServiceCapability::VisionAvailability,
             ServiceCapability::SessionWorkingDirectories,
+            ServiceCapability::DirectoryScopedSessions,
             ServiceCapability::InitialSessionModel,
             ServiceCapability::InitialSessionInstructions,
             ServiceCapability::SessionEnvironment,
@@ -8155,6 +8156,7 @@ mod tests {
             model_id: None,
             options: ModelOptions::default(),
             tools: Some(SessionToolConfiguration {
+                directory_scope: None,
                 tools: Vec::new(),
                 replace_builtin_tools: false,
                 code_mode: false,

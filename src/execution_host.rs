@@ -5,9 +5,9 @@ const MAX_HOST_FACT_CHARS: usize = 128;
 /// Stable, server-observed facts about the machine that owns provider and tool execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionHost {
-    hostname: String,
-    operating_system: String,
-    architecture: String,
+    pub(crate) hostname: String,
+    pub(crate) operating_system: String,
+    pub(crate) architecture: String,
 }
 
 impl ExecutionHost {
