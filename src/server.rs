@@ -4,6 +4,8 @@
 //! server effects for the runtime supervisor to execute; clients never receive
 //! provider commands, persistence handles, or process objects.
 
+mod path_inspection;
+use path_inspection::inspect_workspace_path;
 pub(crate) mod runtime;
 pub mod session_sync;
 mod status;
@@ -3382,11 +3384,10 @@ impl ServerCore {
 
     fn query_view(&self, query: Query) -> Result<QueryResult, ServiceError> {
         match query {
-            Query::InspectWorkspacePath {
-                path,
-                expected_git_repository,
-            } => Ok(QueryResult::WorkspacePathInspection(
-                inspect_workspace_path(&path, expected_git_repository.as_deref())?,
+            Query::InspectWorkspacePath { .. } => Err(service_error(
+                ErrorCode::Internal,
+                "workspace inspection requires the asynchronous runtime",
+                true,
             )),
             Query::Bootstrap {
                 workspace: _,
@@ -4709,57 +4710,6 @@ impl ServerCore {
     }
 }
 
-fn inspect_workspace_path(
-    requested: &str,
-    expected_git_repository: Option<&str>,
-) -> Result<nakode_protocol::WorkspacePathInspectionView, ServiceError> {
-    let canonical_path =
-        canonical_working_directory(Some(requested), requested).map_err(domain_error)?;
-    let git = |arguments: &[&str]| -> Option<String> {
-        let output = std::process::Command::new("git")
-            .envs(crate::machine_path::environment())
-            .args(["-C", canonical_path.as_str()])
-            .args(arguments)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-    };
-    let git_repository = git(&["config", "--get", "remote.origin.url"])
-        .filter(|value| !value.is_empty())
-        .map(|value| sanitized_repository_identity(&value));
-    if let Some(expected) = expected_git_repository {
-        let expected = sanitized_repository_identity(expected);
-        let actual = git_repository.as_deref().ok_or_else(|| {
-            service_error(
-                ErrorCode::Conflict,
-                "workspace path has no configured origin repository",
-                false,
-            )
-        })?;
-        if actual != expected {
-            let message =
-                format!("workspace repository mismatch: expected {expected}, found {actual}");
-            return Err(service_error(ErrorCode::Conflict, &message, false));
-        }
-    }
-    let branch =
-        git(&["symbolic-ref", "--quiet", "--short", "HEAD"]).filter(|value| !value.is_empty());
-    let revision = git(&["rev-parse", "HEAD"]).filter(|value| !value.is_empty());
-    let dirty = git(&["status", "--porcelain=v1", "--untracked-files=normal"])
-        .is_some_and(|value| !value.is_empty());
-    Ok(nakode_protocol::WorkspacePathInspectionView {
-        canonical_path,
-        git_repository,
-        branch,
-        revision,
-        dirty,
-    })
-}
-
 fn sanitized_repository_identity(value: &str) -> String {
     const UNRECOGNIZED: &str = "[unrecognized repository]";
 
@@ -5768,8 +5718,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workspace_path_inspection_reports_git_identity_and_dirty_state() {
+    #[tokio::test]
+    async fn workspace_path_inspection_reports_git_identity_and_dirty_state() {
         let directory = tempfile::tempdir().expect("tempdir");
         for arguments in [
             vec!["init", "-b", "main"],
@@ -5809,6 +5759,7 @@ mod tests {
             directory.path().to_str().unwrap(),
             Some("ssh://example.invalid/team/repo.git"),
         )
+        .await
         .expect("inspect clean repository");
         assert_eq!(
             clean.canonical_path,
@@ -5825,6 +5776,7 @@ mod tests {
         fs::write(directory.path().join("untracked.txt"), "dirty\n").expect("dirty fixture");
         assert!(
             inspect_workspace_path(directory.path().to_str().unwrap(), None)
+                .await
                 .expect("inspect dirty repository")
                 .dirty
         );
@@ -5832,17 +5784,19 @@ mod tests {
             directory.path().to_str().unwrap(),
             Some("ssh://example.invalid/other.git"),
         )
+        .await
         .expect_err("reject repository mismatch");
         assert_eq!(mismatch.code, ErrorCode::Conflict);
     }
 
-    #[test]
-    fn workspace_path_inspection_rejects_missing_or_non_directory_paths() {
+    #[tokio::test]
+    async fn workspace_path_inspection_rejects_missing_or_non_directory_paths() {
         let directory = tempfile::tempdir().expect("tempdir");
         let file = directory.path().join("file.txt");
         fs::write(&file, "not a directory").expect("write fixture");
         for path in [file, directory.path().join("missing")] {
             let error = inspect_workspace_path(path.to_str().unwrap(), None)
+                .await
                 .expect_err("invalid inspection path");
             assert_eq!(error.code, ErrorCode::InvalidRequest);
         }
@@ -5906,10 +5860,12 @@ mod tests {
         assert!(unresolved.contains("runtime user home directory is unavailable"));
     }
 
-    #[test]
-    fn workspace_path_inspection_resolves_the_server_runtime_home() {
+    #[tokio::test]
+    async fn workspace_path_inspection_resolves_the_server_runtime_home() {
         let home = directories::BaseDirs::new().expect("test runtime home");
-        let inspected = inspect_workspace_path("~", None).expect("inspect runtime home");
+        let inspected = inspect_workspace_path("~", None)
+            .await
+            .expect("inspect runtime home");
 
         assert_eq!(
             inspected.canonical_path,
@@ -5917,10 +5873,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workspace_path_inspection_accepts_a_repository_free_directory() {
+    #[tokio::test]
+    async fn workspace_path_inspection_accepts_a_repository_free_directory() {
         let directory = tempfile::tempdir().expect("repository-free directory");
         let inspected = inspect_workspace_path(directory.path().to_str().expect("utf8 path"), None)
+            .await
             .expect("inspect repository-free directory");
 
         assert_eq!(

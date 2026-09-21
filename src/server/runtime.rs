@@ -260,6 +260,10 @@ pub(crate) struct NativeServerRuntime {
     next_mcp_discovery_request: u64,
     skill_catalogue: SkillCatalog,
     skill_preferences: HashMap<String, Vec<crate::skill::SkillPreference>>,
+    path_inspections: tokio::task::JoinSet<()>,
+    agent_browser_checks:
+        tokio::task::JoinSet<(u64, nakode_protocol::SessionId, AgentBrowserStatus)>,
+    agent_browser_check_generation: u64,
 }
 
 pub(crate) struct PreparedRuntime {
@@ -495,6 +499,9 @@ impl NativeServerRuntime {
                 next_mcp_discovery_request: 1,
                 skill_catalogue,
                 skill_preferences,
+                path_inspections: tokio::task::JoinSet::new(),
+                agent_browser_checks: tokio::task::JoinSet::new(),
+                agent_browser_check_generation: 0,
             },
             handle,
         )
@@ -516,6 +523,16 @@ impl NativeServerRuntime {
                     };
                     let context = request.trace_context();
                     Box::pin(nakode_telemetry::operation("nakode.execute", self.handle_request(request)).with_context(context)).await;
+                }
+                _ = self.path_inspections.join_next(), if !self.path_inspections.is_empty() => {}
+                completion = self.agent_browser_checks.join_next(), if !self.agent_browser_checks.is_empty() => {
+                    if let Some(Ok((generation, session_id, status))) = completion
+                        && generation == self.agent_browser_check_generation
+                        && let Some(engine) = self.core.engine_for_mut(&session_id)
+                    {
+                        engine.state_mut().set_agent_browser_status(status);
+                        self.core.commit_and_publish_session(&self.endpoint, &session_id);
+                    }
                 }
                 request = self.quiesce.recv() => {
                     if let Some(request) = request {
@@ -550,27 +567,7 @@ impl NativeServerRuntime {
                 }
                 event = self.effects.shell_processes.events.recv(), if shell_open => {
                     match event {
-                        Some(event) => {
-                            let shell_id = shell_event_id(&event).to_owned();
-                            let terminal = matches!(
-                                event,
-                                ShellEvent::Finished { .. } | ShellEvent::Failed { .. }
-                            );
-                            let session_id = self
-                                .shell_owners
-                                .get(&shell_id)
-                                .cloned()
-                                .unwrap_or_else(|| self.core.default_session_id().clone());
-                            if let Some(engine) = self.core.engine_for_mut(&session_id) {
-                                EffectExecutor::handle_shell_event(engine.state_mut(), event);
-                                self.core
-                                    .commit_and_publish_session(&self.endpoint, &session_id);
-                            }
-                            if terminal {
-                                self.shell_owners.remove(&shell_id);
-                                self.effects.shell_processes.complete(&shell_id);
-                            }
-                        }
+                        Some(event) => self.handle_shell_event(event),
                         None => shell_open = false,
                     }
                 }
@@ -599,6 +596,28 @@ impl NativeServerRuntime {
             pending.cancellation.cancel();
         }
         self.effects.shutdown().await;
+    }
+
+    fn handle_shell_event(&mut self, event: ShellEvent) {
+        let shell_id = shell_event_id(&event).to_owned();
+        let terminal = matches!(
+            event,
+            ShellEvent::Finished { .. } | ShellEvent::Failed { .. }
+        );
+        let session_id = self
+            .shell_owners
+            .get(&shell_id)
+            .cloned()
+            .unwrap_or_else(|| self.core.default_session_id().clone());
+        if let Some(engine) = self.core.engine_for_mut(&session_id) {
+            EffectExecutor::handle_shell_event(engine.state_mut(), event);
+            self.core
+                .commit_and_publish_session(&self.endpoint, &session_id);
+        }
+        if terminal {
+            self.shell_owners.remove(&shell_id);
+            self.effects.shell_processes.complete(&shell_id);
+        }
     }
 
     fn handle_quiesce(&mut self, request: QuiesceRequest) {
@@ -1457,6 +1476,39 @@ impl NativeServerRuntime {
             return;
         }
         let request = match request {
+            nakode_server::ServerRequest::Query {
+                query:
+                    Query::InspectWorkspacePath {
+                        path,
+                        expected_git_repository,
+                    },
+                mut respond,
+                ..
+            } => {
+                // Admission never waits in the actor. Bound subprocess fan-out and cancel work
+                // when its caller disappears; all domain mutations remain on the actor.
+                while self.path_inspections.try_join_next().is_some() {}
+                if self.path_inspections.len() >= 4 {
+                    let _ = respond.send(Err(ServiceError {
+                        code: ErrorCode::ProviderUnavailable,
+                        message: "workspace inspection capacity is busy; retry the read".to_owned(),
+                        retryable: true,
+                    }));
+                    return;
+                }
+                let cursor = self.endpoint.cursor();
+                self.path_inspections.spawn(async move {
+                    tokio::select! {
+                        () = respond.closed() => {},
+                        result = super::inspect_workspace_path(&path, expected_git_repository.as_deref()) => {
+                            let _ = respond.send(result.map(|view| Snapshot {
+                                cursor, value: QueryResult::WorkspacePathInspection(view),
+                            }));
+                        }
+                    }
+                });
+                return;
+            }
             nakode_server::ServerRequest::Query {
                 query:
                     Query::ListSkills {
@@ -2638,6 +2690,9 @@ impl NativeServerRuntime {
         let mut sync_memory_config = false;
         for effect in effects {
             match effect {
+                Effect::CheckAgentBrowser => {
+                    self.spawn_agent_browser_check(session_id.clone(), check_agent_browser());
+                }
                 Effect::SaveMcpServer(server) => {
                     self.cancel_mcp_server_work(&server.id).await;
                     if self
@@ -2810,6 +2865,19 @@ impl NativeServerRuntime {
             let memory_config = self.effects.backends.current_memory_config();
             self.core.install_memory_config(&memory_config);
         }
+    }
+
+    fn spawn_agent_browser_check(
+        &mut self,
+        session_id: nakode_protocol::SessionId,
+        check: impl std::future::Future<Output = AgentBrowserStatus> + Send + 'static,
+    ) {
+        self.agent_browser_checks.abort_all();
+        while self.agent_browser_checks.try_join_next().is_some() {}
+        self.agent_browser_check_generation = self.agent_browser_check_generation.wrapping_add(1);
+        let generation = self.agent_browser_check_generation;
+        self.agent_browser_checks
+            .spawn(async move { (generation, session_id, check.await) });
     }
 
     fn complete_mcp_discovery(&mut self, completion: McpDiscoveryCompletion) {
@@ -4878,7 +4946,9 @@ impl EffectExecutor {
                     state.session_store_failed(error.to_string());
                 }
             }
-            Effect::CheckAgentBrowser => check_agent_browser(state).await,
+            Effect::CheckAgentBrowser => {
+                state.set_agent_browser_status(check_agent_browser().await);
+            }
             Effect::SaveMcpServer(_)
             | Effect::RefreshMcpServer(_)
             | Effect::DeleteMcpServer { .. }
@@ -6328,7 +6398,7 @@ fn load_subagents(
     }
 }
 
-async fn check_agent_browser(state: &mut DomainState) {
+async fn check_agent_browser() -> AgentBrowserStatus {
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::process::Command::new("agent-browser")
@@ -6338,7 +6408,7 @@ async fn check_agent_browser(state: &mut DomainState) {
             .output(),
     )
     .await;
-    let status = match result {
+    match result {
         Ok(Ok(output)) if output.status.success() => {
             let text = if output.stdout.is_empty() {
                 &output.stderr
@@ -6360,8 +6430,7 @@ async fn check_agent_browser(state: &mut DomainState) {
             })
         }
         _ => AgentBrowserStatus::Unavailable,
-    };
-    state.set_agent_browser_status(status);
+    }
 }
 
 fn initial_state(
@@ -9410,6 +9479,281 @@ mod tests {
 
         handle.shutdown().await;
         runtime.await.expect("runtime task");
+    }
+
+    #[cfg(unix)]
+    fn slow_git_workspace() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp");
+        std::fs::create_dir_all(&temporary).expect("temporary root");
+        let workspace = tempfile::tempdir_in(temporary).expect("workspace");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(workspace.path())
+                    .args(args)
+                    .output()
+                    .expect("git setup")
+                    .status
+                    .success()
+            );
+        };
+        git(&["init"]);
+        std::fs::write(workspace.path().join("tracked"), "content").expect("fixture");
+        git(&["add", "tracked"]);
+        let monitor = workspace.path().join("slow-monitor");
+        std::fs::write(
+            &monitor,
+            "#!/bin/sh\nprintf '' > \"$0.started\"\nsleep 2\nexit 1\n",
+        )
+        .expect("monitor");
+        std::fs::set_permissions(&monitor, std::fs::Permissions::from_mode(0o700))
+            .expect("executable");
+        git(&["config", "core.fsmonitor", monitor.to_str().expect("path")]);
+        workspace
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_git_inspection_does_not_block_control_or_session_reads() {
+        let workspace = slow_git_workspace();
+        let (persistence, _) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let (runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let endpoint = handle.endpoint().clone();
+        let actor = tokio::spawn(runtime.run());
+        let inspection_endpoint = endpoint.clone();
+        let path = workspace.path().to_string_lossy().into_owned();
+        let inspection = tokio::spawn(async move {
+            inspection_endpoint
+                .execute_query(
+                    ClientId::from("slow-inspection"),
+                    Query::InspectWorkspacePath {
+                        path,
+                        expected_git_repository: None,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !workspace.path().join("slow-monitor.started").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Git monitor started");
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            let mut reads = tokio::task::JoinSet::new();
+            for _ in 0..16 {
+                let endpoint = endpoint.clone();
+                let session_id = session_id.clone();
+                reads.spawn(async move {
+                    endpoint
+                        .execute_query(ClientId::from("control"), Query::GetSession { session_id })
+                        .await
+                });
+            }
+            while let Some(result) = reads.join_next().await {
+                result.expect("read task").expect("session snapshot");
+            }
+        })
+        .await
+        .expect("session reads must not wait for Git");
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            endpoint.execute_command(
+                ClientId::from("control"),
+                IdempotencyKey::from("cancel-during-inspect"),
+                None,
+                false,
+                Command::CancelSessionWork { session_id },
+            ),
+        )
+        .await
+        .expect("cancel must not wait for Git")
+        .expect("cancel accepted");
+        eprintln!(
+            "16 control reads + cancellation while Git is blocked: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !inspection.is_finished(),
+            "control completed before inspection"
+        );
+        inspection
+            .await
+            .expect("inspection task")
+            .expect("inspection result");
+        handle.shutdown().await;
+        actor.await.expect("runtime");
+    }
+
+    #[tokio::test]
+    async fn saturated_path_inspections_leave_control_available_and_recover() {
+        let temporary = Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp");
+        std::fs::create_dir_all(&temporary).expect("temporary root");
+        let workspace = tempfile::tempdir_in(temporary).expect("workspace");
+        let (persistence, _) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let (mut runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let mut releases = Vec::new();
+        for _ in 0..4 {
+            let (release, gate) = tokio::sync::oneshot::channel::<()>();
+            releases.push(release);
+            runtime.path_inspections.spawn(async move {
+                let _ = gate.await;
+            });
+        }
+        let endpoint = handle.endpoint().clone();
+        let actor = tokio::spawn(runtime.run());
+        let inspect = Query::InspectWorkspacePath {
+            path: workspace.path().to_string_lossy().into_owned(),
+            expected_git_repository: None,
+        };
+        let error = endpoint
+            .execute_query(ClientId::from("capacity"), inspect.clone())
+            .await
+            .expect_err("inspection admission refused");
+        assert!(error.retryable);
+        assert_eq!(error.code, ErrorCode::ProviderUnavailable);
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            endpoint.execute_query(ClientId::from("capacity"), Query::GetSession { session_id }),
+        )
+        .await
+        .expect("control remains responsive")
+        .expect("session");
+        for release in releases {
+            release.send(()).expect("release admitted work");
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match endpoint
+                    .execute_query(ClientId::from("capacity"), inspect.clone())
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error)
+                        if error.code == ErrorCode::ProviderUnavailable && error.retryable =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => panic!("unexpected inspection error: {error:?}"),
+                }
+            }
+        })
+        .await
+        .expect("inspection admission recovers");
+        handle.shutdown().await;
+        actor.await.expect("runtime");
+    }
+
+    #[tokio::test]
+    async fn superseded_browser_checks_are_cancelled_without_blocking_reads() {
+        let temporary = Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp");
+        std::fs::create_dir_all(&temporary).expect("temporary root");
+        let workspace = tempfile::tempdir_in(temporary).expect("workspace");
+        let (persistence, _) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CODEX_PROVIDER,
+            "Codex",
+        );
+        let session_id = SessionId::from(state.nakode_session_id.clone());
+        let (mut runtime, handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+        let (old, abandoned) = tokio::sync::oneshot::channel::<()>();
+        runtime.spawn_agent_browser_check(session_id.clone(), async move {
+            let _ = abandoned.await;
+            crate::state::AgentBrowserStatus::Unavailable
+        });
+        tokio::task::yield_now().await;
+        let (current, waiting) = tokio::sync::oneshot::channel::<()>();
+        runtime.spawn_agent_browser_check(session_id.clone(), async move {
+            let _ = waiting.await;
+            crate::state::AgentBrowserStatus::Available("new".to_owned())
+        });
+        let endpoint = handle.endpoint().clone();
+        let actor = tokio::spawn(runtime.run());
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            endpoint.execute_query(
+                ClientId::from("browser-check"),
+                Query::GetSession {
+                    session_id: session_id.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("query independent of probe")
+        .expect("snapshot");
+        assert!(old.send(()).is_err(), "superseded check was cancelled");
+        current.send(()).expect("current probe still alive");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let result = endpoint
+                    .execute_query(
+                        ClientId::from("browser-status"),
+                        Query::Bootstrap {
+                            workspace: workspace.path().to_string_lossy().into_owned(),
+                            session_id: Some(session_id.clone()),
+                        },
+                    )
+                    .await
+                    .expect("bootstrap");
+                if let QueryResult::Bootstrap(view) = result.value
+                    && view.settings.web.agent_browser
+                        == (nakode_protocol::AgentBrowserView::Available {
+                            version: "new".to_owned(),
+                        })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("newest browser result published");
+        handle.shutdown().await;
+        actor.await.expect("runtime");
     }
 
     #[tokio::test]
