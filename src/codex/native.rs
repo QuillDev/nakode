@@ -41,7 +41,8 @@ use crate::{
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
-const CODEX_CLIENT_VERSION: &str = "0.153.2";
+// Match the stable upstream Codex protocol baseline, not a local CLI installation.
+const CODEX_CLIENT_VERSION: &str = "0.155.1";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -1520,7 +1521,10 @@ async fn discover_models(
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
                         display_name: None,
-                        capabilities: super::model_capabilities(),
+                        capabilities: super::discovered_model_capabilities(
+                            entry.get("supported_reasoning_levels"),
+                            "effort",
+                        ),
                     },
                     context_window,
                 })
@@ -3082,6 +3086,36 @@ mod tests {
         assert_eq!(models[0].info.id, "gpt-native");
         assert!(models[0].info.is_default);
         assert_eq!(models[0].context_window, Some(258_400));
+        assert!(models[0].info.capabilities.reasoning_efforts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_keeps_model_specific_efforts_and_existing_defaults() {
+        let (base_url, server) = serve_once(
+            "application/json",
+            r#"{"models":[
+                {"slug":"gpt-5.6-sol","is_default":true,"supported_reasoning_levels":[{"effort":"none"},{"effort":"high"}]},
+                {"slug":"gpt-6-astra","supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}]}
+            ]}"#,
+        )
+        .await;
+        let config = BackendConfig::native(PathBuf::from(".")).with_base_url(base_url);
+        let models = discover_models(&config, &test_credential()).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].info.id, "gpt-5.6-sol");
+        assert!(models[0].info.is_default);
+        assert_eq!(
+            models[0].info.capabilities.reasoning_efforts,
+            ["none", "high"]
+        );
+        assert_eq!(models[1].info.id, "gpt-6-astra");
+        assert!(!models[1].info.is_default);
+        assert_eq!(
+            models[1].info.capabilities.reasoning_efforts,
+            ["low", "ultra"]
+        );
     }
 
     #[tokio::test]
@@ -3095,7 +3129,7 @@ mod tests {
             (
                 200,
                 "application/json",
-                r#"{"models":[{"slug":"gpt-6-astra","is_default":true}]}"#,
+                r#"{"models":[{"slug":"gpt-6-astra","is_default":true,"supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"},{"effort":"max"},{"effort":"ultra"}]}]}"#,
             ),
             (200, "text/event-stream", response),
         ])
@@ -3118,6 +3152,11 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let mut request = test_request();
         request.model.clone_from(&discovered.info.id);
+        assert_eq!(
+            discovered.info.capabilities.reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        request.reasoning_effort = Some("ultra".to_owned());
 
         let output = provider
             .infer_response(request, event_tx, CancellationToken::new())
@@ -3126,9 +3165,12 @@ mod tests {
         let requests = server.await.expect("mock server task");
 
         assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with("GET /codex/models?client_version=0.153.2 HTTP/1.1"));
+        assert!(requests[0].starts_with("GET /codex/models?client_version=0.155.1 HTTP/1.1"));
         assert!(requests[1].starts_with("POST /codex/responses HTTP/1.1"));
+        assert!(requests[0].contains("version: 0.155.1"));
+        assert!(requests[1].contains("version: 0.155.1"));
         assert!(requests[1].contains(r#""model":"gpt-6-astra""#));
+        assert!(requests[1].contains(r#""effort":"ultra""#));
         assert_eq!(output.text, "ready");
         assert_eq!(output.response_id.as_deref(), Some("response-astra"));
     }
@@ -3771,13 +3813,17 @@ mod tests {
 
     #[test]
     fn codex_requests_parallel_tools_and_the_configured_reasoning_effort() {
-        let mut request = test_request();
-        request.reasoning_effort = Some("low".to_owned());
+        for effort in ["none", "low", "medium", "high", "xhigh", "max", "ultra"] {
+            let mut request = test_request();
+            request.model = "gpt-6-astra".to_owned();
+            request.reasoning_effort = Some(effort.to_owned());
 
-        let body = codex_request_body(&request);
+            let body = codex_request_body(&request);
 
-        assert_eq!(body["parallel_tool_calls"], true);
-        assert_eq!(body["reasoning"]["effort"], "low");
+            assert_eq!(body["model"], "gpt-6-astra");
+            assert_eq!(body["parallel_tool_calls"], true);
+            assert_eq!(body["reasoning"]["effort"], effort);
+        }
     }
 
     #[test]
