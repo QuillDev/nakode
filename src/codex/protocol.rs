@@ -292,7 +292,10 @@ pub fn parse_models(result: &Value) -> Vec<ModelInfo> {
                     .unwrap_or(false),
                 id,
                 display_name: None,
-                capabilities: super::model_capabilities(),
+                capabilities: super::discovered_model_capabilities(
+                    model.get("supportedReasoningEfforts"),
+                    "reasoningEffort",
+                ),
             })
         })
         .collect()
@@ -1008,11 +1011,16 @@ mod tests {
                 "displayName": "GPT Test",
                 "description": "fixture",
                 "isDefault": true,
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low", "description": "Low effort"},
+                    {"reasoningEffort": "ultra", "description": "Ultra effort"}
+                ],
             }]
         }));
 
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-test");
         assert!(models[0].is_default);
+        assert_eq!(models[0].capabilities.reasoning_efforts, ["low", "ultra"]);
     }
 }
