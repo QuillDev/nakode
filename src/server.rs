@@ -1135,13 +1135,24 @@ impl ServerCore {
                 credential,
             } => {
                 self.ensure_provider_account(&provider_id, &account_id)?;
+                // A brokered credential is an access token its broker keeps current; the adapter
+                // validates its shape. Every other kind is an API key.
+                let metadata = if kind == crate::backend::BROKERED_OAUTH_KIND {
+                    crate::backend::brokered_credential_metadata(
+                        provider_id.as_str(),
+                        &credential.0,
+                    )
+                    .map_err(DomainCommandError::Invalid)?
+                } else {
+                    serde_json::json!({ "api_key": credential.0 })
+                };
                 Ok(Self::accepted(
                     Some(account_id.clone()),
                     vec![Effect::SaveProviderAccountCredential {
                         provider: provider_id.to_string(),
                         account_id,
                         kind,
-                        metadata: serde_json::json!({ "api_key": credential.0 }),
+                        metadata,
                     }],
                 ))
             }

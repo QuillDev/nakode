@@ -24,9 +24,11 @@ use uuid::Uuid;
 use crate::backend::{
     ApprovalDecision, ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand,
     BackendError, BackendEvent, BackendHandle, BackendIdentity, BackendOperation,
-    BackendTokenUsage, CLAUDE_PROVIDER, CapabilitySupport, DeltaKind, ExternalToolRequest,
-    ItemKind, ItemStatus, ModelInfo, NormalizedItem, TurnOutcome, request_failed,
+    BackendTokenUsage, CLAUDE_PROVIDER, CREDENTIAL_REFRESH_REQUIRED, CapabilitySupport, DeltaKind,
+    ExternalToolRequest, ItemKind, ItemStatus, ModelInfo, NormalizedItem, TurnOutcome,
+    request_failed,
 };
+use crate::credential::SecretValue;
 
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
@@ -62,6 +64,9 @@ struct ClaudeOAuthCredential {
     organization_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     organization_name: Option<String>,
+    /// Supplied by a broker that alone refreshes it; Nakode holds no refresh token for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    brokered: bool,
 }
 
 #[derive(Deserialize)]
@@ -225,13 +230,54 @@ fn parse_credential(
                 detail: format!("invalid OAuth credential: {error}"),
             }
         })?;
-    if parsed.access_token.is_empty() || parsed.refresh_token.is_empty() {
+    if parsed.access_token.is_empty() || (parsed.refresh_token.is_empty() && !parsed.brokered) {
         return Err(BackendError::InvalidCredential {
             provider: CLAUDE_PROVIDER.to_owned(),
             detail: "OAuth access or refresh token is empty".to_owned(),
         });
     }
     Ok(Some(parsed))
+}
+
+/// The broker's view of one Claude sign-in: a current access token and who it belongs to.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrokeredClaudeCredential {
+    access_token: String,
+    expires_at_ms: u64,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    organization_id: Option<String>,
+    #[serde(default)]
+    organization_name: Option<String>,
+}
+
+/// Validates a brokered Claude credential (JSON) and returns the metadata this adapter stores.
+///
+/// # Errors
+///
+/// Returns a description when the credential is not the brokered shape or has no access token.
+pub fn brokered_credential_metadata(credential: &str) -> Result<Value, String> {
+    let brokered = serde_json::from_str::<BrokeredClaudeCredential>(credential)
+        .map_err(|error| format!("invalid brokered Claude credential: {error}"))?;
+    if brokered.access_token.is_empty() {
+        return Err("brokered Claude credential has no access token".to_owned());
+    }
+    serde_json::to_value(ClaudeOAuthCredential {
+        access_token: brokered.access_token,
+        refresh_token: String::new(),
+        expires_at_ms: brokered.expires_at_ms,
+        authorized_at_ms: None,
+        account_id: brokered.account_id,
+        email: brokered.email,
+        organization_id: brokered.organization_id,
+        organization_name: brokered.organization_name,
+        brokered: true,
+    })
+    .map_err(|error| error.to_string())
 }
 
 async fn spawn_bridge(workspace: &std::path::Path) -> Result<Bridge, BackendError> {
@@ -477,6 +523,16 @@ async fn run_supervisor(
                     }
                     continue;
                 }
+                // A replaced credential applies from the next command; the native session continues.
+                if let BackendCommand::UpdateCredential { credential: replacement } = command {
+                    match parse_credential(replacement.as_ref().map(SecretValue::expose)) {
+                        Ok(replacement) => credential = replacement,
+                        Err(error) => {
+                            request_failed(&events, BackendOperation::Authenticate, error.to_string()).await;
+                        }
+                    }
+                    continue;
+                }
                 if let Err(message) = refresh_supervisor_credential(
                     &mut credential,
                     publish_credential_updates,
@@ -511,7 +567,7 @@ async fn run_supervisor(
                 }
                 handle_command(command, &config, credential.as_ref(), bridge.as_mut(), &events).await;
             }
-            () = wait_until_credential_refresh(credential.as_ref()), if publish_credential_updates && credential.is_some() => {
+            () = wait_until_credential_refresh(credential.as_ref()), if publish_credential_updates && credential.as_ref().is_some_and(|credential| !credential.brokered) => {
                 if let Err(message) = refresh_supervisor_credential(&mut credential, true, &events).await {
                     request_failed(&events, BackendOperation::Reload, message).await;
                 }
@@ -1045,6 +1101,7 @@ async fn parse_claude_token_response(
         organization_name: token
             .organization
             .and_then(|organization| organization.name),
+        brokered: false,
     })
 }
 
@@ -1072,6 +1129,11 @@ async fn refresh_if_needed_with_url(
     };
     if credential.expires_at_ms > now_ms() {
         return Ok((Some(credential), false));
+    }
+    if credential.brokered {
+        return Err(format!(
+            "{CREDENTIAL_REFRESH_REQUIRED}: the brokered Claude sign-in expired; its broker must supply a new access token"
+        ));
     }
 
     let original_refresh_token = credential.refresh_token.clone();
@@ -2850,6 +2912,7 @@ assert.equal(streamMessageIds.size, 0);
             email: Some("user@example.com".to_owned()),
             organization_id: Some("org".to_owned()),
             organization_name: Some("Team".to_owned()),
+            brokered: false,
         };
         let (updated, refreshed) = refresh_if_needed_with_url(Some(original), &endpoint)
             .await
@@ -2875,6 +2938,7 @@ assert.equal(streamMessageIds.size, 0);
             email: None,
             organization_id: Some("org".to_owned()),
             organization_name: None,
+            brokered: false,
         };
         let expired = |refresh_token: &str| ClaudeOAuthCredential {
             access_token: "access-old".to_owned(),
@@ -2885,6 +2949,7 @@ assert.equal(streamMessageIds.size, 0);
             email: None,
             organization_id: Some("org".to_owned()),
             organization_name: None,
+            brokered: false,
         };
         REFRESHED_CREDENTIALS
             .lock()
@@ -2959,5 +3024,114 @@ assert.equal(streamMessageIds.size, 0);
         std::fs::write(sdk.join("package.json"), r#"{"version":"0.0.0"}"#)
             .expect("stale SDK manifest");
         assert!(!claude_sdk_is_current(directory.path()).await);
+    }
+
+    fn brokered(expires_at_ms: u64) -> ClaudeOAuthCredential {
+        ClaudeOAuthCredential {
+            access_token: "brokered-access".to_owned(),
+            refresh_token: String::new(),
+            expires_at_ms,
+            authorized_at_ms: None,
+            account_id: Some("account".to_owned()),
+            email: None,
+            organization_id: None,
+            organization_name: None,
+            brokered: true,
+        }
+    }
+
+    #[test]
+    fn brokered_credentials_carry_an_access_token_and_no_refresh_token() {
+        let metadata = brokered_credential_metadata(
+            r#"{"access_token":"access","expires_at_ms":42,"email":"owner@example.com"}"#,
+        )
+        .expect("brokered credential");
+        assert_eq!(metadata["brokered"], true);
+        assert_eq!(metadata["refresh_token"], "");
+        let parsed = parse_credential(Some(&metadata))
+            .expect("parses")
+            .expect("present");
+        assert!(parsed.brokered);
+        assert_eq!(parsed.email.as_deref(), Some("owner@example.com"));
+        assert!(brokered_credential_metadata(r#"{"access_token":"","expires_at_ms":1}"#).is_err());
+        assert!(
+            brokered_credential_metadata(
+                r#"{"access_token":"a","expires_at_ms":1,"refresh_token":"r"}"#
+            )
+            .is_err(),
+            "a broker never hands out its refresh token"
+        );
+        assert!(
+            parse_credential(Some(&json!({
+                "access_token": "a",
+                "refresh_token": "",
+                "expires_at_ms": 1
+            })))
+            .is_err(),
+            "an ordinary credential still needs its refresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn brokered_credentials_are_never_refreshed() {
+        // Nothing listens here: reaching the network would fail the test differently.
+        let unreachable = "http://127.0.0.1:9/oauth/token";
+        let (kept, refreshed) =
+            refresh_if_needed_with_url(Some(brokered(now_ms() + 60_000)), unreachable)
+                .await
+                .expect("current brokered token");
+        assert!(!refreshed);
+        assert_eq!(
+            kept.map(|credential| credential.access_token).as_deref(),
+            Some("brokered-access")
+        );
+        let error = refresh_if_needed_with_url(Some(brokered(0)), unreachable)
+            .await
+            .expect_err("expired brokered token");
+        assert!(error.starts_with(CREDENTIAL_REFRESH_REQUIRED), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_replacement_credential_reaches_a_running_supervisor() {
+        let (commands, command_rx) = mpsc::channel(4);
+        let (events, mut received) = mpsc::channel(16);
+        let supervisor = tokio::spawn(run_supervisor(
+            false,
+            BackendConfig::native(std::env::temp_dir()),
+            None,
+            false,
+            None,
+            command_rx,
+            events,
+        ));
+        let expired = serde_json::to_value(brokered(0)).expect("credential");
+        commands
+            .send(BackendCommand::UpdateCredential {
+                credential: Some(SecretValue::new(expired)),
+            })
+            .await
+            .expect("update");
+        commands
+            .send(BackendCommand::Reload {
+                provider_session_id: None,
+            })
+            .await
+            .expect("reload");
+        let failure = loop {
+            if let BackendEvent::RequestFailed { message, .. } =
+                received.recv().await.expect("event")
+            {
+                break message;
+            }
+        };
+        assert!(
+            failure.starts_with(CREDENTIAL_REFRESH_REQUIRED),
+            "{failure}"
+        );
+        commands
+            .send(BackendCommand::Shutdown)
+            .await
+            .expect("shutdown");
+        supervisor.await.expect("supervisor exits");
     }
 }

@@ -117,6 +117,21 @@ The initial implementation now provides:
 
 Focused safe-fixture tests cover account CRUD/restart redaction, atomic and concurrent affinity binding, blocked removal while pinned, explicit selection, deterministic balancing, disabled/unauthenticated filtering, account-local cooldown isolation, provider/model-wide non-poisoning, bounded `Retry-After`, and normalized failure propagation. The two-account routing fixture demonstrates that successive live session reservations select different least-loaded accounts while the first session remains bound to its original account.
 
+## Brokered credentials
+
+A trusted broker that serves many machines from one sign-in (the `FStack` dashboard) supplies
+access tokens through the ordinary `SetProviderAccountCredential` command with kind
+`oauth_brokered`. The credential is JSON holding `access_token` and `expires_at_ms` (Claude also
+accepts `account_id`, `email`, `organization_id` and `organization_name`; ChatGPT reads its account
+and email from the token). It has no refresh token: providers rotate refresh tokens, so the broker
+is the only refresher. The owning adapter validates the shape (`claude::brokered_credential_metadata`,
+`codex::brokered_credential_metadata`); other providers refuse the kind.
+
+- Nakode never refreshes a brokered credential. After it expires, commands fail with a message
+  beginning `credential_refresh_required`, which the broker answers with a fresh token.
+- A replacement reaches running Claude and ChatGPT sessions in place through `UpdateCredential`;
+  their native sessions continue and the next command uses the new token.
+
 Current safety boundaries are deliberate:
 
 - account capability eligibility is inherited from the provider adapter/model catalogue because the initial adapters do not expose account-varying capability catalogues;

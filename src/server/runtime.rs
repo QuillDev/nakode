@@ -4087,18 +4087,22 @@ impl BackendRegistry {
         // completed login cannot leave an unauthenticated supervisor serving later reloads.
         self.stop_provider_account_control(provider, account_id)
             .await;
-        self.update_codex_session_credentials(provider, account_id, Some(metadata.clone()))
+        self.update_session_credentials(provider, account_id, Some(metadata.clone()))
             .await;
         self.set_provider_account_credential(provider, account_id, metadata);
     }
 
-    async fn update_codex_session_credentials(
+    /// Hands a replacement credential to every running session of `provider` that uses
+    /// `account_id`, for adapters that apply it in place. Their native sessions keep running, so a
+    /// broker's periodic token replacement never interrupts work.
+    async fn update_session_credentials(
         &self,
         provider: &str,
         account_id: &str,
         metadata: Option<serde_json::Value>,
     ) {
-        if provider != crate::backend::CODEX_PROVIDER {
+        if provider != crate::backend::CODEX_PROVIDER && provider != crate::backend::CLAUDE_PROVIDER
+        {
             return;
         }
         for (key, selected_account) in &self.session_accounts {
@@ -4130,7 +4134,7 @@ impl BackendRegistry {
             })
             .map(|((session_id, _), _)| session_id.clone())
             .collect::<Vec<_>>();
-        self.update_codex_session_credentials(provider, account_id, None)
+        self.update_session_credentials(provider, account_id, None)
             .await;
         for session_id in session_ids {
             if provider != crate::backend::CODEX_PROVIDER {
@@ -6199,7 +6203,7 @@ async fn save_provider_credential(
     backends.update_provider_accounts(&providers);
     if credential.provider == crate::backend::CODEX_PROVIDER {
         backends
-            .update_codex_session_credentials(
+            .update_session_credentials(
                 &credential.provider,
                 &account_id,
                 Some(credential.metadata.clone()),

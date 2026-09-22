@@ -35,6 +35,33 @@ pub const CLAUDE_PROVIDER: &str = "claude-agent";
 pub const KIMI_PROVIDER: &str = "kimi-coding";
 pub const GLM_PROVIDER: &str = "zai-coding";
 
+/// Credential kind for provider access tokens that a trusted broker keeps current.
+///
+/// A brokered credential carries an access token and its expiry but no refresh token: the broker
+/// (for example the `FStack` dashboard, which serves many machines from one sign-in) is the only
+/// party that refreshes, because providers rotate refresh tokens and a second refresher would
+/// invalidate the broker's. Nakode never refreshes it and reports `CREDENTIAL_REFRESH_REQUIRED`
+/// once it has expired.
+pub const BROKERED_OAUTH_KIND: &str = "oauth_brokered";
+
+/// Stable prefix of the failure a brokered credential reports after it expires, so a broker can
+/// recognise it and supply a fresh access token.
+pub const CREDENTIAL_REFRESH_REQUIRED: &str = "credential_refresh_required";
+
+/// Validates a brokered credential for `provider` and returns the metadata its adapter stores.
+///
+/// # Errors
+///
+/// Returns a description when the provider does not accept brokered credentials or the
+/// credential is malformed.
+pub fn brokered_credential_metadata(provider: &str, credential: &str) -> Result<Value, String> {
+    match provider {
+        CLAUDE_PROVIDER => crate::claude::brokered_credential_metadata(credential),
+        CODEX_PROVIDER => crate::codex::brokered_credential_metadata(credential),
+        other => Err(format!("{other} does not accept brokered credentials")),
+    }
+}
+
 /// Adapter-owned estimates for the image detail currently sent by native inference.
 /// Unknown provider/model combinations use the runtime's explicit fallback instead.
 pub(crate) fn estimate_image_tokens(

@@ -26,10 +26,10 @@ use crate::{
     backend::{
         BackendCapabilities, BackendCommand, BackendError, BackendEvent,
         BackendFailureClassification, BackendFailureDetail, BackendFailurePhase, BackendHandle,
-        BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, ModelInfo,
-        ModelOptions, ProviderFailureClassification, TurnOutcome, bounded_failure_text,
-        request_failed, request_failed_with_detail, sanitize_failure_endpoint,
-        sanitize_failure_text as sanitize_backend_failure_text,
+        BackendIdentity, BackendOperation, CODEX_PROVIDER, CREDENTIAL_REFRESH_REQUIRED,
+        CapabilitySupport, ModelInfo, ModelOptions, ProviderFailureClassification, TurnOutcome,
+        bounded_failure_text, request_failed, request_failed_with_detail,
+        sanitize_failure_endpoint, sanitize_failure_text as sanitize_backend_failure_text,
     },
     runtime::{
         AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
@@ -230,6 +230,49 @@ struct CodexCredential {
     account_id: String,
     #[serde(default)]
     email: Option<String>,
+    /// Supplied by a broker that alone refreshes it; Nakode holds no refresh token for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    brokered: bool,
+}
+
+/// The broker's view of one `ChatGPT` sign-in: a current access token and its expiry.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrokeredCodexCredential {
+    access_token: String,
+    expires_at_ms: u64,
+}
+
+/// Validates a brokered `ChatGPT` credential (JSON) and returns the metadata this adapter stores.
+/// The account and email come from the access token itself, as they do after a sign-in.
+///
+/// # Errors
+///
+/// Returns a description when the credential is malformed or its token names no account.
+pub fn brokered_credential_metadata(credential: &str) -> Result<Value, String> {
+    let brokered = serde_json::from_str::<BrokeredCodexCredential>(credential)
+        .map_err(|error| format!("invalid brokered ChatGPT credential: {error}"))?;
+    let claims = jwt_claims(&brokered.access_token)?;
+    let account_id = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "brokered access token omitted ChatGPT account id".to_owned())?
+        .to_owned();
+    let email = claims
+        .get("https://api.openai.com/profile")
+        .and_then(|profile| profile.get("email"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    serde_json::to_value(CodexCredential {
+        access_token: brokered.access_token,
+        refresh_token: String::new(),
+        expires_at_ms: brokered.expires_at_ms,
+        account_id,
+        email,
+        brokered: true,
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2558,6 +2601,20 @@ async fn refresh_if_needed(
     if credential.expires_at_ms > unix_time_ms().saturating_add(60_000) {
         return Some(credential);
     }
+    if credential.brokered {
+        if credential.expires_at_ms > unix_time_ms() {
+            return Some(credential);
+        }
+        request_failed(
+            events,
+            BackendOperation::Authenticate,
+            format!(
+                "{CREDENTIAL_REFRESH_REQUIRED}: the brokered ChatGPT sign-in expired; its broker must supply a new access token"
+            ),
+        )
+        .await;
+        return None;
+    }
     match refresh_credential(config, &credential).await {
         Ok(refreshed) => {
             let metadata = serde_json::to_value(&refreshed).unwrap_or(Value::Null);
@@ -2632,6 +2689,7 @@ fn credential_from_token_payload(
         account_id,
         email,
         expires_at_ms: unix_time_ms().saturating_add(expires_in.saturating_mul(1_000)),
+        brokered: false,
     })
 }
 
@@ -3488,6 +3546,72 @@ mod tests {
         );
     }
 
+    fn brokered_token() -> String {
+        let claims = json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "account-brokered"},
+            "https://api.openai.com/profile": {"email": "owner@example.test"}
+        });
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims JSON"));
+        format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn brokered_chatgpt_credentials_read_their_account_from_the_token() {
+        let token = brokered_token();
+        let metadata = brokered_credential_metadata(
+            &json!({"access_token": token, "expires_at_ms": 42}).to_string(),
+        )
+        .expect("brokered credential");
+        let credential = serde_json::from_value::<CodexCredential>(metadata).expect("stored shape");
+        assert!(credential.brokered);
+        assert!(credential.refresh_token.is_empty());
+        assert_eq!(credential.account_id, "account-brokered");
+        assert_eq!(credential.email.as_deref(), Some("owner@example.test"));
+        assert!(
+            brokered_credential_metadata(
+                &json!({"access_token": "header.e30.signature", "expires_at_ms": 42}).to_string()
+            )
+            .is_err(),
+            "a token naming no account is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn brokered_chatgpt_credentials_are_never_refreshed() {
+        let mut config = BackendConfig::native(std::env::temp_dir());
+        // Nothing listens here: a refresh attempt would fail differently.
+        config.auth_urls.token = "http://127.0.0.1:9/oauth/token".to_owned();
+        let (events, mut received) = mpsc::channel(4);
+        let brokered = |expires_at_ms| CodexCredential {
+            access_token: brokered_token(),
+            refresh_token: String::new(),
+            expires_at_ms,
+            account_id: "account-brokered".to_owned(),
+            email: None,
+            brokered: true,
+        };
+        // Inside the refresh window but unexpired: kept as it is.
+        let nearly = brokered(unix_time_ms() + 30_000);
+        let kept = refresh_if_needed(&config, Some(nearly), &events).await;
+        assert!(kept.is_some());
+        assert!(received.try_recv().is_err());
+        // Expired: reported for the broker, never refreshed.
+        assert!(
+            refresh_if_needed(&config, Some(brokered(0)), &events)
+                .await
+                .is_none()
+        );
+        match received.recv().await.expect("failure event") {
+            BackendEvent::RequestFailed { message, .. } => {
+                assert!(
+                    message.starts_with(CREDENTIAL_REFRESH_REQUIRED),
+                    "{message}"
+                );
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
     #[test]
     fn extracts_namespaced_chatgpt_claims_from_oauth_tokens() {
         let claims = json!({
@@ -4012,6 +4136,7 @@ mod tests {
             expires_at_ms: u64::MAX,
             account_id: "account-1".to_owned(),
             email: None,
+            brokered: false,
         }
     }
 
