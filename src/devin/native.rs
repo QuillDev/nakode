@@ -1430,6 +1430,7 @@ mod tests {
                 #[cfg(unix)]
                 "return_image",
                 "prepare_image",
+                "list_child_materials",
                 "read_skill",
                 "read_skill_component",
                 "write",

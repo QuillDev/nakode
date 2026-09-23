@@ -17,6 +17,7 @@ thiserror = "2"
 tokio = { version = "1.52", features = ["net", "rt", "sync", "time"] }
 tokio-stream = "0.1"
 tonic = { version = "0.14.6", features = ["tls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tower = { version = "0.5", features = ["util"] }
 sha2 = "0.10"
 uuid = { version = "1", features = ["v7"] }

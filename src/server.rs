@@ -104,6 +104,7 @@ pub struct ServerCore {
     providers: Vec<ProviderRecord>,
     sessions: Vec<SessionRecord>,
     session_inventory_complete: bool,
+    durable_child_creation: bool,
     session_bridges: Vec<SessionBridgeRecord>,
     inbound_event_dispositions: HashMap<(SessionId, String), BridgeContinuationDisposition>,
     command_cache: HashMap<IdempotencyKey, CachedCommand>,
@@ -132,6 +133,7 @@ impl ServerCore {
             providers,
             sessions,
             session_inventory_complete: true,
+            durable_child_creation: false,
             session_bridges: Vec::new(),
             inbound_event_dispositions: HashMap::new(),
             command_cache: HashMap::new(),
@@ -363,6 +365,15 @@ impl ServerCore {
         endpoint: &ServerEndpoint,
         request: ServerRequest,
     ) -> DispatchOutcome {
+        self.handle_with_child_questions(endpoint, request, None)
+    }
+
+    fn handle_with_child_questions(
+        &mut self,
+        endpoint: &ServerEndpoint,
+        request: ServerRequest,
+        child_questions: Option<&crate::child_reports::ReportStore>,
+    ) -> DispatchOutcome {
         match request {
             ServerRequest::Command {
                 idempotency_key,
@@ -372,12 +383,14 @@ impl ServerCore {
                 respond,
                 ..
             } => {
-                let (result, effects, effect_session, changed) = self.execute_idempotent(
-                    idempotency_key,
-                    expected_revision,
-                    replay_only,
-                    command,
-                );
+                let (result, effects, effect_session, changed) = self
+                    .execute_idempotent_with_child_questions(
+                        idempotency_key,
+                        expected_revision,
+                        replay_only,
+                        command,
+                        child_questions,
+                    );
                 DispatchOutcome {
                     effects,
                     effect_session,
@@ -557,12 +570,35 @@ impl ServerCore {
         self.command_cache.contains_key(key)
     }
 
+    #[cfg(test)]
     fn execute_idempotent(
         &mut self,
         key: IdempotencyKey,
         expected_revision: Option<u64>,
         replay_only: bool,
         command: Command,
+    ) -> (
+        Result<CommandAccepted, ServiceError>,
+        Vec<Effect>,
+        Option<SessionId>,
+        bool,
+    ) {
+        self.execute_idempotent_with_child_questions(
+            key,
+            expected_revision,
+            replay_only,
+            command,
+            None,
+        )
+    }
+
+    fn execute_idempotent_with_child_questions(
+        &mut self,
+        key: IdempotencyKey,
+        expected_revision: Option<u64>,
+        replay_only: bool,
+        command: Command,
+        child_questions: Option<&crate::child_reports::ReportStore>,
     ) -> (
         Result<CommandAccepted, ServiceError>,
         Vec<Effect>,
@@ -631,7 +667,11 @@ impl ServerCore {
             )
         } else {
             let prompt_id = append_prompt.then(|| key.as_str().to_owned());
-            self.execute_command(command, prompt_id.as_deref())
+            self.execute_command_with_child_questions(
+                command,
+                prompt_id.as_deref(),
+                child_questions,
+            )
         };
         let effect_session = effect_session.or_else(|| {
             result
@@ -663,6 +703,39 @@ impl ServerCore {
             self.command_cache.remove(&expired);
         }
         (result, effects, effect_session, changed)
+    }
+
+    fn execute_command_with_child_questions(
+        &mut self,
+        command: Command,
+        prompt_id: Option<&str>,
+        store: Option<&crate::child_reports::ReportStore>,
+    ) -> (Result<CommandAccepted, ServiceError>, Vec<Effect>) {
+        // Keep the original parent/child command in the digest and receipt. Only new, unfenced
+        // execution reaches live-question validation; successful retries never resolve again.
+        if let (
+            Some(store),
+            Command::AnswerChildQuestions {
+                parent_session_id,
+                child_session_id,
+                interaction_id,
+                answers,
+            },
+        ) = (store, &command)
+        {
+            return match crate::child_questions::answer_command(
+                store,
+                self,
+                parent_session_id,
+                child_session_id,
+                interaction_id,
+                answers.clone(),
+            ) {
+                Ok(answer) => self.execute_command(answer, None),
+                Err(error) => (Err(error), Vec::new()),
+            };
+        }
+        self.execute_command(command, prompt_id)
     }
 
     fn execute_command(
@@ -697,8 +770,23 @@ impl ServerCore {
         prompt_id: Option<&str>,
     ) -> DomainCommandOutcome {
         match command {
+            Command::EnqueueFollowup { .. }
+            | Command::SetFollowupPaused { .. }
+            | Command::LinkChildSession { .. }
+            | Command::PublishChildReport { .. }
+            | Command::AnswerChildQuestions { .. } => Err(DomainCommandError::Invalid(
+                "linked child operations require the persistence runtime".to_owned(),
+            )),
+            Command::CreateSession {
+                parent_session_id: Some(_),
+                ..
+            } if !self.durable_child_creation => Err(DomainCommandError::Unsupported(
+                "parent session creation requires the persistence runtime".to_owned(),
+            )),
             Command::CreateSession {
                 workspace_id,
+                // The persistence runtime checkpoints this relationship before publication.
+                parent_session_id: _,
                 working_directory,
                 title,
                 model_id,
@@ -3382,8 +3470,31 @@ impl ServerCore {
         }))
     }
 
+    fn query_session_routing(&self, session_id: SessionId) -> Result<QueryResult, ServiceError> {
+        if self.engine_for(&session_id).is_some()
+            || self
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id.as_str())
+        {
+            Ok(QueryResult::SessionRouting(session_id))
+        } else {
+            Err(self.unobserved_resource("session", session_id.as_str()))
+        }
+    }
+
     fn query_view(&self, query: Query) -> Result<QueryResult, ServiceError> {
         match query {
+            Query::GetSessionRouting { session_id } => self.query_session_routing(session_id),
+            Query::ListFollowups { .. }
+            | Query::ListChildMaterials { .. }
+            | Query::GetChildMaterial { .. }
+            | Query::ListChildReports { .. }
+            | Query::ListChildQuestions { .. } => Err(service_error(
+                ErrorCode::Internal,
+                "child reports require the persistence runtime",
+                true,
+            )),
             Query::InspectWorkspacePath { .. } => Err(service_error(
                 ErrorCode::Internal,
                 "workspace inspection requires the asynchronous runtime",
@@ -3400,10 +3511,7 @@ impl ServerCore {
                 Ok(QueryResult::Bootstrap(Box::new(view)))
             }
             Query::GetSoul { workspace_id } => self.query_soul(workspace_id),
-            Query::GetMcpManagement { workspace_id } => {
-                self.ensure_workspace(&workspace_id).map_err(domain_error)?;
-                Ok(QueryResult::McpManagement(self.mcp_management()))
-            }
+            Query::GetMcpManagement { workspace_id } => self.query_mcp_management(&workspace_id),
             Query::ListSessions {
                 workspace_id,
                 limit,
@@ -3435,10 +3543,7 @@ impl ServerCore {
                 before_byte,
                 limit_bytes,
             } => self.query_transcript_body_window(&owner, &entry_id, before_byte, limit_bytes),
-            Query::GetRun { run_id } => {
-                let run = self.run_view(&run_id)?;
-                Ok(QueryResult::Run(Box::new(run)))
-            }
+            Query::GetRun { run_id } => Ok(QueryResult::Run(Box::new(self.run_view(&run_id)?))),
             Query::ListRuns {
                 session_id,
                 before,
@@ -3477,6 +3582,14 @@ impl ServerCore {
                 false,
             )),
         }
+    }
+
+    fn query_mcp_management(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<QueryResult, ServiceError> {
+        self.ensure_workspace(workspace_id).map_err(domain_error)?;
+        Ok(QueryResult::McpManagement(self.mcp_management()))
     }
 
     fn query_session_inventory(
@@ -4278,6 +4391,9 @@ impl ServerCore {
     ) -> Result<QueryResult, ServiceError> {
         use crate::state::projection;
         match query {
+            query @ (Query::ListChildMaterials { .. } | Query::GetChildMaterial { .. }) => {
+                projection::materials::project(state, query)
+            }
             Query::GetRun { run_id } => projection::run_view(state, &run_id)
                 .map(|run| QueryResult::Run(Box::new(run)))
                 .ok_or_else(|| not_found("run", run_id.as_str())),
@@ -4528,7 +4644,9 @@ impl ServerCore {
 
     fn command_session(&self, command: &Command) -> Option<SessionId> {
         match command {
-            Command::SendPrompt { session_id, .. }
+            Command::EnqueueFollowup { session_id, .. }
+            | Command::SetFollowupPaused { session_id, .. }
+            | Command::SendPrompt { session_id, .. }
             | Command::ContinueSessionFromBridge { session_id, .. }
             | Command::SetSessionBridgeLifecycle { session_id, .. }
             | Command::BindSessionBridgeThread { session_id, .. }
@@ -4575,8 +4693,22 @@ impl ServerCore {
             Command::CancelRun { run_id } | Command::ContinueRun { run_id, .. } => {
                 self.session_for_run(run_id).ok()
             }
-            Command::CreateSession { .. }
-            | Command::SetWorkspaceBridgeLifecycle { .. }
+            Command::LinkChildSession {
+                parent_session_id, ..
+            } => Some(parent_session_id.clone()),
+            Command::PublishChildReport {
+                child_session_id, ..
+            }
+            | Command::AnswerChildQuestions {
+                child_session_id, ..
+            } => Some(child_session_id.clone()),
+            // Parent-aware creation selects the accepted new child, never the default engine.
+            Command::CreateSession {
+                parent_session_id, ..
+            } => parent_session_id
+                .is_none()
+                .then(|| self.default_session.clone()),
+            Command::SetWorkspaceBridgeLifecycle { .. }
             | Command::SelectModel { .. }
             | Command::SetProviderModelFilter { .. }
             | Command::SetSkillEnabled { .. }
@@ -4609,8 +4741,7 @@ impl ServerCore {
             | Command::DeleteAgent { .. }
             | Command::UpdateSettings { .. }
             | Command::CheckAgentBrowser { .. } => Some(self.default_session.clone()),
-            // Run deletion effects through whichever control-plane engine is default AFTER command
-            // acceptance. This matters when deleting a closed initial session rotates that role.
+            // Deletion can rotate the default engine; select it after acceptance.
             Command::DeleteSession { .. } | Command::PruneSession { .. } => None,
         }
     }
@@ -6068,6 +6199,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: vec![crate::session::PersistedOwnerPrompt {
                 prompt_id: "first".to_owned(),
                 raw_text: format!("  {}  ", "界".repeat(600)),
@@ -6117,6 +6249,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
@@ -6178,6 +6311,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
@@ -6292,6 +6426,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
@@ -7309,6 +7444,7 @@ mod tests {
                     model_options: crate::backend::ModelOptions::default(),
                     last_turn: None,
                     owner_turns: Vec::new(),
+                    queued_prompts: Vec::new(),
                     owner_prompts: Vec::new(),
                     created_at: 10,
                     updated_at: 12,
@@ -7772,6 +7908,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
@@ -7904,6 +8041,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
@@ -7977,6 +8115,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
@@ -8023,6 +8162,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
@@ -8132,6 +8272,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
@@ -8275,6 +8416,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 1,
             updated_at: 2,
@@ -8311,6 +8453,7 @@ mod tests {
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 10,
             updated_at: 12,
@@ -11590,6 +11733,7 @@ enabled = false
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 0,
             updated_at: 0,
@@ -11635,6 +11779,7 @@ enabled = false
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: 0,
             updated_at: 0,

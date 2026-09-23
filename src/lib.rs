@@ -7,6 +7,8 @@ pub(crate) mod api_projection;
 #[cfg(feature = "tui")]
 pub mod app;
 pub mod backend;
+mod child_questions;
+mod child_reports;
 pub mod claude;
 #[cfg(feature = "tui")]
 pub mod clipboard;
@@ -28,6 +30,7 @@ pub mod editor;
 pub mod embedded;
 mod executable;
 pub mod execution_host;
+mod followups;
 pub mod glm;
 pub mod handoff;
 #[cfg(feature = "tui")]

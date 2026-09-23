@@ -4385,6 +4385,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_child_image_is_attached_to_parent_history_with_source_attribution() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::tempdir_in(root).unwrap();
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (route, mut requests) = mpsc::channel::<NativeAgentRequest>(1);
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider)
+            .with_native_delegation(route);
+        let mut session = RuntimeSession::new("test-model".into(), String::new())
+            .with_provider("test-provider")
+            .with_owner(Some("parent-chat".into()), None);
+        let original = crate::image_handoff::tests::png(64, 32);
+        let expected = original.clone();
+        let service = tokio::spawn(async move {
+            let NativeAgentRequest::Material(request) = requests.recv().await.unwrap() else {
+                panic!("material request")
+            };
+            assert_eq!(request.owner_session_id, "parent-chat");
+            assert!(request.requester_run_id.is_none());
+            assert_eq!(request.source.session_id.as_str(), "child-session");
+            assert!(
+                matches!(request.operation, crate::backend::NativeMaterialOperation::Image { ref reference } if reference == "selected-image")
+            );
+            request
+                .respond
+                .send(Ok(nakode_protocol::QueryResult::ChildMaterial(
+                    nakode_protocol::ChildMaterial {
+                        scope: nakode_protocol::MaterialScope {
+                            parent_session_id: "parent-chat".into(),
+                            source: request.source,
+                        },
+                        session_title: "UI implementation".into(),
+                        run_title: Some("Visual review".into()),
+                        artifact: nakode_protocol::ArtifactView {
+                            id: "selected-image".into(),
+                            label: "review.png".into(),
+                            media_type: "image/png".into(),
+                            byte_length: original.len() as u64,
+                            data: original,
+                            width: Some(64),
+                            height: Some(32),
+                        },
+                    },
+                )))
+                .unwrap();
+        });
+        let (events, mut receiver) = mpsc::channel(32);
+        let cancellation = CancellationToken::new();
+        let failures = runtime.execute_tool_calls(&mut session, "parent-turn", vec![ToolCall {
+            id: "selected-child-preview".into(), parent_call_id: None, name: "prepare_image".into(),
+            arguments: json!({"source":{"session_id":"child-session","run_id":"review-run"},"image_reference":"selected-image","inspect":true}),
+        }], &events, &cancellation).await.unwrap();
+        assert!(failures.is_empty());
+        service.await.unwrap();
+        let returned = session.returned_images.values().next().unwrap();
+        assert_eq!(returned.turn_id, "parent-turn");
+        assert_eq!(returned.attachment.image.as_ref().unwrap().data, expected);
+        assert!(returned.attachment.path.is_none());
+        assert_eq!(
+            returned.attachment.label,
+            "Visual review · child-session: review.png"
+        );
+        let restored: RuntimeSession =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(restored.returned_images.len(), 1);
+        let mut attached = 0;
+        while let Ok(event) = receiver.try_recv() {
+            if let BackendEvent::ImageReturned(image) = event {
+                attached += 1;
+                assert_eq!(image.attachment.image.unwrap().data, expected);
+            }
+        }
+        assert_eq!(attached, 1);
+    }
+
+    #[tokio::test]
     async fn read_only_native_delegation_preserves_session_owner_context() {
         let directory = tempfile::tempdir().expect("workspace");
         let provider = Arc::new(ExternalToolProvider {

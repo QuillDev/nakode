@@ -4,7 +4,7 @@ use crate::domain_transcript::{EntryKind, TranscriptEntry};
 
 const MAX_HANDOFF_CHARACTERS: usize = 48_000;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 enum HandoffRole {
     User,
     Assistant,
@@ -19,14 +19,14 @@ impl HandoffRole {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct HandoffMessage {
     role: HandoffRole,
     body: String,
 }
 
 /// Visible, provider-neutral context transferred between native agent sessions.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HandoffPackage {
     source_provider: String,
     source_model: Option<String>,

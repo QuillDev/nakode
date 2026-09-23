@@ -125,6 +125,8 @@ pub struct SessionRecord {
     pub owner_turns: Vec<PersistedTurnConfiguration>,
     /// Raw accepted owner prompts, ordered by durable acceptance for role-safe transcript replay.
     pub owner_prompts: Vec<PersistedOwnerPrompt>,
+    /// Accepted visible follow-ups not yet promoted to provider dispatch.
+    pub queued_prompts: Vec<crate::state::QueuedPrompt>,
     /// Unix epoch seconds at initial persistence; converted exactly once at API projection.
     pub created_at: i64,
     /// Unix epoch seconds at the latest persistence touch; converted exactly once at API projection.
@@ -399,8 +401,20 @@ pub struct SubagentRecord {
     pub transcript_has_earlier: bool,
 }
 
+/// Metadata that must share the initial logical-session transaction.
+#[derive(Default)]
+pub struct SessionCreationContext<'a> {
+    pub initial_instructions: Option<&'a str>,
+    pub parent_session_id: Option<&'a str>,
+    pub bridge: Option<&'a SessionBridgeRecord>,
+}
+
 #[derive(Debug, Error)]
 pub enum SessionError {
+    #[error("session repository does not support atomic child creation")]
+    ChildCreationUnsupported,
+    #[error("child relationship refused: {0:?}")]
+    ChildRelationship(nakode_protocol::ServiceError),
     #[error("session repository does not support durable initial instructions")]
     InitialInstructionsUnsupported,
     #[error("could not determine Nakode's application-data directory")]
@@ -724,9 +738,12 @@ pub trait SessionRepository: Send + Sync {
         code_mode: Option<bool>,
         tool_configuration: Option<&nakode_protocol::SessionToolConfiguration>,
         owner_prompt: Option<&PersistedOwnerPrompt>,
-        initial_instructions: Option<&str>,
+        creation: SessionCreationContext<'_>,
     ) -> Result<SessionRecord, SessionError> {
-        if initial_instructions.is_some() {
+        if creation.parent_session_id.is_some() || creation.bridge.is_some() {
+            return Err(SessionError::ChildCreationUnsupported);
+        }
+        if creation.initial_instructions.is_some() {
             return Err(SessionError::InitialInstructionsUnsupported);
         }
         let record = self.create_with_account_id(
@@ -900,6 +917,7 @@ pub trait SessionRepository: Send + Sync {
     fn save_prompt_dispatch_checkpoint(
         &self,
         owner_prompts: &[(String, PersistedOwnerPrompt)],
+        queue: Option<(&str, &[crate::state::QueuedPrompt])>,
         bridges: &[SessionBridgeRecord],
         inbound_event: Option<(&str, &str, nakode_protocol::BridgeContinuationDisposition)>,
     ) -> Result<(), SessionError>;
@@ -1302,6 +1320,27 @@ impl SqliteSessionRepository {
              );
              CREATE INDEX IF NOT EXISTS session_skill_profiles_profile
                ON session_skill_profiles(profile_id);
+             CREATE TABLE IF NOT EXISTS session_child_links (
+               child_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+               parent_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+               child_title TEXT NOT NULL,
+               CHECK (child_id <> parent_id)
+             );
+             CREATE INDEX IF NOT EXISTS session_child_links_parent ON session_child_links(parent_id);
+             CREATE TABLE IF NOT EXISTS session_child_command_receipts (
+               command_key TEXT PRIMARY KEY,
+               child_id TEXT NOT NULL REFERENCES session_child_links(child_id) ON DELETE CASCADE,
+               digest BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS session_child_reports (
+               sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+               child_id TEXT NOT NULL REFERENCES session_child_links(child_id) ON DELETE CASCADE,
+               report_id TEXT NOT NULL,
+               state TEXT NOT NULL,
+               body TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               UNIQUE(child_id, report_id)
+             );
              CREATE TABLE IF NOT EXISTS provider_models (
                provider TEXT NOT NULL,
                model_id TEXT NOT NULL,
@@ -1443,6 +1482,10 @@ impl SqliteSessionRepository {
              );
              CREATE INDEX IF NOT EXISTS accepted_owner_prompts_session
                ON accepted_owner_prompts(session_id, acceptance_order);
+             CREATE TABLE IF NOT EXISTS session_prompt_queues (
+               session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+               prompts_json TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS session_native_history (
                parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                provider TEXT NOT NULL,
@@ -1526,6 +1569,7 @@ impl SqliteSessionRepository {
                  REFERENCES orchestration_runs(parent_session_id, id) ON DELETE CASCADE
              );",
         )?;
+        execute_batch_with_busy_retry(&connection, include_str!("followups/schema.sql"))?;
         apply_invocation_telemetry_migration(&mut connection)?;
         let provider_model_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(provider_models)")?;
@@ -2080,6 +2124,7 @@ impl SqliteSessionRepository {
             },
             last_turn,
             owner_turns: Vec::new(),
+            queued_prompts: Vec::new(),
             owner_prompts: Vec::new(),
             created_at: row.get(13)?,
             updated_at: row.get(14)?,
@@ -2475,6 +2520,53 @@ fn load_first_prompt_preview(
         )
         .optional()?;
     Ok(preview.unwrap_or_default())
+}
+
+fn load_prompt_queue(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<crate::state::QueuedPrompt>, SessionError> {
+    let encoded: Option<String> = connection
+        .query_row(
+            "SELECT prompts_json FROM session_prompt_queues WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    encoded.map_or_else(
+        || Ok(Vec::new()),
+        |encoded| {
+            serde_json::from_str(&encoded).map_err(|source| SessionError::InvalidStoredJson {
+                field: "session_prompt_queues.prompts_json",
+                source,
+            })
+        },
+    )
+}
+
+fn save_prompt_queue_on(
+    connection: &Connection,
+    session_id: &str,
+    prompts: &[crate::state::QueuedPrompt],
+) -> Result<(), SessionError> {
+    if prompts.is_empty() {
+        connection.execute(
+            "DELETE FROM session_prompt_queues WHERE session_id = ?1",
+            [session_id],
+        )?;
+        return Ok(());
+    }
+    let encoded =
+        serde_json::to_string(prompts).map_err(|source| SessionError::InvalidStoredJson {
+            field: "session_prompt_queues.prompts_json",
+            source,
+        })?;
+    connection.execute(
+        "INSERT INTO session_prompt_queues (session_id, prompts_json) VALUES (?1, ?2)
+         ON CONFLICT(session_id) DO UPDATE SET prompts_json = excluded.prompts_json",
+        params![session_id, encoded],
+    )?;
+    Ok(())
 }
 
 fn load_owner_prompts(
@@ -3240,6 +3332,7 @@ impl SessionRepository for SqliteSessionRepository {
             record.owner_turns = load_owner_turns(&connection, &record.id)?;
             project_checkpointed_turn(&connection, record)?;
             record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
+            record.queued_prompts = load_prompt_queue(&connection, &record.id)?;
             record.first_prompt_preview = load_first_prompt_preview(&connection, record)?;
             record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
         }
@@ -3268,6 +3361,7 @@ impl SessionRepository for SqliteSessionRepository {
             record.owner_turns = load_owner_turns(&connection, &record.id)?;
             project_checkpointed_turn(&connection, record)?;
             record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
+            record.queued_prompts = load_prompt_queue(&connection, &record.id)?;
             record.first_prompt_preview = load_first_prompt_preview(&connection, record)?;
             record.owned_provider_sessions = load_owned_provider_sessions(&connection, &record.id)?;
         }
@@ -3297,6 +3391,7 @@ impl SessionRepository for SqliteSessionRepository {
             exact.owner_turns = load_owner_turns(&connection, &exact.id)?;
             project_checkpointed_turn(&connection, &mut exact)?;
             exact.owner_prompts = load_owner_prompts(&connection, &exact.id)?;
+            exact.queued_prompts = load_prompt_queue(&connection, &exact.id)?;
             exact.first_prompt_preview = load_first_prompt_preview(&connection, &exact)?;
             exact.owned_provider_sessions = load_owned_provider_sessions(&connection, &exact.id)?;
             return Ok(Some(exact));
@@ -3317,6 +3412,7 @@ impl SessionRepository for SqliteSessionRepository {
                 record.owner_turns = load_owner_turns(&connection, &record.id)?;
                 project_checkpointed_turn(&connection, &mut record)?;
                 record.owner_prompts = load_owner_prompts(&connection, &record.id)?;
+                record.queued_prompts = load_prompt_queue(&connection, &record.id)?;
                 record.first_prompt_preview = load_first_prompt_preview(&connection, &record)?;
                 record.owned_provider_sessions =
                     load_owned_provider_sessions(&connection, &record.id)?;
@@ -3424,7 +3520,7 @@ impl SessionRepository for SqliteSessionRepository {
             None,
             None,
             None,
-            None,
+            SessionCreationContext::default(),
         )
     }
 
@@ -3445,7 +3541,7 @@ impl SessionRepository for SqliteSessionRepository {
         code_mode: Option<bool>,
         tool_configuration: Option<&nakode_protocol::SessionToolConfiguration>,
         owner_prompt: Option<&PersistedOwnerPrompt>,
-        initial_instructions: Option<&str>,
+        creation: SessionCreationContext<'_>,
     ) -> Result<SessionRecord, SessionError> {
         let now = unix_timestamp();
         let title = title.lines().next().unwrap_or("New session").trim();
@@ -3530,7 +3626,7 @@ impl SessionRepository for SqliteSessionRepository {
                 enabled_skill_ids_json,
                 code_mode.map(i64::from),
                 tool_configuration_json,
-                initial_instructions,
+                creation.initial_instructions,
             ],
         )?;
         let record = transaction.query_row(
@@ -3561,6 +3657,17 @@ impl SessionRepository for SqliteSessionRepository {
         }
         if let Some(profile_id) = profile_id {
             bind_session_skill_profile_in_transaction(&transaction, &record.id, profile_id)?;
+        }
+        if let Some(bridge) = creation.bridge {
+            save_session_bridge_on(&transaction, bridge)?;
+        }
+        if let Some(parent) = creation.parent_session_id {
+            crate::child_reports::ReportStore::link_in_transaction(
+                &transaction,
+                parent,
+                &record.id,
+            )
+            .map_err(SessionError::ChildRelationship)?;
         }
         if let Some(prompt) = owner_prompt {
             record_owner_prompt_on(&transaction, &record.id, prompt)?;
@@ -4035,6 +4142,7 @@ impl SessionRepository for SqliteSessionRepository {
     fn save_prompt_dispatch_checkpoint(
         &self,
         owner_prompts: &[(String, PersistedOwnerPrompt)],
+        queue: Option<(&str, &[crate::state::QueuedPrompt])>,
         bridges: &[SessionBridgeRecord],
         inbound_event: Option<(&str, &str, nakode_protocol::BridgeContinuationDisposition)>,
     ) -> Result<(), SessionError> {
@@ -4045,6 +4153,9 @@ impl SessionRepository for SqliteSessionRepository {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (session_id, prompt) in owner_prompts {
             record_owner_prompt_on(&transaction, session_id, prompt)?;
+        }
+        if let Some((session_id, prompts)) = queue {
+            save_prompt_queue_on(&transaction, session_id, prompts)?;
         }
         for bridge in bridges {
             save_session_bridge_on(&transaction, bridge)?;
@@ -4110,6 +4221,18 @@ impl SessionRepository for SqliteSessionRepository {
                 i64::from(turn.options.fast_mode),
                 outcome_code
             ],
+        )?;
+        // The terminal event and its child report share the same commit. A crash cannot acknowledge
+        // one without the other, and replay of a turn cannot duplicate its report. This is evidence,
+        // not an owner prompt: it neither wakes a parent nor recursively emits another completion.
+        transaction.execute(
+            "INSERT INTO session_child_reports(child_id, report_id, state, body, created_at_ms)
+             SELECT child_id, ?2, ?3, ?4, ?5 FROM session_child_links WHERE child_id = ?1
+             ON CONFLICT(child_id, report_id) DO NOTHING",
+            params![id, format!("turn:{}", turn.id),
+                if outcome == "interrupted" { "cancelled" } else { outcome },
+                format!("Child turn {} {outcome}. Inspect the child transcript for its result and validation evidence.", turn.id),
+                observed_at.saturating_mul(1_000)],
         )?;
         transaction.commit()?;
         Ok(())
@@ -5591,6 +5714,57 @@ mod tests {
     use crate::credential::{Credential, CredentialStore, SecretValue};
 
     #[test]
+    fn queued_prompt_metadata_survives_repository_restart() -> Result<(), SessionError> {
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp");
+        std::fs::create_dir_all(&scratch).expect("scratch directory");
+        let directory = tempfile::tempdir_in(scratch).expect("tempdir");
+        let database = directory.path().join("queued-prompts.db");
+        let store = SqliteSessionRepository::open(&database)?;
+        let session = store.create(
+            CODEX_PROVIDER,
+            "native-queue",
+            "/fixture/project",
+            "Queue",
+            None,
+        )?;
+        assert!(store.find(&session.id)?.unwrap().queued_prompts.is_empty());
+        let mut metadata = serde_json::json!({
+            "id": "queued-image", "text": "Keep exact context", "delivery_uncertain": false,
+            "source_transport": "fixture-transport",
+            "attachments": [
+                {"label": "image.png", "path": null, "image": {"mime_type": "image/png", "data": [1, 2, 3]}},
+                {"label": "file.txt", "path": "/fixture/project/file.txt", "image": null}
+            ],
+            "handoff": {
+                "source_provider": "source", "source_model": "source/model", "source_session": "source-session",
+                "target_provider": CODEX_PROVIDER, "messages": [{"role": "User", "body": "Selected context"}],
+                "omitted_messages": 2
+            }
+        });
+        let queued: crate::state::QueuedPrompt = serde_json::from_value(metadata.clone()).unwrap();
+        store.save_prompt_dispatch_checkpoint(&[], Some((&session.id, &[queued])), &[], None)?;
+        drop(store);
+        let restarted = SqliteSessionRepository::open(&database)?;
+        let retained = restarted.find(&session.id)?.unwrap();
+        assert_eq!(
+            serde_json::to_value(&retained.queued_prompts[0]).unwrap(),
+            metadata
+        );
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery_uncertain");
+        let legacy: crate::state::QueuedPrompt = serde_json::from_value(metadata).unwrap();
+        assert!(
+            !legacy.delivery_uncertain,
+            "ordinary legacy snapshots remain readable"
+        );
+        restarted.delete(&session.id)?;
+        assert!(load_prompt_queue(&restarted.connection.lock().unwrap(), &session.id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn terminal_image_mode_defaults_to_auto_and_persists() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
@@ -6552,6 +6726,7 @@ mod tests {
             store
                 .save_prompt_dispatch_checkpoint(
                     &[(session.id.clone(), rolled_back)],
+                    None,
                     &[],
                     Some((
                         &session.id,
@@ -6921,7 +7096,7 @@ mod tests {
             Some(false),
             Some(&configuration),
             None,
-            None,
+            SessionCreationContext::default(),
         )?;
         assert_eq!(created.tool_configuration.as_ref(), Some(&configuration));
         store.set_session_tool_configuration(&created.id, &configuration)?;
@@ -8338,7 +8513,10 @@ mod tests {
             None,
             None,
             Some(&prompt),
-            Some(instructions),
+            SessionCreationContext {
+                initial_instructions: Some(instructions),
+                ..Default::default()
+            },
         )?;
         assert_eq!(created.initial_instructions.as_deref(), Some(instructions));
         // Retried creation cannot replace established instructions with another caller's prose.
@@ -8357,7 +8535,10 @@ mod tests {
             None,
             None,
             None,
-            Some("replacement"),
+            SessionCreationContext {
+                initial_instructions: Some("replacement"),
+                ..Default::default()
+            },
         )?;
         repository.transition_primary_with_account(
             &created.id,
@@ -8405,7 +8586,7 @@ mod tests {
             Some(true),
             None,
             None,
-            None,
+            SessionCreationContext::default(),
         )?;
         assert_eq!(
             created.account_id.as_deref(),
@@ -8433,7 +8614,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
-                None,
+                SessionCreationContext::default(),
             )
             .expect_err("a conflicting profile must roll back the whole creation transaction");
         assert!(matches!(error, SessionError::InvalidStoredValue { .. }));
@@ -8489,7 +8670,7 @@ mod tests {
                 Some(false),
                 None,
                 Some(&prompt),
-                None,
+                SessionCreationContext::default(),
             )
             .expect_err("owner insert failure must abort the session creation transaction");
         assert!(matches!(error, SessionError::Database(_)));
@@ -8553,7 +8734,7 @@ mod tests {
                     Some(false),
                     None,
                     Some(&prompt),
-                    None,
+                    SessionCreationContext::default(),
                 )
             }));
         }

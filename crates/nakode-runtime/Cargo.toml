@@ -6,5 +6,8 @@ rust-version = "1.88"
 description = "Embeddable headless Nakode agent runtime"
 repository = "https://github.com/QuillDev/nakode"
 
+[features]
+e2e-fixture-provider = ["nakode/e2e-fixture-provider"]
+
 [dependencies]
 nakode = { path = "../..", version = "0.3.0", default-features = false }

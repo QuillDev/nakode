@@ -38,6 +38,9 @@ use crate::{
     },
 };
 
+#[cfg(feature = "e2e-fixture-provider")]
+mod e2e;
+
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -504,6 +507,8 @@ impl CodexProvider {
 ///
 /// Returns an error when the stored credential has an invalid shape.
 pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError> {
+    #[cfg(feature = "e2e-fixture-provider")]
+    let config = e2e::configure(config)?;
     let credential = config
         .credential
         .as_ref()
@@ -3716,6 +3721,7 @@ mod tests {
                 #[cfg(unix)]
                 "return_image",
                 "prepare_image",
+                "list_child_materials",
                 "read_skill",
                 "read_skill_component",
                 "write",

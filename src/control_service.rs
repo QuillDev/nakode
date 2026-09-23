@@ -718,6 +718,20 @@ async fn write_lifecycle_response(
     }
 }
 
+// Only the trusted launcher supplies these process-start facts. Session Environment never mutates
+// the service process. Missing/malformed enrollment data means unknown locality, not a guessed host.
+fn execution_machine() -> Option<nakode_sdk::v1::ExecutionMachine> {
+    let authority = std::env::var("NAKODE_EXECUTION_MACHINE_AUTHORITY").ok()?;
+    let id = std::env::var("NAKODE_EXECUTION_MACHINE_ID").ok()?;
+    if [&authority, &id]
+        .iter()
+        .any(|value| value.is_empty() || value.len() > 200 || value.trim() != value.as_str())
+    {
+        return None;
+    }
+    Some(nakode_sdk::v1::ExecutionMachine { authority, id })
+}
+
 async fn run_grpc_listener(
     listener: UnixListener,
     _path: PathBuf,
@@ -732,6 +746,8 @@ async fn run_grpc_listener(
         .add_service(
             nakode_server::grpc::GrpcService::new(endpoint)
                 .with_server_id(server_id)
+                .with_execution_routing(execution_machine(), true, false)
+                .map_err(|error| ControlError::ServiceRejected(error.to_string()))?
                 .with_additional_capability("MachinePath")
                 .into_server(),
         )
@@ -744,6 +760,15 @@ async fn run_grpc_listener(
     Ok(())
 }
 
+pub(crate) fn remote_server_tls_config(
+    certificate: &[u8],
+    private_key: &[u8],
+) -> tonic::transport::ServerTlsConfig {
+    nakode_sdk::initialize_tls_provider();
+    let identity = tonic::transport::Identity::from_pem(certificate, private_key);
+    tonic::transport::ServerTlsConfig::new().identity(identity)
+}
+
 async fn run_remote_grpc_listener(
     config: Option<crate::remote::RemoteConfig>,
     endpoint: nakode_server::ServerEndpoint,
@@ -753,11 +778,10 @@ async fn run_remote_grpc_listener(
         std::future::pending::<()>().await;
         return Ok(());
     };
-    let identity = tonic::transport::Identity::from_pem(
+    let tls = remote_server_tls_config(
         config.certificate_pem.as_bytes(),
         config.private_key_pem.as_bytes(),
     );
-    let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
     eprintln!("nakode remote API listening at {}", config.bind);
     let update_service = crate::remote_update::RemoteUpdateService::new(server_id.clone())
         .map_err(ControlError::ServiceRejected)?;
@@ -768,6 +792,8 @@ async fn run_remote_grpc_listener(
         .add_service(
             nakode_server::grpc::GrpcService::new(endpoint)
                 .with_server_id(server_id)
+                .with_execution_routing(execution_machine(), false, true)
+                .map_err(|error| ControlError::ServiceRejected(error.to_string()))?
                 .with_additional_capability("MachinePath")
                 .with_nakode_service_only_lane_catalogue()
                 .with_additional_capability("RemoteSelfUpdate")

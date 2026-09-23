@@ -1,3 +1,5 @@
+pub(crate) mod materials;
+
 use std::{collections::BTreeSet, path::Component};
 
 use nakode_protocol::{
@@ -1689,7 +1691,7 @@ fn settings_view(state: &DomainState, providers: &[ProviderRecord]) -> SettingsV
     }
 }
 
-fn interactions(state: &DomainState, revision: u64) -> Vec<InteractionView> {
+pub(crate) fn interactions(state: &DomainState, revision: u64) -> Vec<InteractionView> {
     let approvals = state.approvals.iter().map(|approval| InteractionView {
         id: approval_interaction_id(&state.nakode_session_id, &approval.id),
         revision,
