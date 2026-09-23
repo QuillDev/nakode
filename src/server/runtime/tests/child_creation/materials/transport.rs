@@ -142,7 +142,9 @@ async fn same_machine_material_sdk_uses_unix_service_with_no_proxy_and_no_fallba
     let mut h = harness().await;
     let child = child(&mut h).await;
     images(&mut h, &child, 1);
-    let socket = h.directory.path().join("m.sock");
+    // Transport sockets need a short path even when the fixture workspace is deeply nested.
+    let socket_directory = tempfile::tempdir().unwrap();
+    let socket = socket_directory.path().join("m.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let service = nakode_server::grpc::GrpcService::new(h.runtime.endpoint.clone())
         .with_server_id("child-installation")

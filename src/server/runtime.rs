@@ -600,7 +600,7 @@ impl NativeServerRuntime {
                         None => shutdown_open = false,
                     }
                 }
-                _ = followup_tick.tick(), if self.followup_polling_enabled => self.dispatch_followups().await,
+                _ = followup_tick.tick() => self.dispatch_followups().await,
                 _ = provider_sync.tick() => {
                     self.synchronize_shared_providers().await;
                     self.cancel_abandoned_native_delegations().await;

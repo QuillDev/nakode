@@ -1306,16 +1306,30 @@ impl AgentRuntime {
                 }
                 batch.push(pending.next().expect("peeked read-only tool call"));
             }
-            let executions = futures_util::future::join_all(batch.into_iter().map(|call| {
-                self.execute_read_only_tool(session, turn_id, call, backend_events, cancellation)
-            }))
-            .await;
+            let read_session = &*session;
+            let executions =
+                futures_util::future::join_all(batch.into_iter().map(|call| async move {
+                    let executed = self
+                        .execute_read_only_tool(
+                            read_session,
+                            turn_id,
+                            call,
+                            backend_events,
+                            cancellation,
+                        )
+                        .await?;
+                    // Publish each terminal audit immediately. Model history remains in call order
+                    // after the batch settles, without withholding a fast sibling's completion.
+                    publish_tool_result(&executed, turn_id, backend_events).await?;
+                    Ok::<_, String>(executed)
+                }))
+                .await;
             for executed in executions {
                 let executed = executed?;
                 if executed.failed {
                     *failures.entry(executed.name.clone()).or_default() += 1;
                 }
-                record_tool_result(session, executed, turn_id, backend_events).await?;
+                retain_tool_result(session, executed, turn_id, backend_events, true).await?;
                 self.checkpoint(session)?;
             }
         }
@@ -2073,7 +2087,8 @@ async fn record_tool_result(
     turn_id: &str,
     events: &mpsc::Sender<BackendEvent>,
 ) -> Result<(), String> {
-    finish_tool_result(session, executed, turn_id, events, true).await
+    publish_tool_result(&executed, turn_id, events).await?;
+    retain_tool_result(session, executed, turn_id, events, true).await
 }
 
 async fn record_nested_tool_result(
@@ -2082,24 +2097,24 @@ async fn record_nested_tool_result(
     turn_id: &str,
     events: &mpsc::Sender<BackendEvent>,
 ) -> Result<(), String> {
-    finish_tool_result(session, executed, turn_id, events, false).await
+    publish_tool_result(&executed, turn_id, events).await?;
+    retain_tool_result(session, executed, turn_id, events, false).await
 }
 
-async fn finish_tool_result(
-    session: &mut RuntimeSession,
-    mut executed: ExecutedTool,
+async fn publish_tool_result(
+    executed: &ExecutedTool,
     turn_id: &str,
     events: &mpsc::Sender<BackendEvent>,
-    add_to_model_history: bool,
 ) -> Result<(), String> {
-    if executed.item_id.is_empty() {
-        executed.item_id = format!("{turn_id}:tool:{}", executed.call_id);
-    }
     events
         .send(BackendEvent::ItemCompleted {
             turn_id: turn_id.to_owned(),
             item: NormalizedItem {
-                id: executed.item_id.clone(),
+                id: if executed.item_id.is_empty() {
+                    format!("{turn_id}:tool:{}", executed.call_id)
+                } else {
+                    executed.item_id.clone()
+                },
                 kind: ItemKind::Tool,
                 title: executed.title.clone(),
                 body: executed.output.clone(),
@@ -2137,6 +2152,16 @@ async fn finish_tool_result(
         })
         .await
         .map_err(|_| "backend event receiver closed".to_owned())?;
+    Ok(())
+}
+
+async fn retain_tool_result(
+    session: &mut RuntimeSession,
+    mut executed: ExecutedTool,
+    turn_id: &str,
+    events: &mpsc::Sender<BackendEvent>,
+    add_to_model_history: bool,
+) -> Result<(), String> {
     if !executed.failed
         && executed.name == "read_skill"
         && let Some(identity) = executed.invocation_identity.take()
@@ -4512,6 +4537,97 @@ mod tests {
         let executed = execution.await.expect("native tool execution");
         assert!(!executed.failed);
         assert_eq!(executed.output, "attributed child completed");
+    }
+
+    #[tokio::test]
+    async fn parallel_native_delegates_publish_fast_completion_before_slow_sibling() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::tempdir_in(root).unwrap();
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (delegation_tx, mut delegation_rx) = mpsc::channel(2);
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider)
+            .with_native_delegation(delegation_tx);
+        let mut session = RuntimeSession::new("test-model".into(), "Test.".into())
+            .with_owner(Some("logical-parent".into()), None);
+        let (events, mut receiver) = mpsc::channel(32);
+        let cancellation = CancellationToken::new();
+        let calls = ["slow", "fast"]
+            .into_iter()
+            .map(|id| ToolCall {
+                id: id.into(),
+                parent_call_id: Some("parallel".into()),
+                name: crate::tools::NAKODE_AGENT_TOOL_NAME.into(),
+                arguments: json!({"agent":"repo-explorer", "title":id, "task":id}),
+            })
+            .collect();
+        {
+            let execution =
+                runtime.execute_tool_calls(&mut session, "turn", calls, &events, &cancellation);
+            tokio::pin!(execution);
+            let mut requests = Vec::new();
+            while requests.len() < 2 {
+                tokio::select! {
+                    request = delegation_rx.recv() => {
+                        let Some(NativeAgentRequest::Delegate(request)) = request else { panic!("expected delegate") };
+                        requests.push(request);
+                    }
+                    result = &mut execution => panic!("settled before delegates: {result:?}"),
+                }
+            }
+            let fast = requests.pop().unwrap();
+            assert_eq!(fast.title, "fast");
+            fast.respond.send(Ok("FAST FINDINGS".into())).unwrap();
+            loop {
+                tokio::select! {
+                    event = receiver.recv() => {
+                        if let Some(BackendEvent::ItemCompleted { item, .. }) = event {
+                            assert_eq!(item.id, "turn:tool:fast");
+                            assert_eq!(item.body, "FAST FINDINGS");
+                            assert!(item.tool_audit_json.unwrap().contains("parallel"));
+                            break;
+                        }
+                    }
+                    result = &mut execution => panic!("slow delegate still blocked: {result:?}"),
+                    () = tokio::time::sleep(std::time::Duration::from_secs(2)) => panic!("fast completion withheld"),
+                }
+            }
+            requests
+                .pop()
+                .unwrap()
+                .respond
+                .send(Ok("SLOW FINDINGS".into()))
+                .unwrap();
+            assert!(execution.await.unwrap().is_empty());
+        }
+        let results: Vec<_> = session
+            .history
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::ToolResult {
+                    call_id,
+                    model_output,
+                    ..
+                } => Some((call_id.as_str(), model_output.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            [
+                ("slow", Some("SLOW FINDINGS")),
+                ("fast", Some("FAST FINDINGS"))
+            ]
+        );
+        let mut completed = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let BackendEvent::ItemCompleted { item, .. } = event {
+                completed.push(item.id);
+            }
+        }
+        assert_eq!(completed, ["turn:tool:slow"]);
     }
 
     #[tokio::test]

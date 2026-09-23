@@ -38,6 +38,63 @@ impl ReportStore {
         Ok(Self(connection))
     }
 
+    /// Questions are evidence about the existing child interaction, never an answer or approval.
+    /// Native run events cannot call this with a linked logical child identity.
+    pub(crate) fn record_question(
+        &self,
+        child: &str,
+        question: &crate::backend::QuestionRequest,
+        now_ms: i64,
+    ) -> Result<()> {
+        let report_id = format!("question:{:x}", Sha256::digest(question.id.as_bytes()));
+        let pending: bool = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_child_links WHERE child_id = ?1)
+             AND NOT EXISTS(SELECT 1 FROM session_child_reports WHERE child_id = ?1 AND report_id = ?2)",
+            params![child, report_id], |row| row.get(0),
+        ).map_err(|error| failure(&error))?;
+        if !pending {
+            return Ok(());
+        }
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "question_id": question.id,
+            "interaction_id": crate::state::projection::question_interaction_id(child, &question.group_id),
+            "group_id": question.group_id,
+            "order": question.order,
+            "question": crate::state::projection::interaction_question(question),
+            "status_at_observation": "pending",
+            "detail": "Question evidence, not owner consent or an answer. Revalidate the original child interaction before resolving it; other questions may belong to the same group."
+        }).to_string();
+        if body.len() > 16 * 1024 {
+            return Err(refuse(
+                "structured child question exceeds 16384-byte report limit; question remains pending",
+            ));
+        }
+        let inserted = self
+            .0
+            .execute(
+                "INSERT INTO session_child_reports(child_id, report_id, state, body, created_at_ms)
+             SELECT child_id, ?2, 'question', ?3, ?4 FROM session_child_links WHERE child_id = ?1
+               AND (SELECT COUNT(*) FROM session_child_reports WHERE child_id = ?1) < 4096
+             ON CONFLICT(child_id, report_id) DO NOTHING",
+                params![child, report_id, body, now_ms],
+            )
+            .map_err(|error| failure(&error))?;
+        if inserted == 0 {
+            let withheld: bool = self.0.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_child_links WHERE child_id = ?1)
+                 AND NOT EXISTS(SELECT 1 FROM session_child_reports WHERE child_id = ?1 AND report_id = ?2)",
+                params![child, report_id], |row| row.get(0),
+            ).map_err(|error| failure(&error))?;
+            if withheld {
+                return Err(refuse(
+                    "child report retention limit reached; question remains pending",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Commit the report-domain mutation and its retry receipt together. Revision fencing is not
     /// supported for this append-only domain; callers must not silently lose an explicit fence.
     pub(crate) fn execute(
@@ -204,12 +261,13 @@ impl ReportStore {
     ) -> Result<()> {
         if report_id.is_empty()
             || report_id.starts_with("turn:")
+            || report_id.starts_with("question:")
             || report_id.len() > 200
             || body.is_empty()
             || body.len() > 16 * 1024
             || !matches!(
                 state,
-                "progress" | "blocker" | "completed" | "failed" | "cancelled"
+                "progress" | "blocker" | "question" | "completed" | "failed" | "cancelled"
             )
         {
             return Err(ServiceError { code: ErrorCode::InvalidRequest, message: "report requires an id (1–200 bytes), body (1–16384 bytes), and a supported state".to_owned(), retryable: false });
