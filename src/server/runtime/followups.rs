@@ -140,12 +140,25 @@ impl NativeServerRuntime {
     /// A fixed timer, never a sliding debounce, gives idle bursts one cutoff and prevents an
     /// unending producer stream from postponing execution. Legacy queue members keep their order.
     pub(super) async fn dispatch_followups(&mut self) {
-        if !self.accepting_work || !self.followup_polling_enabled {
+        if !self.accepting_work {
             return;
         }
         let Ok(mut store) = InboxStore::open(&self.effects.persistence.database) else {
             return;
         };
+        self.observe_child_questions();
+        match store.admit_child_events() {
+            Ok(true) => self.followup_polling_enabled = true,
+            Ok(false) => {}
+            Err(error) => {
+                self.core.engine_mut().state_mut().status_message =
+                    format!("Child notification admission held: {}", error.message);
+                return;
+            }
+        }
+        if !self.followup_polling_enabled {
+            return;
+        }
         let Ok(sessions) = store.candidates(self.followup_cursor.as_ref()) else {
             return;
         };
@@ -208,6 +221,41 @@ impl NativeServerRuntime {
             }
             self.core
                 .commit_and_publish_session(&self.endpoint, &session);
+        }
+    }
+
+    fn observe_child_questions(&mut self) {
+        let Ok(reports) =
+            crate::child_reports::ReportStore::open(&self.effects.persistence.database)
+        else {
+            return;
+        };
+        // Retry observation while the original question is pending; never manufacture or answer
+        // an interaction. Primary logical sessions only: native run questions are excluded.
+        let mut question_failures = Vec::new();
+        for (session, engine) in &self.core.sessions_by_id {
+            for question in &engine.state().questions {
+                if let Err(error) = reports.record_question(
+                    session.as_str(),
+                    &question.request,
+                    super::super::unix_timestamp_ms(),
+                ) && !question_failures
+                    .iter()
+                    .any(|(failed_session, _)| failed_session == session)
+                {
+                    question_failures.push((session.clone(), error.message));
+                }
+            }
+        }
+        for (session, message) in question_failures {
+            let message = format!("Child notification held: {message}");
+            if let Some(engine) = self.core.engine_for_mut(&session)
+                && engine.state().status_message != message
+            {
+                engine.state_mut().status_message = message;
+                self.core
+                    .commit_and_publish_session(&self.endpoint, &session);
+            }
         }
     }
 

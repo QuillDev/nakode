@@ -27,9 +27,9 @@ are not replaced by retries.
 - Metadata pages use independently stored text/labels, never decode image payloads,
   and never restore providers. They expose individual sequence, message ID, sender,
   timestamp, state and batch ID, plus pending count, pause and unresolved state.
-- Once explicitly used, the actor checks every 250 ms without a sliding debounce.
-  Runtimes without retained inbox messages start with polling disabled; a successful
-  explicit inbox mutation enables it. Store-read failures keep recovery polling enabled.
+- The actor checks every 250 ms without a sliding debounce. Ordinary dispatch remains
+  disabled until explicit inbox admission or runtime-owned durable child evidence exists.
+  Report observation also runs without a mounted client; store failures retain evidence for retry.
   Only loaded, ready,
   nonbusy sessions with an empty legacy queue dispatch. Candidate pages rotate
   through at most 64 identities and wrap after exhaustion.
@@ -46,7 +46,9 @@ are not replaced by retries.
   receipts and cached Stop retries cannot undo a later explicit Resume. Resume can
   clear a pre-dispatch blocked claim, but does not reset uncertain dispatch.
 
-Durable batching is **explicit opt-in through `EnqueueFollowup` only**.
+Ordinary-message batching is **explicit opt-in through `EnqueueFollowup` only**.
+Runtime-owned linked-child reports separately enter this same ledger with persisted evidence
+origin and delivery receipts; see `docs/child-followup-delivery.md`.
 `SendPrompt`/`EnqueuePrompt` retain the established visible queue for both Chat
 and agent sessions, including initial prompts and retries. There is no automatic
 conversion and no fallback after durable admission. Answers, approvals and urgent
