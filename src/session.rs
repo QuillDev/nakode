@@ -102,6 +102,8 @@ pub fn is_pending_provider_session_id(provider_session_id: &str) -> bool {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
+    /// Read-only projection of the canonical durable child link.
+    pub parent_session_id: Option<String>,
     /// Bounded display metadata from accepted prompts or normalized legacy runtime history.
     pub first_prompt_preview: String,
     pub id: String,
@@ -2108,6 +2110,7 @@ impl SqliteSessionRepository {
             .transpose()
             .map_err(|error| stored_session_conversion_error(20, error))?;
         Ok(SessionRecord {
+            parent_session_id: row.get(22)?,
             first_prompt_preview: String::new(),
             id: row.get(0)?,
             provider: row.get(1)?,
@@ -3321,7 +3324,8 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
@@ -3351,7 +3355,8 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let rows = statement.query_map([], Self::row)?;
@@ -3381,7 +3386,8 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let exact = connection
             .query_row(
-                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
+                "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
                  FROM sessions WHERE id = ?1",
                 [id],
                 Self::row,
@@ -3397,7 +3403,8 @@ impl SessionRepository for SqliteSessionRepository {
             return Ok(Some(exact));
         }
         let mut statement = connection.prepare(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
              FROM sessions
              WHERE substr(id, 1, length(?1)) = ?1
              ORDER BY updated_at DESC LIMIT 2",
@@ -3484,7 +3491,8 @@ impl SessionRepository for SqliteSessionRepository {
             ],
         )?;
         connection.query_row(
-            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
+            "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -3629,12 +3637,13 @@ impl SessionRepository for SqliteSessionRepository {
                 creation.initial_instructions,
             ],
         )?;
-        let record = transaction.query_row(
+        let mut record = transaction.query_row(
             "SELECT id, provider, provider_session_id, workspace, title, model,
                     model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model,
                     last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome,
                     created_at, updated_at, COALESCE(working_directory, workspace),
-                    last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions
+                    last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -3668,6 +3677,7 @@ impl SessionRepository for SqliteSessionRepository {
                 &record.id,
             )
             .map_err(SessionError::ChildRelationship)?;
+            record.parent_session_id = Some(parent.to_owned());
         }
         if let Some(prompt) = owner_prompt {
             record_owner_prompt_on(&transaction, &record.id, prompt)?;
