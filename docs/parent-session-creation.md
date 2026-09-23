@@ -66,6 +66,18 @@ fixture tests, not live provider, dashboard browser or two-host E2E verification
 never infer parentage from titles, directories, timestamps or native runs. Standalone and unknown
 legacy sessions project no parent. Reading these fields does not open providers or change lifecycle.
 
+Parent observations are additive: newer readers accept an omitted field from older servers as
+unavailable parent metadata, as well as explicit null and a supplied parent identity. They must not
+infer a relationship for an older session or reject its otherwise valid history. A present field
+with an invalid type still fails validation. This read compatibility does not relax the
+`ParentSessionCreation` capability check for mutations.
+
+`crates/nakode-protocol/tests/parent_compatibility.rs` covers older semantic projections, explicit
+null, exact parent identity round trips, and malformed values. FStack's HTTP adapter uses the
+camel-case `parentSessionId`; its generated SDK must accept omission in both workspace summaries
+and session GET/watch/command responses. Updating Nakode alone cannot repair a deployed HTTP
+client that rejects older Host responses.
+
 ## Integration still required
 
 FStack's paired change consumes this contract through its public SDK/Host boundary; its bundled
