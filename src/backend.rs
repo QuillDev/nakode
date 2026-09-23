@@ -925,6 +925,7 @@ pub enum NativeAgentRequest {
     SearchSharedContext(NativeSharedContextSearchRequest),
     ValidationEvidence(NativeValidationEvidenceRequest),
     Image(NativeImageRequest),
+    Material(NativeMaterialRequest),
 }
 
 pub enum NativeValidationEvidenceOperation {
@@ -953,6 +954,24 @@ pub struct NativeSharedContextSearchRequest {
     pub kinds: Vec<String>,
     pub limit: usize,
     pub respond: oneshot::Sender<Result<String, String>>,
+}
+
+pub enum NativeMaterialOperation {
+    List {
+        after: Option<nakode_protocol::ArtifactId>,
+        limit: u32,
+    },
+    Image {
+        reference: String,
+    },
+}
+
+pub struct NativeMaterialRequest {
+    pub owner_session_id: String,
+    pub requester_run_id: Option<String>,
+    pub source: nakode_protocol::MaterialSource,
+    pub operation: NativeMaterialOperation,
+    pub respond: oneshot::Sender<Result<nakode_protocol::QueryResult, String>>,
 }
 
 pub struct NativeImageRequest {

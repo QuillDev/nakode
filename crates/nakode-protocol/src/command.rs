@@ -279,8 +279,41 @@ pub enum ClientContext {
 // Rust command API to optimize an infrequent control-plane enum.
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
+    /// Durable ordinary follow-up admission, separate from steering and interactive answers.
+    EnqueueFollowup {
+        session_id: SessionId,
+        message_id: String,
+        prompt: PromptInput,
+    },
+    /// Pausing retains all messages. Resuming never retries uncertain provider dispatch.
+    SetFollowupPaused {
+        session_id: SessionId,
+        paused: bool,
+    },
+    /// Same-runtime logical sessions only. The authenticated integration supplies owner intent.
+    LinkChildSession {
+        parent_session_id: SessionId,
+        child_session_id: SessionId,
+    },
+    /// Attribution is derived from the immutable link, never accepted from report text.
+    PublishChildReport {
+        child_session_id: SessionId,
+        report_id: String,
+        state: String,
+        body: String,
+    },
+    /// Answer an original linked child's grouped ask. This is never a parent interaction or prompt.
+    AnswerChildQuestions {
+        parent_session_id: SessionId,
+        child_session_id: SessionId,
+        interaction_id: InteractionId,
+        answers: Vec<QuestionResponse>,
+    },
     CreateSession {
         workspace_id: WorkspaceId,
+        /// Same-runtime durable parent; persisted atomically before publication, never a native run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<SessionId>,
         /// Canonical filesystem/provider root. `None` inherits the logical workspace path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         working_directory: Option<String>,
@@ -663,6 +696,33 @@ pub enum Command {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Query {
+    ListFollowups {
+        session_id: SessionId,
+        after_sequence: u64,
+        limit: u32,
+    },
+    /// Read-only session existence for listener-owned routing metadata; never hydrates history.
+    GetSessionRouting {
+        session_id: SessionId,
+    },
+    ListChildMaterials {
+        scope: crate::MaterialScope,
+        after: Option<ArtifactId>,
+        limit: u32,
+    },
+    GetChildMaterial {
+        scope: crate::MaterialScope,
+        image_reference: String,
+        transform: Option<ImageTransform>,
+    },
+    ListChildQuestions {
+        parent_session_id: SessionId,
+    },
+    ListChildReports {
+        parent_session_id: SessionId,
+        after_sequence: u64,
+        limit: u32,
+    },
     Bootstrap {
         workspace: String,
         session_id: Option<SessionId>,
@@ -784,6 +844,7 @@ mod tests {
     fn logical_session_policy_commands_have_stable_wire_shapes() {
         let session_id = SessionId::from("session-1");
         let creation = Command::CreateSession {
+            parent_session_id: None,
             workspace_id: WorkspaceId::from("workspace-1"),
             working_directory: Some("/repo/project".to_owned()),
             title: Some("Dashboard assistant".to_owned()),

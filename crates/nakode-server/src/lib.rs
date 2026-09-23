@@ -137,6 +137,18 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     fixed("NakodeService", "InspectWorkspacePath", RequestLane::Query),
     fixed("NakodeService", "WatchWorkspace", RequestLane::Subscription),
     fixed("NakodeService", "ReloadWorkspace", RequestLane::Control),
+    fixed("NakodeService", "LinkChildSession", RequestLane::Control),
+    fixed("NakodeService", "PublishChildReport", RequestLane::Control),
+    fixed("NakodeService", "ListChildQuestions", RequestLane::Query),
+    fixed(
+        "NakodeService",
+        "AnswerChildQuestions",
+        RequestLane::Control,
+    ),
+    fixed("NakodeService", "EnqueueFollowup", RequestLane::Control),
+    fixed("NakodeService", "SetFollowupPaused", RequestLane::Control),
+    fixed("NakodeService", "ListFollowups", RequestLane::Hydration),
+    fixed("NakodeService", "ListChildReports", RequestLane::Query),
     fixed("NakodeService", "GetSoul", RequestLane::Query),
     fixed("NakodeService", "SaveSoul", RequestLane::Control),
     fixed("NakodeService", "GetMcpManagement", RequestLane::Query),
@@ -346,6 +358,13 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
         RequestLane::Hydration,
     ),
     fixed("NakodeService", "GetRunTextWindow", RequestLane::Hydration),
+    fixed("NakodeService", "GetSessionRouting", RequestLane::Query),
+    fixed(
+        "NakodeService",
+        "ListChildMaterials",
+        RequestLane::Hydration,
+    ),
+    fixed("NakodeService", "GetChildMaterial", RequestLane::Hydration),
     fixed("NakodeService", "GetArtifact", RequestLane::Hydration),
     fixed("NakodeService", "GetSessionImage", RequestLane::Hydration),
     fixed("NakodeService", "GetDiagnostics", RequestLane::Query),
@@ -489,10 +508,16 @@ fn query_lane(query: &Query) -> QueryLane {
         | Query::GetTranscriptBodyWindow { .. }
         | Query::ListRuns { .. }
         | Query::GetRunTextWindow { .. }
+        | Query::ListFollowups { .. }
+        | Query::ListChildMaterials { .. }
+        | Query::GetChildMaterial { .. }
         | Query::GetArtifact { .. }
         | Query::GetSessionImage { .. } => QueryLane::Hydration,
-        Query::InspectWorkspacePath { .. }
+        Query::GetSessionRouting { .. }
+        | Query::InspectWorkspacePath { .. }
         | Query::ListSkills { .. }
+        | Query::ListChildQuestions { .. }
+        | Query::ListChildReports { .. }
         | Query::GetSoul { .. }
         | Query::GetMcpManagement { .. }
         | Query::ListSessions { .. }

@@ -5,12 +5,23 @@
 //! persistence implementation.
 
 mod base64_bytes;
+mod child_question;
+pub use child_question::{ChildQuestionAvailability, ChildQuestionSnapshot, ChildQuestions};
+mod child_report;
 mod command;
+pub use child_report::{ChildReport, ChildReportPage};
 mod diagnostics;
+mod followup;
+pub use followup::{FollowupInbox, FollowupItem};
 mod error;
 mod ids;
 mod invocation;
+mod material;
 mod mcp;
+pub use material::{
+    ChildMaterial, MAX_MATERIAL_PAGE_SIZE, MaterialMetadata, MaterialPage, MaterialScope,
+    MaterialSource,
+};
 mod service;
 mod view;
 

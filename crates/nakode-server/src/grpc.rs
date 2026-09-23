@@ -16,6 +16,8 @@ use crate::{
     TimedServerResponse,
 };
 
+mod materials;
+
 const LAUNCH_CRITICAL_RUN_TEXT_BYTES: usize = 512;
 const DEFERRED_RUN_SUMMARY_BYTES: usize = 1_024;
 
@@ -60,6 +62,7 @@ pub struct GrpcService {
     server_id: String,
     include_activation_rpc_lanes: bool,
     additional_capabilities: Arc<[String]>,
+    routing: materials::Routing,
 }
 
 impl GrpcService {
@@ -72,6 +75,7 @@ impl GrpcService {
             server_id,
             include_activation_rpc_lanes: true,
             additional_capabilities: Arc::from([]),
+            routing: materials::Routing::default(),
         }
     }
 
@@ -720,6 +724,190 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
 
+    command_rpc!(
+        link_child_session,
+        api::LinkChildSessionRequest,
+        input,
+        protocol::Command::LinkChildSession {
+            parent_session_id: protocol::SessionId::from(input.parent_session_id),
+            child_session_id: protocol::SessionId::from(input.child_session_id),
+        }
+    );
+    command_rpc!(
+        publish_child_report,
+        api::PublishChildReportRequest,
+        input,
+        protocol::Command::PublishChildReport {
+            child_session_id: protocol::SessionId::from(input.child_session_id),
+            report_id: input.report_id,
+            state: input.state,
+            body: input.body,
+        }
+    );
+    async fn list_child_questions(
+        &self,
+        request: tonic::Request<api::ListChildQuestionsRequest>,
+    ) -> Result<tonic::Response<api::ChildQuestionSnapshot>, tonic::Status> {
+        let (result, timing) = self
+            .query(protocol::Query::ListChildQuestions {
+                parent_session_id: protocol::SessionId::from(
+                    request.into_inner().parent_session_id,
+                ),
+            })
+            .await?;
+        let protocol::QueryResult::ChildQuestions(view) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected child questions response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            api::ChildQuestionSnapshot {
+                parent_session_id: view.parent_session_id.to_string(),
+                children: view
+                    .children
+                    .into_iter()
+                    .map(|child| api::ChildQuestions {
+                        child_session_id: child.child_session_id.to_string(),
+                        child_title: child.child_title,
+                        availability: match child.availability {
+                            protocol::ChildQuestionAvailability::Live => "live",
+                            protocol::ChildQuestionAvailability::Unavailable => "unavailable",
+                            protocol::ChildQuestionAvailability::Closed => "closed",
+                        }
+                        .to_owned(),
+                        interactions: child.interactions.into_iter().map(interaction).collect(),
+                    })
+                    .collect(),
+            },
+            &timing,
+        ))
+    }
+
+    command_rpc!(
+        answer_child_questions,
+        api::AnswerChildQuestionsRequest,
+        input,
+        protocol::Command::AnswerChildQuestions {
+            parent_session_id: protocol::SessionId::from(input.parent_session_id),
+            child_session_id: protocol::SessionId::from(input.child_session_id),
+            interaction_id: protocol::InteractionId::from(input.interaction_id),
+            answers: input
+                .answers
+                .into_iter()
+                .map(|answer| protocol::QuestionResponse {
+                    question_id: answer.question_id,
+                    option_ids: answer.option_ids,
+                    text: answer.text,
+                })
+                .collect(),
+        }
+    );
+
+    try_command_rpc!(
+        enqueue_followup,
+        api::EnqueueFollowupRequest,
+        input,
+        prompt(input.prompt).map(|prompt| protocol::Command::EnqueueFollowup {
+            session_id: protocol::SessionId::from(input.session_id),
+            message_id: input.message_id,
+            prompt,
+        })
+    );
+    command_rpc!(
+        set_followup_paused,
+        api::SetFollowupPausedRequest,
+        input,
+        protocol::Command::SetFollowupPaused {
+            session_id: protocol::SessionId::from(input.session_id),
+            paused: input.paused,
+        }
+    );
+    async fn list_followups(
+        &self,
+        request: tonic::Request<api::ListFollowupsRequest>,
+    ) -> Result<tonic::Response<api::FollowupInbox>, tonic::Status> {
+        let input = request.into_inner();
+        let (result, timing) = self
+            .query(protocol::Query::ListFollowups {
+                session_id: protocol::SessionId::from(input.session_id),
+                after_sequence: input.after_sequence,
+                limit: input.limit,
+            })
+            .await?;
+        let protocol::QueryResult::Followups(view) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected follow-up inbox response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            api::FollowupInbox {
+                session_id: view.session_id.to_string(),
+                items: view
+                    .items
+                    .into_iter()
+                    .map(|item| api::FollowupItem {
+                        sequence: item.sequence,
+                        message_id: item.message_id,
+                        submitted_by: item.submitted_by,
+                        received_at_ms: item.received_at_ms,
+                        text: item.text,
+                        attachment_labels: item.attachment_labels,
+                        state: item.state,
+                        batch_id: item.batch_id,
+                    })
+                    .collect(),
+                has_more: view.has_more,
+                pending_count: view.pending_count,
+                paused: view.paused,
+                unsettled_batch_id: view.unsettled_batch_id,
+                blocked_reason: view.blocked_reason,
+            },
+            &timing,
+        ))
+    }
+
+    async fn list_child_reports(
+        &self,
+        request: tonic::Request<api::ListChildReportsRequest>,
+    ) -> Result<tonic::Response<api::ChildReportPage>, tonic::Status> {
+        let input = request.into_inner();
+        let (result, timing) = self
+            .query(protocol::Query::ListChildReports {
+                parent_session_id: protocol::SessionId::from(input.parent_session_id),
+                after_sequence: input.after_sequence,
+                limit: input.limit,
+            })
+            .await?;
+        let protocol::QueryResult::ChildReports(page) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected child reports response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            api::ChildReportPage {
+                reports: page
+                    .reports
+                    .into_iter()
+                    .map(|report| api::ChildReport {
+                        sequence: report.sequence,
+                        report_id: report.report_id,
+                        parent_session_id: report.parent_session_id,
+                        child_session_id: report.child_session_id,
+                        child_title: report.child_title,
+                        state: report.state,
+                        body: report.body,
+                        created_at_ms: report.created_at_ms,
+                    })
+                    .collect(),
+                has_more: page.has_more,
+            },
+            &timing,
+        ))
+    }
+
     async fn get_soul(
         &self,
         request: tonic::Request<api::GetSoulRequest>,
@@ -857,6 +1045,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         (|| -> Result<protocol::Command, tonic::Status> {
             Ok(protocol::Command::CreateSession {
                 workspace_id: protocol::WorkspaceId::from(input.workspace_id),
+                parent_session_id: input.parent_session_id.map(protocol::SessionId::from),
                 working_directory: input.working_directory,
                 title: input.title,
                 model_id: input.model_id.map(protocol::ModelId::from),
@@ -2006,6 +2195,95 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         Ok(response_with_timing(run_text(value), &timing))
     }
 
+    async fn get_session_routing(
+        &self,
+        request: tonic::Request<api::GetSessionRoutingRequest>,
+    ) -> Result<tonic::Response<api::SessionRouting>, tonic::Status> {
+        let (result, timing) = self
+            .query(protocol::Query::GetSessionRouting {
+                session_id: request.into_inner().session_id.into(),
+            })
+            .await?;
+        let protocol::QueryResult::SessionRouting(session_id) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected session routing response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            api::SessionRouting {
+                session_id: session_id.to_string(),
+                location: Some(self.execution_location()),
+                operations: self.operation_routing(),
+            },
+            &timing,
+        ))
+    }
+
+    async fn list_child_materials(
+        &self,
+        request: tonic::Request<api::ListChildMaterialsRequest>,
+    ) -> Result<tonic::Response<api::MaterialPage>, tonic::Status> {
+        let request = request.into_inner();
+        self.check_material_epoch(&request.expected_runtime_epoch)?;
+        let (result, timing) = self
+            .query(protocol::Query::ListChildMaterials {
+                scope: materials::material_scope(request.scope)?,
+                after: request.after_artifact_id.map(Into::into),
+                limit: request.limit,
+            })
+            .await?;
+        let protocol::QueryResult::ChildMaterials(page) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected material page response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            materials::material_page(page),
+            &timing,
+        ))
+    }
+
+    async fn get_child_material(
+        &self,
+        request: tonic::Request<api::GetChildMaterialRequest>,
+    ) -> Result<tonic::Response<api::ChildMaterial>, tonic::Status> {
+        let request = request.into_inner();
+        self.check_material_epoch(&request.expected_runtime_epoch)?;
+        let (result, timing) = self
+            .query(protocol::Query::GetChildMaterial {
+                scope: materials::material_scope(request.scope)?,
+                image_reference: request.image_reference,
+                transform: request.transform.map(|transform| protocol::ImageTransform {
+                    crop: transform.crop.map(|crop| protocol::ImageCrop {
+                        x: crop.x,
+                        y: crop.y,
+                        width: crop.width,
+                        height: crop.height,
+                    }),
+                    max_width: transform.max_width,
+                    max_height: transform.max_height,
+                }),
+            })
+            .await?;
+        let protocol::QueryResult::ChildMaterial(value) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected child material response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            api::ChildMaterial {
+                scope: Some(materials::scope_view(value.scope)),
+                session_title: value.session_title,
+                run_title: value.run_title,
+                artifact: Some(artifact(value.artifact)),
+            },
+            &timing,
+        ))
+    }
+
     async fn get_artifact(
         &self,
         request: tonic::Request<api::GetArtifactRequest>,
@@ -2121,6 +2399,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
     ) -> Result<tonic::Response<api::ServerInfo>, tonic::Status> {
         let started_at = Instant::now();
         let response = api::ServerInfo {
+            execution_location: Some(self.execution_location()),
+            operation_routing: self.operation_routing(),
             server_version: self.endpoint.server_version().to_owned(),
             api_version: "nakode.v1".to_owned(),
             capabilities: self
@@ -2130,6 +2410,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .iter()
                 .map(|value| format!("{value:?}"))
                 .chain(self.additional_capabilities.iter().cloned())
+                .chain(std::iter::once("SessionRouting".to_owned()))
                 .collect(),
             server_id: self.server_id.clone(),
             build_revision: self.endpoint.build_revision().map(str::to_owned),

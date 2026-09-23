@@ -11,9 +11,12 @@ use crate::{
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceCapability {
+    DurableFollowupInbox,
     Subscriptions,
     MultipleClients,
     ArtifactTransfer,
+    /// Bounded, parent-authorized transcript image discovery and retrieval in this runtime.
+    ChildMaterials,
     ExternalTools,
     /// `CreateSession` and `OpenSession` atomically install client-owned tools before provider work.
     InitialSessionTools,
@@ -38,6 +41,10 @@ pub enum ServiceCapability {
     SessionOrphanCleanup,
     /// Structured, atomic per-question answers, including free text.
     QuestionTextAnswers,
+    /// Same-runtime linked-child question projection and exact original-ask resolution.
+    LinkedChildQuestions,
+    /// Atomically create a durable same-runtime child with its profile and parent association.
+    ParentSessionCreation,
     /// `SteerQueuedPrompt` atomically redirects active work to a server-owned follow-up.
     QueuedPromptSteering,
     /// Local-only, owner-opted invocation metadata settings and bounded usage queries.
@@ -183,6 +190,12 @@ pub struct SkillCatalogueView {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum QueryResult {
+    Followups(crate::FollowupInbox),
+    SessionRouting(SessionId),
+    ChildMaterials(crate::MaterialPage),
+    ChildMaterial(crate::ChildMaterial),
+    ChildQuestions(crate::ChildQuestionSnapshot),
+    ChildReports(crate::ChildReportPage),
     WorkspacePathInspection(WorkspacePathInspectionView),
     Bootstrap(Box<BootstrapView>),
     SoulDocument(SoulDocumentView),

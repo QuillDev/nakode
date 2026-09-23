@@ -47,6 +47,10 @@ use crate::{
     state::{AgentBrowserStatus, DomainState, Effect},
 };
 
+mod child_creation;
+mod child_materials;
+mod followups;
+
 use super::{BridgeStateCheckpoint, ServerCore};
 
 const SESSION_BACKEND_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -200,8 +204,14 @@ impl BridgeMutationRollback {
             Command::CreateSession {
                 bridge: Some(_), ..
             }
+            | Command::CreateSession {
+                parent_session_id: Some(_),
+                ..
+            }
             | Command::SendPrompt { .. }
             | Command::EnqueuePrompt { .. }
+            | Command::RemoveQueuedPrompt { .. }
+            | Command::SteerQueuedPrompt { .. }
             | Command::ContinueSessionFromBridge { .. }
             | Command::DeleteSession { .. }
             | Command::PruneSession { .. }
@@ -263,6 +273,8 @@ pub(crate) struct NativeServerRuntime {
     path_inspections: tokio::task::JoinSet<()>,
     agent_browser_checks:
         tokio::task::JoinSet<(u64, nakode_protocol::SessionId, AgentBrowserStatus)>,
+    followup_cursor: Option<nakode_protocol::SessionId>,
+    followup_polling_enabled: bool,
     agent_browser_check_generation: u64,
 }
 
@@ -446,7 +458,14 @@ impl NativeServerRuntime {
             shutdown: shutdown_tx,
             quiesce: quiesce_tx,
         };
+        // Ordinary installations do not poll SQLite for an unused opt-in feature.
+        // Retained messages, including uncertain batches, keep recovery checks enabled.
+        let followup_polling_enabled =
+            crate::followups::InboxStore::open(&effects.persistence.database)
+                .and_then(|store| store.has_messages())
+                .unwrap_or(true);
         let mut core = ServerCore::new(engine, providers, sessions);
+        core.durable_child_creation = true;
         match effects.persistence.sessions.list_session_bridges_all() {
             Ok(bridges) => core.install_session_bridges(bridges),
             Err(error) => core
@@ -501,6 +520,8 @@ impl NativeServerRuntime {
                 skill_preferences,
                 path_inspections: tokio::task::JoinSet::new(),
                 agent_browser_checks: tokio::task::JoinSet::new(),
+                followup_cursor: None,
+                followup_polling_enabled,
                 agent_browser_check_generation: 0,
             },
             handle,
@@ -515,6 +536,8 @@ impl NativeServerRuntime {
         let mut provider_sync = tokio::time::interval(SHARED_PROVIDER_SYNC_INTERVAL);
         provider_sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         provider_sync.tick().await;
+        let mut followup_tick = tokio::time::interval(Duration::from_millis(250));
+        followup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 request = self.requests.recv() => {
@@ -577,6 +600,7 @@ impl NativeServerRuntime {
                         None => shutdown_open = false,
                     }
                 }
+                _ = followup_tick.tick(), if self.followup_polling_enabled => self.dispatch_followups().await,
                 _ = provider_sync.tick() => {
                     self.synchronize_shared_providers().await;
                     self.cancel_abandoned_native_delegations().await;
@@ -674,6 +698,7 @@ impl NativeServerRuntime {
             NativeAgentRequest::SearchSharedContext(request) => {
                 self.handle_shared_context_search(request).await;
             }
+            NativeAgentRequest::Material(request) => self.handle_native_material(request),
             NativeAgentRequest::Image(request) => {
                 let session_id = nakode_protocol::SessionId::from(request.owner_session_id);
                 let result = self
@@ -1186,6 +1211,22 @@ impl NativeServerRuntime {
 
     fn retained_query_session(&self, query: &Query) -> Option<&crate::session::SessionRecord> {
         let (Query::GetSession { session_id }
+        | Query::ListChildMaterials {
+            scope:
+                nakode_protocol::MaterialScope {
+                    source: nakode_protocol::MaterialSource { session_id, .. },
+                    ..
+                },
+            ..
+        }
+        | Query::GetChildMaterial {
+            scope:
+                nakode_protocol::MaterialScope {
+                    source: nakode_protocol::MaterialSource { session_id, .. },
+                    ..
+                },
+            ..
+        }
         | Query::GetTranscriptPage { session_id, .. }
         | Query::ListRuns { session_id, .. }
         | Query::GetTranscriptBodyWindow {
@@ -1302,6 +1343,113 @@ impl NativeServerRuntime {
                 }
                 request => request,
             }
+        };
+        let Some(request) = self.handle_followup_request(request) else {
+            return;
+        };
+        let child_question_store = if matches!(
+            &request,
+            nakode_server::ServerRequest::Command {
+                command: Command::AnswerChildQuestions { .. },
+                ..
+            }
+        ) {
+            match crate::child_reports::ReportStore::open(&self.effects.persistence.database) {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                        let _ = respond.send(Err(error));
+                    }
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let request = match request {
+            nakode_server::ServerRequest::Query {
+                query: query @ (Query::ListChildMaterials { .. } | Query::GetChildMaterial { .. }),
+                respond,
+                ..
+            } => {
+                let result = self.read_child_materials(query).map(|value| Snapshot {
+                    cursor: self.endpoint.cursor(),
+                    value,
+                });
+                let _ = respond.send(result);
+                return;
+            }
+            nakode_server::ServerRequest::Query {
+                query: Query::ListChildQuestions { parent_session_id },
+                respond,
+                ..
+            } => {
+                let result =
+                    crate::child_reports::ReportStore::open(&self.effects.persistence.database)
+                        .and_then(|store| {
+                            crate::child_questions::snapshot(&store, &self.core, &parent_session_id)
+                        })
+                        .map(|view| Snapshot {
+                            cursor: self.endpoint.cursor(),
+                            value: QueryResult::ChildQuestions(view),
+                        });
+                let _ = respond.send(result);
+                return;
+            }
+            nakode_server::ServerRequest::Command {
+                command:
+                    command @ (Command::LinkChildSession { .. } | Command::PublishChildReport { .. }),
+                idempotency_key,
+                replay_only,
+                expected_revision,
+                respond,
+                ..
+            } => {
+                let resource_id = match &command {
+                    Command::LinkChildSession {
+                        child_session_id, ..
+                    } => child_session_id.to_string(),
+                    Command::PublishChildReport { report_id, .. } => report_id.clone(),
+                    _ => unreachable!("report command pattern"),
+                };
+                let result =
+                    crate::child_reports::ReportStore::open(&self.effects.persistence.database)
+                        .and_then(|mut store| {
+                            store.execute(
+                                &command,
+                                idempotency_key.as_str(),
+                                replay_only,
+                                expected_revision,
+                                super::unix_timestamp_ms(),
+                            )
+                        });
+                let _ = respond
+                    .send(result.map(|()| ServerCore::accepted(Some(resource_id), Vec::new()).0));
+                return;
+            }
+            nakode_server::ServerRequest::Query {
+                query:
+                    Query::ListChildReports {
+                        parent_session_id,
+                        after_sequence,
+                        limit,
+                    },
+                respond,
+                ..
+            } => {
+                let result =
+                    crate::child_reports::ReportStore::open(&self.effects.persistence.database)
+                        .and_then(|store| {
+                            store.list(parent_session_id.as_str(), after_sequence, limit)
+                        })
+                        .map(|page| Snapshot {
+                            cursor: self.endpoint.cursor(),
+                            value: QueryResult::ChildReports(page),
+                        });
+                let _ = respond.send(result);
+                return;
+            }
+            request => request,
         };
         let mut request = request;
         let cached_command = match &request {
@@ -1807,8 +1955,45 @@ impl NativeServerRuntime {
             }
             request => request,
         };
+        let child_creation = match &request {
+            nakode_server::ServerRequest::Command {
+                command:
+                    Command::CreateSession {
+                        parent_session_id: Some(parent),
+                        title,
+                        ..
+                    },
+                ..
+            } => Some((parent.clone(), title.clone())),
+            _ => None,
+        };
+        let stop_inbox = match &request {
+            nakode_server::ServerRequest::Command {
+                command: Command::CancelSessionWork { session_id },
+                ..
+            } => Some(session_id.clone()),
+            _ => None,
+        };
+        let stop_checkpoint = stop_inbox.as_ref().map(|_| Box::new(self.core.clone()));
         let mut rollback = BridgeMutationRollback::capture(&request, &self.core);
-        let mut outcome = self.core.handle(&self.endpoint, request);
+        let mut outcome = if let Some(store) = child_question_store.as_ref() {
+            self.core
+                .handle_with_child_questions(&self.endpoint, request, Some(store))
+        } else {
+            self.core.handle(&self.endpoint, request)
+        };
+        // Only a newly accepted Stop pauses the inbox. Rejected fences, replay-only misses and
+        // cached retries must not mutate scheduling after an explicit later Resume.
+        if outcome.changed
+            && let Some(session) = stop_inbox
+            && let Err(error) = self.pause_followups_for_stop(&session)
+        {
+            if let Some(checkpoint) = stop_checkpoint {
+                self.core = *checkpoint;
+            }
+            outcome.respond_with_error(error);
+            return;
+        }
         if outcome.changed
             && let Some((session_id, profile_id)) = session_profile_binding
             && let Err(error) = self
@@ -1881,6 +2066,23 @@ impl NativeServerRuntime {
             .effect_session
             .clone()
             .unwrap_or_else(|| self.core.default_session_id().clone());
+        if outcome.changed
+            && let Some((parent, title)) = child_creation
+            && let Err(error) = child_creation::persist_child_creation(
+                &mut self.core,
+                &session_id,
+                &parent,
+                title.as_deref(),
+                self.effects.persistence.sessions.as_ref(),
+                &mut effects,
+            )
+        {
+            if let Some(rollback) = rollback.take() {
+                rollback.restore(&mut self.core);
+            }
+            outcome.respond_with_error(error);
+            return;
+        }
         if let Err(_error) = persist_command_dispatch_effects(
             &mut self.core,
             &session_id,
@@ -2084,6 +2286,13 @@ impl NativeServerRuntime {
         effects
             .retain(|effect| !matches!(effect, Effect::Backend(BackendCommand::StartTurn { .. })));
         if !starts_turn {
+            if let Some(engine) = self.core.engine_for_mut(session_id) {
+                let state = engine.state_mut();
+                state.diagnostic_count += 1;
+                state.status_message = format!(
+                    "Queued work could not be checkpointed: {error}. Retained uncertain guidance will not be replayed automatically."
+                );
+            }
             return;
         }
         if let Some(engine) = self.core.engine_for_mut(session_id) {
@@ -2116,6 +2325,7 @@ impl NativeServerRuntime {
         if !self.effects.backends.is_current_control_source(&source) {
             return;
         }
+        self.acknowledge_followup_event(&source, &event);
         let is_streaming_delta = matches!(&event, BackendEvent::ItemDelta { .. });
         if let BackendEvent::ExternalToolRequested(request) = &event
             && request.name.starts_with(nakode_protocol::MCP_TOOL_PREFIX)
@@ -3158,6 +3368,10 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::SessionDeletion,
             ServiceCapability::SessionOrphanCleanup,
             ServiceCapability::QuestionTextAnswers,
+            ServiceCapability::LinkedChildQuestions,
+            ServiceCapability::DurableFollowupInbox,
+            ServiceCapability::ParentSessionCreation,
+            ServiceCapability::ChildMaterials,
             ServiceCapability::QueuedPromptSteering,
             ServiceCapability::ArchetypeManagement,
             ServiceCapability::CloudArchetypeSynchronization,
@@ -3285,7 +3499,7 @@ fn e2e_codex_fixture() -> Option<PathBuf> {
 
 fn enable_e2e_fixture_provider(providers: &mut [ProviderRecord]) {
     #[cfg(feature = "e2e-fixture-provider")]
-    if e2e_codex_fixture().is_some()
+    if (e2e_codex_fixture().is_some() || std::env::var_os("NAKODE_E2E_CODEX_NATIVE_URL").is_some())
         && let Some(provider) = providers
             .iter_mut()
             .find(|provider| provider.provider == crate::backend::CODEX_PROVIDER)
@@ -5217,6 +5431,34 @@ fn bridge_inbound_event_identity(
     Some((session_id.clone(), external_event_id.clone()))
 }
 
+fn changed_prompt_queue(
+    core: &ServerCore,
+    session_id: &nakode_protocol::SessionId,
+) -> Option<Vec<crate::state::QueuedPrompt>> {
+    let state = core.engine_for(session_id)?.state();
+    let record = core
+        .sessions
+        .iter()
+        .find(|record| record.id == session_id.as_str())?;
+    let queue = state.queue.iter().cloned().collect::<Vec<_>>();
+    (queue != record.queued_prompts).then_some(queue)
+}
+
+fn confirm_prompt_queue(
+    core: &mut ServerCore,
+    session_id: &nakode_protocol::SessionId,
+    queue: Option<Vec<crate::state::QueuedPrompt>>,
+) {
+    if let Some(queue) = queue
+        && let Some(record) = core
+            .sessions
+            .iter_mut()
+            .find(|record| record.id == session_id.as_str())
+    {
+        record.queued_prompts = queue;
+    }
+}
+
 fn persist_command_dispatch_effects(
     core: &mut ServerCore,
     effect_session: &nakode_protocol::SessionId,
@@ -5235,6 +5477,10 @@ fn persist_command_dispatch_effects(
         persist_owner_prompt_effects(core, effect_session, sessions, effects)?;
         return persist_bridge_effects(sessions, effects, inbound_event_to_claim);
     }
+    let queue = changed_prompt_queue(core, effect_session);
+    let queue_checkpoint = queue
+        .as_deref()
+        .map(|prompts| (effect_session.as_str(), prompts));
     let mut owner_prompts = Vec::new();
     let mut bridges = Vec::new();
     let mut tool_configurations = Vec::new();
@@ -5261,13 +5507,19 @@ fn persist_command_dispatch_effects(
             sessions.set_session_tool_configuration(session_id, configuration)
         })
         .and_then(|()| {
-            if owner_prompts.is_empty() && bridges.is_empty() {
+            if owner_prompts.is_empty() && bridges.is_empty() && queue.is_none() {
                 Ok(())
             } else {
-                sessions.save_prompt_dispatch_checkpoint(&owner_prompts, &bridges, inbound_event)
+                sessions.save_prompt_dispatch_checkpoint(
+                    &owner_prompts,
+                    queue_checkpoint,
+                    &bridges,
+                    inbound_event,
+                )
             }
         });
     if result.is_ok() {
+        confirm_prompt_queue(core, effect_session, queue);
         for (session_id, configuration) in &tool_configurations {
             if let Some(record) = core
                 .sessions
@@ -5288,6 +5540,10 @@ fn persist_owner_prompt_effects(
     sessions: &dyn SessionRepository,
     effects: &mut Vec<Effect>,
 ) -> Result<(), SessionError> {
+    let queue = changed_prompt_queue(core, effect_session);
+    let queue_checkpoint = queue
+        .as_deref()
+        .map(|prompts| (effect_session.as_str(), prompts));
     let state = core
         .engine_for_mut(effect_session)
         .ok_or_else(|| SessionError::SessionNotFound(effect_session.to_string()))?
@@ -5309,6 +5565,7 @@ fn persist_owner_prompt_effects(
     });
     let checkpoint_result = (|| {
         let mut creation_prompt_persisted = false;
+        let mut owner_prompts = Vec::new();
         for checkpoint in checkpoints {
             match checkpoint {
                 Effect::PersistSession {
@@ -5338,21 +5595,35 @@ fn persist_owner_prompt_effects(
                         Some(tool_configuration.code_mode),
                         Some(&tool_configuration),
                         creation_prompt.as_ref(),
-                        state.initial_client_instructions(),
+                        crate::session::SessionCreationContext {
+                            initial_instructions: state.initial_client_instructions(),
+                            ..Default::default()
+                        },
                     )?;
                     creation_prompt_persisted = creation_prompt.is_some();
                     state.session_persisted(&record);
                 }
                 Effect::PersistAcceptedOwnerPrompt { session_id, prompt } => {
                     if !creation_prompt_persisted {
-                        sessions.record_owner_prompt(&session_id, &prompt)?;
+                        owner_prompts.push((session_id, prompt));
                     }
                 }
                 _ => unreachable!("only owner transcript checkpoints are collected"),
             }
         }
+        if !owner_prompts.is_empty() || queue_checkpoint.is_some() {
+            sessions.save_prompt_dispatch_checkpoint(
+                &owner_prompts,
+                queue_checkpoint,
+                &[],
+                None,
+            )?;
+        }
         Ok(())
     })();
+    if checkpoint_result.is_ok() {
+        confirm_prompt_queue(core, effect_session, queue);
+    }
     *effects = remaining;
     checkpoint_result
 }
@@ -5635,7 +5906,10 @@ fn persist_session(
         Some(tool_configuration.code_mode),
         Some(tool_configuration),
         None,
-        state.initial_client_instructions(),
+        crate::session::SessionCreationContext {
+            initial_instructions: state.initial_client_instructions(),
+            ..Default::default()
+        },
     ) {
         Ok(record) => state.session_persisted(&record),
         Err(error) => state.session_store_failed(error.to_string()),
@@ -6604,6 +6878,9 @@ fn summarize_provider_error(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod child_creation;
+    mod child_questions;
+    mod followups;
     use std::{
         collections::{HashMap, HashSet, VecDeque},
         path::Path,
@@ -8218,6 +8495,7 @@ mod tests {
         allow_loaders: bool,
     ) -> Command {
         Command::CreateSession {
+            parent_session_id: None,
             workspace_id: workspace_id.clone(),
             working_directory: Some(workspace.to_string_lossy().into_owned()),
             title: Some(format!("{profile_id} session")),
@@ -10139,6 +10417,7 @@ mod tests {
                 false,
                 Command::CreateSession {
                     workspace_id,
+                    parent_session_id: None,
                     working_directory: None,
                     title: None,
                     model_id: None,

@@ -153,6 +153,8 @@ have deterministic conflict and authorization semantics. Interactive requests
 such as approvals and questions remain server-owned resources with explicit
 resolution status so simultaneous clients cannot resolve them inconsistently.
 
+Interactive linked-child question reads and answers reuse the original child interaction through the persistence-backed public runtime; same-runtime availability and restart limitations are documented in `docs/linked-child-questions.md`. Parent reads never create questions or restore providers.
+
 The public API must expose every capability needed to build a feature-complete
 alternative frontend. SDKs own connection recovery, idempotent mutation retry,
 watch resubscription, paging, hydration, and session open/create selection so
@@ -184,7 +186,12 @@ A Nakode session is a logical body of work, not an alias for one provider
 thread. One logical session may contain many native agent sessions using
 different providers, models, and roles.
 
+- Ordinary accepted queues persist exact identity, attachments, transport provenance and handoff with dispatch checkpoints; read-only retained projections never activate providers. Native queued steering persists uncertainty before dispatch; ambiguous acceptance never authorizes replay, and exact-ID removal remains available. `src/session.rs`, `src/server/runtime.rs`, `src/state.rs`.
+- Ordinary sends retain the visible prompt queue; durable batching requires explicit `EnqueueFollowup` and never silently intercepts `SendPrompt`/`EnqueuePrompt`. Uncertainty never authorizes automatic replay. Public API and unfinished recovery/UI boundaries: `docs/followup-inbox.md`.
+- Child-material discovery/retrieval uses persisted exact parent/session/run scope and public launcher-bound locality; unknown locality never enables proxy fallback. Transcript-image and cross-runtime boundaries: `docs/child-materials.md`.
+- Parent-aware `CreateSession` persists the logical child and same-runtime relationship before publication; durable sessions and native archetype runs keep distinct identities and lifecycles. Capability and recovery boundaries: `docs/parent-session-creation.md`.
 - Creation-time client instructions persist with the logical session, independently of owner prompts, and restore before pending creation recovery or provider handoff. New logical sessions must not inherit another session’s instructions; legacy records remain absent rather than reconstructed from transcript prose.
+- Provider-bound instructions place stable runtime policy before dynamic session/host/catalogue context; client references remain subordinate and owner task text stays separate. Verify delivered instructions and ordered tools at adapter boundaries; cache optimizations never imply measured cache savings.
 - Explicit session creation titles remain distinct from first-prompt text.
 - Delegation tools, the public Delegate operation, and the agent CLI require a task-specific title of 1–120 characters; titles persist separately from objectives, and legacy runs remain explicitly untitled.
 - Archived session bridges retain logical identity, native history and workspace associations; retained session/run queries and session subscriptions never activate providers or persist restart corrections. Explicit `OpenSession` restores execution; deletion remains distinct. `src/server/runtime.rs`, `src/server.rs`.

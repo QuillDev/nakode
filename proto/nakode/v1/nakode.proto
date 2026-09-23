@@ -29,6 +29,19 @@ service NakodeService {
   rpc SetMcpServerGrants(SetMcpServerGrantsRequest) returns (MutationResult);
 
   rpc SetSessionEnvironment(SetSessionEnvironmentRequest) returns (MutationResult);
+  // Same-runtime children. A link is immutable and rejects cycles/nested parents.
+  // These owner-integration operations do not authorize cross-machine routing or automatic turns.
+  // Mutation keys are durable within the report domain; replay-only never creates a missing record.
+  // Revision fences are unsupported and explicitly rejected. Report sequence is the paging cursor.
+  // Same bound profile permits different workspaces; unbound legacy sessions require one workspace.
+  rpc LinkChildSession(LinkChildSessionRequest) returns (MutationResult);
+  rpc PublishChildReport(PublishChildReportRequest) returns (MutationResult);
+  rpc ListChildReports(ListChildReportsRequest) returns (ChildReportPage);
+  rpc EnqueueFollowup(EnqueueFollowupRequest) returns (MutationResult);
+  rpc SetFollowupPaused(SetFollowupPausedRequest) returns (MutationResult);
+  rpc ListFollowups(ListFollowupsRequest) returns (FollowupInbox);
+  rpc ListChildQuestions(ListChildQuestionsRequest) returns (ChildQuestionSnapshot);
+  rpc AnswerChildQuestions(AnswerChildQuestionsRequest) returns (MutationResult);
   rpc CreateSession(CreateSessionRequest) returns (MutationResult);
   rpc OpenSession(OpenSessionRequest) returns (MutationResult);
   rpc SetSessionBridgeLifecycle(SetSessionBridgeLifecycleRequest) returns (MutationResult);
@@ -115,6 +128,12 @@ service NakodeService {
   rpc GetTranscriptPage(GetTranscriptPageRequest) returns (TranscriptPage);
   rpc GetTranscriptBodyWindow(GetTranscriptBodyWindowRequest) returns (TranscriptBodyWindow);
   rpc GetRunTextWindow(GetRunTextWindowRequest) returns (RunTextWindow);
+  // Metadata only. No endpoints, credentials or model-selectable transport destinations.
+  rpc GetSessionRouting(GetSessionRoutingRequest) returns (SessionRouting);
+  // Current parent/child and exact session/run membership are rechecked on every call.
+  // This version covers canonical transcript images, not filesystem Gallery entries.
+  rpc ListChildMaterials(ListChildMaterialsRequest) returns (MaterialPage);
+  rpc GetChildMaterial(GetChildMaterialRequest) returns (ChildMaterial);
   rpc GetArtifact(GetArtifactRequest) returns (Artifact);
   // Resolves only images owned by this logical session, including bounded image-v1 recipes.
   rpc GetSessionImage(GetSessionImageRequest) returns (Artifact);
@@ -124,6 +143,96 @@ service NakodeService {
   rpc GetInvocationSummary(GetInvocationSummaryRequest) returns (InvocationSummary);
   rpc GetInvocationTimeline(GetInvocationTimelineRequest) returns (InvocationTimeline);
   rpc GetServerInfo(google.protobuf.Empty) returns (ServerInfo);
+}
+
+message LinkChildSessionRequest {
+  MutationOptions mutation = 1;
+  string parent_session_id = 2;
+  string child_session_id = 3;
+}
+message PublishChildReportRequest {
+  MutationOptions mutation = 1;
+  string child_session_id = 2;
+  string report_id = 3;
+  // progress, blocker, completed, failed, or cancelled.
+  string state = 4;
+  string body = 5;
+}
+// A same-runtime replacement over durable child links. Interactions retain the exact original IDs.
+message ListChildQuestionsRequest { string parent_session_id = 1; }
+message ChildQuestions {
+  string child_session_id = 1;
+  string child_title = 2;
+  // live, unavailable or closed. Unavailable history never represents a pending waiter.
+  string availability = 3;
+  repeated Interaction interactions = 4;
+}
+message ChildQuestionSnapshot {
+  string parent_session_id = 1;
+  repeated ChildQuestions children = 2;
+}
+message AnswerChildQuestionsRequest {
+  MutationOptions mutation = 1;
+  string parent_session_id = 2;
+  string child_session_id = 3;
+  string interaction_id = 4;
+  repeated InteractionAnswer answers = 5;
+}
+
+message EnqueueFollowupRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string message_id = 3;
+  PromptInput prompt = 4;
+}
+message SetFollowupPausedRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  bool paused = 3;
+}
+message ListFollowupsRequest {
+  string session_id = 1;
+  uint64 after_sequence = 2;
+  uint32 limit = 3;
+}
+message FollowupItem {
+  uint64 sequence = 1;
+  string message_id = 2;
+  string submitted_by = 3;
+  int64 received_at_ms = 4;
+  string text = 5;
+  repeated string attachment_labels = 6;
+  string state = 7;
+  optional string batch_id = 8;
+}
+message FollowupInbox {
+  string session_id = 1;
+  repeated FollowupItem items = 2;
+  bool has_more = 3;
+  uint64 pending_count = 4;
+  bool paused = 5;
+  optional string unsettled_batch_id = 6;
+  optional string blocked_reason = 7;
+}
+
+message ListChildReportsRequest {
+  string parent_session_id = 1;
+  uint64 after_sequence = 2;
+  uint32 limit = 3;
+}
+message ChildReport {
+  uint64 sequence = 1;
+  string report_id = 2;
+  string parent_session_id = 3;
+  string child_session_id = 4;
+  string child_title = 5;
+  string state = 6;
+  string body = 7;
+  uint64 created_at_ms = 8;
+}
+message ChildReportPage {
+  repeated ChildReport reports = 1;
+  bool has_more = 2;
 }
 
 // ActivationService is the installation-scoped update activation boundary. While an older
@@ -387,6 +496,65 @@ message ServerInfo {
   // Complete RPC lane catalogue for services bound alongside the responding NakodeService
   // endpoint. Older servers omit this additive field.
   repeated RpcLaneDefinition rpc_lanes = 6;
+  // Absent on old/unbound listeners: locality is unknown, not local.
+  ExecutionLocation execution_location = 7;
+  repeated OperationRouting operation_routing = 8;
+}
+
+// Machine identity is an authority-scoped, server-bound execution identity from the trusted launcher.
+// It is not a hostname, path, physical hardware claim or operator client-device identity.
+message ExecutionMachine { string authority = 1; string id = 2; }
+message ExecutionLocation {
+  ExecutionMachine machine = 1;
+  string server_id = 2;
+  string runtime_epoch = 3;
+}
+message OperationRouting {
+  string operation = 1;
+  bool direct_local_service = 2;
+  bool authenticated_remote = 3;
+  // Current child material operations require both sessions in this runtime.
+  string relationship_scope = 4;
+}
+message GetSessionRoutingRequest { string session_id = 1; }
+message SessionRouting {
+  string session_id = 1;
+  ExecutionLocation location = 2;
+  repeated OperationRouting operations = 3;
+}
+message MaterialSource { string session_id = 1; optional string run_id = 2; }
+message MaterialScope { string parent_session_id = 1; MaterialSource source = 2; }
+message ListChildMaterialsRequest {
+  MaterialScope scope = 1;
+  optional string after_artifact_id = 2;
+  uint32 limit = 3; // 1..64, invalid bounds refuse.
+  string expected_runtime_epoch = 4; // Required; stale discovery refuses.
+}
+message MaterialMetadata {
+  string artifact_id = 1;
+  string entry_id = 2;
+  string label = 3;
+  string media_type = 4;
+  uint64 byte_length = 5;
+}
+message MaterialPage {
+  MaterialScope scope = 1;
+  string session_title = 2;
+  optional string run_title = 3;
+  repeated MaterialMetadata items = 4;
+  optional string next_after_artifact_id = 5;
+}
+message GetChildMaterialRequest {
+  MaterialScope scope = 1;
+  string image_reference = 2;
+  ImageTransform transform = 3;
+  string expected_runtime_epoch = 4;
+}
+message ChildMaterial {
+  MaterialScope scope = 1;
+  string session_title = 2;
+  optional string run_title = 3;
+  Artifact artifact = 4;
 }
 
 message GetWorkspaceRequest { string workspace = 1; optional string session_id = 2; }
@@ -475,6 +643,9 @@ message CreateSessionRequest {
   optional string profile_id = 11;
   // Optional account affinity for the initial provider-native session. Omission uses server routing.
   optional string account_id = 12;
+  // Durable logical child on this runtime; atomic profile/parent binding before publication.
+  // Requires ParentSessionCreation. Never silently omit when targeting an older server.
+  optional string parent_session_id = 13;
 }
 // Supplying tools installs them before a closed session begins provider restoration. An already
 // attached session accepts only the identical table, making client reattachment idempotent without

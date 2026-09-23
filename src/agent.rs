@@ -25,6 +25,9 @@ pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "ask",
     "memory_search",
     "memory_store",
+    "return_image",
+    "prepare_image",
+    "list_child_materials",
     "vision",
     "browser",
     NAKODE_AGENT_TOOL_NAME,
@@ -1371,7 +1374,9 @@ description = "Research the requested topic and report concrete findings"
                 "read_skill".to_owned(),
                 "read_skill_component".to_owned(),
                 SEARCH_SHARED_CONTEXT_TOOL_NAME.to_owned(),
-                "todo".to_owned()
+                "todo".to_owned(),
+                "prepare_image".to_owned(),
+                "list_child_materials".to_owned(),
             ]
         );
         definition.allowed_capabilities = vec!["filesystem_read".to_owned()];

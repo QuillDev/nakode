@@ -33,6 +33,7 @@ use tonic::{
 use tower::{Layer, service_fn};
 
 pub use nakode_api::v1;
+pub mod materials;
 
 const RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_TRANSPORT_ATTEMPTS: usize = 4;
@@ -490,7 +491,7 @@ impl ActivationClient {
 }
 
 macro_rules! typed_mutation {
-    ($method:ident, $request:ty) => {
+    ($method:ident, $request:ty $(, $capability:literal)?) => {
         /// Executes this typed product mutation with an SDK-owned idempotency key.
         /// A caller-supplied key is preserved; callers repeating a completed SDK invocation must
         /// supply the same key themselves. Automatic transport retries within one invocation reuse
@@ -502,6 +503,7 @@ macro_rules! typed_mutation {
             &self,
             mut request: $request,
         ) -> Result<api::MutationResult, SdkError> {
+            $(self.require_capability($capability).await?;)?
             if request.mutation.is_none() {
                 request.mutation = Some(mutation(None));
             }
@@ -754,6 +756,7 @@ impl NakodeClient {
                 working_directory: None,
                 profile_id: None,
                 account_id: Some(account_id.into()),
+                parent_session_id: None,
             }
         )?;
         result
@@ -787,6 +790,7 @@ impl NakodeClient {
                 working_directory: Some(working_directory.into()),
                 profile_id: None,
                 account_id: None,
+                parent_session_id: None,
             }
         )?;
         result
@@ -824,6 +828,7 @@ impl NakodeClient {
                 working_directory: None,
                 profile_id: None,
                 account_id: None,
+                parent_session_id: None,
             }
         )?;
         result
@@ -876,6 +881,7 @@ impl NakodeClient {
                 working_directory: None,
                 profile_id: None,
                 account_id: None,
+                parent_session_id: None,
             }
         )?;
         result
@@ -886,7 +892,12 @@ impl NakodeClient {
     /// Creates a logical session from the complete public creation contract atomically.
     ///
     /// The SDK supplies a fresh mutation identity before transport retry; all retries of this
-    /// invocation retain that identity. Caller-supplied mutation metadata is replaced.
+    /// invocation retain that identity. Caller-supplied mutation metadata is replaced. Supplying
+    /// `parent_session_id` requires the server's `ParentSessionCreation` capability; an older
+    /// server is refused before mutation, never retried as an unparented session.
+    /// Creation receipts are process-local; this method does not promise restart-safe exactly-once
+    /// creation. After an ambiguous result, reconcile session identity rather than issuing a fresh
+    /// creation request.
     ///
     /// # Errors
     /// Returns a transport, server validation, or missing-identifier error.
@@ -894,6 +905,19 @@ impl NakodeClient {
         &self,
         mut request: api::CreateSessionRequest,
     ) -> Result<String, SdkError> {
+        if request.parent_session_id.is_some()
+            && !self
+                .get_server_info()
+                .await?
+                .capabilities
+                .iter()
+                .any(|capability| capability == "ParentSessionCreation")
+        {
+            return Err(tonic::Status::failed_precondition(
+                "server does not support atomic parent session creation; no session was created",
+            )
+            .into());
+        }
         request.mutation = Some(mutation(None));
         let result = send_mutation!(self, create_session, request)?;
         result
@@ -956,6 +980,7 @@ impl NakodeClient {
                 working_directory: None,
                 profile_id: None,
                 account_id: None,
+                parent_session_id: None,
             }
         )?;
         result
@@ -1682,6 +1707,70 @@ impl NakodeClient {
         Ok(self.transport.clone().get_soul(request).await?.into_inner())
     }
 
+    typed_mutation!(answer_child_questions, api::AnswerChildQuestionsRequest);
+
+    /// Read original pending child questions without opening children or suspending the parent.
+    ///
+    /// # Errors
+    /// Returns an explicit transport, unavailable or authorization error from the owning runtime.
+    pub async fn list_child_questions(
+        &self,
+        request: api::ListChildQuestionsRequest,
+    ) -> Result<api::ChildQuestionSnapshot, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .list_child_questions(request)
+            .await?
+            .into_inner())
+    }
+
+    typed_mutation!(
+        enqueue_followup,
+        api::EnqueueFollowupRequest,
+        "DurableFollowupInbox"
+    );
+    typed_mutation!(
+        set_followup_paused,
+        api::SetFollowupPausedRequest,
+        "DurableFollowupInbox"
+    );
+
+    /// Reads a bounded durable follow-up page without restoring a provider.
+    ///
+    /// # Errors
+    /// Returns transport, authorization or unsupported-version errors; never falls back to `SendPrompt`.
+    pub async fn list_followups(
+        &self,
+        request: api::ListFollowupsRequest,
+    ) -> Result<api::FollowupInbox, tonic::Status> {
+        Ok(self
+            .transport
+            .clone()
+            .list_followups(request)
+            .await?
+            .into_inner())
+    }
+
+    typed_mutation!(link_child_session, api::LinkChildSessionRequest);
+    typed_mutation!(publish_child_report, api::PublishChildReportRequest);
+
+    /// Reads ordered inert reports without opening either session or starting inference.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn list_child_reports(
+        &self,
+        request: api::ListChildReportsRequest,
+    ) -> Result<api::ChildReportPage, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .list_child_reports(request)
+            .await?
+            .into_inner())
+    }
+
     typed_mutation!(reload_workspace, api::ReloadWorkspaceRequest);
     typed_mutation!(
         set_session_bridge_lifecycle,
@@ -1984,6 +2073,22 @@ impl NakodeClient {
             })
             .await?
             .into_inner())
+    }
+
+    async fn require_capability(&self, required: &str) -> Result<(), SdkError> {
+        if !self
+            .get_server_info()
+            .await?
+            .capabilities
+            .iter()
+            .any(|capability| capability == required)
+        {
+            return Err(tonic::Status::failed_precondition(format!(
+                "server does not support {required}; no mutation was sent"
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     /// Returns API version and capability metadata.
@@ -2733,12 +2838,21 @@ fn validate_transcript_page(
     Ok(())
 }
 
+/// Establish the TLS provider used by Nakode transports without replacing an embedder's choice.
+/// Dependency feature unification may enable both ring and aws-lc; rustls cannot infer a default
+/// in that case. Server launchers must call this before configuring their TLS listener as well.
+pub fn initialize_tls_provider() {
+    // Failure means another caller already installed a provider, including a concurrent initializer.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 async fn remote_channel(
     endpoint: impl AsRef<str>,
     ca_certificate_pem: impl AsRef<[u8]>,
     tls_server_name: impl Into<String>,
     api_key: impl AsRef<str>,
 ) -> Result<(Channel, ClientApiKey), SdkError> {
+    initialize_tls_provider();
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(ca_certificate_pem))
         .domain_name(tls_server_name.into());
@@ -3067,7 +3181,9 @@ impl NakodeClient {
 
 #[cfg(test)]
 mod tests {
+    mod followups;
     mod hydration_cost;
+    mod parent_creation;
     mod transcript_hydration;
     use nakode_telemetry::{RpcLayer, opentelemetry::trace::FutureExt};
     use std::{

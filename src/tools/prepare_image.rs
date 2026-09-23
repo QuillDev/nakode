@@ -17,6 +17,7 @@ pub struct PrepareImageTool;
 #[serde(deny_unknown_fields)]
 struct Arguments {
     image_reference: String,
+    source: Option<nakode_protocol::MaterialSource>,
     crop: Option<Crop>,
     max_width: Option<u32>,
     max_height: Option<u32>,
@@ -30,7 +31,8 @@ impl Tool for PrepareImageTool {
             name: "prepare_image",
             description: "Inspect image metadata or explicitly crop/downscale a conversation image before handoff. Uses authoritative image references, never file paths. Returns a reusable reference, dimensions, format, bytes and crop provenance; inspect attaches a preview to the transcript. Originals remain unchanged. PNG/JPEG transforms, PNG/JPEG/GIF/WebP originals, 5 MiB, 40 megapixels, 16384 pixels/side. Resizing preserves aspect ratio and never enlarges. Prefer focused crops for small text; visual token savings depend on the provider.",
             parameters: json!({"type":"object","properties":{
-                "image_reference":{"type":"string","minLength":1,"description":"Original reference from Nakode Image References, or a previously returned derived reference for inspection."},
+                "source":super::child_materials::source_schema(),
+                "image_reference":{"type":"string","minLength":1,"description":"Original reference from Nakode Image References, or a selected artifact_id from list_child_materials. Child materials require the same explicit source; omitted source addresses only this conversation/run."},
                 "crop":{"type":"object","properties":{"x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1}},"required":["x","y","width","height"],"additionalProperties":false},
                 "max_width":{"type":"integer","minimum":1,"maximum":16384},
                 "max_height":{"type":"integer","minimum":1,"maximum":16384},
@@ -65,28 +67,19 @@ impl Tool for PrepareImageTool {
                     Some(recipe) => recipe.reference()?,
                     None => args.image_reference,
                 };
-                let owner_session_id = context
-                    .session
-                    .owner_session_id
-                    .clone()
-                    .ok_or("image tool has no authoritative session")?;
-                let route = context
-                    .delegation
-                    .ok_or("image service route is unavailable")?;
-                let (respond, response) = tokio::sync::oneshot::channel();
-                route
-                    .send(NativeAgentRequest::Image(NativeImageRequest {
-                        owner_session_id,
-                        requester_run_id: context.session.parent_run_id.clone(),
-                        reference,
-                        respond,
-                    }))
-                    .await
-                    .map_err(|_| "image service route closed")?;
-                let artifact = response
-                    .await
-                    .map_err(|_| "image service did not respond")??;
-                let output = json!({"image_reference":artifact.id,"width":artifact.width,"height":artifact.height,"format":artifact.media_type,"bytes":artifact.byte_length,"provenance":Recipe::parse(artifact.id.as_str())?,"preview_attached":args.inspect}).to_string();
+                let (artifact, source) = resolve_image(&context, reference, args.source).await?;
+                let output = json!({
+                    "image_reference": artifact.id,
+                    "source": source.as_ref().map(|origin| &origin.source),
+                    "origin": source,
+                    "width": artifact.width,
+                    "height": artifact.height,
+                    "format": artifact.media_type,
+                    "bytes": artifact.byte_length,
+                    "provenance": Recipe::parse(artifact.id.as_str())?,
+                    "preview_attached": args.inspect,
+                })
+                .to_string();
                 if args.inspect {
                     let returned = context
                         .session
@@ -138,4 +131,59 @@ impl Tool for PrepareImageTool {
             }
         })
     }
+}
+
+async fn resolve_image(
+    context: &ToolContext<'_>,
+    reference: String,
+    source: Option<nakode_protocol::MaterialSource>,
+) -> Result<
+    (
+        nakode_protocol::ArtifactView,
+        Option<nakode_protocol::MaterialScope>,
+    ),
+    String,
+> {
+    if let Some(source) = source {
+        let value = super::child_materials::request(
+            context,
+            source,
+            crate::backend::NativeMaterialOperation::Image { reference },
+        )
+        .await?;
+        let nakode_protocol::QueryResult::ChildMaterial(mut material) = value else {
+            return Err("unexpected material image response".to_owned());
+        };
+        let task = material
+            .run_title
+            .as_deref()
+            .unwrap_or(&material.session_title);
+        material.artifact.label = format!(
+            "{} · {}: {}",
+            task, material.scope.source.session_id, material.artifact.label
+        );
+        return Ok((material.artifact, Some(material.scope)));
+    }
+    let owner_session_id = context
+        .session
+        .owner_session_id
+        .clone()
+        .ok_or("image tool has no authoritative session")?;
+    let route = context
+        .delegation
+        .ok_or("image service route is unavailable")?;
+    let (respond, response) = tokio::sync::oneshot::channel();
+    route
+        .send(NativeAgentRequest::Image(NativeImageRequest {
+            owner_session_id,
+            requester_run_id: context.session.parent_run_id.clone(),
+            reference,
+            respond,
+        }))
+        .await
+        .map_err(|_| "image service route closed")?;
+    let artifact = response
+        .await
+        .map_err(|_| "image service did not respond")??;
+    Ok((artifact, None))
 }
