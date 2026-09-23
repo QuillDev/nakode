@@ -27,7 +27,9 @@ There is no caller-supplied destination, ambient machine selection, or cross-run
 
 `followups/child_events.rs` admits completed/failed/blocker/question reports through one immediate
 SQLite transaction containing both inbox message and event delivery receipt. Completed/failed turn
-reports already commit with the child's terminal turn. Live primary-session questions are observed
+reports already commit with the child's terminal turn. They include that exact turn's bounded final
+assistant response, explicit truncation or missing-final metadata, never an earlier turn's answer;
+see [coordination messages](coordination-messages.md). Live primary-session questions are observed
 on the actor tick, deduplicated by exact runtime question ID, and retained as evidence about the
 original interaction; they never answer it. Each question report carries a versioned JSON body with
 the runtime question ID, exact scoped interaction ID, group ID and order, plus the canonical

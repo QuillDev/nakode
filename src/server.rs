@@ -770,7 +770,8 @@ impl ServerCore {
         prompt_id: Option<&str>,
     ) -> DomainCommandOutcome {
         match command {
-            Command::EnqueueFollowup { .. }
+            Command::RelayAgentFollowup { .. }
+            | Command::EnqueueFollowup { .. }
             | Command::SetFollowupPaused { .. }
             | Command::RemoveFollowup { .. }
             | Command::LinkChildSession { .. }
@@ -4651,7 +4652,8 @@ impl ServerCore {
 
     fn command_session(&self, command: &Command) -> Option<SessionId> {
         match command {
-            Command::EnqueueFollowup { session_id, .. }
+            Command::RelayAgentFollowup { session_id, .. }
+            | Command::EnqueueFollowup { session_id, .. }
             | Command::SetFollowupPaused { session_id, .. }
             | Command::RemoveFollowup { session_id, .. }
             | Command::SendPrompt { session_id, .. }
@@ -4688,10 +4690,8 @@ impl ServerCore {
                 .provider_turn_id(turn_id)
                 .ok()
                 .map(|(session_id, _)| session_id),
-            Command::CompactContext { agent_session_id } => {
-                self.session_for_agent_session(agent_session_id).ok()
-            }
-            Command::SelectModel {
+            Command::CompactContext { agent_session_id }
+            | Command::SelectModel {
                 target: ModelTarget::AgentSession { agent_session_id },
                 ..
             } => self.session_for_agent_session(agent_session_id).ok(),
@@ -6210,6 +6210,7 @@ mod tests {
             owner_turns: Vec::new(),
             queued_prompts: Vec::new(),
             owner_prompts: vec![crate::session::PersistedOwnerPrompt {
+                coordination_json: None,
                 prompt_id: "first".to_owned(),
                 raw_text: format!("  {}  ", "界".repeat(600)),
                 source_transport: None,
@@ -10875,6 +10876,7 @@ enabled = false
             status: crate::state::SubagentStatus::Completed,
             latest_activity: latest_activity.clone(),
             transcript: vec![TranscriptEntry {
+                coordination_json: None,
                 id: "final-result".to_owned(),
                 key: None,
                 kind: EntryKind::Assistant,
@@ -10935,6 +10937,7 @@ enabled = false
             latest_activity: "Completed".to_owned(),
             transcript: (0..260)
                 .map(|index| TranscriptEntry {
+                    coordination_json: None,
                     id: format!("run-entry-{index:03}"),
                     key: Some(format!("assistant:{index:03}")),
                     kind: EntryKind::Assistant,
@@ -11181,6 +11184,7 @@ enabled = false
             status: crate::state::SubagentStatus::Completed,
             latest_activity: "Working".to_owned(),
             transcript: vec![TranscriptEntry {
+                coordination_json: None,
                 id: "run-entry".to_owned(),
                 key: Some("stream".to_owned()),
                 kind: EntryKind::Assistant,

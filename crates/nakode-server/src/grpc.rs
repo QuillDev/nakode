@@ -805,6 +805,18 @@ impl api::nakode_service_server::NakodeService for GrpcService {
     );
 
     try_command_rpc!(
+        relay_agent_followup,
+        api::RelayAgentFollowupRequest,
+        input,
+        prompt(input.prompt).map(|prompt| protocol::Command::RelayAgentFollowup {
+            session_id: protocol::SessionId::from(input.session_id),
+            message_id: input.message_id,
+            source_session_id: protocol::SessionId::from(input.source_session_id),
+            source_call_id: input.source_call_id,
+            prompt,
+        })
+    );
+    try_command_rpc!(
         enqueue_followup,
         api::EnqueueFollowupRequest,
         input,
@@ -842,6 +854,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 session_id: protocol::SessionId::from(input.session_id),
                 after_sequence: input.after_sequence,
                 limit: input.limit,
+                view: input.view,
             })
             .await?;
         let protocol::QueryResult::Followups(view) = result.value else {
@@ -3565,6 +3578,7 @@ fn transcript_entry(value: protocol::TranscriptEntryView) -> api::TranscriptEntr
         owner_turn_id: value.owner_turn_id.map(|id| id.to_string()),
         resolved_reasoning_effort: value.resolved_reasoning_effort,
         resolved_fast_mode: value.resolved_fast_mode,
+        coordination_json: value.coordination_json,
         parent_tool_entry_id: value.parent_tool_entry_id.map(|id| id.to_string()),
     }
 }

@@ -45,6 +45,16 @@ fn removal_persists_and_preserves_admission_deduplication() {
     assert_eq!(view.pending_count, 1);
     assert_eq!(view.items.len(), 1);
     assert_eq!(view.items[0].message_id, "retained");
+    let active = f.store().list_view(&f.session, 0, 32, "active").unwrap();
+    assert_eq!(active.items.len(), 1);
+    assert_eq!(active.items[0].message_id, "retained");
+    assert!(
+        f.store()
+            .list_view(&f.session, 0, 32, "consumed")
+            .unwrap()
+            .items
+            .is_empty()
+    );
     let batch = f.store().claim(&f.session).unwrap().unwrap();
     assert!(!batch.prompt.text.contains("Do not deliver"));
     assert!(batch.prompt.text.contains("Deliver this"));

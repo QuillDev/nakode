@@ -141,6 +141,7 @@ mod tests {
 
     fn entry(kind: EntryKind, body: impl Into<String>) -> TranscriptEntry {
         TranscriptEntry {
+            coordination_json: None,
             id: uuid::Uuid::now_v7().to_string(),
             key: None,
             kind,

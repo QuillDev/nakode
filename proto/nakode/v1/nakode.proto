@@ -37,6 +37,7 @@ service NakodeService {
   rpc LinkChildSession(LinkChildSessionRequest) returns (MutationResult);
   rpc PublishChildReport(PublishChildReportRequest) returns (MutationResult);
   rpc ListChildReports(ListChildReportsRequest) returns (ChildReportPage);
+  rpc RelayAgentFollowup(RelayAgentFollowupRequest) returns (MutationResult);
   rpc EnqueueFollowup(EnqueueFollowupRequest) returns (MutationResult);
   rpc RemoveFollowup(RemoveFollowupRequest) returns (MutationResult);
   rpc SetFollowupPaused(SetFollowupPausedRequest) returns (MutationResult);
@@ -180,6 +181,15 @@ message AnswerChildQuestionsRequest {
   repeated InteractionAnswer answers = 5;
 }
 
+// Relay only an existing source-session external tool call. Runtime derives authority.
+message RelayAgentFollowupRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string message_id = 3;
+  string source_session_id = 4;
+  string source_call_id = 5;
+  PromptInput prompt = 6;
+}
 message EnqueueFollowupRequest {
   MutationOptions mutation = 1;
   string session_id = 2;
@@ -200,6 +210,8 @@ message ListFollowupsRequest {
   string session_id = 1;
   uint64 after_sequence = 2;
   uint32 limit = 3;
+  // Empty/all preserves legacy ascending history; active is ascending, consumed is newest first.
+  string view = 4;
 }
 message FollowupItem {
   uint64 sequence = 1;
@@ -1528,6 +1540,8 @@ message TranscriptEntry {
   optional string source_prompt_id = 17;
   // Parent tool transcript entry for one server-attributed nested invocation.
   optional string parent_tool_entry_id = 18;
+  // Versioned server-owned coordination display; never inferred from prompt text.
+  optional string coordination_json = 22;
   // SHA-256 of the complete UTF-8 body; windows must match even for same-length edits.
   string body_sha256 = 19;
 }

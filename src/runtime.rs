@@ -729,6 +729,7 @@ impl AgentRuntime {
         session.recover_interrupted_turn();
         session.pending_turn = Some(turn_id.to_owned());
         session.checkpointed_turn = Some(crate::session::PersistedTurnConfiguration {
+            completion: None,
             id: turn_id.to_owned(),
             model: Some(
                 if session.provider_id.is_empty()

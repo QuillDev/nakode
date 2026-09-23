@@ -32,6 +32,7 @@ pub enum EntryStatus {
 /// Canonical transcript content persisted and projected by the Nakode server.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct TranscriptEntry {
+    pub coordination_json: Option<String>,
     pub id: String,
     pub key: Option<String>,
     pub kind: EntryKind,
@@ -295,6 +296,13 @@ impl DomainTranscript {
         }
     }
 
+    pub(crate) fn set_coordination(&mut self, prompt_id: &str, json: Option<&str>) {
+        self.prefix_fingerprints.take();
+        if let Some(index) = self.item_indices.get(&format!("user:{prompt_id}")) {
+            self.entries[*index].coordination_json = json.map(str::to_owned);
+        }
+    }
+
     pub fn push(
         &mut self,
         kind: EntryKind,
@@ -304,6 +312,7 @@ impl DomainTranscript {
     ) {
         self.prefix_fingerprints.take();
         self.entries.push(TranscriptEntry {
+            coordination_json: None,
             id: uuid::Uuid::now_v7().to_string(),
             key: None,
             kind,
@@ -354,6 +363,7 @@ impl DomainTranscript {
         } else {
             let index = self.entries.len();
             self.entries.push(TranscriptEntry {
+                coordination_json: None,
                 id: uuid::Uuid::now_v7().to_string(),
                 key: Some(key.clone()),
                 kind,
@@ -389,6 +399,7 @@ impl DomainTranscript {
         } else {
             let index = self.entries.len();
             self.entries.push(TranscriptEntry {
+                coordination_json: None,
                 id: uuid::Uuid::now_v7().to_string(),
                 key: Some(key.clone()),
                 kind,

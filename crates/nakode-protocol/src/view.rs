@@ -405,6 +405,8 @@ pub enum TranscriptEntryStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TranscriptEntryView {
     #[serde(default)]
+    pub coordination_json: Option<String>,
+    #[serde(default)]
     pub body_sha256: String,
     pub id: EntryId,
     pub kind: TranscriptEntryKind,
@@ -1492,6 +1494,7 @@ mod tests {
             source_transport: None,
             source_prompt_id: None,
             tool_audit_json: None,
+            coordination_json: None,
             parent_tool_entry_id: None,
         };
         let value = serde_json::to_value(entry).expect("serialize transcript entry");

@@ -69,6 +69,8 @@ struct ProviderCatalogEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistedTurnConfiguration {
+    #[serde(default)]
+    pub completion: Option<crate::child_reports::completion::Completion>,
     pub id: String,
     pub model: Option<String>,
     pub options: ModelOptions,
@@ -77,6 +79,7 @@ pub struct PersistedTurnConfiguration {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedOwnerPrompt {
+    pub coordination_json: Option<String>,
     pub prompt_id: String,
     pub raw_text: String,
     /// Immutable transport provenance captured when the owner prompt is accepted. This remains
@@ -2061,6 +2064,7 @@ impl SqliteSessionRepository {
         let last_turn_outcome = row.get::<_, Option<String>>(12)?;
         let last_turn = match (last_turn_id, last_turn_outcome.as_deref()) {
             (Some(id), Some("completed")) => Some(PersistedTurnConfiguration {
+                completion: None,
                 id,
                 model: row.get(9)?,
                 options: ModelOptions {
@@ -2070,6 +2074,7 @@ impl SqliteSessionRepository {
                 outcome: TurnOutcome::Completed,
             }),
             (Some(id), Some("interrupted")) => Some(PersistedTurnConfiguration {
+                completion: None,
                 id,
                 model: row.get(9)?,
                 options: ModelOptions {
@@ -2079,6 +2084,7 @@ impl SqliteSessionRepository {
                 outcome: TurnOutcome::Interrupted,
             }),
             (Some(id), Some("failed")) => Some(PersistedTurnConfiguration {
+                completion: None,
                 id,
                 model: row.get(9)?,
                 options: ModelOptions {
@@ -2577,13 +2583,15 @@ fn load_owner_prompts(
     session_id: &str,
 ) -> Result<Vec<PersistedOwnerPrompt>, SessionError> {
     let mut statement = connection.prepare(
-        "SELECT prompt_id, raw_text, source_transport, dispatch_pending
+        "SELECT prompt_id, raw_text, source_transport, dispatch_pending,
+           (SELECT coordination_json FROM followup_batch_display WHERE batch_id = prompt_id)
          FROM accepted_owner_prompts
          WHERE session_id = ?1 ORDER BY acceptance_order",
     )?;
     statement
         .query_map([session_id], |row| {
             Ok(PersistedOwnerPrompt {
+                coordination_json: row.get(4)?,
                 prompt_id: row.get(0)?,
                 raw_text: row.get(1)?,
                 source_transport: row.get(2)?,
@@ -2610,6 +2618,7 @@ fn load_owner_turns(
                 _ => TurnOutcome::Failed,
             };
             Ok(PersistedTurnConfiguration {
+                completion: None,
                 id: row.get(0)?,
                 model: row.get(1)?,
                 options: ModelOptions {
@@ -4239,10 +4248,20 @@ impl SessionRepository for SqliteSessionRepository {
             "INSERT INTO session_child_reports(child_id, report_id, state, body, created_at_ms)
              SELECT child_id, ?2, ?3, ?4, ?5 FROM session_child_links WHERE child_id = ?1
              ON CONFLICT(child_id, report_id) DO NOTHING",
-            params![id, format!("turn:{}", turn.id),
-                if outcome == "interrupted" { "cancelled" } else { outcome },
-                format!("Child turn {} {outcome}. Inspect the child transcript for its result and validation evidence.", turn.id),
-                observed_at.saturating_mul(1_000)],
+            params![
+                id,
+                format!("turn:{}", turn.id),
+                if outcome == "interrupted" {
+                    "cancelled"
+                } else {
+                    outcome
+                },
+                serde_json::to_string(&turn.completion.clone().unwrap_or_else(|| {
+                    crate::child_reports::completion::Completion::capture(&turn.id, None)
+                }))
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                observed_at.saturating_mul(1_000)
+            ],
         )?;
         transaction.commit()?;
         Ok(())
@@ -5583,6 +5602,7 @@ fn load_subagent_transcript(
             source_transport,
         ) = row?;
         Ok(TranscriptEntry {
+            coordination_json: None,
             id,
             key,
             kind: entry_kind_from_value(&kind)?,
@@ -6685,6 +6705,7 @@ mod tests {
         store.record_owner_prompt(
             &session.id,
             &PersistedOwnerPrompt {
+                coordination_json: None,
                 prompt_id: "owner".to_owned(),
                 raw_text: "Exact raw owner prompt".to_owned(),
                 source_transport: None,
@@ -6715,18 +6736,21 @@ mod tests {
             Some("model-a"),
         )?;
         let first = PersistedOwnerPrompt {
+            coordination_json: None,
             prompt_id: "prompt-z".to_owned(),
             raw_text: "first raw prompt".to_owned(),
             source_transport: Some("slack".to_owned()),
             dispatch_pending: true,
         };
         let second = PersistedOwnerPrompt {
+            coordination_json: None,
             prompt_id: "prompt-a".to_owned(),
             raw_text: "second raw prompt".to_owned(),
             source_transport: None,
             dispatch_pending: true,
         };
         let rolled_back = PersistedOwnerPrompt {
+            coordination_json: None,
             prompt_id: "prompt-rolled-back".to_owned(),
             raw_text: "must not survive a failed bridge checkpoint".to_owned(),
             source_transport: None,
@@ -6763,10 +6787,9 @@ mod tests {
             store.record_owner_prompt(
                 &session.id,
                 &PersistedOwnerPrompt {
-                    prompt_id: first.prompt_id.clone(),
                     raw_text: "conflicting text".to_owned(),
                     source_transport: None,
-                    dispatch_pending: true,
+                    ..first.clone()
                 },
             ),
             Err(SessionError::OwnerPromptConflict { .. })
@@ -6775,10 +6798,8 @@ mod tests {
             store.record_owner_prompt(
                 &session.id,
                 &PersistedOwnerPrompt {
-                    prompt_id: first.prompt_id.clone(),
-                    raw_text: first.raw_text.clone(),
                     source_transport: Some("discord".to_owned()),
-                    dispatch_pending: true,
+                    ..first.clone()
                 },
             ),
             Err(SessionError::OwnerPromptConflict { .. })
@@ -6829,6 +6850,7 @@ mod tests {
         store.touch(&session.id)?;
         store.record_owner_activity(&session.id)?;
         let turn = PersistedTurnConfiguration {
+            completion: None,
             id: "turn-terminal".to_owned(),
             model: Some("model-a".to_owned()),
             options: ModelOptions::default(),
@@ -6975,6 +6997,7 @@ mod tests {
         };
         store.update_model(&session.id, Some("openai-codex/model-b"), &next)?;
         let last = PersistedTurnConfiguration {
+            completion: None,
             id: "turn-immutable".to_owned(),
             model: Some("openai-codex/model-a".to_owned()),
             options: ModelOptions {
@@ -7568,6 +7591,7 @@ mod tests {
             status: SubagentStatus::Completed,
             latest_activity: "Completed".to_owned(),
             transcript: vec![TranscriptEntry {
+                coordination_json: None,
                 id: "entry-1".to_owned(),
                 key: None,
                 kind: EntryKind::User,
@@ -7663,6 +7687,7 @@ mod tests {
             latest_activity: "Partial result preserved".to_owned(),
             transcript: vec![
                 TranscriptEntry {
+                    coordination_json: None,
                     id: "entry-1".to_owned(),
                     key: None,
                     kind: EntryKind::User,
@@ -7679,6 +7704,7 @@ mod tests {
                     tool_audit_json: None,
                 },
                 TranscriptEntry {
+                    coordination_json: None,
                     id: "entry-2".to_owned(),
                     key: Some("assistant-1".to_owned()),
                     kind: EntryKind::Assistant,
@@ -8047,6 +8073,7 @@ mod tests {
             status: SubagentStatus::Interrupted,
             latest_activity: "stale".to_owned(),
             transcript: vec![TranscriptEntry {
+                coordination_json: None,
                 id: "turn-1".to_owned(),
                 key: None,
                 kind: EntryKind::Assistant,
@@ -8503,6 +8530,7 @@ mod tests {
         let repository = SqliteSessionRepository::open(&path)?;
         let instructions = "Operate within the attached stack.\nPreserve existing work.";
         let prompt = PersistedOwnerPrompt {
+            coordination_json: None,
             prompt_id: "owner-1".to_owned(),
             raw_text: "Investigate the routing defect.".to_owned(),
             source_transport: None,
@@ -8659,6 +8687,7 @@ mod tests {
             )?;
         }
         let prompt = PersistedOwnerPrompt {
+            coordination_json: None,
             prompt_id: "first-prompt".to_owned(),
             raw_text: "exact first owner text".to_owned(),
             source_transport: None,
@@ -8723,6 +8752,7 @@ mod tests {
                 let repository =
                     SqliteSessionRepository::open(database).expect("concurrent repository");
                 let prompt = PersistedOwnerPrompt {
+                    coordination_json: None,
                     prompt_id: "stable-first-prompt".to_owned(),
                     raw_text: "exact first owner text".to_owned(),
                     source_transport: Some("slack".to_owned()),

@@ -7573,6 +7573,7 @@ mod tests {
                 status: SubagentStatus::Working,
                 latest_activity: "Working".to_owned(),
                 transcript: vec![TranscriptEntry {
+                    coordination_json: None,
                     id: "tool-evidence".to_owned(),
                     key: None,
                     kind: EntryKind::Tool,
@@ -10865,6 +10866,7 @@ mod tests {
                 status: SubagentStatus::Working,
                 latest_activity: "Working".into(),
                 transcript: vec![TranscriptEntry {
+                    coordination_json: None,
                     id: "retained-child-entry".into(),
                     key: None,
                     kind: EntryKind::Tool,
