@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 mod admission;
 mod batches;
+mod child_events;
 #[cfg(test)]
 mod tests;
 
@@ -218,6 +219,11 @@ impl InboxStore {
                 message_id,
                 prompt,
             } => {
+                if message_id.starts_with("nakode-child-event:") {
+                    return Err(refuse(
+                        "child event identities are reserved for the runtime",
+                    ));
+                }
                 authorize(&tx, session_id.as_str(), true)?;
                 if !valid_id(message_id) {
                     return Err(refuse("invalid follow-up message identity"));

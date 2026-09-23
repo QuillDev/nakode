@@ -69,7 +69,8 @@ legacy sessions project no parent. Reading these fields does not open providers 
 ## Integration still required
 
 FStack's paired change consumes this contract through its public SDK/Host boundary; its bundled
-Nakode pin must include the additive parent projections before release. Authenticated cross-host creation/routing, independent-child
-participant/attention UX, durable shared-ask recovery, actual-output reports, origin-aware parent
-continuation, artifact transfer and batched follow-up inboxes remain separate unfinished work.
-No parent wake or new owner prompt is synthesized by this creation operation.
+Nakode pin must include the additive parent projections before release. Authenticated cross-host
+creation/routing, independent-child participant/attention UX, durable shared-ask recovery,
+actual-output reports, artifact transfer and integrated dashboard follow-up UX remain separate
+unfinished work. Creation itself never wakes the parent. Later durable child events can enter the
+origin-aware continuation scheduler described in `docs/child-followup-delivery.md`.

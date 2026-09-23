@@ -33,3 +33,9 @@ CREATE TABLE IF NOT EXISTS followup_receipts (
     digest BLOB NOT NULL,
     resource_id TEXT
 );
+
+-- Receipt survives child/report deletion so queued evidence never loses its trusted origin.
+CREATE TABLE IF NOT EXISTS child_followup_deliveries (
+    report_sequence INTEGER PRIMARY KEY,
+    message_sequence INTEGER NOT NULL UNIQUE REFERENCES followup_messages(sequence) ON DELETE CASCADE
+);

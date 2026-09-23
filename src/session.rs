@@ -4234,7 +4234,7 @@ impl SessionRepository for SqliteSessionRepository {
         )?;
         // The terminal event and its child report share the same commit. A crash cannot acknowledge
         // one without the other, and replay of a turn cannot duplicate its report. This is evidence,
-        // not an owner prompt: it neither wakes a parent nor recursively emits another completion.
+        // not an owner prompt: the separate child-evidence inbox adapter owns parent continuation.
         transaction.execute(
             "INSERT INTO session_child_reports(child_id, report_id, state, body, created_at_ms)
              SELECT child_id, ?2, ?3, ?4, ?5 FROM session_child_links WHERE child_id = ?1

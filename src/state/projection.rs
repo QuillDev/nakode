@@ -1726,13 +1726,7 @@ pub(crate) fn interactions(state: &DomainState, revision: u64) -> Vec<Interactio
         prompts.sort_by_key(|prompt| prompt.request.order);
         let items = prompts
             .iter()
-            .map(|question| nakode_protocol::InteractionQuestionView {
-                id: question.request.logical_id.clone(),
-                title: question.request.title.clone(),
-                detail: question.request.question.clone(),
-                options: question_options(question),
-                multiple: question.request.multi,
-            })
+            .map(|question| interaction_question(&question.request))
             .collect::<Vec<_>>();
         let first = prompts[0];
         InteractionView {
@@ -1743,7 +1737,7 @@ pub(crate) fn interactions(state: &DomainState, revision: u64) -> Vec<Interactio
             // Preserve the old scalar shape so old clients can still answer a one-item ask losslessly.
             title: first.request.title.clone(),
             detail: first.request.question.clone(),
-            options: question_options(first),
+            options: question_options(&first.request),
             multiple: first.request.multi,
             questions: items,
         }
@@ -1751,9 +1745,20 @@ pub(crate) fn interactions(state: &DomainState, revision: u64) -> Vec<Interactio
     approvals.chain(questions).collect()
 }
 
-fn question_options(question: &QuestionPrompt) -> Vec<InteractionOptionView> {
-    question
-        .request
+pub(crate) fn interaction_question(
+    request: &crate::backend::QuestionRequest,
+) -> nakode_protocol::InteractionQuestionView {
+    nakode_protocol::InteractionQuestionView {
+        id: request.logical_id.clone(),
+        title: request.title.clone(),
+        detail: request.question.clone(),
+        options: question_options(request),
+        multiple: request.multi,
+    }
+}
+
+fn question_options(request: &crate::backend::QuestionRequest) -> Vec<InteractionOptionView> {
+    request
         .options
         .iter()
         .enumerate()
@@ -1761,7 +1766,7 @@ fn question_options(question: &QuestionPrompt) -> Vec<InteractionOptionView> {
             id: index.to_string(),
             label: option.label.clone(),
             description: option.description.clone(),
-            recommended: question.request.recommended == Some(index),
+            recommended: request.recommended == Some(index),
         })
         .collect()
 }
@@ -1779,7 +1784,7 @@ pub(super) fn approval_interaction_id(
     ))
 }
 
-pub(super) fn question_interaction_id(session_id: &str, provider_id: &str) -> InteractionId {
+pub(crate) fn question_interaction_id(session_id: &str, provider_id: &str) -> InteractionId {
     InteractionId::from(scoped_id(
         "interaction",
         &format!("{session_id}:question:{provider_id}"),
