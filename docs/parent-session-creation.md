@@ -59,10 +59,17 @@ Native coexistence checks canonical run identities/effects without invoking infe
 parent/profile/title delivery across the SDK and real loopback gRPC adapter. These are isolated
 fixture tests, not live provider, dashboard browser or two-host E2E verification.
 
+## Parent projections
+
+`SessionSummary.parent_session_id` and `SessionState.parent_session_id` expose the canonical
+`session_child_links` association on live and retained reads, including archived sessions. They
+never infer parentage from titles, directories, timestamps or native runs. Standalone and unknown
+legacy sessions project no parent. Reading these fields does not open providers or change lifecycle.
+
 ## Integration still required
 
-FStack must consume this contract through its public SDK/Host boundary; the sibling checkout alone
-does not update its bundled Nakode pin. Authenticated cross-host creation/routing, independent-child
+FStack's paired change consumes this contract through its public SDK/Host boundary; its bundled
+Nakode pin must include the additive parent projections before release. Authenticated cross-host creation/routing, independent-child
 participant/attention UX, durable shared-ask recovery, actual-output reports, origin-aware parent
 continuation, artifact transfer and batched follow-up inboxes remain separate unfinished work.
 No parent wake or new owner prompt is synthesized by this creation operation.

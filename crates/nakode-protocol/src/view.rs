@@ -277,6 +277,9 @@ pub struct SessionStatusSummary {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionSummary {
+    /// Durable logical parent, never a native delegated-run owner or inferred workspace match.
+    #[serde(default)]
+    pub parent_session_id: Option<SessionId>,
     /// First accepted owner prompt, bounded to 512 Unicode characters.
     #[serde(default)]
     pub first_prompt_preview: String,
@@ -1086,6 +1089,9 @@ pub struct SharedContextEntryView {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionView {
+    /// Canonical durable logical parent, independent of native delegated runs.
+    #[serde(default)]
+    pub parent_session_id: Option<SessionId>,
     pub id: SessionId,
     pub revision: u64,
     pub workspace_id: WorkspaceId,

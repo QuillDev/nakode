@@ -117,6 +117,35 @@ fn children(runtime: &NativeServerRuntime, parent: &SessionId) -> Vec<(String, S
         .unwrap()
 }
 
+fn assert_parent_projection(runtime: &NativeServerRuntime, child: &str, parent: &SessionId) {
+    let child_id = SessionId::from(child);
+    assert_eq!(
+        runtime
+            .core
+            .session_view(&child_id)
+            .unwrap()
+            .parent_session_id,
+        Some(parent.clone())
+    );
+    let summaries = runtime.core.workspace_bootstrap().sessions;
+    assert_eq!(
+        summaries
+            .iter()
+            .find(|session| session.id == child_id)
+            .unwrap()
+            .parent_session_id,
+        Some(parent.clone())
+    );
+    assert!(
+        summaries
+            .iter()
+            .find(|session| session.id == *parent)
+            .unwrap()
+            .parent_session_id
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn parent_creation_persists_before_acceptance_and_replays_original_parent_identity() {
     let mut h = harness().await;
@@ -131,6 +160,8 @@ async fn parent_creation_persists_before_acceptance_and_replays_original_parent_
     );
     let sessions = &h.runtime.effects.persistence.sessions;
     let saved = sessions.find(child).unwrap().unwrap();
+    assert_eq!(saved.parent_session_id.as_deref(), Some(h.parent.as_str()));
+    assert_parent_projection(&h.runtime, child, &h.parent);
     assert_eq!(
         saved.provider_session_id,
         pending_provider_session_id(child)
@@ -183,12 +214,30 @@ async fn parent_creation_persists_before_acceptance_and_replays_original_parent_
     let repository =
         SqliteSessionRepository::open(&h.runtime.effects.persistence.database).unwrap();
     let restored = repository.find(child).unwrap().unwrap();
+    assert_eq!(
+        restored.parent_session_id.as_deref(),
+        Some(h.parent.as_str())
+    );
+    let records = repository.list_recent_all().unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| record.id == child)
+            .unwrap()
+            .parent_session_id,
+        restored.parent_session_id
+    );
     let mut state =
         DomainState::new_for_backend(&restored.workspace, None, 100, CODEX_PROVIDER, "Codex");
     state.connection = crate::state::ConnectionState::Ready {
         server: "test".to_owned(),
     };
     assert!(state.begin_resume(restored).is_empty());
+    let projection = crate::state::projection::bootstrap(&state, 1, &[], &records);
+    assert_eq!(
+        projection.active_session.unwrap().parent_session_id,
+        Some(h.parent.clone())
+    );
     assert_eq!(state.session_id.as_deref(), Some(child));
     assert!(state.provider_session_id.is_none());
     let effects = state
@@ -199,6 +248,90 @@ async fn parent_creation_persists_before_acceptance_and_replays_original_parent_
         crate::state::Effect::Backend(BackendCommand::StartSession { .. })
     )));
     assert_eq!(state.session_id.as_deref(), Some(child));
+}
+
+#[tokio::test]
+async fn retained_parent_projection_survives_archive_and_reopen_without_guessing_standalone_links()
+{
+    let mut h = harness().await;
+    let command = creation(&h.runtime, &h.parent);
+    let accepted = send(&mut h.runtime, "linked-projection", command.clone(), false)
+        .await
+        .unwrap();
+    let child = accepted.resource_id.unwrap();
+    let mut standalone = command;
+    if let Command::CreateSession {
+        parent_session_id, ..
+    } = &mut standalone
+    {
+        *parent_session_id = None;
+    }
+    let manual = send(&mut h.runtime, "standalone-projection", standalone, false)
+        .await
+        .unwrap()
+        .resource_id
+        .unwrap();
+    let repository =
+        SqliteSessionRepository::open(&h.runtime.effects.persistence.database).unwrap();
+    // Parentless idle creation keeps the existing lazy persistence behavior.
+    assert!(
+        h.runtime
+            .core
+            .session_view(&SessionId::from(manual))
+            .unwrap()
+            .parent_session_id
+            .is_none()
+    );
+    // The standalone parent fixture is already durable and must not gain a guessed link.
+    let standalone = repository.find(h.parent.as_str()).unwrap().unwrap();
+    let retained = h
+        .runtime
+        .core
+        .query_retained_session(
+            Query::GetSession {
+                session_id: h.parent.clone(),
+            },
+            &standalone,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+    let QueryResult::Session(standalone_view) = retained else {
+        panic!("expected retained standalone session")
+    };
+    assert!(standalone_view.parent_session_id.is_none());
+    let mut bridge = repository
+        .list_session_bridges_all()
+        .unwrap()
+        .into_iter()
+        .find(|bridge| bridge.session_id == child)
+        .unwrap();
+    for lifecycle in [BridgeLifecycle::Archived, BridgeLifecycle::Open] {
+        bridge.lifecycle = lifecycle;
+        bridge.revision += 1;
+        repository.save_session_bridge(&bridge).unwrap();
+        let record = repository.find(&child).unwrap().unwrap();
+        let result = h
+            .runtime
+            .core
+            .query_retained_session(
+                Query::GetSession {
+                    session_id: SessionId::from(child.clone()),
+                },
+                &record,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let QueryResult::Session(view) = result else {
+            panic!("expected retained session")
+        };
+        assert_eq!(view.parent_session_id, Some(h.parent.clone()));
+        assert!(view.runs.is_empty());
+    }
+    assert!(h.runtime.effects.backends.session_commands.is_empty());
 }
 
 #[tokio::test]

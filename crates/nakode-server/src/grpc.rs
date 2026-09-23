@@ -3141,6 +3141,7 @@ fn agent_browser(value: protocol::AgentBrowserView) -> api::AgentBrowser {
 
 pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSummary {
     api::SessionSummary {
+        parent_session_id: value.parent_session_id.map(|id| id.to_string()),
         first_prompt_preview: value.first_prompt_preview,
         id: value.id.to_string(),
         workspace_id: value.workspace_id.to_string(),
@@ -3175,6 +3176,7 @@ fn session_projection(
     parent_presentation_only: bool,
 ) -> api::SessionState {
     let mut state = api::SessionState {
+        parent_session_id: value.parent_session_id.map(|id| id.to_string()),
         id: value.id.to_string(),
         revision: value.revision,
         workspace_id: value.workspace_id.to_string(),
@@ -4796,6 +4798,7 @@ mod saved_summary_tests {
     #[test]
     fn summary_preserves_first_prompt_preview_on_wire() {
         let summary = nakode_protocol::SessionSummary {
+            parent_session_id: Some(nakode_protocol::SessionId::from("parent")),
             id: nakode_protocol::SessionId::from("saved"),
             workspace_id: nakode_protocol::WorkspaceId::from("workspace"),
             title: "Owner title".to_owned(),
@@ -4812,6 +4815,7 @@ mod saved_summary_tests {
             routing_diagnostic: None,
         };
         let wire = super::session_summary(summary);
+        assert_eq!(wire.parent_session_id.as_deref(), Some("parent"));
         assert_eq!(wire.first_prompt_preview, "First owner prompt");
         assert_eq!(wire.title, "Owner title");
     }

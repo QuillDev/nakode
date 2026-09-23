@@ -385,6 +385,7 @@ mod tests {
 
     fn session(id: &str, status: &str) -> SessionView {
         SessionView {
+            parent_session_id: None,
             first_prompt_preview: String::new(),
             id: SessionId::from(id),
             revision: 1,

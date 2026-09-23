@@ -71,6 +71,7 @@ pub fn bootstrap(
         session_summaries.insert(
             0,
             SessionSummary {
+                parent_session_id: None,
                 first_prompt_preview: active_session.first_prompt_preview.clone(),
                 id: SessionId::from(state.nakode_session_id.clone()),
                 workspace_id: workspace_id.clone(),
@@ -240,6 +241,9 @@ fn session_view(
         .and_then(|session| session.last_owner_activity_at)
         .map_or(0, unix_seconds_to_milliseconds);
     SessionView {
+        parent_session_id: persisted
+            .and_then(|session| session.parent_session_id.clone())
+            .map(SessionId::from),
         id: session_id.clone(),
         revision,
         workspace_id: workspace_id.clone(),
@@ -2268,6 +2272,9 @@ pub(crate) fn active_session_summary(
         .iter()
         .find(|session| session.id == state.nakode_session_id);
     Some(SessionSummary {
+        parent_session_id: persisted
+            .and_then(|session| session.parent_session_id.clone())
+            .map(SessionId::from),
         first_prompt_preview: first_prompt_preview(state, sessions),
         id: SessionId::from(state.nakode_session_id.clone()),
         workspace_id,
@@ -2319,6 +2326,7 @@ fn first_prompt_preview(state: &DomainState, sessions: &[SessionRecord]) -> Stri
 
 fn session_summary(session: &SessionRecord, workspace_id: &WorkspaceId) -> SessionSummary {
     SessionSummary {
+        parent_session_id: session.parent_session_id.clone().map(SessionId::from),
         first_prompt_preview: session.owner_prompts.first().map_or_else(
             || session.first_prompt_preview.clone(),
             |prompt| prompt.raw_text.trim().chars().take(512).collect(),
