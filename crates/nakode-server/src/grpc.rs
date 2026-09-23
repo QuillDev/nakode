@@ -823,6 +823,15 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             paused: input.paused,
         }
     );
+    command_rpc!(
+        remove_followup,
+        api::RemoveFollowupRequest,
+        input,
+        protocol::Command::RemoveFollowup {
+            session_id: protocol::SessionId::from(input.session_id),
+            message_id: input.message_id,
+        }
+    );
     async fn list_followups(
         &self,
         request: tonic::Request<api::ListFollowupsRequest>,

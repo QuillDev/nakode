@@ -39,3 +39,8 @@ CREATE TABLE IF NOT EXISTS child_followup_deliveries (
     report_sequence INTEGER PRIMARY KEY,
     message_sequence INTEGER NOT NULL UNIQUE REFERENCES followup_messages(sequence) ON DELETE CASCADE
 );
+
+-- Retain message identity/digest and child receipts; removal never deletes shared artifacts.
+CREATE TABLE IF NOT EXISTS followup_removals (
+    message_sequence INTEGER PRIMARY KEY REFERENCES followup_messages(sequence) ON DELETE CASCADE
+);
