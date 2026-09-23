@@ -451,7 +451,7 @@ impl CodexProvider {
         events: mpsc::Sender<InferenceEvent>,
         cancellation: CancellationToken,
     ) -> Result<InferenceOutput, InferenceFailure> {
-        let body = codex_request_body(&request);
+        let body = codex_request_body(&request, &self.credential.account_id);
         let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
         for attempt in 0..MAX_INFERENCE_ATTEMPTS {
             if cancellation.is_cancelled() {
@@ -469,6 +469,7 @@ impl CodexProvider {
             {
                 Ok(mut output) => {
                     output.retry_count = attempt;
+                    tag_reasoning_account(&mut output.provider_state, &self.credential.account_id);
                     return Ok(output);
                 }
                 Err(error) if error.retryable && attempt + 1 < MAX_INFERENCE_ATTEMPTS => {
@@ -1715,11 +1716,28 @@ async fn discover_context_window(
         .and_then(|candidate| candidate.context_window)
 }
 
-fn codex_request_body(request: &InferenceRequest) -> Value {
+/// Marks which `ChatGPT` account produced a reasoning item. Its encrypted content opens only for
+/// that account, so a session that moves to another account stops replaying it.
+const REASONING_ACCOUNT_KEY: &str = "nakode_account_id";
+
+fn tag_reasoning_account(provider_state: &mut [Value], account_id: &str) {
+    for item in provider_state {
+        if item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && let Some(object) = item.as_object_mut()
+        {
+            object.insert(
+                REASONING_ACCOUNT_KEY.to_owned(),
+                Value::String(account_id.to_owned()),
+            );
+        }
+    }
+}
+
+fn codex_request_body(request: &InferenceRequest, account_id: &str) -> Value {
     let input = request
         .history
         .iter()
-        .flat_map(conversation_input)
+        .flat_map(|item| conversation_input(item, account_id))
         .collect::<Vec<_>>();
     let tools = request
         .tools
@@ -1756,7 +1774,7 @@ fn codex_request_body(request: &InferenceRequest) -> Value {
     body
 }
 
-fn conversation_input(item: &ConversationItem) -> Vec<Value> {
+fn conversation_input(item: &ConversationItem, account_id: &str) -> Vec<Value> {
     match item {
         ConversationItem::User { text, attachments } => {
             let mut content = vec![json!({"type": "input_text", "text": text})];
@@ -1779,7 +1797,23 @@ fn conversation_input(item: &ConversationItem) -> Vec<Value> {
             provider_state,
             ..
         } => {
-            let mut items = provider_state.clone();
+            // Reasoning from another account cannot be decrypted by this one; untagged items predate
+            // the tag and are replayed as before. The tag itself never reaches the provider.
+            let mut items = provider_state
+                .iter()
+                .filter(|item| {
+                    item.get(REASONING_ACCOUNT_KEY)
+                        .and_then(Value::as_str)
+                        .is_none_or(|producer| producer == account_id)
+                })
+                .cloned()
+                .map(|mut item| {
+                    if let Some(object) = item.as_object_mut() {
+                        object.remove(REASONING_ACCOUNT_KEY);
+                    }
+                    item
+                })
+                .collect::<Vec<_>>();
             if !text.is_empty() {
                 items.push(json!({"role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}));
             }
@@ -2774,24 +2808,65 @@ mod tests {
             error: None,
         };
 
-        assert!(conversation_input(&event).is_empty());
+        assert!(conversation_input(&event, "account-1").is_empty());
+    }
+
+    #[test]
+    fn reasoning_replays_only_to_the_account_that_produced_it() {
+        let mut provider_state = vec![
+            json!({"type": "reasoning", "encrypted_content": "from-a"}),
+            json!({"type": "message", "id": "kept"}),
+        ];
+        tag_reasoning_account(&mut provider_state, "account-a");
+        provider_state.push(json!({"type": "reasoning", "encrypted_content": "untagged"}));
+        let item = ConversationItem::Assistant {
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            provider_id: None,
+            model_id: None,
+            signature: None,
+            provider_state,
+        };
+
+        let same = conversation_input(&item, "account-a");
+        assert_eq!(same.len(), 3);
+        assert!(
+            same.iter()
+                .all(|value| value.get(REASONING_ACCOUNT_KEY).is_none())
+        );
+        assert_eq!(same[0]["encrypted_content"], "from-a");
+
+        // Another account cannot decrypt account A's reasoning, so it is not sent there.
+        let other = conversation_input(&item, "account-b");
+        assert_eq!(
+            other
+                .iter()
+                .filter_map(|value| value.get("encrypted_content").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            ["untagged"]
+        );
+        assert!(other.iter().any(|value| value["id"] == "kept"));
     }
 
     #[test]
     fn codex_receives_bounded_model_tool_output() {
-        let input = conversation_input(&ConversationItem::ToolResult {
-            call_id: "call-1".to_owned(),
-            title: Some("read".to_owned()),
-            output: "full transcript output".to_owned(),
-            model_output: Some("bounded model output".to_owned()),
-            failed: false,
-            denied: false,
-            denial_reason: None,
-            name: None,
-            arguments: None,
-            audit_kind: None,
-            duration_ms: None,
-        });
+        let input = conversation_input(
+            &ConversationItem::ToolResult {
+                call_id: "call-1".to_owned(),
+                title: Some("read".to_owned()),
+                output: "full transcript output".to_owned(),
+                model_output: Some("bounded model output".to_owned()),
+                failed: false,
+                denied: false,
+                denial_reason: None,
+                name: None,
+                arguments: None,
+                audit_kind: None,
+                duration_ms: None,
+            },
+            "account-1",
+        );
 
         assert_eq!(input[0]["output"], "bounded model output");
     }
@@ -3830,7 +3905,7 @@ mod tests {
             .map(Into::into)
             .collect();
 
-        let body = codex_request_body(&request);
+        let body = codex_request_body(&request, "account-1");
         let names = body["tools"]
             .as_array()
             .expect("tools array")
@@ -3892,7 +3967,7 @@ mod tests {
             }),
         });
 
-        let body = codex_request_body(&request);
+        let body = codex_request_body(&request, "account-1");
         let content = body["input"][0]["content"]
             .as_array()
             .expect("user content array");
@@ -3905,7 +3980,7 @@ mod tests {
     #[test]
     fn codex_request_keeps_operating_instructions_out_of_user_history() {
         let request = test_request();
-        let body = codex_request_body(&request);
+        let body = codex_request_body(&request, "account-1");
         assert_eq!(body["instructions"], "Be direct.");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["text"], "Hi");
@@ -3928,7 +4003,7 @@ mod tests {
             assert_eq!(request.reasoning_effort.as_deref(), Some(effort));
             assert!(request.tools.is_empty());
             assert!(!request.fast_mode);
-            let body = codex_request_body(&request);
+            let body = codex_request_body(&request, "account-1");
             assert_eq!(body["reasoning"]["effort"], effort);
             assert!(body["input"].to_string().contains("input_image"));
         }
@@ -3936,7 +4011,7 @@ mod tests {
 
     #[test]
     fn codex_requests_disable_provider_storage() {
-        let body = codex_request_body(&test_request());
+        let body = codex_request_body(&test_request(), "account-1");
 
         assert_eq!(body["store"], false);
     }
@@ -3948,7 +4023,7 @@ mod tests {
             request.model = "gpt-6-astra".to_owned();
             request.reasoning_effort = Some(effort.to_owned());
 
-            let body = codex_request_body(&request);
+            let body = codex_request_body(&request, "account-1");
 
             assert_eq!(body["model"], "gpt-6-astra");
             assert_eq!(body["parallel_tool_calls"], true);
@@ -4009,9 +4084,16 @@ mod tests {
     #[test]
     fn fast_mode_requests_priority_service_tier() {
         let mut request = test_request();
-        assert!(codex_request_body(&request).get("service_tier").is_none());
+        assert!(
+            codex_request_body(&request, "account-1")
+                .get("service_tier")
+                .is_none()
+        );
         request.fast_mode = true;
-        assert_eq!(codex_request_body(&request)["service_tier"], "priority");
+        assert_eq!(
+            codex_request_body(&request, "account-1")["service_tier"],
+            "priority"
+        );
     }
 
     #[tokio::test]

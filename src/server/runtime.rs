@@ -40,7 +40,7 @@ use crate::{
     service::ServiceEngine,
     session::{
         ProviderAccountRecord, ProviderRecord, SessionError, SessionRecord, SessionRepository,
-        SqliteSessionRepository, is_pending_provider_session_id,
+        SqliteSessionRepository,
     },
     shell::{ShellEvent, ShellProcesses},
     skill::{SkillCatalog, SkillCatalogError},
@@ -3451,6 +3451,10 @@ pub(crate) struct BackendRegistry {
     pub(crate) session_commands:
         HashMap<(nakode_protocol::SessionId, String), mpsc::Sender<BackendCommand>>,
     session_accounts: HashMap<(nakode_protocol::SessionId, String), String>,
+    /// The account each live session handle currently runs on, shared with its event forwarder so
+    /// provider events are attributed to the account that produced them after a switch.
+    session_account_cells:
+        HashMap<(nakode_protocol::SessionId, String), Arc<std::sync::Mutex<String>>>,
     /// Backend and event-forwarding tasks retained by canonical session/provider identity so a
     /// destructive delete can await provider termination before removing durable history.
     session_tasks: HashMap<(nakode_protocol::SessionId, String), Vec<SessionBackendTasks>>,
@@ -3628,6 +3632,7 @@ impl BackendRegistry {
             account_control_generations: HashMap::new(),
             session_commands: HashMap::new(),
             session_accounts: HashMap::new(),
+            session_account_cells: HashMap::new(),
             session_tasks: HashMap::new(),
             subagent_commands: HashMap::new(),
             subagent_providers: HashMap::new(),
@@ -3996,6 +4001,7 @@ impl BackendRegistry {
             }
         }
         self.session_accounts.remove(&key);
+        self.session_account_cells.remove(&key);
         let Some(task_sets) = self.session_tasks.remove(&key) else {
             return Ok(());
         };
@@ -4101,8 +4107,7 @@ impl BackendRegistry {
         account_id: &str,
         metadata: Option<serde_json::Value>,
     ) {
-        if provider != crate::backend::CODEX_PROVIDER && provider != crate::backend::CLAUDE_PROVIDER
-        {
+        if !Self::switches_credential_in_place(provider) {
             return;
         }
         for (key, selected_account) in &self.session_accounts {
@@ -4214,16 +4219,23 @@ impl BackendRegistry {
         let key = (session_id.clone(), provider.clone());
         self.session_accounts
             .insert(key.clone(), account_id.clone());
+        let account_cell = Arc::new(std::sync::Mutex::new(account_id));
+        self.session_account_cells
+            .insert(key.clone(), Arc::clone(&account_cell));
         self.session_commands.insert(key.clone(), commands);
         let event_tx = self.event_tx.clone();
         let event_forwarder = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
+                let account_id = account_cell.lock().map_or_else(
+                    |poisoned| poisoned.into_inner().clone(),
+                    |account| account.clone(),
+                );
                 if event_tx
                     .send((
                         BackendSource::Primary {
                             session_id: session_id.clone(),
                             provider: provider.clone(),
-                            account_id: account_id.clone(),
+                            account_id,
                         },
                         event,
                     ))
@@ -4642,11 +4654,16 @@ impl BackendRegistry {
         true
     }
 
+    /// Chooses the account a session's next command runs on. A session is not bound to an account:
+    /// `preferred` (the session's last or requested account) is used while it stays eligible, and
+    /// otherwise routing picks any eligible account. Only a command inside a running turn keeps the
+    /// account its live handle is on.
     pub(crate) fn select_session_account(
         &mut self,
         session_id: &nakode_protocol::SessionId,
         provider: &str,
-        account_id: Option<&str>,
+        preferred: Option<&str>,
+        may_switch: bool,
     ) -> Result<AccountSelection, SessionBackendError> {
         if !self.commands.contains_key(provider) {
             return Err(BackendError::ProviderUnavailable {
@@ -4655,33 +4672,69 @@ impl BackendRegistry {
             .into());
         }
         let key = (session_id.clone(), provider.to_owned());
-        if let Some(selected) = self.session_accounts.get(&key).cloned() {
-            if account_id.is_some_and(|requested| requested != selected) {
-                return Err(BackendError::InvalidCredential {
-                    provider: provider.to_owned(),
-                    detail: "an established session cannot switch provider accounts; start a new session"
-                        .to_owned(),
-                }
-                .into());
-            }
-            let label = self
-                .provider_accounts
-                .get(provider)
-                .and_then(|accounts| {
-                    accounts
-                        .iter()
-                        .find(|account| account.account_id == selected)
-                })
-                .map_or_else(|| selected.clone(), |account| account.label.clone());
-            Ok(AccountSelection {
-                account_id: selected,
+        let current = self.session_accounts.get(&key).cloned();
+        if !may_switch && let Some(current) = current {
+            let label = self.account_label(provider, &current);
+            return Ok(AccountSelection {
+                account_id: current,
                 label,
-                reason: "persisted session affinity".to_owned(),
-            })
-        } else {
-            self.select_account(provider, account_id)
-                .map_err(Into::into)
+                reason: "the running turn's account".to_owned(),
+            });
         }
+        let accounts = self
+            .provider_accounts
+            .get(provider)
+            .cloned()
+            .unwrap_or_default();
+        for candidate in preferred.into_iter().chain(current.as_deref()) {
+            if let Some(account) = accounts
+                .iter()
+                .find(|account| account.account_id == candidate)
+                && self.ensure_account_eligible(provider, account).is_ok()
+            {
+                return Ok(AccountSelection {
+                    account_id: account.account_id.clone(),
+                    label: account.label.clone(),
+                    reason: "the session's current account".to_owned(),
+                });
+            }
+        }
+        match self.select_account(provider, None) {
+            Ok(selection) => Ok(selection),
+            // With nowhere better to go, the live handle keeps its account and the provider reports
+            // what is wrong with it.
+            Err(_) if current.is_some() => {
+                let current = current.unwrap_or_default();
+                Ok(AccountSelection {
+                    label: self.account_label(provider, &current),
+                    account_id: current,
+                    reason: "no other eligible account".to_owned(),
+                })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn account_label(&self, provider: &str, account_id: &str) -> String {
+        self.provider_accounts
+            .get(provider)
+            .and_then(|accounts| {
+                accounts
+                    .iter()
+                    .find(|account| account.account_id == account_id)
+            })
+            .map_or_else(|| account_id.to_owned(), |account| account.label.clone())
+    }
+
+    /// Whether a provider's live session handle can take another account's credential in place.
+    fn switches_credential_in_place(provider: &str) -> bool {
+        matches!(
+            provider,
+            crate::backend::CODEX_PROVIDER
+                | crate::backend::CLAUDE_PROVIDER
+                | crate::backend::KIMI_PROVIDER
+                | crate::backend::GLM_PROVIDER
+        )
     }
 
     pub(crate) async fn send_session(
@@ -4693,7 +4746,62 @@ impl BackendRegistry {
         command: BackendCommand,
     ) -> Result<AccountSelection, SessionBackendError> {
         let key = (session_id.clone(), provider.to_owned());
-        let selection = self.select_session_account(session_id, provider, account_id)?;
+        // A session may move accounts only where a turn begins; anything inside a running turn goes
+        // to the handle already running it.
+        let boundary = matches!(
+            command,
+            BackendCommand::StartSession { .. }
+                | BackendCommand::ResumeSession { .. }
+                | BackendCommand::StartTurn { .. }
+        );
+        let mut selection =
+            self.select_session_account(session_id, provider, account_id, boundary)?;
+        if let Some(current) = self.session_accounts.get(&key).cloned()
+            && current != selection.account_id
+        {
+            if matches!(
+                command,
+                BackendCommand::StartSession { .. } | BackendCommand::ResumeSession { .. }
+            ) {
+                // The command loads the session into a fresh handle, so start that on the new
+                // account.
+                self.stop_session_backend(key.clone())
+                    .await
+                    .map_err(|detail| BackendError::InvalidCredential {
+                        provider: provider.to_owned(),
+                        detail,
+                    })?;
+            } else if Self::switches_credential_in_place(provider)
+                && let Some(commands) = self.session_commands.get(&key)
+            {
+                let credential = self
+                    .provider_account_credentials
+                    .get(&(provider.to_owned(), selection.account_id.clone()))
+                    .cloned();
+                if commands
+                    .send(BackendCommand::UpdateCredential {
+                        credential: credential.map(SecretValue::new),
+                    })
+                    .await
+                    .is_ok()
+                {
+                    self.session_accounts
+                        .insert(key.clone(), selection.account_id.clone());
+                    if let Some(cell) = self.session_account_cells.get(&key)
+                        && let Ok(mut account) = cell.lock()
+                    {
+                        account.clone_from(&selection.account_id);
+                    }
+                }
+            } else {
+                // This provider takes another account when the session's handle next starts.
+                selection = AccountSelection {
+                    label: self.account_label(provider, &current),
+                    account_id: current,
+                    reason: "the session's running handle".to_owned(),
+                };
+            }
+        }
         if !self.session_commands.contains_key(&key) {
             let handle = self
                 .spawn_provider_handle_for_account(
@@ -5983,89 +6091,32 @@ async fn send_backend_command(
     command: BackendCommand,
 ) {
     let provider = state.backend_provider.clone();
-    let requested_account = state.provider_account_id.clone();
+    // The session's last or requested account is only a preference: routing moves the session to
+    // another eligible account whenever that one cannot serve it.
+    let preferred_account = state.provider_account_id.clone();
     let durable_session_id = state
         .durable_session_id_for_backend()
         .map(ToOwned::to_owned);
-    let (unbound_durable_session, pending_creation_session) =
-        if let Some(durable_session_id) = durable_session_id.as_deref() {
-            match sessions.find(durable_session_id) {
-                Ok(Some(record)) => (
-                    record.account_id.is_none(),
-                    is_pending_provider_session_id(&record.provider_session_id),
-                ),
-                Ok(None) => (false, false),
-                Err(error) => {
-                    state.handle_provider_backend(
-                        &provider,
-                        BackendEvent::Disconnected {
-                            reason: format!("could not read provider account affinity: {error}"),
-                        },
-                    );
-                    return;
-                }
-            }
-        } else {
-            (false, false)
-        };
-    if unbound_durable_session && !pending_creation_session && requested_account.is_none() {
-        state.handle_provider_backend(
-            &provider,
-            BackendEvent::Disconnected {
-                reason: "this historical session predates provider account affinity; restart it as a new session with an explicit original-account selection"
-                    .to_owned(),
-            },
-        );
-        return;
-    }
-    let selection = match backends.select_session_account(
-        session_id,
-        &provider,
-        requested_account.as_deref(),
-    ) {
-        Ok(selection) => selection,
-        Err(error) => {
-            state.handle_provider_backend(
-                &provider,
-                BackendEvent::Disconnected {
-                    reason: error.to_string(),
-                },
-            );
-            return;
-        }
-    };
-
-    // Historical unbound rows require an explicit account because their provider-native identity
-    // may belong to credentials that are no longer the automatic choice. A pending-creation row has
-    // no provider-native identity yet, so automatic routing is safe; bind that selected account
-    // durably before releasing StartSession.
-    let needs_affinity = unbound_durable_session;
-    if needs_affinity && let Some(durable_session_id) = durable_session_id.as_deref() {
-        if let Err(error) =
-            sessions.set_session_account(durable_session_id, Some(&selection.account_id))
-        {
-            state.handle_provider_backend(
-                &provider,
-                BackendEvent::Disconnected {
-                    reason: format!("could not persist provider account affinity: {error}"),
-                },
-            );
-            return;
-        }
-        // Keep the in-memory request pinned even if backend startup fails after the durable bind.
-        state.provider_account_id = Some(selection.account_id.clone());
-    }
     match backends
         .send_session(
             session_id,
             &provider,
-            Some(&selection.account_id),
+            preferred_account.as_deref(),
             Path::new(&state.working_directory),
             command,
         )
         .await
     {
         Ok(selection) => {
+            // Record the account the session last ran on: history and a routing preference, never
+            // a requirement.
+            if let Some(durable_session_id) = durable_session_id.as_deref()
+                && state.provider_account_id.as_deref() != Some(selection.account_id.as_str())
+                && let Err(error) =
+                    sessions.set_session_account(durable_session_id, Some(&selection.account_id))
+            {
+                eprintln!("nakode: could not record the session's provider account: {error}");
+            }
             state.provider_account_id = Some(selection.account_id.clone());
             state.provider_account_routing =
                 Some(nakode_protocol::ProviderAccountRoutingDiagnosticView {
@@ -6442,7 +6493,6 @@ fn take_remove_provider_account_effect(effects: &mut Vec<Effect>) -> Option<(Str
 fn provider_account_removal_error(error: &SessionError) -> ServiceError {
     let (code, retryable) = match error {
         SessionError::ProviderAccountNotFound { .. } => (ErrorCode::NotFound, false),
-        SessionError::ProviderAccountInUse { .. } => (ErrorCode::Conflict, false),
         _ => (ErrorCode::Internal, true),
     };
     ServiceError {
@@ -8120,7 +8170,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_session_is_not_routed_until_its_account_is_explicitly_identified() {
+    async fn historical_session_routes_to_an_eligible_account_and_records_it() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (persistence, _credentials) = test_persistence(workspace.path());
         let record = persistence
@@ -8180,32 +8230,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            persistence
-                .sessions
-                .find(&record.id)
-                .expect("read session")
-                .expect("session")
-                .account_id,
-            None
-        );
-        assert!(received.try_recv().is_err());
-        assert!(
-            state
-                .status_message
-                .contains("predates provider account affinity")
-        );
-
-        state.set_provider_account_override(Some(CODEX_TEST_ACCOUNT_ID.to_owned()));
-        super::send_backend_command(
-            &SessionId::from(record.id.clone()),
-            &mut state,
-            &mut registry,
-            persistence.sessions.as_ref(),
-            BackendCommand::Shutdown,
-        )
-        .await;
-
+        // A session from before accounts existed simply runs on an eligible one.
         assert_eq!(
             persistence
                 .sessions
@@ -8454,7 +8479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_account_removal_refuses_in_use_account_through_command_result() {
+    async fn provider_account_removal_frees_the_sessions_that_last_used_it() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (persistence, _credentials) = test_persistence(workspace.path());
         let account = persistence
@@ -8499,10 +8524,10 @@ mod tests {
         let endpoint = handle.endpoint().clone();
         let runtime = tokio::spawn(runtime.run());
 
-        let error = endpoint
+        endpoint
             .execute_command(
                 ClientId::from("provider-removal-test"),
-                IdempotencyKey::from("remove-pinned-account"),
+                IdempotencyKey::from("remove-used-account"),
                 None,
                 false,
                 Command::RemoveProviderAccount {
@@ -8511,32 +8536,25 @@ mod tests {
                 },
             )
             .await
-            .expect_err("pinned account removal must be refused to the client");
-        assert_eq!(error.code, ErrorCode::Conflict);
-        assert!(error.message.contains("pinned to persisted sessions"));
-        let retry = endpoint
-            .execute_command(
-                ClientId::from("provider-removal-test"),
-                IdempotencyKey::from("remove-pinned-account"),
-                None,
-                false,
-                Command::RemoveProviderAccount {
-                    provider_id: nakode_protocol::ProviderId::from(CODEX_PROVIDER),
-                    account_id: account.account_id.clone(),
-                },
-            )
-            .await
-            .expect_err("same-key retry must re-run the refused removal");
-        assert_eq!(retry.code, ErrorCode::Conflict);
-        assert!(retry.message.contains("pinned to persisted sessions"));
+            .expect("an account a session last used can be removed");
         assert!(
-            persistence
+            !persistence
                 .sessions
                 .list_providers()
-                .expect("provider records after refusal")
+                .expect("provider records after removal")
                 .into_iter()
                 .flat_map(|provider| provider.accounts)
                 .any(|candidate| candidate.account_id == account.account_id)
+        );
+        // The session no longer names an account; its next turn routes to any eligible one.
+        assert_eq!(
+            persistence
+                .sessions
+                .find("pinned-session")
+                .expect("read session")
+                .expect("session")
+                .account_id,
+            None
         );
 
         handle.shutdown().await;
@@ -12655,10 +12673,137 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_session_moves_to_another_account_at_a_turn_boundary_only() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        registry
+            .commands
+            .insert(CODEX_PROVIDER.to_owned(), control_tx);
+        let automatic = nakode_protocol::ProviderAccountRoutingMode::Automatic;
+        registry.provider_accounts.insert(
+            CODEX_PROVIDER.to_owned(),
+            vec![
+                routing_account(CODEX_PROVIDER, "account-a", "A", true, true, automatic),
+                routing_account(CODEX_PROVIDER, "account-b", "B", true, false, automatic),
+            ],
+        );
+        for account in ["account-a", "account-b"] {
+            registry.provider_account_credentials.insert(
+                (CODEX_PROVIDER.to_owned(), account.to_owned()),
+                serde_json::json!({"fixture": account}),
+            );
+        }
+        let session = SessionId::from("session-moving");
+        let key = (session.clone(), CODEX_PROVIDER.to_owned());
+        let (handle, mut commands, _events) = fake_backend();
+        registry.insert_session(
+            session.clone(),
+            CODEX_PROVIDER.to_owned(),
+            "account-a".to_owned(),
+            handle,
+        );
+        let start_turn = || BackendCommand::StartTurn {
+            provider_session_id: "native".to_owned(),
+            client_id: "client".to_owned(),
+            prompt: "hello".to_owned(),
+            attachments: Vec::new(),
+            model: None,
+            skill_catalogue: crate::skill::SkillCatalog::default(),
+        };
+
+        // While its account is usable the session stays on it.
+        let selection = registry
+            .send_session(
+                &session,
+                CODEX_PROVIDER,
+                Some("account-a"),
+                workspace.path(),
+                start_turn(),
+            )
+            .await
+            .expect("routed");
+        assert_eq!(selection.account_id, "account-a");
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(BackendCommand::StartTurn { .. })
+        ));
+
+        // Once it is not, the next turn runs on another account, swapped into the live handle.
+        registry
+            .provider_accounts
+            .get_mut(CODEX_PROVIDER)
+            .expect("accounts")[0]
+            .enabled = false;
+        let selection = registry
+            .send_session(
+                &session,
+                CODEX_PROVIDER,
+                Some("account-a"),
+                workspace.path(),
+                start_turn(),
+            )
+            .await
+            .expect("routed");
+        assert_eq!(selection.account_id, "account-b");
+        let Ok(BackendCommand::UpdateCredential {
+            credential: Some(credential),
+        }) = commands.try_recv()
+        else {
+            panic!("expected the new account's credential");
+        };
+        assert_eq!(
+            credential.into_inner(),
+            serde_json::json!({"fixture": "account-b"})
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(BackendCommand::StartTurn { .. })
+        ));
+        assert_eq!(
+            registry.session_accounts.get(&key).map(String::as_str),
+            Some("account-b")
+        );
+
+        // A command inside the running turn stays on the account running it.
+        registry
+            .provider_accounts
+            .get_mut(CODEX_PROVIDER)
+            .expect("accounts")[1]
+            .enabled = false;
+        let selection = registry
+            .send_session(
+                &session,
+                CODEX_PROVIDER,
+                Some("account-b"),
+                workspace.path(),
+                BackendCommand::SteerTurn {
+                    provider_session_id: "native".to_owned(),
+                    turn_id: "turn".to_owned(),
+                    client_id: "steer".to_owned(),
+                    prompt: "and then".to_owned(),
+                },
+            )
+            .await
+            .expect("routed");
+        assert_eq!(selection.account_id, "account-b");
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(BackendCommand::SteerTurn { .. })
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn session_token_refresh_preserves_all_live_session_handles() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (persistence, credentials) = test_persistence(workspace.path());
         let mut registry = empty_registry(workspace.path()).await;
+        // The live sessions run on the provider's default account, which the refresh updates.
+        let default_account =
+            super::ensure_default_provider_account(persistence.sessions.as_ref(), CODEX_PROVIDER)
+                .expect("default account");
         let (control_tx, mut control_rx) = mpsc::channel(1);
         registry
             .commands
@@ -12670,13 +12815,13 @@ mod tests {
         registry.insert_session(
             first_id.clone(),
             CODEX_PROVIDER.to_owned(),
-            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            default_account.clone(),
             first,
         );
         registry.insert_session(
             second_id.clone(),
             CODEX_PROVIDER.to_owned(),
-            CODEX_TEST_ACCOUNT_ID.to_owned(),
+            default_account.clone(),
             second,
         );
         let mut state = DomainState::new_for_backend(
@@ -12710,8 +12855,16 @@ mod tests {
             control_rx.recv().await,
             Some(BackendCommand::Shutdown)
         ));
-        assert!(first_commands.try_recv().is_err());
-        assert!(second_commands.try_recv().is_err());
+        // Each live session takes the refreshed token in place rather than restarting.
+        for commands in [&mut first_commands, &mut second_commands] {
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(BackendCommand::UpdateCredential {
+                    credential: Some(_)
+                })
+            ));
+            assert!(commands.try_recv().is_err());
+        }
         let (refreshed_control_tx, _refreshed_control_rx) = mpsc::channel(1);
         registry
             .commands

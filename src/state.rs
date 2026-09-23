@@ -3962,7 +3962,7 @@ impl DomainState {
             nakode_protocol::ProviderAccountRoutingDiagnosticView {
                 account_id: Some(account_id.clone()),
                 account_label: None,
-                reason: "persisted session affinity".to_owned(),
+                reason: "the session's last account".to_owned(),
                 cooldown_until_ms: None,
             }
         });

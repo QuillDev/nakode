@@ -53,13 +53,16 @@ On repository open, migrate each legacy `provider_credentials` row transactional
 3. backfill existing `sessions.account_id` for that provider;
 4. retain the legacy table for forward compatibility but stop writing it after successful migration; removing a migrated `legacy-<provider>` account also deletes its source row so repository reopen cannot recreate it.
 
-A single-account installation therefore keeps the same credential, provider enablement, default selection, session affinity, and first-session behavior without reauthentication. Reopening is idempotent. A legacy session whose provider had no credential remains unbound rather than receiving a fabricated account. Because its provider-native conversation may belong to any later-added account, Nakode never least-load routes that resume; it returns an actionable error requiring a new/restarted session with an explicit original-account selection.
+A single-account installation therefore keeps the same credential, provider enablement, default selection, session affinity, and first-session behavior without reauthentication. Reopening is idempotent. A legacy session whose provider had no credential starts unbound and simply routes to an eligible account on its next turn.
 
-### 2.3 Session affinity
+### 2.3 Sessions are account-agnostic
 
-Add nullable `account_id` to logical sessions and account attribution to owned/delegated native sessions where needed. Resolve an account exactly once before a new native session is created, then persist it with the logical session/provider transition. Session backend keys become `(session_id, provider, account_id)`. Resume must use the persisted account and must fail actionably if that account is disabled, removed, unauthenticated, cooling down, or no longer serves the requested model.
+A session is not bound to an account. `sessions.account_id` records the account a session last ran on; it is a routing preference and history, never a requirement. Before each command the runtime chooses an account:
 
-Changing a provider default, disabling an account, or adding a healthier account never mutates an established session's account. Nakode does not transparently retry an established session against another credential. A user must start/restart a new provider-native session or perform an explicit handoff. This preserves provider conversation ownership and opaque state.
+- a command inside a running turn (steer, interrupt, approvals, tool results) goes to the account running that turn;
+- where a turn begins (start, resume, next turn) the session keeps its last or requested account while that account is eligible, and otherwise routing picks any eligible account; with nothing else eligible it stays put and the provider reports the problem.
+
+Moving accounts at a turn boundary: Codex (native), Claude, Kimi and GLM take the new account's credential into the live session handle (`UpdateCredential`), since their conversation state is Nakode's or on local disk; a start or resume loads the session into a fresh handle on the new account; other adapters take the new account the next time their handle starts. Codex reasoning items are tagged with the ChatGPT account that produced them and are replayed only to that account, because their encrypted content opens for no other. Removing an account clears it from the sessions that last used it rather than refusing.
 
 ## 3. Ephemeral routing model
 
@@ -84,7 +87,7 @@ For a new native session:
 3. if an explicit account override is present, validate it with the same eligibility checks and choose it without fallback;
 4. otherwise prefer the configured default only when it is tied on effective load; select by least active-session load, then stable account ID;
 5. reserve/increment the selected account's load before releasing the runtime lock and before spawning the adapter;
-6. persist affinity with native session creation; roll back the reservation if creation fails before persistence.
+6. record the account the session ran on; it guides the next selection but does not bind the session.
 
 This is deterministic least-loaded routing, not random rotation. Diagnostics report account ID, safe label, and one of `explicit override`, `only eligible account`, `preferred account tie-break`, or `least loaded`.
 
@@ -92,9 +95,9 @@ If no account is eligible, return a structured diagnostic listing only safe acco
 
 ## 5. Provider safety gate
 
-Each adapter declares whether fresh-session automatic account routing is safe. Adapters without a reliable account-isolated credential/session boundary are `explicit_only`: Nakode still stores multiple accounts and accepts an explicit account override, but automatic selection returns an honest unsupported-routing diagnostic when ambiguity exists. No implementation rewrites provider state, shares opaque conversations across credentials, or uses quota/rate-limit failures to swap an in-flight session.
+Each adapter declares whether fresh-session automatic account routing is safe. Adapters without a reliable account-isolated credential/session boundary are `explicit_only`: Nakode still stores multiple accounts and accepts an explicit account override, but automatic selection returns an honest unsupported-routing diagnostic when ambiguity exists. No implementation swaps the account of a turn already in flight; the next turn may run elsewhere.
 
-OpenAI Codex native sessions have an account-isolated bearer token plus ChatGPT account header and Nakode-owned normalized resume state. Automatic selection is permitted only for creation of a fresh provider-native session. Resume and every subsequent turn remain pinned. Compatibility/process adapters and external-login-marker adapters default to `explicit_only` until they can prove account-isolated construction.
+OpenAI Codex native sessions have an account-isolated bearer token plus ChatGPT account header and Nakode-owned normalized resume state. Every turn boundary may select another account; reasoning is replayed only to the account that produced it. Compatibility/process adapters and external-login-marker adapters default to `explicit_only` until they can prove account-isolated construction.
 
 ## 6. Public contract and client projection
 
@@ -107,15 +110,15 @@ The built-in TUI renders authoritative account rows with safe labels/identity, e
 The initial implementation now provides:
 
 - additive protocol, gRPC, SDK, and redacted snapshot types for account CRUD, authentication, credential lifecycle, explicit account selection, selected-account identity, routing reason, and health;
-- protected per-account credential rows with deterministic legacy migration and durable session affinity;
+- protected per-account credential rows with deterministic legacy migration and a recorded last account per session;
 - serialized deterministic least-load selection with default/account-ID tie-breaking and strict adapter safety gates (`openai-codex` automatic, other adapters explicit-only when multiple accounts are eligible);
 - account-specific adapter construction, provider-control OAuth refresh persistence, local logout, and removal cleanup;
-- strict resume affinity and actionable refusal of a mid-session account change;
+- account-agnostic sessions: per-turn selection with the last account as a preference and in-place credential swaps;
 - Codex-adapter failure classification for authentication, quota, rate limit, provider-wide, and model-wide failures, including bounded `Retry-After` account cooldowns;
 - process-local health projections that reset to `unknown` after restart, plus safe selected-account routing diagnostics;
 - built-in provider settings projection of safe account label/ID, enablement, default, routing mode, credential state, and health. Existing built-in login/logout continues to operate on the authoritative default account and does not overwrite sibling accounts.
 
-Focused safe-fixture tests cover account CRUD/restart redaction, atomic and concurrent affinity binding, blocked removal while pinned, explicit selection, deterministic balancing, disabled/unauthenticated filtering, account-local cooldown isolation, provider/model-wide non-poisoning, bounded `Retry-After`, and normalized failure propagation. The two-account routing fixture demonstrates that successive live session reservations select different least-loaded accounts while the first session remains bound to its original account.
+Focused safe-fixture tests cover account CRUD/restart redaction, recording and changing a session's account, freeing sessions when their account is removed, moving a session between accounts only at a turn boundary, explicit selection, deterministic balancing, disabled/unauthenticated filtering, account-local cooldown isolation, provider/model-wide non-poisoning, bounded `Retry-After`, and normalized failure propagation. The two-account routing fixture demonstrates that successive live session reservations select different least-loaded accounts.
 
 ## Brokered credentials
 

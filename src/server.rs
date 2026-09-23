@@ -2181,13 +2181,13 @@ impl ServerCore {
                         state.provider_account_id.clone(),
                     )
                 };
-                if account_id
-                    .is_some_and(|requested| Some(requested) != loaded_account_id.as_deref())
+                // A session runs on any eligible account; a requested one becomes its preference.
+                if let Some(requested) = account_id
+                    && Some(requested) != loaded_account_id.as_deref()
                 {
-                    return Err(DomainCommandError::Conflict(
-                        "an established session cannot switch provider accounts; start a new session"
-                            .to_owned(),
-                    ));
+                    self.session_engine_mut(loaded)?
+                        .state_mut()
+                        .set_provider_account_override(Some(requested.to_owned()));
                 }
                 canonical_open_session_working_directory(
                     loaded,
@@ -2273,20 +2273,10 @@ impl ServerCore {
                 )));
             }
         };
+        // The persisted account is only where the session last ran; a requested one replaces it
+        // as the preference.
         if let Some(requested) = account_id {
-            if session
-                .account_id
-                .as_deref()
-                .is_some_and(|persisted| persisted != requested)
-            {
-                return Err(DomainCommandError::Conflict(
-                    "the persisted session is pinned to another provider account; start a new session"
-                        .to_owned(),
-                ));
-            }
-            if session.account_id.is_none() {
-                session.account_id = Some(requested.to_owned());
-            }
+            session.account_id = Some(requested.to_owned());
         }
         let working_directory = canonical_open_session_working_directory(
             session_id,

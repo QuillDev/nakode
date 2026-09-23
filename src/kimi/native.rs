@@ -268,9 +268,78 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
     Ok(BackendHandle::new(command_tx, event_rx, task))
 }
 
+/// The provider that authenticates requests with one API key.
+fn provider_for(config: &BackendConfig, api_key: String) -> Arc<dyn InferenceProvider> {
+    Arc::new(KimiProvider {
+        client: config.client.clone(),
+        base_url: config.base_url.clone(),
+        api_key,
+    })
+}
+
+fn runtime_for(config: &BackendConfig, provider: Arc<dyn InferenceProvider>) -> AgentRuntime {
+    let mut runtime = AgentRuntime::new(config.workspace.clone(), provider)
+        .with_compaction_threshold_percent(config.compaction_threshold_percent);
+    if let Some(database) = &config.session_database {
+        runtime =
+            runtime.with_session_store(RuntimeSessionStore::new(database.clone(), KIMI_PROVIDER));
+    }
+    if let Some(requests) = &config.native_delegation {
+        runtime = runtime.with_native_delegation(requests.clone());
+    }
+    if let Some(web_config) = &config.web_config {
+        runtime = runtime.with_web_config(Arc::clone(web_config));
+    }
+    if let Some(memory_service) = &config.memory_service {
+        runtime = runtime.with_memory(Arc::clone(memory_service));
+    }
+    if let Some(vision_config) = &config.vision_config {
+        runtime = runtime.with_vision(
+            Arc::clone(vision_config),
+            config.vision_service.clone(),
+            true,
+        );
+    }
+    runtime
+}
+
+/// Takes another account's key into the live adapter: the same sessions continue on it from the
+/// next request. Without a key, the active turn stops.
+fn replace_api_key(
+    config: &BackendConfig,
+    credential: Option<crate::credential::SecretValue>,
+    api_key: &mut Option<String>,
+    runtime: &mut Option<AgentRuntime>,
+    active: Option<&ActiveTurn>,
+) {
+    let replacement = credential.and_then(|value| {
+        value
+            .into_inner()
+            .get("api_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|api_key| !api_key.is_empty())
+            .map(ToOwned::to_owned)
+    });
+    if let Some(key) = replacement {
+        let provider = provider_for(config, key.clone());
+        if let Some(runtime) = runtime.as_mut() {
+            runtime.replace_provider(provider);
+        } else {
+            *runtime = Some(runtime_for(config, provider));
+        }
+        *api_key = Some(key);
+    } else {
+        *api_key = None;
+        if let Some(active) = active {
+            active.cancellation.cancel();
+        }
+    }
+}
+
 async fn run_supervisor(
     config: BackendConfig,
-    api_key: Option<String>,
+    mut api_key: Option<String>,
     mut commands: mpsc::Receiver<BackendCommand>,
     events: mpsc::Sender<BackendEvent>,
 ) {
@@ -282,38 +351,9 @@ async fn run_supervisor(
             capabilities: native_capabilities(),
         }))
         .await;
-    let provider = api_key.clone().map(|api_key| {
-        Arc::new(KimiProvider {
-            client: config.client.clone(),
-            base_url: config.base_url.clone(),
-            api_key,
-        }) as Arc<dyn InferenceProvider>
-    });
-    let runtime = provider.map(|provider| {
-        let mut runtime = AgentRuntime::new(config.workspace.clone(), provider)
-            .with_compaction_threshold_percent(config.compaction_threshold_percent);
-        if let Some(database) = &config.session_database {
-            runtime = runtime
-                .with_session_store(RuntimeSessionStore::new(database.clone(), KIMI_PROVIDER));
-        }
-        if let Some(requests) = &config.native_delegation {
-            runtime = runtime.with_native_delegation(requests.clone());
-        }
-        if let Some(web_config) = &config.web_config {
-            runtime = runtime.with_web_config(Arc::clone(web_config));
-        }
-        if let Some(memory_service) = &config.memory_service {
-            runtime = runtime.with_memory(Arc::clone(memory_service));
-        }
-        if let Some(vision_config) = &config.vision_config {
-            runtime = runtime.with_vision(
-                Arc::clone(vision_config),
-                config.vision_service.clone(),
-                true,
-            );
-        }
-        runtime
-    });
+    let mut runtime = api_key
+        .clone()
+        .map(|api_key| runtime_for(&config, provider_for(&config, api_key)));
     let session_store = config
         .session_database
         .clone()
@@ -327,6 +367,10 @@ async fn run_supervisor(
                 let Some(command) = command else { break };
                 if matches!(command, BackendCommand::Shutdown) {
                     break;
+                }
+                if let BackendCommand::UpdateCredential { credential } = command {
+                    replace_api_key(&config, credential, &mut api_key, &mut runtime, active.as_ref());
+                    continue;
                 }
                 let mut context = CommandContext {
                     config: &config,
