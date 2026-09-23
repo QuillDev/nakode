@@ -4342,9 +4342,24 @@ impl BackendRegistry {
             }
         }
         if eligible.len() > 1 {
-            eligible.retain(|account| {
-                account.routing_mode == nakode_protocol::ProviderAccountRoutingMode::Automatic
-            });
+            let automatic = eligible
+                .iter()
+                .filter(|account| {
+                    account.routing_mode == nakode_protocol::ProviderAccountRoutingMode::Automatic
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            // With no account routed automatically, the owner's default is the choice.
+            if automatic.is_empty()
+                && let Some(default) = eligible.iter().find(|account| account.is_default)
+            {
+                return Ok(AccountSelection {
+                    account_id: default.account_id.clone(),
+                    label: default.label.clone(),
+                    reason: "default account".to_owned(),
+                });
+            }
+            eligible = automatic;
             if eligible.is_empty() {
                 return Err(BackendError::InvalidCredential {
                     provider: provider.to_owned(),
@@ -7761,6 +7776,40 @@ mod tests {
                 .select_account(CODEX_PROVIDER, Some("disabled"))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_only_accounts_fall_back_to_the_eligible_default() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = empty_registry(workspace.path()).await;
+        let explicit = nakode_protocol::ProviderAccountRoutingMode::ExplicitOnly;
+        registry.provider_accounts.insert(
+            CLAUDE_PROVIDER.to_owned(),
+            vec![
+                routing_account(CLAUDE_PROVIDER, "local", "Default", true, false, explicit),
+                routing_account(CLAUDE_PROVIDER, "brokered", "FStack", true, true, explicit),
+            ],
+        );
+        for account_id in ["local", "brokered"] {
+            registry.provider_account_credentials.insert(
+                (CLAUDE_PROVIDER.to_owned(), account_id.to_owned()),
+                serde_json::json!({"fixture": account_id}),
+            );
+        }
+        let selected = registry
+            .select_account(CLAUDE_PROVIDER, None)
+            .expect("the default is selected");
+        assert_eq!(selected.account_id, "brokered");
+        assert_eq!(selected.reason, "default account");
+
+        // Without an eligible default the choice stays the owner's.
+        registry
+            .provider_accounts
+            .get_mut(CLAUDE_PROVIDER)
+            .expect("accounts")
+            .iter_mut()
+            .for_each(|account| account.is_default = false);
+        assert!(registry.select_account(CLAUDE_PROVIDER, None).is_err());
     }
 
     #[tokio::test]
