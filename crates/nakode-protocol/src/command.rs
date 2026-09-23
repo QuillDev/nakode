@@ -293,6 +293,10 @@ pub enum Command {
         prompt: PromptInput,
     },
     /// Pausing retains all messages. Resuming never retries uncertain provider dispatch.
+    RemoveFollowup {
+        session_id: SessionId,
+        message_id: String,
+    },
     SetFollowupPaused {
         session_id: SessionId,
         paused: bool,

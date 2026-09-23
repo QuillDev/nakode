@@ -93,3 +93,69 @@ async fn followup_sdk_preserves_caller_identity_and_original_message() {
     shutdown.send(()).unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn removal_requires_capability_and_preserves_exact_identity() {
+    let (client, mut requests, shutdown, server) = parent_creation::server(None).await;
+    let request = api::RemoveFollowupRequest {
+        session_id: "exact-session".into(),
+        message_id: "exact-message".into(),
+        mutation: Some(api::MutationOptions {
+            idempotency_key: "remove-retry-key".into(),
+            ..Default::default()
+        }),
+    };
+    let error = client.remove_followup(request.clone()).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not support PendingFollowupRemoval")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), requests.recv())
+            .await
+            .is_err()
+    );
+    shutdown.send(()).unwrap();
+    server.await.unwrap();
+
+    let (client, mut requests, shutdown, server) =
+        parent_creation::server(Some(protocol::ServiceCapability::PendingFollowupRemoval)).await;
+    let send = client.remove_followup(request);
+    let receive = async {
+        let Some(ServerRequest::Command {
+            command,
+            idempotency_key,
+            respond,
+            ..
+        }) = requests.recv().await
+        else {
+            panic!("expected RemoveFollowup");
+        };
+        assert_eq!(idempotency_key.as_str(), "remove-retry-key");
+        assert_eq!(
+            command,
+            protocol::Command::RemoveFollowup {
+                session_id: protocol::SessionId::from("exact-session"),
+                message_id: "exact-message".into(),
+            }
+        );
+        respond
+            .send(Ok(protocol::CommandAccepted {
+                resource_id: Some("exact-message".into()),
+                revision: Some(1),
+                effective_session_tools: None,
+                bridge_continuation: None,
+                replayed_bridge_continuation: None,
+                replayed_bridge_source_active: None,
+            }))
+            .unwrap();
+    };
+    let (result, ()) = tokio::join!(send, receive);
+    assert_eq!(
+        result.unwrap().resource_id.as_deref(),
+        Some("exact-message")
+    );
+    shutdown.send(()).unwrap();
+    server.await.unwrap();
+}

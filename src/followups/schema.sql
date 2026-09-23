@@ -61,3 +61,8 @@ JOIN session_child_links l ON l.child_id = r.child_id;
 CREATE UNIQUE INDEX IF NOT EXISTS followup_source_call
 ON followup_sources(json_extract(source_json, '$.sessionId'), json_extract(source_json, '$.callId'))
 WHERE json_extract(source_json, '$.callId') IS NOT NULL;
+
+-- Retain message identity/digest and child receipts; removal never deletes shared artifacts.
+CREATE TABLE IF NOT EXISTS followup_removals (
+    message_sequence INTEGER PRIMARY KEY REFERENCES followup_messages(sequence) ON DELETE CASCADE
+);

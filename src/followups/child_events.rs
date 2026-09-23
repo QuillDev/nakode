@@ -62,10 +62,10 @@ impl InboxStore {
                  WHERE r.state IN ('completed', 'failed', 'blocker', 'question')
                    AND NOT EXISTS (SELECT 1 FROM child_followup_deliveries d WHERE d.report_sequence = r.sequence)
                    AND (SELECT COUNT(*) FROM followup_messages m LEFT JOIN followup_batches b ON b.batch_id = m.batch_id
-                        WHERE m.session_id = p.id AND (b.state IS NULL OR b.state <> 'consumed')) < 256
+                        WHERE m.session_id = p.id AND m.sequence NOT IN (SELECT message_sequence FROM followup_removals) AND (b.state IS NULL OR b.state <> 'consumed')) < 256
                    AND (SELECT COALESCE(SUM(m.payload_bytes), 0) FROM followup_messages m
                         LEFT JOIN followup_batches b ON b.batch_id = m.batch_id
-                        WHERE m.session_id = p.id AND (b.state IS NULL OR b.state <> 'consumed')) <= ?1
+                        WHERE m.session_id = p.id AND m.sequence NOT IN (SELECT message_sequence FROM followup_removals) AND (b.state IS NULL OR b.state <> 'consumed')) <= ?1
                    AND NOT EXISTS (SELECT 1 FROM session_bridges b WHERE b.session_id = p.id AND b.lifecycle <> 'open')
                    AND ((cp.profile_id IS NOT NULL AND cp.profile_id = pp.profile_id)
                      OR (cp.profile_id IS NULL AND pp.profile_id IS NULL AND c.workspace = p.workspace))
@@ -165,7 +165,7 @@ pub(super) fn authorized_child_messages(
            LEFT JOIN sessions c ON c.id = l.child_id
            LEFT JOIN session_skill_profiles pp ON pp.session_id = p.id
            LEFT JOIN session_skill_profiles cp ON cp.session_id = c.id
-           WHERE m.session_id = ?1 AND (m.batch_id IS NULL OR m.batch_id IN (
+           WHERE m.session_id = ?1 AND m.sequence NOT IN (SELECT message_sequence FROM followup_removals) AND (m.batch_id IS NULL OR m.batch_id IN (
              SELECT batch_id FROM followup_batches WHERE state <> 'consumed'))
            AND (l.parent_id IS NULL OR NOT (
              (cp.profile_id IS NOT NULL AND pp.profile_id IS NOT NULL AND cp.profile_id = pp.profile_id)

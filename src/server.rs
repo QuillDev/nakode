@@ -773,6 +773,7 @@ impl ServerCore {
             Command::RelayAgentFollowup { .. }
             | Command::EnqueueFollowup { .. }
             | Command::SetFollowupPaused { .. }
+            | Command::RemoveFollowup { .. }
             | Command::LinkChildSession { .. }
             | Command::PublishChildReport { .. }
             | Command::AnswerChildQuestions { .. } => Err(DomainCommandError::Invalid(
@@ -4654,6 +4655,7 @@ impl ServerCore {
             Command::RelayAgentFollowup { session_id, .. }
             | Command::EnqueueFollowup { session_id, .. }
             | Command::SetFollowupPaused { session_id, .. }
+            | Command::RemoveFollowup { session_id, .. }
             | Command::SendPrompt { session_id, .. }
             | Command::ContinueSessionFromBridge { session_id, .. }
             | Command::SetSessionBridgeLifecycle { session_id, .. }
@@ -4688,10 +4690,8 @@ impl ServerCore {
                 .provider_turn_id(turn_id)
                 .ok()
                 .map(|(session_id, _)| session_id),
-            Command::CompactContext { agent_session_id } => {
-                self.session_for_agent_session(agent_session_id).ok()
-            }
-            Command::SelectModel {
+            Command::CompactContext { agent_session_id }
+            | Command::SelectModel {
                 target: ModelTarget::AgentSession { agent_session_id },
                 ..
             } => self.session_for_agent_session(agent_session_id).ok(),

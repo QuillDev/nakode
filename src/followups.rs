@@ -13,6 +13,7 @@ mod admission;
 mod batches;
 mod child_events;
 pub(crate) mod coordination;
+mod removal;
 #[cfg(test)]
 mod tests;
 
@@ -139,6 +140,18 @@ fn validate_request_identities(key: &str, sender: &str) -> Result<()> {
     }
 }
 
+fn validate_message_identity(message_id: &str) -> Result<()> {
+    if message_id.starts_with("nakode-child-event:") {
+        return Err(refuse(
+            "child event identities are reserved for the runtime",
+        ));
+    }
+    if !valid_id(message_id) {
+        return Err(refuse("invalid follow-up message identity"));
+    }
+    Ok(())
+}
+
 fn validate_page(after: u64, limit: u32, view: &str) -> Result<()> {
     if !(1..=64).contains(&limit) || after > i64::MAX as u64 {
         return Err(refuse(
@@ -260,15 +273,8 @@ impl InboxStore {
                 prompt,
                 ..
             } => {
-                if message_id.starts_with("nakode-child-event:") {
-                    return Err(refuse(
-                        "child event identities are reserved for the runtime",
-                    ));
-                }
+                validate_message_identity(message_id)?;
                 authorize(&tx, session_id.as_str(), true)?;
-                if !valid_id(message_id) {
-                    return Err(refuse("invalid follow-up message identity"));
-                }
                 if !admission::message_exists(&tx, session_id.as_str(), message_id, &digest)? {
                     let source = coordination::authenticate_source(&tx, command, authenticate)?;
                     let prompt = materialize(prompt)?;
@@ -284,6 +290,13 @@ impl InboxStore {
                         coordination::save_source(&tx, session_id.as_str(), message_id, &source)?;
                     }
                 }
+                (session_id.as_str(), Some(message_id.clone()))
+            }
+            Command::RemoveFollowup {
+                session_id,
+                message_id,
+            } => {
+                removal::remove_pending(&tx, session_id, message_id)?;
                 (session_id.as_str(), Some(message_id.clone()))
             }
             Command::SetFollowupPaused { session_id, paused } => {
@@ -329,15 +342,15 @@ impl InboxStore {
         limit: u32,
         view: &str,
     ) -> Result<FollowupInbox> {
-        authorize(&self.0, session.as_str(), false)?;
+        let tx = self.0.unchecked_transaction().map_err(failure)?;
+        authorize(&tx, session.as_str(), false)?;
         validate_page(after, limit, view)?;
-        let mut statement = self
-            .0
+        let mut statement = tx
             .prepare(
                 "SELECT m.sequence, m.message_id, m.submitted_by, m.received_at_ms,
                  m.display_text, COALESCE(b.state, 'pending'), m.batch_id, m.attachment_labels_json
              FROM followup_messages m LEFT JOIN followup_batches b ON b.batch_id = m.batch_id
-             WHERE m.session_id = ?1
+             WHERE m.session_id = ?1 AND m.sequence NOT IN (SELECT message_sequence FROM followup_removals)
                AND ((?4 = 'consumed' AND b.state = 'consumed' AND (?2 = 0 OR m.sequence < ?2))
                  OR (?4 <> 'consumed' AND m.sequence > ?2 AND (?4 <> 'active' OR b.state IS NULL OR b.state <> 'consumed')))
              ORDER BY CASE WHEN ?4 = 'consumed' THEN -m.sequence ELSE m.sequence END LIMIT ?3",
@@ -374,16 +387,14 @@ impl InboxStore {
                 batch_id: row.get(6).map_err(failure)?,
             });
         }
-        let pending_count: i64 = self
-            .0
+        let pending_count: i64 = tx
             .query_row(
-                "SELECT COUNT(*) FROM followup_messages WHERE session_id = ?1 AND batch_id IS NULL",
+                "SELECT COUNT(*) FROM followup_messages WHERE session_id = ?1 AND batch_id IS NULL AND sequence NOT IN (SELECT message_sequence FROM followup_removals)",
                 [session.as_str()],
                 |row| row.get(0),
             )
             .map_err(failure)?;
-        let paused = self
-            .0
+        let paused = tx
             .query_row(
                 "SELECT paused FROM followup_inboxes WHERE session_id = ?1",
                 [session.as_str()],
@@ -392,8 +403,7 @@ impl InboxStore {
             .optional()
             .map_err(failure)?
             .unwrap_or(false);
-        let unresolved: Option<(String, String, Option<String>)> = self
-            .0
+        let unresolved: Option<(String, String, Option<String>)> = tx
             .query_row(
                 "SELECT batch_id, state, blocked_reason FROM followup_batches
              WHERE session_id = ?1 AND state <> 'consumed'",

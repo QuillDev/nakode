@@ -116,3 +116,26 @@ delivery, not successful task completion; these read-only views do not change cl
 
 The dashboard capability `nakode.followups.views` gates these additive modes. It shows active
 messages directly and consumed history in a collapsed, independently paginated window.
+
+## Pending removal and display identity
+
+`followup_messages.sequence` is a SQLite AUTOINCREMENT key across this runtime database's
+entire table, not a session-local position or a count of pending updates. Queries filter
+by exact session and order by this stable key; gaps can reflect other sessions, prior
+messages, or removals. Clients must not rename identities or rewrite cursors to make
+labels consecutive. FStack uses explicit page-local labels and secondary queue diagnostics.
+
+`RemoveFollowup` requires `PendingFollowupRemoval`, an exact session/message identity,
+and a stable mutation idempotency key. It shares an IMMEDIATE transaction with batch claim.
+Only unclaimed pending input is removable; claimed, dispatching (including uncertain),
+and consumed input returns a conflict with its current state. This is not recall and
+never changes model context. Missing session/message identities return NotFound.
+
+Removal persists a tombstone, clears only the ledger row's private payload, and retains
+message identity/digest, admission receipts and durable-child delivery receipts. Producer
+or removal retries cannot restore removed work. Shared artifacts and source transcripts
+are untouched. List/count/capacity/claim queries exclude removals; listing uses one read
+transaction so rows and counts describe the same database snapshot. Removal can address
+a retained session without opening a provider. Service transport authentication remains
+the runtime access boundary; client IDs are attribution, not ownership credentials.
+Hosted FStack additionally enforces account-owned exact-session-to-Host routing.

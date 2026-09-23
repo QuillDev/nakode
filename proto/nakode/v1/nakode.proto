@@ -39,6 +39,7 @@ service NakodeService {
   rpc ListChildReports(ListChildReportsRequest) returns (ChildReportPage);
   rpc RelayAgentFollowup(RelayAgentFollowupRequest) returns (MutationResult);
   rpc EnqueueFollowup(EnqueueFollowupRequest) returns (MutationResult);
+  rpc RemoveFollowup(RemoveFollowupRequest) returns (MutationResult);
   rpc SetFollowupPaused(SetFollowupPausedRequest) returns (MutationResult);
   rpc ListFollowups(ListFollowupsRequest) returns (FollowupInbox);
   rpc ListChildQuestions(ListChildQuestionsRequest) returns (ChildQuestionSnapshot);
@@ -194,6 +195,11 @@ message EnqueueFollowupRequest {
   string session_id = 2;
   string message_id = 3;
   PromptInput prompt = 4;
+}
+message RemoveFollowupRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string message_id = 3;
 }
 message SetFollowupPausedRequest {
   MutationOptions mutation = 1;
