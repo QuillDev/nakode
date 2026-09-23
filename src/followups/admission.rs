@@ -36,7 +36,7 @@ pub(super) fn admit_message(
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(m.payload_bytes), 0)
          FROM followup_messages m LEFT JOIN followup_batches b ON b.batch_id = m.batch_id
-         WHERE m.session_id = ?1 AND (b.state IS NULL OR b.state <> 'consumed')",
+         WHERE m.session_id = ?1 AND m.sequence NOT IN (SELECT message_sequence FROM followup_removals) AND (b.state IS NULL OR b.state <> 'consumed')",
             [session],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )

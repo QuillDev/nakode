@@ -772,6 +772,7 @@ impl ServerCore {
         match command {
             Command::EnqueueFollowup { .. }
             | Command::SetFollowupPaused { .. }
+            | Command::RemoveFollowup { .. }
             | Command::LinkChildSession { .. }
             | Command::PublishChildReport { .. }
             | Command::AnswerChildQuestions { .. } => Err(DomainCommandError::Invalid(
@@ -4652,6 +4653,7 @@ impl ServerCore {
         match command {
             Command::EnqueueFollowup { session_id, .. }
             | Command::SetFollowupPaused { session_id, .. }
+            | Command::RemoveFollowup { session_id, .. }
             | Command::SendPrompt { session_id, .. }
             | Command::ContinueSessionFromBridge { session_id, .. }
             | Command::SetSessionBridgeLifecycle { session_id, .. }

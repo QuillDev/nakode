@@ -34,7 +34,9 @@ impl NativeServerRuntime {
             }
             nakode_server::ServerRequest::Command {
                 command:
-                    command @ (Command::EnqueueFollowup { .. } | Command::SetFollowupPaused { .. }),
+                    command @ (Command::EnqueueFollowup { .. }
+                    | Command::SetFollowupPaused { .. }
+                    | Command::RemoveFollowup { .. }),
                 idempotency_key,
                 client_id,
                 expected_revision,
@@ -84,9 +86,11 @@ impl NativeServerRuntime {
         // Ordinary mutations address an explicitly opened logical session, as SendPrompt does.
         // Read-only retained inbox queries never activate a provider. Authentication belongs to
         // the service transport; a client ID is attribution, never a profile/ownership credential.
-        self.core
-            .ensure_session(&session)
-            .map_err(super::super::domain_error)?;
+        if !matches!(command, Command::RemoveFollowup { .. }) {
+            self.core
+                .ensure_session(&session)
+                .map_err(super::super::domain_error)?;
+        }
         InboxStore::open(&self.effects.persistence.database)?.execute_materialized(
             InboxRequest {
                 command,

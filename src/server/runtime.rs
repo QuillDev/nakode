@@ -3370,6 +3370,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::QuestionTextAnswers,
             ServiceCapability::LinkedChildQuestions,
             ServiceCapability::DurableFollowupInbox,
+            ServiceCapability::PendingFollowupRemoval,
             ServiceCapability::ParentSessionCreation,
             ServiceCapability::ChildMaterials,
             ServiceCapability::QueuedPromptSteering,

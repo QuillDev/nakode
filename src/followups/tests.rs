@@ -1,6 +1,7 @@
 use super::*;
 
 mod child_events;
+mod removal;
 use crate::session::{SessionRepository, SqliteSessionRepository};
 
 struct Fixture {

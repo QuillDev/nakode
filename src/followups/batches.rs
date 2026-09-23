@@ -59,7 +59,7 @@ fn read_messages(
             "SELECT sequence, message_id, submitted_by, received_at_ms, prompt_json,
                 EXISTS(SELECT 1 FROM child_followup_deliveries d WHERE d.message_sequence = followup_messages.sequence)
          FROM followup_messages
-         WHERE session_id = ?1 AND batch_id IS ?2
+         WHERE session_id = ?1 AND batch_id IS ?2 AND sequence NOT IN (SELECT message_sequence FROM followup_removals)
          ORDER BY sequence LIMIT 32",
         )
         .map_err(failure)?;
@@ -126,7 +126,7 @@ impl InboxStore {
     pub(crate) fn candidates(&self, after: Option<&SessionId>) -> Result<Vec<SessionId>> {
         let mut statement = self.0.prepare(
             "SELECT session_id FROM followup_messages
-             WHERE session_id > ?1 AND (batch_id IS NULL OR batch_id IN (
+             WHERE session_id > ?1 AND sequence NOT IN (SELECT message_sequence FROM followup_removals) AND (batch_id IS NULL OR batch_id IN (
                  SELECT batch_id FROM followup_batches WHERE state = 'claimed' AND blocked_reason IS NULL
              ))
              GROUP BY session_id ORDER BY session_id LIMIT 64"
@@ -198,7 +198,7 @@ impl InboxStore {
         ).map_err(failure)?;
         tx.execute(
             "UPDATE followup_messages SET batch_id = ?1
-             WHERE session_id = ?2 AND batch_id IS NULL AND sequence <= ?3",
+             WHERE session_id = ?2 AND batch_id IS NULL AND sequence <= ?3 AND sequence NOT IN (SELECT message_sequence FROM followup_removals)",
             params![id, session.as_str(), cutoff],
         )
         .map_err(failure)?;

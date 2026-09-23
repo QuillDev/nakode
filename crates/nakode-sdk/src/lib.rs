@@ -1736,6 +1736,12 @@ impl NakodeClient {
         "DurableFollowupInbox"
     );
 
+    typed_mutation!(
+        remove_followup,
+        api::RemoveFollowupRequest,
+        "PendingFollowupRemoval"
+    );
+
     /// Reads a bounded durable follow-up page without restoring a provider.
     ///
     /// # Errors

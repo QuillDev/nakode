@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 mod admission;
 mod batches;
 mod child_events;
+mod removal;
 #[cfg(test)]
 mod tests;
 
@@ -241,6 +242,13 @@ impl InboxStore {
                 }
                 (session_id.as_str(), Some(message_id.clone()))
             }
+            Command::RemoveFollowup {
+                session_id,
+                message_id,
+            } => {
+                removal::remove_pending(&tx, session_id, message_id)?;
+                (session_id.as_str(), Some(message_id.clone()))
+            }
             Command::SetFollowupPaused { session_id, paused } => {
                 authorize(&tx, session_id.as_str(), true)?;
                 tx.execute(
@@ -273,19 +281,19 @@ impl InboxStore {
         after: u64,
         limit: u32,
     ) -> Result<FollowupInbox> {
-        authorize(&self.0, session.as_str(), false)?;
+        let tx = self.0.unchecked_transaction().map_err(failure)?;
+        authorize(&tx, session.as_str(), false)?;
         if !(1..=64).contains(&limit) || after > i64::MAX as u64 {
             return Err(refuse(
                 "follow-up page limit must be 1–64; cursor must be nonnegative i64",
             ));
         }
-        let mut statement = self
-            .0
+        let mut statement = tx
             .prepare(
                 "SELECT m.sequence, m.message_id, m.submitted_by, m.received_at_ms,
                  m.display_text, COALESCE(b.state, 'pending'), m.batch_id, m.attachment_labels_json
              FROM followup_messages m LEFT JOIN followup_batches b ON b.batch_id = m.batch_id
-             WHERE m.session_id = ?1 AND m.sequence > ?2 ORDER BY m.sequence LIMIT ?3",
+             WHERE m.session_id = ?1 AND m.sequence NOT IN (SELECT message_sequence FROM followup_removals) AND m.sequence > ?2 ORDER BY m.sequence LIMIT ?3",
             )
             .map_err(failure)?;
         let mut rows = statement
@@ -318,16 +326,14 @@ impl InboxStore {
                 batch_id: row.get(6).map_err(failure)?,
             });
         }
-        let pending_count: i64 = self
-            .0
+        let pending_count: i64 = tx
             .query_row(
-                "SELECT COUNT(*) FROM followup_messages WHERE session_id = ?1 AND batch_id IS NULL",
+                "SELECT COUNT(*) FROM followup_messages WHERE session_id = ?1 AND batch_id IS NULL AND sequence NOT IN (SELECT message_sequence FROM followup_removals)",
                 [session.as_str()],
                 |row| row.get(0),
             )
             .map_err(failure)?;
-        let paused = self
-            .0
+        let paused = tx
             .query_row(
                 "SELECT paused FROM followup_inboxes WHERE session_id = ?1",
                 [session.as_str()],
@@ -336,8 +342,7 @@ impl InboxStore {
             .optional()
             .map_err(failure)?
             .unwrap_or(false);
-        let unresolved: Option<(String, String, Option<String>)> = self
-            .0
+        let unresolved: Option<(String, String, Option<String>)> = tx
             .query_row(
                 "SELECT batch_id, state, blocked_reason FROM followup_batches
              WHERE session_id = ?1 AND state <> 'consumed'",
