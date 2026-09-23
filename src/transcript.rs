@@ -1168,6 +1168,7 @@ mod tests {
             source_transport: None,
             source_prompt_id: None,
             tool_audit_json: None,
+            coordination_json: None,
             parent_tool_entry_id: parent.map(|id| EntryId::from(id.to_owned())),
         }
     }

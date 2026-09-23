@@ -1377,6 +1377,7 @@ fn transcript_entry(value: api::TranscriptEntry) -> Result<view::TranscriptEntry
         source_prompt_id: value.source_prompt_id,
         tool_audit_json: value.tool_audit_json,
         created_at_ms: value.created_at_ms,
+        coordination_json: value.coordination_json,
         parent_tool_entry_id: value.parent_tool_entry_id.map(view::EntryId::from),
     })
 }

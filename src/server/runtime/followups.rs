@@ -19,12 +19,13 @@ impl NativeServerRuntime {
                         session_id,
                         after_sequence,
                         limit,
+                        view,
                     },
                 respond,
                 ..
             } => {
                 let result = InboxStore::open(&self.effects.persistence.database)
-                    .and_then(|store| store.list(&session_id, after_sequence, limit))
+                    .and_then(|store| store.list_view(&session_id, after_sequence, limit, &view))
                     .map(|view| Snapshot {
                         cursor: self.endpoint.cursor(),
                         value: QueryResult::Followups(view),
@@ -34,7 +35,9 @@ impl NativeServerRuntime {
             }
             nakode_server::ServerRequest::Command {
                 command:
-                    command @ (Command::EnqueueFollowup { .. } | Command::SetFollowupPaused { .. }),
+                    command @ (Command::EnqueueFollowup { .. }
+                    | Command::RelayAgentFollowup { .. }
+                    | Command::SetFollowupPaused { .. }),
                 idempotency_key,
                 client_id,
                 expected_revision,
@@ -87,7 +90,7 @@ impl NativeServerRuntime {
         self.core
             .ensure_session(&session)
             .map_err(super::super::domain_error)?;
-        InboxStore::open(&self.effects.persistence.database)?.execute_materialized(
+        InboxStore::open(&self.effects.persistence.database)?.execute_authenticated(
             InboxRequest {
                 command,
                 key,
@@ -96,7 +99,77 @@ impl NativeServerRuntime {
                 now_ms: super::super::unix_timestamp_ms(),
             },
             |prompt| self.freeze_followup_attachments(&session, prompt),
+            || self.authenticate_relay(command),
         )
+    }
+
+    fn authenticate_relay(&self, command: &Command) -> Result<(), ServiceError> {
+        let Command::RelayAgentFollowup {
+            session_id,
+            source_session_id,
+            source_call_id,
+            prompt,
+            ..
+        } = command
+        else {
+            return Err(refuse("not a relay command"));
+        };
+        let call = self
+            .core
+            .engine_for(source_session_id)
+            .and_then(|engine| {
+                engine
+                    .state()
+                    .external_tool_calls
+                    .iter()
+                    .find(|call| call.id == *source_call_id)
+            })
+            .ok_or_else(|| refuse("source relay call is not pending"))?;
+        if call.name != "SendAgentMessage" {
+            return Err(refuse("source call is not an agent-message operation"));
+        }
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments_json)
+            .map_err(|_| refuse("source call arguments are invalid"))?;
+        if arguments
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            != Some(session_id.as_str())
+            || arguments.get("message").and_then(serde_json::Value::as_str)
+                != Some(prompt.text.as_str())
+        {
+            return Err(refuse(
+                "relay target or message differs from the pending source call",
+            ));
+        }
+        let references = arguments
+            .get("imageReferences")
+            .and_then(serde_json::Value::as_array);
+        let selected = references
+            .into_iter()
+            .flatten()
+            .map(|reference| {
+                let id = reference
+                    .as_str()
+                    .ok_or_else(|| refuse("invalid source image reference"))?;
+                Ok(PromptAttachment::Artifact {
+                    artifact_id: id.into(),
+                    label: "Coordinator image".to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?;
+        let expected = self.freeze_followup_attachments(
+            source_session_id,
+            &PromptInput {
+                text: prompt.text.clone(),
+                attachments: selected,
+            },
+        )?;
+        if expected.attachments != prompt.attachments {
+            return Err(refuse(
+                "relay attachments differ from the source session's selected images",
+            ));
+        }
+        Ok(())
     }
 
     fn freeze_followup_attachments(
@@ -188,6 +261,11 @@ impl NativeServerRuntime {
                         continue;
                     }
                 };
+            if let Some(engine) = self.core.engine_for_mut(&session) {
+                engine
+                    .state_mut()
+                    .set_prompt_coordination(&batch.id, &batch.coordination_json);
+            }
             // This ledger, not the legacy owner-prompt replay bit, owns batch delivery recovery.
             for effect in &mut effects {
                 if let Effect::PersistAcceptedOwnerPrompt { prompt, .. } = effect {

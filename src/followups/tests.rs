@@ -1,6 +1,7 @@
 use super::*;
 
 mod child_events;
+mod coordination;
 use crate::session::{SessionRepository, SqliteSessionRepository};
 
 struct Fixture {
@@ -90,8 +91,8 @@ fn burst_claim_is_one_ordered_cutoff_and_later_arrivals_remain_pending() {
     }
     let batch = f.store().claim(&f.session).unwrap().unwrap();
     assert!(
-        batch.prompt.text.find("Requirement 2\n").unwrap()
-            < batch.prompt.text.find("Requirement 11\n").unwrap()
+        batch.prompt.text.find("Requirement 2\"\n").unwrap()
+            < batch.prompt.text.find("Requirement 11\"\n").unwrap()
     );
     f.enqueue("later", "Arrived after cutoff");
     let recovered = f.store().claim(&f.session).unwrap().unwrap();

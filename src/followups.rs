@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 mod admission;
 mod batches;
 mod child_events;
+pub(crate) mod coordination;
 #[cfg(test)]
 mod tests;
 
@@ -86,6 +87,10 @@ fn validate_prompt(prompt: &PromptInput) -> Result<usize> {
             "follow-up requires content and at most 64 KiB of text; nothing was enqueued",
         ));
     }
+    // JSON quoting must not turn an accepted head message into an undispatchable batch.
+    if serde_json::to_string(&prompt.text).map_err(failure)?.len() > 96 * 1024 {
+        return Err(refuse("escaped follow-up text exceeds 96 KiB"));
+    }
     if prompt.attachments.len() > 8 {
         return Err(refuse("follow-up supports at most eight attachments"));
     }
@@ -122,6 +127,28 @@ fn validate_prompt(prompt: &PromptInput) -> Result<usize> {
         return Err(refuse("follow-up attachments exceed 20 MiB"));
     }
     Ok(bytes)
+}
+
+fn validate_request_identities(key: &str, sender: &str) -> Result<()> {
+    if valid_id(key) && valid_id(sender) {
+        Ok(())
+    } else {
+        Err(refuse(
+            "follow-up command/client identity must be 1–200 bytes",
+        ))
+    }
+}
+
+fn validate_page(after: u64, limit: u32, view: &str) -> Result<()> {
+    if !(1..=64).contains(&limit) || after > i64::MAX as u64 {
+        return Err(refuse(
+            "follow-up page limit must be 1–64; cursor must be nonnegative i64",
+        ));
+    }
+    if !matches!(view, "" | "all" | "active" | "consumed") {
+        return Err(refuse("follow-up view must be all, active or consumed"));
+    }
+    Ok(())
 }
 
 impl InboxStore {
@@ -169,23 +196,31 @@ impl InboxStore {
 
     /// Receipts hash the original request, not volatile materialization results. A retry can replay
     /// its durable receipt even after the source artifact is no longer in the in-memory transcript.
+    #[cfg(test)]
     pub(crate) fn execute_materialized(
         &mut self,
         request: InboxRequest<'_>,
         materialize: impl FnOnce(&PromptInput) -> Result<PromptInput>,
+    ) -> Result<Option<String>> {
+        self.execute_authenticated(request, materialize, || {
+            Err(refuse("relay requires runtime call authentication"))
+        })
+    }
+
+    pub(crate) fn execute_authenticated(
+        &mut self,
+        request: InboxRequest<'_>,
+        materialize: impl FnOnce(&PromptInput) -> Result<PromptInput>,
+        authenticate: impl FnOnce() -> Result<()>,
     ) -> Result<Option<String>> {
         let InboxRequest {
             command,
             key,
             sender,
             replay_only,
-            now_ms: _,
+            ..
         } = request;
-        if !valid_id(key) || !valid_id(sender) {
-            return Err(refuse(
-                "follow-up command/client identity must be 1–200 bytes",
-            ));
-        }
+        validate_request_identities(key, sender)?;
         let encoded =
             serde_json::to_vec(command).map_err(|_| refuse("invalid follow-up command"))?;
         let digest = Sha256::digest(&encoded).to_vec();
@@ -218,6 +253,12 @@ impl InboxStore {
                 session_id,
                 message_id,
                 prompt,
+            }
+            | Command::RelayAgentFollowup {
+                session_id,
+                message_id,
+                prompt,
+                ..
             } => {
                 if message_id.starts_with("nakode-child-event:") {
                     return Err(refuse(
@@ -229,6 +270,7 @@ impl InboxStore {
                     return Err(refuse("invalid follow-up message identity"));
                 }
                 if !admission::message_exists(&tx, session_id.as_str(), message_id, &digest)? {
+                    let source = coordination::authenticate_source(&tx, command, authenticate)?;
                     let prompt = materialize(prompt)?;
                     admission::admit_message(
                         &tx,
@@ -238,6 +280,9 @@ impl InboxStore {
                         request,
                         &digest,
                     )?;
+                    if let Some(source) = source {
+                        coordination::save_source(&tx, session_id.as_str(), message_id, &source)?;
+                    }
                 }
                 (session_id.as_str(), Some(message_id.clone()))
             }
@@ -267,32 +312,43 @@ impl InboxStore {
         Ok(id)
     }
 
+    #[cfg(test)]
     pub(crate) fn list(
         &self,
         session: &SessionId,
         after: u64,
         limit: u32,
     ) -> Result<FollowupInbox> {
+        self.list_view(session, after, limit, "all")
+    }
+
+    pub(crate) fn list_view(
+        &self,
+        session: &SessionId,
+        after: u64,
+        limit: u32,
+        view: &str,
+    ) -> Result<FollowupInbox> {
         authorize(&self.0, session.as_str(), false)?;
-        if !(1..=64).contains(&limit) || after > i64::MAX as u64 {
-            return Err(refuse(
-                "follow-up page limit must be 1–64; cursor must be nonnegative i64",
-            ));
-        }
+        validate_page(after, limit, view)?;
         let mut statement = self
             .0
             .prepare(
                 "SELECT m.sequence, m.message_id, m.submitted_by, m.received_at_ms,
                  m.display_text, COALESCE(b.state, 'pending'), m.batch_id, m.attachment_labels_json
              FROM followup_messages m LEFT JOIN followup_batches b ON b.batch_id = m.batch_id
-             WHERE m.session_id = ?1 AND m.sequence > ?2 ORDER BY m.sequence LIMIT ?3",
+             WHERE m.session_id = ?1
+               AND ((?4 = 'consumed' AND b.state = 'consumed' AND (?2 = 0 OR m.sequence < ?2))
+                 OR (?4 <> 'consumed' AND m.sequence > ?2 AND (?4 <> 'active' OR b.state IS NULL OR b.state <> 'consumed')))
+             ORDER BY CASE WHEN ?4 = 'consumed' THEN -m.sequence ELSE m.sequence END LIMIT ?3",
             )
             .map_err(failure)?;
         let mut rows = statement
             .query(params![
                 session.as_str(),
                 i64::try_from(after).map_err(|_| refuse("invalid follow-up cursor"))?,
-                limit + 1
+                limit + 1,
+                view
             ])
             .map_err(failure)?;
         let mut items = Vec::new();

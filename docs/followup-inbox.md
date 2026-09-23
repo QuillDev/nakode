@@ -4,10 +4,11 @@
 
 This is an unshipped runtime/API foundation, not a completed dashboard feature.
 Nakode owns the ledger and scheduler. FStack consumes the public SDK; it must not
-read or rewrite these tables. No migration of an existing live prompt queue is
+read or rewrite these tables. Authenticated coordinator relays, structured transcript display and
+exact-turn final reports are defined in [coordination messages](coordination-messages.md). No migration of an existing live prompt queue is
 required or performed.
 
-The public contract exposes `EnqueueFollowup`, `SetFollowupPaused`, and
+The public contract exposes `EnqueueFollowup`, `RelayAgentFollowup`, `SetFollowupPaused`, and
 `ListFollowups`, with the `DurableFollowupInbox` capability. SDK mutations verify
 that capability before sending and never fall back to `SendPrompt`. Mutation
 callers must retain their command key across transport retries. A stable message
@@ -47,6 +48,7 @@ are not replaced by retries.
   clear a pre-dispatch blocked claim, but does not reset uncertain dispatch.
 
 Ordinary-message batching is **explicit opt-in through `EnqueueFollowup` only**.
+Authenticated coordinator calls use `RelayAgentFollowup` with server-derived origin.
 Runtime-owned linked-child reports separately enter this same ledger with persisted evidence
 origin and delivery receipts; see `docs/child-followup-delivery.md`.
 `SendPrompt`/`EnqueuePrompt` retain the established visible queue for both Chat
@@ -71,7 +73,7 @@ queued admission must drain accepted work before an executable transition.
 ## Bounds
 
 - Message IDs and command/client identities: 1–200 bytes.
-- Message text: at most 64 KiB; at most eight validated attachments.
+- Message text: at most 64 KiB raw and 96 KiB after JSON character escaping; at most eight validated attachments.
 - Outstanding inbox: 256 messages / 64 MiB. Overflow explicitly refuses admission;
   previously accepted requirements remain intact.
 - Batch: at most 32 messages, 128 KiB of exact composed text including escaped
@@ -98,6 +100,19 @@ Still required:
    explicit recovery controls and bounded paging/overflow presentation.
 4. Real restart, remote transport and browser integration coverage.
 
-The current FStack stack build intentionally uses sibling SDK/runtime paths with
-owner permission. Before standalone release, both dependencies, Cargo.lock and
-runtime release metadata require one coordinated published revision.
+Local stack validation may use ignored sibling SDK/runtime Cargo patches. Before standalone
+release, both dependencies, Cargo.lock and runtime release metadata require one coordinated
+published revision; local validation patches must not replace the release pins.
+
+## Inbox display views
+
+`ListFollowupsRequest.view` is optional: empty or `all` preserves ascending all-state pages.
+`active` includes pending, claimed and dispatching messages in ascending sequence order;
+`consumed` includes only consumed batches in descending sequence order. Filtering occurs before
+the page limit. Cursor zero starts the newest consumed page; subsequent consumed requests use
+`after_sequence` as a strict lower-than cursor (other views retain strict greater-than cursors).
+The metadata still describes the entire inbox, not only the selected view. Consumed denotes
+delivery, not successful task completion; these read-only views do not change claiming or replay.
+
+The dashboard capability `nakode.followups.views` gates these additive modes. It shows active
+messages directly and consumed history in a collapsed, independently paginated window.

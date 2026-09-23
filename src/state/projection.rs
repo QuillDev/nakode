@@ -853,7 +853,7 @@ fn originating_owner_entry(state: &DomainState, run: &SubagentRun) -> Option<Tra
         })
         .map(|entry| {
             let body = bounded_text(&entry.body).value;
-            transcript_entry_view(&state.transcript, entry, &body, false)
+            transcript_entry_view(&state.transcript, entry, &body, false, false)
         })
 }
 
@@ -1987,6 +1987,11 @@ fn projected_transcript_page(
             .position(|entry| entry.id == owner.id)
             .is_some_and(|index| index < row_window_start)
     });
+    let reserved_coordination_bytes = current_owner
+        .and_then(|entry| entry.coordination_json.as_ref())
+        .filter(|json| json.len() <= body_budget)
+        .map_or(0, String::len);
+    let body_budget = body_budget.saturating_sub(reserved_coordination_bytes);
     let reserved_owner_body = current_owner
         .filter(|_| current_owner_outside_row_window)
         .map(|entry| {
@@ -2002,7 +2007,9 @@ fn projected_transcript_page(
         // Tool audit envelopes share the same IPC/memory budget as transcript bodies. Providers bound
         // each payload field before it reaches here; the page keeps an envelope whole so a client is
         // never handed valid-looking partial JSON.
-        let audit_bytes = entry.tool_audit_json.as_ref().map_or(0, String::len);
+        let coordination_bytes = entry.coordination_json.as_ref().map_or(0, String::len);
+        let audit_bytes =
+            entry.tool_audit_json.as_ref().map_or(0, String::len) + coordination_bytes;
         if !projected.is_empty()
             && (audit_bytes > remaining_body_bytes
                 || (remaining_body_bytes == 0 && !entry.body.is_empty()))
@@ -2020,6 +2027,7 @@ fn projected_transcript_page(
             transcript,
             entry,
             body,
+            include_audit,
             include_audit,
         ));
     }
@@ -2043,6 +2051,7 @@ fn projected_transcript_page(
             current_owner,
             &projected,
             reserved_owner_body,
+            reserved_coordination_bytes > 0,
         ),
         entries: projected,
         has_earlier: transcript.has_earlier_entries() || omitted_entries,
@@ -2081,6 +2090,7 @@ fn projected_current_owner(
     current_owner: Option<&TranscriptEntry>,
     projected: &[TranscriptEntryView],
     reserved_owner_body: Option<&str>,
+    include_coordination: bool,
 ) -> Option<TranscriptEntryView> {
     current_owner.map(|entry| {
         projected
@@ -2094,6 +2104,7 @@ fn projected_current_owner(
                         entry,
                         reserved_owner_body.unwrap_or(""),
                         false,
+                        include_coordination,
                     )
                 },
                 |mut projected| {
@@ -2140,8 +2151,9 @@ fn transcript_entry_view(
     entry: &TranscriptEntry,
     body: &str,
     include_audit: bool,
+    include_coordination: bool,
 ) -> TranscriptEntryView {
-    TranscriptEntryView {
+    let mut view = TranscriptEntryView {
         body_sha256: transcript_body_digest(&entry.body),
         id: EntryId::from(entry.id.clone()),
         kind: entry_kind(entry.kind),
@@ -2175,8 +2187,26 @@ fn transcript_entry_view(
         tool_audit_json: include_audit
             .then(|| entry.tool_audit_json.clone())
             .flatten(),
+        coordination_json: include_coordination
+            .then(|| entry.coordination_json.clone())
+            .flatten(),
         parent_tool_entry_id: parent_tool_entry_id(transcript, entry),
+    };
+    if entry.coordination_json.is_some() && !include_coordination {
+        // An undersized view must not fall back to a raw runtime envelope attributed to the owner.
+        // The full session transcript retains the complete message; this is a neutral display stub.
+        view.kind = entry_kind(EntryKind::System);
+        "Coordination messages omitted from this bounded view; open the full transcript"
+            .clone_into(&mut view.title);
+        let notice = "Coordination messages omitted; open the full session transcript.";
+        notice[..body.len().min(notice.len())].clone_into(&mut view.body);
+        view.body_start_byte = 0;
+        view.body_total_bytes = u64::try_from(view.body.len()).unwrap_or(u64::MAX);
+        view.body_sha256 = transcript_body_digest(&view.body);
+        view.artifacts.clear();
+        view.source_prompt_id = None;
     }
+    view
 }
 
 fn utf8_tail(value: &str, maximum_bytes: usize) -> &str {
@@ -2801,6 +2831,7 @@ mod tests {
                      parent_item_id: Option<&str>,
                      turn: &str| {
             TranscriptEntry {
+                coordination_json: None,
                 id: id.to_owned(),
                 key: Some(format!("tool:{call_id}")),
                 kind: EntryKind::Tool,
@@ -3269,6 +3300,60 @@ mod tests {
     }
 
     #[test]
+    fn coordination_metadata_survives_page_cutoffs_within_the_shared_budget() {
+        let mut transcript = DomainTranscript::new(100);
+        let metadata = "m".repeat(8 * 1024);
+        transcript.upsert(
+            "user:batch",
+            EntryKind::User,
+            "YOU",
+            "runtime envelope",
+            EntryStatus::Complete,
+        );
+        transcript.set_coordination("batch", Some(&metadata));
+        for index in 0..8 {
+            transcript.upsert(
+                format!("tool-{index}"),
+                EntryKind::Tool,
+                "read",
+                "x".repeat(4 * 1024),
+                EntryStatus::Complete,
+            );
+        }
+        for limit in [1, 10] {
+            let page =
+                super::projected_transcript_page(&transcript, None, limit, 32 * 1024).unwrap();
+            let owner = page.current_owner_entry.as_ref().unwrap();
+            assert_eq!(owner.coordination_json.as_deref(), Some(metadata.as_str()));
+            let bytes: usize = page
+                .entries
+                .iter()
+                .chain(page.current_owner_entry.iter())
+                .map(|entry| {
+                    entry.body.len()
+                        + entry.coordination_json.as_ref().map_or(0, String::len)
+                        + entry.tool_audit_json.as_ref().map_or(0, String::len)
+                })
+                .sum();
+            assert!(bytes <= 32 * 1024);
+        }
+        let tiny = super::projected_transcript_page(&transcript, None, 1, 1024).unwrap();
+        let omitted = tiny.current_owner_entry.as_ref().unwrap();
+        assert!(omitted.coordination_json.is_none());
+        assert!(!omitted.body.contains("runtime envelope"));
+        assert!(omitted.body.len() <= 1024);
+        assert_eq!(omitted.kind, super::entry_kind(EntryKind::System));
+        assert!(omitted.title.contains("open the full transcript"));
+        let before = EntryId::from(transcript.entries()[1].id.clone());
+        let history =
+            super::projected_transcript_page(&transcript, Some(&before), 10, 32 * 1024).unwrap();
+        assert_eq!(
+            history.entries[0].coordination_json.as_deref(),
+            Some(metadata.as_str())
+        );
+    }
+
+    #[test]
     fn current_owner_metadata_is_additive_when_the_owner_row_is_retained() {
         let mut transcript = DomainTranscript::new(10);
         transcript.upsert(
@@ -3613,6 +3698,7 @@ mod tests {
             latest_activity: "a".repeat(MAX_RUN_TEXT_BYTES * 2),
             transcript: (0..75)
                 .map(|index| TranscriptEntry {
+                    coordination_json: None,
                     id: format!("run-entry-{index:02}"),
                     key: Some(format!("assistant-{index}")),
                     kind: EntryKind::Assistant,
@@ -3938,6 +4024,7 @@ mod tests {
             source_transport: None,
             source_prompt_id: None,
             tool_audit_json: None,
+            coordination_json: None,
             parent_tool_entry_id: None,
         }
     }

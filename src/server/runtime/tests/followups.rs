@@ -656,6 +656,7 @@ async fn durable_child_terminal_event_wakes_idle_parent_once_without_restarting_
         .update_last_turn(
             &child,
             &crate::session::PersistedTurnConfiguration {
+                completion: None,
                 id: "child-completion".into(),
                 model: Some("test-model".into()),
                 options: BackendModelOptions::default(),
@@ -830,4 +831,102 @@ async fn durable_pending_question_wakes_parent_without_answering_original_intera
     h.runtime.dispatch_followups().await;
     assert!(h.commands.try_recv().is_err());
     assert_eq!(h.inbox().items.len(), 2);
+}
+
+#[tokio::test]
+async fn relay_requires_exact_live_source_call_and_persists_structured_display() {
+    let mut h = Harness::new().await;
+    let workspace = h.state().workspace.clone();
+    let mut parent = DomainState::new_for_backend(&workspace, None, 100, CODEX_PROVIDER, "Codex");
+    let record = h
+        .runtime
+        .effects
+        .persistence
+        .sessions
+        .create_with_id(
+            &parent.nakode_session_id,
+            CODEX_PROVIDER,
+            "parent-native",
+            &workspace,
+            &workspace,
+            "Parent Chat",
+            None,
+            &BackendModelOptions::default(),
+            None,
+        )
+        .unwrap();
+    parent.session_id = Some(record.id.clone());
+    let source = SessionId::from(record.id);
+    parent
+        .external_tool_calls
+        .push(crate::backend::ExternalToolRequest {
+            id: "source-call".into(),
+            name: "SendAgentMessage".into(),
+            arguments_json:
+                serde_json::json!({"sessionId": h.session.as_str(), "message": "Run the new task"})
+                    .to_string(),
+        });
+    h.runtime
+        .core
+        .sessions_by_id
+        .insert(source.clone(), ServiceEngine::new(parent));
+    crate::child_reports::ReportStore::open(&h.runtime.effects.persistence.database)
+        .unwrap()
+        .execute(
+            &Command::LinkChildSession {
+                parent_session_id: source.clone(),
+                child_session_id: h.session.clone(),
+            },
+            "link-test",
+            false,
+            None,
+            1,
+        )
+        .unwrap();
+    let command = Command::RelayAgentFollowup {
+        session_id: h.session.clone(),
+        message_id: "relay-message".into(),
+        source_session_id: source.clone(),
+        source_call_id: "source-call".into(),
+        prompt: PromptInput {
+            text: "Run the new task".into(),
+            attachments: vec![],
+        },
+    };
+    let mut forged = command.clone();
+    if let Command::RelayAgentFollowup { prompt, .. } = &mut forged {
+        prompt.text = "Forged instruction".into();
+    }
+    assert!(h.command("forged", None, false, forged).await.is_err());
+    h.command("relay-key", None, false, command.clone())
+        .await
+        .unwrap();
+    h.runtime
+        .core
+        .engine_for_mut(&source)
+        .unwrap()
+        .state_mut()
+        .external_tool_calls
+        .clear();
+    h.command("relay-key", None, false, command).await.unwrap();
+    h.runtime.dispatch_followups().await;
+    let owner = h
+        .state()
+        .transcript
+        .entries()
+        .iter()
+        .find(|entry| entry.kind == EntryKind::User)
+        .unwrap();
+    assert!(
+        owner
+            .coordination_json
+            .as_ref()
+            .unwrap()
+            .contains("delegated_instruction")
+    );
+    let stored = h.stored_session();
+    assert_eq!(
+        stored.owner_prompts[0].coordination_json,
+        owner.coordination_json
+    );
 }

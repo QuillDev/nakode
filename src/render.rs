@@ -2697,6 +2697,7 @@ mod tests {
                     source_prompt_id: None,
                     tool_audit_json: None,
                     created_at_ms: None,
+                    coordination_json: None,
                     parent_tool_entry_id: None,
                 }],
                 has_earlier: false,

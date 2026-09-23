@@ -39,3 +39,25 @@ CREATE TABLE IF NOT EXISTS child_followup_deliveries (
     report_sequence INTEGER PRIMARY KEY,
     message_sequence INTEGER NOT NULL UNIQUE REFERENCES followup_messages(sequence) ON DELETE CASCADE
 );
+
+-- Runtime-owned metadata is separate from all producer-controlled prompt payloads.
+CREATE TABLE IF NOT EXISTS followup_sources (
+    message_sequence INTEGER PRIMARY KEY REFERENCES followup_messages(sequence) ON DELETE CASCADE,
+    source_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS followup_batch_display (
+    batch_id TEXT PRIMARY KEY REFERENCES followup_batches(batch_id) ON DELETE CASCADE,
+    coordination_json TEXT NOT NULL
+);
+
+-- Existing runtime receipt rows retain their inert child provenance on upgrade.
+INSERT OR IGNORE INTO followup_sources(message_sequence, source_json)
+SELECT d.message_sequence, json_object('kind', 'durable_child_evidence',
+    'sessionId', r.child_id, 'title', substr(l.child_title, 1, 120),
+    'callId', NULL, 'status', r.state)
+FROM child_followup_deliveries d JOIN session_child_reports r ON r.sequence = d.report_sequence
+JOIN session_child_links l ON l.child_id = r.child_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS followup_source_call
+ON followup_sources(json_extract(source_json, '$.sessionId'), json_extract(source_json, '$.callId'))
+WHERE json_extract(source_json, '$.callId') IS NOT NULL;

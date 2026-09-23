@@ -146,6 +146,7 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
         RequestLane::Control,
     ),
     fixed("NakodeService", "EnqueueFollowup", RequestLane::Control),
+    fixed("NakodeService", "RelayAgentFollowup", RequestLane::Control),
     fixed("NakodeService", "SetFollowupPaused", RequestLane::Control),
     fixed("NakodeService", "ListFollowups", RequestLane::Hydration),
     fixed("NakodeService", "ListChildReports", RequestLane::Query),

@@ -6,6 +6,9 @@ use nakode_protocol::{ChildReport, ChildReportPage, Command, ErrorCode, ServiceE
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
+pub mod completion;
+pub(crate) use completion::display as completion_display;
+
 pub(crate) struct ReportStore(Connection);
 
 type Result<T> = std::result::Result<T, ServiceError>;
@@ -544,6 +547,7 @@ mod tests {
         let mut store = ReportStore::open(&path).unwrap();
         store.link(&parent.id, &child.id).unwrap();
         let turn = PersistedTurnConfiguration {
+            completion: None,
             id: "terminal".into(),
             model: None,
             options: ModelOptions::default(),
@@ -557,6 +561,7 @@ mod tests {
         assert_eq!(page.reports[0].state, "cancelled");
         store.0.execute_batch("CREATE TRIGGER refuse_child_report BEFORE INSERT ON session_child_reports BEGIN SELECT RAISE(ABORT, 'injected persistence failure'); END;").unwrap();
         let failed_turn = PersistedTurnConfiguration {
+            completion: None,
             id: "must-rollback".into(),
             ..turn.clone()
         };

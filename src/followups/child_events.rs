@@ -13,6 +13,7 @@ struct ChildEvent {
     state: String,
     body: String,
     created: i64,
+    title: String,
 }
 
 impl ChildEvent {
@@ -51,7 +52,7 @@ impl InboxStore {
             .map_err(failure)?;
         let events = {
             let mut statement = tx.prepare(
-                "SELECT r.sequence, l.parent_id, r.child_id, r.report_id, r.state, r.body, r.created_at_ms
+                "SELECT r.sequence, l.parent_id, r.child_id, r.report_id, r.state, r.body, r.created_at_ms, l.child_title
                  FROM session_child_reports r
                  JOIN session_child_links l ON l.child_id = r.child_id
                  JOIN sessions p ON p.id = l.parent_id
@@ -85,6 +86,7 @@ impl InboxStore {
                             state: row.get(4)?,
                             body: row.get(5)?,
                             created: row.get(6)?,
+                            title: row.get(7)?,
                         })
                     },
                 )
@@ -116,10 +118,28 @@ impl InboxStore {
                 Err(error) if error.code == nakode_protocol::ErrorCode::Conflict => continue,
                 Err(error) => return Err(error),
             }
+            super::coordination::save_source(
+                &tx,
+                &event.parent,
+                &message,
+                &super::coordination::Source {
+                    kind: "durable_child_evidence".to_owned(),
+                    session_id: event.child.clone(),
+                    title: event.title.chars().take(120).collect(),
+                    call_id: None,
+                    status: Some(event.state.clone()),
+                },
+            )?;
+            let display = if event.report.starts_with("turn:") {
+                crate::child_reports::completion_display(&event.body)
+            } else {
+                event.body.clone()
+            };
+            tx.execute("UPDATE followup_messages SET display_text = ?3 WHERE session_id = ?1 AND message_id = ?2", params![event.parent, message, display]).map_err(failure)?;
             tx.execute(
                 "INSERT INTO child_followup_deliveries(report_sequence, message_sequence)
-                 VALUES (?1, last_insert_rowid())",
-                [event.sequence],
+                 SELECT ?1, sequence FROM followup_messages WHERE session_id = ?2 AND message_id = ?3",
+                params![event.sequence, event.parent, message],
             )
             .map_err(failure)?;
             admitted = true;

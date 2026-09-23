@@ -280,6 +280,13 @@ pub enum ClientContext {
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Durable ordinary follow-up admission, separate from steering and interactive answers.
+    RelayAgentFollowup {
+        session_id: SessionId,
+        message_id: String,
+        source_session_id: SessionId,
+        source_call_id: String,
+        prompt: PromptInput,
+    },
     EnqueueFollowup {
         session_id: SessionId,
         message_id: String,
@@ -700,6 +707,7 @@ pub enum Query {
         session_id: SessionId,
         after_sequence: u64,
         limit: u32,
+        view: String,
     },
     /// Read-only session existence for listener-owned routing metadata; never hydrates history.
     GetSessionRouting {

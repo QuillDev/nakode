@@ -24,6 +24,7 @@ fn entry(index: usize) -> protocol::TranscriptEntryView {
         source_transport: None,
         source_prompt_id: None,
         tool_audit_json: None,
+        coordination_json: None,
         parent_tool_entry_id: None,
     }
 }
