@@ -241,6 +241,14 @@ impl NativeServerRuntime {
         // An exhausted page resets to None, so busy and previously visited sessions are revisited.
         self.followup_cursor = sessions.last().cloned();
         for session in sessions {
+            // An inbox is durable: a session not loaded in this runtime (after a restart, say) is
+            // reopened exactly as an explicit open would, and delivers on a later tick once ready.
+            if self.core.engine_for(&session).is_none() {
+                if store.deliverable(&session) {
+                    self.reopen_for_inbox(&session);
+                }
+                continue;
+            }
             let ready = self.core.engine_for(&session).is_some_and(|engine| {
                 let state = engine.state();
                 state.connection.is_ready() && !state.is_busy() && state.queue.is_empty()
@@ -303,6 +311,52 @@ impl NativeServerRuntime {
             self.core
                 .commit_and_publish_session(&self.endpoint, &session);
         }
+    }
+
+    /// Asks this runtime to open `session` through its own request queue, so the open takes the
+    /// same path as an owner's explicit reopen. At most once a minute per session; a failure is
+    /// reported and retried then, leaving every message in the inbox.
+    fn reopen_for_inbox(&mut self, session: &nakode_protocol::SessionId) {
+        const RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+        let now = std::time::Instant::now();
+        if self
+            .inbox_reopens
+            .get(session)
+            .is_some_and(|last| now.duration_since(*last) < RETRY)
+        {
+            return;
+        }
+        self.inbox_reopens.insert(session.clone(), now);
+        let endpoint = self.endpoint.clone();
+        let session = session.clone();
+        tokio::spawn(async move {
+            let key = format!(
+                "inbox-reopen:{session}:{}",
+                super::super::unix_timestamp_ms()
+            );
+            let result = endpoint
+                .execute_command(
+                    nakode_protocol::ClientId::from("nakode:inbox"),
+                    nakode_protocol::IdempotencyKey::from(key.as_str()),
+                    None,
+                    false,
+                    Command::OpenSession {
+                        session_id: session.clone(),
+                        account_id: None,
+                        tools: None,
+                        mcp_grant: None,
+                        profile_id: None,
+                        enabled_skill_ids: Vec::new(),
+                    },
+                )
+                .await;
+            if let Err(error) = result {
+                eprintln!(
+                    "nakode inbox: reopening {session} for its inbox failed: {}",
+                    error.message
+                );
+            }
+        });
     }
 
     fn observe_child_questions(&mut self) {

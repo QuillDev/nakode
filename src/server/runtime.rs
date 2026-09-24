@@ -275,6 +275,9 @@ pub(crate) struct NativeServerRuntime {
         tokio::task::JoinSet<(u64, nakode_protocol::SessionId, AgentBrowserStatus)>,
     followup_cursor: Option<nakode_protocol::SessionId>,
     followup_polling_enabled: bool,
+    /// When the inbox last asked to reopen a session that was not loaded, so a session that
+    /// cannot open is retried at intervals rather than every tick.
+    inbox_reopens: HashMap<nakode_protocol::SessionId, std::time::Instant>,
     agent_browser_check_generation: u64,
 }
 
@@ -522,6 +525,7 @@ impl NativeServerRuntime {
                 agent_browser_checks: tokio::task::JoinSet::new(),
                 followup_cursor: None,
                 followup_polling_enabled,
+                inbox_reopens: HashMap::new(),
                 agent_browser_check_generation: 0,
             },
             handle,

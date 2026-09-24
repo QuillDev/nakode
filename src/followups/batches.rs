@@ -214,6 +214,21 @@ impl InboxStore {
             .collect()
     }
 
+    /// Whether this inbox could deliver now, were its session loaded: the session exists and is
+    /// open, and its inbox is not paused. Decides whether to reopen a session for its inbox.
+    pub(crate) fn deliverable(&self, session: &SessionId) -> bool {
+        if authorize(&self.0, session.as_str(), true).is_err() {
+            return false;
+        }
+        self.0
+            .query_row(
+                "SELECT NOT COALESCE((SELECT paused FROM followup_inboxes WHERE session_id = ?1), 0)",
+                [session.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap_or(false)
+    }
+
     /// IMMEDIATE serializes producers/claimers; the batch is a bounded FIFO prefix at this cutoff.
     /// An existing claim is reconstructed exactly. No arrival can join it after the commit.
     pub(crate) fn claim(&mut self, session: &SessionId) -> Result<Option<ClaimedBatch>> {

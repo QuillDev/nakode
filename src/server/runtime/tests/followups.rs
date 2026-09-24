@@ -931,3 +931,58 @@ async fn relay_requires_exact_live_source_call_and_persists_structured_display()
         owner.coordination_json
     );
 }
+
+#[tokio::test]
+async fn an_inbox_reopens_a_parent_that_is_not_loaded_once_and_never_while_paused() {
+    let mut h = Harness::new().await;
+    let child = linked_child(&h);
+    // The parent Chat is saved but not loaded, as after a runtime restart.
+    h.runtime.core.sessions_by_id.remove(&h.session);
+    h.runtime
+        .effects
+        .persistence
+        .sessions
+        .update_last_turn(
+            &child,
+            &crate::session::PersistedTurnConfiguration {
+                completion: None,
+                id: "child-completion".into(),
+                model: Some("test-model".into()),
+                options: BackendModelOptions::default(),
+                outcome: crate::backend::TurnOutcome::Completed,
+            },
+        )
+        .unwrap();
+    h.runtime.dispatch_followups().await;
+    let first = *h
+        .runtime
+        .inbox_reopens
+        .get(&h.session)
+        .expect("a waiting report reopens its parent");
+    // A reopen still in flight, or one that failed, is not requested again every tick.
+    h.runtime.dispatch_followups().await;
+    assert_eq!(h.runtime.inbox_reopens.get(&h.session), Some(&first));
+    assert_eq!(
+        h.inbox().items.len(),
+        1,
+        "the report stays in the inbox until delivered"
+    );
+
+    // A paused inbox never reopens its session.
+    h.runtime.inbox_reopens.clear();
+    InboxStore::open(&h.runtime.effects.persistence.database)
+        .unwrap()
+        .execute(
+            &Command::SetFollowupPaused {
+                session_id: h.session.clone(),
+                paused: true,
+            },
+            "pause",
+            "client",
+            false,
+            1,
+        )
+        .unwrap();
+    h.runtime.dispatch_followups().await;
+    assert!(h.runtime.inbox_reopens.is_empty());
+}
