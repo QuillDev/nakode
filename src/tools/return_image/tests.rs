@@ -161,3 +161,35 @@ async fn return_image_refuses_escape_unsupported_and_oversized_files() {
     assert!(session.returned_images.is_empty());
     assert!(receiver.try_recv().is_err());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_gallery_image_is_returnable_by_absolute_path_and_nothing_else_outside_the_workspace() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let stack = tempfile::tempdir().expect("stack");
+    let gallery = stack.path().join(".tmp-gallery").join("run");
+    std::fs::create_dir_all(&gallery).expect("gallery");
+    let png = b"\x89PNG\r\n\x1a\n";
+    std::fs::write(gallery.join("shot.png"), png).expect("gallery image");
+    std::fs::write(stack.path().join("secret.png"), png).expect("outside image");
+    // An image in a gallery is returned by its absolute path.
+    let loaded =
+        load_returnable_image(workspace.path(), gallery.join("shot.png").to_str().unwrap())
+            .await
+            .expect("gallery image");
+    assert_eq!(loaded.label, "shot.png");
+    assert_eq!(loaded.mime_type, "image/png");
+    // Outside both the workspace and any gallery, it is refused.
+    let outside = load_returnable_image(
+        workspace.path(),
+        stack.path().join("secret.png").to_str().unwrap(),
+    )
+    .await;
+    assert!(outside.is_err());
+    // A gallery symlink to a file elsewhere is judged by where it leads.
+    std::os::unix::fs::symlink(stack.path().join("secret.png"), gallery.join("link.png"))
+        .expect("symlink");
+    let escaped =
+        load_returnable_image(workspace.path(), gallery.join("link.png").to_str().unwrap()).await;
+    assert!(escaped.is_err());
+}

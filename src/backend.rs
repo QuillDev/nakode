@@ -93,6 +93,7 @@ const PROVIDER_TOOL_IDENTITIES: &[(&str, &str, &str)] = &[
         crate::tools::NAKODE_AGENT_TOOL_NAME,
         "mcp__nakode__delegate",
     ),
+    (CLAUDE_PROVIDER, "return_image", "mcp__nakode__return_image"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -9,6 +9,78 @@ use crate::{
 };
 
 const MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// Images one turn may return, and their bytes together.
+pub(crate) const MAX_IMAGES_PER_TURN: usize = 8;
+pub(crate) const MAX_BYTES_PER_TURN: usize = 20 * 1024 * 1024;
+
+pub(crate) const RETURN_IMAGE_DESCRIPTION: &str = "Attach an existing PNG, JPEG, GIF or WebP image to the assistant transcript: a file in this session's workspace, or one under a `.tmp-gallery` directory (such as an agent's screenshots). The server retains the bytes for remote clients and history. This does not generate images. Maximum 5 MiB per image and eight images per turn. Never return a client-local filesystem link instead.";
+pub(crate) const RETURN_IMAGE_PATH_DESCRIPTION: &str =
+    "Workspace-relative image file, or an absolute path inside a `.tmp-gallery` directory";
+
+/// A validated image file, ready to attach.
+pub(crate) struct LoadedImage {
+    pub label: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
+/// Resolves and reads an image a session may return: one inside its workspace, or, by absolute
+/// path, one inside a `.tmp-gallery` directory, where agents keep their screenshots. Both are
+/// judged on the canonical path, so a symlink cannot lead out of either, and the file is then
+/// opened without following any replacement symlink.
+pub(crate) async fn load_returnable_image(
+    workspace: &std::path::Path,
+    supplied: &str,
+) -> Result<LoadedImage, String> {
+    let root = tokio::fs::canonicalize(workspace)
+        .await
+        .map_err(|e| e.to_string())?;
+    let requested = std::path::Path::new(supplied);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let path = tokio::fs::canonicalize(candidate)
+        .await
+        .map_err(|e| e.to_string())?;
+    let in_gallery = path.parent().is_some_and(|parent| {
+        parent
+            .ancestors()
+            .any(|dir| dir.file_name() == Some(".tmp-gallery".as_ref()))
+    });
+    if !path.starts_with(&root) && !in_gallery {
+        return Err(
+            "image must be inside the session workspace or a .tmp-gallery directory".to_owned(),
+        );
+    }
+    let file = open_image(path.clone()).await?;
+    let metadata = file.metadata().await.map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+        return Err("image must be a regular file of at most 5 MiB".to_owned());
+    }
+    let mut data = Vec::new();
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut data)
+        .await
+        .map_err(|e| e.to_string())?;
+    if data.len() as u64 > MAX_BYTES {
+        return Err("image exceeds 5 MiB".to_owned());
+    }
+    let mime_type = image_media_type(&data)
+        .ok_or("unsupported image; use PNG, JPEG, GIF or WebP")?
+        .to_owned();
+    let label = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Image")
+        .to_owned();
+    Ok(LoadedImage {
+        label,
+        mime_type,
+        data,
+    })
+}
 
 #[cfg(test)]
 mod tests;
@@ -19,8 +91,8 @@ impl Tool for ReturnImageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "return_image",
-            description: "Attach an existing PNG, JPEG, GIF or WebP image from this session's workspace to the assistant transcript. The server retains the bytes for remote clients and history. This does not generate images. Maximum 5 MiB per image and eight images per turn. Never return a client-local filesystem link instead.",
-            parameters: json!({"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative image file"}},"required":["path"],"additionalProperties":false}),
+            description: RETURN_IMAGE_DESCRIPTION,
+            parameters: json!({"type":"object","properties":{"path":{"type":"string","description":RETURN_IMAGE_PATH_DESCRIPTION}},"required":["path"],"additionalProperties":false}),
         }
     }
 
@@ -51,32 +123,15 @@ impl Tool for ReturnImageTool {
                     .values()
                     .filter(|image| image.turn_id == context.turn_id)
                     .count()
-                    >= 8
+                    >= MAX_IMAGES_PER_TURN
                 {
                     return Err("at most eight images may be returned per turn".to_owned());
                 }
-                let root = tokio::fs::canonicalize(context.workspace)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let path = tokio::fs::canonicalize(root.join(supplied))
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if !path.starts_with(&root) {
-                    return Err("image must be inside the session workspace".to_owned());
-                }
-                let file = open_image(path.clone()).await?;
-                let metadata = file.metadata().await.map_err(|e| e.to_string())?;
-                if !metadata.is_file() || metadata.len() > MAX_BYTES {
-                    return Err("image must be a regular file of at most 5 MiB".to_owned());
-                }
-                let mut data = Vec::new();
-                file.take(MAX_BYTES + 1)
-                    .read_to_end(&mut data)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if data.len() as u64 > MAX_BYTES {
-                    return Err("image exceeds 5 MiB".to_owned());
-                }
+                let LoadedImage {
+                    label,
+                    mime_type,
+                    data,
+                } = load_returnable_image(context.workspace, supplied).await?;
                 let retained_bytes: usize = context
                     .session
                     .returned_images
@@ -85,16 +140,9 @@ impl Tool for ReturnImageTool {
                     .filter_map(|image| image.attachment.image.as_ref())
                     .map(|image| image.data.len())
                     .sum();
-                if retained_bytes.saturating_add(data.len()) > 20 * 1024 * 1024 {
+                if retained_bytes.saturating_add(data.len()) > MAX_BYTES_PER_TURN {
                     return Err("returned images exceed 20 MiB per turn".to_owned());
                 }
-                let mime_type = image_media_type(&data)
-                    .ok_or("unsupported image; use PNG, JPEG, GIF or WebP")?;
-                let label = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Image")
-                    .to_owned();
                 let image = ReturnedImage {
                     id: format!("{}:image:{}", context.turn_id, context.call_id),
                     turn_id: context.turn_id.to_owned(),
@@ -105,10 +153,7 @@ impl Tool for ReturnImageTool {
                     attachment: PromptAttachment {
                         label,
                         path: None,
-                        image: Some(PromptImage {
-                            mime_type: mime_type.to_owned(),
-                            data,
-                        }),
+                        image: Some(PromptImage { mime_type, data }),
                     },
                 };
                 context

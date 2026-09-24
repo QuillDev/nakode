@@ -17,7 +17,7 @@ mod process;
 mod read;
 mod read_skill;
 mod read_skill_component;
-mod return_image;
+pub(crate) mod return_image;
 mod shared_context;
 mod todo;
 mod truncate;

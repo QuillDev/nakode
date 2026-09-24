@@ -83,13 +83,56 @@ async function delegate(ownerSessionId, task, parentRunId = null) {
   });
 }
 
-function nakodeServer(ownerSessionId, parentRunId) {
+// Nakode's own tools for Claude: `delegate` creates attributed sub-agents, and `return_image`
+// attaches an image file from this machine to the transcript. Nakode reads and validates the file
+// itself, so its bytes never pass through the provider.
+function nakodeServer(session, turn, { delegate: withDelegate, returnImage }) {
+  const tools = [];
+  if (returnImage) tools.push(returnImageTool(session, turn));
+  if (withDelegate) tools.push(delegateTool(session.ownerSessionId, session.attributedRunId));
   return createSdkMcpServer({
     name: "nakode",
     version: "1.0.0",
     instructions:
-      "Creates bounded, attributed Nakode sub-agents from the configured archetype catalogue.",
-    tools: [
+      "Nakode tools: delegate bounded work to configured archetypes, and attach images from this machine to the transcript.",
+    tools,
+  });
+}
+
+function returnImageTool(session, turn) {
+  return tool(
+    "return_image",
+    "Attach an existing PNG, JPEG, GIF or WebP image to the assistant transcript so the owner sees it: a file in this session's workspace, or one under a `.tmp-gallery` directory (such as an agent's screenshots). The bytes are retained for remote clients. Maximum 5 MiB per image and eight images per turn. Use this instead of pasting a file path.",
+    {
+      path: z
+        .string()
+        .min(1)
+        .describe(
+          "Workspace-relative image file, or an absolute path inside a `.tmp-gallery` directory",
+        ),
+    },
+    async ({ path }) =>
+      new Promise((resolve) => {
+        const id = randomUUID();
+        externalToolCalls.set(id, {
+          resolve,
+          sessionId: session.sessionId,
+          turnId: turn.turnId,
+        });
+        write({
+          event: "image_return_request",
+          id,
+          turnId: turn.turnId,
+          workspace: turn.workspace,
+          model: session.model,
+          path,
+        });
+      }),
+  );
+}
+
+function delegateTool(ownerSessionId, parentRunId) {
+  return (
       tool(
         "delegate",
         "Delegate one concrete bounded task to a configured Nakode archetype and wait for its result.",
@@ -114,9 +157,8 @@ function nakodeServer(ownerSessionId, parentRunId) {
             };
           }
         },
-      ),
-    ],
-  });
+      )
+  );
 }
 
 function externalToolShape(definition) {
@@ -201,12 +243,14 @@ function providerToolName(name) {
     : name || "Tool";
 }
 
+const NAKODE_MCP_TOOLS = new Set(["mcp__nakode__delegate", "mcp__nakode__return_image"]);
+
 function effectiveAllowedTools(session) {
   const external = externalToolNames(session);
   if (session.replaceBuiltinTools) {
     return [
       ...external,
-      ...(session.allowedTools?.filter((name) => name === "mcp__nakode__delegate") ?? []),
+      ...(session.allowedTools?.filter((name) => NAKODE_MCP_TOOLS.has(name)) ?? []),
     ];
   }
   if (session.allowedTools === null) return null;
@@ -875,15 +919,19 @@ async function sendTurn(command) {
   const processLifecycle = providerProcessLifecycle(command.oauthAccessToken);
   const allowedTools = effectiveAllowedTools(session);
   const mcpServers = {};
-  if (
+  const allows = (name) => allowedTools === null || allowedTools.includes(name);
+  const withDelegate = Boolean(
     session.ownerSessionId &&
-    session.validationEnabled &&
-    session.delegationEnabled &&
-    (allowedTools === null || allowedTools.includes("mcp__nakode__delegate"))
-  ) {
+      session.validationEnabled &&
+      session.delegationEnabled &&
+      allows("mcp__nakode__delegate"),
+  );
+  const returnImage = allows("mcp__nakode__return_image");
+  if (withDelegate || returnImage) {
     mcpServers.nakode = nakodeServer(
-      session.ownerSessionId,
-      session.attributedRunId,
+      session,
+      { turnId: command.turnId, workspace: command.workspace },
+      { delegate: withDelegate, returnImage },
     );
   }
   if (session.externalTools.length > 0) {
@@ -1145,6 +1193,7 @@ async function handle(command) {
       break;
     }
     case "resolve_external_tool":
+    case "resolve_image_return":
       resolveExternalToolCall(
         command.id,
         command.output,
