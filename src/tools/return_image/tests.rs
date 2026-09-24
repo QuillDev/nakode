@@ -216,6 +216,28 @@ fn a_call_names_one_path_or_up_to_eight_distinct_paths() {
     }
 }
 
+async fn call(
+    workspace: &std::path::Path,
+    session: &mut RuntimeSession,
+    events: &tokio::sync::mpsc::Sender<BackendEvent>,
+    questions: &QuestionBroker,
+    call_id: &str,
+    arguments: Value,
+) -> ToolResult {
+    let context = ToolContext {
+        workspace,
+        session,
+        backend_events: events,
+        turn_id: "turn",
+        call_id,
+        questions,
+        delegation: None,
+    };
+    ReturnImageTool
+        .execute(context, arguments, &CancellationToken::new())
+        .await
+}
+
 #[tokio::test]
 async fn several_images_attach_in_order_in_one_call_or_not_at_all() {
     let workspace = tempfile::tempdir().expect("workspace");
@@ -227,27 +249,6 @@ async fn several_images_attach_in_order_in_one_call_or_not_at_all() {
     let mut session = RuntimeSession::new("test/model".into(), String::new());
     let (events, mut receiver) = tokio::sync::mpsc::channel(8);
     let questions = QuestionBroker::default();
-    async fn call(
-        workspace: &std::path::Path,
-        session: &mut RuntimeSession,
-        events: &tokio::sync::mpsc::Sender<BackendEvent>,
-        questions: &QuestionBroker,
-        call_id: &str,
-        arguments: Value,
-    ) -> ToolResult {
-        let context = ToolContext {
-            workspace,
-            session,
-            backend_events: events,
-            turn_id: "turn",
-            call_id,
-            questions,
-            delegation: None,
-        };
-        ReturnImageTool
-            .execute(context, arguments, &CancellationToken::new())
-            .await
-    }
     // One unreadable image stops the whole call before anything is attached.
     let failed = call(
         workspace.path(),
