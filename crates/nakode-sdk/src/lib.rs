@@ -1760,6 +1760,7 @@ impl NakodeClient {
     }
 
     typed_mutation!(link_child_session, api::LinkChildSessionRequest);
+    typed_mutation!(reparent_child_session, api::ReparentChildSessionRequest);
     typed_mutation!(publish_child_report, api::PublishChildReportRequest);
 
     /// Reads ordered inert reports without opening either session or starting inference.

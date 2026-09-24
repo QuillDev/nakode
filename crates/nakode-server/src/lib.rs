@@ -138,6 +138,11 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     fixed("NakodeService", "WatchWorkspace", RequestLane::Subscription),
     fixed("NakodeService", "ReloadWorkspace", RequestLane::Control),
     fixed("NakodeService", "LinkChildSession", RequestLane::Control),
+    fixed(
+        "NakodeService",
+        "ReparentChildSession",
+        RequestLane::Control,
+    ),
     fixed("NakodeService", "PublishChildReport", RequestLane::Control),
     fixed("NakodeService", "ListChildQuestions", RequestLane::Query),
     fixed(
