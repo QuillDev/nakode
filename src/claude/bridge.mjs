@@ -102,16 +102,23 @@ function nakodeServer(session, turn, { delegate: withDelegate, returnImage }) {
 function returnImageTool(session, turn) {
   return tool(
     "return_image",
-    "Attach an existing PNG, JPEG, GIF or WebP image to the assistant transcript so the owner sees it: a file in this session's workspace, or one under a `.tmp-gallery` directory (such as an agent's screenshots). The bytes are retained for remote clients. Maximum 5 MiB per image and eight images per turn. Use this instead of pasting a file path.",
+    "Attach existing PNG, JPEG, GIF or WebP images to the assistant transcript so the owner sees them: files in this session's workspace, or under a `.tmp-gallery` directory (such as an agent's screenshots). Give one `path`, or several at once as `paths`; if any cannot be attached, none is. The bytes are retained for remote clients. Maximum 5 MiB per image and eight images per turn. Use this instead of pasting a file path.",
     {
       path: z
         .string()
         .min(1)
+        .optional()
         .describe(
           "Workspace-relative image file, or an absolute path inside a `.tmp-gallery` directory",
         ),
+      paths: z
+        .array(z.string().min(1))
+        .min(1)
+        .max(8)
+        .optional()
+        .describe("Several such image files to attach at once, in order"),
     },
-    async ({ path }) =>
+    async ({ path, paths }) =>
       new Promise((resolve) => {
         const id = randomUUID();
         externalToolCalls.set(id, {
@@ -125,7 +132,8 @@ function returnImageTool(session, turn) {
           turnId: turn.turnId,
           workspace: turn.workspace,
           model: session.model,
-          path,
+          ...(path === undefined ? {} : { path }),
+          ...(paths === undefined ? {} : { paths }),
         });
       }),
   );

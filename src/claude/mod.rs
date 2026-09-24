@@ -1399,43 +1399,59 @@ async fn return_image(
     events: &mpsc::Sender<BackendEvent>,
 ) -> Result<String, String> {
     use crate::tools::return_image::{
-        LoadedImage, MAX_BYTES_PER_TURN, MAX_IMAGES_PER_TURN, load_returnable_image,
+        LoadedImage, MAX_BYTES_PER_TURN, MAX_IMAGES_PER_TURN, load_returnable_images,
+        requested_image_paths, returned_images_output,
     };
     let turn_id = string(message, "turnId");
+    let call_id = string(message, "id");
+    let paths = requested_image_paths(message)?;
     let (count, bytes) = returned.turns.get(&turn_id).copied().unwrap_or_default();
-    if count >= MAX_IMAGES_PER_TURN {
+    if count + paths.len() > MAX_IMAGES_PER_TURN {
         return Err("at most eight images may be returned per turn".to_owned());
     }
     let workspace = string(message, "workspace");
-    let LoadedImage {
-        label,
-        mime_type,
-        data,
-    } = load_returnable_image(std::path::Path::new(&workspace), &string(message, "path")).await?;
-    if bytes.saturating_add(data.len()) > MAX_BYTES_PER_TURN {
+    let loaded = load_returnable_images(std::path::Path::new(&workspace), &paths).await?;
+    let added: usize = loaded.iter().map(|image| image.data.len()).sum();
+    if bytes.saturating_add(added) > MAX_BYTES_PER_TURN {
         return Err("returned images exceed 20 MiB per turn".to_owned());
     }
     returned
         .turns
-        .insert(turn_id.clone(), (count + 1, bytes + data.len()));
-    let image = crate::runtime::ReturnedImage {
-        id: format!("{turn_id}:image:{}", string(message, "id")),
-        turn_id,
-        provider_id: CLAUDE_PROVIDER.to_owned(),
-        model_id: string(message, "model"),
-        history_index: 0,
-        sequence: count,
-        attachment: crate::backend::PromptAttachment {
+        .insert(turn_id.clone(), (count + loaded.len(), bytes + added));
+    let total = loaded.len();
+    for (
+        index,
+        LoadedImage {
             label,
-            path: None,
-            image: Some(crate::backend::PromptImage { mime_type, data }),
+            mime_type,
+            data,
         },
-    };
-    events
-        .send(BackendEvent::ImageReturned(image))
-        .await
-        .map_err(|_| "session event receiver closed".to_owned())?;
-    Ok("Image attached to the assistant transcript.".to_owned())
+    ) in loaded.into_iter().enumerate()
+    {
+        let key = if total == 1 {
+            call_id.clone()
+        } else {
+            format!("{call_id}:{index}")
+        };
+        let image = crate::runtime::ReturnedImage {
+            id: format!("{turn_id}:image:{key}"),
+            turn_id: turn_id.clone(),
+            provider_id: CLAUDE_PROVIDER.to_owned(),
+            model_id: string(message, "model"),
+            history_index: 0,
+            sequence: count + index,
+            attachment: crate::backend::PromptAttachment {
+                label,
+                path: None,
+                image: Some(crate::backend::PromptImage { mime_type, data }),
+            },
+        };
+        events
+            .send(BackendEvent::ImageReturned(image))
+            .await
+            .map_err(|_| "session event receiver closed".to_owned())?;
+    }
+    Ok(returned_images_output(total))
 }
 
 #[allow(clippy::too_many_lines)]

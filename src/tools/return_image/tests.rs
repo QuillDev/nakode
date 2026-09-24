@@ -193,3 +193,92 @@ async fn a_gallery_image_is_returnable_by_absolute_path_and_nothing_else_outside
         load_returnable_image(workspace.path(), gallery.join("link.png").to_str().unwrap()).await;
     assert!(escaped.is_err());
 }
+
+#[test]
+fn a_call_names_one_path_or_up_to_eight_distinct_paths() {
+    assert_eq!(
+        requested_image_paths(&json!({"path":"a.png"})).unwrap(),
+        vec!["a.png".to_owned()]
+    );
+    assert_eq!(
+        requested_image_paths(&json!({"paths":["a.png","b.png"]})).unwrap(),
+        vec!["a.png".to_owned(), "b.png".to_owned()]
+    );
+    for bad in [
+        json!({}),
+        json!({"path":"a.png","paths":["b.png"]}),
+        json!({"paths":[]}),
+        json!({"paths":["a.png","a.png"]}),
+        json!({"paths":[1]}),
+        json!({"paths":["1","2","3","4","5","6","7","8","9"]}),
+    ] {
+        assert!(requested_image_paths(&bad).is_err(), "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn several_images_attach_in_order_in_one_call_or_not_at_all() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let png = b"\x89PNG\r\n\x1a\n";
+    for name in ["one.png", "two.png"] {
+        std::fs::write(workspace.path().join(name), png).expect("image");
+    }
+    std::fs::write(workspace.path().join("notes.txt"), b"not an image").expect("text");
+    let mut session = RuntimeSession::new("test/model".into(), String::new());
+    let (events, mut receiver) = tokio::sync::mpsc::channel(8);
+    let questions = QuestionBroker::default();
+    async fn call(
+        workspace: &std::path::Path,
+        session: &mut RuntimeSession,
+        events: &tokio::sync::mpsc::Sender<BackendEvent>,
+        questions: &QuestionBroker,
+        call_id: &str,
+        arguments: Value,
+    ) -> ToolResult {
+        let context = ToolContext {
+            workspace,
+            session,
+            backend_events: events,
+            turn_id: "turn",
+            call_id,
+            questions,
+            delegation: None,
+        };
+        ReturnImageTool
+            .execute(context, arguments, &CancellationToken::new())
+            .await
+    }
+    // One unreadable image stops the whole call before anything is attached.
+    let failed = call(
+        workspace.path(),
+        &mut session,
+        &events,
+        &questions,
+        "mixed",
+        json!({"paths":["one.png","notes.txt"]}),
+    )
+    .await;
+    assert!(failed.failed);
+    assert!(failed.output.contains("notes.txt"), "{}", failed.output);
+    assert!(receiver.try_recv().is_err());
+    let result = call(
+        workspace.path(),
+        &mut session,
+        &events,
+        &questions,
+        "pair",
+        json!({"paths":["one.png","two.png"]}),
+    )
+    .await;
+    assert!(!result.failed, "{}", result.output);
+    assert_eq!(
+        result.output,
+        "2 images attached to the assistant transcript."
+    );
+    let mut labels = Vec::new();
+    while let Ok(BackendEvent::ImageReturned(image)) = receiver.try_recv() {
+        labels.push((image.attachment.label, image.sequence));
+    }
+    assert_eq!(labels, vec![("one.png".into(), 0), ("two.png".into(), 1)]);
+    assert_eq!(session.returned_images.len(), 2);
+}
