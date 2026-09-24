@@ -1300,8 +1300,25 @@ impl NativeServerRuntime {
                 message,
                 retryable: true,
             })?;
+        // The Claude SDK owns Claude history; its bridge leaves a snapshot to read back instead.
+        let native = match native {
+            None if session.provider == crate::backend::CLAUDE_PROVIDER => {
+                claude::retained_history(
+                    &self.effects.persistence.database,
+                    &session.provider_session_id,
+                )
+                .map_err(|message| ServiceError {
+                    code: ErrorCode::Internal,
+                    message,
+                    retryable: true,
+                })?
+                .map(Ok)
+            }
+            native => native.map(Err),
+        };
         let history = match native {
-                Some(native) => Ok(native.normalized_history()),
+                Some(Ok(snapshot)) => Ok(snapshot),
+                Some(Err(native)) => Ok(native.normalized_history()),
                 None if crate::session::is_pending_provider_session_id(&session.provider_session_id) => Ok(Vec::new()),
                 None => Err("Retained provider history is unavailable; the logical session is preserved. Explicitly reopen on its execution machine to recover provider-owned history.".to_owned()),
             }
@@ -3745,7 +3762,8 @@ impl BackendRegistry {
             }
             crate::backend::CLAUDE_PROVIDER => {
                 let mut config = claude::BackendConfig::native(working_directory.to_path_buf())
-                    .with_credential(credential);
+                    .with_credential(credential)
+                    .with_session_database(self.session_database.clone());
                 if publish_credential_updates {
                     config = config.with_credential_updates();
                 }
@@ -11186,6 +11204,42 @@ mod tests {
             .expect_err("storage read must fail");
         assert_eq!(error.code, nakode_protocol::ErrorCode::Internal);
         assert!(error.retryable);
+    }
+
+    #[tokio::test]
+    async fn retained_claude_session_reads_back_from_its_history_snapshot() {
+        let root = tempfile::tempdir().expect("isolated history");
+        let id = save_retained_history(root.path());
+        let (mut runtime, _handle) = retained_history_runtime(root.path()).await;
+        let row = runtime
+            .core
+            .sessions
+            .iter_mut()
+            .find(|row| row.id == id.as_str())
+            .expect("logical record");
+        row.provider = crate::backend::CLAUDE_PROVIDER.to_owned();
+        row.provider_session_id = "claude-native".to_owned();
+        let unavailable = runtime
+            .read_retained_query(Query::GetSession {
+                session_id: id.clone(),
+            })
+            .expect_err("no snapshot kept yet");
+        assert!(unavailable.message.contains("Explicitly reopen"));
+        rusqlite::Connection::open(&runtime.effects.persistence.database)
+            .expect("store")
+            .execute(
+                "INSERT INTO provider_history_snapshots VALUES (?1, ?2, ?3, 1)",
+                rusqlite::params![
+                    crate::backend::CLAUDE_PROVIDER,
+                    "claude-native",
+                    r#"[{"turnId":"t1","id":"a1","kind":"assistant","title":"","body":"Claude kept answer","status":"complete"}]"#
+                ],
+            )
+            .expect("snapshot");
+        let session = runtime
+            .read_retained_query(Query::GetSession { session_id: id })
+            .expect("snapshot reads back without reopening");
+        assert!(format!("{session:?}").contains("Claude kept answer"));
     }
 
     #[tokio::test]

@@ -1459,6 +1459,13 @@ impl SqliteSessionRepository {
                updated_at INTEGER NOT NULL,
                PRIMARY KEY(provider, session_id)
              );
+             CREATE TABLE IF NOT EXISTS provider_history_snapshots (
+               provider TEXT NOT NULL,
+               session_id TEXT NOT NULL,
+               history_json TEXT NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(provider, session_id)
+             );
              CREATE TABLE IF NOT EXISTS owner_turns (
                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                turn_id TEXT NOT NULL,

@@ -460,23 +460,7 @@ async function createSession(command, resumed) {
       : [],
     replaceBuiltinTools: command.replaceBuiltinTools === true,
   });
-  let history = [];
-  if (resumed) {
-    try {
-      history = [
-        ...savedHistory(
-          await getSessionMessages(sessionId, { dir: command.workspace }),
-          sessionId,
-        ),
-        ...(await nativeAgentHistory(command.workspace, sessionId)),
-      ];
-    } catch (error) {
-      write({
-        event: "diagnostic",
-        message: `could not read Claude session history: ${errorMessage(error)}`,
-      });
-    }
-  }
+  const history = resumed ? await readHistory(command.workspace, sessionId) : [];
   write({
     event: resumed ? "session_resumed" : "session_created",
     requestId: command.requestId,
@@ -484,6 +468,22 @@ async function createSession(command, resumed) {
     model: command.model || "sonnet",
     history,
   });
+}
+
+/** The session's history as a resume rebuilds it; empty, with a diagnostic, when unreadable. */
+async function readHistory(workspace, sessionId) {
+  try {
+    return [
+      ...savedHistory(await getSessionMessages(sessionId, { dir: workspace }), sessionId),
+      ...(await nativeAgentHistory(workspace, sessionId)),
+    ];
+  } catch (error) {
+    write({
+      event: "diagnostic",
+      message: `could not read Claude session history: ${errorMessage(error)}`,
+    });
+    return [];
+  }
 }
 
 function validatorSession(instructions) {
@@ -1093,6 +1093,12 @@ async function sendTurn(command) {
     event: "turn_completed",
     turnId: command.turnId,
     ...completion,
+  });
+  // Nakode keeps this so the session reads back while it is not loaded, e.g. after a restart.
+  write({
+    event: "history_snapshot",
+    sessionId: command.sessionId,
+    history: await readHistory(command.workspace, command.sessionId),
   });
 }
 

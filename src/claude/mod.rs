@@ -126,6 +126,8 @@ pub struct BackendConfig {
     vision_config: Option<std::sync::Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
     vision_service: Option<crate::vision::SharedVisionService>,
     publish_credential_updates: bool,
+    /// Where each session's latest history snapshot is kept, so it reads back while not loaded.
+    session_database: Option<PathBuf>,
 }
 
 impl BackendConfig {
@@ -137,12 +139,19 @@ impl BackendConfig {
             vision_config: None,
             vision_service: None,
             publish_credential_updates: false,
+            session_database: None,
         }
     }
 
     #[must_use]
     pub fn with_credential(mut self, credential: Option<Value>) -> Self {
         self.credential = credential;
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_database(mut self, path: PathBuf) -> Self {
+        self.session_database = Some(path);
         self
     }
 
@@ -604,6 +613,14 @@ async fn run_supervisor(
                     continue;
                 };
                 let event_name = message.get("event").and_then(Value::as_str);
+                if matches!(event_name, Some("history_snapshot" | "session_resumed"))
+                    && let Some(database) = config.session_database.clone()
+                {
+                    keep_history_snapshot(database, &message).await;
+                }
+                if event_name == Some("history_snapshot") {
+                    continue;
+                }
                 if event_name == Some("image_return_request") {
                     let (output, failed) = match return_image(&message, &mut returned_images, &events).await {
                         Ok(output) => (output, false),
@@ -1692,6 +1709,67 @@ fn without_context_window(name: &str) -> &str {
         return name;
     }
     name[..index].trim_end()
+}
+
+/// Keeps the bridge's latest history for a session. The Claude SDK owns the transcript itself;
+/// this copy exists only so a session that is not loaded can still be read.
+async fn keep_history_snapshot(database: PathBuf, message: &Value) {
+    let session_id = string(message, "sessionId");
+    let Some(history) = message.get("history").filter(|history| history.is_array()) else {
+        return;
+    };
+    if session_id.is_empty() {
+        return;
+    }
+    let history = history.to_string();
+    let saved = tokio::task::spawn_blocking(move || {
+        let connection = rusqlite::Connection::open(&database)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute(
+            "INSERT INTO provider_history_snapshots (provider, session_id, history_json, updated_at)
+             VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(provider, session_id) DO UPDATE SET
+               history_json = excluded.history_json,
+               updated_at = excluded.updated_at",
+            rusqlite::params![CLAUDE_PROVIDER, session_id, history],
+        )
+    })
+    .await;
+    if let Ok(Err(error)) = saved {
+        eprintln!("claude: could not keep the session history snapshot: {error}");
+    }
+}
+
+/// The last history snapshot kept for a Claude session, when there is one.
+///
+/// # Errors
+/// Returns an error when the session store cannot be read.
+pub fn retained_history(
+    database: &std::path::Path,
+    provider_session_id: &str,
+) -> Result<Option<Vec<crate::backend::SessionHistoryItem>>, String> {
+    use rusqlite::OptionalExtension as _;
+    let connection = rusqlite::Connection::open(database)
+        .map_err(|error| format!("failed to open session store: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("failed to configure session store: {error}"))?;
+    let history = connection
+        .query_row(
+            "SELECT history_json FROM provider_history_snapshots
+             WHERE provider = ?1 AND session_id = ?2",
+            rusqlite::params![CLAUDE_PROVIDER, provider_session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read Claude history snapshot: {error}"))?;
+    history
+        .map(|history| {
+            serde_json::from_str::<Value>(&history)
+                .map(|history| session_history(&json!({ "history": history })))
+                .map_err(|error| format!("invalid Claude history snapshot: {error}"))
+        })
+        .transpose()
 }
 
 fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
