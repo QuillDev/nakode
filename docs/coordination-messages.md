@@ -5,7 +5,9 @@
 `RelayAgentFollowup` is distinct from ordinary `EnqueueFollowup`. The runtime verifies an exact
 live pending `SendAgentMessage` call on the source session, including destination, unchanged text,
 and selected source-image bytes. Producer-supplied roles, headers and JSON never establish origin.
-The same-owner, immutable logical parent/child link grants `delegated_instruction`; another
+The same-owner, immutable logical parent/child link grants `delegated_instruction`, and so does an
+integration-vouched owner Chat (`source_owner_chat`), which may instruct any same-owner session it
+did not start; the vouch is stored with the message and honoured when a batch is claimed. Another
 same-owner source is `peer_context`. Cross-owner and cross-runtime relays refuse.
 
 A delegated instruction can assign new work beyond the initial task. It never supplies approval,
