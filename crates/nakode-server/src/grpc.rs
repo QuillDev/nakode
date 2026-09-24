@@ -814,6 +814,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             source_session_id: protocol::SessionId::from(input.source_session_id),
             source_call_id: input.source_call_id,
             prompt,
+            source_owner_chat: input.source_owner_chat,
         })
     );
     try_command_rpc!(

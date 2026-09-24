@@ -892,6 +892,7 @@ async fn relay_requires_exact_live_source_call_and_persists_structured_display()
             text: "Run the new task".into(),
             attachments: vec![],
         },
+        source_owner_chat: false,
     };
     let mut forged = command.clone();
     if let Command::RelayAgentFollowup { prompt, .. } = &mut forged {

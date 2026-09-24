@@ -11,6 +11,9 @@ pub(crate) struct Source {
     pub title: String,
     pub call_id: Option<String>,
     pub status: Option<String>,
+    /// Admitted as an owner Chat's instruction; its authority does not rest on a parent link.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_chat: bool,
 }
 
 #[derive(Serialize)]
@@ -27,12 +30,15 @@ pub(super) struct DisplayMessage<'a> {
 }
 
 /// Called only after the runtime has matched the exact pending source call and its arguments.
-/// The immutable, same-owner runtime relationship—not payload claims—grants downward authority.
+/// Instruction authority comes from the runtime, never payload claims: the immutable same-owner
+/// parent link, or the authenticated integration vouching that the source is one of the owner's
+/// Chats, which may instruct any of the owner's agents. Everything else stays peer context.
 pub(crate) fn relay_source(
     connection: &Connection,
     source: &str,
     target: &str,
     call: &str,
+    owner_chat: bool,
 ) -> Result<Source> {
     super::authorize(connection, source, true)?;
     let title: Option<String> = connection
@@ -55,7 +61,7 @@ pub(crate) fn relay_source(
         params![source, target], |row| row.get(0),
     ).map_err(failure)?;
     Ok(Source {
-        kind: if downward {
+        kind: if downward || owner_chat {
             "delegated_instruction"
         } else {
             "peer_context"
@@ -65,6 +71,7 @@ pub(crate) fn relay_source(
         title: title.chars().take(120).collect(),
         call_id: Some(call.to_owned()),
         status: None,
+        owner_chat,
     })
 }
 
@@ -77,6 +84,7 @@ pub(super) fn authenticate_source(
         session_id,
         source_session_id,
         source_call_id,
+        source_owner_chat,
         ..
     } = command
     else {
@@ -88,6 +96,7 @@ pub(super) fn authenticate_source(
         source_session_id.as_str(),
         session_id.as_str(),
         source_call_id,
+        *source_owner_chat,
     )
     .map(Some)
 }

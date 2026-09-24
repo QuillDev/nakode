@@ -189,6 +189,9 @@ message RelayAgentFollowupRequest {
   string source_session_id = 4;
   string source_call_id = 5;
   PromptInput prompt = 6;
+  // The authenticated integration vouches that the source is one of the owner's Chats: its
+  // message instructs any of the owner's agents, not only the source's own children.
+  bool source_owner_chat = 7;
 }
 message EnqueueFollowupRequest {
   MutationOptions mutation = 1;

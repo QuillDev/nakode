@@ -10,6 +10,7 @@ fn relay(f: &Fixture, source: &str, call: &str, id: &str) -> Command {
             text: "Run a new harmless task beyond readiness".into(),
             attachments: vec![],
         },
+        source_owner_chat: false,
     }
 }
 
@@ -245,4 +246,39 @@ fn local_files_do_not_shift_later_message_image_offsets() {
     assert_eq!(display["messages"][1]["attachmentStartIndex"], 0);
     assert_eq!(display["messages"][1]["attachmentCount"], 1);
     assert_eq!(batch.prompt.attachments.len(), 2);
+}
+
+#[test]
+fn an_owner_chat_instructs_an_agent_it_did_not_start() {
+    for owner_chat in [true, false] {
+        let f = Fixture::new();
+        // A same-owner session with no parent link to the target.
+        let source = source(&f, false);
+        let mut command = relay(&f, &source, "call", "message");
+        if let Command::RelayAgentFollowup {
+            source_owner_chat, ..
+        } = &mut command
+        {
+            *source_owner_chat = owner_chat;
+        }
+        let request = InboxRequest {
+            command: &command,
+            key: "receipt",
+            sender: "transport",
+            replay_only: false,
+            now_ms: 10,
+        };
+        f.store()
+            .execute_authenticated(request, |prompt| Ok(prompt.clone()), || Ok(()))
+            .unwrap();
+        let batch = f.store().claim(&f.session).unwrap().unwrap();
+        let display: serde_json::Value = serde_json::from_str(&batch.coordination_json).unwrap();
+        // The vouched Chat instructs; without the integration's word it stays peer context.
+        let expected = if owner_chat {
+            "delegated_instruction"
+        } else {
+            "peer_context"
+        };
+        assert_eq!(display["messages"][0]["source"]["kind"], expected);
+    }
 }

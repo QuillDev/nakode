@@ -128,6 +128,7 @@ impl InboxStore {
                     title: event.title.chars().take(120).collect(),
                     call_id: None,
                     status: Some(event.state.clone()),
+                    owner_chat: false,
                 },
             )?;
             let display = if event.report.starts_with("turn:") {

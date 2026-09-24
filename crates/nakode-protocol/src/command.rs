@@ -286,6 +286,10 @@ pub enum Command {
         source_session_id: SessionId,
         source_call_id: String,
         prompt: PromptInput,
+        /// The authenticated integration vouches that the source is one of the owner's Chats, so
+        /// its message instructs any of the owner's agents rather than only its own children.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        source_owner_chat: bool,
     },
     EnqueueFollowup {
         session_id: SessionId,
