@@ -288,6 +288,9 @@ impl InboxStore {
                     )?;
                     if let Some(source) = source {
                         coordination::save_source(&tx, session_id.as_str(), message_id, &source)?;
+                        if source.owner_chat {
+                            coordination::adopt(&tx, &source.session_id, session_id.as_str())?;
+                        }
                     }
                 }
                 (session_id.as_str(), Some(message_id.clone()))

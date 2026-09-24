@@ -75,6 +75,59 @@ pub(crate) fn relay_source(
     })
 }
 
+/// An owner Chat that instructs an agent becomes its parent, so the agent's reports return to
+/// whoever last directed it and it appears among that Chat's agents. The link row is re-pointed,
+/// never deleted, so the agent's report and question history stay attached to it. Nothing changes
+/// when either session is itself nested (a parent's child, or a child's parent) or the Chat
+/// already has the most children a parent may hold; the message is admitted either way.
+pub(super) fn adopt(connection: &Connection, chat: &str, agent: &str) -> Result<()> {
+    let current: Option<String> = connection
+        .query_row(
+            "SELECT parent_id FROM session_child_links WHERE child_id = ?1",
+            [agent],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(failure)?;
+    if current.as_deref() == Some(chat) {
+        return Ok(());
+    }
+    let nested: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_child_links WHERE child_id = ?1 OR parent_id = ?2)",
+            params![chat, agent],
+            |row| row.get(0),
+        )
+        .map_err(failure)?;
+    let children: u32 = connection
+        .query_row(
+            "SELECT count(*) FROM session_child_links WHERE parent_id = ?1",
+            [chat],
+            |row| row.get(0),
+        )
+        .map_err(failure)?;
+    if nested || children >= 32 {
+        return Ok(());
+    }
+    if current.is_some() {
+        connection
+            .execute(
+                "UPDATE session_child_links SET parent_id = ?1 WHERE child_id = ?2",
+                params![chat, agent],
+            )
+            .map_err(failure)?;
+    } else {
+        connection
+            .execute(
+                "INSERT INTO session_child_links(child_id, parent_id, child_title)
+                 SELECT id, ?1, COALESCE(title, '') FROM sessions WHERE id = ?2",
+                params![chat, agent],
+            )
+            .map_err(failure)?;
+    }
+    Ok(())
+}
+
 pub(super) fn authenticate_source(
     connection: &Connection,
     command: &nakode_protocol::Command,
