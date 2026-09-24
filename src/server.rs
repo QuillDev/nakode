@@ -1989,7 +1989,10 @@ impl ServerCore {
         session_id: &SessionId,
     ) -> Result<Vec<Effect>, DomainCommandError> {
         let (pending, source_transport) = {
-            let bridge = self.session_bridge(session_id)?;
+            // A session opened without a bridge has no inbound prompt to replay.
+            let Ok(bridge) = self.session_bridge(session_id) else {
+                return Ok(Vec::new());
+            };
             if bridge.lifecycle != BridgeLifecycle::Open {
                 return Ok(Vec::new());
             }
