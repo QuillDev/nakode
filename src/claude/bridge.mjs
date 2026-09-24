@@ -951,6 +951,8 @@ async function sendTurn(command) {
   const options = {
     cwd: command.workspace,
     pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE || "claude",
+    // The session's variables (GH_TOKEN, git credentials, account environment) for its tools.
+    env: { ...process.env, ...(command.environment || {}) },
     model,
     systemPrompt: session.instructions
       ? { type: "preset", preset: "claude_code", append: session.instructions }

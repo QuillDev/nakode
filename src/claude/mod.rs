@@ -575,7 +575,8 @@ async fn run_supervisor(
                         }
                     }
                 }
-                handle_command(command, &config, credential.as_ref(), bridge.as_mut(), &events).await;
+                let owner = session_owner(attachment.as_ref());
+                handle_command(command, &config, credential.as_ref(), bridge.as_mut(), &events, owner).await;
             }
             () = wait_until_credential_refresh(credential.as_ref()), if publish_credential_updates && credential.as_ref().is_some_and(|credential| !credential.brokered) => {
                 if let Err(message) = refresh_supervisor_credential(&mut credential, true, &events).await {
@@ -645,6 +646,7 @@ async fn run_supervisor(
                         credential.as_ref(),
                         &mut bridge,
                         &events,
+                        session_owner(attachment.as_ref()),
                     )
                     .await;
                     recovery_ready_event = None;
@@ -721,7 +723,7 @@ async fn reattach_session(
 ) -> Option<&'static str> {
     let command = attachment?;
     let recovery_event = recovery_event_for(&command);
-    handle_command(command, config, credential, bridge.as_mut(), events).await;
+    handle_command(command, config, credential, bridge.as_mut(), events, None).await;
     recovery_event
 }
 
@@ -732,12 +734,26 @@ async fn replay_after_reattach(
     credential: Option<&ClaudeOAuthCredential>,
     bridge: &mut Option<Bridge>,
     events: &mpsc::Sender<BackendEvent>,
+    owner: Option<&str>,
 ) {
     if let Some(command) = session_options {
-        handle_command(command, config, credential, bridge.as_mut(), events).await;
+        handle_command(command, config, credential, bridge.as_mut(), events, owner).await;
     }
     if let Some(command) = deferred_command {
-        handle_command(command, config, credential, bridge.as_mut(), events).await;
+        handle_command(command, config, credential, bridge.as_mut(), events, owner).await;
+    }
+}
+
+/// The logical Nakode session a Claude backend serves; its environment is keyed by it.
+fn session_owner(attachment: Option<&BackendCommand>) -> Option<&str> {
+    match attachment? {
+        BackendCommand::StartSession {
+            owner_session_id, ..
+        }
+        | BackendCommand::ResumeSession {
+            owner_session_id, ..
+        } => owner_session_id.as_deref(),
+        _ => None,
     }
 }
 
@@ -747,6 +763,7 @@ async fn handle_command(
     credential: Option<&ClaudeOAuthCredential>,
     bridge: Option<&mut Bridge>,
     events: &mpsc::Sender<BackendEvent>,
+    owner: Option<&str>,
 ) {
     if matches!(
         command,
@@ -823,6 +840,14 @@ async fn handle_command(
         "oauthAccessToken".to_owned(),
         Value::String(credential.expect("checked above").access_token.clone()),
     );
+    // Claude Code's own tools run in its process, so a turn carries the session's environment
+    // (account variables such as GH_TOKEN) the way Nakode's own shell tools receive it.
+    if method == "send" {
+        object.insert(
+            "environment".to_owned(),
+            json!(crate::session_environment::read(owner)),
+        );
+    }
     if let Err(error) = send(bridge, payload).await {
         request_failed(events, operation_for_method(method), error).await;
     }
@@ -2061,6 +2086,24 @@ mod tests {
             .expect("send request");
         assert_eq!(text.method, "send");
         assert_eq!(text.payload["prompt"], "Inspect the selected image");
+    }
+
+    #[test]
+    fn turns_carry_the_owning_session_environment_to_claude_code() {
+        let resume = BackendCommand::ResumeSession {
+            provider_session_id: "claude-session".to_owned(),
+            owner_session_id: Some("owner".to_owned()),
+            enabled_skill_ids: Vec::new(),
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
+            code_mode: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
+        };
+        assert_eq!(session_owner(Some(&resume)), Some("owner"));
+        assert_eq!(session_owner(None), None);
+        assert!(BRIDGE_SOURCE.contains("env: { ...process.env, ...(command.environment || {}) }"));
     }
 
     #[test]
