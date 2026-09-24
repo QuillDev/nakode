@@ -2,8 +2,6 @@ import {
   query,
   createSdkMcpServer,
   getSessionMessages,
-  filterEscalatingDefaultMode,
-  resolveSettings,
   tool,
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
@@ -508,14 +506,23 @@ function archetypePolicy(instructions) {
   };
 }
 
-async function permissionMode(workspace) {
-  const resolved = await resolveSettings({
-    cwd: workspace,
-    settingSources: ["user", "project", "local"],
-  });
-  return (
-    filterEscalatingDefaultMode(resolved).permissions?.defaultMode || "auto"
-  );
+// Nakode sessions run unattended, like Codex's never-ask full-access sessions: archetype allow and
+// deny lists still apply through the PreToolUse hook, but Claude Code's own permission prompts and
+// auto-mode classifier do not. Claude Code's `permissions.defaultMode` is the owner's choice for
+// interactive Claude Code and does not govern Nakode; NAKODE_CLAUDE_PERMISSION_MODE does.
+const PERMISSION_MODES = new Set([
+  "bypassPermissions",
+  "auto",
+  "acceptEdits",
+  "default",
+  "plan",
+]);
+
+function permissionMode() {
+  const configured = process.env.NAKODE_CLAUDE_PERMISSION_MODE?.trim();
+  return configured && PERMISSION_MODES.has(configured)
+    ? configured
+    : "bypassPermissions";
 }
 
 function parseValidatorResult(result) {
@@ -864,7 +871,7 @@ async function sendTurn(command) {
   session.model = model;
   const mode = session.securityValidator
     ? "dontAsk"
-    : await permissionMode(command.workspace);
+    : permissionMode();
   const processLifecycle = providerProcessLifecycle(command.oauthAccessToken);
   const allowedTools = effectiveAllowedTools(session);
   const mcpServers = {};
@@ -896,6 +903,7 @@ async function sendTurn(command) {
     includePartialMessages: true,
     abortController,
     permissionMode: mode,
+    ...(mode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
     ...(session.maxTurns ? { maxTurns: session.maxTurns } : {}),
     ...(builtinTools !== null ? { tools: builtinTools } : {}),
     ...(session.deniedTools.length > 0

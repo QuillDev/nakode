@@ -2226,9 +2226,11 @@ process.stdout.write(output);
     }
 
     #[test]
-    fn claude_uses_auto_as_the_filtered_default_and_an_attributed_validator() {
-        assert!(BRIDGE_SOURCE.contains("filterEscalatingDefaultMode"));
-        assert!(BRIDGE_SOURCE.contains("defaultMode || \"auto\""));
+    fn claude_bypasses_permissions_by_default_and_keeps_an_attributed_validator() {
+        assert!(BRIDGE_SOURCE.contains("NAKODE_CLAUDE_PERMISSION_MODE"));
+        assert!(BRIDGE_SOURCE.contains(": \"bypassPermissions\";"));
+        assert!(BRIDGE_SOURCE.contains("allowDangerouslySkipPermissions: true"));
+        assert!(!BRIDGE_SOURCE.contains("filterEscalatingDefaultMode"));
         assert!(BRIDGE_SOURCE.contains("NAKODE_SECURITY_VALIDATOR_AGENT"));
         assert!(BRIDGE_SOURCE.contains("SecurityValidation"));
         assert!(BRIDGE_SOURCE.contains("validated: false"));
