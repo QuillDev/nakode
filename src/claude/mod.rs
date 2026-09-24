@@ -1419,38 +1419,33 @@ async fn return_image(
         .turns
         .insert(turn_id.clone(), (count + loaded.len(), bytes + added));
     let total = loaded.len();
-    for (
-        index,
-        LoadedImage {
+    // One call is one message: every image it names travels in the same reply.
+    let mut attachments = loaded.into_iter().map(
+        |LoadedImage {
+             label,
+             mime_type,
+             data,
+         }| crate::backend::PromptAttachment {
             label,
-            mime_type,
-            data,
+            path: None,
+            image: Some(crate::backend::PromptImage { mime_type, data }),
         },
-    ) in loaded.into_iter().enumerate()
-    {
-        let key = if total == 1 {
-            call_id.clone()
-        } else {
-            format!("{call_id}:{index}")
-        };
-        let image = crate::runtime::ReturnedImage {
-            id: format!("{turn_id}:image:{key}"),
-            turn_id: turn_id.clone(),
-            provider_id: CLAUDE_PROVIDER.to_owned(),
-            model_id: string(message, "model"),
-            history_index: 0,
-            sequence: count + index,
-            attachment: crate::backend::PromptAttachment {
-                label,
-                path: None,
-                image: Some(crate::backend::PromptImage { mime_type, data }),
-            },
-        };
-        events
-            .send(BackendEvent::ImageReturned(image))
-            .await
-            .map_err(|_| "session event receiver closed".to_owned())?;
-    }
+    );
+    let first = attachments.next().ok_or("no image to return")?;
+    let image = crate::runtime::ReturnedImage {
+        id: format!("{turn_id}:image:{call_id}"),
+        turn_id,
+        provider_id: CLAUDE_PROVIDER.to_owned(),
+        model_id: string(message, "model"),
+        history_index: 0,
+        sequence: count,
+        attachment: first,
+        more_attachments: attachments.collect(),
+    };
+    events
+        .send(BackendEvent::ImageReturned(image))
+        .await
+        .map_err(|_| "session event receiver closed".to_owned())?;
     Ok(returned_images_output(total))
 }
 

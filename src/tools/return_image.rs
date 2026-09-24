@@ -178,55 +178,50 @@ impl Tool for ReturnImageTool {
                     .values()
                     .filter(|image| image.turn_id == context.turn_id)
                     .collect::<Vec<_>>();
-                if turn_images.len() + paths.len() > MAX_IMAGES_PER_TURN {
+                let returned: usize = turn_images.iter().map(|image| image.image_count()).sum();
+                if returned + paths.len() > MAX_IMAGES_PER_TURN {
                     return Err("at most eight images may be returned per turn".to_owned());
                 }
-                let retained_bytes: usize = turn_images
-                    .iter()
-                    .filter_map(|image| image.attachment.image.as_ref())
-                    .map(|image| image.data.len())
-                    .sum();
+                let retained_bytes: usize =
+                    turn_images.iter().map(|image| image.image_bytes()).sum();
                 let loaded = load_returnable_images(context.workspace, &paths).await?;
                 let added: usize = loaded.iter().map(|image| image.data.len()).sum();
                 if retained_bytes.saturating_add(added) > MAX_BYTES_PER_TURN {
                     return Err("returned images exceed 20 MiB per turn".to_owned());
                 }
                 let count = loaded.len();
-                for (
-                    index,
-                    LoadedImage {
+                // One call is one message: every image it names travels in the same reply.
+                let mut attachments = loaded.into_iter().map(
+                    |LoadedImage {
+                         label,
+                         mime_type,
+                         data,
+                     }| PromptAttachment {
                         label,
-                        mime_type,
-                        data,
+                        path: None,
+                        image: Some(PromptImage { mime_type, data }),
                     },
-                ) in loaded.into_iter().enumerate()
-                {
-                    // One image keeps the call's own identity; several are numbered in order.
-                    let key = if count == 1 {
-                        context.call_id.to_owned()
-                    } else {
-                        format!("{}:{index}", context.call_id)
-                    };
-                    let image = ReturnedImage {
-                        id: format!("{}:image:{key}", context.turn_id),
-                        turn_id: context.turn_id.to_owned(),
-                        provider_id: context.session.provider_id.clone(),
-                        model_id: context.session.model.clone(),
-                        history_index: context.session.history_position(),
-                        sequence: context.session.returned_images.len(),
-                        attachment: PromptAttachment {
-                            label,
-                            path: None,
-                            image: Some(PromptImage { mime_type, data }),
-                        },
-                    };
-                    context
-                        .backend_events
-                        .send(BackendEvent::ImageReturned(image.clone()))
-                        .await
-                        .map_err(|_| "session event receiver closed")?;
-                    context.session.returned_images.insert(key, image);
-                }
+                );
+                let first = attachments.next().ok_or("no image to return")?;
+                let image = ReturnedImage {
+                    id: format!("{}:image:{}", context.turn_id, context.call_id),
+                    turn_id: context.turn_id.to_owned(),
+                    provider_id: context.session.provider_id.clone(),
+                    model_id: context.session.model.clone(),
+                    history_index: context.session.history_position(),
+                    sequence: context.session.returned_images.len(),
+                    attachment: first,
+                    more_attachments: attachments.collect(),
+                };
+                context
+                    .backend_events
+                    .send(BackendEvent::ImageReturned(image.clone()))
+                    .await
+                    .map_err(|_| "session event receiver closed")?;
+                context
+                    .session
+                    .returned_images
+                    .insert(context.call_id.to_owned(), image);
                 Ok(returned_images_output(count))
             };
             tokio::select! {

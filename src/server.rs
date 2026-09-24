@@ -10216,6 +10216,7 @@ enabled = false
                             data: data.clone(),
                         }),
                     },
+                    more_attachments: Vec::new(),
                 }),
             );
         let QueryResult::Session(session) = core

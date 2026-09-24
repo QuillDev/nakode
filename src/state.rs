@@ -7379,9 +7379,9 @@ impl DomainState {
             BackendEvent::ImageReturned(image) => {
                 let history = image.history_item();
                 self.observe_item(&image.turn_id, history.item, true);
-                if let Some(data) = image.attachment.image {
-                    self.transcript
-                        .set_labeled_images(&image.id, vec![(image.attachment.label, data)]);
+                let images = image.labeled_images();
+                if !images.is_empty() {
+                    self.transcript.set_labeled_images(&image.id, images);
                 }
             }
             BackendEvent::ItemCompleted { turn_id, item } => {
@@ -10385,11 +10385,11 @@ impl DomainState {
         let history = image.history_item();
         self.record_subagent_item(run_id, &image.turn_id, &history.item);
         self.observe_subagent_item(run_id, history.item);
+        let images = image.labeled_images();
         if let Some(chat) = self.subagent_chats.get_mut(run_id)
-            && let Some(data) = image.attachment.image
+            && !images.is_empty()
         {
-            chat.transcript
-                .set_labeled_images(&image.id, vec![(image.attachment.label, data)]);
+            chat.transcript.set_labeled_images(&image.id, images);
         }
         Vec::new()
     }

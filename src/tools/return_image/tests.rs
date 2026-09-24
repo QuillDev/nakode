@@ -275,10 +275,13 @@ async fn several_images_attach_in_order_in_one_call_or_not_at_all() {
         result.output,
         "2 images attached to the assistant transcript."
     );
-    let mut labels = Vec::new();
-    while let Ok(BackendEvent::ImageReturned(image)) = receiver.try_recv() {
-        labels.push((image.attachment.label, image.sequence));
-    }
-    assert_eq!(labels, vec![("one.png".into(), 0), ("two.png".into(), 1)]);
-    assert_eq!(session.returned_images.len(), 2);
+    // One call is one message: a single reply carries both images, in the order named.
+    let Ok(BackendEvent::ImageReturned(image)) = receiver.try_recv() else {
+        panic!("one image reply");
+    };
+    assert!(receiver.try_recv().is_err());
+    let labels: Vec<_> = image.attachments().map(|a| a.label.clone()).collect();
+    assert_eq!(labels, vec!["one.png".to_owned(), "two.png".to_owned()]);
+    assert_eq!(image.history_item().attachments.len(), 2);
+    assert_eq!(session.returned_images.len(), 1);
 }
