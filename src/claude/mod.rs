@@ -1849,6 +1849,24 @@ fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
                 Some("failed") => ItemStatus::Failed,
                 _ => ItemStatus::Complete,
             };
+            let body = string(value, "body");
+            // Saved history keeps a tool call as `{input, output}` in its body; rebuild the audit a
+            // live call carries so a restored transcript presents it the same way.
+            let tool_audit_json = (kind == ItemKind::Tool)
+                .then(|| serde_json::from_str::<Value>(&body).ok())
+                .flatten()
+                .filter(|saved| saved.get("input").is_some())
+                .and_then(|saved| {
+                    tool_audit(
+                        &json!({
+                            "callId": string(value, "id"),
+                            "name": string(value, "title"),
+                            "args": saved["input"],
+                            "result": saved,
+                        }),
+                        status,
+                    )
+                });
             crate::backend::SessionHistoryItem {
                 turn_id: string(value, "turnId"),
                 provider_id: None,
@@ -1858,9 +1876,9 @@ fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
                     id: string(value, "id"),
                     kind,
                     title: string(value, "title"),
-                    body: string(value, "body"),
+                    body,
                     status,
-                    tool_audit_json: None,
+                    tool_audit_json,
                 },
             }
         })
@@ -1878,13 +1896,38 @@ fn tool_call_event(message: &Value) -> BackendEvent {
         .or_else(|| message.get("args"))
         .map_or_else(String::new, display_value);
     let name = string(message, "name");
+    let item = NormalizedItem {
+        id: string(message, "callId"),
+        kind: ItemKind::Tool,
+        title: name,
+        body,
+        status,
+        tool_audit_json: tool_audit(message, status),
+    };
+    if status == ItemStatus::Running {
+        BackendEvent::ItemStarted {
+            turn_id: string(message, "turnId"),
+            item,
+        }
+    } else {
+        BackendEvent::ItemCompleted {
+            turn_id: string(message, "turnId"),
+            item,
+        }
+    }
+}
+
+/// The audit a Claude tool call carries, live or rebuilt from saved history, so transcripts
+/// present both the same way.
+fn tool_audit(message: &Value, status: ItemStatus) -> Option<Box<str>> {
+    let name = string(message, "name");
     let arguments = message
         .get("args")
         .or_else(|| message.pointer("/result/input"))
         .cloned()
         .unwrap_or(Value::Null);
     let output = message.pointer("/result/output").cloned();
-    let tool_audit_json = serde_json::to_string(&json!({
+    serde_json::to_string(&json!({
         "version": 1,
         "callId": string(message, "callId"),
         "name": name,
@@ -1907,26 +1950,7 @@ fn tool_call_event(message: &Value) -> BackendEvent {
         "denialReason": message.get("denialReason").and_then(Value::as_str),
     }))
     .ok()
-    .map(String::into_boxed_str);
-    let item = NormalizedItem {
-        id: string(message, "callId"),
-        kind: ItemKind::Tool,
-        title: name,
-        body,
-        status,
-        tool_audit_json,
-    };
-    if status == ItemStatus::Running {
-        BackendEvent::ItemStarted {
-            turn_id: string(message, "turnId"),
-            item,
-        }
-    } else {
-        BackendEvent::ItemCompleted {
-            turn_id: string(message, "turnId"),
-            item,
-        }
-    }
+    .map(String::into_boxed_str)
 }
 
 fn bounded_claude_audit_value(value: &Value) -> Value {
@@ -2122,6 +2146,29 @@ mod tests {
             .expect("send request");
         assert_eq!(text.method, "send");
         assert_eq!(text.payload["prompt"], "Inspect the selected image");
+    }
+
+    #[test]
+    fn restored_tool_calls_carry_the_audit_a_live_call_does() {
+        let history = session_history(&json!({"history": [
+            {"turnId":"t","id":"call-1","kind":"tool","title":"Bash","status":"complete",
+             "body":"{\"input\":{\"command\":\"git status\"},\"output\":\"clean\"}"},
+            {"turnId":"t","id":"text","kind":"assistant","title":"CLAUDE","status":"complete","body":"{\"input\":1}"}
+        ]}));
+        let audit: Value = serde_json::from_str(
+            history[0]
+                .item
+                .tool_audit_json
+                .as_deref()
+                .expect("restored tool audit"),
+        )
+        .expect("audit json");
+        assert_eq!(audit["name"], "Bash");
+        assert_eq!(audit["callId"], "call-1");
+        assert_eq!(audit["status"], "completed");
+        assert!(audit["input"].to_string().contains("git status"));
+        assert!(audit["output"].to_string().contains("clean"));
+        assert!(history[1].item.tool_audit_json.is_none());
     }
 
     #[test]
