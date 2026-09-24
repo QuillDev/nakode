@@ -115,6 +115,26 @@ pub struct ServerCore {
     soul_store: Option<SoulStore>,
 }
 
+/// Entry digests kept across reads of a session that is rebuilt for every query. Its entries keep
+/// stable retained ids, so a read after the first hashes only what changed. Bounded to the
+/// sessions read most recently.
+fn retained_entry_digests(session_id: &str) -> crate::domain_transcript::EntryDigests {
+    use std::sync::{LazyLock, Mutex, PoisonError};
+    const KEPT: usize = 16;
+    static KEPT_DIGESTS: LazyLock<
+        Mutex<std::collections::VecDeque<(String, crate::domain_transcript::EntryDigests)>>,
+    > = LazyLock::new(Mutex::default);
+    let mut kept = KEPT_DIGESTS.lock().unwrap_or_else(PoisonError::into_inner);
+    let digests = kept
+        .iter()
+        .position(|(id, _)| id == session_id)
+        .and_then(|index| kept.remove(index))
+        .map_or_else(Default::default, |(_, digests)| digests);
+    kept.push_front((session_id.to_owned(), digests.clone()));
+    kept.truncate(KEPT);
+    digests
+}
+
 impl ServerCore {
     #[must_use]
     pub fn new(
@@ -4354,6 +4374,9 @@ impl ServerCore {
         let _corrections = state.install_subagents(children);
         state.install_shared_context(shared_context);
         state.transcript.retain_entry_ids(&session.id);
+        state
+            .transcript
+            .share_entry_digests(retained_entry_digests(&session.id));
         let engine = ServiceEngine::new(state);
         let state = engine.state();
         match query {

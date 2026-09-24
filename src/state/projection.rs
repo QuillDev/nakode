@@ -1917,28 +1917,79 @@ fn transcript_body_digest(body: &str) -> String {
     format!("{:x}", Sha256::digest(body.as_bytes()))
 }
 
+/// What one entry contributes to the proofs, computed once per version of the entry.
+fn entry_digest(
+    transcript: &DomainTranscript,
+    entry: &TranscriptEntry,
+) -> std::sync::Arc<crate::domain_transcript::EntryDigest> {
+    transcript.entry_digest(entry, |entry| {
+        use sha2::{Digest, Sha256};
+        crate::domain_transcript::EntryDigest {
+            content: Sha256::digest(serde_json::to_vec(entry).unwrap_or_default()).into(),
+            body_sha256: transcript_body_digest(&entry.body),
+            parent_item_id: tool_audit_identity(entry, "parentItemId"),
+            codemode_tool: entry.kind == EntryKind::Tool
+                && tool_audit_identity(entry, "name").as_deref() == Some("codemode"),
+        }
+    })
+}
+
+/// A proof per visible prefix: each chains the previous one with the next entry's digest, its
+/// image count and its code-mode parent. Only entries that changed are serialized and hashed
+/// again; the chain itself costs one small hash per entry.
 fn transcript_prefixes(transcript: &DomainTranscript) -> Option<Vec<String>> {
     use sha2::{Digest, Sha256};
-    let mut digest = Sha256::new();
-    digest.update(b"nakode.transcript.prefix.v1");
-    digest.update([u8::from(transcript.has_earlier_entries())]);
-    let mut prefixes = vec![format!("{:x}", digest.clone().finalize())];
-    for entry in transcript
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+    };
+    let digests = transcript
         .entries()
         .iter()
-        .filter(|entry| visible_transcript_entry(entry))
+        .map(|entry| (entry, entry_digest(transcript, entry)))
+        .collect::<Vec<_>>();
+    transcript.prune_entry_digests();
+    let codemode_tools = digests
+        .iter()
+        .filter(|(_, digest)| digest.codemode_tool)
+        .map(|(entry, _)| entry.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut start = Sha256::new();
+    start.update(b"nakode.transcript.prefix.v2");
+    start.update([u8::from(transcript.has_earlier_entries())]);
+    let mut current: [u8; 32] = start.finalize().into();
+    let mut prefixes = vec![hex(&current)];
+    for (entry, digest) in digests
+        .iter()
+        .filter(|(entry, _)| visible_transcript_entry(entry))
     {
-        // Length framing covers full canonical content plus derived entry references, not bounded
-        // bodies. Cache all checkpoints once per domain mutation, not once per fetched page.
-        let bytes = serde_json::to_vec(&(
-            entry,
-            transcript.image_artifacts(entry).count(),
-            parent_tool_entry_id(transcript, entry),
-        ))
-        .ok()?;
-        digest.update(u64::try_from(bytes.len()).ok()?.to_le_bytes());
-        digest.update(bytes);
-        prefixes.push(format!("{:x}", digest.clone().finalize()));
+        let mut step = Sha256::new();
+        step.update(current);
+        step.update(digest.content);
+        step.update(
+            u64::try_from(transcript.image_artifacts(entry).count())
+                .ok()?
+                .to_le_bytes(),
+        );
+        match digest
+            .parent_item_id
+            .as_deref()
+            .filter(|parent| codemode_tools.contains(parent))
+        {
+            Some(parent) => {
+                step.update([1]);
+                step.update(u64::try_from(parent.len()).ok()?.to_le_bytes());
+                step.update(parent.as_bytes());
+            }
+            None => step.update([0]),
+        }
+        current = step.finalize().into();
+        prefixes.push(hex(&current));
     }
     Some(prefixes)
 }
@@ -2154,7 +2205,7 @@ fn transcript_entry_view(
     include_coordination: bool,
 ) -> TranscriptEntryView {
     let mut view = TranscriptEntryView {
-        body_sha256: transcript_body_digest(&entry.body),
+        body_sha256: entry_digest(transcript, entry).body_sha256.clone(),
         id: EntryId::from(entry.id.clone()),
         kind: entry_kind(entry.kind),
         title: entry.title.clone(),
@@ -2713,6 +2764,91 @@ mod tests {
         let removed = super::projected_transcript_page(&transcript, Some(before), 3, 1024)
             .expect("removed prefix");
         assert_ne!(removed.prefix_through, changed.prefix_through);
+    }
+
+    #[test]
+    fn reused_entry_digests_prove_the_same_prefixes_as_a_fresh_computation() {
+        type Mutation = fn(&mut DomainTranscript);
+        let mut transcript = DomainTranscript::new(1);
+        for index in 0..4 {
+            transcript.upsert(
+                format!("row-{index}"),
+                EntryKind::Tool,
+                "tool",
+                "body",
+                EntryStatus::Complete,
+            );
+        }
+        let mutations: [Mutation; 9] = [
+            |t| t.append_delta("row-3", EntryKind::Tool, "tool", "streamed"),
+            |t| t.append_delta("row-4", EntryKind::Assistant, "answer", "new row"),
+            |t| t.set_status("row-1", EntryStatus::Failed),
+            |t| t.replace_body("row-0", "body", EntryStatus::Complete),
+            |t| t.set_tool_audit("row-2", Some(r#"{"name":"codemode"}"#.into())),
+            |t| t.set_tool_audit("row-3", Some(r#"{"parentItemId":"x"}"#.into())),
+            |t| t.move_before("row-4", "row-1"),
+            |t| t.remove("row-2"),
+            |t| t.retain_entry_ids("retained-session"),
+        ];
+        for mutate in mutations {
+            let _warm = super::transcript_prefixes(&transcript).expect("warm");
+            mutate(&mut transcript);
+            let mut fresh = transcript.clone();
+            fresh.share_entry_digests(crate::domain_transcript::EntryDigests::default());
+            assert_eq!(
+                super::transcript_prefixes(&transcript),
+                super::transcript_prefixes(&fresh),
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_into_the_last_entry_rehashes_only_that_entry() {
+        let mut transcript = DomainTranscript::new(1);
+        for index in 0..3 {
+            transcript.upsert(
+                format!("row-{index}"),
+                EntryKind::Assistant,
+                "answer",
+                "body",
+                EntryStatus::Complete,
+            );
+        }
+        let digest =
+            |t: &DomainTranscript, index: usize| super::entry_digest(t, &t.entries()[index]);
+        let before = super::transcript_prefixes(&transcript).expect("prefixes");
+        let (first, last) = (digest(&transcript, 0), digest(&transcript, 2));
+        transcript.append_delta("row-2", EntryKind::Assistant, "answer", " more");
+        let after = super::transcript_prefixes(&transcript).expect("prefixes");
+        assert!(std::sync::Arc::ptr_eq(&first, &digest(&transcript, 0)));
+        assert!(!std::sync::Arc::ptr_eq(&last, &digest(&transcript, 2)));
+        assert_eq!(before[..3], after[..3]);
+        assert_ne!(before[3], after[3]);
+    }
+
+    #[test]
+    fn a_rebuilt_transcript_reuses_shared_digests_of_unchanged_entries() {
+        let shared = crate::domain_transcript::EntryDigests::default();
+        let build = || {
+            let mut transcript = DomainTranscript::new(1);
+            transcript.upsert(
+                "row",
+                EntryKind::User,
+                "YOU",
+                "hello",
+                EntryStatus::Complete,
+            );
+            // Installed history carries no creation time, so a rebuild is entry-for-entry equal.
+            transcript.set_created_at_ms("row", None);
+            transcript.retain_entry_ids("retained");
+            transcript.share_entry_digests(shared.clone());
+            transcript
+        };
+        let (first, second) = (build(), build());
+        assert!(std::sync::Arc::ptr_eq(
+            &super::entry_digest(&first, &first.entries()[0]),
+            &super::entry_digest(&second, &second.entries()[0]),
+        ));
     }
 
     #[test]
