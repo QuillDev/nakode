@@ -50,6 +50,7 @@ use crate::{
 mod child_creation;
 mod child_materials;
 mod followups;
+mod relationships;
 
 use super::{BridgeStateCheckpoint, ServerCore};
 
@@ -1345,6 +1346,9 @@ impl NativeServerRuntime {
             }
         };
         let Some(request) = self.handle_followup_request(request) else {
+            return;
+        };
+        let Some(request) = self.handle_relationship_request(request) else {
             return;
         };
         let child_question_store = if matches!(

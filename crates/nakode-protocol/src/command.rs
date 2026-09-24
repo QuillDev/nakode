@@ -302,6 +302,15 @@ pub enum Command {
         paused: bool,
     },
     /// Same-runtime logical sessions only. The authenticated integration supplies owner intent.
+    /// Authenticated source call supplies the new parent; the model never selects one.
+    ReparentChildSession {
+        source_session_id: SessionId,
+        source_call_id: String,
+        child_session_id: SessionId,
+        expected_parent_session_id: Option<SessionId>,
+        expected_relationship_revision: u64,
+        transfer: bool,
+    },
     LinkChildSession {
         parent_session_id: SessionId,
         child_session_id: SessionId,

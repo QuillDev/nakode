@@ -1,4 +1,5 @@
 use super::*;
+mod relationships;
 use crate::followups::InboxStore;
 use nakode_protocol::{CommandAccepted, FollowupInbox, PromptInput, ServiceError};
 
