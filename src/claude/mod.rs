@@ -1765,6 +1765,42 @@ async fn keep_history_snapshot(database: PathBuf, message: &Value) {
     }
 }
 
+/// Keeps a history snapshot for each retained Claude session that has none yet, reading the
+/// Claude SDK's transcript through one short-lived bridge without resuming any session.
+pub async fn backfill_history_snapshots(database: PathBuf, sessions: Vec<(String, PathBuf)>) {
+    let missing: Vec<_> = sessions
+        .into_iter()
+        .filter(|(session_id, _)| matches!(retained_history(&database, session_id), Ok(None)))
+        .collect();
+    let Some((_, first)) = missing.first() else {
+        return;
+    };
+    let mut bridge = match spawn_bridge(first).await {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            eprintln!("claude: history snapshot backfill skipped: {error}");
+            return;
+        }
+    };
+    'sessions: for (session_id, workspace) in missing {
+        let request = json!({"method":"history","sessionId":session_id,"workspace":workspace});
+        if send(&mut bridge, request).await.is_err() {
+            break;
+        }
+        loop {
+            match timeout(Duration::from_secs(30), bridge.messages.recv()).await {
+                Ok(Some(message)) if message["event"] == "history_snapshot" => {
+                    keep_history_snapshot(database.clone(), &message).await;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                _ => break 'sessions,
+            }
+        }
+    }
+    bridge.task.abort();
+}
+
 /// The last history snapshot kept for a Claude session, when there is one.
 ///
 /// # Errors

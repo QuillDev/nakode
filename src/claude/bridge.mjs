@@ -460,7 +460,7 @@ async function createSession(command, resumed) {
       : [],
     replaceBuiltinTools: command.replaceBuiltinTools === true,
   });
-  const history = resumed ? await readHistory(command.workspace, sessionId) : [];
+  const history = resumed ? ((await readHistory(command.workspace, sessionId)) ?? []) : [];
   write({
     event: resumed ? "session_resumed" : "session_created",
     requestId: command.requestId,
@@ -470,7 +470,7 @@ async function createSession(command, resumed) {
   });
 }
 
-/** The session's history as a resume rebuilds it; empty, with a diagnostic, when unreadable. */
+/** The session's history as a resume rebuilds it; null, with a diagnostic, when unreadable. */
 async function readHistory(workspace, sessionId) {
   try {
     return [
@@ -482,7 +482,7 @@ async function readHistory(workspace, sessionId) {
       event: "diagnostic",
       message: `could not read Claude session history: ${errorMessage(error)}`,
     });
-    return [];
+    return null;
   }
 }
 
@@ -1170,6 +1170,13 @@ async function handle(command) {
       break;
     case "send":
       await sendTurn(command);
+      break;
+    case "history":
+      write({
+        event: "history_snapshot",
+        sessionId: command.sessionId,
+        history: await readHistory(command.workspace, command.sessionId),
+      });
       break;
     case "set_options": {
       const session = sessions.get(command.sessionId);

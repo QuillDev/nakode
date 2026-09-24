@@ -532,8 +532,32 @@ impl NativeServerRuntime {
         )
     }
 
+    /// Claude history lives in the Claude SDK; keep a snapshot of each retained session that has
+    /// none yet so it reads back without being reopened.
+    fn backfill_claude_history_snapshots(&self) {
+        let claude_sessions: Vec<_> = self
+            .core
+            .sessions
+            .iter()
+            .filter(|session| session.provider == crate::backend::CLAUDE_PROVIDER)
+            .map(|session| {
+                (
+                    session.provider_session_id.clone(),
+                    PathBuf::from(&session.working_directory),
+                )
+            })
+            .collect();
+        if !claude_sessions.is_empty() {
+            tokio::spawn(claude::backfill_history_snapshots(
+                self.effects.persistence.database.clone(),
+                claude_sessions,
+            ));
+        }
+    }
+
     pub(crate) async fn run(mut self) {
         self.refresh_builtin_tool_availability();
+        self.backfill_claude_history_snapshots();
         let mut backend_open = true;
         let mut shell_open = true;
         let mut shutdown_open = true;
