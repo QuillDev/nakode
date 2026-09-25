@@ -1760,6 +1760,7 @@ impl NakodeClient {
     }
 
     typed_mutation!(link_child_session, api::LinkChildSessionRequest);
+    typed_mutation!(reparent_child_session, api::ReparentChildSessionRequest);
     typed_mutation!(publish_child_report, api::PublishChildReportRequest);
 
     /// Reads ordered inert reports without opening either session or starting inference.
@@ -3363,6 +3364,7 @@ mod tests {
     fn session_view(id: &str) -> protocol::SessionView {
         protocol::SessionView {
             parent_session_id: None,
+            relationship_revision: None,
             id: protocol::SessionId::from(id),
             revision: 1,
             workspace_id: protocol::WorkspaceId::from("workspace-a"),

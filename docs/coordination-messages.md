@@ -5,7 +5,7 @@
 `RelayAgentFollowup` is distinct from ordinary `EnqueueFollowup`. The runtime verifies an exact
 live pending `SendAgentMessage` call on the source session, including destination, unchanged text,
 and selected source-image bytes. Producer-supplied roles, headers and JSON never establish origin.
-The same-owner, immutable logical parent/child link grants `delegated_instruction`, and so does an
+The same-owner, current canonical logical parent/child link grants `delegated_instruction`, and so does an
 integration-vouched owner Chat (`source_owner_chat`), which may instruct any same-owner session it
 did not start; the vouch is stored with the message and honoured when a batch is claimed. An owner Chat's instruction also makes it the
 agent's parent, re-pointing the existing link (report and question history stay with the agent), so

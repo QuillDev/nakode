@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 pub mod completion;
+pub(crate) mod relationships;
 pub(crate) use completion::display as completion_display;
 
 pub(crate) struct ReportStore(Connection);

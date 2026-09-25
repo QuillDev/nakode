@@ -107,6 +107,7 @@ pub fn is_pending_provider_session_id(provider_session_id: &str) -> bool {
 pub struct SessionRecord {
     /// Read-only projection of the canonical durable child link.
     pub parent_session_id: Option<String>,
+    pub relationship_revision: u64,
     /// Bounded display metadata from accepted prompts or normalized legacy runtime history.
     pub first_prompt_preview: String,
     pub id: String,
@@ -1575,6 +1576,10 @@ impl SqliteSessionRepository {
              );",
         )?;
         execute_batch_with_busy_retry(&connection, include_str!("followups/schema.sql"))?;
+        execute_batch_with_busy_retry(
+            &connection,
+            include_str!("child_reports/relationships.sql"),
+        )?;
         apply_invocation_telemetry_migration(&mut connection)?;
         let provider_model_columns = {
             let mut statement = connection.prepare("PRAGMA table_info(provider_models)")?;
@@ -2117,6 +2122,7 @@ impl SqliteSessionRepository {
             .map_err(|error| stored_session_conversion_error(20, error))?;
         Ok(SessionRecord {
             parent_session_id: row.get(22)?,
+            relationship_revision: read_relationship_revision(row, 23)?,
             first_prompt_preview: String::new(),
             id: row.get(0)?,
             provider: row.get(1)?,
@@ -3334,7 +3340,8 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
-                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id),
+                    COALESCE((SELECT revision FROM session_relationship_revisions WHERE child_id = sessions.id), 0)
              FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let bounded_limit = i64::try_from(limit.min(500)).expect("limit is at most 500");
@@ -3365,7 +3372,8 @@ impl SessionRepository for SqliteSessionRepository {
             .expect("session database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
-                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id),
+                    COALESCE((SELECT revision FROM session_relationship_revisions WHERE child_id = sessions.id), 0)
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let rows = statement.query_map([], Self::row)?;
@@ -3396,7 +3404,8 @@ impl SessionRepository for SqliteSessionRepository {
         let exact = connection
             .query_row(
                 "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
-                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id),
+                    COALESCE((SELECT revision FROM session_relationship_revisions WHERE child_id = sessions.id), 0)
                  FROM sessions WHERE id = ?1",
                 [id],
                 Self::row,
@@ -3413,7 +3422,8 @@ impl SessionRepository for SqliteSessionRepository {
         }
         let mut statement = connection.prepare(
             "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
-                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id),
+                    COALESCE((SELECT revision FROM session_relationship_revisions WHERE child_id = sessions.id), 0)
              FROM sessions
              WHERE substr(id, 1, length(?1)) = ?1
              ORDER BY updated_at DESC LIMIT 2",
@@ -3501,7 +3511,8 @@ impl SessionRepository for SqliteSessionRepository {
         )?;
         connection.query_row(
             "SELECT id, provider, provider_session_id, workspace, title, model, model_reasoning_effort, model_fast_mode, last_turn_id, last_turn_model, last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome, created_at, updated_at, COALESCE(working_directory, workspace), last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
-                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id),
+                    COALESCE((SELECT revision FROM session_relationship_revisions WHERE child_id = sessions.id), 0)
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -3650,7 +3661,8 @@ impl SessionRepository for SqliteSessionRepository {
                     last_turn_reasoning_effort, last_turn_fast_mode, last_turn_outcome,
                     created_at, updated_at, COALESCE(working_directory, workspace),
                     last_owner_activity_at, enabled_skill_ids_json, account_id, code_mode, tool_configuration_json, initial_instructions,
-                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id)
+                    (SELECT parent_id FROM session_child_links WHERE child_id = sessions.id),
+                    COALESCE((SELECT revision FROM session_relationship_revisions WHERE child_id = sessions.id), 0)
              FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, provider_session_id],
             Self::row,
@@ -3677,6 +3689,11 @@ impl SessionRepository for SqliteSessionRepository {
             )
             .map_err(SessionError::ChildRelationship)?;
             record.parent_session_id = Some(parent.to_owned());
+            record.relationship_revision = transaction.query_row(
+                "SELECT revision FROM session_relationship_revisions WHERE child_id = ?1",
+                [&record.id],
+                |row| read_relationship_revision(row, 0),
+            )?;
         }
         if let Some(prompt) = owner_prompt {
             record_owner_prompt_on(&transaction, &record.id, prompt)?;
@@ -5699,6 +5716,11 @@ fn unix_timestamp() -> i64 {
         .as_secs()
         .try_into()
         .unwrap_or(i64::MAX)
+}
+
+fn read_relationship_revision(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
 }
 
 #[cfg(test)]

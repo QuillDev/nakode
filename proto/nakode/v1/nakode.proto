@@ -34,6 +34,7 @@ service NakodeService {
   // Mutation keys are durable within the report domain; replay-only never creates a missing record.
   // Revision fences are unsupported and explicitly rejected. Report sequence is the paging cursor.
   // Same bound profile permits different workspaces; unbound legacy sessions require one workspace.
+  rpc ReparentChildSession(ReparentChildSessionRequest) returns (MutationResult);
   rpc LinkChildSession(LinkChildSessionRequest) returns (MutationResult);
   rpc PublishChildReport(PublishChildReportRequest) returns (MutationResult);
   rpc ListChildReports(ListChildReportsRequest) returns (ChildReportPage);
@@ -145,6 +146,16 @@ service NakodeService {
   rpc GetInvocationSummary(GetInvocationSummaryRequest) returns (InvocationSummary);
   rpc GetInvocationTimeline(GetInvocationTimelineRequest) returns (InvocationTimeline);
   rpc GetServerInfo(google.protobuf.Empty) returns (ServerInfo);
+}
+
+message ReparentChildSessionRequest {
+  MutationOptions mutation = 1;
+  string source_session_id = 2;
+  string source_call_id = 3;
+  string child_session_id = 4;
+  optional string expected_parent_session_id = 5;
+  uint64 expected_relationship_revision = 6;
+  bool transfer = 7;
 }
 
 message LinkChildSessionRequest {
@@ -1381,6 +1392,7 @@ message SessionSummary {
   string first_prompt_preview = 14;
   // Authoritative durable logical parent. Absent for standalone and unknown legacy sessions.
   optional string parent_session_id = 15;
+  optional uint64 relationship_revision = 16;
 }
 enum SessionActivity { SESSION_ACTIVITY_UNSPECIFIED = 0; SESSION_ACTIVITY_IDLE = 1; SESSION_ACTIVITY_CREATING_AGENT_SESSION = 2; SESSION_ACTIVITY_STARTING_TURN = 3; SESSION_ACTIVITY_RUNNING_TURN = 4; SESSION_ACTIVITY_COMPACTING_CONTEXT = 5; SESSION_ACTIVITY_RUNNING_DELEGATES = 6; SESSION_ACTIVITY_RUNNING_SHELL = 7; }
 message TokenUsage { uint64 input_tokens = 1; uint64 output_tokens = 2; uint64 cached_input_tokens = 3; uint64 cache_write_tokens = 4; }
@@ -1464,6 +1476,7 @@ message SessionState {
   // First owner prompt, capped at 512 Unicode characters; distinct from an explicit session title.
   string first_prompt_preview = 38;
   optional string parent_session_id = 39;
+  optional uint64 relationship_revision = 40;
 }
 message SharedContextEntry {
   uint64 sequence = 1;

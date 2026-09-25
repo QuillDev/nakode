@@ -790,7 +790,8 @@ impl ServerCore {
         prompt_id: Option<&str>,
     ) -> DomainCommandOutcome {
         match command {
-            Command::RelayAgentFollowup { .. }
+            Command::ReparentChildSession { .. }
+            | Command::RelayAgentFollowup { .. }
             | Command::EnqueueFollowup { .. }
             | Command::SetFollowupPaused { .. }
             | Command::RemoveFollowup { .. }
@@ -4294,6 +4295,11 @@ impl ServerCore {
                     })
                 }));
                 nakode_protocol::SessionSummary {
+                    relationship_revision: self
+                        .sessions
+                        .iter()
+                        .find(|record| record.id == session.id.as_str())
+                        .map(|record| record.relationship_revision),
                     parent_session_id: self
                         .sessions
                         .iter()
@@ -4677,9 +4683,20 @@ impl ServerCore {
             .ok_or_else(|| DomainCommandError::NotFound(run_id.to_string()))
     }
 
+    fn loaded_session_id(&self, session_id: &SessionId) -> Option<SessionId> {
+        self.sessions_by_id
+            .keys()
+            .find(|loaded| loaded.as_str().starts_with(session_id.as_str()))
+            .cloned()
+    }
+
     fn command_session(&self, command: &Command) -> Option<SessionId> {
         match command {
-            Command::RelayAgentFollowup { session_id, .. }
+            Command::ReparentChildSession {
+                source_session_id: session_id,
+                ..
+            }
+            | Command::RelayAgentFollowup { session_id, .. }
             | Command::EnqueueFollowup { session_id, .. }
             | Command::SetFollowupPaused { session_id, .. }
             | Command::RemoveFollowup { session_id, .. }
@@ -4708,11 +4725,7 @@ impl ServerCore {
                 target: ModelTarget::Session { session_id },
                 ..
             } => Some(session_id.clone()),
-            Command::OpenSession { session_id, .. } => self
-                .sessions_by_id
-                .keys()
-                .find(|loaded| loaded.as_str().starts_with(session_id.as_str()))
-                .cloned(),
+            Command::OpenSession { session_id, .. } => self.loaded_session_id(session_id),
             Command::SteerTurn { turn_id, .. } | Command::CancelTurn { turn_id } => self
                 .provider_turn_id(turn_id)
                 .ok()
@@ -6221,6 +6234,7 @@ mod tests {
         let (mut core, _) = ready_external_tools_server();
         let restored_id = SessionId::from("saved-preview");
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -6273,6 +6287,7 @@ mod tests {
         let canonical = directory.path().canonicalize().expect("canonical cwd");
         let restored_id = SessionId::from("restored-cwd-session");
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -6331,6 +6346,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("persisted cwd");
         let restored_id = SessionId::from("cross-root-session");
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -6447,6 +6463,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("persisted cwd");
         let restored_id = SessionId::from("resume-unsupported-session");
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -7471,6 +7488,7 @@ mod tests {
         core.replace_session_records(
             ids.iter()
                 .map(|id| SessionRecord {
+                    relationship_revision: 0,
                     parent_session_id: None,
                     first_prompt_preview: String::new(),
                     initial_instructions: None,
@@ -7936,6 +7954,7 @@ mod tests {
             allowed_builtin_tools: Some(vec!["read".to_owned()]),
         };
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -8070,6 +8089,7 @@ mod tests {
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-tools-session");
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -8145,6 +8165,7 @@ mod tests {
         let restored_id = SessionId::from("restored-dashboard-session");
         let tools = dashboard_tools("ReadAssociatedTicket", false);
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -8193,6 +8214,7 @@ mod tests {
         install_available_tools(&mut core, CODEX_PROVIDER, &["read"]);
         let restored_id = SessionId::from("restored-unavailable-memory");
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -8304,6 +8326,7 @@ mod tests {
         install_available_tools(&mut core, CLAUDE_PROVIDER, &["read", "ask"]);
         let restored_id = SessionId::from("restored-claude-session");
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -8449,6 +8472,7 @@ mod tests {
         assert_eq!(core.sessions_by_id.len(), session_count);
 
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -8487,6 +8511,7 @@ mod tests {
     fn persisted_initial_engine_is_discoverable_after_restart_reconciliation() {
         let (mut core, initial_id) = ready_codex_server();
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -11772,6 +11797,7 @@ enabled = false
             .expect("first delete rotates the role");
         let successor = core.default_session_id().clone();
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
@@ -11819,6 +11845,7 @@ enabled = false
         let (mut core, _) = ready_codex_server();
         core.session_inventory_complete = true;
         core.replace_session_records(vec![SessionRecord {
+            relationship_revision: 0,
             parent_session_id: None,
             id: id.to_string(),
             working_directory: missing.to_string_lossy().into_owned(),

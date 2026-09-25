@@ -680,6 +680,7 @@ fn bridge_projection_kind(value: i32) -> Result<view::BridgeProjectionKind, Stri
 pub(crate) fn session(value: api::SessionState) -> Result<view::SessionView, String> {
     Ok(view::SessionView {
         parent_session_id: value.parent_session_id.map(view::SessionId::from),
+        relationship_revision: value.relationship_revision,
         id: view::SessionId::from(value.id),
         revision: value.revision,
         workspace_id: view::WorkspaceId::from(value.workspace_id),
@@ -1158,6 +1159,7 @@ fn agent_browser(value: api::AgentBrowser) -> Result<view::AgentBrowserView, Str
 fn session_summary(value: api::SessionSummary) -> view::SessionSummary {
     view::SessionSummary {
         parent_session_id: value.parent_session_id.map(view::SessionId::from),
+        relationship_revision: value.relationship_revision,
         first_prompt_preview: value.first_prompt_preview,
         id: view::SessionId::from(value.id),
         workspace_id: view::WorkspaceId::from(value.workspace_id),

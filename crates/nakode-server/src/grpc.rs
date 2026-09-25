@@ -725,6 +725,20 @@ impl api::nakode_service_server::NakodeService for GrpcService {
     );
 
     command_rpc!(
+        reparent_child_session,
+        api::ReparentChildSessionRequest,
+        input,
+        protocol::Command::ReparentChildSession {
+            source_session_id: input.source_session_id.into(),
+            source_call_id: input.source_call_id,
+            child_session_id: input.child_session_id.into(),
+            expected_parent_session_id: input.expected_parent_session_id.map(Into::into),
+            expected_relationship_revision: input.expected_relationship_revision,
+            transfer: input.transfer,
+        }
+    );
+
+    command_rpc!(
         link_child_session,
         api::LinkChildSessionRequest,
         input,
@@ -3165,6 +3179,7 @@ fn agent_browser(value: protocol::AgentBrowserView) -> api::AgentBrowser {
 pub(crate) fn session_summary(value: protocol::SessionSummary) -> api::SessionSummary {
     api::SessionSummary {
         parent_session_id: value.parent_session_id.map(|id| id.to_string()),
+        relationship_revision: value.relationship_revision,
         first_prompt_preview: value.first_prompt_preview,
         id: value.id.to_string(),
         workspace_id: value.workspace_id.to_string(),
@@ -3200,6 +3215,7 @@ fn session_projection(
 ) -> api::SessionState {
     let mut state = api::SessionState {
         parent_session_id: value.parent_session_id.map(|id| id.to_string()),
+        relationship_revision: value.relationship_revision,
         id: value.id.to_string(),
         revision: value.revision,
         workspace_id: value.workspace_id.to_string(),
@@ -4823,6 +4839,7 @@ mod saved_summary_tests {
     fn summary_preserves_first_prompt_preview_on_wire() {
         let summary = nakode_protocol::SessionSummary {
             parent_session_id: Some(nakode_protocol::SessionId::from("parent")),
+            relationship_revision: None,
             id: nakode_protocol::SessionId::from("saved"),
             workspace_id: nakode_protocol::WorkspaceId::from("workspace"),
             title: "Owner title".to_owned(),
