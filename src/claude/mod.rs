@@ -1869,7 +1869,9 @@ fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
                 });
             crate::backend::SessionHistoryItem {
                 turn_id: string(value, "turnId"),
-                provider_id: None,
+                // Claude's own saved transcript: what Claude produced is Claude's, as it was live.
+                // The model per turn is not recorded there, so it stays unknown.
+                provider_id: (kind != ItemKind::User).then(|| CLAUDE_PROVIDER.to_owned()),
                 model_id: None,
                 attachments: Vec::new(),
                 item: NormalizedItem {
@@ -2169,6 +2171,15 @@ mod tests {
         assert!(audit["input"].to_string().contains("git status"));
         assert!(audit["output"].to_string().contains("clean"));
         assert!(history[1].item.tool_audit_json.is_none());
+        assert!(
+            history
+                .iter()
+                .all(|item| item.provider_id.as_deref() == Some(CLAUDE_PROVIDER))
+        );
+        let owner = session_history(&json!({"history": [
+            {"turnId":"t","id":"u","kind":"user","title":"YOU","status":"complete","body":"hi"}
+        ]}));
+        assert_eq!(owner[0].provider_id, None);
     }
 
     #[test]
