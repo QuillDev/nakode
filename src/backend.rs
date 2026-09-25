@@ -94,6 +94,21 @@ const PROVIDER_TOOL_IDENTITIES: &[(&str, &str, &str)] = &[
         "mcp__nakode__delegate",
     ),
     (CLAUDE_PROVIDER, "return_image", "mcp__nakode__return_image"),
+    (
+        CLAUDE_PROVIDER,
+        "desktop_screenshot",
+        "mcp__nakode__desktop_screenshot",
+    ),
+    (
+        CLAUDE_PROVIDER,
+        "desktop_action",
+        "mcp__nakode__desktop_action",
+    ),
+    (
+        CLAUDE_PROVIDER,
+        "screen_record",
+        "mcp__nakode__screen_record",
+    ),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]

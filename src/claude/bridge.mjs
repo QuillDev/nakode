@@ -86,17 +86,68 @@ async function delegate(ownerSessionId, task, parentRunId = null) {
 // Nakode's own tools for Claude: `delegate` creates attributed sub-agents, and `return_image`
 // attaches an image file from this machine to the transcript. Nakode reads and validates the file
 // itself, so its bytes never pass through the provider.
-function nakodeServer(session, turn, { delegate: withDelegate, returnImage }) {
+function nakodeServer(session, turn, { delegate: withDelegate, returnImage, desktop }) {
   const tools = [];
   if (returnImage) tools.push(returnImageTool(session, turn));
+  for (const name of desktop) tools.push(desktopTool(name, session, turn));
   if (withDelegate) tools.push(delegateTool(session.ownerSessionId, session.attributedRunId));
   return createSdkMcpServer({
     name: "nakode",
     version: "1.0.0",
     instructions:
-      "Nakode tools: delegate bounded work to configured archetypes, and attach images from this machine to the transcript.",
+      "Nakode tools: delegate bounded work to configured archetypes, attach images from this machine to the transcript, and use and record this agent's private desktop when it has one.",
     tools,
   });
+}
+
+/** The agent's private desktop: its screenshots come back as images the model sees. */
+const DESKTOP_TOOLS = {
+  desktop_screenshot: {
+    description:
+      "Capture this agent's private desktop (a virtual screen with a browser, not the owner's screen) and see it. Coordinates in the image are the ones desktop_action uses.",
+    schema: {},
+  },
+  desktop_action: {
+    description:
+      "Use the mouse and keyboard on this agent's private desktop, then see the screen. Start a browser with `fstack-browser <url> &` from Bash. Take a desktop_screenshot first to find coordinates.",
+    schema: {
+      action: z.enum(["click", "double_click", "right_click", "move", "drag", "scroll", "type", "key"]),
+      x: z.number().int().min(0).optional().describe("Screen pixel, from the left"),
+      y: z.number().int().min(0).optional().describe("Screen pixel, from the top"),
+      to_x: z.number().int().min(0).optional().describe("drag: where to release"),
+      to_y: z.number().int().min(0).optional().describe("drag: where to release"),
+      direction: z.enum(["up", "down", "left", "right"]).optional().describe("scroll direction"),
+      amount: z.number().int().min(1).max(20).optional().describe("scroll steps"),
+      text: z.string().optional().describe("type: the text to type"),
+      keys: z.string().optional().describe("key: key names such as Return, Escape or ctrl+l"),
+    },
+  },
+  screen_record: {
+    description:
+      "Record this agent's private desktop as a small MP4 for the owner. `start` begins recording (across turns, up to 5 minutes); do the work you want to show; `stop` compresses it and saves it to the Gallery with a poster frame.",
+    schema: {
+      action: z.enum(["start", "stop"]),
+      name: z.string().optional().describe("start: a short file name, e.g. checkout-flow"),
+    },
+  },
+};
+
+function desktopTool(name, session, turn) {
+  const { description, schema } = DESKTOP_TOOLS[name];
+  return tool(name, description, schema, async (args) =>
+    new Promise((resolve) => {
+      const id = randomUUID();
+      externalToolCalls.set(id, { resolve, sessionId: session.sessionId, turnId: turn.turnId });
+      write({
+        event: "desktop_request",
+        id,
+        turnId: turn.turnId,
+        workspace: turn.workspace,
+        tool: name,
+        arguments: args,
+      });
+    }),
+  );
 }
 
 function returnImageTool(session, turn) {
@@ -185,13 +236,16 @@ function externalToolShape(definition) {
   );
 }
 
-function resolveExternalToolCall(id, output, failed) {
+function resolveExternalToolCall(id, output, failed, image) {
   const pending = externalToolCalls.get(id);
   if (!pending) return;
   externalToolCalls.delete(id);
   pending.resolve({
     isError: failed === true,
-    content: [{ type: "text", text: output || "" }],
+    content: [
+      { type: "text", text: output || "" },
+      ...(image?.data ? [{ type: "image", data: image.data, mimeType: image.mimeType }] : []),
+    ],
   });
 }
 
@@ -251,7 +305,13 @@ function providerToolName(name) {
     : name || "Tool";
 }
 
-const NAKODE_MCP_TOOLS = new Set(["mcp__nakode__delegate", "mcp__nakode__return_image"]);
+const NAKODE_MCP_TOOLS = new Set([
+  "mcp__nakode__delegate",
+  "mcp__nakode__return_image",
+  "mcp__nakode__desktop_screenshot",
+  "mcp__nakode__desktop_action",
+  "mcp__nakode__screen_record",
+]);
 
 function effectiveAllowedTools(session) {
   const external = externalToolNames(session);
@@ -935,11 +995,15 @@ async function sendTurn(command) {
       allows("mcp__nakode__delegate"),
   );
   const returnImage = allows("mcp__nakode__return_image");
-  if (withDelegate || returnImage) {
+  // Offered where this machine gives agents a desktop.
+  const desktop = process.env.DISPLAY
+    ? Object.keys(DESKTOP_TOOLS).filter((name) => allows(`mcp__nakode__${name}`))
+    : [];
+  if (withDelegate || returnImage || desktop.length > 0) {
     mcpServers.nakode = nakodeServer(
       session,
       { turnId: command.turnId, workspace: command.workspace },
-      { delegate: withDelegate, returnImage },
+      { delegate: withDelegate, returnImage, desktop },
     );
   }
   if (session.externalTools.length > 0) {
@@ -1222,6 +1286,9 @@ async function handle(command) {
         command.output,
         command.failed === true,
       );
+      break;
+    case "resolve_desktop":
+      resolveExternalToolCall(command.id, command.output, command.failed === true, command.image);
       break;
     case "cancel": {
       interruptExternalToolCalls(

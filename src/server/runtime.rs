@@ -2260,6 +2260,7 @@ impl NativeServerRuntime {
                 return;
             }
             crate::session_environment::remove(&delete_session_id);
+            crate::tools::desktop::record_discard(&delete_session_id);
         }
         self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);

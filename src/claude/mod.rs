@@ -622,6 +622,13 @@ async fn run_supervisor(
                 if event_name == Some("history_snapshot") {
                     continue;
                 }
+                if event_name == Some("desktop_request") {
+                    let reply = desktop_request(&message, session_owner(attachment.as_ref())).await;
+                    if let Some(bridge) = bridge.as_mut() {
+                        let _ = send(bridge, reply).await;
+                    }
+                    continue;
+                }
                 if event_name == Some("image_return_request") {
                     let (output, failed) = match return_image(&message, &mut returned_images, &events).await {
                         Ok(output) => (output, false),
@@ -1734,6 +1741,59 @@ fn without_context_window(name: &str) -> &str {
         return name;
     }
     name[..index].trim_end()
+}
+
+/// Runs one desktop tool call from the bridge. Screenshots, including the one taken after each
+/// action, come back as an image the model sees.
+async fn desktop_request(message: &Value, owner: Option<&str>) -> Value {
+    use crate::tools::desktop;
+    use base64::Engine as _;
+    let workspace = PathBuf::from(string(message, "workspace"));
+    let arguments = &message["arguments"];
+    let session = owner.map_or_else(|| string(message, "turnId"), str::to_owned);
+    let outcome = match string(message, "tool").as_str() {
+        desktop::SCREENSHOT_TOOL => desktop::screenshot(&workspace).await.map(|shot| {
+            (
+                format!("The {}x{} desktop.", shot.width, shot.height),
+                Some(shot),
+            )
+        }),
+        desktop::ACTION_TOOL => match desktop::act(arguments).await {
+            Ok(said) => {
+                // Let the screen settle so the image shows the action's effect.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                Ok(match desktop::screenshot(&workspace).await {
+                    Ok(shot) => (said, Some(shot)),
+                    Err(error) => (format!("{said}; the screenshot failed: {error}"), None),
+                })
+            }
+            Err(error) => Err(error),
+        },
+        desktop::RECORD_TOOL => match arguments["action"].as_str() {
+            Some("start") => desktop::record_start(&session, arguments["name"].as_str())
+                .await
+                .map(|said| (said, None)),
+            Some("stop") => desktop::record_stop(&session, &workspace)
+                .await
+                .map(|saved| (desktop::describe(&saved), None)),
+            _ => Err("`action` must be \"start\" or \"stop\"".to_owned()),
+        },
+        other => Err(format!("unknown desktop tool {other:?}")),
+    };
+    let (output, failed, image) = match outcome {
+        Ok((said, shot)) => (
+            said,
+            false,
+            shot.map(|shot| {
+                json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(shot.png),
+                    "mimeType": "image/png",
+                })
+            }),
+        ),
+        Err(error) => (error, true, None),
+    };
+    json!({"method": "resolve_desktop", "id": string(message, "id"), "output": output, "failed": failed, "image": image})
 }
 
 /// Keeps the bridge's latest history for a session. The Claude SDK owns the transcript itself;
