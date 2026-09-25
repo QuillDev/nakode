@@ -11,9 +11,10 @@ import {
 } from "./tool_policy.mjs";
 import { spawn as spawnChild } from "node:child_process";
 import { providerProcessLifecycle } from "./process_lifecycle.mjs";
+import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 
@@ -1014,7 +1015,7 @@ async function sendTurn(command) {
     : allowedTools.filter((name) => !name.startsWith("mcp__"));
   const options = {
     cwd: command.workspace,
-    pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE || "claude",
+    ...claudeExecutable(),
     // The session's variables (GH_TOKEN, git credentials, account environment) for its tools.
     env: { ...process.env, ...(command.environment || {}) },
     model,
@@ -1168,6 +1169,20 @@ async function sendTurn(command) {
   });
 }
 
+/**
+ * The Claude Code to run: one this machine names or installed, else the build the Agent SDK
+ * installed for this platform (a machine without Claude Code, such as an environment VM).
+ */
+function claudeExecutable() {
+  if (process.env.CLAUDE_CODE_EXECUTABLE) {
+    return { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE };
+  }
+  const installed = (process.env.PATH || "")
+    .split(delimiter)
+    .some((directory) => directory && existsSync(join(directory, "claude")));
+  return installed ? { pathToClaudeCodeExecutable: "claude" } : {};
+}
+
 async function modelCatalogue(command) {
   const processLifecycle = providerProcessLifecycle(command.oauthAccessToken);
   let releasePrompt;
@@ -1181,8 +1196,7 @@ async function modelCatalogue(command) {
     prompt,
     options: {
       cwd: command.workspace,
-      pathToClaudeCodeExecutable:
-        process.env.CLAUDE_CODE_EXECUTABLE || "claude",
+      ...claudeExecutable(),
       persistSession: false,
       systemPrompt: "Report the installed model catalogue.",
       allowedTools: [],
