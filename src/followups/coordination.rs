@@ -11,6 +11,9 @@ pub(crate) struct Source {
     pub title: String,
     pub call_id: Option<String>,
     pub status: Option<String>,
+    /// Admitted as an owner Chat's instruction; its authority does not rest on a parent link.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_chat: bool,
 }
 
 #[derive(Serialize)]
@@ -27,12 +30,15 @@ pub(super) struct DisplayMessage<'a> {
 }
 
 /// Called only after the runtime has matched the exact pending source call and its arguments.
-/// The immutable, same-owner runtime relationship—not payload claims—grants downward authority.
+/// Instruction authority comes from the runtime, never payload claims: the immutable same-owner
+/// parent link, or the authenticated integration vouching that the source is one of the owner's
+/// Chats, which may instruct any of the owner's agents. Everything else stays peer context.
 pub(crate) fn relay_source(
     connection: &Connection,
     source: &str,
     target: &str,
     call: &str,
+    owner_chat: bool,
 ) -> Result<Source> {
     super::authorize(connection, source, true)?;
     let title: Option<String> = connection
@@ -55,7 +61,7 @@ pub(crate) fn relay_source(
         params![source, target], |row| row.get(0),
     ).map_err(failure)?;
     Ok(Source {
-        kind: if downward {
+        kind: if downward || owner_chat {
             "delegated_instruction"
         } else {
             "peer_context"
@@ -65,7 +71,61 @@ pub(crate) fn relay_source(
         title: title.chars().take(120).collect(),
         call_id: Some(call.to_owned()),
         status: None,
+        owner_chat,
     })
+}
+
+/// An owner Chat that instructs an agent becomes its parent, so the agent's reports return to
+/// whoever last directed it and it appears among that Chat's agents. The link row is re-pointed,
+/// never deleted, so the agent's report and question history stay attached to it. Nothing changes
+/// when either session is itself nested (a parent's child, or a child's parent) or the Chat
+/// already has the most children a parent may hold; the message is admitted either way.
+pub(super) fn adopt(connection: &Connection, chat: &str, agent: &str) -> Result<()> {
+    let current: Option<String> = connection
+        .query_row(
+            "SELECT parent_id FROM session_child_links WHERE child_id = ?1",
+            [agent],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(failure)?;
+    if current.as_deref() == Some(chat) {
+        return Ok(());
+    }
+    let nested: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_child_links WHERE child_id = ?1 OR parent_id = ?2)",
+            params![chat, agent],
+            |row| row.get(0),
+        )
+        .map_err(failure)?;
+    let children: u32 = connection
+        .query_row(
+            "SELECT count(*) FROM session_child_links WHERE parent_id = ?1",
+            [chat],
+            |row| row.get(0),
+        )
+        .map_err(failure)?;
+    if nested || children >= 32 {
+        return Ok(());
+    }
+    if current.is_some() {
+        connection
+            .execute(
+                "UPDATE session_child_links SET parent_id = ?1 WHERE child_id = ?2",
+                params![chat, agent],
+            )
+            .map_err(failure)?;
+    } else {
+        connection
+            .execute(
+                "INSERT INTO session_child_links(child_id, parent_id, child_title)
+                 SELECT id, ?1, COALESCE(title, '') FROM sessions WHERE id = ?2",
+                params![chat, agent],
+            )
+            .map_err(failure)?;
+    }
+    Ok(())
 }
 
 pub(super) fn authenticate_source(
@@ -77,6 +137,7 @@ pub(super) fn authenticate_source(
         session_id,
         source_session_id,
         source_call_id,
+        source_owner_chat,
         ..
     } = command
     else {
@@ -88,6 +149,7 @@ pub(super) fn authenticate_source(
         source_session_id.as_str(),
         session_id.as_str(),
         source_call_id,
+        *source_owner_chat,
     )
     .map(Some)
 }

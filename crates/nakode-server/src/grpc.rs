@@ -828,6 +828,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             source_session_id: protocol::SessionId::from(input.source_session_id),
             source_call_id: input.source_call_id,
             prompt,
+            source_owner_chat: input.source_owner_chat,
         })
     );
     try_command_rpc!(
@@ -839,6 +840,20 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             message_id: input.message_id,
             prompt,
         })
+    );
+    command_rpc!(
+        admit_external_child_report,
+        api::AdmitExternalChildReportRequest,
+        input,
+        protocol::Command::AdmitExternalChildReport {
+            session_id: protocol::SessionId::from(input.session_id),
+            message_id: input.message_id,
+            child_session_id: input.child_session_id,
+            child_title: input.child_title,
+            report_id: input.report_id,
+            state: input.state,
+            body: input.body,
+        }
     );
     command_rpc!(
         set_followup_paused,
@@ -3528,6 +3543,11 @@ fn turn(value: protocol::TurnView) -> api::Turn {
         model_id: value.model_id.map(|id| id.to_string()),
         status: status as i32,
         resolved_model_options: Some(projected_model_options(value.resolved_model_options)),
+        completion: value.completion.map(|completion| api::TurnCompletion {
+            final_text: completion.final_text,
+            final_total_bytes: completion.final_total_bytes,
+            truncated: completion.truncated,
+        }),
     }
 }
 
@@ -4838,6 +4858,7 @@ mod saved_summary_tests {
     fn summary_preserves_first_prompt_preview_on_wire() {
         let summary = nakode_protocol::SessionSummary {
             parent_session_id: Some(nakode_protocol::SessionId::from("parent")),
+            relationship_revision: None,
             id: nakode_protocol::SessionId::from("saved"),
             workspace_id: nakode_protocol::WorkspaceId::from("workspace"),
             title: "Owner title".to_owned(),

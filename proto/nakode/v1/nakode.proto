@@ -40,6 +40,7 @@ service NakodeService {
   rpc ListChildReports(ListChildReportsRequest) returns (ChildReportPage);
   rpc RelayAgentFollowup(RelayAgentFollowupRequest) returns (MutationResult);
   rpc EnqueueFollowup(EnqueueFollowupRequest) returns (MutationResult);
+  rpc AdmitExternalChildReport(AdmitExternalChildReportRequest) returns (MutationResult);
   rpc RemoveFollowup(RemoveFollowupRequest) returns (MutationResult);
   rpc SetFollowupPaused(SetFollowupPausedRequest) returns (MutationResult);
   rpc ListFollowups(ListFollowupsRequest) returns (FollowupInbox);
@@ -200,12 +201,27 @@ message RelayAgentFollowupRequest {
   string source_session_id = 4;
   string source_call_id = 5;
   PromptInput prompt = 6;
+  // The authenticated integration vouches that the source is one of the owner's Chats: its
+  // message instructs any of the owner's agents, not only the source's own children.
+  bool source_owner_chat = 7;
 }
 message EnqueueFollowupRequest {
   MutationOptions mutation = 1;
   string session_id = 2;
   string message_id = 3;
   PromptInput prompt = 4;
+}
+// A child in another runtime (a stack VM) reports to its parent here, through the
+// authenticated integration that recorded the relationship. Admitted as inert child evidence.
+message AdmitExternalChildReportRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string message_id = 3;
+  string child_session_id = 4;
+  string child_title = 5;
+  string report_id = 6;
+  string state = 7;
+  string body = 8;
 }
 message RemoveFollowupRequest {
   MutationOptions mutation = 1;
@@ -1415,6 +1431,13 @@ message Turn {
   TurnStatus status = 4;
   // Concrete options captured when this owner turn was accepted. They never follow later selection changes.
   ModelOptions resolved_model_options = 5;
+  // The bounded final response of a terminal owner turn; only last_turn carries it.
+  optional TurnCompletion completion = 6;
+}
+message TurnCompletion {
+  optional string final_text = 1;
+  uint64 final_total_bytes = 2;
+  bool truncated = 3;
 }
 message ContextUsage { uint64 estimated_tokens = 1; optional uint64 context_window = 2; bool compacting = 3; }
 message SessionState {

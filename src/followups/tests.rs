@@ -2,6 +2,7 @@ use super::*;
 
 mod child_events;
 mod coordination;
+mod external_child_reports;
 
 mod removal;
 use crate::session::{SessionRepository, SqliteSessionRepository};

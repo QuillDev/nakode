@@ -369,6 +369,7 @@ fn native_run_with_image(h: &mut Harness, child: &SessionId) -> String {
                 data: crate::image_handoff::tests::png(64, 32),
             }),
         },
+        more_attachments: Vec::new(),
     };
     let state = h.runtime.core.engine_for_mut(child).unwrap().state_mut();
     // Test the normalized persistence boundary without starting a provider.

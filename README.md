@@ -21,13 +21,14 @@ Use `prepare_image` to inspect or explicitly crop/downscale conversation images,
 
 ## Existing image replies
 
-Native tool sessions on Linux/macOS can use `return_image({"path":"relative/image.png"})`
-to attach an existing workspace image to the assistant transcript. This is not image generation.
+Native tool sessions on Linux/macOS, and Claude sessions as `mcp__nakode__return_image`, can use
+`return_image({"path":"relative/image.png"})`, or `{"paths":[...]}` for several at once, to attach
+existing images to the assistant transcript: workspace files, or absolute paths inside a
+`.tmp-gallery` directory. A call attaches all of its images or none. This is not image generation.
 The tool requires filesystem-read permission and accepts PNG, JPEG, GIF and WebP, up to 5 MiB
 per image, eight images and 20 MiB per turn. Nakode retains the bytes in native-session history
 and exposes them through public transcript artifacts; deleting the source file does not remove
-the retained reply. Image bytes are not echoed into provider tool-result text. Compatibility
-harness adapters are not guaranteed to expose this native tool. Image-input support still
+the retained reply. Image bytes are not echoed into provider tool-result text. Image-input support still
 belongs to the selected model. Prompt input may contain images without text.
 
 ## Architecture boundary

@@ -288,7 +288,47 @@ impl InboxStore {
                     )?;
                     if let Some(source) = source {
                         coordination::save_source(&tx, session_id.as_str(), message_id, &source)?;
+                        if source.owner_chat {
+                            coordination::adopt(&tx, &source.session_id, session_id.as_str())?;
+                        }
                     }
+                }
+                (session_id.as_str(), Some(message_id.clone()))
+            }
+            Command::AdmitExternalChildReport {
+                session_id,
+                message_id,
+                child_session_id,
+                child_title,
+                report_id,
+                state,
+                body,
+            } => {
+                validate_message_identity(message_id)?;
+                authorize(&tx, session_id.as_str(), true)?;
+                let (prompt, source, display) = child_events::external_report(
+                    session_id.as_str(),
+                    child_session_id,
+                    child_title,
+                    report_id,
+                    state,
+                    body,
+                )?;
+                if !admission::message_exists(&tx, session_id.as_str(), message_id, &digest)? {
+                    admission::admit_message(
+                        &tx,
+                        session_id.as_str(),
+                        message_id,
+                        &prompt,
+                        request,
+                        &digest,
+                    )?;
+                    coordination::save_source(&tx, session_id.as_str(), message_id, &source)?;
+                    tx.execute(
+                        "UPDATE followup_messages SET display_text = ?3 WHERE session_id = ?1 AND message_id = ?2",
+                        params![session_id.as_str(), message_id, display],
+                    )
+                    .map_err(failure)?;
                 }
                 (session_id.as_str(), Some(message_id.clone()))
             }

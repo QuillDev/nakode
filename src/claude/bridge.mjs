@@ -2,8 +2,6 @@ import {
   query,
   createSdkMcpServer,
   getSessionMessages,
-  filterEscalatingDefaultMode,
-  resolveSettings,
   tool,
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
@@ -13,9 +11,10 @@ import {
 } from "./tool_policy.mjs";
 import { spawn as spawnChild } from "node:child_process";
 import { providerProcessLifecycle } from "./process_lifecycle.mjs";
+import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 
@@ -85,13 +84,115 @@ async function delegate(ownerSessionId, task, parentRunId = null) {
   });
 }
 
-function nakodeServer(ownerSessionId, parentRunId) {
+// Nakode's own tools for Claude: `delegate` creates attributed sub-agents, and `return_image`
+// attaches an image file from this machine to the transcript. Nakode reads and validates the file
+// itself, so its bytes never pass through the provider.
+function nakodeServer(session, turn, { delegate: withDelegate, returnImage, desktop }) {
+  const tools = [];
+  if (returnImage) tools.push(returnImageTool(session, turn));
+  for (const name of desktop) tools.push(desktopTool(name, session, turn));
+  if (withDelegate) tools.push(delegateTool(session.ownerSessionId, session.attributedRunId));
   return createSdkMcpServer({
     name: "nakode",
     version: "1.0.0",
     instructions:
-      "Creates bounded, attributed Nakode sub-agents from the configured archetype catalogue.",
-    tools: [
+      "Nakode tools: delegate bounded work to configured archetypes, attach images from this machine to the transcript, and use and record this agent's private desktop when it has one.",
+    tools,
+  });
+}
+
+/** The agent's private desktop: its screenshots come back as images the model sees. */
+const DESKTOP_TOOLS = {
+  desktop_screenshot: {
+    description:
+      "Capture this agent's private desktop (a virtual screen with a browser, not the owner's screen) and see it. Coordinates in the image are the ones desktop_action uses.",
+    schema: {},
+  },
+  desktop_action: {
+    description:
+      "Use the mouse and keyboard on this agent's private desktop, then see the screen. Start a browser with `fstack-browser <url> &` from Bash. Take a desktop_screenshot first to find coordinates.",
+    schema: {
+      action: z.enum(["click", "double_click", "right_click", "move", "drag", "scroll", "type", "key"]),
+      x: z.number().int().min(0).optional().describe("Screen pixel, from the left"),
+      y: z.number().int().min(0).optional().describe("Screen pixel, from the top"),
+      to_x: z.number().int().min(0).optional().describe("drag: where to release"),
+      to_y: z.number().int().min(0).optional().describe("drag: where to release"),
+      direction: z.enum(["up", "down", "left", "right"]).optional().describe("scroll direction"),
+      amount: z.number().int().min(1).max(20).optional().describe("scroll steps"),
+      text: z.string().optional().describe("type: the text to type"),
+      keys: z.string().optional().describe("key: key names such as Return, Escape or ctrl+l"),
+    },
+  },
+  screen_record: {
+    description:
+      "Record this agent's private desktop as a small MP4 for the owner. `start` begins recording (across turns, up to 5 minutes); do the work you want to show; `stop` compresses it and saves it to the Gallery with a poster frame.",
+    schema: {
+      action: z.enum(["start", "stop"]),
+      name: z.string().optional().describe("start: a short file name, e.g. checkout-flow"),
+    },
+  },
+};
+
+function desktopTool(name, session, turn) {
+  const { description, schema } = DESKTOP_TOOLS[name];
+  return tool(name, description, schema, async (args) =>
+    new Promise((resolve) => {
+      const id = randomUUID();
+      externalToolCalls.set(id, { resolve, sessionId: session.sessionId, turnId: turn.turnId });
+      write({
+        event: "desktop_request",
+        id,
+        turnId: turn.turnId,
+        workspace: turn.workspace,
+        tool: name,
+        arguments: args,
+      });
+    }),
+  );
+}
+
+function returnImageTool(session, turn) {
+  return tool(
+    "return_image",
+    "Attach existing PNG, JPEG, GIF or WebP images to the assistant transcript so the owner sees them: files in this session's workspace, or under a `.tmp-gallery` directory (such as an agent's screenshots). Give one `path`, or several at once as `paths`; if any cannot be attached, none is. The bytes are retained for remote clients. Maximum 5 MiB per image and eight images per turn. Use this instead of pasting a file path.",
+    {
+      path: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Workspace-relative image file, or an absolute path inside a `.tmp-gallery` directory",
+        ),
+      paths: z
+        .array(z.string().min(1))
+        .min(1)
+        .max(8)
+        .optional()
+        .describe("Several such image files to attach at once, in order"),
+    },
+    async ({ path, paths }) =>
+      new Promise((resolve) => {
+        const id = randomUUID();
+        externalToolCalls.set(id, {
+          resolve,
+          sessionId: session.sessionId,
+          turnId: turn.turnId,
+        });
+        write({
+          event: "image_return_request",
+          id,
+          turnId: turn.turnId,
+          workspace: turn.workspace,
+          model: session.model,
+          ...(path === undefined ? {} : { path }),
+          ...(paths === undefined ? {} : { paths }),
+        });
+      }),
+  );
+}
+
+function delegateTool(ownerSessionId, parentRunId) {
+  return (
       tool(
         "delegate",
         "Delegate one concrete bounded task to a configured Nakode archetype and wait for its result.",
@@ -116,9 +217,8 @@ function nakodeServer(ownerSessionId, parentRunId) {
             };
           }
         },
-      ),
-    ],
-  });
+      )
+  );
 }
 
 function externalToolShape(definition) {
@@ -137,13 +237,16 @@ function externalToolShape(definition) {
   );
 }
 
-function resolveExternalToolCall(id, output, failed) {
+function resolveExternalToolCall(id, output, failed, image) {
   const pending = externalToolCalls.get(id);
   if (!pending) return;
   externalToolCalls.delete(id);
   pending.resolve({
     isError: failed === true,
-    content: [{ type: "text", text: output || "" }],
+    content: [
+      { type: "text", text: output || "" },
+      ...(image?.data ? [{ type: "image", data: image.data, mimeType: image.mimeType }] : []),
+    ],
   });
 }
 
@@ -203,12 +306,20 @@ function providerToolName(name) {
     : name || "Tool";
 }
 
+const NAKODE_MCP_TOOLS = new Set([
+  "mcp__nakode__delegate",
+  "mcp__nakode__return_image",
+  "mcp__nakode__desktop_screenshot",
+  "mcp__nakode__desktop_action",
+  "mcp__nakode__screen_record",
+]);
+
 function effectiveAllowedTools(session) {
   const external = externalToolNames(session);
   if (session.replaceBuiltinTools) {
     return [
       ...external,
-      ...(session.allowedTools?.filter((name) => name === "mcp__nakode__delegate") ?? []),
+      ...(session.allowedTools?.filter((name) => NAKODE_MCP_TOOLS.has(name)) ?? []),
     ];
   }
   if (session.allowedTools === null) return null;
@@ -410,23 +521,7 @@ async function createSession(command, resumed) {
       : [],
     replaceBuiltinTools: command.replaceBuiltinTools === true,
   });
-  let history = [];
-  if (resumed) {
-    try {
-      history = [
-        ...savedHistory(
-          await getSessionMessages(sessionId, { dir: command.workspace }),
-          sessionId,
-        ),
-        ...(await nativeAgentHistory(command.workspace, sessionId)),
-      ];
-    } catch (error) {
-      write({
-        event: "diagnostic",
-        message: `could not read Claude session history: ${errorMessage(error)}`,
-      });
-    }
-  }
+  const history = resumed ? ((await readHistory(command.workspace, sessionId)) ?? []) : [];
   write({
     event: resumed ? "session_resumed" : "session_created",
     requestId: command.requestId,
@@ -434,6 +529,22 @@ async function createSession(command, resumed) {
     model: command.model || "sonnet",
     history,
   });
+}
+
+/** The session's history as a resume rebuilds it; null, with a diagnostic, when unreadable. */
+async function readHistory(workspace, sessionId) {
+  try {
+    return [
+      ...savedHistory(await getSessionMessages(sessionId, { dir: workspace }), sessionId),
+      ...(await nativeAgentHistory(workspace, sessionId)),
+    ];
+  } catch (error) {
+    write({
+      event: "diagnostic",
+      message: `could not read Claude session history: ${errorMessage(error)}`,
+    });
+    return null;
+  }
 }
 
 function validatorSession(instructions) {
@@ -508,14 +619,23 @@ function archetypePolicy(instructions) {
   };
 }
 
-async function permissionMode(workspace) {
-  const resolved = await resolveSettings({
-    cwd: workspace,
-    settingSources: ["user", "project", "local"],
-  });
-  return (
-    filterEscalatingDefaultMode(resolved).permissions?.defaultMode || "auto"
-  );
+// Nakode sessions run unattended, like Codex's never-ask full-access sessions: archetype allow and
+// deny lists still apply through the PreToolUse hook, but Claude Code's own permission prompts and
+// auto-mode classifier do not. Claude Code's `permissions.defaultMode` is the owner's choice for
+// interactive Claude Code and does not govern Nakode; NAKODE_CLAUDE_PERMISSION_MODE does.
+const PERMISSION_MODES = new Set([
+  "bypassPermissions",
+  "auto",
+  "acceptEdits",
+  "default",
+  "plan",
+]);
+
+function permissionMode() {
+  const configured = process.env.NAKODE_CLAUDE_PERMISSION_MODE?.trim();
+  return configured && PERMISSION_MODES.has(configured)
+    ? configured
+    : "bypassPermissions";
 }
 
 function parseValidatorResult(result) {
@@ -864,19 +984,27 @@ async function sendTurn(command) {
   session.model = model;
   const mode = session.securityValidator
     ? "dontAsk"
-    : await permissionMode(command.workspace);
+    : permissionMode();
   const processLifecycle = providerProcessLifecycle(command.oauthAccessToken);
   const allowedTools = effectiveAllowedTools(session);
   const mcpServers = {};
-  if (
+  const allows = (name) => allowedTools === null || allowedTools.includes(name);
+  const withDelegate = Boolean(
     session.ownerSessionId &&
-    session.validationEnabled &&
-    session.delegationEnabled &&
-    (allowedTools === null || allowedTools.includes("mcp__nakode__delegate"))
-  ) {
+      session.validationEnabled &&
+      session.delegationEnabled &&
+      allows("mcp__nakode__delegate"),
+  );
+  const returnImage = allows("mcp__nakode__return_image");
+  // Offered where this machine gives agents a desktop.
+  const desktop = process.env.DISPLAY
+    ? Object.keys(DESKTOP_TOOLS).filter((name) => allows(`mcp__nakode__${name}`))
+    : [];
+  if (withDelegate || returnImage || desktop.length > 0) {
     mcpServers.nakode = nakodeServer(
-      session.ownerSessionId,
-      session.attributedRunId,
+      session,
+      { turnId: command.turnId, workspace: command.workspace },
+      { delegate: withDelegate, returnImage, desktop },
     );
   }
   if (session.externalTools.length > 0) {
@@ -887,7 +1015,9 @@ async function sendTurn(command) {
     : allowedTools.filter((name) => !name.startsWith("mcp__"));
   const options = {
     cwd: command.workspace,
-    pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE || "claude",
+    ...claudeExecutable(),
+    // The session's variables (GH_TOKEN, git credentials, account environment) for its tools.
+    env: { ...process.env, ...(command.environment || {}) },
     model,
     systemPrompt: session.instructions
       ? { type: "preset", preset: "claude_code", append: session.instructions }
@@ -896,6 +1026,7 @@ async function sendTurn(command) {
     includePartialMessages: true,
     abortController,
     permissionMode: mode,
+    ...(mode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
     ...(session.maxTurns ? { maxTurns: session.maxTurns } : {}),
     ...(builtinTools !== null ? { tools: builtinTools } : {}),
     ...(session.deniedTools.length > 0
@@ -1030,6 +1161,26 @@ async function sendTurn(command) {
     turnId: command.turnId,
     ...completion,
   });
+  // Nakode keeps this so the session reads back while it is not loaded, e.g. after a restart.
+  write({
+    event: "history_snapshot",
+    sessionId: command.sessionId,
+    history: await readHistory(command.workspace, command.sessionId),
+  });
+}
+
+/**
+ * The Claude Code to run: one this machine names or installed, else the build the Agent SDK
+ * installed for this platform (a machine without Claude Code, such as an environment VM).
+ */
+function claudeExecutable() {
+  if (process.env.CLAUDE_CODE_EXECUTABLE) {
+    return { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE };
+  }
+  const installed = (process.env.PATH || "")
+    .split(delimiter)
+    .some((directory) => directory && existsSync(join(directory, "claude")));
+  return installed ? { pathToClaudeCodeExecutable: "claude" } : {};
 }
 
 async function modelCatalogue(command) {
@@ -1045,8 +1196,7 @@ async function modelCatalogue(command) {
     prompt,
     options: {
       cwd: command.workspace,
-      pathToClaudeCodeExecutable:
-        process.env.CLAUDE_CODE_EXECUTABLE || "claude",
+      ...claudeExecutable(),
       persistSession: false,
       systemPrompt: "Report the installed model catalogue.",
       allowedTools: [],
@@ -1099,6 +1249,13 @@ async function handle(command) {
     case "send":
       await sendTurn(command);
       break;
+    case "history":
+      write({
+        event: "history_snapshot",
+        sessionId: command.sessionId,
+        history: await readHistory(command.workspace, command.sessionId),
+      });
+      break;
     case "set_options": {
       const session = sessions.get(command.sessionId);
       if (session)
@@ -1137,11 +1294,15 @@ async function handle(command) {
       break;
     }
     case "resolve_external_tool":
+    case "resolve_image_return":
       resolveExternalToolCall(
         command.id,
         command.output,
         command.failed === true,
       );
+      break;
+    case "resolve_desktop":
+      resolveExternalToolCall(command.id, command.output, command.failed === true, command.image);
       break;
     case "cancel": {
       interruptExternalToolCalls(

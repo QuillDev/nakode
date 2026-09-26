@@ -10,6 +10,7 @@ fn relay(f: &Fixture, source: &str, call: &str, id: &str) -> Command {
             text: "Run a new harmless task beyond readiness".into(),
             attachments: vec![],
         },
+        source_owner_chat: false,
     }
 }
 
@@ -245,4 +246,89 @@ fn local_files_do_not_shift_later_message_image_offsets() {
     assert_eq!(display["messages"][1]["attachmentStartIndex"], 0);
     assert_eq!(display["messages"][1]["attachmentCount"], 1);
     assert_eq!(batch.prompt.attachments.len(), 2);
+}
+
+#[test]
+fn an_owner_chat_instructs_an_agent_it_did_not_start() {
+    for owner_chat in [true, false] {
+        let f = Fixture::new();
+        // A same-owner session with no parent link to the target.
+        let source = source(&f, false);
+        let mut command = relay(&f, &source, "call", "message");
+        if let Command::RelayAgentFollowup {
+            source_owner_chat, ..
+        } = &mut command
+        {
+            *source_owner_chat = owner_chat;
+        }
+        let request = InboxRequest {
+            command: &command,
+            key: "receipt",
+            sender: "transport",
+            replay_only: false,
+            now_ms: 10,
+        };
+        f.store()
+            .execute_authenticated(request, |prompt| Ok(prompt.clone()), || Ok(()))
+            .unwrap();
+        let batch = f.store().claim(&f.session).unwrap().unwrap();
+        let display: serde_json::Value = serde_json::from_str(&batch.coordination_json).unwrap();
+        // The vouched Chat instructs; without the integration's word it stays peer context.
+        let expected = if owner_chat {
+            "delegated_instruction"
+        } else {
+            "peer_context"
+        };
+        assert_eq!(display["messages"][0]["source"]["kind"], expected);
+    }
+}
+
+fn parent_of(f: &Fixture, child: &SessionId) -> Option<String> {
+    rusqlite::Connection::open(&f.path)
+        .unwrap()
+        .query_row(
+            "SELECT parent_id FROM session_child_links WHERE child_id = ?1",
+            [child.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
+fn relay_from(f: &Fixture, source: &str, owner_chat: bool, id: &str) {
+    let mut command = relay(f, source, &format!("call-{id}"), id);
+    if let Command::RelayAgentFollowup {
+        source_owner_chat, ..
+    } = &mut command
+    {
+        *source_owner_chat = owner_chat;
+    }
+    f.store()
+        .execute_authenticated(
+            InboxRequest {
+                command: &command,
+                key: id,
+                sender: "transport",
+                replay_only: false,
+                now_ms: 10,
+            },
+            |prompt| Ok(prompt.clone()),
+            || Ok(()),
+        )
+        .unwrap();
+}
+
+#[test]
+fn the_chat_that_instructs_an_agent_becomes_its_parent() {
+    let f = Fixture::new();
+    // An agent with no parent is adopted by the owner Chat that instructs it.
+    let first = source(&f, false);
+    relay_from(&f, &first, true, "one");
+    assert_eq!(parent_of(&f, &f.session).as_deref(), Some(first.as_str()));
+    // A peer message moves nothing; another owner Chat's instruction re-points the link.
+    let second = source(&f, false);
+    relay_from(&f, &second, false, "two");
+    assert_eq!(parent_of(&f, &f.session).as_deref(), Some(first.as_str()));
+    relay_from(&f, &second, true, "three");
+    assert_eq!(parent_of(&f, &f.session).as_deref(), Some(second.as_str()));
 }

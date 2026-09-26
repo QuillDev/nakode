@@ -115,6 +115,26 @@ pub struct ServerCore {
     soul_store: Option<SoulStore>,
 }
 
+/// Entry digests kept across reads of a session that is rebuilt for every query. Its entries keep
+/// stable retained ids, so a read after the first hashes only what changed. Bounded to the
+/// sessions read most recently.
+fn retained_entry_digests(session_id: &str) -> crate::domain_transcript::EntryDigests {
+    use std::sync::{LazyLock, Mutex, PoisonError};
+    const KEPT: usize = 16;
+    static KEPT_DIGESTS: LazyLock<
+        Mutex<std::collections::VecDeque<(String, crate::domain_transcript::EntryDigests)>>,
+    > = LazyLock::new(Mutex::default);
+    let mut kept = KEPT_DIGESTS.lock().unwrap_or_else(PoisonError::into_inner);
+    let digests = kept
+        .iter()
+        .position(|(id, _)| id == session_id)
+        .and_then(|index| kept.remove(index))
+        .map_or_else(Default::default, |(_, digests)| digests);
+    kept.push_front((session_id.to_owned(), digests.clone()));
+    kept.truncate(KEPT);
+    digests
+}
+
 impl ServerCore {
     #[must_use]
     pub fn new(
@@ -773,6 +793,7 @@ impl ServerCore {
             Command::ReparentChildSession { .. }
             | Command::RelayAgentFollowup { .. }
             | Command::EnqueueFollowup { .. }
+            | Command::AdmitExternalChildReport { .. }
             | Command::SetFollowupPaused { .. }
             | Command::RemoveFollowup { .. }
             | Command::LinkChildSession { .. }
@@ -1136,13 +1157,24 @@ impl ServerCore {
                 credential,
             } => {
                 self.ensure_provider_account(&provider_id, &account_id)?;
+                // A brokered credential is an access token its broker keeps current; the adapter
+                // validates its shape. Every other kind is an API key.
+                let metadata = if kind == crate::backend::BROKERED_OAUTH_KIND {
+                    crate::backend::brokered_credential_metadata(
+                        provider_id.as_str(),
+                        &credential.0,
+                    )
+                    .map_err(DomainCommandError::Invalid)?
+                } else {
+                    serde_json::json!({ "api_key": credential.0 })
+                };
                 Ok(Self::accepted(
                     Some(account_id.clone()),
                     vec![Effect::SaveProviderAccountCredential {
                         provider: provider_id.to_string(),
                         account_id,
                         kind,
-                        metadata: serde_json::json!({ "api_key": credential.0 }),
+                        metadata,
                     }],
                 ))
             }
@@ -1979,7 +2011,10 @@ impl ServerCore {
         session_id: &SessionId,
     ) -> Result<Vec<Effect>, DomainCommandError> {
         let (pending, source_transport) = {
-            let bridge = self.session_bridge(session_id)?;
+            // A session opened without a bridge has no inbound prompt to replay.
+            let Ok(bridge) = self.session_bridge(session_id) else {
+                return Ok(Vec::new());
+            };
             if bridge.lifecycle != BridgeLifecycle::Open {
                 return Ok(Vec::new());
             }
@@ -2171,13 +2206,13 @@ impl ServerCore {
                         state.provider_account_id.clone(),
                     )
                 };
-                if account_id
-                    .is_some_and(|requested| Some(requested) != loaded_account_id.as_deref())
+                // A session runs on any eligible account; a requested one becomes its preference.
+                if let Some(requested) = account_id
+                    && Some(requested) != loaded_account_id.as_deref()
                 {
-                    return Err(DomainCommandError::Conflict(
-                        "an established session cannot switch provider accounts; start a new session"
-                            .to_owned(),
-                    ));
+                    self.session_engine_mut(loaded)?
+                        .state_mut()
+                        .set_provider_account_override(Some(requested.to_owned()));
                 }
                 canonical_open_session_working_directory(
                     loaded,
@@ -2263,20 +2298,10 @@ impl ServerCore {
                 )));
             }
         };
+        // The persisted account is only where the session last ran; a requested one replaces it
+        // as the preference.
         if let Some(requested) = account_id {
-            if session
-                .account_id
-                .as_deref()
-                .is_some_and(|persisted| persisted != requested)
-            {
-                return Err(DomainCommandError::Conflict(
-                    "the persisted session is pinned to another provider account; start a new session"
-                        .to_owned(),
-                ));
-            }
-            if session.account_id.is_none() {
-                session.account_id = Some(requested.to_owned());
-            }
+            session.account_id = Some(requested.to_owned());
         }
         let working_directory = canonical_open_session_working_directory(
             session_id,
@@ -4356,6 +4381,9 @@ impl ServerCore {
         let _corrections = state.install_subagents(children);
         state.install_shared_context(shared_context);
         state.transcript.retain_entry_ids(&session.id);
+        state
+            .transcript
+            .share_entry_digests(retained_entry_digests(&session.id));
         let engine = ServiceEngine::new(state);
         let state = engine.state();
         match query {
@@ -4671,6 +4699,7 @@ impl ServerCore {
             }
             | Command::RelayAgentFollowup { session_id, .. }
             | Command::EnqueueFollowup { session_id, .. }
+            | Command::AdmitExternalChildReport { session_id, .. }
             | Command::SetFollowupPaused { session_id, .. }
             | Command::RemoveFollowup { session_id, .. }
             | Command::SendPrompt { session_id, .. }
@@ -10240,6 +10269,7 @@ enabled = false
                             data: data.clone(),
                         }),
                     },
+                    more_attachments: Vec::new(),
                 }),
             );
         let QueryResult::Session(session) = core

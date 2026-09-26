@@ -286,11 +286,27 @@ pub enum Command {
         source_session_id: SessionId,
         source_call_id: String,
         prompt: PromptInput,
+        /// The authenticated integration vouches that the source is one of the owner's Chats, so
+        /// its message instructs any of the owner's agents rather than only its own children.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        source_owner_chat: bool,
     },
     EnqueueFollowup {
         session_id: SessionId,
         message_id: String,
         prompt: PromptInput,
+    },
+    /// Terminal evidence from a child in another runtime, such as a stack VM, relayed by the
+    /// authenticated integration that recorded the relationship. It is admitted exactly as a
+    /// linked child's report is: inert durable child evidence, never an owner instruction.
+    AdmitExternalChildReport {
+        session_id: SessionId,
+        message_id: String,
+        child_session_id: String,
+        child_title: String,
+        report_id: String,
+        state: String,
+        body: String,
     },
     /// Pausing retains all messages. Resuming never retries uncertain provider dispatch.
     RemoveFollowup {

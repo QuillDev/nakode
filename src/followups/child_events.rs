@@ -18,28 +18,90 @@ struct ChildEvent {
 
 impl ChildEvent {
     fn prompt(&self) -> PromptInput {
-        // Serialize untrusted fields as data. Batch composition adds a separate trusted
-        // origin marker; neither report prose nor a client-supplied sender grants authority.
-        let mut evidence = serde_json::json!({
-            "parent_session_id": self.parent,
-            "child_session_id": self.child,
-            "report_id": self.report,
-            "state": self.state,
-            "body": self.body,
-        });
-        let mut text = evidence.to_string();
-        if text.len() > super::MAX_TEXT_BYTES {
-            // Escaping control characters can enlarge a valid report. Retain the original in
-            // report history and notify by identity instead of poisoning the FIFO head.
-            evidence["body"] = serde_json::Value::Null;
-            evidence["body_retained_in_report_history"] = serde_json::Value::Bool(true);
-            text = evidence.to_string();
-        }
-        PromptInput {
-            text,
-            attachments: Vec::new(),
-        }
+        evidence_prompt(
+            &self.parent,
+            &self.child,
+            &self.report,
+            &self.state,
+            &self.body,
+        )
     }
+}
+
+/// Serialize untrusted fields as data. Batch composition adds a separate trusted origin marker;
+/// neither report prose nor a client-supplied sender grants authority.
+pub(super) fn evidence_prompt(
+    parent: &str,
+    child: &str,
+    report: &str,
+    state: &str,
+    body: &str,
+) -> PromptInput {
+    let mut evidence = serde_json::json!({
+        "parent_session_id": parent,
+        "child_session_id": child,
+        "report_id": report,
+        "state": state,
+        "body": body,
+    });
+    let mut text = evidence.to_string();
+    if text.len() > super::MAX_TEXT_BYTES {
+        // Escaping control characters can enlarge a valid report. Retain the original in
+        // report history and notify by identity instead of poisoning the FIFO head.
+        evidence["body"] = serde_json::Value::Null;
+        evidence["body_retained_in_report_history"] = serde_json::Value::Bool(true);
+        text = evidence.to_string();
+    }
+    PromptInput {
+        text,
+        attachments: Vec::new(),
+    }
+}
+
+/// Reports a child in another runtime may relay: the same terminal and attention states a linked
+/// child's report carries, at the same size bound.
+pub(super) fn external_report(
+    parent: &str,
+    child: &str,
+    title: &str,
+    report: &str,
+    state: &str,
+    body: &str,
+) -> Result<(PromptInput, super::coordination::Source, String)> {
+    let identity = |value: &str| !value.is_empty() && value.len() <= 200 && value.trim() == value;
+    if !identity(child) || !identity(report) || child == parent {
+        return Err(super::refuse(
+            "external child report requires stable child and report identities",
+        ));
+    }
+    if !matches!(state, "completed" | "failed" | "blocker" | "question") {
+        return Err(super::refuse(
+            "external child report state must be completed, failed, blocker or question",
+        ));
+    }
+    if body.len() > 16 * 1024 {
+        return Err(super::refuse(
+            "external child report exceeds the 16384-byte report limit",
+        ));
+    }
+    let source = super::coordination::Source {
+        kind: "durable_child_evidence".to_owned(),
+        session_id: child.to_owned(),
+        title: title.chars().take(120).collect(),
+        call_id: None,
+        status: Some(state.to_owned()),
+        owner_chat: false,
+    };
+    let display = if report.starts_with("turn:") {
+        crate::child_reports::completion_display(body)
+    } else {
+        body.to_owned()
+    };
+    Ok((
+        evidence_prompt(parent, child, report, state, body),
+        source,
+        display,
+    ))
 }
 
 impl InboxStore {
@@ -128,6 +190,7 @@ impl InboxStore {
                     title: event.title.chars().take(120).collect(),
                     call_id: None,
                     status: Some(event.state.clone()),
+                    owner_chat: false,
                 },
             )?;
             let display = if event.report.starts_with("turn:") {

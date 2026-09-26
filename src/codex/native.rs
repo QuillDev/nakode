@@ -26,10 +26,10 @@ use crate::{
     backend::{
         BackendCapabilities, BackendCommand, BackendError, BackendEvent,
         BackendFailureClassification, BackendFailureDetail, BackendFailurePhase, BackendHandle,
-        BackendIdentity, BackendOperation, CODEX_PROVIDER, CapabilitySupport, ModelInfo,
-        ModelOptions, ProviderFailureClassification, TurnOutcome, bounded_failure_text,
-        request_failed, request_failed_with_detail, sanitize_failure_endpoint,
-        sanitize_failure_text as sanitize_backend_failure_text,
+        BackendIdentity, BackendOperation, CODEX_PROVIDER, CREDENTIAL_REFRESH_REQUIRED,
+        CapabilitySupport, ModelInfo, ModelOptions, ProviderFailureClassification, TurnOutcome,
+        bounded_failure_text, request_failed, request_failed_with_detail,
+        sanitize_failure_endpoint, sanitize_failure_text as sanitize_backend_failure_text,
     },
     runtime::{
         AgentRuntime, ConversationItem, DEFAULT_COMPACTION_THRESHOLD_PERCENT, InferenceEvent,
@@ -230,6 +230,49 @@ struct CodexCredential {
     account_id: String,
     #[serde(default)]
     email: Option<String>,
+    /// Supplied by a broker that alone refreshes it; Nakode holds no refresh token for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    brokered: bool,
+}
+
+/// The broker's view of one `ChatGPT` sign-in: a current access token and its expiry.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrokeredCodexCredential {
+    access_token: String,
+    expires_at_ms: u64,
+}
+
+/// Validates a brokered `ChatGPT` credential (JSON) and returns the metadata this adapter stores.
+/// The account and email come from the access token itself, as they do after a sign-in.
+///
+/// # Errors
+///
+/// Returns a description when the credential is malformed or its token names no account.
+pub fn brokered_credential_metadata(credential: &str) -> Result<Value, String> {
+    let brokered = serde_json::from_str::<BrokeredCodexCredential>(credential)
+        .map_err(|error| format!("invalid brokered ChatGPT credential: {error}"))?;
+    let claims = jwt_claims(&brokered.access_token)?;
+    let account_id = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "brokered access token omitted ChatGPT account id".to_owned())?
+        .to_owned();
+    let email = claims
+        .get("https://api.openai.com/profile")
+        .and_then(|profile| profile.get("email"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    serde_json::to_value(CodexCredential {
+        access_token: brokered.access_token,
+        refresh_token: String::new(),
+        expires_at_ms: brokered.expires_at_ms,
+        account_id,
+        email,
+        brokered: true,
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -408,7 +451,7 @@ impl CodexProvider {
         events: mpsc::Sender<InferenceEvent>,
         cancellation: CancellationToken,
     ) -> Result<InferenceOutput, InferenceFailure> {
-        let body = codex_request_body(&request);
+        let body = codex_request_body(&request, &self.credential.account_id);
         let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
         for attempt in 0..MAX_INFERENCE_ATTEMPTS {
             if cancellation.is_cancelled() {
@@ -426,6 +469,7 @@ impl CodexProvider {
             {
                 Ok(mut output) => {
                     output.retry_count = attempt;
+                    tag_reasoning_account(&mut output.provider_state, &self.credential.account_id);
                     return Ok(output);
                 }
                 Err(error) if error.retryable && attempt + 1 < MAX_INFERENCE_ATTEMPTS => {
@@ -1672,11 +1716,28 @@ async fn discover_context_window(
         .and_then(|candidate| candidate.context_window)
 }
 
-fn codex_request_body(request: &InferenceRequest) -> Value {
+/// Marks which `ChatGPT` account produced a reasoning item. Its encrypted content opens only for
+/// that account, so a session that moves to another account stops replaying it.
+const REASONING_ACCOUNT_KEY: &str = "nakode_account_id";
+
+fn tag_reasoning_account(provider_state: &mut [Value], account_id: &str) {
+    for item in provider_state {
+        if item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && let Some(object) = item.as_object_mut()
+        {
+            object.insert(
+                REASONING_ACCOUNT_KEY.to_owned(),
+                Value::String(account_id.to_owned()),
+            );
+        }
+    }
+}
+
+fn codex_request_body(request: &InferenceRequest, account_id: &str) -> Value {
     let input = request
         .history
         .iter()
-        .flat_map(conversation_input)
+        .flat_map(|item| conversation_input(item, account_id))
         .collect::<Vec<_>>();
     let tools = request
         .tools
@@ -1713,7 +1774,7 @@ fn codex_request_body(request: &InferenceRequest) -> Value {
     body
 }
 
-fn conversation_input(item: &ConversationItem) -> Vec<Value> {
+fn conversation_input(item: &ConversationItem, account_id: &str) -> Vec<Value> {
     match item {
         ConversationItem::User { text, attachments } => {
             let mut content = vec![json!({"type": "input_text", "text": text})];
@@ -1736,7 +1797,23 @@ fn conversation_input(item: &ConversationItem) -> Vec<Value> {
             provider_state,
             ..
         } => {
-            let mut items = provider_state.clone();
+            // Reasoning from another account cannot be decrypted by this one; untagged items predate
+            // the tag and are replayed as before. The tag itself never reaches the provider.
+            let mut items = provider_state
+                .iter()
+                .filter(|item| {
+                    item.get(REASONING_ACCOUNT_KEY)
+                        .and_then(Value::as_str)
+                        .is_none_or(|producer| producer == account_id)
+                })
+                .cloned()
+                .map(|mut item| {
+                    if let Some(object) = item.as_object_mut() {
+                        object.remove(REASONING_ACCOUNT_KEY);
+                    }
+                    item
+                })
+                .collect::<Vec<_>>();
             if !text.is_empty() {
                 items.push(json!({"role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}));
             }
@@ -2558,6 +2635,20 @@ async fn refresh_if_needed(
     if credential.expires_at_ms > unix_time_ms().saturating_add(60_000) {
         return Some(credential);
     }
+    if credential.brokered {
+        if credential.expires_at_ms > unix_time_ms() {
+            return Some(credential);
+        }
+        request_failed(
+            events,
+            BackendOperation::Authenticate,
+            format!(
+                "{CREDENTIAL_REFRESH_REQUIRED}: the brokered ChatGPT sign-in expired; its broker must supply a new access token"
+            ),
+        )
+        .await;
+        return None;
+    }
     match refresh_credential(config, &credential).await {
         Ok(refreshed) => {
             let metadata = serde_json::to_value(&refreshed).unwrap_or(Value::Null);
@@ -2632,6 +2723,7 @@ fn credential_from_token_payload(
         account_id,
         email,
         expires_at_ms: unix_time_ms().saturating_add(expires_in.saturating_mul(1_000)),
+        brokered: false,
     })
 }
 
@@ -2716,24 +2808,65 @@ mod tests {
             error: None,
         };
 
-        assert!(conversation_input(&event).is_empty());
+        assert!(conversation_input(&event, "account-1").is_empty());
+    }
+
+    #[test]
+    fn reasoning_replays_only_to_the_account_that_produced_it() {
+        let mut provider_state = vec![
+            json!({"type": "reasoning", "encrypted_content": "from-a"}),
+            json!({"type": "message", "id": "kept"}),
+        ];
+        tag_reasoning_account(&mut provider_state, "account-a");
+        provider_state.push(json!({"type": "reasoning", "encrypted_content": "untagged"}));
+        let item = ConversationItem::Assistant {
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            provider_id: None,
+            model_id: None,
+            signature: None,
+            provider_state,
+        };
+
+        let same = conversation_input(&item, "account-a");
+        assert_eq!(same.len(), 3);
+        assert!(
+            same.iter()
+                .all(|value| value.get(REASONING_ACCOUNT_KEY).is_none())
+        );
+        assert_eq!(same[0]["encrypted_content"], "from-a");
+
+        // Another account cannot decrypt account A's reasoning, so it is not sent there.
+        let other = conversation_input(&item, "account-b");
+        assert_eq!(
+            other
+                .iter()
+                .filter_map(|value| value.get("encrypted_content").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            ["untagged"]
+        );
+        assert!(other.iter().any(|value| value["id"] == "kept"));
     }
 
     #[test]
     fn codex_receives_bounded_model_tool_output() {
-        let input = conversation_input(&ConversationItem::ToolResult {
-            call_id: "call-1".to_owned(),
-            title: Some("read".to_owned()),
-            output: "full transcript output".to_owned(),
-            model_output: Some("bounded model output".to_owned()),
-            failed: false,
-            denied: false,
-            denial_reason: None,
-            name: None,
-            arguments: None,
-            audit_kind: None,
-            duration_ms: None,
-        });
+        let input = conversation_input(
+            &ConversationItem::ToolResult {
+                call_id: "call-1".to_owned(),
+                title: Some("read".to_owned()),
+                output: "full transcript output".to_owned(),
+                model_output: Some("bounded model output".to_owned()),
+                failed: false,
+                denied: false,
+                denial_reason: None,
+                name: None,
+                arguments: None,
+                audit_kind: None,
+                duration_ms: None,
+            },
+            "account-1",
+        );
 
         assert_eq!(input[0]["output"], "bounded model output");
     }
@@ -3488,6 +3621,72 @@ mod tests {
         );
     }
 
+    fn brokered_token() -> String {
+        let claims = json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "account-brokered"},
+            "https://api.openai.com/profile": {"email": "owner@example.test"}
+        });
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims JSON"));
+        format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn brokered_chatgpt_credentials_read_their_account_from_the_token() {
+        let token = brokered_token();
+        let metadata = brokered_credential_metadata(
+            &json!({"access_token": token, "expires_at_ms": 42}).to_string(),
+        )
+        .expect("brokered credential");
+        let credential = serde_json::from_value::<CodexCredential>(metadata).expect("stored shape");
+        assert!(credential.brokered);
+        assert!(credential.refresh_token.is_empty());
+        assert_eq!(credential.account_id, "account-brokered");
+        assert_eq!(credential.email.as_deref(), Some("owner@example.test"));
+        assert!(
+            brokered_credential_metadata(
+                &json!({"access_token": "header.e30.signature", "expires_at_ms": 42}).to_string()
+            )
+            .is_err(),
+            "a token naming no account is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn brokered_chatgpt_credentials_are_never_refreshed() {
+        let mut config = BackendConfig::native(std::env::temp_dir());
+        // Nothing listens here: a refresh attempt would fail differently.
+        config.auth_urls.token = "http://127.0.0.1:9/oauth/token".to_owned();
+        let (events, mut received) = mpsc::channel(4);
+        let brokered = |expires_at_ms| CodexCredential {
+            access_token: brokered_token(),
+            refresh_token: String::new(),
+            expires_at_ms,
+            account_id: "account-brokered".to_owned(),
+            email: None,
+            brokered: true,
+        };
+        // Inside the refresh window but unexpired: kept as it is.
+        let nearly = brokered(unix_time_ms() + 30_000);
+        let kept = refresh_if_needed(&config, Some(nearly), &events).await;
+        assert!(kept.is_some());
+        assert!(received.try_recv().is_err());
+        // Expired: reported for the broker, never refreshed.
+        assert!(
+            refresh_if_needed(&config, Some(brokered(0)), &events)
+                .await
+                .is_none()
+        );
+        match received.recv().await.expect("failure event") {
+            BackendEvent::RequestFailed { message, .. } => {
+                assert!(
+                    message.starts_with(CREDENTIAL_REFRESH_REQUIRED),
+                    "{message}"
+                );
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
     #[test]
     fn extracts_namespaced_chatgpt_claims_from_oauth_tokens() {
         let claims = json!({
@@ -3706,7 +3905,7 @@ mod tests {
             .map(Into::into)
             .collect();
 
-        let body = codex_request_body(&request);
+        let body = codex_request_body(&request, "account-1");
         let names = body["tools"]
             .as_array()
             .expect("tools array")
@@ -3768,7 +3967,7 @@ mod tests {
             }),
         });
 
-        let body = codex_request_body(&request);
+        let body = codex_request_body(&request, "account-1");
         let content = body["input"][0]["content"]
             .as_array()
             .expect("user content array");
@@ -3781,7 +3980,7 @@ mod tests {
     #[test]
     fn codex_request_keeps_operating_instructions_out_of_user_history() {
         let request = test_request();
-        let body = codex_request_body(&request);
+        let body = codex_request_body(&request, "account-1");
         assert_eq!(body["instructions"], "Be direct.");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["text"], "Hi");
@@ -3804,7 +4003,7 @@ mod tests {
             assert_eq!(request.reasoning_effort.as_deref(), Some(effort));
             assert!(request.tools.is_empty());
             assert!(!request.fast_mode);
-            let body = codex_request_body(&request);
+            let body = codex_request_body(&request, "account-1");
             assert_eq!(body["reasoning"]["effort"], effort);
             assert!(body["input"].to_string().contains("input_image"));
         }
@@ -3812,7 +4011,7 @@ mod tests {
 
     #[test]
     fn codex_requests_disable_provider_storage() {
-        let body = codex_request_body(&test_request());
+        let body = codex_request_body(&test_request(), "account-1");
 
         assert_eq!(body["store"], false);
     }
@@ -3824,7 +4023,7 @@ mod tests {
             request.model = "gpt-6-astra".to_owned();
             request.reasoning_effort = Some(effort.to_owned());
 
-            let body = codex_request_body(&request);
+            let body = codex_request_body(&request, "account-1");
 
             assert_eq!(body["model"], "gpt-6-astra");
             assert_eq!(body["parallel_tool_calls"], true);
@@ -3885,9 +4084,16 @@ mod tests {
     #[test]
     fn fast_mode_requests_priority_service_tier() {
         let mut request = test_request();
-        assert!(codex_request_body(&request).get("service_tier").is_none());
+        assert!(
+            codex_request_body(&request, "account-1")
+                .get("service_tier")
+                .is_none()
+        );
         request.fast_mode = true;
-        assert_eq!(codex_request_body(&request)["service_tier"], "priority");
+        assert_eq!(
+            codex_request_body(&request, "account-1")["service_tier"],
+            "priority"
+        );
     }
 
     #[tokio::test]
@@ -4012,6 +4218,7 @@ mod tests {
             expires_at_ms: u64::MAX,
             account_id: "account-1".to_owned(),
             email: None,
+            brokered: false,
         }
     }
 

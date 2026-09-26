@@ -531,6 +531,8 @@ pub struct LastTurn {
     pub model: Option<String>,
     pub options: ModelOptions,
     pub outcome: TurnOutcome,
+    /// The turn's bounded final response, as its linked parent's report carries it.
+    pub completion: Option<crate::child_reports::completion::Completion>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3918,6 +3920,7 @@ impl DomainState {
             model: turn.model.clone(),
             options: turn.options.clone(),
             outcome: turn.outcome,
+            completion: turn.completion.clone(),
         });
         self.connection = ConnectionState::Disconnected("Retained history".to_owned());
         if self.queue.iter().any(|prompt| prompt.delivery_uncertain) {
@@ -3962,7 +3965,7 @@ impl DomainState {
             nakode_protocol::ProviderAccountRoutingDiagnosticView {
                 account_id: Some(account_id.clone()),
                 account_label: None,
-                reason: "persisted session affinity".to_owned(),
+                reason: "the session's last account".to_owned(),
                 cooldown_until_ms: None,
             }
         });
@@ -3980,6 +3983,7 @@ impl DomainState {
             model: turn.model.clone(),
             options: turn.options.clone(),
             outcome: turn.outcome,
+            completion: turn.completion.clone(),
         });
         self.owner_turns = session
             .owner_turns
@@ -7379,9 +7383,9 @@ impl DomainState {
             BackendEvent::ImageReturned(image) => {
                 let history = image.history_item();
                 self.observe_item(&image.turn_id, history.item, true);
-                if let Some(data) = image.attachment.image {
-                    self.transcript
-                        .set_labeled_images(&image.id, vec![(image.attachment.label, data)]);
+                let images = image.labeled_images();
+                if !images.is_empty() {
+                    self.transcript.set_labeled_images(&image.id, images);
                 }
             }
             BackendEvent::ItemCompleted { turn_id, item } => {
@@ -7719,6 +7723,7 @@ impl DomainState {
             model: turn.model.clone(),
             options: turn.options.clone(),
             outcome: turn.outcome,
+            completion: turn.completion.clone(),
         });
         self.owner_turns = session
             .owner_turns
@@ -8477,6 +8482,7 @@ impl DomainState {
             model: turn.model,
             options: turn.options,
             outcome,
+            completion: None,
         });
     }
 
@@ -8556,6 +8562,9 @@ impl DomainState {
         }
 
         self.record_terminal_owner_turn(completed_turn, outcome);
+        if let Some(last) = self.last_turn.as_mut() {
+            last.completion = Some(completion.clone());
+        }
 
         let mut effects = Vec::new();
         if let (Some(session_id), Some(turn)) = (self.session_id.clone(), self.last_turn.clone()) {
@@ -10385,11 +10394,11 @@ impl DomainState {
         let history = image.history_item();
         self.record_subagent_item(run_id, &image.turn_id, &history.item);
         self.observe_subagent_item(run_id, history.item);
+        let images = image.labeled_images();
         if let Some(chat) = self.subagent_chats.get_mut(run_id)
-            && let Some(data) = image.attachment.image
+            && !images.is_empty()
         {
-            chat.transcript
-                .set_labeled_images(&image.id, vec![(image.attachment.label, data)]);
+            chat.transcript.set_labeled_images(&image.id, images);
         }
         Vec::new()
     }
@@ -15582,6 +15591,11 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             assert_eq!(
                 report.final_text.as_deref(),
                 (has_final && !tool_after).then_some("This turn's answer")
+            );
+            // The view's last turn carries the same bounded report, for a parent in another runtime.
+            assert_eq!(
+                state.last_turn.as_ref().and_then(|turn| turn.completion.as_ref()),
+                Some(report)
             );
         }
     }

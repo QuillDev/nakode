@@ -2200,6 +2200,7 @@ mod tests {
             model_id: None,
             resolved_model_options: nakode_protocol::ModelOptions::default(),
             status: TurnStatus::Running,
+            completion: None,
         });
         let mut state = state(&view);
 
@@ -2224,6 +2225,7 @@ mod tests {
             model_id: None,
             resolved_model_options: nakode_protocol::ModelOptions::default(),
             status: TurnStatus::Running,
+            completion: None,
         });
         let mut state = state(&view);
 

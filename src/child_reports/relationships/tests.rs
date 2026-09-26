@@ -303,6 +303,7 @@ fn relay(f: &Fixture, inbox: &mut InboxStore) {
                         text: "Task".into(),
                         attachments: vec![],
                     },
+                    source_owner_chat: false,
                 },
                 key: "relay",
                 sender: "host",
