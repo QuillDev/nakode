@@ -842,6 +842,20 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         })
     );
     command_rpc!(
+        admit_external_child_report,
+        api::AdmitExternalChildReportRequest,
+        input,
+        protocol::Command::AdmitExternalChildReport {
+            session_id: protocol::SessionId::from(input.session_id),
+            message_id: input.message_id,
+            child_session_id: input.child_session_id,
+            child_title: input.child_title,
+            report_id: input.report_id,
+            state: input.state,
+            body: input.body,
+        }
+    );
+    command_rpc!(
         set_followup_paused,
         api::SetFollowupPausedRequest,
         input,

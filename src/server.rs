@@ -793,6 +793,7 @@ impl ServerCore {
             Command::ReparentChildSession { .. }
             | Command::RelayAgentFollowup { .. }
             | Command::EnqueueFollowup { .. }
+            | Command::AdmitExternalChildReport { .. }
             | Command::SetFollowupPaused { .. }
             | Command::RemoveFollowup { .. }
             | Command::LinkChildSession { .. }
@@ -4698,6 +4699,7 @@ impl ServerCore {
             }
             | Command::RelayAgentFollowup { session_id, .. }
             | Command::EnqueueFollowup { session_id, .. }
+            | Command::AdmitExternalChildReport { session_id, .. }
             | Command::SetFollowupPaused { session_id, .. }
             | Command::RemoveFollowup { session_id, .. }
             | Command::SendPrompt { session_id, .. }

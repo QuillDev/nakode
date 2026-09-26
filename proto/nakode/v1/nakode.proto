@@ -40,6 +40,7 @@ service NakodeService {
   rpc ListChildReports(ListChildReportsRequest) returns (ChildReportPage);
   rpc RelayAgentFollowup(RelayAgentFollowupRequest) returns (MutationResult);
   rpc EnqueueFollowup(EnqueueFollowupRequest) returns (MutationResult);
+  rpc AdmitExternalChildReport(AdmitExternalChildReportRequest) returns (MutationResult);
   rpc RemoveFollowup(RemoveFollowupRequest) returns (MutationResult);
   rpc SetFollowupPaused(SetFollowupPausedRequest) returns (MutationResult);
   rpc ListFollowups(ListFollowupsRequest) returns (FollowupInbox);
@@ -209,6 +210,18 @@ message EnqueueFollowupRequest {
   string session_id = 2;
   string message_id = 3;
   PromptInput prompt = 4;
+}
+// A child in another runtime (a stack VM) reports to its parent here, through the
+// authenticated integration that recorded the relationship. Admitted as inert child evidence.
+message AdmitExternalChildReportRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  string message_id = 3;
+  string child_session_id = 4;
+  string child_title = 5;
+  string report_id = 6;
+  string state = 7;
+  string body = 8;
 }
 message RemoveFollowupRequest {
   MutationOptions mutation = 1;
