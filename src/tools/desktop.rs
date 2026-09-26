@@ -699,8 +699,13 @@ mod tests {
         let shot = screenshot(&workspace).await.expect("screenshot");
         assert!(shot.png.starts_with(b"\x89PNG"));
         assert!(shot.width > 0 && shot.height > 0);
-        record_start("live", Some("Live Test")).await.expect("start");
-        assert!(record_start("live", None).await.is_err(), "one recording per session");
+        record_start("live", Some("Live Test"))
+            .await
+            .expect("start");
+        assert!(
+            record_start("live", None).await.is_err(),
+            "one recording per session"
+        );
         for action in [
             json!({"action": "click", "x": 700, "y": 400}),
             json!({"action": "scroll", "direction": "down", "amount": 5, "x": 700, "y": 400}),
@@ -710,13 +715,27 @@ mod tests {
             act(&action).await.expect("action");
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        assert!(act(&json!({"action": "click", "x": 99_999, "y": 1})).await.is_err());
+        assert!(
+            act(&json!({"action": "click", "x": 99_999, "y": 1}))
+                .await
+                .is_err()
+        );
         let saved = record_stop("live", &workspace).await.expect("stop");
-        assert_eq!(saved.video, root.path().join(".tmp-gallery/recordings/live-test.mp4"));
+        assert_eq!(
+            saved.video,
+            root.path().join(".tmp-gallery/recordings/live-test.mp4")
+        );
         assert!(saved.bytes > 0 && saved.bytes <= RECORDING_BUDGET_BYTES);
-        assert!(std::fs::read(&saved.poster).expect("poster").starts_with(b"\x89PNG"));
+        assert!(
+            std::fs::read(&saved.poster)
+                .expect("poster")
+                .starts_with(b"\x89PNG")
+        );
         eprintln!("LIVE {}", describe(&saved));
-        assert!(record_stop("live", &workspace).await.is_err(), "already stopped");
+        assert!(
+            record_stop("live", &workspace).await.is_err(),
+            "already stopped"
+        );
     }
 
     #[test]
