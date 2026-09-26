@@ -1431,6 +1431,13 @@ message Turn {
   TurnStatus status = 4;
   // Concrete options captured when this owner turn was accepted. They never follow later selection changes.
   ModelOptions resolved_model_options = 5;
+  // The bounded final response of a terminal owner turn; only last_turn carries it.
+  optional TurnCompletion completion = 6;
+}
+message TurnCompletion {
+  optional string final_text = 1;
+  uint64 final_total_bytes = 2;
+  bool truncated = 3;
 }
 message ContextUsage { uint64 estimated_tokens = 1; optional uint64 context_window = 2; bool compacting = 3; }
 message SessionState {

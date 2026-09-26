@@ -3543,6 +3543,11 @@ fn turn(value: protocol::TurnView) -> api::Turn {
         model_id: value.model_id.map(|id| id.to_string()),
         status: status as i32,
         resolved_model_options: Some(projected_model_options(value.resolved_model_options)),
+        completion: value.completion.map(|completion| api::TurnCompletion {
+            final_text: completion.final_text,
+            final_total_bytes: completion.final_total_bytes,
+            truncated: completion.truncated,
+        }),
     }
 }
 
