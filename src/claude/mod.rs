@@ -1684,8 +1684,37 @@ fn models_event(message: &Value) -> BackendEvent {
                 },
             })
         })
-        .collect();
-    BackendEvent::Models(models)
+        .collect::<Vec<_>>();
+    BackendEvent::Models(distinguish_context_windows(models))
+}
+
+/// Two rows of one model differ only in their context window (`opus` and `opus[1m]` both read
+/// "Opus 5.5"), which the name leaves out; where names collide, the row whose identifier carries a
+/// window says so.
+fn distinguish_context_windows(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for model in &models {
+        *counts.entry(model.display_name()).or_default() += 1;
+    }
+    for model in &mut models {
+        if counts.get(&model.display_name()).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        if let Some(window) = context_window_of(&model.id) {
+            model.display_name = Some(format!("{} ({window} context)", model.display_name()));
+        }
+    }
+    models
+}
+
+/// The context window a Claude Code model identifier asks for: `opus[1m]` → `1M`.
+fn context_window_of(id: &str) -> Option<String> {
+    let window = id.strip_suffix(']')?.rsplit_once('[')?.1;
+    let valid = !window.is_empty()
+        && window
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, 'k' | 'm' | '.'));
+    valid.then(|| window.to_ascii_uppercase())
 }
 
 /// Claude Code's picker rows carry the family as the display name ("Fable", "Sonnet",
@@ -2751,6 +2780,22 @@ assert.equal(replacementSent, true, "replacement did not send after child close"
             ]
         );
         assert_eq!(without_context_window("Opus (1M context)"), "Opus");
+        let BackendEvent::Models(both) = models_event(&json!({
+            "models": [
+                {"id": "opus", "displayName": "Opus", "description": "Opus 5.5 · Best for everyday tasks"},
+                {"id": "opus[1m]", "displayName": "Opus (1M context)",
+                 "description": "Opus 5.5 with 1M context · Best for everyday tasks"},
+                {"id": "claude-fable-5-1[1m]", "displayName": "Fable",
+                 "description": "Fable 5.1 · Most capable"}
+            ]
+        })) else {
+            panic!("expected models event");
+        };
+        // Only a name that would otherwise repeat says its window.
+        assert_eq!(
+            both.iter().map(ModelInfo::display_name).collect::<Vec<_>>(),
+            ["Opus 5.5", "Opus 5.5 (1M context)", "Fable 5.1"]
+        );
         assert_eq!(
             without_context_window("Sonnet 5 with 200k context"),
             "Sonnet 5"
