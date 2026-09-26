@@ -1727,6 +1727,11 @@ impl NakodeClient {
 
     typed_mutation!(relay_agent_followup, api::RelayAgentFollowupRequest);
     typed_mutation!(
+        admit_external_child_report,
+        api::AdmitExternalChildReportRequest,
+        "ExternalChildReports"
+    );
+    typed_mutation!(
         enqueue_followup,
         api::EnqueueFollowupRequest,
         "DurableFollowupInbox"

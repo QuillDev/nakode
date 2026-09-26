@@ -842,6 +842,20 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         })
     );
     command_rpc!(
+        admit_external_child_report,
+        api::AdmitExternalChildReportRequest,
+        input,
+        protocol::Command::AdmitExternalChildReport {
+            session_id: protocol::SessionId::from(input.session_id),
+            message_id: input.message_id,
+            child_session_id: input.child_session_id,
+            child_title: input.child_title,
+            report_id: input.report_id,
+            state: input.state,
+            body: input.body,
+        }
+    );
+    command_rpc!(
         set_followup_paused,
         api::SetFollowupPausedRequest,
         input,
@@ -3529,6 +3543,11 @@ fn turn(value: protocol::TurnView) -> api::Turn {
         model_id: value.model_id.map(|id| id.to_string()),
         status: status as i32,
         resolved_model_options: Some(projected_model_options(value.resolved_model_options)),
+        completion: value.completion.map(|completion| api::TurnCompletion {
+            final_text: completion.final_text,
+            final_total_bytes: completion.final_total_bytes,
+            truncated: completion.truncated,
+        }),
     }
 }
 

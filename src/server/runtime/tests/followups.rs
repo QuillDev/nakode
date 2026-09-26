@@ -61,6 +61,27 @@ async fn invalid_file_paths_are_refused_before_they_can_block_the_inbox() {
     assert!(harness.commands.try_recv().is_ok());
 }
 
+#[tokio::test]
+async fn an_external_child_report_activates_its_idle_parent() {
+    let mut harness = Harness::new().await;
+    let command = Command::AdmitExternalChildReport {
+        session_id: harness.session.clone(),
+        message_id: "external-child:vm-child:t1".to_owned(),
+        child_session_id: "vm-child".to_owned(),
+        child_title: "Stack agent".to_owned(),
+        report_id: "turn:t1".to_owned(),
+        state: "completed".to_owned(),
+        body: "Finished the migration.".to_owned(),
+    };
+    harness
+        .command("external-report", None, false, command)
+        .await
+        .unwrap();
+    assert!(harness.runtime.followup_polling_enabled);
+    harness.runtime.dispatch_followups().await;
+    assert!(harness.commands.try_recv().is_ok());
+}
+
 struct Harness {
     runtime: NativeServerRuntime,
     session: SessionId,

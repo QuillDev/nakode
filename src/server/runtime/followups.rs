@@ -37,6 +37,7 @@ impl NativeServerRuntime {
                 command:
                     command @ (Command::EnqueueFollowup { .. }
                     | Command::RelayAgentFollowup { .. }
+                    | Command::AdmitExternalChildReport { .. }
                     | Command::SetFollowupPaused { .. }
                     | Command::RemoveFollowup { .. }),
                 idempotency_key,

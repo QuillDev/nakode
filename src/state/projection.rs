@@ -486,6 +486,7 @@ fn turn_view(
             } else {
                 TurnStatus::Running
             },
+            completion: None,
         });
     }
     let starting = state
@@ -504,6 +505,7 @@ fn turn_view(
             fast_mode: starting.options.fast_mode,
         },
         status: TurnStatus::Starting,
+        completion: None,
     })
 }
 
@@ -530,6 +532,13 @@ fn last_turn_view(
             crate::backend::TurnOutcome::Interrupted => TurnStatus::Interrupted,
             crate::backend::TurnOutcome::Failed => TurnStatus::Failed,
         },
+        completion: turn.completion.as_ref().map(|completion| {
+            nakode_protocol::TurnCompletionView {
+                final_text: completion.final_text.clone(),
+                final_total_bytes: completion.final_total_bytes as u64,
+                truncated: completion.truncated,
+            }
+        }),
     })
 }
 
