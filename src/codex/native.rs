@@ -3913,30 +3913,28 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("tool name"))
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            names,
-            [
-                "read",
-                #[cfg(unix)]
-                "return_image",
-                "prepare_image",
-                "list_child_materials",
-                "read_skill",
-                "read_skill_component",
-                "write",
-                "edit",
-                "bash",
-                "grep",
-                "find",
-                "ls",
-                "eval",
-                "ask",
-                "todo",
-                "desktop_screenshot",
-                "desktop_action",
-                "screen_record"
-            ]
-        );
+        let mut expected = vec![
+            "read",
+            #[cfg(unix)]
+            "return_image",
+            "prepare_image",
+            "list_child_materials",
+            "read_skill",
+            "read_skill_component",
+            "write",
+            "edit",
+            "bash",
+            "grep",
+            "find",
+            "ls",
+            "eval",
+            "ask",
+            "todo",
+        ];
+        if crate::tools::desktop::available() {
+            expected.extend(["desktop_screenshot", "desktop_action", "screen_record"]);
+        }
+        assert_eq!(names, expected);
         assert!(!names.contains(&"task"));
         assert!(!names.contains(&"hub"));
         let edit = body["tools"]
