@@ -10389,7 +10389,7 @@ impl DomainState {
     fn record_subagent_image(
         &mut self,
         run_id: &str,
-        image: crate::runtime::ReturnedImage,
+        image: &crate::runtime::ReturnedImage,
     ) -> Vec<Effect> {
         let history = image.history_item();
         self.record_subagent_item(run_id, &image.turn_id, &history.item);
@@ -10426,7 +10426,7 @@ impl DomainState {
                 kind,
                 delta,
             } => self.handle_subagent_delta(run_id, &turn_id, &item_id, kind, &delta),
-            BackendEvent::ImageReturned(image) => self.record_subagent_image(run_id, image),
+            BackendEvent::ImageReturned(image) => self.record_subagent_image(run_id, &image),
             BackendEvent::ItemStarted { turn_id, item }
             | BackendEvent::ItemCompleted { turn_id, item } => {
                 self.record_subagent_item(run_id, &turn_id, &item);
@@ -15594,7 +15594,10 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             );
             // The view's last turn carries the same bounded report, for a parent in another runtime.
             assert_eq!(
-                state.last_turn.as_ref().and_then(|turn| turn.completion.as_ref()),
+                state
+                    .last_turn
+                    .as_ref()
+                    .and_then(|turn| turn.completion.as_ref()),
                 Some(report)
             );
         }

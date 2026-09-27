@@ -1267,7 +1267,7 @@ impl NakodeClient {
         limit: usize,
     ) -> Result<HydratedSession, SdkError> {
         let state = self.get_session(session_id).await?;
-        self.hydrate_session_with_refresh(state, limit).await
+        Box::pin(self.hydrate_session_with_refresh(state, limit)).await
     }
 
     /// Sends work using the server-owned start-versus-queue policy.
@@ -2350,7 +2350,7 @@ impl NakodeClient {
         let task = spawn_traced(async move {
             while let Some(update) = source.next().await {
                 let hydrated = match update {
-                    Ok(state) => client.hydrate_session_with_refresh(state, limit).await,
+                    Ok(state) => Box::pin(client.hydrate_session_with_refresh(state, limit)).await,
                     Err(error) => Err(error),
                 };
                 if sender.send(hydrated).await.is_err() {
@@ -2376,7 +2376,7 @@ impl NakodeClient {
         let task = spawn_traced(async move {
             while let Some(update) = source.next().await {
                 let hydrated = match update {
-                    Ok(state) => client.hydrate_session_with_refresh(state, limit).await,
+                    Ok(state) => Box::pin(client.hydrate_session_with_refresh(state, limit)).await,
                     Err(error) => Err(error),
                 };
                 if sender.send(hydrated).await.is_err() {

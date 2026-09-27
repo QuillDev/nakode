@@ -3931,7 +3931,10 @@ mod tests {
                 "ls",
                 "eval",
                 "ask",
-                "todo"
+                "todo",
+                "desktop_screenshot",
+                "desktop_action",
+                "screen_record"
             ]
         );
         assert!(!names.contains(&"task"));
