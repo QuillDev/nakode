@@ -1423,27 +1423,28 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            tool_names,
-            [
-                "read",
-                #[cfg(unix)]
-                "return_image",
-                "prepare_image",
-                "list_child_materials",
-                "read_skill",
-                "read_skill_component",
-                "write",
-                "edit",
-                "bash",
-                "grep",
-                "find",
-                "ls",
-                "eval",
-                "ask",
-                "todo"
-            ]
-        );
+        let mut expected = vec![
+            "read",
+            #[cfg(unix)]
+            "return_image",
+            "prepare_image",
+            "list_child_materials",
+            "read_skill",
+            "read_skill_component",
+            "write",
+            "edit",
+            "bash",
+            "grep",
+            "find",
+            "ls",
+            "eval",
+            "ask",
+            "todo",
+        ];
+        if crate::tools::desktop::available() {
+            expected.extend(["desktop_screenshot", "desktop_action", "screen_record"]);
+        }
+        assert_eq!(tool_names, expected);
         assert!(!tool_names.contains(&"task"));
         assert!(!tool_names.contains(&"hub"));
         let todo_schema: Value = serde_json::from_str(

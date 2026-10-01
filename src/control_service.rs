@@ -3157,7 +3157,11 @@ mod tests {
         let executable = directory.path().join("nakode");
         std::fs::write(&executable, b"build-one").expect("first build");
         let first = executable_identity(&executable).expect("first identity");
-        std::fs::write(&executable, b"build-two").expect("replacement build");
+        // Installed replacements change inode even on filesystems whose timestamp resolution
+        // cannot distinguish two same-size writes in one tick.
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, b"build-two").expect("replacement build");
+        std::fs::rename(replacement, &executable).expect("install replacement");
         let second = executable_identity(&executable).expect("second identity");
 
         assert_eq!(first.path, second.path);

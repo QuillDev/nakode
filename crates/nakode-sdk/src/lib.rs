@@ -1267,7 +1267,7 @@ impl NakodeClient {
         limit: usize,
     ) -> Result<HydratedSession, SdkError> {
         let state = self.get_session(session_id).await?;
-        self.hydrate_session_with_refresh(state, limit).await
+        Box::pin(self.hydrate_session_with_refresh(state, limit)).await
     }
 
     /// Sends work using the server-owned start-versus-queue policy.
@@ -1726,6 +1726,11 @@ impl NakodeClient {
     }
 
     typed_mutation!(relay_agent_followup, api::RelayAgentFollowupRequest);
+    typed_mutation!(
+        admit_external_child_report,
+        api::AdmitExternalChildReportRequest,
+        "ExternalChildReports"
+    );
     typed_mutation!(
         enqueue_followup,
         api::EnqueueFollowupRequest,
@@ -2345,7 +2350,7 @@ impl NakodeClient {
         let task = spawn_traced(async move {
             while let Some(update) = source.next().await {
                 let hydrated = match update {
-                    Ok(state) => client.hydrate_session_with_refresh(state, limit).await,
+                    Ok(state) => Box::pin(client.hydrate_session_with_refresh(state, limit)).await,
                     Err(error) => Err(error),
                 };
                 if sender.send(hydrated).await.is_err() {
@@ -2371,7 +2376,7 @@ impl NakodeClient {
         let task = spawn_traced(async move {
             while let Some(update) = source.next().await {
                 let hydrated = match update {
-                    Ok(state) => client.hydrate_session_with_refresh(state, limit).await,
+                    Ok(state) => Box::pin(client.hydrate_session_with_refresh(state, limit)).await,
                     Err(error) => Err(error),
                 };
                 if sender.send(hydrated).await.is_err() {
@@ -3364,6 +3369,7 @@ mod tests {
     fn session_view(id: &str) -> protocol::SessionView {
         protocol::SessionView {
             parent_session_id: None,
+            relationship_revision: None,
             id: protocol::SessionId::from(id),
             revision: 1,
             workspace_id: protocol::WorkspaceId::from("workspace-a"),

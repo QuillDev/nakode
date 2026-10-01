@@ -24,9 +24,11 @@ use uuid::Uuid;
 use crate::backend::{
     ApprovalDecision, ApprovalKind, ApprovalRequest, BackendCapabilities, BackendCommand,
     BackendError, BackendEvent, BackendHandle, BackendIdentity, BackendOperation,
-    BackendTokenUsage, CLAUDE_PROVIDER, CapabilitySupport, DeltaKind, ExternalToolRequest,
-    ItemKind, ItemStatus, ModelInfo, NormalizedItem, TurnOutcome, request_failed,
+    BackendTokenUsage, CLAUDE_PROVIDER, CREDENTIAL_REFRESH_REQUIRED, CapabilitySupport, DeltaKind,
+    ExternalToolRequest, ItemKind, ItemStatus, ModelInfo, NormalizedItem, TurnOutcome,
+    request_failed,
 };
+use crate::credential::SecretValue;
 
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
@@ -62,6 +64,9 @@ struct ClaudeOAuthCredential {
     organization_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     organization_name: Option<String>,
+    /// Supplied by a broker that alone refreshes it; Nakode holds no refresh token for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    brokered: bool,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +126,8 @@ pub struct BackendConfig {
     vision_config: Option<std::sync::Arc<std::sync::RwLock<crate::vision::VisionConfig>>>,
     vision_service: Option<crate::vision::SharedVisionService>,
     publish_credential_updates: bool,
+    /// Where each session's latest history snapshot is kept, so it reads back while not loaded.
+    session_database: Option<PathBuf>,
 }
 
 impl BackendConfig {
@@ -132,12 +139,19 @@ impl BackendConfig {
             vision_config: None,
             vision_service: None,
             publish_credential_updates: false,
+            session_database: None,
         }
     }
 
     #[must_use]
     pub fn with_credential(mut self, credential: Option<Value>) -> Self {
         self.credential = credential;
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_database(mut self, path: PathBuf) -> Self {
+        self.session_database = Some(path);
         self
     }
 
@@ -225,13 +239,54 @@ fn parse_credential(
                 detail: format!("invalid OAuth credential: {error}"),
             }
         })?;
-    if parsed.access_token.is_empty() || parsed.refresh_token.is_empty() {
+    if parsed.access_token.is_empty() || (parsed.refresh_token.is_empty() && !parsed.brokered) {
         return Err(BackendError::InvalidCredential {
             provider: CLAUDE_PROVIDER.to_owned(),
             detail: "OAuth access or refresh token is empty".to_owned(),
         });
     }
     Ok(Some(parsed))
+}
+
+/// The broker's view of one Claude sign-in: a current access token and who it belongs to.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrokeredClaudeCredential {
+    access_token: String,
+    expires_at_ms: u64,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    organization_id: Option<String>,
+    #[serde(default)]
+    organization_name: Option<String>,
+}
+
+/// Validates a brokered Claude credential (JSON) and returns the metadata this adapter stores.
+///
+/// # Errors
+///
+/// Returns a description when the credential is not the brokered shape or has no access token.
+pub fn brokered_credential_metadata(credential: &str) -> Result<Value, String> {
+    let brokered = serde_json::from_str::<BrokeredClaudeCredential>(credential)
+        .map_err(|error| format!("invalid brokered Claude credential: {error}"))?;
+    if brokered.access_token.is_empty() {
+        return Err("brokered Claude credential has no access token".to_owned());
+    }
+    serde_json::to_value(ClaudeOAuthCredential {
+        access_token: brokered.access_token,
+        refresh_token: String::new(),
+        expires_at_ms: brokered.expires_at_ms,
+        authorized_at_ms: None,
+        account_id: brokered.account_id,
+        email: brokered.email,
+        organization_id: brokered.organization_id,
+        organization_name: brokered.organization_name,
+        brokered: true,
+    })
+    .map_err(|error| error.to_string())
 }
 
 async fn spawn_bridge(workspace: &std::path::Path) -> Result<Bridge, BackendError> {
@@ -430,6 +485,7 @@ async fn run_supervisor(
     let mut attachment = None;
     let mut session_options = None;
     let mut recovery_ready_event = None;
+    let mut returned_images = ReturnedImages::default();
     let mut deferred_command = None;
     let mut authentication_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut authentication_callback: Option<mpsc::Sender<String>> = None;
@@ -477,6 +533,16 @@ async fn run_supervisor(
                     }
                     continue;
                 }
+                // A replaced credential applies from the next command; the native session continues.
+                if let BackendCommand::UpdateCredential { credential: replacement } = command {
+                    match parse_credential(replacement.as_ref().map(SecretValue::expose)) {
+                        Ok(replacement) => credential = replacement,
+                        Err(error) => {
+                            request_failed(&events, BackendOperation::Authenticate, error.to_string()).await;
+                        }
+                    }
+                    continue;
+                }
                 if let Err(message) = refresh_supervisor_credential(
                     &mut credential,
                     publish_credential_updates,
@@ -509,9 +575,10 @@ async fn run_supervisor(
                         }
                     }
                 }
-                handle_command(command, &config, credential.as_ref(), bridge.as_mut(), &events).await;
+                let owner = session_owner(attachment.as_ref());
+                handle_command(command, &config, credential.as_ref(), bridge.as_mut(), &events, owner).await;
             }
-            () = wait_until_credential_refresh(credential.as_ref()), if publish_credential_updates && credential.is_some() => {
+            () = wait_until_credential_refresh(credential.as_ref()), if publish_credential_updates && credential.as_ref().is_some_and(|credential| !credential.brokered) => {
                 if let Err(message) = refresh_supervisor_credential(&mut credential, true, &events).await {
                     request_failed(&events, BackendOperation::Reload, message).await;
                 }
@@ -547,6 +614,31 @@ async fn run_supervisor(
                     continue;
                 };
                 let event_name = message.get("event").and_then(Value::as_str);
+                if matches!(event_name, Some("history_snapshot" | "session_resumed"))
+                    && let Some(database) = config.session_database.clone()
+                {
+                    keep_history_snapshot(database, &message).await;
+                }
+                if event_name == Some("history_snapshot") {
+                    continue;
+                }
+                if event_name == Some("desktop_request") {
+                    let reply = desktop_request(&message, session_owner(attachment.as_ref())).await;
+                    if let Some(bridge) = bridge.as_mut() {
+                        let _ = send(bridge, reply).await;
+                    }
+                    continue;
+                }
+                if event_name == Some("image_return_request") {
+                    let (output, failed) = match return_image(&message, &mut returned_images, &events).await {
+                        Ok(output) => (output, false),
+                        Err(error) => (error, true),
+                    };
+                    if let Some(bridge) = bridge.as_mut() {
+                        let _ = send(bridge, json!({"method":"resolve_image_return","id":string(&message, "id"),"output":output,"failed":failed})).await;
+                    }
+                    continue;
+                }
                 if event_name == Some("session_created")
                     && let Some(command) = attachment.take()
                 {
@@ -561,6 +653,7 @@ async fn run_supervisor(
                         credential.as_ref(),
                         &mut bridge,
                         &events,
+                        session_owner(attachment.as_ref()),
                     )
                     .await;
                     recovery_ready_event = None;
@@ -637,7 +730,7 @@ async fn reattach_session(
 ) -> Option<&'static str> {
     let command = attachment?;
     let recovery_event = recovery_event_for(&command);
-    handle_command(command, config, credential, bridge.as_mut(), events).await;
+    handle_command(command, config, credential, bridge.as_mut(), events, None).await;
     recovery_event
 }
 
@@ -648,12 +741,26 @@ async fn replay_after_reattach(
     credential: Option<&ClaudeOAuthCredential>,
     bridge: &mut Option<Bridge>,
     events: &mpsc::Sender<BackendEvent>,
+    owner: Option<&str>,
 ) {
     if let Some(command) = session_options {
-        handle_command(command, config, credential, bridge.as_mut(), events).await;
+        handle_command(command, config, credential, bridge.as_mut(), events, owner).await;
     }
     if let Some(command) = deferred_command {
-        handle_command(command, config, credential, bridge.as_mut(), events).await;
+        handle_command(command, config, credential, bridge.as_mut(), events, owner).await;
+    }
+}
+
+/// The logical Nakode session a Claude backend serves; its environment is keyed by it.
+fn session_owner(attachment: Option<&BackendCommand>) -> Option<&str> {
+    match attachment? {
+        BackendCommand::StartSession {
+            owner_session_id, ..
+        }
+        | BackendCommand::ResumeSession {
+            owner_session_id, ..
+        } => owner_session_id.as_deref(),
+        _ => None,
     }
 }
 
@@ -663,6 +770,7 @@ async fn handle_command(
     credential: Option<&ClaudeOAuthCredential>,
     bridge: Option<&mut Bridge>,
     events: &mpsc::Sender<BackendEvent>,
+    owner: Option<&str>,
 ) {
     if matches!(
         command,
@@ -739,6 +847,14 @@ async fn handle_command(
         "oauthAccessToken".to_owned(),
         Value::String(credential.expect("checked above").access_token.clone()),
     );
+    // Claude Code's own tools run in its process, so a turn carries the session's environment
+    // (account variables such as GH_TOKEN) the way Nakode's own shell tools receive it.
+    if method == "send" {
+        object.insert(
+            "environment".to_owned(),
+            json!(crate::session_environment::read(owner)),
+        );
+    }
     if let Err(error) = send(bridge, payload).await {
         request_failed(events, operation_for_method(method), error).await;
     }
@@ -1045,6 +1161,7 @@ async fn parse_claude_token_response(
         organization_name: token
             .organization
             .and_then(|organization| organization.name),
+        brokered: false,
     })
 }
 
@@ -1072,6 +1189,11 @@ async fn refresh_if_needed_with_url(
     };
     if credential.expires_at_ms > now_ms() {
         return Ok((Some(credential), false));
+    }
+    if credential.brokered {
+        return Err(format!(
+            "{CREDENTIAL_REFRESH_REQUIRED}: the brokered Claude sign-in expired; its broker must supply a new access token"
+        ));
     }
 
     let original_refresh_token = credential.refresh_token.clone();
@@ -1312,6 +1434,70 @@ async fn augment_image_attachments(
     })
 }
 
+/// How many images, and how many bytes, each turn has returned so far.
+#[derive(Default)]
+struct ReturnedImages {
+    turns: HashMap<String, (usize, usize)>,
+}
+
+/// Claude's `return_image`: the bridge names a file, and Nakode reads, validates and attaches it
+/// exactly as the native tool does, so the bytes never pass through the provider.
+async fn return_image(
+    message: &Value,
+    returned: &mut ReturnedImages,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<String, String> {
+    use crate::tools::return_image::{
+        LoadedImage, MAX_BYTES_PER_TURN, MAX_IMAGES_PER_TURN, load_returnable_images,
+        requested_image_paths, returned_images_output,
+    };
+    let turn_id = string(message, "turnId");
+    let call_id = string(message, "id");
+    let paths = requested_image_paths(message)?;
+    let (count, bytes) = returned.turns.get(&turn_id).copied().unwrap_or_default();
+    if count + paths.len() > MAX_IMAGES_PER_TURN {
+        return Err("at most eight images may be returned per turn".to_owned());
+    }
+    let workspace = string(message, "workspace");
+    let loaded = load_returnable_images(std::path::Path::new(&workspace), &paths).await?;
+    let added: usize = loaded.iter().map(|image| image.data.len()).sum();
+    if bytes.saturating_add(added) > MAX_BYTES_PER_TURN {
+        return Err("returned images exceed 20 MiB per turn".to_owned());
+    }
+    returned
+        .turns
+        .insert(turn_id.clone(), (count + loaded.len(), bytes + added));
+    let total = loaded.len();
+    // One call is one message: every image it names travels in the same reply.
+    let mut attachments = loaded.into_iter().map(
+        |LoadedImage {
+             label,
+             mime_type,
+             data,
+         }| crate::backend::PromptAttachment {
+            label,
+            path: None,
+            image: Some(crate::backend::PromptImage { mime_type, data }),
+        },
+    );
+    let first = attachments.next().ok_or("no image to return")?;
+    let image = crate::runtime::ReturnedImage {
+        id: format!("{turn_id}:image:{call_id}"),
+        turn_id,
+        provider_id: CLAUDE_PROVIDER.to_owned(),
+        model_id: string(message, "model"),
+        history_index: 0,
+        sequence: count,
+        attachment: first,
+        more_attachments: attachments.collect(),
+    };
+    events
+        .send(BackendEvent::ImageReturned(image))
+        .await
+        .map_err(|_| "session event receiver closed".to_owned())?;
+    Ok(returned_images_output(total))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEvent>) {
     let event_name = message
@@ -1498,8 +1684,37 @@ fn models_event(message: &Value) -> BackendEvent {
                 },
             })
         })
-        .collect();
-    BackendEvent::Models(models)
+        .collect::<Vec<_>>();
+    BackendEvent::Models(distinguish_context_windows(models))
+}
+
+/// Two rows of one model differ only in their context window (`opus` and `opus[1m]` both read
+/// "Opus 5.5"), which the name leaves out; where names collide, the row whose identifier carries a
+/// window says so.
+fn distinguish_context_windows(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for model in &models {
+        *counts.entry(model.display_name()).or_default() += 1;
+    }
+    for model in &mut models {
+        if counts.get(&model.display_name()).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        if let Some(window) = context_window_of(&model.id) {
+            model.display_name = Some(format!("{} ({window} context)", model.display_name()));
+        }
+    }
+    models
+}
+
+/// The context window a Claude Code model identifier asks for: `opus[1m]` → `1M`.
+fn context_window_of(id: &str) -> Option<String> {
+    let window = id.strip_suffix(']')?.rsplit_once('[')?.1;
+    let valid = !window.is_empty()
+        && window
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, 'k' | 'm' | '.'));
+    valid.then(|| window.to_ascii_uppercase())
 }
 
 /// Claude Code's picker rows carry the family as the display name ("Fable", "Sonnet",
@@ -1557,6 +1772,156 @@ fn without_context_window(name: &str) -> &str {
     name[..index].trim_end()
 }
 
+/// Runs one desktop tool call from the bridge. Screenshots, including the one taken after each
+/// action, come back as an image the model sees.
+async fn desktop_request(message: &Value, owner: Option<&str>) -> Value {
+    use crate::tools::desktop;
+    use base64::Engine as _;
+    let workspace = PathBuf::from(string(message, "workspace"));
+    let arguments = &message["arguments"];
+    let session = owner.map_or_else(|| string(message, "turnId"), str::to_owned);
+    let outcome = match string(message, "tool").as_str() {
+        desktop::SCREENSHOT_TOOL => desktop::screenshot(&workspace).await.map(|shot| {
+            (
+                format!("The {}x{} desktop.", shot.width, shot.height),
+                Some(shot),
+            )
+        }),
+        desktop::ACTION_TOOL => match desktop::act(arguments).await {
+            Ok(said) => {
+                // Let the screen settle so the image shows the action's effect.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                Ok(match desktop::screenshot(&workspace).await {
+                    Ok(shot) => (said, Some(shot)),
+                    Err(error) => (format!("{said}; the screenshot failed: {error}"), None),
+                })
+            }
+            Err(error) => Err(error),
+        },
+        desktop::RECORD_TOOL => match arguments["action"].as_str() {
+            Some("start") => desktop::record_start(&session, arguments["name"].as_str())
+                .await
+                .map(|said| (said, None)),
+            Some("stop") => desktop::record_stop(&session, &workspace)
+                .await
+                .map(|saved| (desktop::describe(&saved), None)),
+            _ => Err("`action` must be \"start\" or \"stop\"".to_owned()),
+        },
+        other => Err(format!("unknown desktop tool {other:?}")),
+    };
+    let (output, failed, image) = match outcome {
+        Ok((said, shot)) => (
+            said,
+            false,
+            shot.map(|shot| {
+                json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(shot.png),
+                    "mimeType": "image/png",
+                })
+            }),
+        ),
+        Err(error) => (error, true, None),
+    };
+    json!({"method": "resolve_desktop", "id": string(message, "id"), "output": output, "failed": failed, "image": image})
+}
+
+/// Keeps the bridge's latest history for a session. The Claude SDK owns the transcript itself;
+/// this copy exists only so a session that is not loaded can still be read.
+async fn keep_history_snapshot(database: PathBuf, message: &Value) {
+    let session_id = string(message, "sessionId");
+    let Some(history) = message.get("history").filter(|history| history.is_array()) else {
+        return;
+    };
+    if session_id.is_empty() {
+        return;
+    }
+    let history = history.to_string();
+    let saved = tokio::task::spawn_blocking(move || {
+        let connection = rusqlite::Connection::open(&database)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute(
+            "INSERT INTO provider_history_snapshots (provider, session_id, history_json, updated_at)
+             VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(provider, session_id) DO UPDATE SET
+               history_json = excluded.history_json,
+               updated_at = excluded.updated_at",
+            rusqlite::params![CLAUDE_PROVIDER, session_id, history],
+        )
+    })
+    .await;
+    if let Ok(Err(error)) = saved {
+        eprintln!("claude: could not keep the session history snapshot: {error}");
+    }
+}
+
+/// Keeps a history snapshot for each retained Claude session that has none yet, reading the
+/// Claude SDK's transcript through one short-lived bridge without resuming any session.
+pub async fn backfill_history_snapshots(database: PathBuf, sessions: Vec<(String, PathBuf)>) {
+    let missing: Vec<_> = sessions
+        .into_iter()
+        .filter(|(session_id, _)| matches!(retained_history(&database, session_id), Ok(None)))
+        .collect();
+    let Some((_, first)) = missing.first() else {
+        return;
+    };
+    let mut bridge = match spawn_bridge(first).await {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            eprintln!("claude: history snapshot backfill skipped: {error}");
+            return;
+        }
+    };
+    'sessions: for (session_id, workspace) in missing {
+        let request = json!({"method":"history","sessionId":session_id,"workspace":workspace});
+        if send(&mut bridge, request).await.is_err() {
+            break;
+        }
+        loop {
+            match timeout(Duration::from_secs(30), bridge.messages.recv()).await {
+                Ok(Some(message)) if message["event"] == "history_snapshot" => {
+                    keep_history_snapshot(database.clone(), &message).await;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                _ => break 'sessions,
+            }
+        }
+    }
+    bridge.task.abort();
+}
+
+/// The last history snapshot kept for a Claude session, when there is one.
+///
+/// # Errors
+/// Returns an error when the session store cannot be read.
+pub fn retained_history(
+    database: &std::path::Path,
+    provider_session_id: &str,
+) -> Result<Option<Vec<crate::backend::SessionHistoryItem>>, String> {
+    use rusqlite::OptionalExtension as _;
+    let connection = rusqlite::Connection::open(database)
+        .map_err(|error| format!("failed to open session store: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("failed to configure session store: {error}"))?;
+    let history = connection
+        .query_row(
+            "SELECT history_json FROM provider_history_snapshots
+             WHERE provider = ?1 AND session_id = ?2",
+            rusqlite::params![CLAUDE_PROVIDER, provider_session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read Claude history snapshot: {error}"))?;
+    history
+        .map(|history| {
+            serde_json::from_str::<Value>(&history)
+                .map(|history| session_history(&json!({ "history": history })))
+                .map_err(|error| format!("invalid Claude history snapshot: {error}"))
+        })
+        .transpose()
+}
+
 fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
     message["history"]
         .as_array()
@@ -1573,18 +1938,38 @@ fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
                 Some("failed") => ItemStatus::Failed,
                 _ => ItemStatus::Complete,
             };
+            let body = string(value, "body");
+            // Saved history keeps a tool call as `{input, output}` in its body; rebuild the audit a
+            // live call carries so a restored transcript presents it the same way.
+            let tool_audit_json = (kind == ItemKind::Tool)
+                .then(|| serde_json::from_str::<Value>(&body).ok())
+                .flatten()
+                .filter(|saved| saved.get("input").is_some())
+                .and_then(|saved| {
+                    tool_audit(
+                        &json!({
+                            "callId": string(value, "id"),
+                            "name": string(value, "title"),
+                            "args": saved["input"],
+                            "result": saved,
+                        }),
+                        status,
+                    )
+                });
             crate::backend::SessionHistoryItem {
                 turn_id: string(value, "turnId"),
-                provider_id: None,
+                // Claude's own saved transcript: what Claude produced is Claude's, as it was live.
+                // The model per turn is not recorded there, so it stays unknown.
+                provider_id: (kind != ItemKind::User).then(|| CLAUDE_PROVIDER.to_owned()),
                 model_id: None,
                 attachments: Vec::new(),
                 item: NormalizedItem {
                     id: string(value, "id"),
                     kind,
                     title: string(value, "title"),
-                    body: string(value, "body"),
+                    body,
                     status,
-                    tool_audit_json: None,
+                    tool_audit_json,
                 },
             }
         })
@@ -1602,13 +1987,38 @@ fn tool_call_event(message: &Value) -> BackendEvent {
         .or_else(|| message.get("args"))
         .map_or_else(String::new, display_value);
     let name = string(message, "name");
+    let item = NormalizedItem {
+        id: string(message, "callId"),
+        kind: ItemKind::Tool,
+        title: name,
+        body,
+        status,
+        tool_audit_json: tool_audit(message, status),
+    };
+    if status == ItemStatus::Running {
+        BackendEvent::ItemStarted {
+            turn_id: string(message, "turnId"),
+            item,
+        }
+    } else {
+        BackendEvent::ItemCompleted {
+            turn_id: string(message, "turnId"),
+            item,
+        }
+    }
+}
+
+/// The audit a Claude tool call carries, live or rebuilt from saved history, so transcripts
+/// present both the same way.
+fn tool_audit(message: &Value, status: ItemStatus) -> Option<Box<str>> {
+    let name = string(message, "name");
     let arguments = message
         .get("args")
         .or_else(|| message.pointer("/result/input"))
         .cloned()
         .unwrap_or(Value::Null);
     let output = message.pointer("/result/output").cloned();
-    let tool_audit_json = serde_json::to_string(&json!({
+    serde_json::to_string(&json!({
         "version": 1,
         "callId": string(message, "callId"),
         "name": name,
@@ -1631,26 +2041,7 @@ fn tool_call_event(message: &Value) -> BackendEvent {
         "denialReason": message.get("denialReason").and_then(Value::as_str),
     }))
     .ok()
-    .map(String::into_boxed_str);
-    let item = NormalizedItem {
-        id: string(message, "callId"),
-        kind: ItemKind::Tool,
-        title: name,
-        body,
-        status,
-        tool_audit_json,
-    };
-    if status == ItemStatus::Running {
-        BackendEvent::ItemStarted {
-            turn_id: string(message, "turnId"),
-            item,
-        }
-    } else {
-        BackendEvent::ItemCompleted {
-            turn_id: string(message, "turnId"),
-            item,
-        }
-    }
+    .map(String::into_boxed_str)
 }
 
 fn bounded_claude_audit_value(value: &Value) -> Value {
@@ -1846,6 +2237,56 @@ mod tests {
             .expect("send request");
         assert_eq!(text.method, "send");
         assert_eq!(text.payload["prompt"], "Inspect the selected image");
+    }
+
+    #[test]
+    fn restored_tool_calls_carry_the_audit_a_live_call_does() {
+        let history = session_history(&json!({"history": [
+            {"turnId":"t","id":"call-1","kind":"tool","title":"Bash","status":"complete",
+             "body":"{\"input\":{\"command\":\"git status\"},\"output\":\"clean\"}"},
+            {"turnId":"t","id":"text","kind":"assistant","title":"CLAUDE","status":"complete","body":"{\"input\":1}"}
+        ]}));
+        let audit: Value = serde_json::from_str(
+            history[0]
+                .item
+                .tool_audit_json
+                .as_deref()
+                .expect("restored tool audit"),
+        )
+        .expect("audit json");
+        assert_eq!(audit["name"], "Bash");
+        assert_eq!(audit["callId"], "call-1");
+        assert_eq!(audit["status"], "completed");
+        assert!(audit["input"].to_string().contains("git status"));
+        assert!(audit["output"].to_string().contains("clean"));
+        assert!(history[1].item.tool_audit_json.is_none());
+        assert!(
+            history
+                .iter()
+                .all(|item| item.provider_id.as_deref() == Some(CLAUDE_PROVIDER))
+        );
+        let owner = session_history(&json!({"history": [
+            {"turnId":"t","id":"u","kind":"user","title":"YOU","status":"complete","body":"hi"}
+        ]}));
+        assert_eq!(owner[0].provider_id, None);
+    }
+
+    #[test]
+    fn turns_carry_the_owning_session_environment_to_claude_code() {
+        let resume = BackendCommand::ResumeSession {
+            provider_session_id: "claude-session".to_owned(),
+            owner_session_id: Some("owner".to_owned()),
+            enabled_skill_ids: Vec::new(),
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
+            code_mode: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            timeout_seconds: None,
+        };
+        assert_eq!(session_owner(Some(&resume)), Some("owner"));
+        assert_eq!(session_owner(None), None);
+        assert!(BRIDGE_SOURCE.contains("env: { ...process.env, ...(command.environment || {}) }"));
     }
 
     #[test]
@@ -2164,9 +2605,19 @@ process.stdout.write(output);
     }
 
     #[test]
-    fn claude_uses_auto_as_the_filtered_default_and_an_attributed_validator() {
-        assert!(BRIDGE_SOURCE.contains("filterEscalatingDefaultMode"));
-        assert!(BRIDGE_SOURCE.contains("defaultMode || \"auto\""));
+    fn claude_returns_images_through_nakode_not_the_provider() {
+        assert!(BRIDGE_SOURCE.contains("\"return_image\""));
+        assert!(BRIDGE_SOURCE.contains("event: \"image_return_request\""));
+        assert!(BRIDGE_SOURCE.contains("case \"resolve_image_return\""));
+        assert!(BRIDGE_SOURCE.contains("\"mcp__nakode__return_image\""));
+    }
+
+    #[test]
+    fn claude_bypasses_permissions_by_default_and_keeps_an_attributed_validator() {
+        assert!(BRIDGE_SOURCE.contains("NAKODE_CLAUDE_PERMISSION_MODE"));
+        assert!(BRIDGE_SOURCE.contains(": \"bypassPermissions\";"));
+        assert!(BRIDGE_SOURCE.contains("allowDangerouslySkipPermissions: true"));
+        assert!(!BRIDGE_SOURCE.contains("filterEscalatingDefaultMode"));
         assert!(BRIDGE_SOURCE.contains("NAKODE_SECURITY_VALIDATOR_AGENT"));
         assert!(BRIDGE_SOURCE.contains("SecurityValidation"));
         assert!(BRIDGE_SOURCE.contains("validated: false"));
@@ -2329,6 +2780,22 @@ assert.equal(replacementSent, true, "replacement did not send after child close"
             ]
         );
         assert_eq!(without_context_window("Opus (1M context)"), "Opus");
+        let BackendEvent::Models(both) = models_event(&json!({
+            "models": [
+                {"id": "opus", "displayName": "Opus", "description": "Opus 5.5 · Best for everyday tasks"},
+                {"id": "opus[1m]", "displayName": "Opus (1M context)",
+                 "description": "Opus 5.5 with 1M context · Best for everyday tasks"},
+                {"id": "claude-fable-5-1[1m]", "displayName": "Fable",
+                 "description": "Fable 5.1 · Most capable"}
+            ]
+        })) else {
+            panic!("expected models event");
+        };
+        // Only a name that would otherwise repeat says its window.
+        assert_eq!(
+            both.iter().map(ModelInfo::display_name).collect::<Vec<_>>(),
+            ["Opus 5.5", "Opus 5.5 (1M context)", "Fable 5.1"]
+        );
         assert_eq!(
             without_context_window("Sonnet 5 with 200k context"),
             "Sonnet 5"
@@ -2850,6 +3317,7 @@ assert.equal(streamMessageIds.size, 0);
             email: Some("user@example.com".to_owned()),
             organization_id: Some("org".to_owned()),
             organization_name: Some("Team".to_owned()),
+            brokered: false,
         };
         let (updated, refreshed) = refresh_if_needed_with_url(Some(original), &endpoint)
             .await
@@ -2875,6 +3343,7 @@ assert.equal(streamMessageIds.size, 0);
             email: None,
             organization_id: Some("org".to_owned()),
             organization_name: None,
+            brokered: false,
         };
         let expired = |refresh_token: &str| ClaudeOAuthCredential {
             access_token: "access-old".to_owned(),
@@ -2885,6 +3354,7 @@ assert.equal(streamMessageIds.size, 0);
             email: None,
             organization_id: Some("org".to_owned()),
             organization_name: None,
+            brokered: false,
         };
         REFRESHED_CREDENTIALS
             .lock()
@@ -2959,5 +3429,114 @@ assert.equal(streamMessageIds.size, 0);
         std::fs::write(sdk.join("package.json"), r#"{"version":"0.0.0"}"#)
             .expect("stale SDK manifest");
         assert!(!claude_sdk_is_current(directory.path()).await);
+    }
+
+    fn brokered(expires_at_ms: u64) -> ClaudeOAuthCredential {
+        ClaudeOAuthCredential {
+            access_token: "brokered-access".to_owned(),
+            refresh_token: String::new(),
+            expires_at_ms,
+            authorized_at_ms: None,
+            account_id: Some("account".to_owned()),
+            email: None,
+            organization_id: None,
+            organization_name: None,
+            brokered: true,
+        }
+    }
+
+    #[test]
+    fn brokered_credentials_carry_an_access_token_and_no_refresh_token() {
+        let metadata = brokered_credential_metadata(
+            r#"{"access_token":"access","expires_at_ms":42,"email":"owner@example.com"}"#,
+        )
+        .expect("brokered credential");
+        assert_eq!(metadata["brokered"], true);
+        assert_eq!(metadata["refresh_token"], "");
+        let parsed = parse_credential(Some(&metadata))
+            .expect("parses")
+            .expect("present");
+        assert!(parsed.brokered);
+        assert_eq!(parsed.email.as_deref(), Some("owner@example.com"));
+        assert!(brokered_credential_metadata(r#"{"access_token":"","expires_at_ms":1}"#).is_err());
+        assert!(
+            brokered_credential_metadata(
+                r#"{"access_token":"a","expires_at_ms":1,"refresh_token":"r"}"#
+            )
+            .is_err(),
+            "a broker never hands out its refresh token"
+        );
+        assert!(
+            parse_credential(Some(&json!({
+                "access_token": "a",
+                "refresh_token": "",
+                "expires_at_ms": 1
+            })))
+            .is_err(),
+            "an ordinary credential still needs its refresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn brokered_credentials_are_never_refreshed() {
+        // Nothing listens here: reaching the network would fail the test differently.
+        let unreachable = "http://127.0.0.1:9/oauth/token";
+        let (kept, refreshed) =
+            refresh_if_needed_with_url(Some(brokered(now_ms() + 60_000)), unreachable)
+                .await
+                .expect("current brokered token");
+        assert!(!refreshed);
+        assert_eq!(
+            kept.map(|credential| credential.access_token).as_deref(),
+            Some("brokered-access")
+        );
+        let error = refresh_if_needed_with_url(Some(brokered(0)), unreachable)
+            .await
+            .expect_err("expired brokered token");
+        assert!(error.starts_with(CREDENTIAL_REFRESH_REQUIRED), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_replacement_credential_reaches_a_running_supervisor() {
+        let (commands, command_rx) = mpsc::channel(4);
+        let (events, mut received) = mpsc::channel(16);
+        let supervisor = tokio::spawn(run_supervisor(
+            false,
+            BackendConfig::native(std::env::temp_dir()),
+            None,
+            false,
+            None,
+            command_rx,
+            events,
+        ));
+        let expired = serde_json::to_value(brokered(0)).expect("credential");
+        commands
+            .send(BackendCommand::UpdateCredential {
+                credential: Some(SecretValue::new(expired)),
+            })
+            .await
+            .expect("update");
+        commands
+            .send(BackendCommand::Reload {
+                provider_session_id: None,
+            })
+            .await
+            .expect("reload");
+        let failure = loop {
+            if let BackendEvent::RequestFailed { message, .. } =
+                received.recv().await.expect("event")
+            {
+                break message;
+            }
+        };
+        assert!(
+            failure.starts_with(CREDENTIAL_REFRESH_REQUIRED),
+            "{failure}"
+        );
+        commands
+            .send(BackendCommand::Shutdown)
+            .await
+            .expect("shutdown");
+        supervisor.await.expect("supervisor exits");
     }
 }

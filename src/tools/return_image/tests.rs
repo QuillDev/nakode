@@ -161,3 +161,128 @@ async fn return_image_refuses_escape_unsupported_and_oversized_files() {
     assert!(session.returned_images.is_empty());
     assert!(receiver.try_recv().is_err());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_gallery_image_is_returnable_by_absolute_path_and_nothing_else_outside_the_workspace() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let stack = tempfile::tempdir().expect("stack");
+    let gallery = stack.path().join(".tmp-gallery").join("run");
+    std::fs::create_dir_all(&gallery).expect("gallery");
+    let png = b"\x89PNG\r\n\x1a\n";
+    std::fs::write(gallery.join("shot.png"), png).expect("gallery image");
+    std::fs::write(stack.path().join("secret.png"), png).expect("outside image");
+    // An image in a gallery is returned by its absolute path.
+    let loaded =
+        load_returnable_image(workspace.path(), gallery.join("shot.png").to_str().unwrap())
+            .await
+            .expect("gallery image");
+    assert_eq!(loaded.label, "shot.png");
+    assert_eq!(loaded.mime_type, "image/png");
+    // Outside both the workspace and any gallery, it is refused.
+    let outside = load_returnable_image(
+        workspace.path(),
+        stack.path().join("secret.png").to_str().unwrap(),
+    )
+    .await;
+    assert!(outside.is_err());
+    // A gallery symlink to a file elsewhere is judged by where it leads.
+    std::os::unix::fs::symlink(stack.path().join("secret.png"), gallery.join("link.png"))
+        .expect("symlink");
+    let escaped =
+        load_returnable_image(workspace.path(), gallery.join("link.png").to_str().unwrap()).await;
+    assert!(escaped.is_err());
+}
+
+#[test]
+fn a_call_names_one_path_or_up_to_eight_distinct_paths() {
+    assert_eq!(
+        requested_image_paths(&json!({"path":"a.png"})).unwrap(),
+        vec!["a.png".to_owned()]
+    );
+    assert_eq!(
+        requested_image_paths(&json!({"paths":["a.png","b.png"]})).unwrap(),
+        vec!["a.png".to_owned(), "b.png".to_owned()]
+    );
+    for bad in [
+        json!({}),
+        json!({"path":"a.png","paths":["b.png"]}),
+        json!({"paths":[]}),
+        json!({"paths":["a.png","a.png"]}),
+        json!({"paths":[1]}),
+        json!({"paths":["1","2","3","4","5","6","7","8","9"]}),
+    ] {
+        assert!(requested_image_paths(&bad).is_err(), "{bad}");
+    }
+}
+
+async fn call(
+    workspace: &std::path::Path,
+    session: &mut RuntimeSession,
+    events: &tokio::sync::mpsc::Sender<BackendEvent>,
+    questions: &QuestionBroker,
+    call_id: &str,
+    arguments: Value,
+) -> ToolResult {
+    let context = ToolContext {
+        workspace,
+        session,
+        backend_events: events,
+        turn_id: "turn",
+        call_id,
+        questions,
+        delegation: None,
+    };
+    ReturnImageTool
+        .execute(context, arguments, &CancellationToken::new())
+        .await
+}
+
+#[tokio::test]
+async fn several_images_attach_in_order_in_one_call_or_not_at_all() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let png = b"\x89PNG\r\n\x1a\n";
+    for name in ["one.png", "two.png"] {
+        std::fs::write(workspace.path().join(name), png).expect("image");
+    }
+    std::fs::write(workspace.path().join("notes.txt"), b"not an image").expect("text");
+    let mut session = RuntimeSession::new("test/model".into(), String::new());
+    let (events, mut receiver) = tokio::sync::mpsc::channel(8);
+    let questions = QuestionBroker::default();
+    // One unreadable image stops the whole call before anything is attached.
+    let failed = call(
+        workspace.path(),
+        &mut session,
+        &events,
+        &questions,
+        "mixed",
+        json!({"paths":["one.png","notes.txt"]}),
+    )
+    .await;
+    assert!(failed.failed);
+    assert!(failed.output.contains("notes.txt"), "{}", failed.output);
+    assert!(receiver.try_recv().is_err());
+    let result = call(
+        workspace.path(),
+        &mut session,
+        &events,
+        &questions,
+        "pair",
+        json!({"paths":["one.png","two.png"]}),
+    )
+    .await;
+    assert!(!result.failed, "{}", result.output);
+    assert_eq!(
+        result.output,
+        "2 images attached to the assistant transcript."
+    );
+    // One call is one message: a single reply carries both images, in the order named.
+    let Ok(BackendEvent::ImageReturned(image)) = receiver.try_recv() else {
+        panic!("one image reply");
+    };
+    assert!(receiver.try_recv().is_err());
+    let labels: Vec<_> = image.attachments().map(|a| a.label.clone()).collect();
+    assert_eq!(labels, vec!["one.png".to_owned(), "two.png".to_owned()]);
+    assert_eq!(image.history_item().attachments.len(), 2);
+    assert_eq!(session.returned_images.len(), 1);
+}

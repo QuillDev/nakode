@@ -455,13 +455,6 @@ pub enum SessionError {
         provider: String,
         account_id: String,
     },
-    #[error("provider account {account_id} is pinned to persisted sessions")]
-    ProviderAccountInUse { account_id: String },
-    #[error("session {session_id} is already pinned to provider account {account_id}")]
-    ProviderAccountAffinityConflict {
-        session_id: String,
-        account_id: String,
-    },
     #[error("session {session_id} already has a different persisted tool boundary")]
     ToolConfigurationConflict { session_id: String },
     #[error("owner prompt {prompt_id:?} for session {session_id:?} was reused with different text")]
@@ -1464,6 +1457,13 @@ impl SqliteSessionRepository {
                provider TEXT NOT NULL,
                session_id TEXT NOT NULL,
                session_json TEXT NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(provider, session_id)
+             );
+             CREATE TABLE IF NOT EXISTS provider_history_snapshots (
+               provider TEXT NOT NULL,
+               session_id TEXT NOT NULL,
+               history_json TEXT NOT NULL,
                updated_at INTEGER NOT NULL,
                PRIMARY KEY(provider, session_id)
              );
@@ -3619,7 +3619,7 @@ impl SessionRepository for SqliteSessionRepository {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11, ?12,
                      COALESCE(?13, 0), ?14, ?15)
              ON CONFLICT(provider, provider_session_id) DO UPDATE SET
-               account_id = COALESCE(sessions.account_id, excluded.account_id),
+               account_id = COALESCE(excluded.account_id, sessions.account_id),
                code_mode = COALESCE(?13, sessions.code_mode),
                tool_configuration_json = COALESCE(
                  sessions.tool_configuration_json,
@@ -3636,9 +3636,7 @@ impl SessionRepository for SqliteSessionRepository {
                last_owner_activity_at = MAX(
                  COALESCE(sessions.last_owner_activity_at, 0),
                  excluded.last_owner_activity_at
-               )
-             WHERE sessions.account_id IS NULL OR excluded.account_id IS NULL
-                OR sessions.account_id = excluded.account_id",
+               )",
             params![
                 id,
                 provider,
@@ -3669,14 +3667,6 @@ impl SessionRepository for SqliteSessionRepository {
             params![provider, provider_session_id],
             Self::row,
         )?;
-        if let (Some(requested), Some(persisted)) = (account_id, record.account_id.as_deref())
-            && requested != persisted
-        {
-            return Err(SessionError::ProviderAccountAffinityConflict {
-                session_id: record.id.clone(),
-                account_id: persisted.to_owned(),
-            });
-        }
         if let (Some(requested), Some(persisted)) =
             (tool_configuration, record.tool_configuration.as_ref())
             && requested != persisted
@@ -3717,26 +3707,13 @@ impl SessionRepository for SqliteSessionRepository {
             .connection
             .lock()
             .expect("session database mutex poisoned");
+        // The account a session last ran on; a session may run on any eligible account.
         let updated = connection.execute(
-            "UPDATE sessions SET account_id = ?2 WHERE id = ?1
-             AND (account_id IS NULL OR account_id = ?2)",
+            "UPDATE sessions SET account_id = ?2 WHERE id = ?1",
             params![id, account_id],
         )?;
         if updated == 0 {
-            let persisted = connection
-                .query_row(
-                    "SELECT account_id FROM sessions WHERE id = ?1",
-                    [id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?;
-            return match persisted {
-                Some(Some(account_id)) => Err(SessionError::ProviderAccountAffinityConflict {
-                    session_id: id.to_owned(),
-                    account_id,
-                }),
-                None | Some(None) => Err(SessionError::SessionNotFound(id.to_owned())),
-            };
+            return Err(SessionError::SessionNotFound(id.to_owned()));
         }
         Ok(())
     }
@@ -3951,15 +3928,6 @@ impl SessionRepository for SqliteSessionRepository {
             )
             .optional()?
             .ok_or_else(|| SessionError::SessionNotFound(id.to_owned()))?;
-        if current.0 == provider
-            && let (Some(requested), Some(persisted)) = (account_id, current.2.as_deref())
-            && requested != persisted
-        {
-            return Err(SessionError::ProviderAccountAffinityConflict {
-                session_id: id.to_owned(),
-                account_id: persisted.to_owned(),
-            });
-        }
         transaction.execute(
             "DELETE FROM session_native_history
              WHERE parent_session_id = ?1 AND provider = ?2 AND provider_session_id = ?3",
@@ -3978,7 +3946,7 @@ impl SessionRepository for SqliteSessionRepository {
              SET provider = ?1,
                  account_id = CASE
                    WHEN provider != ?1 THEN ?2
-                   ELSE COALESCE(account_id, ?2)
+                   ELSE COALESCE(?2, account_id)
                  END,
                  provider_session_id = ?3, model = ?4,
                  model_reasoning_effort = ?5, model_fast_mode = ?6, updated_at = ?7
@@ -4810,16 +4778,11 @@ impl SessionRepository for SqliteSessionRepository {
             .lock()
             .expect("session database mutex poisoned");
         let transaction = connection.transaction()?;
-        let in_use = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE account_id = ?1)",
+        // Sessions that last ran on the account simply route to another one next time.
+        transaction.execute(
+            "UPDATE sessions SET account_id = NULL WHERE account_id = ?1",
             [account_id],
-            |row| row.get::<_, bool>(0),
         )?;
-        if in_use {
-            return Err(SessionError::ProviderAccountInUse {
-                account_id: account_id.to_owned(),
-            });
-        }
         let removed = transaction.execute(
             "DELETE FROM provider_accounts WHERE provider = ?1 AND account_id = ?2",
             params![provider, account_id],
@@ -8444,7 +8407,7 @@ mod tests {
     }
 
     #[test]
-    fn session_account_affinity_is_atomic_and_cannot_be_switched() -> Result<(), SessionError> {
+    fn session_account_is_where_it_last_ran_and_may_change() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let repository = SqliteSessionRepository::open(directory.path().join("sessions.db"))?;
         let provider = crate::backend::CODEX_PROVIDER;
@@ -8458,7 +8421,7 @@ mod tests {
             "native-session",
             "/workspace",
             "/workspace",
-            "Pinned",
+            "Session",
             Some("model"),
             &options,
             None,
@@ -8467,35 +8430,43 @@ mod tests {
             created.account_id.as_deref(),
             Some(first.account_id.as_str())
         );
-        let error = repository
-            .create_with_account_id(
-                "duplicate-request",
-                provider,
-                Some(&second.account_id),
-                "native-session",
-                "/workspace",
-                "/workspace",
-                "Pinned",
-                Some("model"),
-                &options,
-                None,
-            )
-            .expect_err("native identity cannot change account affinity");
-        assert!(matches!(
-            error,
-            SessionError::ProviderAccountAffinityConflict { .. }
-        ));
-        let restored = repository
-            .find("logical-session")?
-            .expect("persisted session");
+        // Recreating the same native session on another account moves it there.
+        let moved = repository.create_with_account_id(
+            "duplicate-request",
+            provider,
+            Some(&second.account_id),
+            "native-session",
+            "/workspace",
+            "/workspace",
+            "Session",
+            Some("model"),
+            &options,
+            None,
+        )?;
+        assert_eq!(moved.id, "logical-session");
         assert_eq!(
-            restored.account_id.as_deref(),
+            moved.account_id.as_deref(),
+            Some(second.account_id.as_str())
+        );
+        // Routing records whichever account ran the session last.
+        repository.set_session_account("logical-session", Some(&first.account_id))?;
+        assert_eq!(
+            repository
+                .find("logical-session")?
+                .expect("persisted session")
+                .account_id
+                .as_deref(),
             Some(first.account_id.as_str())
         );
-        assert!(matches!(
-            repository.remove_provider_account(provider, &first.account_id),
-            Err(SessionError::ProviderAccountInUse { .. })
-        ));
+        // Removing that account leaves the session free to run on any other.
+        repository.remove_provider_account(provider, &first.account_id)?;
+        assert_eq!(
+            repository
+                .find("logical-session")?
+                .expect("persisted session")
+                .account_id,
+            None
+        );
         Ok(())
     }
 
@@ -8824,7 +8795,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_account_binding_accepts_only_one_affinity() -> Result<(), SessionError> {
+    fn concurrent_account_records_both_land_on_one_account() -> Result<(), SessionError> {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = directory.path().join("concurrent-affinity.db");
         let repository = SqliteSessionRepository::open(&database)?;
@@ -8845,7 +8816,9 @@ mod tests {
         )?;
         drop(repository);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let handles = [first.account_id, second.account_id]
+        let accounts = [first.account_id, second.account_id];
+        let handles = accounts
+            .clone()
             .into_iter()
             .map(|account_id| {
                 let database = database.clone();
@@ -8862,17 +8835,15 @@ mod tests {
             .into_iter()
             .map(|handle| handle.join().expect("binding thread"))
             .collect::<Vec<_>>();
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(
-            results
-                .iter()
-                .filter(|result| matches!(
-                    result,
-                    Err(SessionError::ProviderAccountAffinityConflict { .. })
-                ))
-                .count(),
-            1
-        );
+        // Neither write is refused; the session ends on whichever account was recorded last.
+        assert!(results.iter().all(Result::is_ok));
+        let repository = SqliteSessionRepository::open(&database)?;
+        let recorded = repository
+            .find("logical-session")?
+            .expect("persisted session")
+            .account_id
+            .expect("recorded account");
+        assert!(accounts.contains(&recorded));
         Ok(())
     }
 
