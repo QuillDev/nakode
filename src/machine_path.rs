@@ -47,12 +47,16 @@ struct State {
 #[derive(Clone)]
 pub(crate) struct MachinePathService {
     file: PathBuf,
+    read_only: bool,
     inherited: Option<String>,
     state: Arc<Mutex<State>>,
 }
 impl MachinePathService {
     async fn load(file: PathBuf) -> Self {
-        let (saved, error) = match tokio::fs::read(&file).await {
+        Self::load_with_policy(file, false).await
+    }
+    async fn load_with_policy(file: PathBuf, read_only: bool) -> Self {
+        let (mut saved, mut error) = match tokio::fs::read(&file).await {
             Ok(bytes) => match serde_json::from_slice::<Saved>(&bytes) {
                 Ok(saved) => (saved, None),
                 Err(error) => (
@@ -60,11 +64,36 @@ impl MachinePathService {
                     Some(format!("Cannot read saved PATH: {error}")),
                 ),
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Saved::default(), None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !read_only => {
+                (Saved::default(), None)
+            }
             Err(error) => (
                 Saved::default(),
                 Some(format!("Cannot read saved PATH: {error}")),
             ),
+        };
+        let persistence = if read_only {
+            // Authored command stays on the immutable configuration mount. Resolved directories
+            // are guest-local state, never inherited from the provisioning machine.
+            saved.last_good_path = None;
+            saved.resolved_command = None;
+            saved.resolved_at = None;
+            if saved.command.len() > 16 * 1024 || saved.command.contains('\0') {
+                error = Some("Invalid inherited PATH command".to_owned());
+            }
+            let cache = file.with_file_name("machine-path-runtime.json");
+            if let Ok(bytes) = tokio::fs::read(&cache).await
+                && let Ok(local) = serde_json::from_slice::<Saved>(&bytes)
+                && local.command == saved.command
+                && local.resolved_command.as_deref() == Some(saved.command.as_str())
+            {
+                saved.last_good_path = local.last_good_path;
+                saved.resolved_command = local.resolved_command;
+                saved.resolved_at = local.resolved_at;
+            }
+            cache
+        } else {
+            file
         };
         let inherited = std::env::var("PATH").ok();
         let last_good = saved
@@ -77,7 +106,8 @@ impl MachinePathService {
             last_good.clone().or_else(|| inherited.clone())
         };
         Self {
-            file,
+            file: persistence,
+            read_only,
             inherited,
             state: Arc::new(Mutex::new(State {
                 source: if !saved.command.is_empty() && last_good.is_some() {
@@ -177,6 +207,11 @@ impl MachinePathService {
         {
             return Err(Status::invalid_argument(
                 "command must be at most 16 KiB without NUL",
+            ));
+        }
+        if self.read_only && command.is_some() {
+            return Err(Status::failed_precondition(
+                "PATH command is inherited read-only; change it on the provisioning parent for future environments",
             ));
         }
         let identity = format!("{revision}:{command:?}");
@@ -357,16 +392,24 @@ async fn bounded(stream: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>, S
     Ok(bytes)
 }
 pub(crate) async fn initialize() -> Result<(), String> {
-    let service = MachinePathService::load(
-        crate::config::nakode_home()
-            .map_err(|error| error.to_string())?
-            .join("machine-path.json"),
-    )
-    .await;
+    let file = crate::config::nakode_home()
+        .map_err(|error| error.to_string())?
+        .join("machine-path.json");
+    let read_only = std::env::var("NAKODE_MACHINE_PATH_READ_ONLY").as_deref() == Ok("1");
+    let service = if read_only {
+        MachinePathService::load_with_policy(file, true).await
+    } else {
+        MachinePathService::load(file).await
+    };
     {
         let mut state = service.state.lock().await;
         if !state.load_failed {
             service.resolve(&mut state, Duration::from_secs(10)).await;
+        }
+        if read_only && let Some(error) = &state.error {
+            return Err(format!(
+                "Inherited PATH configuration is not ready: {error}"
+            ));
         }
         if !state.saved.command.is_empty()
             && let Ok(mut effective) = EFFECTIVE.write()
@@ -591,6 +634,92 @@ mod tests {
         let _ = stop.send(());
         server.await.unwrap();
     }
+    #[tokio::test]
+    async fn inherited_command_is_immutable_and_sync_uses_private_guest_cache() {
+        let root = root();
+        let file = root.join("machine-path.json");
+        let marker = root.join("executed-in-guest");
+        let command = format!(
+            "printf yes > '{}'; printf /guest/bin:/bin",
+            marker.display()
+        );
+        let authored = serde_json::json!({
+            "command": command, "revision": 1,
+            "last_good_path": "/parent/must-not-transfer",
+            "resolved_command": command, "resolved_at": "parent-time"
+        })
+        .to_string();
+        tokio::fs::write(&file, &authored).await.unwrap();
+        let service = MachinePathService::load_with_policy(file.clone(), true).await;
+        let initial = service
+            .get_machine_path(Request::new(api::GetMachinePathRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!marker.exists());
+        assert_ne!(
+            initial.effective_path.as_deref(),
+            Some("/parent/must-not-transfer")
+        );
+        assert!(initial.resolved_command.is_none());
+        for change in [String::new(), command.clone(), "printf /other".to_owned()] {
+            let rejected = service
+                .change("save".into(), 1, Some(change))
+                .await
+                .unwrap_err();
+            assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
+        }
+        let synced = service.change("sync".into(), 1, None).await.unwrap();
+        assert!(marker.exists());
+        assert_eq!(synced.effective_path.as_deref(), Some("/guest/bin:/bin"));
+        assert!(synced.error.is_none());
+        assert_eq!(tokio::fs::read_to_string(&file).await.unwrap(), authored);
+        let cache = root.join("machine-path-runtime.json");
+        assert!(cache.is_file());
+        let reloaded = MachinePathService::load_with_policy(file.clone(), true).await;
+        assert_eq!(
+            reloaded.state.lock().await.effective.as_deref(),
+            Some("/guest/bin:/bin")
+        );
+        let changed = serde_json::json!({"command": "printf /new", "revision": 1}).to_string();
+        tokio::fs::write(&file, changed).await.unwrap();
+        let other_policy = MachinePathService::load_with_policy(file, true).await;
+        assert!(
+            other_policy
+                .state
+                .lock()
+                .await
+                .saved
+                .last_good_path
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_inherited_policy_fails_closed_and_empty_command_stays_disabled() {
+        let root = root();
+        let file = root.join("machine-path.json");
+        let missing = MachinePathService::load_with_policy(file.clone(), true).await;
+        assert!(missing.state.lock().await.load_failed);
+        assert!(missing.change("sync".into(), 0, None).await.is_err());
+        tokio::fs::write(&file, r#"{"command":"","revision":1}"#)
+            .await
+            .unwrap();
+        let disabled = MachinePathService::load_with_policy(file.clone(), true).await;
+        assert!(disabled.change("sync".into(), 1, None).await.is_err());
+        let result = disabled
+            .get_machine_path(Request::new(api::GetMachinePathRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(result.command.is_empty());
+        assert_eq!(result.source, "inherited");
+        assert_eq!(
+            tokio::fs::read_to_string(file).await.unwrap(),
+            r#"{"command":"","revision":1}"#
+        );
+    }
+
     #[tokio::test]
     async fn corrupt_settings_fail_closed_without_overwrite() {
         let file = root().join("bad.json");

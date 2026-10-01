@@ -12,6 +12,36 @@ Nakode owns machine-local PATH configuration, resolution and the runtime overlay
 - Saved configuration and runtime state are distinct. A newly saved command does not invalidate a usable older resolved value; `resolved_command` and `source` identify that fallback honestly.
 - Existing shells, evaluator kernels, MCP memory subprocesses and provider adapters retain their launch environment. Sync does not restart them.
 
+## Read-only inherited command
+
+A provisioning runtime may set `NAKODE_MACHINE_PATH_READ_ONLY=1` for a new guest whose
+`$NAKODE_HOME/machine-path.json` is delivered on a read-only configuration mount. In that mode:
+
+- Only the authored command and revision are authoritative in that file. Resolved fields there
+  are discarded, so a provisioning machine's resolved directories cannot become the guest cache.
+- Resolution persists to private `machine-path-runtime.json` beside it. A retained local cache
+  is accepted only when both its command and resolved-command match the inherited command.
+- `SaveMachinePath` refuses with FailedPrecondition, including identical/empty saves. Sync is
+  still explicit guest-local execution and writes only the local cache. Empty commands stay
+  disabled and Sync without a command still refuses.
+- Missing/invalid inherited configuration and failed startup resolution refuse startup. Ordinary
+  standalone configurations keep their existing fallback semantics.
+- Both service listeners advertise `MachinePathReadOnly`. A provisioning consumer must check this
+  capability, not assume an older runtime supports separating the policy from its writable cache.
+
+Read-only policy does not change tool-environment precedence, restart already running processes,
+or grant permissions. The mounting/provisioning layer owns snapshot identity and filesystem
+protection. This is not protection against privileged guest root deliberately replacing mounts.
+
+Two regression tests were added for immutability, guest-cache persistence/reload, parent-cache
+exclusion, changed-command cache rejection, missing policy and disabled command semantics.
+The focused real-source harness now passes **8 Rust tests**, including these two tests and the
+public-service authentication regression, using the actual pinned SDK/server interceptor. Its
+production-home/startup seam remains disabled, so this is not full-runtime startup validation.
+The 3m45s build/link and 0.49s test run establish that earlier short timeouts were insufficient.
+FStack's public bundled-runtime pin still requires the normal coordinated release update before
+this behavior is available in newly provisioned guests; sibling source edits alone do not activate it.
+
 ## Precedence and launches
 
 Lowest to highest: inherited process PATH, machine overlay, session Environment PATH, explicit tool `env.PATH`. Session Environment remains memory-only/write-only and is never included in the machine PATH response. The display is the machine baseline, not a reveal of account credentials or session overrides.
