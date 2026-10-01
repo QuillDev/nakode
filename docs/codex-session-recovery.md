@@ -16,7 +16,7 @@ Catalogue refresh keeps the complete durable inventory. Session creation and fir
 
 Codex account credential changes update existing session supervisors in place. Subsequent inference uses the replacement credential while retaining native sessions and tool brokers. Sign-out cancels active Codex work and blocks authenticated execution without shutting down its session supervisor. Completion retains the ordinary native-session checkpoint path. Existing provider-control generation fences continue rejecting events from superseded authentication controls.
 
-Codex provider disablement retains an established session's logical/native IDs, account affinity and selected model. Other providers retain their existing disablement behavior because their session adapters are still stopped. Refresh reports failed readiness, uses typed authentication failures for account health, and clears health on successful model discovery. Public workspace snapshots remain the credential-safe client contract; no frontend persistence access is introduced.
+Codex provider disablement retains an established session's logical/native IDs, last account and selected model. Other providers retain their existing disablement behavior because their session adapters are still stopped. Refresh reports failed readiness, uses typed authentication failures for account health, and clears health on successful model discovery. Public workspace snapshots remain the credential-safe client contract; no frontend persistence access is introduced.
 
 A missing native continuation reports a resume failure rather than claiming the logical session was deleted. No empty replacement session or transcript reconstruction is performed.
 

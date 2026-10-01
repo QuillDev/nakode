@@ -2220,22 +2220,60 @@ pub struct ReturnedImage {
     pub provider_id: String,
     pub model_id: String,
     pub attachment: PromptAttachment,
+    /// The rest of the images one call returned, shown in the same message as the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more_attachments: Vec<PromptAttachment>,
     pub history_index: usize,
     pub sequence: usize,
 }
 
 impl ReturnedImage {
+    /// Every image in this reply, in the order the call named them.
+    pub fn attachments(&self) -> impl Iterator<Item = &PromptAttachment> {
+        std::iter::once(&self.attachment).chain(&self.more_attachments)
+    }
+
+    #[must_use]
+    pub fn image_count(&self) -> usize {
+        1 + self.more_attachments.len()
+    }
+
+    #[must_use]
+    pub fn image_bytes(&self) -> usize {
+        self.attachments()
+            .filter_map(|attachment| attachment.image.as_ref())
+            .map(|image| image.data.len())
+            .sum()
+    }
+
+    /// The images as the transcript keeps them: label and bytes, in order.
+    #[must_use]
+    pub fn labeled_images(&self) -> Vec<(String, crate::backend::PromptImage)> {
+        self.attachments()
+            .filter_map(|attachment| {
+                attachment
+                    .image
+                    .clone()
+                    .map(|image| (attachment.label.clone(), image))
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn history_item(&self) -> SessionHistoryItem {
         SessionHistoryItem {
             turn_id: self.turn_id.clone(),
             provider_id: Some(self.provider_id.clone()),
             model_id: Some(self.model_id.clone()),
-            attachments: vec![self.attachment.clone()],
+            attachments: self.attachments().cloned().collect(),
             item: NormalizedItem {
                 id: self.id.clone(),
                 kind: ItemKind::Assistant,
-                title: self.attachment.label.clone(),
+                title: if self.more_attachments.is_empty() {
+                    self.attachment.label.clone()
+                } else {
+                    format!("{} images", self.image_count())
+                },
                 body: String::new(),
                 status: ItemStatus::Complete,
                 tool_audit_json: None,

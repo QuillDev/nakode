@@ -13,6 +13,8 @@ use crate::{
 pub enum ServiceCapability {
     DurableFollowupInbox,
     PendingFollowupRemoval,
+    /// `AdmitExternalChildReport` admits a child in another runtime's report as child evidence.
+    ExternalChildReports,
     Subscriptions,
     MultipleClients,
     ArtifactTransfer,

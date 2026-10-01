@@ -1310,6 +1310,11 @@ fn turn(value: api::Turn) -> Result<view::TurnView, String> {
             api::TurnStatus::Failed => view::TurnStatus::Failed,
             api::TurnStatus::Unspecified => return Err("unspecified turn status".into()),
         },
+        completion: value.completion.map(|completion| view::TurnCompletionView {
+            final_text: completion.final_text,
+            final_total_bytes: completion.final_total_bytes,
+            truncated: completion.truncated,
+        }),
     })
 }
 

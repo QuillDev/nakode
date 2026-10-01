@@ -1,11 +1,14 @@
 # Claude automatic permissions and security validation
 
-Nakode's Claude adapter uses the authoritative Claude Code/Agent SDK setting
-`permissionMode: "auto"` (Claude Code 2.1.268; `@anthropic-ai/claude-agent-sdk` 0.3.268) when the
-resolved Claude settings do not name a mode. The adapter calls the SDK's `resolveSettings` and
-`filterEscalatingDefaultMode`, so valid managed/user/project/local `permissions.defaultMode` values
-remain explicit owner overrides. This policy is Claude-specific. The Codex adapter and its existing
-unrestricted/automatic approval behavior are unchanged.
+Nakode's Claude sessions run with `permissionMode: "bypassPermissions"` by default, the Claude
+equivalent of the Codex adapter's never-ask, full-access sessions: they run unattended, so Claude
+Code's own permission prompts and auto-mode classifier do not stand between a session and its tools
+(the classifier otherwise refuses dashboard tools such as ticket creation as external writes).
+Archetype allow and deny lists still apply through the `PreToolUse` hook. Claude Code's
+`permissions.defaultMode` is the owner's choice for interactive Claude Code and does not govern
+Nakode; set `NAKODE_CLAUDE_PERMISSION_MODE` (`auto`, `acceptEdits`, `default` or `plan`) to run
+Nakode's Claude sessions under a stricter mode. The rest of this page applies when that mode is
+`auto`.
 
 In auto mode routine repository reads, edits, builds, and tests are handled by Claude's classifier and
 do not enter Nakode's owner-approval channel. When Claude routes a security-sensitive proposal to
@@ -33,6 +36,4 @@ The boundary is fail-closed:
 - validator runs carry a marker that disables validation/delegation re-entry, preventing recursive
   validator loops.
 
-`AskUserQuestion` remains an actual question rather than a security decision. An owner can also choose
-a stricter persisted permission mode; this ticket changes the absent-setting default, not Claude's
-configuration surface.
+`AskUserQuestion` remains an actual question rather than a security decision. An owner chooses a stricter mode with `NAKODE_CLAUDE_PERMISSION_MODE`.

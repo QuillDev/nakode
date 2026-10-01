@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    sync::OnceLock,
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -98,6 +98,60 @@ pub struct DomainTranscript {
     history_retention: HistoryRetention,
     /// Server query proofs, never a client presentation cache. Every mutator invalidates them.
     prefix_fingerprints: OnceLock<Option<Vec<String>>>,
+    /// Per-entry digests behind those proofs, reused while an entry is unchanged.
+    entry_digests: EntryDigests,
+}
+
+/// What an entry contributes to transcript proofs, derived from the entry alone.
+#[derive(Debug)]
+pub(crate) struct EntryDigest {
+    pub content: [u8; 32],
+    pub body_sha256: String,
+    pub parent_item_id: Option<String>,
+    pub codemode_tool: bool,
+}
+
+/// Entry digests reused while their entry is unchanged. A hit is checked by comparing the entry,
+/// which is far cheaper than serializing and hashing it, so no mutator has to say what it touched.
+#[derive(Clone, Default)]
+pub(crate) struct EntryDigests(Arc<Mutex<DigestsById>>);
+
+/// Each entry's digest beside the exact entry it was computed from.
+type DigestsById = HashMap<String, (TranscriptEntry, Arc<EntryDigest>)>;
+
+impl std::fmt::Debug for EntryDigests {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EntryDigests")
+    }
+}
+
+impl EntryDigests {
+    fn get(
+        &self,
+        entry: &TranscriptEntry,
+        compute: impl FnOnce(&TranscriptEntry) -> EntryDigest,
+    ) -> Arc<EntryDigest> {
+        let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached, digest)) = cache.get(&entry.id)
+            && cached == entry
+        {
+            return Arc::clone(digest);
+        }
+        let digest = Arc::new(compute(entry));
+        cache.insert(entry.id.clone(), (entry.clone(), Arc::clone(&digest)));
+        digest
+    }
+
+    fn retain(&self, entries: &[TranscriptEntry]) {
+        let live = entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<HashSet<_>>();
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|id, _| live.contains(id.as_str()));
+    }
 }
 
 impl DomainTranscript {
@@ -112,6 +166,7 @@ impl DomainTranscript {
             local_files: HashMap::new(),
             history_retention: HistoryRetention::Complete,
             prefix_fingerprints: OnceLock::new(),
+            entry_digests: EntryDigests::default(),
         }
     }
 
@@ -125,6 +180,24 @@ impl DomainTranscript {
         compute: impl FnOnce() -> Option<Vec<String>>,
     ) -> Option<&[String]> {
         self.prefix_fingerprints.get_or_init(compute).as_deref()
+    }
+
+    pub(crate) fn entry_digest(
+        &self,
+        entry: &TranscriptEntry,
+        compute: impl FnOnce(&TranscriptEntry) -> EntryDigest,
+    ) -> Arc<EntryDigest> {
+        self.entry_digests.get(entry, compute)
+    }
+
+    /// Forgets digests of entries this transcript no longer holds.
+    pub(crate) fn prune_entry_digests(&self) {
+        self.entry_digests.retain(&self.entries);
+    }
+
+    /// Reuses digests kept elsewhere, e.g. across reads of a session rebuilt for each query.
+    pub(crate) fn share_entry_digests(&mut self, digests: EntryDigests) {
+        self.entry_digests = digests;
     }
 
     #[must_use]

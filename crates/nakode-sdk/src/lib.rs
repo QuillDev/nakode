@@ -1727,6 +1727,11 @@ impl NakodeClient {
 
     typed_mutation!(relay_agent_followup, api::RelayAgentFollowupRequest);
     typed_mutation!(
+        admit_external_child_report,
+        api::AdmitExternalChildReportRequest,
+        "ExternalChildReports"
+    );
+    typed_mutation!(
         enqueue_followup,
         api::EnqueueFollowupRequest,
         "DurableFollowupInbox"
@@ -3364,6 +3369,7 @@ mod tests {
     fn session_view(id: &str) -> protocol::SessionView {
         protocol::SessionView {
             parent_session_id: None,
+            relationship_revision: None,
             id: protocol::SessionId::from(id),
             revision: 1,
             workspace_id: protocol::WorkspaceId::from("workspace-a"),

@@ -372,6 +372,17 @@ pub struct TurnView {
     #[serde(default)]
     pub resolved_model_options: ModelOptions,
     pub status: TurnStatus,
+    /// Bounded final response of a terminal owner turn; only `last_turn` carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<TurnCompletionView>,
+}
+
+/// A terminal turn's final assistant response, bounded as a linked child's report is.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TurnCompletionView {
+    pub final_text: Option<String>,
+    pub final_total_bytes: u64,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

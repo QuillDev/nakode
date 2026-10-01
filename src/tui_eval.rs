@@ -1083,6 +1083,7 @@ fn install_started_turn_view(
         model_id: agent.model_id.clone(),
         resolved_model_options: nakode_protocol::ModelOptions::default(),
         status: nakode_protocol::TurnStatus::Running,
+        completion: None,
     });
     session.activity = nakode_protocol::SessionActivity::RunningTurn;
     session.transcript.stream_active = true;

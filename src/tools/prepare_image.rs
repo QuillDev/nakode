@@ -87,14 +87,9 @@ impl Tool for PrepareImageTool {
                         .values()
                         .filter(|image| image.turn_id == context.turn_id)
                         .collect::<Vec<_>>();
-                    let bytes: usize = returned
-                        .iter()
-                        .filter_map(|image| image.attachment.image.as_ref())
-                        .map(|image| image.data.len())
-                        .sum();
-                    if returned.len() >= 8
-                        || bytes.saturating_add(artifact.data.len()) > 20 * 1024 * 1024
-                    {
+                    let bytes: usize = returned.iter().map(|image| image.image_bytes()).sum();
+                    let count: usize = returned.iter().map(|image| image.image_count()).sum();
+                    if count >= 8 || bytes.saturating_add(artifact.data.len()) > 20 * 1024 * 1024 {
                         return Err("preview limit is eight images / 20 MiB per turn".to_owned());
                     }
                     let image = ReturnedImage {
@@ -112,6 +107,7 @@ impl Tool for PrepareImageTool {
                                 data: artifact.data,
                             }),
                         },
+                        more_attachments: Vec::new(),
                     };
                     context
                         .backend_events

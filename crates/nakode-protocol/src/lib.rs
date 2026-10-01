@@ -71,8 +71,8 @@ pub use view::{
     SharedContextBriefingView, SharedContextEntryView, SharedContextUtilizationView, SkillView,
     TerminalImageModeView, TodoItemView, TodoPhaseView, TodoStatusView, TokenUsageView,
     TranscriptBodyWindow, TranscriptEntryKind, TranscriptEntryStatus, TranscriptEntryView,
-    TranscriptPage, TranscriptWindowView, TurnStatus, TurnView, ViewEvent, VisionAvailabilityView,
-    VisionSettingsView, WebSettingsView,
+    TranscriptPage, TranscriptWindowView, TurnCompletionView, TurnStatus, TurnView, ViewEvent,
+    VisionAvailabilityView, VisionSettingsView, WebSettingsView,
 };
 
 /// Maximum encoded Protobuf request or response accepted by Nakode's API.

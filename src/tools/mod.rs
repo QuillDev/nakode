@@ -12,12 +12,13 @@ mod nakode_agent;
 pub(crate) use nakode_agent::NAKODE_AGENT_TOOL_NAME;
 pub(crate) use shared_context::SEARCH_SHARED_CONTEXT_TOOL_NAME;
 mod child_materials;
+pub(crate) mod desktop;
 mod prepare_image;
 mod process;
 mod read;
 mod read_skill;
 mod read_skill_component;
-mod return_image;
+pub(crate) mod return_image;
 mod shared_context;
 mod todo;
 mod truncate;
@@ -136,6 +137,10 @@ impl ToolRegistry {
                 Arc::new(eval::EvalTool::default()),
                 Arc::new(ask::AskTool),
                 Arc::new(todo::TodoTool),
+                // Offered only where the machine gives agents a desktop.
+                Arc::new(desktop::DesktopScreenshotTool),
+                Arc::new(desktop::DesktopActionTool),
+                Arc::new(desktop::ScreenRecordTool),
             ],
         }
     }

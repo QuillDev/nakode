@@ -5,7 +5,12 @@
 `RelayAgentFollowup` is distinct from ordinary `EnqueueFollowup`. The runtime verifies an exact
 live pending `SendAgentMessage` call on the source session, including destination, unchanged text,
 and selected source-image bytes. Producer-supplied roles, headers and JSON never establish origin.
-The same-owner, current canonical logical parent/child link grants `delegated_instruction`; another
+The same-owner, current canonical logical parent/child link grants `delegated_instruction`, and so does an
+integration-vouched owner Chat (`source_owner_chat`), which may instruct any same-owner session it
+did not start; the vouch is stored with the message and honoured when a batch is claimed. An owner Chat's instruction also makes it the
+agent's parent, re-pointing the existing link (report and question history stay with the agent), so
+the agent's later completion reports return to the Chat that last directed it and it is listed among
+that Chat's children. Nested sessions and a parent already at 32 children are left as they are. Another
 same-owner source is `peer_context`. Cross-owner and cross-runtime relays refuse.
 
 A delegated instruction can assign new work beyond the initial task. It never supplies approval,
@@ -49,7 +54,10 @@ Completed and failed reports follow existing delivery policy; cancellation/progr
 parent. Older reports without captured finals retain their existing inspection fallback.
 
 Report-sequence receipts deduplicate admission across reload, and accepted-batch identities retain
-one transcript entry. A completion is child evidence, not authority to restart a child or approve
+one transcript entry. An inbox is durable: when messages wait for a session that is not loaded in the
+runtime (after a restart, say), the dispatcher opens it through the runtime's own request queue, as an
+owner's explicit reopen would, and delivers once it is ready. A paused inbox or a closed session is
+never reopened; a failed open is reported and retried at most once a minute, and the messages stay. A completion is child evidence, not authority to restart a child or approve
 work. Transcript inspection remains available for deeper evidence and omitted final content.
 
 ## Integration and validation limits
@@ -57,5 +65,4 @@ work. Transcript inspection remains available for deeper evidence and omitted fi
 Both FStack SDK/runtime dependencies must point to a published Nakode revision containing this API
 before standalone FStack builds or release. Local sibling Cargo patches are validation-only and must
 not become release lockfile changes. No deployment or installed-service replacement is part of this
-work. Unit/runtime fixture tests and offscreen UI scenes do not prove live provider acceptance or
-durable parent-Chat wake-up. Native `nakode_agent` completion is a separate path.
+work. Unit/runtime fixture tests and offscreen UI scenes do not prove live provider acceptance. Native `nakode_agent` completion is a separate path.
