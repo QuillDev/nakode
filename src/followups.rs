@@ -209,6 +209,23 @@ fn admit_external_report<'a>(
     Ok((session_id.as_str(), Some(message_id.clone())))
 }
 
+fn set_followup_paused(tx: &rusqlite::Transaction<'_>, session: &str, paused: bool) -> Result<()> {
+    authorize(tx, session, true)?;
+    tx.execute(
+        "INSERT INTO followup_inboxes(session_id, paused) VALUES (?1, ?2)
+         ON CONFLICT(session_id) DO UPDATE SET paused = excluded.paused",
+        params![session, paused],
+    )
+    .map_err(failure)?;
+    if !paused {
+        tx.execute(
+            "UPDATE followup_batches SET blocked_reason = NULL WHERE session_id = ?1 AND state = 'claimed'",
+            [session],
+        ).map_err(failure)?;
+    }
+    Ok(())
+}
+
 impl InboxStore {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path).map_err(failure)?;
@@ -351,19 +368,7 @@ impl InboxStore {
                 (session_id.as_str(), Some(message_id.clone()))
             }
             Command::SetFollowupPaused { session_id, paused } => {
-                authorize(&tx, session_id.as_str(), true)?;
-                tx.execute(
-                    "INSERT INTO followup_inboxes(session_id, paused) VALUES (?1, ?2)
-                     ON CONFLICT(session_id) DO UPDATE SET paused = excluded.paused",
-                    params![session_id.as_str(), paused],
-                )
-                .map_err(failure)?;
-                if !paused {
-                    tx.execute(
-                        "UPDATE followup_batches SET blocked_reason = NULL WHERE session_id = ?1 AND state = 'claimed'",
-                        [session_id.as_str()],
-                    ).map_err(failure)?;
-                }
+                set_followup_paused(&tx, session_id.as_str(), *paused)?;
                 (session_id.as_str(), None)
             }
             _ => return Err(refuse("not a follow-up command")),
