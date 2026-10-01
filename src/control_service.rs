@@ -749,6 +749,7 @@ async fn run_grpc_listener(
                 .with_execution_routing(execution_machine(), true, false)
                 .map_err(|error| ControlError::ServiceRejected(error.to_string()))?
                 .with_additional_capability("MachinePath")
+                .with_additional_capability("MachinePathReadOnly")
                 .into_server(),
         )
         .add_service(crate::machine_path::service().into_server())
@@ -795,6 +796,7 @@ async fn run_remote_grpc_listener(
                 .with_execution_routing(execution_machine(), false, true)
                 .map_err(|error| ControlError::ServiceRejected(error.to_string()))?
                 .with_additional_capability("MachinePath")
+                .with_additional_capability("MachinePathReadOnly")
                 .with_nakode_service_only_lane_catalogue()
                 .with_additional_capability("RemoteSelfUpdate")
                 .into_authenticated_server(api_key),
