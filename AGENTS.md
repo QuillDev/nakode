@@ -126,8 +126,9 @@ server traffic merely to redraw a view.
 ### Service protocol
 
 The service boundary is the explicit, versioned, language-neutral Protobuf
-contract in `proto/nakode/v1/nakode.proto`, served over gRPC. It has three
-concepts:
+contract in `crates/nakode-api/proto/nakode/v1/nakode.proto`, served over gRPC.
+The API crate owns its complete code-generation inputs so packaged and vendored
+builds are independent of a workspace checkout. It has three concepts:
 
 1. **Commands** request domain changes and receive accepted or rejected results.
 2. **Queries and snapshots** establish a complete client view at a known

@@ -261,7 +261,7 @@ mod tests {
     fn rpc_name_allowlist_matches_the_public_proto() {
         let mut service = "";
         let mut methods = Vec::new();
-        for line in include_str!("../../../proto/nakode/v1/nakode.proto").lines() {
+        for line in include_str!("../../nakode-api/proto/nakode/v1/nakode.proto").lines() {
             let line = line.trim();
             if let Some(rest) = line.strip_prefix("service ") {
                 service = rest.split_whitespace().next().expect("service name");

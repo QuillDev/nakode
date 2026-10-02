@@ -10,9 +10,9 @@ controls or presentation.
 
 ## Public contract
 
-- [x] `proto/nakode/v1/nakode.proto` is the sole public API schema.
+- [x] `crates/nakode-api/proto/nakode/v1/nakode.proto` is the sole public API schema.
 - [x] gRPC is the sole frontend transport.
-- [x] Go and TypeScript generation is declared in `proto/buf.gen.yaml`; Rust
+- [x] Go and TypeScript generation is declared in `crates/nakode-api/proto/buf.gen.yaml`; Rust
       generation is owned by the `nakode-api` crate.
 - [x] API requests and responses have explicit size limits that preserve the
       20 MiB artifact contract.

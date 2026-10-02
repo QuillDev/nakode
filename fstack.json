@@ -1,0 +1,13 @@
+{
+  "repo": "QuillDev/nakode",
+  "worktrees": {
+    "preMaterialize": {
+      "inputs": ["Cargo.toml", "Cargo.lock", "crates/nakode-api/Cargo.toml", "crates/nakode-protocol/Cargo.toml", "crates/nakode-sdk/Cargo.toml", "crates/nakode-server/Cargo.toml", "crates/nakode-runtime/Cargo.toml", "crates/nakode-telemetry/Cargo.toml", "scripts/prepare-dependencies.sh"],
+      "persist": [".dependencies/vendor", ".dependencies/config"],
+      "tools": ["cargo", "rustc", "python3", "gcc", "bash", "git"],
+      "compatibility": "nakode-guest-vendor-v1",
+      "commands": ["bash scripts/prepare-dependencies.sh"]
+    },
+    "hooks": { "init": ["python3 scripts/activate-dependencies.py"] }
+  }
+}

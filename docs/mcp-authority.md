@@ -16,7 +16,7 @@ A **grant** is explicit session input. `CreateSessionRequest.mcp_grant` and `Ope
 
 The public path is:
 
-1. `proto/nakode/v1/nakode.proto`
+1. `crates/nakode-api/proto/nakode/v1/nakode.proto`
 2. generated `nakode-api`
 3. `crates/nakode-server/src/grpc.rs`
 4. `src/server.rs` domain commands/queries
