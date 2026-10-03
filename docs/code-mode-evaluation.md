@@ -102,7 +102,7 @@ Code Mode should be selected by task shape, not made the only tool-use mode. Dir
 
 ### 4.1 Authority and public boundary
 
-`AGENTS.md` makes the server the authority for tools, process supervision, approvals, credentials, persistence, cancellation, and canonical state. The public boundary is `proto/nakode/v1/nakode.proto`, generated API types, `crates/nakode-server/src/grpc.rs`, and reusable behavior in `crates/nakode-sdk/src/lib.rs`. A provider adapter or frontend-owned Code Mode would violate this boundary.
+`AGENTS.md` makes the server the authority for tools, process supervision, approvals, credentials, persistence, cancellation, and canonical state. The public boundary is `crates/nakode-api/proto/nakode/v1/nakode.proto`, generated API types, `crates/nakode-server/src/grpc.rs`, and reusable behavior in `crates/nakode-sdk/src/lib.rs`. A provider adapter or frontend-owned Code Mode would violate this boundary.
 
 The current command model already installs tools and MCP grants atomically:
 

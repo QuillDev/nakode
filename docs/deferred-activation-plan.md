@@ -254,7 +254,7 @@ Nakode:
 - atomic quiescence fence: `src/control_service.rs:553-586`, `src/server/runtime.rs:493-516`;
 - detached restart/start/readiness: `src/control_service.rs:1768-1825`;
 - session activity/queue inventory: `src/server.rs:3272-3285` and public workspace projections;
-- Protobuf service boundary: `proto/nakode/v1/nakode.proto`;
+- Protobuf service boundary: `crates/nakode-api/proto/nakode/v1/nakode.proto`;
 - server/SDK status precedent: `crates/nakode-server/src/grpc.rs`, `crates/nakode-sdk/src/lib.rs`.
 
 FStack:
@@ -275,7 +275,7 @@ FStack:
 - `src/config.rs`, `src/main.rs`, `src/service_cli.rs`: hidden helper entry point, activation endpoint/status discovery, and CLI lifecycle plumbing.
 - `src/control_service.rs`: executable identity, endpoint descriptors, stale-service classification, structured lifecycle requests, atomic quiescence/conditional-force shutdown, and bounded replacement readiness.
 - `src/server.rs`, `src/server/runtime.rs`: structured blockers and the complete live-work predicate, including turns, queues, interactions, native delegations, external/MCP calls, and owned shells.
-- `proto/nakode/v1/nakode.proto`, `crates/nakode-api`, and `crates/nakode-protocol`: public activation messages/service and lifecycle blocker/capability transport.
+- `crates/nakode-api/proto/nakode/v1/nakode.proto`, `crates/nakode-api`, and `crates/nakode-protocol`: public activation messages/service and lifecycle blocker/capability transport.
 - `crates/nakode-sdk/src/lib.rs`: activation discovery/watch client plus same-logical-session reconnect and authoritative replacement hydration.
 - `src/app.rs`: built-in client attachment recovery without projecting transport loss as terminal session state.
 - `tests/activation_lifecycle.rs`, `tests/backend_fixture.rs`, and module tests: isolated old-A/new-B cutover, helper and no-service recovery, identity mismatch/failure recording, force fences, lease ownership, and bounded fixture gates.

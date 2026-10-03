@@ -1,4 +1,6 @@
 /target
+/.dependencies/
+/.cargo/config.toml
 /target-ticket/
 /gen
 **/target/

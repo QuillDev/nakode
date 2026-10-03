@@ -2,7 +2,7 @@
 
 ## Decision
 
-The public frontend boundary is `proto/nakode/v1/nakode.proto`. The native
+The public frontend boundary is `crates/nakode-api/proto/nakode/v1/nakode.proto`. The native
 Rust server implements that service. Rust, TypeScript, Go, and future language
 clients generate transport types and service stubs from the same schema. gRPC
 is the only public frontend transport.

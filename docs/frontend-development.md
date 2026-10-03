@@ -20,9 +20,9 @@ automation ────┘                              ├─ providers and too
 
 ## Contract and generation
 
-`proto/nakode/v1/nakode.proto` is the only public contract. It generates
+`crates/nakode-api/proto/nakode/v1/nakode.proto` is the only public contract. It generates
 type-safe service clients and models for Rust, Go, TypeScript, and any other
-language with Protobuf/gRPC support. `proto/buf.gen.yaml` contains the
+language with Protobuf/gRPC support. `crates/nakode-api/proto/buf.gen.yaml` contains the
 multi-language generation configuration.
 
 Generated RPC clients expose the complete product edge inventory, including:

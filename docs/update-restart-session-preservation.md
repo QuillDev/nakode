@@ -152,7 +152,7 @@ This is a mismatch between Nakode authority and FStack projection, independent o
 | Persisted provider/model/add-on settings | Nakode public commands | Applied by runtime effects and provider synchronization | No for supported live mutations; new implementation code still needs server activation |
 | Startup-only paths/environment/service configuration | CLI/service environment | Read while preparing the runtime | Yes unless a typed live reload exists |
 
-For the reported skill case, a service restart is technically broader than necessary. Nakode already exposes `ReloadWorkspace` and the TUI `/reload` action for skills, agents, and backend metadata (`proto/nakode/v1/nakode.proto:11-15,121-125`, `src/controls.rs:584-590`, `src/server/runtime.rs:3181-3211`). FStack does not currently expose that operation. Also, `fstack update` installs bundled skill links only after its nested `nakode update` activation attempt, so that attempt cannot observe the new skill files.
+For the reported skill case, a service restart is technically broader than necessary. Nakode already exposes `ReloadWorkspace` and the TUI `/reload` action for skills, agents, and backend metadata (`crates/nakode-api/proto/nakode/v1/nakode.proto:11-15,121-125`, `src/controls.rs:584-590`, `src/server/runtime.rs:3181-3211`). FStack does not currently expose that operation. Also, `fstack update` installs bundled skill links only after its nested `nakode update` activation attempt, so that attempt cannot observe the new skill files.
 
 ## Root-cause classification
 
@@ -264,7 +264,7 @@ This preserves all work on the default path because cutover cannot begin until t
 - `src/activation.rs`: journal schema, helper singleton, heartbeat/recovery, activation socket lease, immediate/periodic/manual checks, status/watch authority, idempotency/audit history, readiness verification, and helper-to-service handoff.
 - `src/config.rs`, `src/main.rs`, `src/service_cli.rs`: hidden helper process, activation endpoint discovery, and owner CLI surfaces.
 - `src/control_service.rs`, `src/server.rs`, `src/server/runtime.rs`: structured live-work inventory, reachable service/build verification, conditional force compare/fence, and final atomic quiescence authority.
-- `proto/nakode/v1/nakode.proto`, `crates/nakode-api`, `crates/nakode-protocol`, and `crates/nakode-sdk`: public activation service plus attached-session recovery with stable identity enforcement.
+- `crates/nakode-api/proto/nakode/v1/nakode.proto`, `crates/nakode-api`, `crates/nakode-protocol`, and `crates/nakode-sdk`: public activation service plus attached-session recovery with stable identity enforcement.
 - `src/app.rs`: built-in client reconnection through SDK attached-session recovery.
 - `tests/activation_lifecycle.rs` and focused module tests: isolated A/B process lifecycle, helper recovery/handoff, a stopped-A/no-B cutover gap, same-ID active and persisted-idle reattachment, transcript survival, exact execution-error idempotency replay, force fences, journal/lease behavior, blocker query bounds, and false-current prevention.
 

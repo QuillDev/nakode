@@ -103,7 +103,7 @@ Every frontend—including the built-in TUI—only:
 Frontends never open Nakode's database, connect directly to providers, execute
 tools, reduce provider events, or decide session and queue policy. This is a
 hard project boundary: a new capability must be implemented in the server,
-exposed through `proto/nakode/v1/nakode.proto`, represented in the SDK, and only
+exposed through `crates/nakode-api/proto/nakode/v1/nakode.proto`, represented in the SDK, and only
 then rendered by clients. See [Building a Nakode frontend](docs/frontend-development.md)
 and the [SDK architecture](docs/sdk-architecture.md).
 

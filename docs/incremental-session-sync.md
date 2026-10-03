@@ -43,7 +43,7 @@ The underlying raw projection/diff construction remains existing work. This prot
 
 ## 5. Proposed public contract and SDK rules
 
-The language-neutral schema still needs to be added to `proto/nakode/v1/nakode.proto`, with explicit capability/version negotiation and generated mappings. The native prototype types are not a finalized public schema.
+The language-neutral schema still needs to be added to `crates/nakode-api/proto/nakode/v1/nakode.proto`, with explicit capability/version negotiation and generated mappings. The native prototype types are not a finalized public schema.
 
 Proposed responses:
 
