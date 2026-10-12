@@ -33,6 +33,7 @@ use crate::credential::SecretValue;
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
 const SDK_VERSION: &str = "0.3.268";
+static SDK_PREPARATION: Mutex<()> = Mutex::const_new(());
 const BRIDGE_SOURCE: &str = include_str!("bridge.mjs");
 const PROCESS_LIFECYCLE_SOURCE: &str = include_str!("process_lifecycle.mjs");
 const TOOL_POLICY_SOURCE: &str = include_str!("tool_policy.mjs");
@@ -193,7 +194,8 @@ struct UnsupportedCommand {
 /// Starts the Claude TypeScript SDK adapter.
 ///
 /// # Errors
-/// Returns an error when a stored credential is malformed or the Node SDK bridge cannot be prepared.
+/// Returns an error when a stored credential is malformed or cannot be refreshed.
+/// SDK preparation belongs to the provider supervisor, not the shared runtime actor.
 pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError> {
     let credential = parse_credential(config.credential.as_ref())?;
     let (credential, credential_updated) =
@@ -203,10 +205,11 @@ pub async fn spawn(config: BackendConfig) -> Result<BackendHandle, BackendError>
                 provider: CLAUDE_PROVIDER.to_owned(),
                 detail,
             })?;
-    let bridge = match credential.as_ref() {
-        Some(_) => Some(spawn_bridge(&config.workspace).await?),
-        None => None,
-    };
+    // A cold SDK install can need network access. Never await it while the shared
+    // runtime is enabling an account: status, other providers, and cancellation
+    // must remain available. The supervisor's existing recovery path starts the
+    // bridge for its first command and reports setup errors on that provider.
+    let bridge = None;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
     let task = tokio::spawn(run_supervisor(
@@ -295,6 +298,9 @@ async fn spawn_bridge(workspace: &std::path::Path) -> Result<Bridge, BackendErro
 }
 
 async fn prepare_bridge_directory() -> Result<PathBuf, BackendError> {
+    // Account and provider-control supervisors share this installation. Lazy
+    // startup must not run concurrent npm installs into the same directory.
+    let _preparation = SDK_PREPARATION.lock().await;
     ensure_node_version().await?;
     let project =
         ProjectDirs::from("dev", "nakode", "Nakode").ok_or_else(|| BackendError::BridgeSetup {
@@ -339,7 +345,14 @@ async fn prepare_bridge_directory() -> Result<PathBuf, BackendError> {
             detail: error.to_string(),
         })?;
     if !claude_sdk_is_current(&directory).await {
-        let output = Command::new("npm")
+        invalidate_sdk_receipt(&directory)
+            .await
+            .map_err(|error| BackendError::BridgeSetup {
+                provider: CLAUDE_PROVIDER.to_owned(),
+                detail: error.to_string(),
+            })?;
+        let mut install = Command::new("npm");
+        install
             .envs(crate::machine_path::environment())
             .args([
                 "install",
@@ -348,12 +361,12 @@ async fn prepare_bridge_directory() -> Result<PathBuf, BackendError> {
                 "--no-fund",
                 "--package-lock=false",
             ])
-            .current_dir(&directory)
-            .output()
+            .current_dir(&directory);
+        let output = sdk_install_output(install, Duration::from_secs(120))
             .await
             .map_err(|error| BackendError::BridgeSetup {
                 provider: CLAUDE_PROVIDER.to_owned(),
-                detail: format!("Node.js 18+ and npm are required: {error}"),
+                detail: format!("Node.js 18+ and npm SDK setup failed: {error}"),
             })?;
         if !output.status.success() {
             return Err(BackendError::BridgeSetup {
@@ -361,11 +374,53 @@ async fn prepare_bridge_directory() -> Result<PathBuf, BackendError> {
                 detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             });
         }
+        tokio::fs::write(directory.join(".nakode-sdk-ready"), SDK_VERSION)
+            .await
+            .map_err(|error| BackendError::BridgeSetup {
+                provider: CLAUDE_PROVIDER.to_owned(),
+                detail: error.to_string(),
+            })?;
     }
     Ok(directory)
 }
 
+async fn sdk_install_output(
+    mut command: Command,
+    deadline: Duration,
+) -> std::io::Result<std::process::Output> {
+    // Dropping the timed-out/cancelled wait must not leave npm running behind a
+    // failed provider setup. Tokio also reaps the terminated direct child.
+    command.kill_on_drop(true);
+    timeout(deadline, command.output()).await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Claude SDK installation timed out; check registry connectivity and retry",
+        )
+    })?
+}
+
+async fn invalidate_sdk_receipt(directory: &std::path::Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(directory.join(".nakode-sdk-ready")).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 async fn claude_sdk_is_current(directory: &std::path::Path) -> bool {
+    // npm can write a matching manifest before dependencies finish. A failed or
+    // cancelled installation must not be accepted as a complete SDK on retry.
+    if tokio::fs::read_to_string(directory.join(".nakode-sdk-ready"))
+        .await
+        .ok()
+        .as_deref()
+        != Some(SDK_VERSION)
+        || !directory
+            .join("node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs")
+            .is_file()
+    {
+        return false;
+    }
     let manifest = directory.join("node_modules/@anthropic-ai/claude-agent-sdk/package.json");
     if !manifest.is_file() {
         return false;
@@ -2210,6 +2265,97 @@ fn capabilities() -> BackendCapabilities {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn partial_sdk_install_is_not_current() {
+        let directory = tempfile::tempdir().unwrap();
+        let sdk = directory
+            .path()
+            .join("node_modules/@anthropic-ai/claude-agent-sdk");
+        tokio::fs::create_dir_all(&sdk).await.unwrap();
+        tokio::fs::write(
+            sdk.join("package.json"),
+            json!({"version": SDK_VERSION}).to_string(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(sdk.join("sdk.mjs"), "").await.unwrap();
+        assert!(!claude_sdk_is_current(directory.path()).await);
+        tokio::fs::write(directory.path().join(".nakode-sdk-ready"), SDK_VERSION)
+            .await
+            .unwrap();
+        assert!(claude_sdk_is_current(directory.path()).await);
+        invalidate_sdk_receipt(directory.path()).await.unwrap();
+        invalidate_sdk_receipt(directory.path()).await.unwrap();
+        assert!(!claude_sdk_is_current(directory.path()).await);
+        tokio::fs::write(directory.path().join(".nakode-sdk-ready"), SDK_VERSION)
+            .await
+            .unwrap();
+        tokio::fs::remove_file(sdk.join("sdk.mjs")).await.unwrap();
+        assert!(!claude_sdk_is_current(directory.path()).await);
+    }
+
+    #[tokio::test]
+    async fn authenticated_spawn_does_not_wait_for_sdk_installation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config =
+            BackendConfig::native(workspace.path().to_path_buf()).with_credential(Some(json!({
+                "access_token": "test-brokered-token",
+                "refresh_token": "",
+                "expires_at_ms": u64::MAX,
+                "brokered": true
+            })));
+        let mut handle = timeout(Duration::from_secs(2), spawn(config))
+            .await
+            .expect("provider registration must not run the SDK installer")
+            .unwrap();
+        assert!(matches!(
+            handle.events.recv().await,
+            Some(BackendEvent::Ready(_))
+        ));
+        handle
+            .commands
+            .send(BackendCommand::Shutdown)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), handle.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sdk_install_timeout_kills_the_installer() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("installer.pid");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; exec sleep 60", "installer"])
+            .arg(&pid_file);
+        let error = sdk_install_output(command, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let pid: i32 = tokio::fs::read_to_string(pid_file)
+            .await
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                    == Err(nix::errno::Errno::ESRCH)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed-out installer must be terminated and reaped");
+    }
+
     #[test]
     fn image_handoff_is_refused_instead_of_silently_dropped_by_claude_bridge() {
         let command = |attachments| BackendCommand::StartTurn {
@@ -3424,6 +3570,9 @@ assert.equal(streamMessageIds.size, 0);
             format!(r#"{{"version":"{SDK_VERSION}"}}"#),
         )
         .expect("SDK manifest");
+        std::fs::write(sdk.join("sdk.mjs"), "").expect("SDK entrypoint");
+        std::fs::write(directory.path().join(".nakode-sdk-ready"), SDK_VERSION)
+            .expect("successful SDK installation receipt");
         assert!(claude_sdk_is_current(directory.path()).await);
 
         std::fs::write(sdk.join("package.json"), r#"{"version":"0.0.0"}"#)
