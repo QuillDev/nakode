@@ -7,3 +7,5 @@ Codex startup refreshes share an account-scoped coordinator across control, prim
 This repairs established source defects, not proof of the cause of every historical 401. It cannot recover previously lost refresh tokens or revive revoked sign-ins. Those require the supported sign-in-again flow after updating, not retries with an unchanged invalid credential. No token values or protected lifecycle logs are required for diagnosis.
 
 Synthetic coverage lives in `src/codex/native/tests/refresh.rs` and `src/server/runtime/tests/delegated_credentials.rs`. Live authentication and post-update delegate startup remain separate verification steps.
+
+Same-provider native delegates inherit their parent session’s exact provider account. Ineligible inherited accounts fail explicitly; they never fall back to a less-loaded or newly defaulted sibling. Cross-provider delegates retain ordinary provider routing.
