@@ -43,6 +43,7 @@ Nakode feature and must not be merged as one.
 ### In-process provider adapters own
 
 - Provider authentication and token refresh
+- Delegate refresh persistence and cooldowns retain launch-account attribution; Codex startup refreshes coalesce per account. `docs/delegate-oauth-refresh.md`.
 - Provider protocol encoding, request validation, streaming, and errors
 - Model discovery and provider-specific model configuration
 - Provider conversation identifiers and resumable response state

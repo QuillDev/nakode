@@ -11,6 +11,7 @@ pub mod protocol;
 pub use compatibility::{
     BackendConfig as CompatibilityBackendConfig, spawn as spawn_compatibility,
 };
+pub(crate) use native::RefreshCoordinator;
 pub use native::{BackendConfig, brokered_credential_metadata, spawn, vision_service};
 #[cfg(feature = "codex-process-adapter")]
 pub use protocol::{RpcError, RpcMessage};

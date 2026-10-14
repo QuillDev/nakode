@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     error::Error as _,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
@@ -69,6 +69,7 @@ pub struct BackendConfig {
     pub base_url: String,
     client: Client,
     auth_urls: AuthUrls,
+    refresh_coordinator: RefreshCoordinator,
     auth_flow: CodexAuthFlow,
     callback_ports: Vec<u16>,
     session_database: Option<PathBuf>,
@@ -112,6 +113,7 @@ impl BackendConfig {
                 verification: DEVICE_AUTH_URL.to_owned(),
                 token: TOKEN_URL.to_owned(),
             },
+            refresh_coordinator: RefreshCoordinator::default(),
             auth_flow: CodexAuthFlow::default(),
             callback_ports: BROWSER_CALLBACK_PORTS.to_vec(),
             session_database: None,
@@ -128,6 +130,12 @@ impl BackendConfig {
     #[must_use]
     pub fn with_credential(mut self, credential: Option<Value>) -> Self {
         self.credential = credential;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_refresh_coordinator(mut self, coordinator: RefreshCoordinator) -> Self {
+        self.refresh_coordinator = coordinator;
         self
     }
 
@@ -222,7 +230,7 @@ impl BackendConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct CodexCredential {
     access_token: String,
     refresh_token: String,
@@ -233,6 +241,20 @@ struct CodexCredential {
     /// Supplied by a broker that alone refreshes it; Nakode holds no refresh token for it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     brokered: bool,
+}
+
+/// Coalesces startup refreshes across control, primary and delegate handles for one
+/// registry account. Never global: accounts and independent runtimes remain isolated.
+/// Cached rotations contain secrets, so this type intentionally has no Debug output.
+#[derive(Clone, Default)]
+pub(crate) struct RefreshCoordinator {
+    rotations: Arc<tokio::sync::Mutex<VecDeque<CredentialRotation>>>,
+}
+
+struct CredentialRotation {
+    token_url: String,
+    previous: CodexCredential,
+    refreshed: CodexCredential,
 }
 
 /// The broker's view of one `ChatGPT` sign-in: a current access token and its expiry.
@@ -2649,22 +2671,57 @@ async fn refresh_if_needed(
         .await;
         return None;
     }
-    match refresh_credential(config, &credential).await {
-        Ok(refreshed) => {
-            let metadata = serde_json::to_value(&refreshed).unwrap_or(Value::Null);
-            let _ = events
-                .send(BackendEvent::AuthenticationCompleted {
-                    kind: "chatgpt_oauth".to_owned(),
-                    metadata,
-                })
-                .await;
-            Some(refreshed)
+    // A handle captures its credential before its supervisor starts. Siblings may
+    // therefore hold the same old refresh token even after one rotates it successfully.
+    let mut rotations = config.refresh_coordinator.rotations.lock().await;
+    let cached = rotations
+        .iter()
+        .find(|rotation| {
+            rotation.token_url == config.auth_urls.token && rotation.previous == credential
+        })
+        .map(|rotation| rotation.refreshed.clone());
+    let credential = cached.unwrap_or(credential);
+    let refreshed = if credential.expires_at_ms > unix_time_ms().saturating_add(60_000) {
+        credential.clone()
+    } else {
+        match refresh_credential(config, &credential).await {
+            Ok(refreshed) => {
+                // Keep recent aliases current if another startup spans a later rotation.
+                for rotation in rotations.iter_mut() {
+                    if rotation.token_url == config.auth_urls.token
+                        && rotation.refreshed == credential
+                    {
+                        rotation.refreshed.clone_from(&refreshed);
+                    }
+                }
+                rotations.push_back(CredentialRotation {
+                    token_url: config.auth_urls.token.clone(),
+                    previous: credential,
+                    refreshed: refreshed.clone(),
+                });
+                // Bound retained secret material, including superseded sign-ins.
+                while rotations.len() > 32 {
+                    rotations.pop_front();
+                }
+                refreshed
+            }
+            Err(error) => {
+                request_failed(events, BackendOperation::Authenticate, error).await;
+                return None;
+            }
         }
-        Err(error) => {
-            request_failed(events, BackendOperation::Authenticate, error).await;
-            None
-        }
-    }
+    };
+    drop(rotations);
+    // Cached consumers also publish: the first handle may have been cancelled before
+    // the server consumed its event. Persistence must not depend on that handle surviving.
+    let metadata = serde_json::to_value(&refreshed).unwrap_or(Value::Null);
+    let _ = events
+        .send(BackendEvent::AuthenticationCompleted {
+            kind: "chatgpt_oauth".to_owned(),
+            metadata,
+        })
+        .await;
+    Some(refreshed)
 }
 
 async fn refresh_credential(
@@ -2756,6 +2813,7 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, String>
 
 #[cfg(test)]
 mod tests {
+    mod refresh;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
