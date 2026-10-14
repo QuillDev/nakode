@@ -2592,12 +2592,18 @@ impl NativeServerRuntime {
                     .core
                     .session_for_run_id(&run_id)
                     .unwrap_or_else(|| self.core.default_session_id().clone());
-                let effects = self
+                // Authentication is account lifecycle, not a child transcript event.
+                let credential_effect = self
+                    .effects
+                    .backends
+                    .subagent_credential_effect(&run_id, &event);
+                let mut effects = self
                     .core
                     .engine_for_mut(&session_id)
                     .map_or_else(Vec::new, |engine| {
                         engine.state_mut().handle_subagent_backend(&run_id, event)
                     });
+                effects.extend(credential_effect);
                 (session_id, effects)
             }
         };
@@ -3511,6 +3517,8 @@ pub(crate) struct BackendRegistry {
     session_tasks: HashMap<(nakode_protocol::SessionId, String), Vec<SessionBackendTasks>>,
     pub(crate) subagent_commands: HashMap<String, mpsc::Sender<BackendCommand>>,
     pub(crate) subagent_providers: HashMap<String, String>,
+    /// Exact account captured at launch; None explicitly identifies legacy provider credentials.
+    subagent_accounts: HashMap<String, Option<String>>,
     subagent_parents: HashMap<String, nakode_protocol::SessionId>,
     subagent_tasks: HashMap<String, Vec<SessionBackendTasks>>,
     pub(crate) events: mpsc::Receiver<(BackendSource, BackendEvent)>,
@@ -3526,6 +3534,7 @@ pub(crate) struct BackendRegistry {
     pub(crate) web_config: Arc<RwLock<crate::web::WebConfig>>,
     pub(crate) memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
     pub(crate) memory_services: Mutex<HashMap<String, crate::memory::SharedMemoryService>>,
+    codex_refresh_coordinators: Mutex<HashMap<Option<String>, codex::RefreshCoordinator>>,
     pub(crate) vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
     pub(crate) vision_service: Option<crate::vision::SharedVisionService>,
     pub(crate) native_delegation: mpsc::Sender<NativeAgentRequest>,
@@ -3687,6 +3696,8 @@ impl BackendRegistry {
             session_tasks: HashMap::new(),
             subagent_commands: HashMap::new(),
             subagent_providers: HashMap::new(),
+            subagent_accounts: HashMap::new(),
+            codex_refresh_coordinators: Mutex::new(HashMap::new()),
             subagent_parents: HashMap::new(),
             subagent_tasks: HashMap::new(),
             events,
@@ -3737,15 +3748,6 @@ impl BackendRegistry {
         Ok(())
     }
 
-    async fn spawn_provider_handle(
-        &self,
-        provider: &str,
-        working_directory: &Path,
-    ) -> Result<BackendHandle, BackendError> {
-        self.spawn_provider_handle_for_account(provider, None, working_directory, false)
-            .await
-    }
-
     #[allow(clippy::too_many_lines)]
     async fn spawn_provider_handle_for_account(
         &self,
@@ -3775,9 +3777,21 @@ impl BackendRegistry {
                     })
                     .await;
                 }
+                let refresh_coordinator = self
+                    .codex_refresh_coordinators
+                    .lock()
+                    .await
+                    .entry(
+                        account_id
+                            .map(str::to_owned)
+                            .or_else(|| self.default_account_id(provider)),
+                    )
+                    .or_default()
+                    .clone();
                 codex::spawn(
                     codex::BackendConfig::native(working_directory.to_path_buf())
                         .with_credential(credential)
+                        .with_refresh_coordinator(refresh_coordinator)
                         .with_reasoning_effort(self.config.openai_reasoning_effort.as_str())
                         .with_compaction_threshold_percent(usize::from(
                             self.config.compaction_threshold_percent,
@@ -4174,6 +4188,21 @@ impl BackendRegistry {
                     .await;
             }
         }
+        for (run_id, selected_account) in &self.subagent_accounts {
+            if selected_account.as_deref() == Some(account_id)
+                && self
+                    .subagent_providers
+                    .get(run_id)
+                    .is_some_and(|selected| selected == provider)
+                && let Some(commands) = self.subagent_commands.get(run_id)
+            {
+                let _ = commands
+                    .send(BackendCommand::UpdateCredential {
+                        credential: metadata.clone().map(SecretValue::new),
+                    })
+                    .await;
+            }
+        }
     }
 
     pub(crate) async fn clear_provider_account_credential(
@@ -4315,33 +4344,38 @@ impl BackendRegistry {
         working_directory: &Path,
         require_local_auth: bool,
     ) -> Result<(), BackendError> {
-        if let Some(account_id) = self.default_account_id(provider)
-            && let Some(cooldown) = self.active_cooldown(provider, &account_id)
-        {
-            return Err(BackendError::ProviderCoolingDown {
-                provider: provider.to_owned(),
-                remaining_seconds: cooldown.0,
-                reason: cooldown.1,
-            });
-        }
         if !self.commands.contains_key(provider) {
             return Err(BackendError::ProviderUnavailable {
                 provider: provider.to_owned(),
             });
         }
-        let handle = if require_local_auth {
-            let selection = self.select_account(provider, None)?;
-            self.spawn_provider_handle_for_account(
+        // Preserve routing policy, but capture the account actually used, not whichever
+        // account happens to be the default when a later refresh/failure event arrives.
+        let account_id = if require_local_auth {
+            Some(self.select_account(provider, None)?.account_id)
+        } else {
+            let account_id = self.default_account_id(provider);
+            if let Some(account_id) = account_id.as_deref()
+                && let Some((remaining_seconds, reason)) =
+                    self.active_cooldown(provider, account_id)
+            {
+                return Err(BackendError::ProviderCoolingDown {
+                    provider: provider.to_owned(),
+                    remaining_seconds,
+                    reason,
+                });
+            }
+            account_id
+        };
+        let handle = self
+            .spawn_provider_handle_for_account(
                 provider,
-                Some(&selection.account_id),
+                account_id.as_deref(),
                 working_directory,
                 false,
             )
-            .await?
-        } else {
-            self.spawn_provider_handle(provider, working_directory)
-                .await?
-        };
+            .await?;
+        self.subagent_accounts.insert(run_id.clone(), account_id);
         let (commands, mut events, task) = handle.into_parts();
         self.subagent_commands.insert(run_id.clone(), commands);
         self.subagent_providers
@@ -4568,12 +4602,7 @@ impl BackendRegistry {
                 account_id,
                 ..
             } => Some((provider.clone(), account_id.clone())),
-            BackendSource::Subagent(run_id) => {
-                self.subagent_providers.get(run_id).and_then(|provider| {
-                    self.default_account_id(provider)
-                        .map(|account_id| (provider.clone(), account_id))
-                })
-            }
+            BackendSource::Subagent(run_id) => self.subagent_account(run_id),
         };
         if matches!(
             event,
@@ -4893,6 +4922,33 @@ impl BackendRegistry {
         commands.send(command).await.is_ok()
     }
 
+    fn subagent_account(&self, run_id: &str) -> Option<(String, String)> {
+        let provider = self.subagent_providers.get(run_id)?;
+        let account = self.subagent_accounts.get(run_id)?.as_ref()?;
+        Some((provider.clone(), account.clone()))
+    }
+
+    fn subagent_credential_effect(&self, run_id: &str, event: &BackendEvent) -> Option<Effect> {
+        let BackendEvent::AuthenticationCompleted { kind, metadata } = event else {
+            return None;
+        };
+        let provider = self.subagent_providers.get(run_id)?.clone();
+        let account = self.subagent_accounts.get(run_id)?;
+        Some(match account {
+            Some(account_id) => Effect::SaveProviderAccountCredential {
+                provider,
+                account_id: account_id.clone(),
+                kind: kind.clone(),
+                metadata: metadata.clone(),
+            },
+            None => Effect::SaveProviderCredential {
+                provider,
+                kind: kind.clone(),
+                metadata: metadata.clone(),
+            },
+        })
+    }
+
     pub(crate) async fn stop_subagent(&mut self, run_id: &str) -> Result<(), String> {
         if let Some(commands) = self.subagent_commands.get(run_id).cloned() {
             match tokio::time::timeout(
@@ -4911,6 +4967,7 @@ impl BackendRegistry {
         }
         let Some(task_sets) = self.subagent_tasks.remove(run_id) else {
             self.subagent_providers.remove(run_id);
+            self.subagent_accounts.remove(run_id);
             self.subagent_parents.remove(run_id);
             return Ok(());
         };
@@ -4929,6 +4986,7 @@ impl BackendRegistry {
             let _ = tasks.event_forwarder.await;
         }
         self.subagent_providers.remove(run_id);
+        self.subagent_accounts.remove(run_id);
         self.subagent_parents.remove(run_id);
         Ok(())
     }
@@ -7002,6 +7060,7 @@ fn summarize_provider_error(message: &str) -> String {
 mod tests {
     mod child_creation;
     mod child_questions;
+    mod delegated_credentials;
     mod followups;
     use std::{
         collections::{HashMap, HashSet, VecDeque},
