@@ -120,3 +120,92 @@ async fn delegate_credential_replacement_and_revocation_stay_account_scoped() {
     assert!(receivers[1].try_recv().is_err());
     assert!(receivers[2].try_recv().is_err());
 }
+
+#[tokio::test]
+async fn delegate_inherits_parent_account_instead_of_less_loaded_or_default_sibling() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut registry = empty_registry(workspace.path()).await;
+    let parent = SessionId::from("parent");
+    let automatic = nakode_protocol::ProviderAccountRoutingMode::Automatic;
+    registry.provider_accounts.insert(
+        CODEX_PROVIDER.to_owned(),
+        vec![
+            routing_account(
+                CODEX_PROVIDER,
+                "parent-account",
+                "Parent",
+                true,
+                false,
+                automatic,
+            ),
+            routing_account(
+                CODEX_PROVIDER,
+                "other-account",
+                "Other",
+                true,
+                true,
+                automatic,
+            ),
+        ],
+    );
+    for id in ["parent-account", "other-account"] {
+        registry.provider_account_credentials.insert(
+            (CODEX_PROVIDER.to_owned(), id.to_owned()),
+            serde_json::json!({"fixture": id}),
+        );
+    }
+    registry.session_accounts.insert(
+        (parent.clone(), CODEX_PROVIDER.to_owned()),
+        "parent-account".to_owned(),
+    );
+    for require_local_auth in [true, false] {
+        assert_eq!(
+            registry
+                .select_subagent_account(&parent, CODEX_PROVIDER, require_local_auth)
+                .expect("selection"),
+            Some("parent-account".to_owned())
+        );
+    }
+    registry
+        .provider_account_credentials
+        .remove(&(CODEX_PROVIDER.to_owned(), "parent-account".to_owned()));
+    for require_local_auth in [true, false] {
+        assert!(
+            registry
+                .select_subagent_account(&parent, CODEX_PROVIDER, require_local_auth)
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn delegate_does_not_apply_parent_account_to_another_provider() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut registry = empty_registry(workspace.path()).await;
+    let parent = SessionId::from("parent");
+    registry.session_accounts.insert(
+        (parent.clone(), CODEX_PROVIDER.to_owned()),
+        "codex-only".to_owned(),
+    );
+    registry.provider_accounts.insert(
+        CLAUDE_PROVIDER.to_owned(),
+        vec![routing_account(
+            CLAUDE_PROVIDER,
+            "claude-account",
+            "Claude",
+            true,
+            true,
+            nakode_protocol::ProviderAccountRoutingMode::Automatic,
+        )],
+    );
+    registry.provider_account_credentials.insert(
+        (CLAUDE_PROVIDER.to_owned(), "claude-account".to_owned()),
+        serde_json::json!({"fixture": true}),
+    );
+    assert_eq!(
+        registry
+            .select_subagent_account(&parent, CLAUDE_PROVIDER, true)
+            .expect("selection"),
+        Some("claude-account".to_owned())
+    );
+}

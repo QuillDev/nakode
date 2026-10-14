@@ -4349,24 +4349,8 @@ impl BackendRegistry {
                 provider: provider.to_owned(),
             });
         }
-        // Preserve routing policy, but capture the account actually used, not whichever
-        // account happens to be the default when a later refresh/failure event arrives.
-        let account_id = if require_local_auth {
-            Some(self.select_account(provider, None)?.account_id)
-        } else {
-            let account_id = self.default_account_id(provider);
-            if let Some(account_id) = account_id.as_deref()
-                && let Some((remaining_seconds, reason)) =
-                    self.active_cooldown(provider, account_id)
-            {
-                return Err(BackendError::ProviderCoolingDown {
-                    provider: provider.to_owned(),
-                    remaining_seconds,
-                    reason,
-                });
-            }
-            account_id
-        };
+        let account_id =
+            self.select_subagent_account(&parent_session_id, provider, require_local_auth)?;
         let handle = self
             .spawn_provider_handle_for_account(
                 provider,
@@ -4403,6 +4387,42 @@ impl BackendRegistry {
                 event_forwarder,
             });
         Ok(())
+    }
+
+    /// Same-provider delegates retain the parent's exact account, not a less-loaded sibling.
+    /// Cross-provider delegates use ordinary routing; an ineligible inherited account fails closed.
+    fn select_subagent_account(
+        &mut self,
+        parent_session_id: &nakode_protocol::SessionId,
+        provider: &str,
+        require_local_auth: bool,
+    ) -> Result<Option<String>, BackendError> {
+        if let Some(account_id) = self
+            .session_accounts
+            .get(&(parent_session_id.clone(), provider.to_owned()))
+            .cloned()
+        {
+            return self
+                .select_account(provider, Some(&account_id))
+                .map(|selected| Some(selected.account_id));
+        }
+        let account_id = if require_local_auth {
+            Some(self.select_account(provider, None)?.account_id)
+        } else {
+            let account_id = self.default_account_id(provider);
+            if let Some(account_id) = account_id.as_deref()
+                && let Some((remaining_seconds, reason)) =
+                    self.active_cooldown(provider, account_id)
+            {
+                return Err(BackendError::ProviderCoolingDown {
+                    provider: provider.to_owned(),
+                    remaining_seconds,
+                    reason,
+                });
+            }
+            account_id
+        };
+        Ok(account_id)
     }
 
     pub(crate) fn select_account(
