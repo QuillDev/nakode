@@ -1385,6 +1385,29 @@ impl NakodeClient {
         )
     }
 
+    /// Interrupts current work while preserving the inbox's existing pause state.
+    ///
+    /// Use this for coordinator tool interruptions. Manual Stop should use
+    /// [`Self::cancel_session_work`] to pause future inbox dispatch as well.
+    /// This never resumes a manually paused inbox or replays interrupted work.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error, including unsupported older servers.
+    pub async fn interrupt_session_work(
+        &self,
+        session_id: impl Into<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<api::MutationResult, SdkError> {
+        send_mutation!(
+            self,
+            interrupt_session_work,
+            api::InterruptSessionWorkRequest {
+                mutation: Some(mutation(expected_revision)),
+                session_id: session_id.into(),
+            }
+        )
+    }
+
     /// Resolves a pending approval or question.
     ///
     /// # Errors

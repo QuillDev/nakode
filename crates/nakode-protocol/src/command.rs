@@ -505,6 +505,12 @@ pub enum Command {
     CancelSessionWork {
         session_id: SessionId,
     },
+    /// Interrupts current session work without changing the coordination inbox pause state.
+    /// Pending follow-ups may dispatch at the next supported idle boundary; interrupted work
+    /// is never restarted by this command.
+    InterruptSessionWork {
+        session_id: SessionId,
+    },
     CompactContext {
         agent_session_id: AgentSessionId,
     },

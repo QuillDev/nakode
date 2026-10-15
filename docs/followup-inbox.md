@@ -1,5 +1,11 @@
 # Durable ordinary follow-up inbox
 
+`InterruptSessionWork` interrupts current work while leaving the inbox pause state unchanged.
+Coordinator tools use this operation; manual Stop uses `CancelSessionWork` and pauses inbox
+dispatch. Neither operation resumes a manually paused inbox or replays interrupted work.
+Pending messages still wait for the supported idle boundary and existing durable
+claim/acceptance checkpoints. Older servers reject the distinct interrupt RPC.
+
 ## Current boundary
 
 This is an unshipped runtime/API foundation, not a completed dashboard feature.

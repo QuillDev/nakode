@@ -86,6 +86,8 @@ service NakodeService {
   rpc SteerTurn(SteerTurnRequest) returns (MutationResult);
   rpc CancelTurn(CancelTurnRequest) returns (MutationResult);
   rpc CancelSessionWork(CancelSessionWorkRequest) returns (MutationResult);
+  // Interrupts work without pausing or resuming coordination follow-ups.
+  rpc InterruptSessionWork(InterruptSessionWorkRequest) returns (MutationResult);
   rpc CompactContext(CompactContextRequest) returns (MutationResult);
   rpc ResolveInteraction(ResolveInteractionRequest) returns (MutationResult);
   rpc ConfigureSessionTools(ConfigureSessionToolsRequest) returns (MutationResult);
@@ -890,6 +892,7 @@ message CancelTurnRequest { MutationOptions mutation = 1; string turn_id = 2; }
 // invalidate the request. An existing session with no cancellable work is accepted as an idempotent
 // no-op, allowing stop-before-close clients to race safely with terminal replacement snapshots.
 message CancelSessionWorkRequest { MutationOptions mutation = 1; string session_id = 2; }
+message InterruptSessionWorkRequest { MutationOptions mutation = 1; string session_id = 2; }
 message CompactContextRequest { MutationOptions mutation = 1; string agent_session_id = 2; }
 message RunShellRequest { MutationOptions mutation = 1; string session_id = 2; string command = 3; }
 

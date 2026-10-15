@@ -1549,6 +1549,14 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
     command_rpc!(
+        interrupt_session_work,
+        api::InterruptSessionWorkRequest,
+        input,
+        protocol::Command::InterruptSessionWork {
+            session_id: protocol::SessionId::from(input.session_id)
+        }
+    );
+    command_rpc!(
         compact_context,
         api::CompactContextRequest,
         input,
