@@ -45,7 +45,7 @@ const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 // Match the stable upstream Codex protocol baseline, not a local CLI installation.
-const CODEX_CLIENT_VERSION: &str = "0.155.1";
+const CODEX_CLIENT_VERSION: &str = "0.162.1";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -3317,7 +3317,7 @@ mod tests {
     #[tokio::test]
     async fn newly_discovered_model_is_executable_over_the_native_transport() {
         let response = concat!(
-            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"response-astra\"}}\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"response-sol\"}}\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n",
             "data: [DONE]\n"
         );
@@ -3325,7 +3325,7 @@ mod tests {
             (
                 200,
                 "application/json",
-                r#"{"models":[{"slug":"gpt-6-astra","is_default":true,"supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"},{"effort":"max"},{"effort":"ultra"}]}]}"#,
+                r#"{"models":[{"slug":"gpt-6.1-sol","is_default":true,"supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"},{"effort":"max"},{"effort":"ultra"}]}]}"#,
             ),
             (200, "text/event-stream", response),
         ])
@@ -3338,8 +3338,8 @@ mod tests {
             .expect("native model discovery");
         let discovered = models
             .iter()
-            .find(|model| model.info.id == "gpt-6-astra")
-            .expect("Astra should be discovered");
+            .find(|model| model.info.id == "gpt-6.1-sol")
+            .expect("Sol should be discovered");
         let provider = CodexProvider {
             client: Client::new(),
             base_url,
@@ -3357,18 +3357,18 @@ mod tests {
         let output = provider
             .infer_response(request, event_tx, CancellationToken::new())
             .await
-            .expect("a discovered Astra model should use the native response transport");
+            .expect("a discovered Sol model should use the native response transport");
         let requests = server.await.expect("mock server task");
 
         assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with("GET /codex/models?client_version=0.155.1 HTTP/1.1"));
+        assert!(requests[0].starts_with("GET /codex/models?client_version=0.162.1 HTTP/1.1"));
         assert!(requests[1].starts_with("POST /codex/responses HTTP/1.1"));
-        assert!(requests[0].contains("version: 0.155.1"));
-        assert!(requests[1].contains("version: 0.155.1"));
-        assert!(requests[1].contains(r#""model":"gpt-6-astra""#));
+        assert!(requests[0].contains("version: 0.162.1"));
+        assert!(requests[1].contains("version: 0.162.1"));
+        assert!(requests[1].contains(r#""model":"gpt-6.1-sol""#));
         assert!(requests[1].contains(r#""effort":"ultra""#));
         assert_eq!(output.text, "ready");
-        assert_eq!(output.response_id.as_deref(), Some("response-astra"));
+        assert_eq!(output.response_id.as_deref(), Some("response-sol"));
     }
 
     #[tokio::test]
