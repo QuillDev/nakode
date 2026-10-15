@@ -965,7 +965,8 @@ impl ServerCore {
             } => self.steer_queued_prompt_command(&session_id, prompt_id.as_str()),
             Command::SteerTurn { turn_id, text } => self.steer_turn_command(&turn_id, &text),
             Command::CancelTurn { turn_id } => self.cancel_turn_command(&turn_id),
-            Command::CancelSessionWork { session_id } => {
+            Command::CancelSessionWork { session_id }
+            | Command::InterruptSessionWork { session_id } => {
                 self.cancel_session_work_command(&session_id)
             }
             Command::DeleteSession { session_id } => self.delete_session_command(&session_id),
@@ -4715,6 +4716,7 @@ impl ServerCore {
             | Command::RemoveQueuedPrompt { session_id, .. }
             | Command::SteerQueuedPrompt { session_id, .. }
             | Command::CancelSessionWork { session_id }
+            | Command::InterruptSessionWork { session_id }
             | Command::Delegate { session_id, .. }
             | Command::PublishSharedContext { session_id, .. }
             | Command::RunShell { session_id, .. }
@@ -4728,21 +4730,16 @@ impl ServerCore {
                 ..
             } => Some(session_id.clone()),
             Command::OpenSession { session_id, .. } => self.loaded_session_id(session_id),
-            Command::SteerTurn { turn_id, .. } | Command::CancelTurn { turn_id } => self
-                .provider_turn_id(turn_id)
-                .ok()
-                .map(|(session_id, _)| session_id),
-            Command::CompactContext { agent_session_id }
+            Command::SteerTurn { .. }
+            | Command::CancelTurn { .. }
+            | Command::CompactContext { .. }
+            | Command::ResolveInteraction { .. }
+            | Command::CancelRun { .. }
+            | Command::ContinueRun { .. }
             | Command::SelectModel {
-                target: ModelTarget::AgentSession { agent_session_id },
+                target: ModelTarget::AgentSession { .. },
                 ..
-            } => self.session_for_agent_session(agent_session_id).ok(),
-            Command::ResolveInteraction { interaction_id, .. } => {
-                self.session_for_interaction(interaction_id).ok()
-            }
-            Command::CancelRun { run_id } | Command::ContinueRun { run_id, .. } => {
-                self.session_for_run(run_id).ok()
-            }
+            } => self.execution_command_session(command),
             Command::LinkChildSession {
                 parent_session_id, ..
             } => Some(parent_session_id.clone()),
@@ -4793,6 +4790,27 @@ impl ServerCore {
             | Command::CheckAgentBrowser { .. } => Some(self.default_session.clone()),
             // Deletion can rotate the default engine; select it after acceptance.
             Command::DeleteSession { .. } | Command::PruneSession { .. } => None,
+        }
+    }
+
+    fn execution_command_session(&self, command: &Command) -> Option<SessionId> {
+        match command {
+            Command::SteerTurn { turn_id, .. } | Command::CancelTurn { turn_id } => self
+                .provider_turn_id(turn_id)
+                .ok()
+                .map(|(session_id, _)| session_id),
+            Command::CompactContext { agent_session_id }
+            | Command::SelectModel {
+                target: ModelTarget::AgentSession { agent_session_id },
+                ..
+            } => self.session_for_agent_session(agent_session_id).ok(),
+            Command::ResolveInteraction { interaction_id, .. } => {
+                self.session_for_interaction(interaction_id).ok()
+            }
+            Command::CancelRun { run_id } | Command::ContinueRun { run_id, .. } => {
+                self.session_for_run(run_id).ok()
+            }
+            _ => None,
         }
     }
 
