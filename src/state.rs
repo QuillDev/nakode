@@ -14409,6 +14409,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
                     .into_iter()
                     .map(str::to_owned)
                     .collect(),
+                ..Default::default()
             },
         }];
         state.selected_model = Some(format!("{CLAUDE_PROVIDER}/opus"));
@@ -14450,6 +14451,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             display_name: None,
             capabilities: ModelCapabilities {
                 reasoning_efforts: vec!["low".to_owned()],
+                ..Default::default()
             },
         }];
         state.selected_model = Some(format!("{CLAUDE_PROVIDER}/haiku"));
@@ -18075,6 +18077,7 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             display_name: None,
             capabilities: ModelCapabilities {
                 reasoning_efforts: vec!["low".to_owned(), "high".to_owned()],
+                ..Default::default()
             },
         });
         state.session_id = Some(state.nakode_session_id.clone());

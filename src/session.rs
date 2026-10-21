@@ -6934,6 +6934,7 @@ mod tests {
                 display_name: None,
                 capabilities: crate::backend::ModelCapabilities {
                     reasoning_efforts: vec!["low".to_owned(), "high".to_owned()],
+                    ..Default::default()
                 },
             },
             ModelInfo {
