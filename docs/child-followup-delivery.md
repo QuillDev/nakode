@@ -44,7 +44,14 @@ interaction is still pending: revalidate it before any authorized answer. Explic
 Runtime-owned delivery receipts mark the inbox message as `durable_child_evidence`. Batch headers
 carry that origin independently of client-supplied text/sender. Report content is JSON-encoded inert
 evidence, never owner authorization, consent or approval. The continuation instructs the parent to
-summarize, continue only already-authorized work, and use ask only for a genuine owner decision.
+assess the requested outcome, not mistake a terminal turn for a completed task, and continue the
+same durable agent through available coordination tools when reasonable already-authorized work
+remains, without redundant permission. Identity, workspace and history stay intact. Completed tasks
+need no continuation; genuine owner decisions must be surfaced. Owner stop/pause/cancel, permission,
+approval, structured-question and runtime lifecycle boundaries still apply. Reports grant no recursive
+delegation authority, session recreation, native-run restart, unconditional wake/retry loop or blind
+retry of uncertain mutations. Instruction-text regression tests verify delivered wording, not model
+behavior or the cause of a particular missed continuation.
 No approval resolver or child-restart operation is added. Reserved event message IDs cannot be
 submitted through ordinary `EnqueueFollowup`.
 
