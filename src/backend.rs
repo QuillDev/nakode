@@ -324,6 +324,25 @@ impl ModelInfo {
     }
 }
 
+/// Match a discovery-filter preference without changing canonical execution identity.
+pub(crate) fn model_matches_filter(
+    model: &ModelInfo,
+    selected: &str,
+    discovered: &[ModelInfo],
+) -> bool {
+    let Some((provider, selected_slug)) = selected.split_once('/') else {
+        return false;
+    };
+    provider == model.provider
+        && (selected_slug == model.id
+            || (provider == CLAUDE_PROVIDER
+                && crate::claude::matches_retired_model_filter(
+                    selected_slug,
+                    &model.id,
+                    discovered,
+                )))
+}
+
 /// Converts a provider model identifier into a human-readable display name while
 /// preserving the original identifier for all provider requests and persistence.
 #[must_use]
@@ -1265,6 +1284,66 @@ mod tests {
             sanitize_failure_text("device authorization failed", 512),
             "device authorization failed"
         );
+    }
+
+    #[test]
+    fn retired_claude_context_filters_do_not_merge_live_rows_or_other_models() {
+        let model = |provider: &str, id: &str| super::ModelInfo {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            is_default: false,
+            display_name: None,
+            capabilities: super::ModelCapabilities::default(),
+        };
+        let opus = model(CLAUDE_PROVIDER, "opus");
+        let context = model(CLAUDE_PROVIDER, "opus[1m]");
+        let sonnet = model(CLAUDE_PROVIDER, "sonnet");
+        let discovered = [opus.clone(), sonnet.clone()];
+        assert!(super::model_matches_filter(
+            &opus,
+            "claude-agent/opus[1m]",
+            &discovered
+        ));
+        assert!(super::model_matches_filter(
+            &opus,
+            "claude-agent/opus",
+            &discovered
+        ));
+        for selection in [
+            "opus[1m]",
+            "other/opus[1m]",
+            "claude-agent/opus[200k]",
+            "claude-agent/claude-opus-5[1m]",
+        ] {
+            assert!(!super::model_matches_filter(&opus, selection, &discovered));
+        }
+        assert!(!super::model_matches_filter(
+            &sonnet,
+            "claude-agent/opus[1m]",
+            &discovered
+        ));
+        let both = [opus.clone(), context.clone()];
+        assert!(!super::model_matches_filter(
+            &opus,
+            "claude-agent/opus[1m]",
+            &both
+        ));
+        assert!(super::model_matches_filter(
+            &context,
+            "claude-agent/opus[1m]",
+            &both
+        ));
+        assert!(!super::model_matches_filter(
+            &context,
+            "claude-agent/opus",
+            &both
+        ));
+        let other = model(CODEX_PROVIDER, "opus");
+        assert!(!super::model_matches_filter(
+            &other,
+            "openai-codex/opus[1m]",
+            std::slice::from_ref(&other)
+        ));
     }
 
     #[test]

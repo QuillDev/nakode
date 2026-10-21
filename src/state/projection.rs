@@ -1426,7 +1426,7 @@ fn model_filter_passes(state: &DomainState, provider: &ProviderRecord, model: &M
     if provider
         .selected_model_ids
         .iter()
-        .any(|id| id == &model.qualified_id())
+        .any(|id| crate::backend::model_matches_filter(model, id, &state.models))
     {
         return true;
     }
@@ -1435,7 +1435,7 @@ fn model_filter_passes(state: &DomainState, provider: &ProviderRecord, model: &M
             && provider
                 .selected_model_ids
                 .iter()
-                .any(|id| id == &candidate.qualified_id())
+                .any(|id| crate::backend::model_matches_filter(candidate, id, &state.models))
     })
 }
 
@@ -3256,7 +3256,7 @@ mod tests {
     fn unavailable_provider_models_never_enter_the_ordinary_catalogue() {
         let mut state = AppState::new_unconfigured("/tmp/workspace", None, 100);
         state.models = vec![
-            model(CLAUDE_PROVIDER, "provider-disabled"),
+            model(CLAUDE_PROVIDER, "opus"),
             model(CODEX_PROVIDER, "account-disabled"),
         ];
         let providers = vec![
@@ -3265,8 +3265,8 @@ mod tests {
                 display_name: "Claude".to_owned(),
                 enabled: false,
                 credential: None,
-                model_filter_enabled: false,
-                selected_model_ids: Vec::new(),
+                model_filter_enabled: true,
+                selected_model_ids: vec!["claude-agent/opus[1m]".to_owned()],
                 accounts: Vec::new(),
             },
             ProviderRecord {

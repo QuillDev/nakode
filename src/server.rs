@@ -8670,6 +8670,106 @@ mod tests {
     }
 
     #[test]
+    fn retired_claude_context_filter_keeps_opus_available_without_aliasing_launch_ids() {
+        let mut state =
+            AppState::new_for_backend(project_workspace(), None, 100, CLAUDE_PROVIDER, "Claude");
+        state.models = ["fable", "opus", "sonnet"]
+            .map(|id| ModelInfo {
+                provider: CLAUDE_PROVIDER.to_owned(),
+                id: id.to_owned(),
+                is_default: id == "sonnet",
+                display_name: Some(format!("{id} 5.5")),
+                capabilities: ModelCapabilities {
+                    reasoning_efforts: ["low", "medium", "high", "xhigh", "max"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                },
+            })
+            .to_vec();
+        let provider = ProviderRecord {
+            provider: CLAUDE_PROVIDER.to_owned(),
+            display_name: "Claude".to_owned(),
+            enabled: true,
+            credential: None,
+            model_filter_enabled: true,
+            selected_model_ids: vec![
+                "claude-agent/claude-fable-5[1m]".to_owned(),
+                "claude-agent/opus[1m]".to_owned(),
+                "claude-agent/sonnet".to_owned(),
+            ],
+            accounts: Vec::new(),
+        };
+        let mut core = ServerCore::new(ServiceEngine::new(state), vec![provider], Vec::new());
+        let bootstrap = core.workspace_bootstrap();
+        assert_eq!(
+            bootstrap
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["claude-agent/opus", "claude-agent/sonnet"],
+            "a surviving Sonnet selection must not hide Opus after its context row retires"
+        );
+        let workspace_id = bootstrap.workspace_id;
+        let (accepted, effects) = core
+            .create_session_command(
+                &workspace_id,
+                Some(&ModelId::from("claude-agent/opus")),
+                &ModelOptions {
+                    reasoning_effort: Some("xhigh".to_owned()),
+                    fast_mode: false,
+                },
+                None,
+            )
+            .expect("available Opus launches atomically");
+        assert!(
+            effects.is_empty(),
+            "logical creation must not start a provider process"
+        );
+        let session_id = SessionId::from(accepted.resource_id.expect("created session"));
+        let created = core.engine_for(&session_id).expect("created state").state();
+        assert_eq!(created.selected_model.as_deref(), Some("claude-agent/opus"));
+        assert_eq!(
+            created.selected_model_options().reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
+        let count = core.sessions_by_id.len();
+        for (id, effort) in [
+            ("claude-agent/opus[1m]", "high"),
+            ("claude-agent/removed", "high"),
+            ("other-provider/opus", "high"),
+            ("claude-agent/opus", "ultra"),
+        ] {
+            core.create_session_command(
+                &workspace_id,
+                Some(&ModelId::from(id)),
+                &ModelOptions {
+                    reasoning_effort: Some(effort.to_owned()),
+                    fast_mode: false,
+                },
+                None,
+            )
+            .expect_err("invalid execution identity or effort must not alias or fall back");
+            assert_eq!(core.sessions_by_id.len(), count);
+        }
+        let existing = core
+            .engine_for(&session_id)
+            .expect("unchanged existing session")
+            .state();
+        assert_eq!(
+            existing.selected_model.as_deref(),
+            Some("claude-agent/opus")
+        );
+        assert_eq!(
+            existing
+                .selected_model_options()
+                .reasoning_effort
+                .as_deref(),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
     fn invalid_initial_model_options_do_not_publish_a_session() {
         let (mut core, _) = ready_codex_server();
         let workspace_id = core.workspace_bootstrap().workspace_id;
