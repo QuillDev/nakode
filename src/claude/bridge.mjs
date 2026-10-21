@@ -970,6 +970,24 @@ function emitStreamEvent(turnId, message, session) {
   }
 }
 
+function turnPrompt(command) {
+  if (!command.images?.length) return command.prompt;
+  return (async function* () {
+    yield {
+      type: "user",
+      session_id: command.sessionId,
+      parent_tool_use_id: null,
+      message: {
+        role: "user",
+        content: [
+          ...command.images,
+          ...(command.prompt ? [{ type: "text", text: command.prompt }] : []),
+        ],
+      },
+    };
+  })();
+}
+
 async function sendTurn(command) {
   const session = sessions.get(command.sessionId);
   if (!session)
@@ -1070,7 +1088,7 @@ async function sendTurn(command) {
       }, session.timeoutSeconds * 1000)
     : null;
   try {
-    const stream = query({ prompt: command.prompt, options });
+    const stream = query({ prompt: turnPrompt(command), options });
     await processLifecycle.started();
     write({ event: "turn_started", turnId: command.turnId });
     for await (const message of stream) {
@@ -1220,6 +1238,7 @@ async function modelCatalogue(command) {
       requestId: command.requestId,
       models: models.map((model, index) => ({
         id: model.value,
+        resolvedModel: model.resolvedModel || null,
         isDefault: index === 0,
         displayName: model.displayName || "",
         description: model.description || "",

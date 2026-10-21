@@ -32,7 +32,7 @@ use crate::credential::SecretValue;
 
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
-const SDK_VERSION: &str = "0.3.268";
+const SDK_VERSION: &str = "0.3.280";
 static SDK_PREPARATION: Mutex<()> = Mutex::const_new(());
 const BRIDGE_SOURCE: &str = include_str!("bridge.mjs");
 const PROCESS_LIFECYCLE_SOURCE: &str = include_str!("process_lifecycle.mjs");
@@ -864,13 +864,6 @@ async fn handle_command(
         .await;
         return;
     };
-    let command = match augment_image_attachments(command, config).await {
-        Ok(command) => command,
-        Err(error) => {
-            request_failed(events, BackendOperation::StartTurn, error).await;
-            return;
-        }
-    };
     let BridgeRequest {
         method,
         mut payload,
@@ -1305,22 +1298,25 @@ async fn emit_refreshed_credential(
     }
 }
 
-fn validate_bridge_images(command: &BackendCommand) -> Result<(), UnsupportedCommand> {
-    if let BackendCommand::StartTurn { attachments, .. } = command
-        && attachments
-            .iter()
-            .any(|attachment| attachment.image.is_some())
-    {
-        return Err(UnsupportedCommand {
-            operation: BackendOperation::StartTurn,
-            message: "Claude compatibility adapter does not support image attachments; choose a native vision-capable provider (no text-only fallback)",
-        });
-    }
-    Ok(())
+fn bridge_image_blocks(attachments: &[crate::backend::PromptAttachment]) -> Vec<Value> {
+    attachments
+        .iter()
+        .filter_map(|attachment| {
+            attachment.image.as_ref().map(|image| {
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.mime_type,
+                        "data": base64::engine::general_purpose::STANDARD.encode(&image.data),
+                    },
+                })
+            })
+        })
+        .collect()
 }
 
 fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, UnsupportedCommand> {
-    validate_bridge_images(&command)?;
     let (method, payload) = match command {
         BackendCommand::StartSession {
             model,
@@ -1359,12 +1355,12 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
             provider_session_id,
             client_id,
             prompt,
-            attachments: _,
+            attachments,
             model,
             skill_catalogue: _,
         } => (
             "send",
-            json!({"sessionId":provider_session_id,"turnId":client_id,"prompt":prompt,"model":model}),
+            json!({"sessionId":provider_session_id,"turnId":client_id,"prompt":prompt,"model":model,"images":bridge_image_blocks(&attachments)}),
         ),
         BackendCommand::InterruptTurn { turn_id, .. } => ("cancel", json!({"turnId":turn_id})),
         BackendCommand::Reload {
@@ -1428,65 +1424,6 @@ async fn send(bridge: &mut Bridge, value: Value) -> Result<(), String> {
         .write_all(&encoded)
         .await
         .map_err(|error| error.to_string())
-}
-
-async fn augment_image_attachments(
-    command: BackendCommand,
-    config: &BackendConfig,
-) -> Result<BackendCommand, String> {
-    let BackendCommand::StartTurn {
-        provider_session_id,
-        client_id,
-        mut prompt,
-        mut attachments,
-        model,
-        skill_catalogue,
-    } = command
-    else {
-        return Ok(command);
-    };
-    let images = attachments
-        .iter()
-        .filter_map(|attachment| attachment.image.clone())
-        .collect::<Vec<_>>();
-    let vision_enabled = config
-        .vision_config
-        .as_ref()
-        .is_some_and(|config| config.read().is_ok_and(|config| config.is_enabled()));
-    if images.is_empty() || !vision_enabled {
-        return Ok(BackendCommand::StartTurn {
-            provider_session_id,
-            client_id,
-            prompt,
-            attachments,
-            model,
-            skill_catalogue,
-        });
-    }
-    let service = config.vision_service.as_ref().ok_or_else(|| {
-        "Vision add-on model is configured but its provider is unavailable".to_owned()
-    })?;
-    let cancellation = tokio_util::sync::CancellationToken::new();
-    let description = service
-        .analyze(
-            "Describe these attached images precisely for the coding agent. Focus on visible text, layout, state, errors, and implementation-relevant details.",
-            images,
-            &cancellation,
-        )
-        .await?;
-    prompt.push_str("\n\nVision add-on analysis of the attached images:\n");
-    prompt.push_str(&description);
-    for attachment in &mut attachments {
-        attachment.image = None;
-    }
-    Ok(BackendCommand::StartTurn {
-        provider_session_id,
-        client_id,
-        prompt,
-        attachments,
-        model,
-        skill_catalogue,
-    })
 }
 
 /// How many images, and how many bytes, each turn has returned so far.
@@ -1702,6 +1639,15 @@ fn turn_completed_event(message: &Value) -> BackendEvent {
     }
 }
 
+/// The Agent SDK catalogue does not report input modalities. Normalize the documented
+/// Opus 5.5 contract here, never from a display label or a client-side provider guess.
+/// A resolved identity takes precedence over mutable aliases; unknown targets fail closed.
+fn claude_native_image_input(id: &str, resolved_model: Option<&str>) -> bool {
+    let identity = resolved_model.unwrap_or(id);
+    matches!(identity, "claude-opus-5-5" | "claude-opus-5-5[1m]")
+        || (resolved_model.is_none() && matches!(id, "opus" | "opus[1m]"))
+}
+
 fn models_event(message: &Value) -> BackendEvent {
     let models = message["models"]
         .as_array()
@@ -1726,6 +1672,10 @@ fn models_event(message: &Value) -> BackendEvent {
                         .unwrap_or(""),
                 ),
                 capabilities: crate::backend::ModelCapabilities {
+                    accepts_image_input: claude_native_image_input(
+                        model.get("id")?.as_str()?,
+                        model.get("resolvedModel").and_then(Value::as_str),
+                    ),
                     reasoning_efforts: model
                         .get("supportedEffortLevels")
                         .and_then(Value::as_array)
@@ -2371,7 +2321,27 @@ mod tests {
     }
 
     #[test]
-    fn image_handoff_is_refused_instead_of_silently_dropped_by_claude_bridge() {
+    fn claude_sdk_image_transport_isolated() {
+        let directory = tempfile::tempdir().expect("isolated image transport directory");
+        std::fs::write(directory.path().join("bridge.mjs"), BRIDGE_SOURCE).expect("bridge fixture");
+        let test = directory.path().join("image_transport.test.mjs");
+        std::fs::write(&test, include_str!("image_transport.test.mjs")).expect("transport test");
+        let output = std::process::Command::new("node")
+            .envs(crate::machine_path::environment())
+            .arg("--test")
+            .arg(test)
+            .output()
+            .expect("Node transport test");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn image_handoff_reaches_claude_bridge_as_base64_content() {
         let command = |attachments| BackendCommand::StartTurn {
             provider_session_id: "session".to_owned(),
             client_id: "turn".to_owned(),
@@ -2388,9 +2358,18 @@ mod tests {
                 data: crate::image_handoff::tests::png(16, 8),
             }),
         }]));
-        assert!(
-            matches!(result, Err(error) if error.operation == BackendOperation::StartTurn
-            && error.message.contains("no text-only fallback"))
+        let image = result
+            .expect("image transport supported")
+            .expect("send request");
+        assert_eq!(image.payload["images"][0]["type"], "image");
+        assert_eq!(
+            image.payload["images"][0]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(
+            image.payload["images"][0]["source"]["data"],
+            base64::engine::general_purpose::STANDARD
+                .encode(crate::image_handoff::tests::png(16, 8)),
         );
         let text = bridge_request(command(Vec::new()))
             .expect("text-only remains supported")
@@ -2886,6 +2865,36 @@ assert.equal(replacementSent, true, "replacement did not send after child close"
         assert_eq!(request.method, "set_options");
         assert_eq!(request.payload["sessionId"], "claude-session");
         assert_eq!(request.payload["fastMode"], true);
+    }
+
+    #[test]
+    fn claude_image_capability_uses_sdk_identity_not_display_label() {
+        let BackendEvent::Models(models) = models_event(&json!({"models": [
+            {"id":"claude-opus-5-5"},
+            {"id":"opus"},
+            {"id":"opus[1m]", "resolvedModel":"claude-opus-5-5[1m]"},
+            {"id":"default", "resolvedModel":"claude-opus-5-5[1m]"},
+            {"id":"unknown", "displayName":"Opus 5.5"},
+            {"id":"opus", "resolvedModel":"text-only"},
+            {"id":"claude-opus-5-50"}
+        ]})) else {
+            panic!("models event");
+        };
+        for (index, model) in models.iter().enumerate() {
+            assert_eq!(
+                model.capabilities.accepts_image_input,
+                index < 4,
+                "{}",
+                model.id
+            );
+            assert_eq!(
+                crate::state::projection::model_configuration(model, false).accepts_image_input,
+                index < 4
+            );
+        }
+        let legacy: crate::backend::ModelCapabilities =
+            serde_json::from_str("{\"reasoning_efforts\":[]}").expect("legacy cache");
+        assert!(!legacy.accepts_image_input);
     }
 
     #[test]
