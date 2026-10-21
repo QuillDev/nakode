@@ -292,6 +292,9 @@ pub struct ModelOptions {
 pub struct ModelCapabilities {
     #[serde(default)]
     pub reasoning_efforts: Vec<String>,
+    /// Native image transport, normalized by the provider adapter. Unknown stays false.
+    #[serde(default)]
+    pub accepts_image_input: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

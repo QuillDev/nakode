@@ -195,6 +195,7 @@ pub(crate) fn model_configuration(
     let mut configuration = ModelConfigurationView {
         reasoning_efforts: model.capabilities.reasoning_efforts.clone(),
         accepts_image_input: vision_add_on_enabled
+            || model.capabilities.accepts_image_input
             || matches!(
                 model.provider.as_str(),
                 CODEX_PROVIDER | CURSOR_PROVIDER | KIMI_PROVIDER | GLM_PROVIDER
@@ -4193,6 +4194,7 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                ..Default::default()
             },
         }
     }

@@ -8599,6 +8599,7 @@ mod tests {
                     display_name: None,
                     capabilities: ModelCapabilities {
                         reasoning_efforts: vec!["high".to_owned()],
+                        ..Default::default()
                     },
                 },
                 ModelInfo {
@@ -8608,6 +8609,7 @@ mod tests {
                     display_name: None,
                     capabilities: ModelCapabilities {
                         reasoning_efforts: vec!["high".to_owned()],
+                        ..Default::default()
                     },
                 },
             ]),
@@ -8683,6 +8685,7 @@ mod tests {
                     reasoning_efforts: ["low", "medium", "high", "xhigh", "max"]
                         .map(str::to_owned)
                         .to_vec(),
+                    ..Default::default()
                 },
             })
             .to_vec();
@@ -10542,6 +10545,66 @@ enabled = false
             crate::state::DomainCommandError::Invalid(message)
                 if message.contains("maximum")
         ));
+    }
+
+    #[test]
+    fn claude_image_sends_follow_refreshed_selected_model_capabilities() {
+        for id in ["claude-opus-5-5", "opus", "opus[1m]", "default"] {
+            let mut state = AppState::new_for_backend(
+                project_workspace(),
+                None,
+                100,
+                CLAUDE_PROVIDER,
+                "Claude",
+            );
+            state.provider_session_id = Some("claude-session".to_owned());
+            state.selected_model = Some(format!("{CLAUDE_PROVIDER}/{id}"));
+            let model = |accepts_image_input| ModelInfo {
+                provider: CLAUDE_PROVIDER.to_owned(),
+                id: id.to_owned(),
+                display_name: None,
+                is_default: true,
+                capabilities: ModelCapabilities {
+                    accepts_image_input,
+                    ..Default::default()
+                },
+            };
+            state.handle_backend(BackendEvent::Models(vec![model(false)]));
+            let session_id = SessionId::from(state.nakode_session_id.clone());
+            let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+            let prompt = |text: &str| PromptInput {
+                text: text.to_owned(),
+                attachments: vec![ProtocolPromptAttachment::InlineImage {
+                    label: "tiny.png".to_owned(),
+                    media_type: "image/png".to_owned(),
+                    data: crate::image_handoff::tests::png(16, 8),
+                }],
+            };
+            assert!(
+                core.convert_prompt(&session_id, prompt("")).is_err(),
+                "stale/unknown capability"
+            );
+            core.engine_for_mut(&session_id)
+                .unwrap()
+                .state_mut()
+                .handle_backend(BackendEvent::Models(vec![model(true)]));
+            for text in ["Inspect", ""] {
+                let (actual, attachments) = core.convert_prompt(&session_id, prompt(text)).unwrap();
+                assert_eq!(actual, text);
+                assert_eq!(
+                    attachments[0].image.as_ref().unwrap().mime_type,
+                    "image/png"
+                );
+            }
+            core.engine_for_mut(&session_id)
+                .unwrap()
+                .state_mut()
+                .handle_backend(BackendEvent::Models(vec![model(false)]));
+            assert!(
+                core.convert_prompt(&session_id, prompt("Inspect")).is_err(),
+                "withdrawn capability"
+            );
+        }
     }
 
     #[test]

@@ -33,7 +33,10 @@ fn discovered_model_capabilities(
             reasoning_efforts.push(effort.to_owned());
         }
     }
-    crate::backend::ModelCapabilities { reasoning_efforts }
+    crate::backend::ModelCapabilities {
+        reasoning_efforts,
+        ..Default::default()
+    }
 }
 
 // Synthetic capabilities for shared runtime tests, never a production catalogue.
@@ -44,6 +47,7 @@ pub(crate) fn model_capabilities() -> crate::backend::ModelCapabilities {
             .into_iter()
             .map(str::to_owned)
             .collect(),
+        ..Default::default()
     }
 }
 
