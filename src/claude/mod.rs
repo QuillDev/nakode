@@ -1743,6 +1743,20 @@ fn models_event(message: &Value) -> BackendEvent {
     BackendEvent::Models(distinguish_context_windows(models))
 }
 
+/// Preserve a model-filter preference when discovery retires its explicit 1M picker row.
+/// This is presentation compatibility only: session model IDs are never rewritten. When the
+/// selected row still exists, its context-window distinction remains exact.
+pub(crate) fn matches_retired_model_filter(
+    selected: &str,
+    candidate: &str,
+    discovered: &[ModelInfo],
+) -> bool {
+    selected.strip_suffix("[1m]") == Some(candidate)
+        && !discovered
+            .iter()
+            .any(|model| model.provider == CLAUDE_PROVIDER && model.id == selected)
+}
+
 /// Two rows of one model differ only in their context window (`opus` and `opus[1m]` both read
 /// "Opus 5.5"), which the name leaves out; where names collide, the row whose identifier carries a
 /// window says so.
