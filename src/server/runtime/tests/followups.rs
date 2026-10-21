@@ -1,6 +1,7 @@
 use super::*;
 mod interruption;
 mod relationships;
+mod self_clear;
 use crate::followups::InboxStore;
 use nakode_protocol::{CommandAccepted, FollowupInbox, PromptInput, ServiceError};
 

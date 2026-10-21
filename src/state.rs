@@ -4134,6 +4134,32 @@ impl DomainState {
         self.has_active_work()
     }
 
+    pub(crate) fn validate_self_clear(&self, call_id: &str) -> Result<(), DomainCommandError> {
+        let valid_call = self.external_tool_calls.len() == 1
+            && self.external_tool_calls.iter().any(|call| {
+                call.id == call_id
+                    && call.name == "ClearSelf"
+                    && serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+                        .is_ok_and(|value| value.as_object().is_some_and(serde_json::Map::is_empty))
+            });
+        if !valid_call
+            || !self.provider_is_live()
+            || self.active_turn.as_ref().is_none_or(|turn| turn.cancelling)
+            || self.creating_session.is_some()
+            || self.resuming_session.is_some()
+            || self.starting_turn.is_some()
+            || self.context_compaction.is_some()
+            || !self.active_shells.is_empty()
+            || self.has_running_subagents()
+            || !self.queue.is_empty()
+            || !self.approvals.is_empty()
+            || !self.questions.is_empty()
+        {
+            return Err(DomainCommandError::Conflict("ClearSelf requires its sole exact pending call and no other work or queued prompts".to_owned()));
+        }
+        Ok(())
+    }
+
     /// Returns the logical session whose provider account affinity must be durable before backend work.
     /// During legacy resume the record is held separately until the provider confirms restoration.
     #[must_use]
@@ -8133,8 +8159,9 @@ impl DomainState {
     }
 
     fn handle_disconnected(&mut self, reason: String) -> Vec<Effect> {
-        // The process-local question waiters cannot survive backend loss.
+        // Process-local question/tool waiters cannot survive backend loss or authorize a later turn.
         self.questions.clear();
+        self.external_tool_calls.clear();
         let pending_prompt = self
             .pending_session_prompt
             .take()

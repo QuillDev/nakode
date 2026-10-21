@@ -556,3 +556,5 @@ Authenticated clients can replace a logical session’s ephemeral process enviro
 ## Machine PATH
 
 Owner clients can save a shell command and explicitly Sync the execution service’s PATH through the public SDK. Startup resolves it before runtime preparation; failures retain the last-good/inherited value. See [machine PATH](docs/machine-path.md) for precedence, shell initialization, security bounds and platform limitations.
+
+Guarded orchestrator Chat removal is available through the public `ClearSelf` RPC/SDK; see [self-clear lifecycle](docs/chat-self-clear.md).
