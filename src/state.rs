@@ -13,10 +13,10 @@ use crate::{
     backend::{
         ApprovalRequest, BackendCapabilities, BackendCommand, BackendEvent,
         BackendFailureClassification, BackendFailureDetail, BackendFailurePhase, BackendOperation,
-        CODEX_PROVIDER, CURSOR_PROVIDER, CompactionReason, DEVIN_PROVIDER, DeltaKind, GLM_PROVIDER,
-        ItemKind, ItemStatus, KIMI_PROVIDER, ModelInfo, ModelOptions, NormalizedItem,
-        PromptAttachment, QuestionRequest, SessionHistoryItem, TodoPhase, TurnOutcome,
-        display_qualified_model_name, sanitize_failure_endpoint, sanitize_failure_text,
+        CODEX_PROVIDER, CURSOR_PROVIDER, CompactionReason, DeltaKind, ItemKind, ItemStatus,
+        ModelInfo, ModelOptions, NormalizedItem, PromptAttachment, QuestionRequest,
+        SessionHistoryItem, TodoPhase, TurnOutcome, display_qualified_model_name,
+        sanitize_failure_endpoint, sanitize_failure_text,
     },
     domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
     execution_host::ExecutionHost,
@@ -10193,19 +10193,31 @@ impl DomainState {
         }
     }
 
-    fn native_delegation_callable(&self) -> bool {
-        matches!(
-            self.backend_provider.as_str(),
-            CODEX_PROVIDER | KIMI_PROVIDER | GLM_PROVIDER | DEVIN_PROVIDER
-        ) && self.backend_capabilities.native_tools.is_supported()
-            && !self.replace_builtin_tools
+    /// The provider-visible identity of Nakode's canonical `nakode_agent` tool in this session,
+    /// or `None` when the session cannot call it. Claude exposes it as `mcp__nakode__delegate`;
+    /// providers without a supervised server route (such as Cursor) project nothing.
+    fn native_delegation_tool(&self) -> Option<String> {
+        if !self.backend_capabilities.native_tools.is_supported() || self.replace_builtin_tools {
+            return None;
+        }
+        // An explicit canonical allowlist is authoritative even for the delegation tool.
+        if let Some(allowed) = self.allowed_builtin_tools.as_deref()
+            && !allowed.iter().any(|tool| tool == NAKODE_AGENT_TOOL_NAME)
+        {
+            return None;
+        }
+        let canonical = [NAKODE_AGENT_TOOL_NAME.to_owned()];
+        crate::backend::project_provider_tools(&self.backend_provider, Some(&canonical))
+            .allowed_tools?
+            .into_iter()
+            .next()
     }
 
     fn rendered_agent_catalogue(&self) -> String {
-        if !self.native_delegation_callable() {
+        let Some(tool) = self.native_delegation_tool() else {
             return "- none (this provider session has no callable Nakode delegation tool)"
                 .to_owned();
-        }
+        };
         let agents = self
             .agents
             .definitions()
@@ -10216,7 +10228,7 @@ impl DomainState {
                     "- {}: {}\n  Callable: {}({{\"agent\":\"{}\",\"title\":\"<specific task title>\",\"task\":\"<bounded task>\"}})",
                     agent.slug,
                     agent.description.trim(),
-                    NAKODE_AGENT_TOOL_NAME,
+                    tool,
                     agent.slug,
                 )
             })
@@ -10268,7 +10280,9 @@ impl DomainState {
             host,
             agents,
             skills,
-            tool = NAKODE_AGENT_TOOL_NAME,
+            tool = self
+                .native_delegation_tool()
+                .unwrap_or_else(|| NAKODE_AGENT_TOOL_NAME.to_owned()),
         );
         let base = if let Some(client) = self.initial_client_instructions.as_deref() {
             format!(
@@ -19873,15 +19887,53 @@ tool_profile = "none"
     }
 
     #[test]
-    fn catalogue_never_claims_native_route_for_bridge_only_providers() {
+    fn claude_catalogue_names_its_server_routed_delegate_tool() {
         let mut state = ready_state();
         state.install_agents(explorer_catalog());
-        for provider in [CLAUDE_PROVIDER, CURSOR_PROVIDER] {
+        state.backend_provider = CLAUDE_PROVIDER.to_owned();
+
+        let catalogue = state.rendered_agent_catalogue();
+        assert!(catalogue.contains("- explorer: "));
+        assert!(catalogue.contains(
+            "Callable: mcp__nakode__delegate({\"agent\":\"explorer\",\"title\":\"<specific task title>\",\"task\":\"<bounded task>\"})"
+        ));
+        assert!(!catalogue.contains("Callable: nakode_agent"));
+
+        // The guidance names the tool Claude can actually call.
+        let instructions = state.nakode_system_instructions();
+        assert!(instructions.contains("session-bound `mcp__nakode__delegate` tool"));
+        assert!(instructions.contains("When `mcp__nakode__delegate` is callable"));
+    }
+
+    #[test]
+    fn catalogue_never_claims_native_route_for_unsupervised_providers() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        state.backend_provider = CURSOR_PROVIDER.to_owned();
+        let catalogue = state.rendered_agent_catalogue();
+        assert!(catalogue.contains("no callable Nakode delegation tool"));
+        assert!(!catalogue.contains("Callable:"));
+        assert!(!catalogue.contains("explorer"));
+    }
+
+    #[test]
+    fn catalogue_follows_the_sessions_canonical_tool_allowlist() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        for provider in [CLAUDE_PROVIDER, CODEX_PROVIDER] {
             state.backend_provider = provider.to_owned();
-            let catalogue = state.rendered_agent_catalogue();
-            assert!(catalogue.contains("no callable Nakode delegation tool"));
-            assert!(!catalogue.contains("Callable: nakode_agent"));
-            assert!(!catalogue.contains("explorer"));
+            state.allowed_builtin_tools = Some(vec!["read".to_owned(), "grep".to_owned()]);
+            assert!(
+                state
+                    .rendered_agent_catalogue()
+                    .contains("no callable Nakode delegation tool"),
+                "{provider} without nakode_agent in its allowlist"
+            );
+            state.allowed_builtin_tools = Some(vec!["read".to_owned(), "nakode_agent".to_owned()]);
+            assert!(
+                state.rendered_agent_catalogue().contains("- explorer: "),
+                "{provider} with nakode_agent in its allowlist"
+            );
         }
     }
 
