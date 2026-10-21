@@ -1943,6 +1943,7 @@ impl NakodeClient {
     typed_mutation!(save_agent, api::SaveAgentRequest);
     typed_mutation!(delete_agent, api::DeleteAgentRequest);
     typed_mutation!(delete_session, api::DeleteSessionRequest);
+    typed_mutation!(clear_self, api::ClearSelfRequest);
     typed_mutation!(prune_session, api::DeleteSessionRequest);
     typed_mutation!(update_settings, api::UpdateSettingsRequest);
     typed_mutation!(check_agent_browser, api::CheckAgentBrowserRequest);

@@ -333,3 +333,42 @@ fn claimed_and_dispatching_downward_instruction_refuse_until_consumed() {
     assert!(inbox.claim(&child).unwrap().is_none());
     assert_eq!(f.parent(), (Some(f.new.clone()), 2));
 }
+
+#[test]
+fn canonical_deletion_never_detaches_retained_children() {
+    let f = Fixture::new();
+    f.claim();
+    let repository = SqliteSessionRepository::open(f.path()).unwrap();
+    assert!(repository.delete(&f.old).is_err());
+    assert_eq!(f.parent(), (Some(f.old.clone()), 1));
+    repository.delete(&f.child).unwrap();
+    repository.delete(&f.old).unwrap();
+    assert!(repository.find(&f.old).unwrap().is_none());
+}
+
+#[test]
+fn concurrent_claim_and_parent_delete_cannot_orphan_child() {
+    for _ in 0..8 {
+        let f = std::sync::Arc::new(Fixture::new());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker = std::thread::spawn({
+            let f = f.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                f.apply(&f.command(&f.old, None, 0, "race"), "race").is_ok()
+            }
+        });
+        let repository = SqliteSessionRepository::open(f.path()).unwrap();
+        barrier.wait();
+        let deleted = repository.delete(&f.old).is_ok();
+        let claimed = worker.join().unwrap();
+        assert!(!(deleted && claimed));
+        if claimed {
+            assert_eq!(f.parent().0, Some(f.old.clone()));
+        }
+        if deleted {
+            assert!(f.parent().0.is_none());
+        }
+    }
+}

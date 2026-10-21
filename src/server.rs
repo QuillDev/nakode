@@ -970,6 +970,10 @@ impl ServerCore {
                 self.cancel_session_work_command(&session_id)
             }
             Command::DeleteSession { session_id } => self.delete_session_command(&session_id),
+            Command::ClearSelf {
+                session_id,
+                source_call_id,
+            } => self.clear_self_command(&session_id, &source_call_id),
             Command::PruneSession { session_id } => self.prune_session_command(&session_id),
             Command::CompactContext { agent_session_id } => {
                 self.compact_context_command(&agent_session_id)
@@ -2649,6 +2653,50 @@ impl ServerCore {
             ))),
             [] => Ok(requested.clone()),
         }
+    }
+
+    fn clear_self_command(
+        &mut self,
+        session_id: &SessionId,
+        call_id: &str,
+    ) -> DomainCommandOutcome {
+        if !self.session_inventory_complete {
+            return Err(DomainCommandError::Conflict(
+                "session inventory is incomplete".to_owned(),
+            ));
+        }
+        let bridge = self
+            .session_bridges
+            .iter()
+            .find(|bridge| bridge.session_id == session_id.as_str());
+        if !bridge.is_some_and(|bridge| {
+            bridge.kind == nakode_protocol::OrchestratorKind::Chat
+                && bridge.lifecycle == BridgeLifecycle::Open
+        }) {
+            return Err(DomainCommandError::Conflict(
+                "ClearSelf requires an open orchestrator Chat".to_owned(),
+            ));
+        }
+        if self
+            .sessions
+            .iter()
+            .any(|record| record.parent_session_id.as_deref() == Some(session_id.as_str()))
+        {
+            return Err(DomainCommandError::Conflict(
+                "delete every linked durable agent first, including closed agents".to_owned(),
+            ));
+        }
+        let engine = self.session_engine_mut(session_id)?;
+        engine.state().validate_self_clear(call_id)?;
+        // The authenticated suspended caller is the only permitted active work. Backend teardown
+        // is awaited by the ordinary deletion effect before durable history removal is acknowledged.
+        let mut effects = vec![Effect::ReleaseSessionBackends(session_id.to_string())];
+        if *session_id == self.default_session {
+            self.replace_default_session()?;
+        }
+        self.release_session(session_id);
+        effects.push(Effect::DeleteSession(session_id.to_string()));
+        Ok(Self::accepted(Some(session_id.to_string()), effects))
     }
 
     /// Deletes one logical session and releases all runtime state attached to it.
@@ -4789,7 +4837,9 @@ impl ServerCore {
             | Command::UpdateSettings { .. }
             | Command::CheckAgentBrowser { .. } => Some(self.default_session.clone()),
             // Deletion can rotate the default engine; select it after acceptance.
-            Command::DeleteSession { .. } | Command::PruneSession { .. } => None,
+            Command::DeleteSession { .. }
+            | Command::ClearSelf { .. }
+            | Command::PruneSession { .. } => None,
         }
     }
 

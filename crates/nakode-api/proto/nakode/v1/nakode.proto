@@ -69,6 +69,8 @@ service NakodeService {
   // Process-owned session status without transcript, provider configuration or detail hydration.
   rpc ListSessionStatuses(ListSessionStatusesRequest) returns (ListSessionStatusesResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (MutationResult);
+  // Exact pending ClearSelf call; terminates only its own suspended turn after child guards.
+  rpc ClearSelf(ClearSelfRequest) returns (MutationResult);
   rpc GetSession(GetSessionRequest) returns (SessionSnapshot);
   rpc WatchSession(WatchSessionRequest) returns (stream SessionSnapshot);
   // Appends one owner prompt and evaluates start-versus-queue against authoritative state when the
@@ -838,6 +840,7 @@ message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // current initial-session role still owns a live native provider resource. Closed
 // former initial sessions are rotated to a fresh control-plane successor and deleted.
 // Requires the `SessionDeletion` capability.
+message ClearSelfRequest { MutationOptions mutation = 1; string session_id = 2; string source_call_id = 3; }
 message DeleteSessionRequest { MutationOptions mutation = 1; string session_id = 2; }
 message ListSessionsResponse {
   repeated SessionSummary sessions = 1;
