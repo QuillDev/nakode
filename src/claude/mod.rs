@@ -30,6 +30,12 @@ use crate::backend::{
 };
 use crate::credential::SecretValue;
 
+pub(crate) mod delegation;
+
+use delegation::{
+    ClaudeDelegations, DELEGATION_CANCELLED_EVENT, DELEGATION_REQUEST_EVENT, DelegationScope,
+};
+
 const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
 const SDK_VERSION: &str = "0.3.280";
@@ -129,6 +135,8 @@ pub struct BackendConfig {
     publish_credential_updates: bool,
     /// Where each session's latest history snapshot is kept, so it reads back while not loaded.
     session_database: Option<PathBuf>,
+    /// The workspace server's attributed delegation route for `mcp__nakode__delegate`.
+    native_delegation: Option<mpsc::Sender<crate::backend::NativeAgentRequest>>,
 }
 
 impl BackendConfig {
@@ -141,6 +149,7 @@ impl BackendConfig {
             vision_service: None,
             publish_credential_updates: false,
             session_database: None,
+            native_delegation: None,
         }
     }
 
@@ -153,6 +162,15 @@ impl BackendConfig {
     #[must_use]
     pub fn with_session_database(mut self, path: PathBuf) -> Self {
         self.session_database = Some(path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_native_delegation(
+        mut self,
+        requests: mpsc::Sender<crate::backend::NativeAgentRequest>,
+    ) -> Self {
+        self.native_delegation = Some(requests);
         self
     }
 
@@ -292,9 +310,9 @@ pub fn brokered_credential_metadata(credential: &str) -> Result<Value, String> {
     .map_err(|error| error.to_string())
 }
 
-async fn spawn_bridge(workspace: &std::path::Path) -> Result<Bridge, BackendError> {
+async fn spawn_bridge() -> Result<Bridge, BackendError> {
     let directory = prepare_bridge_directory().await?;
-    launch_bridge(&directory, workspace)
+    launch_bridge(&directory)
 }
 
 async fn prepare_bridge_directory() -> Result<PathBuf, BackendError> {
@@ -433,33 +451,37 @@ async fn claude_sdk_is_current(directory: &std::path::Path) -> bool {
         .is_some_and(|version| version == SDK_VERSION)
 }
 
-fn launch_bridge(
-    directory: &std::path::Path,
-    workspace: &std::path::Path,
-) -> Result<Bridge, BackendError> {
-    let executable = std::env::current_exe().map_err(|error| BackendError::BridgeSetup {
-        provider: CLAUDE_PROVIDER.to_owned(),
-        detail: error.to_string(),
-    })?;
-    let mut child = Command::new("node")
+/// Starts the Node bridge. It never receives a Nakode executable: delegation crosses back to the
+/// supervisor as a bridge event, so an embedding host binary (such as `FStack`) needs no Nakode CLI.
+fn launch_bridge(directory: &std::path::Path) -> Result<Bridge, BackendError> {
+    start_bridge_process(bridge_command(directory))
+}
+
+fn bridge_command(directory: &std::path::Path) -> Command {
+    let mut command = Command::new("node");
+    command
         .envs(crate::machine_path::environment())
         .arg(directory.join("bridge.mjs"))
         .current_dir(directory)
-        .env("NAKODE_WORKSPACE", workspace)
-        .env("NAKODE_EXECUTABLE", executable)
+        // Not even an inherited value: delegation must never shell out to a Nakode CLI.
+        .env_remove("NAKODE_EXECUTABLE")
+        .env_remove("NAKODE_WORKSPACE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| BackendError::Spawn {
-            backend: "Claude SDK",
-            program: PathBuf::from("node"),
-            source,
-        })?;
+        .stderr(Stdio::piped());
+    command
+}
+
+fn start_bridge_process(mut command: Command) -> Result<Bridge, BackendError> {
+    let mut child = command.spawn().map_err(|source| BackendError::Spawn {
+        backend: "Claude SDK",
+        program: PathBuf::from("node"),
+        source,
+    })?;
     let stdin = child.stdin.take().ok_or(BackendError::MissingPipe {
         backend: "Claude SDK",
         pipe: "stdin",
@@ -542,6 +564,8 @@ async fn run_supervisor(
     let mut recovery_ready_event = None;
     let mut returned_images = ReturnedImages::default();
     let mut deferred_command = None;
+    let mut delegation_scope = DelegationScope::default();
+    let mut delegations = ClaudeDelegations::new(config.native_delegation.clone());
     let mut authentication_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut authentication_callback: Option<mpsc::Sender<String>> = None;
     let _ = events.send(BackendEvent::Ready(claude_identity())).await;
@@ -555,6 +579,9 @@ async fn run_supervisor(
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else { break };
+                // Interrupts, unsubscribes and shutdown cancel pending delegations even when the
+                // command itself cannot reach the bridge.
+                delegations.observe_command(&command);
                 if matches!(command, BackendCommand::Shutdown) {
                     if let Some(task) = authentication_task.take() {
                         task.abort();
@@ -607,8 +634,9 @@ async fn run_supervisor(
                     continue;
                 }
                 remember_session_state(&command, &mut attachment, &mut session_options);
+                delegation_scope.observe(&command);
                 if should_recover_bridge(credential.is_some(), bridge.is_some(), &command) {
-                    match spawn_bridge(&config.workspace).await {
+                    match spawn_bridge().await {
                         Ok(restarted) => bridge = Some(restarted),
                         Err(error) => {
                             bridge_recovery_failed(&events, operation_for(&command), error).await;
@@ -633,6 +661,11 @@ async fn run_supervisor(
                 let owner = session_owner(attachment.as_ref());
                 handle_command(command, &config, credential.as_ref(), bridge.as_mut(), &events, owner).await;
             }
+            completion = delegations.next_completion() => {
+                if let Some(bridge) = bridge.as_mut() {
+                    let _ = send(bridge, completion.bridge_reply()).await;
+                }
+            }
             () = wait_until_credential_refresh(credential.as_ref()), if publish_credential_updates && credential.as_ref().is_some_and(|credential| !credential.brokered) => {
                 if let Err(message) = refresh_supervisor_credential(&mut credential, true, &events).await {
                     request_failed(&events, BackendOperation::Reload, message).await;
@@ -640,12 +673,14 @@ async fn run_supervisor(
             }
             message = async { bridge.as_mut().expect("guarded").messages.recv().await }, if bridge.is_some() => {
                 let Some(message) = message else {
+                    // The exited bridge's tool calls can no longer receive a result.
+                    delegations.cancel_all();
                     let _ = events.send(BackendEvent::Disconnected { reason: "Claude SDK bridge exited".to_owned() }).await;
                     if let Some(stopped) = bridge.take() {
                         stopped.task.abort();
                     }
                     if credential.is_some() {
-                        match spawn_bridge(&config.workspace).await {
+                        match spawn_bridge().await {
                             Ok(restarted) => {
                                 bridge = Some(restarted);
                                 recovery_ready_event = reattach_session(
@@ -682,6 +717,19 @@ async fn run_supervisor(
                     if let Some(bridge) = bridge.as_mut() {
                         let _ = send(bridge, reply).await;
                     }
+                    continue;
+                }
+                if event_name == Some(DELEGATION_REQUEST_EVENT) {
+                    // Identity is bound from the control plane; any identity in the payload is ignored.
+                    if let Some(refused) = delegations.start(&message, &delegation_scope)
+                        && let Some(bridge) = bridge.as_mut()
+                    {
+                        let _ = send(bridge, refused.bridge_reply()).await;
+                    }
+                    continue;
+                }
+                if event_name == Some(DELEGATION_CANCELLED_EVENT) {
+                    delegations.cancel(&string(&message, "id"));
                     continue;
                 }
                 if event_name == Some("image_return_request") {
@@ -1880,10 +1928,10 @@ pub async fn backfill_history_snapshots(database: PathBuf, sessions: Vec<(String
         .into_iter()
         .filter(|(session_id, _)| matches!(retained_history(&database, session_id), Ok(None)))
         .collect();
-    let Some((_, first)) = missing.first() else {
+    if missing.is_empty() {
         return;
-    };
-    let mut bridge = match spawn_bridge(first).await {
+    }
+    let mut bridge = match spawn_bridge().await {
         Ok(bridge) => bridge,
         Err(error) => {
             eprintln!("claude: history snapshot backfill skipped: {error}");
@@ -1960,21 +2008,29 @@ fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
             let body = string(value, "body");
             // Saved history keeps a tool call as `{input, output}` in its body; rebuild the audit a
             // live call carries so a restored transcript presents it the same way.
-            let tool_audit_json = (kind == ItemKind::Tool)
+            let saved_tool = (kind == ItemKind::Tool)
                 .then(|| serde_json::from_str::<Value>(&body).ok())
                 .flatten()
-                .filter(|saved| saved.get("input").is_some())
-                .and_then(|saved| {
-                    tool_audit(
-                        &json!({
-                            "callId": string(value, "id"),
-                            "name": string(value, "title"),
-                            "args": saved["input"],
-                            "result": saved,
-                        }),
-                        status,
-                    )
-                });
+                .filter(|saved| saved.get("input").is_some());
+            let title = if kind == ItemKind::Tool {
+                claude_tool_title(
+                    &string(value, "title"),
+                    saved_tool.as_ref().map(|saved| &saved["input"]),
+                )
+            } else {
+                string(value, "title")
+            };
+            let tool_audit_json = saved_tool.as_ref().and_then(|saved| {
+                tool_audit(
+                    &json!({
+                        "callId": string(value, "id"),
+                        "name": string(value, "title"),
+                        "args": saved["input"],
+                        "result": saved,
+                    }),
+                    status,
+                )
+            });
             crate::backend::SessionHistoryItem {
                 turn_id: string(value, "turnId"),
                 // Claude's own saved transcript: what Claude produced is Claude's, as it was live.
@@ -1985,7 +2041,7 @@ fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
                 item: NormalizedItem {
                     id: string(value, "id"),
                     kind,
-                    title: string(value, "title"),
+                    title,
                     body,
                     status,
                     tool_audit_json,
@@ -2001,15 +2057,30 @@ fn tool_call_event(message: &Value) -> BackendEvent {
         Some("error") => ItemStatus::Failed,
         _ => ItemStatus::Complete,
     };
-    let body = message
-        .get("result")
-        .or_else(|| message.get("args"))
-        .map_or_else(String::new, display_value);
     let name = string(message, "name");
+    // A delegation result is the attributed `[Subagent Result]` text, exactly as other providers
+    // report it, so the transcript shows the child run card rather than a second copy.
+    let delegation_result = if name == CLAUDE_DELEGATE_TOOL {
+        message
+            .pointer("/result/output/0/text")
+            .and_then(Value::as_str)
+    } else {
+        None
+    };
+    let body = match delegation_result {
+        Some(text) => text.to_owned(),
+        None => message
+            .get("result")
+            .or_else(|| message.get("args"))
+            .map_or_else(String::new, display_value),
+    };
+    let arguments = message
+        .get("args")
+        .or_else(|| message.pointer("/result/input"));
     let item = NormalizedItem {
         id: string(message, "callId"),
         kind: ItemKind::Tool,
-        title: name,
+        title: claude_tool_title(&name, arguments),
         body,
         status,
         tool_audit_json: tool_audit(message, status),
@@ -2025,6 +2096,22 @@ fn tool_call_event(message: &Value) -> BackendEvent {
             item,
         }
     }
+}
+
+/// Claude's provider identity for Nakode's canonical `nakode_agent` tool.
+const CLAUDE_DELEGATE_TOOL: &str = "mcp__nakode__delegate";
+
+/// A Claude delegation row carries the canonical `nakode_agent · <agent>` title, so clients place
+/// the attributed child run card on it by call id, as they do for every other provider.
+fn claude_tool_title(name: &str, arguments: Option<&Value>) -> String {
+    if name != CLAUDE_DELEGATE_TOOL {
+        return name.to_owned();
+    }
+    let agent = arguments
+        .and_then(|arguments| arguments.get("agent"))
+        .and_then(Value::as_str)
+        .unwrap_or("agent");
+    format!("{} · {agent}", crate::tools::NAKODE_AGENT_TOOL_NAME)
 }
 
 /// The audit a Claude tool call carries, live or rebuilt from saved history, so transcripts
@@ -2341,6 +2428,256 @@ mod tests {
     }
 
     #[test]
+    fn claude_tool_policy_isolated() {
+        let directory = tempfile::tempdir().expect("isolated tool policy directory");
+        std::fs::write(directory.path().join("tool_policy.mjs"), TOOL_POLICY_SOURCE)
+            .expect("tool policy");
+        let test = directory.path().join("tool_policy.test.mjs");
+        std::fs::write(&test, include_str!("tool_policy.test.mjs")).expect("tool policy test");
+        let output = std::process::Command::new("node")
+            .envs(crate::machine_path::environment())
+            .arg("--test")
+            .arg(test)
+            .output()
+            .expect("Node tool policy test");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Installs the production bridge beside a stub Agent SDK that calls `delegate` like Claude Code.
+    fn stub_sdk_bridge_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("isolated bridge directory");
+        let root = directory.path();
+        std::fs::write(root.join("bridge.mjs"), BRIDGE_SOURCE).expect("bridge");
+        std::fs::write(root.join("process_lifecycle.mjs"), PROCESS_LIFECYCLE_SOURCE)
+            .expect("process lifecycle");
+        std::fs::write(root.join("tool_policy.mjs"), TOOL_POLICY_SOURCE).expect("tool policy");
+        let sdk = root.join("node_modules/@anthropic-ai/claude-agent-sdk");
+        std::fs::create_dir_all(&sdk).expect("sdk directory");
+        std::fs::write(
+            sdk.join("package.json"),
+            r#"{"name":"@anthropic-ai/claude-agent-sdk","type":"module","exports":"./index.mjs"}"#,
+        )
+        .expect("sdk manifest");
+        std::fs::write(
+            sdk.join("index.mjs"),
+            include_str!("delegation_sdk_stub.mjs"),
+        )
+        .expect("sdk stub");
+        // Schemas are not exercised here; every zod builder call returns the same chainable value.
+        let zod = root.join("node_modules/zod");
+        std::fs::create_dir_all(&zod).expect("zod directory");
+        std::fs::write(
+            zod.join("package.json"),
+            r#"{"name":"zod","type":"module","exports":{"./v4":"./v4.mjs"}}"#,
+        )
+        .expect("zod manifest");
+        std::fs::write(
+            zod.join("v4.mjs"),
+            "const chain = new Proxy(function () {}, { get: () => chain, apply: () => chain });\nexport const z = chain;\n",
+        )
+        .expect("zod stub");
+        directory
+    }
+
+    async fn next_matching<T>(
+        events: &mut mpsc::Receiver<BackendEvent>,
+        mut matcher: impl FnMut(BackendEvent) -> Option<T>,
+    ) -> T {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let event = events.recv().await.expect("Claude backend event");
+                if let Some(found) = matcher(event) {
+                    return found;
+                }
+            }
+        })
+        .await
+        .expect("expected Claude backend event")
+    }
+
+    /// The real bridge and supervisor route Claude's `delegate` call to the workspace server with
+    /// server-bound identity, without any Nakode executable (which an embedding host such as `FStack`
+    /// cannot provide as `nakode agent`), and return the attributed result to the same tool call.
+    /// Claude Code's native subagent routes are refused first, so they cannot stand in for it.
+    #[tokio::test]
+    async fn claude_delegate_tool_routes_through_the_server_without_a_nakode_executable() {
+        delegate_through_stub_sdk("bypassPermissions").await;
+    }
+
+    /// Prompting modes decide ordinary tools through `canUseTool`, which settings `allow` rules can
+    /// skip; native delegation is still refused before it, and Nakode delegation still works.
+    #[tokio::test]
+    async fn claude_native_subagents_are_refused_in_prompting_permission_modes() {
+        delegate_through_stub_sdk("default").await;
+    }
+
+    fn denial_reason(item: &NormalizedItem) -> Option<String> {
+        let audit: Value = serde_json::from_str(item.tool_audit_json.as_deref()?).ok()?;
+        if audit["denied"] != true {
+            return None;
+        }
+        audit["denialReason"].as_str().map(str::to_owned)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn delegate_through_stub_sdk(permission_mode: &str) {
+        let directory = stub_sdk_bridge_directory();
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut command = bridge_command(directory.path());
+        command.env("NAKODE_CLAUDE_PERMISSION_MODE", permission_mode);
+        let bridge = start_bridge_process(command).expect("bridge process");
+        let (route, mut requests) = mpsc::channel(4);
+        let config =
+            BackendConfig::native(workspace.path().to_path_buf()).with_native_delegation(route);
+        let credential = ClaudeOAuthCredential {
+            access_token: "isolated-test-token".to_owned(),
+            refresh_token: String::new(),
+            expires_at_ms: now_ms() + 24 * 60 * 60 * 1_000,
+            authorized_at_ms: None,
+            account_id: None,
+            email: None,
+            organization_id: None,
+            organization_name: None,
+            brokered: true,
+        };
+        let (commands, command_rx) = mpsc::channel(8);
+        let (event_tx, mut events) = mpsc::channel(64);
+        let supervisor = tokio::spawn(run_supervisor(
+            false,
+            config,
+            Some(credential),
+            false,
+            Some(bridge),
+            command_rx,
+            event_tx,
+        ));
+
+        commands
+            .send(BackendCommand::StartSession {
+                model: Some("opus".to_owned()),
+                instructions: None,
+                owner_session_id: Some("owner-session".to_owned()),
+                parent_run_id: Some("run-parent".to_owned()),
+                enabled_skill_ids: Vec::new(),
+                external_tools: Vec::new(),
+                replace_builtin_tools: false,
+                code_mode: false,
+                allowed_builtin_tools: None,
+                max_turns: None,
+                finalization_reserve_turns: 0,
+                timeout_seconds: None,
+            })
+            .await
+            .unwrap();
+        let provider_session_id = next_matching(&mut events, |event| match event {
+            BackendEvent::SessionCreated {
+                provider_session_id,
+                ..
+            } => Some(provider_session_id),
+            _ => None,
+        })
+        .await;
+        commands
+            .send(BackendCommand::StartTurn {
+                provider_session_id,
+                client_id: "turn-1".to_owned(),
+                prompt: "Delegate the proof read.".to_owned(),
+                attachments: Vec::new(),
+                model: None,
+                skill_catalogue: crate::skill::SkillCatalog::default(),
+            })
+            .await
+            .unwrap();
+
+        let Ok(request) = timeout(Duration::from_secs(20), requests.recv()).await else {
+            let mut seen = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                seen.push(format!("{event:?}"));
+            }
+            panic!("no delegation reached the server route; events: {seen:#?}");
+        };
+        let request = request.expect("delegation request");
+        let crate::backend::NativeAgentRequest::Delegate(request) = request else {
+            panic!("expected a delegation request");
+        };
+        assert_eq!(request.owner_session_id, "owner-session");
+        assert_eq!(request.parent_run_id.as_deref(), Some("run-parent"));
+        assert_eq!(request.invocation_turn_id, "turn-1");
+        assert_eq!(request.invocation_call_id, "toolu_stub_delegate");
+        assert_eq!(request.agent, "repo-explorer");
+        assert_eq!(request.title, "Read delegation proof marker");
+        assert_eq!(request.task, "Read README.md and report the marker.");
+        request
+            .respond
+            .send(Ok(
+                "[Subagent Result] [agent-7] [repo-explorer]\nNAKODE-CLAUDE-DELEGATION-7429"
+                    .to_owned(),
+            ))
+            .unwrap();
+
+        let mut delegation_row = None;
+        let mut native_denials = std::collections::BTreeMap::new();
+        let outcome = next_matching(&mut events, |event| match event {
+            BackendEvent::ItemCompleted { item, .. } if item.id == "toolu_stub_delegate" => {
+                delegation_row = Some(item);
+                None
+            }
+            BackendEvent::ItemCompleted { item, .. } => {
+                if let Some(reason) = denial_reason(&item) {
+                    native_denials.insert(item.id, reason);
+                }
+                None
+            }
+            BackendEvent::TurnCompleted { outcome, error, .. } => Some((outcome, error)),
+            _ => None,
+        })
+        .await;
+        assert_eq!(outcome, (TurnOutcome::Completed, None));
+        assert_eq!(
+            native_denials.len(),
+            4,
+            "native denials: {native_denials:#?}"
+        );
+        assert!(
+            native_denials["toolu_native_agent"]
+                .contains("native Agent tool is disabled in Nakode"),
+            "{native_denials:#?}"
+        );
+        assert!(
+            native_denials["toolu_native_task"].contains("native Task tool is disabled in Nakode"),
+            "{native_denials:#?}"
+        );
+        assert!(
+            native_denials["toolu_future_native"]
+                .contains("SpawnAgentTeam is outside Nakode's Claude tool boundary"),
+            "{native_denials:#?}"
+        );
+        assert!(
+            native_denials["toolu_native_subagent_read"]
+                .contains("native subagents cannot use tools in Nakode"),
+            "{native_denials:#?}"
+        );
+        let row = delegation_row.expect("completed delegation row");
+        assert_eq!(row.status, ItemStatus::Complete);
+        assert_eq!(row.title, "nakode_agent · repo-explorer");
+        assert_eq!(
+            row.body,
+            "[Subagent Result] [agent-7] [repo-explorer]\nNAKODE-CLAUDE-DELEGATION-7429"
+        );
+
+        commands.send(BackendCommand::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(10), supervisor)
+            .await
+            .expect("supervisor stops")
+            .expect("supervisor task");
+    }
+
+    #[test]
     fn image_handoff_reaches_claude_bridge_as_base64_content() {
         let command = |attachments| BackendCommand::StartTurn {
             provider_session_id: "session".to_owned(),
@@ -2551,13 +2888,19 @@ process.stdout.write(output);
             );
         }
         assert!(BRIDGE_SOURCE.contains("if (!Array.isArray(configured)) return null"));
-        assert!(BRIDGE_SOURCE.contains("command.parentRunId || policy?.runId || null"));
+        // Delegation identity is bound by the supervisor, never carried or parsed by the bridge.
+        assert!(!BRIDGE_SOURCE.contains("attributedRunId"));
+        assert!(!BRIDGE_SOURCE.contains("node:child_process"));
+        assert!(!BRIDGE_SOURCE.contains("NAKODE_EXECUTABLE"));
         assert!(BRIDGE_SOURCE.contains("CLAUDE_POLICY_TOOLS.has(name)"));
         assert!(BRIDGE_SOURCE.contains("denied: true"));
         assert!(BRIDGE_SOURCE.contains("denialReason: message"));
-        assert!(BRIDGE_SOURCE.contains("tools: builtinTools"));
+        assert!(BRIDGE_SOURCE.contains("    tools: builtinTools,"));
+        assert!(BRIDGE_SOURCE.contains("? [...UNRESTRICTED_BUILTIN_TOOLS]"));
         assert!(!BRIDGE_SOURCE.contains("tools: allowedTools"));
-        assert!(BRIDGE_SOURCE.contains("disallowedTools: session.deniedTools"));
+        assert!(
+            BRIDGE_SOURCE.contains("disallowedTools: disallowedProviderTools(session.deniedTools)")
+        );
     }
 
     #[test]

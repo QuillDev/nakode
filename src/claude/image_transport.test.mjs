@@ -24,6 +24,8 @@ test("Claude sends image+text and image-only SDK messages in new and resumed ses
   const effectiveAllowedTools = () => [];
   const permissionMode = () => "dontAsk";
   const permissionHandler = () => () => {};
+  const nativeDelegationGuard = () => () => ({});
+  const disallowedProviderTools = (deniedTools) => deniedTools;
   const claudeExecutable = () => ({});
   const interruptExternalToolCalls = () => {};
   const readHistory = async () => [];

@@ -3843,7 +3843,8 @@ impl BackendRegistry {
             crate::backend::CLAUDE_PROVIDER => {
                 let mut config = claude::BackendConfig::native(working_directory.to_path_buf())
                     .with_credential(credential)
-                    .with_session_database(self.session_database.clone());
+                    .with_session_database(self.session_database.clone())
+                    .with_native_delegation(self.native_delegation.clone());
                 if publish_credential_updates {
                     config = config.with_credential_updates();
                 }
@@ -10500,6 +10501,198 @@ mod tests {
             Ok("child result delivered to its waiting parent".to_owned())
         );
         assert!(runtime.pending_native_delegations.is_empty());
+        runtime.effects.shutdown().await;
+    }
+
+    /// The Claude bridge's `delegate` tool reaches the same attributed server route as every
+    /// in-process provider: no subprocess, server-bound identity, and server-side policy.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn claude_bridge_delegation_creates_an_attributed_run_through_the_server_route() {
+        use crate::{
+            backend::NativeAgentRequest,
+            claude::delegation::{ClaudeDelegations, DelegationScope},
+        };
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (persistence, _credentials) = test_persistence(workspace.path());
+        let effects = EffectExecutor::new(empty_registry(workspace.path()).await, persistence);
+        let mut state = DomainState::new_for_backend(
+            workspace.path().to_string_lossy(),
+            None,
+            100,
+            CLAUDE_PROVIDER,
+            "Claude",
+        );
+        // The runtime reloads archetypes from the session's agent directory.
+        let agents = workspace.path().join(".nakode/agents");
+        state.set_agent_directory(agents.clone());
+        std::fs::create_dir_all(&agents).expect("agent directory");
+        std::fs::write(
+            agents.join("repo-explorer.toml"),
+            "slug = \"repo-explorer\"\ndescription = \"Explores repository context\"\n",
+        )
+        .expect("repo-explorer definition");
+        std::fs::write(
+            agents.join("designer.toml"),
+            "slug = \"designer\"\ndescription = \"Designs interfaces\"\nenabled = false\n",
+        )
+        .expect("disabled definition");
+        state.install_agents(crate::agent::AgentCatalog::load(&agents).expect("catalog"));
+        let owner = state.nakode_session_id.clone();
+        let session_id = SessionId::from(owner.clone());
+        let (mut runtime, _handle) = NativeServerRuntime::from_parts(
+            ServiceEngine::new(state),
+            Vec::new(),
+            Vec::new(),
+            effects,
+            mpsc::channel(1).1,
+        );
+
+        // The adapter's control-plane attachment binds the owner; payload identity is ignored.
+        let (route, mut requests) = mpsc::channel(4);
+        let mut delegations = ClaudeDelegations::new(Some(route));
+        let mut scope = DelegationScope::default();
+        scope.observe(&BackendCommand::StartSession {
+            model: None,
+            instructions: None,
+            owner_session_id: Some(owner.clone()),
+            parent_run_id: None,
+            enabled_skill_ids: Vec::new(),
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
+            code_mode: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            finalization_reserve_turns: 0,
+            timeout_seconds: None,
+        });
+        let bridge_request = |id: &str, agent: &str| {
+            serde_json::json!({
+                "event": "delegation_request",
+                "id": id,
+                "turnId": "claude-turn-1",
+                "callId": format!("toolu_{id}"),
+                "agent": agent,
+                "title": "Read delegation proof marker",
+                "task": "Read README.md and report the marker.",
+                "ownerSessionId": "forged-owner",
+                "parentRunId": "forged-parent",
+            })
+        };
+
+        assert!(
+            delegations
+                .start(&bridge_request("proof", "repo-explorer"), &scope)
+                .is_none()
+        );
+        let Some(NativeAgentRequest::Delegate(request)) = requests.recv().await else {
+            panic!("expected a server-routed delegation");
+        };
+        runtime.handle_native_delegation(request).await;
+
+        let run = runtime
+            .core
+            .engine()
+            .state()
+            .subagents
+            .iter()
+            .find(|run| run.agent == "repo-explorer")
+            .cloned();
+        let Some(run) = run else {
+            let refusal = delegations.next_completion().await.bridge_reply();
+            panic!("no attributed run was created: {refusal}");
+        };
+        assert_eq!(run.provider, CLAUDE_PROVIDER);
+        assert_eq!(run.objective, "Read README.md and report the marker.");
+        assert_eq!(
+            run.observability.title.as_deref(),
+            Some("Read delegation proof marker")
+        );
+        assert_eq!(run.observability.parent_run_id, None);
+        assert_eq!(
+            run.observability.invocation_turn_id.as_deref(),
+            Some("claude-turn-1")
+        );
+        assert_eq!(
+            run.observability.invocation_call_id.as_deref(),
+            Some("toolu_proof")
+        );
+        let (request_id, pending) = runtime
+            .pending_native_delegations
+            .iter()
+            .next()
+            .expect("server waiter registered");
+        assert_eq!(pending.run_id, run.id);
+        assert_eq!(pending.session_id, session_id);
+        let request_id = *request_id;
+
+        // The child's terminal result returns to the waiting Claude tool call.
+        let result = format!(
+            "[Subagent Result] [{}] [repo-explorer]\nNAKODE-MARKER",
+            run.id
+        );
+        runtime.complete_native_delegations(&[Effect::CompleteAgentRequest {
+            request_id,
+            result: result.clone(),
+            success: true,
+        }]);
+        let reply = delegations.next_completion().await.bridge_reply();
+        assert_eq!(reply["method"], "resolve_delegation");
+        assert_eq!(reply["id"], "proof");
+        assert_eq!(reply["failed"], false);
+        assert_eq!(reply["output"], result);
+
+        // Disabled archetypes and unknown parent runs are refused by the server, not the bridge.
+        delegations.start(&bridge_request("disabled", "designer"), &scope);
+        let Some(NativeAgentRequest::Delegate(request)) = requests.recv().await else {
+            panic!("expected a server-routed delegation");
+        };
+        runtime.handle_native_delegation(request).await;
+        let reply = delegations.next_completion().await.bridge_reply();
+        assert_eq!(reply["failed"], true);
+        assert!(reply["output"].as_str().unwrap().contains("is disabled"));
+
+        let mut nested = DelegationScope::default();
+        nested.observe(&BackendCommand::StartSession {
+            model: None,
+            instructions: None,
+            owner_session_id: Some(owner),
+            parent_run_id: Some("agent-not-running".to_owned()),
+            enabled_skill_ids: Vec::new(),
+            external_tools: Vec::new(),
+            replace_builtin_tools: false,
+            code_mode: false,
+            allowed_builtin_tools: None,
+            max_turns: None,
+            finalization_reserve_turns: 0,
+            timeout_seconds: None,
+        });
+        delegations.start(&bridge_request("nested", "repo-explorer"), &nested);
+        let Some(NativeAgentRequest::Delegate(request)) = requests.recv().await else {
+            panic!("expected a server-routed delegation");
+        };
+        runtime.handle_native_delegation(request).await;
+        let reply = delegations.next_completion().await.bridge_reply();
+        assert_eq!(reply["failed"], true);
+        assert!(
+            reply["output"]
+                .as_str()
+                .unwrap()
+                .contains("parent agent run `agent-not-running`")
+        );
+        assert_eq!(
+            runtime
+                .core
+                .engine()
+                .state()
+                .subagents
+                .iter()
+                .filter(|run| run.agent == "repo-explorer")
+                .count(),
+            1,
+            "refused requests create no child runs"
+        );
         runtime.effects.shutdown().await;
     }
 

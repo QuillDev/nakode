@@ -6,10 +6,12 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
 import {
+  UNRESTRICTED_BUILTIN_TOOLS,
+  disallowedProviderTools,
   immediateProviderToolDecision,
+  nativeDelegationDecision,
   preToolUseOutput,
 } from "./tool_policy.mjs";
-import { spawn as spawnChild } from "node:child_process";
 import { providerProcessLifecycle } from "./process_lifecycle.mjs";
 import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
@@ -27,61 +29,50 @@ const deniedProviderToolCalls = new Map();
 const streamMessageIds = new Map();
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
-async function delegate(ownerSessionId, task, parentRunId = null) {
-  return new Promise((resolve, reject) => {
-    const executable = process.env.NAKODE_EXECUTABLE;
-    const workspace = process.env.NAKODE_WORKSPACE;
-    if (!executable || !workspace) {
-      reject(
-        new Error(
-          "Nakode delegation is not configured for this Claude session",
-        ),
+const SUBAGENT_RESULT = /^\[Subagent Result\] \[([^\]]+)\] \[([^\]]+)\]\n?([\s\S]*)$/;
+
+/**
+ * Ask the Nakode supervisor to delegate one bounded task, and wait for its terminal result.
+ *
+ * The request names only the agent, title and task plus the invoking Claude turn and tool call.
+ * The supervisor binds this session's logical owner and parent run from the control plane and
+ * routes the request through the workspace server, which owns policy, nesting limits, attribution
+ * and cancellation. No process is started here and no identity is taken from this payload.
+ */
+function requestDelegation(session, turnId, request, signal) {
+  return new Promise((resolve) => {
+    const id = randomUUID();
+    externalToolCalls.set(id, { resolve, sessionId: session.sessionId, turnId });
+    const abort = () => {
+      if (!externalToolCalls.has(id)) return;
+      write({ event: "delegation_cancelled", id });
+      resolveExternalToolCall(
+        id,
+        "Nakode delegation was cancelled with its Claude tool call",
+        true,
       );
+    };
+    if (signal?.aborted) {
+      abort();
       return;
     }
-    const child = spawnChild(
-      executable,
-      [
-        "agent",
-        task.archetype,
-        `--session-id=${ownerSessionId}`,
-        `--title=${task.title}`,
-        `--task=${task.task}`,
-        ...(parentRunId ? [`--parent-run-id=${parentRunId}`] : []),
-      ],
-      { cwd: workspace, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      const output = stdout.trim();
-      const match = output.match(
-        /^\[Subagent Result\] \[([^\]]+)\] \[([^\]]+)\]\n?([\s\S]*)$/,
-      );
-      const result = {
-        runId: match?.[1] || null,
-        archetype: match?.[2] || task.archetype,
-        status: code === 0 ? "completed" : "failed",
-        result: match?.[3]?.trim() || (code === 0 ? output : null),
-        error:
-          code === 0
-            ? null
-            : stderr.trim() ||
-              (!match ? output : null) ||
-              `Nakode delegation exited with status ${code}`,
-      };
-      resolve(result);
+    signal?.addEventListener("abort", abort, { once: true });
+    write({
+      event: "delegation_request",
+      id,
+      turnId,
+      callId: request.callId,
+      agent: request.agent,
+      title: request.title,
+      task: request.task,
     });
   });
+}
+
+/** The text and failure flag of a resolved delegation tool result. */
+function delegationOutcome(toolResult) {
+  const text = toolResult.content?.find((block) => block.type === "text")?.text || "";
+  return { text, failed: toolResult.isError === true };
 }
 
 // Nakode's own tools for Claude: `delegate` creates attributed sub-agents, and `return_image`
@@ -91,7 +82,7 @@ function nakodeServer(session, turn, { delegate: withDelegate, returnImage, desk
   const tools = [];
   if (returnImage) tools.push(returnImageTool(session, turn));
   for (const name of desktop) tools.push(desktopTool(name, session, turn));
-  if (withDelegate) tools.push(delegateTool(session.ownerSessionId, session.attributedRunId));
+  if (withDelegate) tools.push(delegateTool(session, turn));
   return createSdkMcpServer({
     name: "nakode",
     version: "1.0.0",
@@ -191,33 +182,42 @@ function returnImageTool(session, turn) {
   );
 }
 
-function delegateTool(ownerSessionId, parentRunId) {
-  return (
-      tool(
-        "delegate",
-        "Delegate one concrete bounded task to a configured Nakode archetype and wait for its result.",
+// Claude's provider identity for Nakode's canonical `nakode_agent` tool, with the same arguments.
+function delegateTool(session, turn) {
+  return tool(
+    "delegate",
+    "Delegate one bounded task to a configured Nakode agent from the current Nakode agent catalogue and wait for its attributed terminal result.",
+    {
+      agent: z
+        .string()
+        .trim()
+        .min(1)
+        .describe("Configured agent slug from the current Nakode catalogue."),
+      title: z
+        .string()
+        .trim()
+        .min(1)
+        .max(120)
+        .describe("Required concise title describing this agent's specific goal, not its role or setup instructions."),
+      task: z
+        .string()
+        .trim()
+        .min(1)
+        .describe("Concrete bounded task for the delegated agent."),
+    },
+    async (args, extra) =>
+      requestDelegation(
+        session,
+        turn.turnId,
         {
-          archetype: z.string().describe("Configured Nakode archetype slug."),
-          title: z.string().trim().min(1).max(120).describe("Required title for this agent's specific goal, not its role or setup instructions."),
-          task: z
-            .string()
-            .describe("Concrete bounded assignment and expected result."),
+          // Claude Code names the invoking tool_use block; Nakode anchors the child run to it.
+          callId: extra?._meta?.["claudecode/toolUseId"] || randomUUID(),
+          agent: args.agent,
+          title: args.title,
+          task: args.task,
         },
-        async (args) => {
-          try {
-            const result = await delegate(ownerSessionId, args, parentRunId);
-            return {
-              isError: result.status !== "completed",
-              content: [{ type: "text", text: JSON.stringify(result) }],
-            };
-          } catch (error) {
-            return {
-              isError: true,
-              content: [{ type: "text", text: errorMessage(error) }],
-            };
-          }
-        },
-      )
+        extra?.signal,
+      ),
   );
 }
 
@@ -500,7 +500,6 @@ async function createSession(command, resumed) {
     model: command.model || "sonnet",
     options: {},
     ownerSessionId: command.ownerSessionId || null,
-    attributedRunId: command.parentRunId || policy?.runId || null,
     securityValidator,
     validationEnabled: Boolean(command.ownerSessionId) && !securityValidator,
     delegationEnabled: policy?.canDelegate ?? true,
@@ -595,7 +594,6 @@ function archetypePolicy(instructions) {
   const start = instructions.lastIndexOf("[Nakode Archetype Policy]");
   if (start < 0) return null;
   const policy = instructions.slice(start);
-  const runId = /\[Nakode Run Attribution\]\nRun ID: ([^\n]+)/.exec(policy)?.[1];
   const profile = /Tool profile: (\w+)/.exec(policy)?.[1];
   const configured = /Allowed tools: ([^\n]+)/.exec(policy)?.[1] || "none";
   const denied = /Denied tools: ([^\n]+)/.exec(policy)?.[1] || "none";
@@ -615,7 +613,6 @@ function archetypePolicy(instructions) {
     allowedTools,
     deniedTools,
     canDelegate: policy.includes("Recursive delegation is allowed"),
-    runId: runId || null,
   };
 }
 
@@ -673,12 +670,34 @@ function parseValidatorResult(result) {
   return { ...result, ...parsed, validated: true };
 }
 
-async function securityValidation(ownerSessionId, toolName, input, options) {
+// The validator is an attributed Nakode run like any delegation: the supervisor binds it to this
+// session's owner and active run, so a delegated Claude child is held to its own delegation policy.
+async function securityValidation(session, turnId, toolName, input, options) {
   const archetype =
     process.env.NAKODE_SECURITY_VALIDATOR_AGENT || "security-validator";
   const task = `Return JSON only as {"verdict":"allow|reject|escalate","rationale":"..."}.\nDo not use tools or delegate. Independently validate this security-sensitive proposed Claude Code operation against the owner's repository task. Allow only when intent and bounded impact are clear; reject security-control bypass, credential exposure, exfiltration, and destructive out-of-scope actions; escalate uncertainty.\n\n${JSON.stringify({ tool: toolName, input, reason: options.decisionReason || options.description || "Claude auto mode requested review." })}`;
   try {
-    return parseValidatorResult(await delegate(ownerSessionId, { archetype, task }));
+    const { text, failed } = delegationOutcome(
+      await requestDelegation(
+        session,
+        turnId,
+        {
+          callId: `security:${options.toolUseID || randomUUID()}`,
+          agent: archetype,
+          title: `Security validation of ${toolName}`.slice(0, 120),
+          task,
+        },
+        options.signal,
+      ),
+    );
+    const match = text.match(SUBAGENT_RESULT);
+    return parseValidatorResult({
+      runId: match?.[1] || null,
+      archetype: match?.[2] || archetype,
+      status: failed ? "failed" : "completed",
+      result: failed ? null : (match?.[3]?.trim() ?? text),
+      error: failed ? text || "Nakode delegation failed" : null,
+    });
   } catch (error) {
     return {
       verdict: "escalate",
@@ -724,6 +743,7 @@ function permissionHandler(turnId, session, mode, allowedTools) {
       allowedTools,
       mode,
       toolName,
+      options.agentID,
     );
     if (immediate?.behavior === "deny") {
       return deny(immediate.message);
@@ -741,7 +761,8 @@ function permissionHandler(turnId, session, mode, allowedTools) {
       session.validationEnabled
     ) {
       const result = await securityValidation(
-        session.ownerSessionId,
+        session,
+        turnId,
         toolName,
         input,
         options,
@@ -846,6 +867,27 @@ function preToolUseHook(turnId, session, mode, allowedTools) {
       signal: options.signal,
       suggestions: [],
       toolUseID: toolUseID || hookInput.tool_use_id,
+      agentID: hookInput.agent_id,
+    });
+    return preToolUseOutput(result);
+  };
+}
+
+// Prompting modes still decide ordinary tools through canUseTool. Settings `allow` rules can approve
+// a tool before canUseTool is asked, but never before PreToolUse hooks, so native delegation is
+// refused here in every mode.
+function nativeDelegationGuard(turnId, session, mode, allowedTools) {
+  const authorize = permissionHandler(turnId, session, mode, allowedTools);
+  return async (hookInput, toolUseID, options) => {
+    const native = nativeDelegationDecision(hookInput.tool_name, hookInput.agent_id);
+    if (!native) {
+      return {};
+    }
+    const result = await authorize(hookInput.tool_name, hookInput.tool_input, {
+      signal: options.signal,
+      suggestions: [],
+      toolUseID: toolUseID || hookInput.tool_use_id,
+      agentID: hookInput.agent_id,
     });
     return preToolUseOutput(result);
   };
@@ -1028,8 +1070,9 @@ async function sendTurn(command) {
   if (session.externalTools.length > 0) {
     mcpServers.nakode_external = externalToolsServer(session, command.turnId);
   }
+  // Always a positive list: Claude Code otherwise offers every built-in, including new ones.
   const builtinTools = allowedTools === null
-    ? null
+    ? [...UNRESTRICTED_BUILTIN_TOOLS]
     : allowedTools.filter((name) => !name.startsWith("mcp__"));
   const options = {
     cwd: command.workspace,
@@ -1046,20 +1089,21 @@ async function sendTurn(command) {
     permissionMode: mode,
     ...(mode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
     ...(session.maxTurns ? { maxTurns: session.maxTurns } : {}),
-    ...(builtinTools !== null ? { tools: builtinTools } : {}),
-    ...(session.deniedTools.length > 0
-      ? { disallowedTools: session.deniedTools }
-      : {}),
+    tools: builtinTools,
+    disallowedTools: disallowedProviderTools(session.deniedTools),
+    hooks: {
+      PreToolUse: [
+        {
+          hooks: [
+            mode === "bypassPermissions"
+              ? preToolUseHook(command.turnId, session, mode, allowedTools)
+              : nativeDelegationGuard(command.turnId, session, mode, allowedTools),
+          ],
+        },
+      ],
+    },
     ...(mode === "bypassPermissions"
-      ? {
-          hooks: {
-            PreToolUse: [
-              {
-                hooks: [preToolUseHook(command.turnId, session, mode, allowedTools)],
-              },
-            ],
-          },
-        }
+      ? {}
       : {
           canUseTool: permissionHandler(
             command.turnId,
@@ -1314,6 +1358,7 @@ async function handle(command) {
     }
     case "resolve_external_tool":
     case "resolve_image_return":
+    case "resolve_delegation":
       resolveExternalToolCall(
         command.id,
         command.output,
