@@ -1,5 +1,33 @@
 use super::*;
 
+#[tokio::test]
+async fn rejected_refresh_reports_reconnect_without_retry_or_credential_leakage() {
+    let (url, server) = serve_sequence(vec![(
+        401,
+        "application/json",
+        r#"{"error":"synthetic-secret-response"}"#,
+    )])
+    .await;
+    let config = BackendConfig::native(PathBuf::from("."))
+        .with_auth_urls(&url)
+        .with_base_url(url);
+    let (events, mut received) = mpsc::channel(4);
+    assert!(
+        refresh_if_needed(&config, Some(expired("synthetic-revoked")), &events)
+            .await
+            .is_none()
+    );
+    let event = received.try_recv().expect("authentication failure");
+    assert!(matches!(event, BackendEvent::RequestFailed {
+        operation: BackendOperation::Authenticate, ref message, ..
+    } if message.contains("401 Unauthorized") && message.contains("reconnect this Codex account")));
+    assert!(!format!("{event:?}").contains("synthetic-"));
+    assert!(received.try_recv().is_err());
+    let requests = server.await.expect("refresh server");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("POST /oauth/token "));
+}
+
 const ROTATED: &str = r#"{"access_token":"header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC1icm93c2VyIn19.signature","refresh_token":"synthetic-rotated","expires_in":3600}"#;
 
 fn expired(refresh_token: &str) -> CodexCredential {

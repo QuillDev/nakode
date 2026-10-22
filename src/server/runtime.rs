@@ -3571,6 +3571,8 @@ pub(crate) struct BackendRegistry {
     pub(crate) memory_config: Arc<RwLock<crate::memory::MemoryConfig>>,
     pub(crate) memory_services: Mutex<HashMap<String, crate::memory::SharedMemoryService>>,
     codex_refresh_coordinators: Mutex<HashMap<Option<String>, codex::RefreshCoordinator>>,
+    #[cfg(test)]
+    codex_test_origin: Option<String>,
     pub(crate) vision_config: Arc<RwLock<crate::vision::VisionConfig>>,
     pub(crate) vision_service: Option<crate::vision::SharedVisionService>,
     pub(crate) native_delegation: mpsc::Sender<NativeAgentRequest>,
@@ -3734,6 +3736,8 @@ impl BackendRegistry {
             subagent_providers: HashMap::new(),
             subagent_accounts: HashMap::new(),
             codex_refresh_coordinators: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            codex_test_origin: None,
             subagent_parents: HashMap::new(),
             subagent_tasks: HashMap::new(),
             events,
@@ -3824,21 +3828,24 @@ impl BackendRegistry {
                     )
                     .or_default()
                     .clone();
-                codex::spawn(
-                    codex::BackendConfig::native(working_directory.to_path_buf())
-                        .with_credential(credential)
-                        .with_refresh_coordinator(refresh_coordinator)
-                        .with_reasoning_effort(self.config.openai_reasoning_effort.as_str())
-                        .with_compaction_threshold_percent(usize::from(
-                            self.config.compaction_threshold_percent,
-                        ))
-                        .with_session_database(self.session_database.clone())
-                        .with_native_delegation(self.native_delegation.clone())
-                        .with_web_config(Arc::clone(&self.web_config))
-                        .with_memory(Arc::clone(&memory_service))
-                        .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone()),
-                )
-                .await?
+                let config = codex::BackendConfig::native(working_directory.to_path_buf())
+                    .with_credential(credential)
+                    .with_refresh_coordinator(refresh_coordinator)
+                    .with_reasoning_effort(self.config.openai_reasoning_effort.as_str())
+                    .with_compaction_threshold_percent(usize::from(
+                        self.config.compaction_threshold_percent,
+                    ))
+                    .with_session_database(self.session_database.clone())
+                    .with_native_delegation(self.native_delegation.clone())
+                    .with_web_config(Arc::clone(&self.web_config))
+                    .with_memory(Arc::clone(&memory_service))
+                    .with_vision(Arc::clone(&self.vision_config), self.vision_service.clone());
+                #[cfg(test)]
+                let config = match &self.codex_test_origin {
+                    Some(origin) => config.with_auth_urls(origin).with_base_url(origin.clone()),
+                    None => config,
+                };
+                codex::spawn(config).await?
             }
             crate::backend::CLAUDE_PROVIDER => {
                 let mut config = claude::BackendConfig::native(working_directory.to_path_buf())
@@ -4426,8 +4433,8 @@ impl BackendRegistry {
         Ok(())
     }
 
-    /// Same-provider delegates retain the parent's exact account, not a less-loaded sibling.
-    /// Cross-provider delegates use ordinary routing; an ineligible inherited account fails closed.
+    /// Delegates retain the parent's account for the same provider, otherwise the target default.
+    /// Neither binding may silently fall back to a less-loaded sibling when it is unavailable.
     fn select_subagent_account(
         &mut self,
         parent_session_id: &nakode_protocol::SessionId,
@@ -4438,6 +4445,7 @@ impl BackendRegistry {
             .session_accounts
             .get(&(parent_session_id.clone(), provider.to_owned()))
             .cloned()
+            .or_else(|| self.configured_default_account_id(provider))
         {
             return self
                 .select_account(provider, Some(&account_id))
@@ -4586,7 +4594,10 @@ impl BackendRegistry {
         {
             return Err(BackendError::InvalidCredential {
                 provider: provider.to_owned(),
-                detail: format!("account {} requires authentication", account.account_id),
+                detail: format!(
+                    "account {} requires authentication; reconnect this account or synchronize its brokered credential",
+                    account.account_id
+                ),
             });
         }
         if let Some((remaining_seconds, reason)) =
@@ -7117,6 +7128,7 @@ fn summarize_provider_error(message: &str) -> String {
 mod tests {
     mod child_creation;
     mod child_questions;
+    mod delegated_auth;
     mod delegated_credentials;
     mod followups;
     use std::{
