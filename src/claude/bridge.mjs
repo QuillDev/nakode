@@ -6,7 +6,9 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
 import {
+  disallowedProviderTools,
   immediateProviderToolDecision,
+  nativeDelegationDecision,
   preToolUseOutput,
 } from "./tool_policy.mjs";
 import { providerProcessLifecycle } from "./process_lifecycle.mjs";
@@ -740,6 +742,7 @@ function permissionHandler(turnId, session, mode, allowedTools) {
       allowedTools,
       mode,
       toolName,
+      options.agentID,
     );
     if (immediate?.behavior === "deny") {
       return deny(immediate.message);
@@ -863,6 +866,27 @@ function preToolUseHook(turnId, session, mode, allowedTools) {
       signal: options.signal,
       suggestions: [],
       toolUseID: toolUseID || hookInput.tool_use_id,
+      agentID: hookInput.agent_id,
+    });
+    return preToolUseOutput(result);
+  };
+}
+
+// Prompting modes still decide ordinary tools through canUseTool. Settings `allow` rules can approve
+// a tool before canUseTool is asked, but never before PreToolUse hooks, so native delegation is
+// refused here in every mode.
+function nativeDelegationGuard(turnId, session, mode, allowedTools) {
+  const authorize = permissionHandler(turnId, session, mode, allowedTools);
+  return async (hookInput, toolUseID, options) => {
+    const native = nativeDelegationDecision(hookInput.tool_name, hookInput.agent_id);
+    if (!native) {
+      return {};
+    }
+    const result = await authorize(hookInput.tool_name, hookInput.tool_input, {
+      signal: options.signal,
+      suggestions: [],
+      toolUseID: toolUseID || hookInput.tool_use_id,
+      agentID: hookInput.agent_id,
     });
     return preToolUseOutput(result);
   };
@@ -1064,19 +1088,20 @@ async function sendTurn(command) {
     ...(mode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
     ...(session.maxTurns ? { maxTurns: session.maxTurns } : {}),
     ...(builtinTools !== null ? { tools: builtinTools } : {}),
-    ...(session.deniedTools.length > 0
-      ? { disallowedTools: session.deniedTools }
-      : {}),
+    disallowedTools: disallowedProviderTools(session.deniedTools),
+    hooks: {
+      PreToolUse: [
+        {
+          hooks: [
+            mode === "bypassPermissions"
+              ? preToolUseHook(command.turnId, session, mode, allowedTools)
+              : nativeDelegationGuard(command.turnId, session, mode, allowedTools),
+          ],
+        },
+      ],
+    },
     ...(mode === "bypassPermissions"
-      ? {
-          hooks: {
-            PreToolUse: [
-              {
-                hooks: [preToolUseHook(command.turnId, session, mode, allowedTools)],
-              },
-            ],
-          },
-        }
+      ? {}
       : {
           canUseTool: permissionHandler(
             command.turnId,

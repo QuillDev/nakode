@@ -454,7 +454,12 @@ async fn claude_sdk_is_current(directory: &std::path::Path) -> bool {
 /// Starts the Node bridge. It never receives a Nakode executable: delegation crosses back to the
 /// supervisor as a bridge event, so an embedding host binary (such as `FStack`) needs no Nakode CLI.
 fn launch_bridge(directory: &std::path::Path) -> Result<Bridge, BackendError> {
-    let mut child = Command::new("node")
+    start_bridge_process(bridge_command(directory))
+}
+
+fn bridge_command(directory: &std::path::Path) -> Command {
+    let mut command = Command::new("node");
+    command
         .envs(crate::machine_path::environment())
         .arg(directory.join("bridge.mjs"))
         .current_dir(directory)
@@ -467,13 +472,16 @@ fn launch_bridge(directory: &std::path::Path) -> Result<Bridge, BackendError> {
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| BackendError::Spawn {
-            backend: "Claude SDK",
-            program: PathBuf::from("node"),
-            source,
-        })?;
+        .stderr(Stdio::piped());
+    command
+}
+
+fn start_bridge_process(mut command: Command) -> Result<Bridge, BackendError> {
+    let mut child = command.spawn().map_err(|source| BackendError::Spawn {
+        backend: "Claude SDK",
+        program: PathBuf::from("node"),
+        source,
+    })?;
     let stdin = child.stdin.take().ok_or(BackendError::MissingPipe {
         backend: "Claude SDK",
         pipe: "stdin",
@@ -2419,6 +2427,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_tool_policy_isolated() {
+        let directory = tempfile::tempdir().expect("isolated tool policy directory");
+        std::fs::write(directory.path().join("tool_policy.mjs"), TOOL_POLICY_SOURCE)
+            .expect("tool policy");
+        let test = directory.path().join("tool_policy.test.mjs");
+        std::fs::write(&test, include_str!("tool_policy.test.mjs")).expect("tool policy test");
+        let output = std::process::Command::new("node")
+            .envs(crate::machine_path::environment())
+            .arg("--test")
+            .arg(test)
+            .output()
+            .expect("Node tool policy test");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Installs the production bridge beside a stub Agent SDK that calls `delegate` like Claude Code.
     fn stub_sdk_bridge_directory() -> tempfile::TempDir {
         let directory = tempfile::tempdir().expect("isolated bridge directory");
@@ -2474,12 +2503,34 @@ mod tests {
     /// The real bridge and supervisor route Claude's `delegate` call to the workspace server with
     /// server-bound identity, without any Nakode executable (which an embedding host such as `FStack`
     /// cannot provide as `nakode agent`), and return the attributed result to the same tool call.
+    /// Claude Code's native subagent routes are refused first, so they cannot stand in for it.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn claude_delegate_tool_routes_through_the_server_without_a_nakode_executable() {
+        delegate_through_stub_sdk("bypassPermissions").await;
+    }
+
+    /// Prompting modes decide ordinary tools through `canUseTool`, which settings `allow` rules can
+    /// skip; native delegation is still refused before it, and Nakode delegation still works.
+    #[tokio::test]
+    async fn claude_native_subagents_are_refused_in_prompting_permission_modes() {
+        delegate_through_stub_sdk("default").await;
+    }
+
+    fn denial_reason(item: &NormalizedItem) -> Option<String> {
+        let audit: Value = serde_json::from_str(item.tool_audit_json.as_deref()?).ok()?;
+        if audit["denied"] != true {
+            return None;
+        }
+        audit["denialReason"].as_str().map(str::to_owned)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn delegate_through_stub_sdk(permission_mode: &str) {
         let directory = stub_sdk_bridge_directory();
         let workspace = tempfile::tempdir().expect("workspace");
-        let bridge = launch_bridge(directory.path()).expect("bridge process");
+        let mut command = bridge_command(directory.path());
+        command.env("NAKODE_CLAUDE_PERMISSION_MODE", permission_mode);
+        let bridge = start_bridge_process(command).expect("bridge process");
         let (route, mut requests) = mpsc::channel(4);
         let config =
             BackendConfig::native(workspace.path().to_path_buf()).with_native_delegation(route);
@@ -2570,9 +2621,16 @@ mod tests {
             .unwrap();
 
         let mut delegation_row = None;
+        let mut native_denials = std::collections::BTreeMap::new();
         let outcome = next_matching(&mut events, |event| match event {
             BackendEvent::ItemCompleted { item, .. } if item.id == "toolu_stub_delegate" => {
                 delegation_row = Some(item);
+                None
+            }
+            BackendEvent::ItemCompleted { item, .. } => {
+                if let Some(reason) = denial_reason(&item) {
+                    native_denials.insert(item.id, reason);
+                }
                 None
             }
             BackendEvent::TurnCompleted { outcome, error, .. } => Some((outcome, error)),
@@ -2580,6 +2638,21 @@ mod tests {
         })
         .await;
         assert_eq!(outcome, (TurnOutcome::Completed, None));
+        assert_eq!(
+            native_denials.len(),
+            2,
+            "native denials: {native_denials:#?}"
+        );
+        assert!(
+            native_denials["toolu_native_agent"]
+                .contains("native Agent tool is disabled in Nakode"),
+            "{native_denials:#?}"
+        );
+        assert!(
+            native_denials["toolu_native_subagent_read"]
+                .contains("native subagents cannot use tools in Nakode"),
+            "{native_denials:#?}"
+        );
         let row = delegation_row.expect("completed delegation row");
         assert_eq!(row.status, ItemStatus::Complete);
         assert_eq!(row.title, "nakode_agent · repo-explorer");
@@ -2815,7 +2888,9 @@ process.stdout.write(output);
         assert!(BRIDGE_SOURCE.contains("denialReason: message"));
         assert!(BRIDGE_SOURCE.contains("tools: builtinTools"));
         assert!(!BRIDGE_SOURCE.contains("tools: allowedTools"));
-        assert!(BRIDGE_SOURCE.contains("disallowedTools: session.deniedTools"));
+        assert!(
+            BRIDGE_SOURCE.contains("disallowedTools: disallowedProviderTools(session.deniedTools)")
+        );
     }
 
     #[test]
