@@ -715,6 +715,11 @@ pub enum Command {
         session_id: SessionId,
     },
     /// Exact-ID, missing-directory-only canonical deletion; never restores or cancels work.
+    /// Authenticated orchestrator self-removal, never arbitrary target deletion.
+    ClearSelf {
+        session_id: SessionId,
+        source_call_id: String,
+    },
     PruneSession {
         session_id: SessionId,
     },

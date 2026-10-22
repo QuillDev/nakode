@@ -182,6 +182,8 @@ Client-owned tools use the session-scoped public external-tool contract. The
 server owns pending calls and turn suspension; clients only execute a call and
 submit its result.
 
+- Guarded orchestrator `ClearSelf` authenticates its exact pending external call; individual canonical deletion never detaches retained children. `docs/chat-self-clear.md`.
+
 ## Session model
 
 - Coordinator `InterruptSessionWork` preserves coordination inbox pause state; manual `CancelSessionWork` pauses dispatch. Both cancel current work without replay. `docs/followup-inbox.md`.

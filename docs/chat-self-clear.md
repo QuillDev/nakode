@@ -1,0 +1,11 @@
+# Guarded orchestrator self-clear
+
+`ClearSelf` is a public gRPC command and Rust SDK method, authenticated against the exact sole pending external tool call named `ClearSelf` on an open Chat bridge. Its model-facing input is `{}`. The client supplies the session and call identity from its authenticated tool executor, never from tool arguments. The current live turn must not be cancelling; stale calls after backend loss are ineligible.
+
+The runtime refuses incomplete canonical inventory, any durable linked child (including idle and retained/archived children), other native work, queued prompts, pending inbound bridge delivery and unsettled coordination. Persistence is read before teardown and rechecked in the deletion transaction. An unsupported repository fails closed.
+
+All canonical individual session deletion now refuses parent deletion while durable children remain. An SQLite immediate transaction serializes deletion against child creation and relationship claim/transfer; foreign keys prevent attachment after deletion. No child is silently detached or deleted.
+
+Successful self-clear intentionally terminates the suspended caller. The runtime awaits canonical backend shutdown, removes session history and releases session-owned environment/artifact state before returning its mutation receipt. Clients must treat that receipt as terminal and must not submit an external tool result to the deleted session. The ordinary command receipt supports exact same-runtime replay; it is not a new owner authorization. A backend/persistence failure is not success and must not authorize blind destructive retries.
+
+FStack remains responsible for account/profile authorization, app confirmation, complete cross-runtime relay-child guards and the dashboard's terminal navigation. Nakode does not parse owner prose or accept a model assertion as confirmation. Only use this capability when the owner explicitly requests removal, after existing `DeleteAgent` controls acknowledge complete cleanup. Never validate with a live requesting Chat.

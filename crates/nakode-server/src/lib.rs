@@ -252,6 +252,7 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     fixed("NakodeService", "ListActiveSessions", RequestLane::Query),
     fixed("NakodeService", "ListSessionStatuses", RequestLane::Query),
     fixed("NakodeService", "DeleteSession", RequestLane::Control),
+    fixed("NakodeService", "ClearSelf", RequestLane::Control),
     fixed("NakodeService", "GetSession", RequestLane::Hydration),
     fixed("NakodeService", "WatchSession", RequestLane::Subscription),
     fixed("NakodeService", "SendPrompt", RequestLane::Control),

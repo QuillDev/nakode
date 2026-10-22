@@ -215,6 +215,7 @@ impl BridgeMutationRollback {
             | Command::SteerQueuedPrompt { .. }
             | Command::ContinueSessionFromBridge { .. }
             | Command::DeleteSession { .. }
+            | Command::ClearSelf { .. }
             | Command::PruneSession { .. }
             | Command::OpenSession {
                 profile_id: Some(_),
@@ -2024,6 +2025,33 @@ impl NativeServerRuntime {
             _ => None,
         };
         let stop_checkpoint = stop_inbox.as_ref().map(|_| Box::new(self.core.clone()));
+        let self_clear = matches!(
+            &request,
+            nakode_server::ServerRequest::Command {
+                command: Command::ClearSelf { .. },
+                ..
+            }
+        );
+        if let nakode_server::ServerRequest::Command {
+            command: Command::ClearSelf { session_id, .. },
+            ..
+        } = &request
+            && self.core.engine_for(session_id).is_some()
+            && let Err(error) = self
+                .effects
+                .persistence
+                .sessions
+                .check_self_clear(session_id.as_str())
+        {
+            if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                let _ = respond.send(Err(ServiceError {
+                    code: ErrorCode::Conflict,
+                    message: error.to_string(),
+                    retryable: false,
+                }));
+            }
+            return;
+        }
         let mut rollback = BridgeMutationRollback::capture(&request, &self.core);
         let mut outcome = if let Some(store) = child_question_store.as_ref() {
             self.core
@@ -2230,7 +2258,15 @@ impl NativeServerRuntime {
                 });
                 return;
             }
-            if let Err(error) = self.effects.persistence.sessions.delete(&delete_session_id) {
+            let deletion = if self_clear {
+                self.effects
+                    .persistence
+                    .sessions
+                    .delete_self(&delete_session_id)
+            } else {
+                self.effects.persistence.sessions.delete(&delete_session_id)
+            };
+            if let Err(error) = deletion {
                 // DeleteSession mutates the complete in-memory projection (including default-session
                 // and bridge state) before effects run. Restore the pre-command checkpoint so
                 // same-process retries, including the same idempotency key, execute instead of

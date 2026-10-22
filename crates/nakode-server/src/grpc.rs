@@ -1983,6 +1983,15 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             session_id: protocol::SessionId::from(input.session_id)
         }
     );
+    command_rpc!(
+        clear_self,
+        api::ClearSelfRequest,
+        input,
+        protocol::Command::ClearSelf {
+            session_id: protocol::SessionId::from(input.session_id),
+            source_call_id: input.source_call_id
+        }
+    );
     try_command_rpc!(
         update_settings,
         api::UpdateSettingsRequest,
