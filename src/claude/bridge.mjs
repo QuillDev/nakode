@@ -11,6 +11,9 @@ import {
   immediateProviderToolDecision,
   nativeDelegationDecision,
   preToolUseOutput,
+  permissionContext,
+  SDK_CANCELLATION_TEXT,
+  TOOL_PERMISSION_GUIDANCE,
 } from "./tool_policy.mjs";
 import { providerProcessLifecycle } from "./process_lifecycle.mjs";
 import { existsSync } from "node:fs";
@@ -25,7 +28,7 @@ const runs = new Map();
 const approvals = new Map();
 const externalToolCalls = new Map();
 const providerToolCalls = new Map();
-const deniedProviderToolCalls = new Map();
+const providerToolPermissions = new Map();
 const streamMessageIds = new Map();
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
@@ -423,7 +426,7 @@ async function emitNativeAgentHistory(workspace, sessionId, turnId) {
   }
 }
 
-function savedHistory(messages, sessionId) {
+function savedHistory(messages, sessionId, permissions = new Map()) {
   const history = [];
   const historicalTools = new Map();
   let ordinal = 0;
@@ -439,6 +442,7 @@ function savedHistory(messages, sessionId) {
       let kind;
       let title;
       let body;
+      let permission;
       if (block.type === "text") {
         kind = role === "user" ? "user" : "assistant";
         title = role === "user" ? "YOU" : "CLAUDE";
@@ -457,6 +461,13 @@ function savedHistory(messages, sessionId) {
         const started = historicalTools.get(block.tool_use_id);
         title = started?.name || "Tool";
         body = JSON.stringify({ input: started?.input, output: block.content });
+        permission = permissions.get(block.tool_use_id)?.permission;
+        if (!permission && block.is_error && block.content === SDK_CANCELLATION_TEXT) {
+          permission = {
+            decision: "unknown", source: "sdk_unknown",
+            reason: "Retained SDK cancellation text has no authenticated owner-stop provenance. Do not retry automatically.",
+          };
+        }
       } else {
         continue;
       }
@@ -477,6 +488,11 @@ function savedHistory(messages, sessionId) {
         title,
         body,
         status: block.is_error ? "failed" : "complete",
+        ...(permission ? {
+          permission,
+          denied: permission.decision === "deny",
+          denialReason: permission.decision === "allow" ? undefined : permission.reason,
+        } : {}),
       });
       ordinal += 1;
     }
@@ -531,10 +547,10 @@ async function createSession(command, resumed) {
 }
 
 /** The session's history as a resume rebuilds it; null, with a diagnostic, when unreadable. */
-async function readHistory(workspace, sessionId) {
+async function readHistory(workspace, sessionId, permissions) {
   try {
     return [
-      ...savedHistory(await getSessionMessages(sessionId, { dir: workspace }), sessionId),
+      ...savedHistory(await getSessionMessages(sessionId, { dir: workspace }), sessionId, permissions),
       ...(await nativeAgentHistory(workspace, sessionId)),
     ];
   } catch (error) {
@@ -709,17 +725,35 @@ async function securityValidation(session, turnId, toolName, input, options) {
   }
 }
 
+function interruptedPermission(turnId, mode) {
+  // A hook/control-request signal is SDK-owned: timeout and batch cancellation can abort it too.
+  // Only the separately held runtime controller establishes a Nakode interruption.
+  const runtimeSignal = runs.get(turnId)?.signal;
+  const source = runtimeSignal?.aborted
+    ? runtimeSignal.reason?.source || "runtime_interrupt"
+    : "sdk_abort";
+  return {
+    decision: "interrupted",
+    source,
+    reason: source === "sdk_abort"
+      ? "Claude SDK cancelled the permission request; no owner decision was received."
+      : `Nakode stopped this turn (${source}); do not continue its operations.`,
+    mode,
+  };
+}
+
 function permissionHandler(turnId, session, mode, allowedTools) {
   return async (toolName, input, options) => {
-    const deny = (message) => {
-      const callId = options.toolUseID || randomUUID();
-      if (options.toolUseID) {
-        deniedProviderToolCalls.set(options.toolUseID, {
-          name: providerToolName(toolName),
-          reason: message,
-          turnId,
-        });
-      }
+    const callId = options.toolUseID || randomUUID();
+    const record = (permission) => {
+      permission = { ...permission, reason: permission.reason.slice(0, 4096) };
+      providerToolPermissions.set(callId, {
+        name: providerToolName(toolName), turnId, permission,
+      });
+      return permission;
+    };
+    const deny = (reason, source = "policy", permission = null) => {
+      permission = record(permission || { decision: "deny", source, reason, mode });
       write({
         event: "tool_call",
         turnId,
@@ -728,136 +762,130 @@ function permissionHandler(turnId, session, mode, allowedTools) {
         status: "error",
         args: input,
         external: externalToolNames(session).includes(toolName),
-        denied: true,
-        denialReason: message,
+        denied: permission.decision === "deny",
+        denialReason: permission.reason,
+        permission,
       });
-      return { behavior: "deny", message, toolUseID: options.toolUseID };
+      return {
+        behavior: "deny", message: permissionContext(permission),
+        toolUseID: callId, permission,
+      };
     };
+    const allow = (source, reason) => ({
+      behavior: "allow", updatedInput: input,
+      permission: record({ decision: "allow", source, reason, mode }),
+    });
+    if (options.signal.aborted || runs.get(turnId)?.signal.aborted) {
+      const permission = interruptedPermission(turnId, mode);
+      return { ...deny(permission.reason, permission.source, permission), interrupt: true };
+    }
     if (session.finalizing) {
       return deny(
         "Protected finalization reserve denies new tool use; synthesize the best final or partial report from retained evidence.",
+        "finalization",
       );
     }
     const immediate = immediateProviderToolDecision(
-      session.deniedTools,
-      allowedTools,
-      mode,
-      toolName,
-      options.agentID,
+      session.deniedTools, allowedTools, mode, toolName, options.agentID,
     );
-    if (immediate?.behavior === "deny") {
-      return deny(immediate.message);
-    }
-    if (immediate?.behavior === "allow") {
-      return { ...immediate, updatedInput: input };
-    }
+    if (immediate?.behavior === "deny") return deny(immediate.message);
+    if (immediate?.behavior === "allow") return allow("policy", "Nakode tool policy allows this call.");
     if (externalToolNames(session).includes(toolName)) {
-      return { behavior: "allow", updatedInput: input };
+      return allow("external_tool", "The external tool's application authorization remains authoritative.");
     }
-    if (
-      toolName !== "AskUserQuestion" &&
-      mode === "auto" &&
-      !options.matchedAskRule &&
-      session.validationEnabled
-    ) {
-      const result = await securityValidation(
-        session,
-        turnId,
-        toolName,
-        input,
-        options,
-      );
+    if (toolName !== "AskUserQuestion" && mode === "auto" && !options.matchedAskRule) {
+      if (!session.validationEnabled) {
+        return deny("Recursive security validation was prevented in a delegated validator context.");
+      }
+      const result = await securityValidation(session, turnId, toolName, input, options);
       write({
-        event: "tool_call",
-        turnId,
-        callId: `security:${options.toolUseID || randomUUID()}`,
+        event: "tool_call", turnId, callId: `security:${callId}`,
         name: "SecurityValidation",
         status: result.verdict === "allow" ? "completed" : "error",
         result: {
-          verdict: result.verdict,
-          rationale: result.rationale,
-          validated: result.validated,
-          validator: result.archetype,
-          runId: result.runId,
+          verdict: result.verdict, rationale: result.rationale,
+          validated: result.validated, validator: result.archetype, runId: result.runId,
         },
       });
-      if (result.verdict === "allow") {
-        return { behavior: "allow", updatedInput: input };
+      if (options.signal.aborted || runs.get(turnId)?.signal.aborted) {
+        const permission = interruptedPermission(turnId, mode);
+        return { ...deny(permission.reason, permission.source, permission), interrupt: true };
       }
-      return deny(
-        result.verdict === "reject"
-          ? `Independent security validation rejected this operation: ${result.rationale}`
-          : `Security validation requires escalation; the operation was not run: ${result.rationale}`,
-      );
-    }
-    if (
-      toolName !== "AskUserQuestion" &&
-      mode === "auto" &&
-      !options.matchedAskRule &&
-      !session.validationEnabled
-    ) {
-      return deny(
-        "Recursive security validation was prevented in a delegated validator context.",
-      );
+      if (result.verdict === "allow") return allow("validator", result.rationale);
+      const source = !result.validated ? "validator_error"
+        : result.verdict === "reject" ? "validator_reject" : "validator_escalation";
+      return deny(result.rationale, source);
     }
     return new Promise((resolve) => {
-      const approvalId = options.toolUseID || randomUUID();
       let settled = false;
       const finish = (result) => {
         if (settled) return;
         settled = true;
         options.signal.removeEventListener("abort", abort);
-        approvals.delete(approvalId);
-        if (result.behavior === "deny") {
-          const reason = result.message || "Tool use denied";
-          if (options.toolUseID) {
-            deniedProviderToolCalls.set(options.toolUseID, {
-              name: providerToolName(toolName),
-              reason,
-              turnId,
-            });
-          }
-          write({
-            event: "tool_call",
-            turnId,
-            callId: approvalId,
-            name: providerToolName(toolName) || "UnknownProviderTool",
-            status: "error",
-            args: input,
-            external: externalToolNames(session).includes(toolName),
-            denied: true,
-            denialReason: reason,
-          });
+        approvals.delete(callId);
+        if (result.behavior === "allow" && runs.get(turnId)?.signal.aborted) {
+          result = { behavior: "deny", interrupt: true, permission: interruptedPermission(turnId, mode) };
         }
-        resolve(result);
+        if (result.behavior === "deny") {
+          const permission = result.permission || {
+            decision: "deny", source: "approval_declined", reason: result.message, mode,
+          };
+          resolve({ ...result, ...deny(permission.reason, permission.source, permission) });
+        } else {
+          resolve({ ...result, ...allow("approval", "The pending approval was accepted.") });
+        }
       };
-      const abort = () =>
-        finish({
-          behavior: "deny",
-          message: "Interrupted by user",
-          interrupt: true,
-          toolUseID: approvalId,
-        });
+      const abort = () => {
+        const permission = interruptedPermission(turnId, mode);
+        finish({ behavior: "deny", interrupt: true, permission });
+      };
       if (options.signal.aborted) {
         abort();
         return;
       }
       options.signal.addEventListener("abort", abort, { once: true });
-      approvals.set(approvalId, {
-        finish,
-        suggestions: options.suggestions || [],
+      approvals.set(callId, { finish, suggestions: options.suggestions || [] });
+      const permission = record({
+        decision: "pending", source: "approval", reason: "Awaiting approval; no decision has been received.", mode,
       });
       write({
-        event: "approval_request",
-        turnId,
-        approvalId,
-        toolName,
-        input,
+        event: "approval_request", turnId, approvalId: callId, toolName, input, permission,
         title: options.title || options.displayName || `Allow ${toolName}?`,
         description: options.description || options.decisionReason || "",
       });
     });
   };
+}
+
+// This supported SDK hook supplies model-facing provenance as well as the host audit. It never
+// returns retry:true, changes a permission, or rewrites the provider's raw tool result.
+function permissionBatchHook(turnId) {
+  return (input) => {
+    const permissions = (input.tool_calls || []).flatMap((call) => {
+      const recorded = providerToolPermissions.get(call.tool_use_id);
+      if (!recorded || recorded.turnId !== turnId || recorded.permission.decision === "allow") return [];
+      return [{ callId: call.tool_use_id, ...recorded.permission }];
+    });
+    return permissions.length === 0 ? {} : {
+      hookSpecificOutput: {
+        hookEventName: "PostToolBatch",
+        additionalContext: permissionContext(permissions),
+      },
+    };
+  };
+}
+
+function sdkPermissionDenied(turnId, message) {
+  const existing = providerToolPermissions.get(message.tool_use_id);
+  if (existing?.permission.decision === "deny") return;
+  providerToolPermissions.set(message.tool_use_id, {
+    name: providerToolName(message.tool_name), turnId,
+    permission: {
+      decision: "deny", source: "sdk_policy",
+      reason: (message.decision_reason || message.message || "Claude SDK denied the operation.").slice(0, 4096),
+      sdkReasonType: message.decision_reason_type || null,
+    },
+  });
 }
 
 function preToolUseHook(turnId, session, mode, allowedTools) {
@@ -921,18 +949,34 @@ function emitUserToolResults(turnId, message) {
     if (block.type === "tool_result") {
       const started = providerToolCalls.get(block.tool_use_id);
       providerToolCalls.delete(block.tool_use_id);
-      const denied = deniedProviderToolCalls.get(block.tool_use_id);
-      deniedProviderToolCalls.delete(block.tool_use_id);
+      let recorded = providerToolPermissions.get(block.tool_use_id);
+      // This exact SDK fallback is also used for internal cancellation/skipped siblings. Matching
+      // it only establishes UNKNOWN provenance, never an owner stop or a policy decision.
+      if (block.is_error && block.content === SDK_CANCELLATION_TEXT &&
+          (!recorded || recorded.permission.decision === "allow")) {
+        const runtimeSignal = runs.get(turnId)?.signal;
+        const permission = runtimeSignal?.aborted
+          ? interruptedPermission(turnId, recorded?.permission.mode)
+          : {
+              decision: "unknown", source: "sdk_unknown",
+              reason: "Claude SDK reported cancellation without an attributed Nakode stop or denial. Execution outcome is unconfirmed; do not retry automatically.",
+              mode: recorded?.permission.mode,
+            };
+        recorded = { name: started?.name || "Tool", turnId, permission };
+        providerToolPermissions.set(block.tool_use_id, recorded);
+      }
+      const permission = recorded?.permission;
       write({
         event: "tool_call",
         turnId,
         callId: block.tool_use_id,
-        name: denied?.name || started?.name || "Tool",
+        name: recorded?.name || started?.name || "Tool",
         status: block.is_error ? "error" : "completed",
         result: { input: started?.input, output: block.content },
         external: started?.external === true,
-        denied: denied !== undefined,
-        denialReason: denied?.reason,
+        denied: permission?.decision === "deny",
+        denialReason: permission && permission.decision !== "allow" ? permission.reason : undefined,
+        permission,
       });
     }
   }
@@ -1080,9 +1124,11 @@ async function sendTurn(command) {
     // The session's variables (GH_TOKEN, git credentials, account environment) for its tools.
     env: { ...process.env, ...(command.environment || {}) },
     model,
-    systemPrompt: session.instructions
-      ? { type: "preset", preset: "claude_code", append: session.instructions }
-      : { type: "preset", preset: "claude_code" },
+    systemPrompt: {
+      type: "preset",
+      preset: "claude_code",
+      append: [session.instructions, TOOL_PERMISSION_GUIDANCE].filter(Boolean).join("\n\n"),
+    },
     settingSources: ["user", "project", "local"],
     includePartialMessages: true,
     abortController,
@@ -1092,6 +1138,7 @@ async function sendTurn(command) {
     tools: builtinTools,
     disallowedTools: disallowedProviderTools(session.deniedTools),
     hooks: {
+      PostToolBatch: [{ hooks: [permissionBatchHook(command.turnId)] }],
       PreToolUse: [
         {
           hooks: [
@@ -1124,11 +1171,12 @@ async function sendTurn(command) {
   };
 
   let completion = null;
+  let turnPermissions = new Map();
   let timedOut = false;
   const timeout = session.timeoutSeconds
     ? setTimeout(() => {
         timedOut = true;
-        abortController.abort();
+        abortController.abort({ source: "runtime_timeout" });
       }, session.timeoutSeconds * 1000)
     : null;
   try {
@@ -1142,6 +1190,8 @@ async function sendTurn(command) {
         emitContent(command.turnId, message);
       else if (message.type === "user")
         emitUserToolResults(command.turnId, message);
+      else if (message.type === "system" && message.subtype === "permission_denied")
+        sdkPermissionDenied(command.turnId, message);
       else if (message.type === "result") {
         await emitNativeAgentHistory(
           command.workspace,
@@ -1183,9 +1233,10 @@ async function sendTurn(command) {
       "External tool call interrupted",
     );
     streamMessageIds.delete(command.turnId);
-    for (const [callId, denied] of deniedProviderToolCalls) {
-      if (denied.turnId === command.turnId) deniedProviderToolCalls.delete(callId);
-    }
+    turnPermissions = new Map(
+      [...providerToolPermissions].filter(([, recorded]) => recorded.turnId === command.turnId),
+    );
+    for (const callId of turnPermissions.keys()) providerToolPermissions.delete(callId);
     runs.delete(command.turnId);
   }
 
@@ -1227,7 +1278,7 @@ async function sendTurn(command) {
   write({
     event: "history_snapshot",
     sessionId: command.sessionId,
-    history: await readHistory(command.workspace, command.sessionId),
+    history: await readHistory(command.workspace, command.sessionId, turnPermissions),
   });
 }
 
@@ -1373,7 +1424,7 @@ async function handle(command) {
         (pending) => pending.turnId === command.turnId,
         "External tool call interrupted",
       );
-      runs.get(command.turnId)?.abort();
+      runs.get(command.turnId)?.abort({ source: "runtime_interrupt" });
       write({
         event: "interrupt_accepted",
         requestId: command.requestId,
@@ -1394,7 +1445,7 @@ async function handle(command) {
       });
       break;
     case "shutdown":
-      for (const controller of runs.values()) controller.abort();
+      for (const controller of runs.values()) controller.abort({ source: "runtime_shutdown" });
       interruptExternalToolCalls(
         () => true,
         "External tool bridge shut down",
