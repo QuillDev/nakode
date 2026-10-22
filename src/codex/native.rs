@@ -202,7 +202,7 @@ impl BackendConfig {
     }
 
     #[cfg(test)]
-    fn with_auth_urls(mut self, base_url: &str) -> Self {
+    pub(crate) fn with_auth_urls(mut self, base_url: &str) -> Self {
         self.auth_urls = AuthUrls {
             authorize: format!("{base_url}/oauth/authorize"),
             user_code: format!("{base_url}/device/usercode"),
@@ -220,7 +220,7 @@ impl BackendConfig {
     }
 
     #[cfg(test)]
-    fn with_base_url(mut self, base_url: String) -> Self {
+    pub(crate) fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url;
         self.client = Client::builder()
             .no_proxy()
@@ -2739,6 +2739,12 @@ async fn refresh_credential(
         .send()
         .await
         .map_err(|error| safe_adapter_error("token refresh failed", &error))?;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return Err(format!(
+            "token refresh returned {}; reconnect this Codex account before retrying",
+            response.status()
+        ));
+    }
     if !response.status().is_success() {
         return Err(format!("token refresh returned {}", response.status()));
     }
