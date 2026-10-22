@@ -2640,12 +2640,21 @@ mod tests {
         assert_eq!(outcome, (TurnOutcome::Completed, None));
         assert_eq!(
             native_denials.len(),
-            2,
+            4,
             "native denials: {native_denials:#?}"
         );
         assert!(
             native_denials["toolu_native_agent"]
                 .contains("native Agent tool is disabled in Nakode"),
+            "{native_denials:#?}"
+        );
+        assert!(
+            native_denials["toolu_native_task"].contains("native Task tool is disabled in Nakode"),
+            "{native_denials:#?}"
+        );
+        assert!(
+            native_denials["toolu_future_native"]
+                .contains("SpawnAgentTeam is outside Nakode's Claude tool boundary"),
             "{native_denials:#?}"
         );
         assert!(
@@ -2886,7 +2895,8 @@ process.stdout.write(output);
         assert!(BRIDGE_SOURCE.contains("CLAUDE_POLICY_TOOLS.has(name)"));
         assert!(BRIDGE_SOURCE.contains("denied: true"));
         assert!(BRIDGE_SOURCE.contains("denialReason: message"));
-        assert!(BRIDGE_SOURCE.contains("tools: builtinTools"));
+        assert!(BRIDGE_SOURCE.contains("    tools: builtinTools,"));
+        assert!(BRIDGE_SOURCE.contains("? [...UNRESTRICTED_BUILTIN_TOOLS]"));
         assert!(!BRIDGE_SOURCE.contains("tools: allowedTools"));
         assert!(
             BRIDGE_SOURCE.contains("disallowedTools: disallowedProviderTools(session.deniedTools)")

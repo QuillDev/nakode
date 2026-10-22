@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   NATIVE_DELEGATION_TOOLS,
+  UNRESTRICTED_BUILTIN_TOOLS,
   disallowedProviderTools,
   immediateProviderToolDecision,
   preToolUseOutput,
@@ -93,4 +94,27 @@ test("native delegation tools are always disallowed alongside archetype denials"
     "Bash",
     ...NATIVE_DELEGATION_TOOLS,
   ]);
+});
+
+test("unrestricted archetypes fail closed for built-ins outside the reviewed boundary", () => {
+  for (const mode of PERMISSION_MODES) {
+    // Unknown names stand in for agent-starting tools a later Claude Code release adds.
+    for (const toolName of ["SpawnAgentTeam", "Coordinator", "REPL", "CronCreate"]) {
+      const result = immediateProviderToolDecision([], null, mode, toolName);
+      assert.equal(result?.behavior, "deny", `${toolName} in ${mode}`);
+    }
+  }
+  assert.deepEqual(immediateProviderToolDecision([], null, "bypassPermissions", "Read"), {
+    behavior: "allow",
+  });
+  assert.deepEqual(
+    immediateProviderToolDecision([], null, "bypassPermissions", "mcp__github__get_issue"),
+    { behavior: "allow" },
+  );
+});
+
+test("the reviewed boundary never contains a native delegation tool", () => {
+  for (const toolName of NATIVE_DELEGATION_TOOLS) {
+    assert.equal(UNRESTRICTED_BUILTIN_TOOLS.includes(toolName), false, toolName);
+  }
 });

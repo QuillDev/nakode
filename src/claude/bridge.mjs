@@ -6,6 +6,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
 import {
+  UNRESTRICTED_BUILTIN_TOOLS,
   disallowedProviderTools,
   immediateProviderToolDecision,
   nativeDelegationDecision,
@@ -1069,8 +1070,9 @@ async function sendTurn(command) {
   if (session.externalTools.length > 0) {
     mcpServers.nakode_external = externalToolsServer(session, command.turnId);
   }
+  // Always a positive list: Claude Code otherwise offers every built-in, including new ones.
   const builtinTools = allowedTools === null
-    ? null
+    ? [...UNRESTRICTED_BUILTIN_TOOLS]
     : allowedTools.filter((name) => !name.startsWith("mcp__"));
   const options = {
     cwd: command.workspace,
@@ -1087,7 +1089,7 @@ async function sendTurn(command) {
     permissionMode: mode,
     ...(mode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
     ...(session.maxTurns ? { maxTurns: session.maxTurns } : {}),
-    ...(builtinTools !== null ? { tools: builtinTools } : {}),
+    tools: builtinTools,
     disallowedTools: disallowedProviderTools(session.deniedTools),
     hooks: {
       PreToolUse: [

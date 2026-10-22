@@ -6,6 +6,8 @@
 
 const TOOL_USE_ID = "toolu_stub_delegate";
 const NATIVE_AGENT_ID = "toolu_native_agent";
+const NATIVE_TASK_ID = "toolu_native_task";
+const FUTURE_NATIVE_ID = "toolu_future_native";
 const NATIVE_SUBAGENT_READ_ID = "toolu_native_subagent_read";
 const NATIVE_DELEGATION_TOOLS = [
   "Agent",
@@ -15,6 +17,7 @@ const NATIVE_DELEGATION_TOOLS = [
   "TeamCreate",
   "TeamDelete",
   "RemoteTrigger",
+  "ListAgents",
 ];
 
 export function tool(name, description, schema, handler) {
@@ -110,8 +113,13 @@ export function query({ options }) {
     signal: options.abortController.signal,
   });
   return (async function* turn() {
+    // Without a positive `tools` list Claude Code offers every built-in it has.
+    if (!Array.isArray(options.tools)) {
+      yield { type: "result", subtype: "error", is_error: true, result: "no tool boundary" };
+      return;
+    }
     const offered = NATIVE_DELEGATION_TOOLS.filter(
-      (name) => !options.disallowedTools?.includes(name),
+      (name) => options.tools.includes(name) || !options.disallowedTools?.includes(name),
     );
     if (offered.length > 0) {
       yield {
@@ -130,6 +138,22 @@ export function query({ options }) {
         "Agent",
         { subagent_type: "general-purpose", description: "Read", prompt: "Read README.md" },
         NATIVE_AGENT_ID,
+        null,
+      ),
+      // The legacy name current Claude Code still offers by default.
+      await nativeAttempt(
+        options,
+        "Task",
+        { subagent_type: "general-purpose", description: "Read", prompt: "Read README.md" },
+        NATIVE_TASK_ID,
+        null,
+      ),
+      // A built-in a later Claude Code release might add to start agents.
+      await nativeAttempt(
+        options,
+        "SpawnAgentTeam",
+        { prompt: "Read README.md" },
+        FUTURE_NATIVE_ID,
         null,
       ),
       // A native subagent started some other way, such as a forked skill.

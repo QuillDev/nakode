@@ -10,7 +10,49 @@ export const NATIVE_DELEGATION_TOOLS = Object.freeze([
   "TeamCreate",
   "TeamDelete",
   "RemoteTrigger",
+  "ListAgents",
 ]);
+
+// The positive boundary for archetypes without a tool allowlist: Claude Code built-ins known to act
+// only inside this session. A built-in Claude Code adds later, including any new agent-starting
+// variant, is neither offered nor allowed until it is reviewed and listed here. MCP tools (Nakode's
+// own and configured servers) stay governed by the archetype deny list.
+export const UNRESTRICTED_BUILTIN_TOOLS = Object.freeze([
+  "Bash",
+  "BashOutput",
+  "KillShell",
+  "Read",
+  "Edit",
+  "Write",
+  "Glob",
+  "Grep",
+  "NotebookEdit",
+  "LSP",
+  "WebFetch",
+  "WebSearch",
+  "TodoWrite",
+  "TaskOutput",
+  "TaskStop",
+  "TaskCreate",
+  "TaskGet",
+  "TaskUpdate",
+  "TaskList",
+  "AskUserQuestion",
+  "EnterPlanMode",
+  "ExitPlanMode",
+  "EnterWorktree",
+  "ExitWorktree",
+  "Monitor",
+  "Skill",
+  "ToolSearch",
+  "ListMcpResources",
+  "ReadMcpResource",
+  "ReadMcpResourceDir",
+]);
+
+function isMcpTool(toolName) {
+  return typeof toolName === "string" && toolName.startsWith("mcp__");
+}
 
 const NAKODE_DELEGATION_HINT =
   "Delegate through the Nakode delegate tool when it is offered; otherwise do the work directly.";
@@ -54,6 +96,16 @@ export function immediateProviderToolDecision(
     return {
       behavior: "deny",
       message: `Archetype policy explicitly denies ${toolName}.`,
+    };
+  }
+  if (
+    allowedTools === null &&
+    !isMcpTool(toolName) &&
+    !UNRESTRICTED_BUILTIN_TOOLS.includes(toolName)
+  ) {
+    return {
+      behavior: "deny",
+      message: `${toolName} is outside Nakode's Claude tool boundary.`,
     };
   }
   if (allowedTools !== null && !allowedTools.includes(toolName)) {
