@@ -672,7 +672,7 @@ async fn run_supervisor(
                 }
             }
             message = async { bridge.as_mut().expect("guarded").messages.recv().await }, if bridge.is_some() => {
-                let Some(message) = message else {
+                let Some(mut message) = message else {
                     // The exited bridge's tool calls can no longer receive a result.
                     delegations.cancel_all();
                     let _ = events.send(BackendEvent::Disconnected { reason: "Claude SDK bridge exited".to_owned() }).await;
@@ -703,12 +703,12 @@ async fn run_supervisor(
                     }
                     continue;
                 };
-                let event_name = message.get("event").and_then(Value::as_str);
-                if matches!(event_name, Some("history_snapshot" | "session_resumed"))
+                if matches!(message["event"].as_str(), Some("history_snapshot" | "session_resumed"))
                     && let Some(database) = config.session_database.clone()
                 {
-                    keep_history_snapshot(database, &message).await;
+                    keep_history_snapshot(database, &mut message).await;
                 }
+                let event_name = message.get("event").and_then(Value::as_str);
                 if event_name == Some("history_snapshot") {
                     continue;
                 }
@@ -1894,30 +1894,72 @@ async fn desktop_request(message: &Value, owner: Option<&str>) -> Value {
 
 /// Keeps the bridge's latest history for a session. The Claude SDK owns the transcript itself;
 /// this copy exists only so a session that is not loaded can still be read.
-async fn keep_history_snapshot(database: PathBuf, message: &Value) {
+async fn keep_history_snapshot(database: PathBuf, message: &mut Value) {
+    use rusqlite::OptionalExtension as _;
     let session_id = string(message, "sessionId");
-    let Some(history) = message.get("history").filter(|history| history.is_array()) else {
+    let Some(mut history) = message
+        .get("history")
+        .filter(|history| history.is_array())
+        .cloned()
+    else {
         return;
     };
     if session_id.is_empty() {
         return;
     }
-    let history = history.to_string();
-    let saved = tokio::task::spawn_blocking(move || {
-        let connection = rusqlite::Connection::open(&database)?;
+    let saved = tokio::task::spawn_blocking(move || -> Result<Value, rusqlite::Error> {
+        let mut connection = rusqlite::Connection::open(&database)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute(
+        let transaction = connection.transaction()?;
+        let previous: Option<String> = transaction.query_row(
+            "SELECT history_json FROM provider_history_snapshots WHERE provider = ?1 AND session_id = ?2",
+            rusqlite::params![CLAUDE_PROVIDER, session_id],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(previous) = previous.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()) {
+            retain_history_permissions(&mut history, &previous);
+        }
+        transaction.execute(
             "INSERT INTO provider_history_snapshots (provider, session_id, history_json, updated_at)
              VALUES (?1, ?2, ?3, unixepoch())
              ON CONFLICT(provider, session_id) DO UPDATE SET
                history_json = excluded.history_json,
                updated_at = excluded.updated_at",
-            rusqlite::params![CLAUDE_PROVIDER, session_id, history],
-        )
+            rusqlite::params![CLAUDE_PROVIDER, session_id, history.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(history)
     })
     .await;
-    if let Ok(Err(error)) = saved {
-        eprintln!("claude: could not keep the session history snapshot: {error}");
+    match saved {
+        Ok(Ok(history)) => message["history"] = history,
+        Ok(Err(error)) => eprintln!("claude: could not keep the session history snapshot: {error}"),
+        Err(error) => eprintln!("claude: history snapshot task failed: {error}"),
+    }
+}
+
+// The SDK's history does not retain host callback provenance. Preserve only Nakode's prior
+// evidence for the same provider session and exact call id, never infer it from model/tool text.
+fn retain_history_permissions(history: &mut Value, previous: &Value) {
+    let permissions: std::collections::HashMap<_, _> = previous
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["kind"] == "tool" && row["permission"].is_object())
+        .filter_map(|row| row["id"].as_str().map(|id| (id, row)))
+        .collect();
+    for row in history.as_array_mut().into_iter().flatten() {
+        if row["kind"] != "tool"
+            || (row["permission"].is_object() && row["permission"]["source"] != "sdk_unknown")
+        {
+            continue;
+        }
+        let Some(saved) = row["id"].as_str().and_then(|id| permissions.get(id)) else {
+            continue;
+        };
+        for field in ["permission", "denied", "denialReason"] {
+            row[field] = saved[field].clone();
+        }
     }
 }
 
@@ -1945,8 +1987,8 @@ pub async fn backfill_history_snapshots(database: PathBuf, sessions: Vec<(String
         }
         loop {
             match timeout(Duration::from_secs(30), bridge.messages.recv()).await {
-                Ok(Some(message)) if message["event"] == "history_snapshot" => {
-                    keep_history_snapshot(database.clone(), &message).await;
+                Ok(Some(mut message)) if message["event"] == "history_snapshot" => {
+                    keep_history_snapshot(database.clone(), &mut message).await;
                     break;
                 }
                 Ok(Some(_)) => {}
@@ -2027,6 +2069,9 @@ fn session_history(message: &Value) -> Vec<crate::backend::SessionHistoryItem> {
                         "name": string(value, "title"),
                         "args": saved["input"],
                         "result": saved,
+                        "permission": value["permission"],
+                        "denied": value["denied"],
+                        "denialReason": value["denialReason"],
                     }),
                     status,
                 )
@@ -2145,6 +2190,9 @@ fn tool_audit(message: &Value, status: ItemStatus) -> Option<Box<str>> {
         },
         "denied": message.get("denied").and_then(Value::as_bool).unwrap_or(false),
         "denialReason": message.get("denialReason").and_then(Value::as_str),
+        "permission": message.get("permission"),
+        "error": message.get("denialReason").and_then(Value::as_str)
+            .map(|reason| bounded_claude_audit_value(&Value::String(reason.to_owned()))),
     }))
     .ok()
     .map(String::into_boxed_str)
@@ -2440,6 +2488,28 @@ mod tests {
             .arg(test)
             .output()
             .expect("Node tool policy test");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn claude_permission_provenance_isolated() {
+        let directory = tempfile::tempdir().expect("isolated permission directory");
+        std::fs::write(directory.path().join("bridge.mjs"), BRIDGE_SOURCE).expect("bridge");
+        std::fs::write(directory.path().join("tool_policy.mjs"), TOOL_POLICY_SOURCE)
+            .expect("tool policy");
+        let test = directory.path().join("tool_provenance.test.mjs");
+        std::fs::write(&test, include_str!("tool_provenance.test.mjs")).expect("provenance test");
+        let output = std::process::Command::new("node")
+            .envs(crate::machine_path::environment())
+            .arg("--test")
+            .arg(test)
+            .output()
+            .expect("Node provenance test");
         assert!(
             output.status.success(),
             "{}\n{}",
@@ -2893,8 +2963,8 @@ process.stdout.write(output);
         assert!(!BRIDGE_SOURCE.contains("node:child_process"));
         assert!(!BRIDGE_SOURCE.contains("NAKODE_EXECUTABLE"));
         assert!(BRIDGE_SOURCE.contains("CLAUDE_POLICY_TOOLS.has(name)"));
-        assert!(BRIDGE_SOURCE.contains("denied: true"));
-        assert!(BRIDGE_SOURCE.contains("denialReason: message"));
+        assert!(BRIDGE_SOURCE.contains("permission.decision === \"deny\""));
+        assert!(BRIDGE_SOURCE.contains("denialReason: permission.reason"));
         assert!(BRIDGE_SOURCE.contains("    tools: builtinTools,"));
         assert!(BRIDGE_SOURCE.contains("? [...UNRESTRICTED_BUILTIN_TOOLS]"));
         assert!(!BRIDGE_SOURCE.contains("tools: allowedTools"));
@@ -2916,7 +2986,8 @@ process.stdout.write(output);
                 "output": "permission denied"
             },
             "denied": true,
-            "denialReason": "Archetype policy does not allow Bash."
+            "denialReason": "Archetype policy does not allow Bash.",
+            "permission": {"decision": "deny", "source": "policy", "reason": "Archetype policy does not allow Bash.", "mode": "auto"}
         }));
         let BackendEvent::ItemCompleted { item, .. } = event else {
             panic!("expected completed tool event");
@@ -2928,6 +2999,13 @@ process.stdout.write(output);
         )
         .expect("audit json");
         assert_eq!(audit["denied"], true);
+        assert_eq!(audit["permission"]["source"], "policy");
+        assert!(
+            audit["error"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("Archetype policy")
+        );
         assert_eq!(audit["name"], "Bash");
         assert!(
             audit["input"]["value"]
@@ -2943,6 +3021,34 @@ process.stdout.write(output);
             audit["denialReason"],
             "Archetype policy does not allow Bash."
         );
+    }
+
+    #[tokio::test]
+    async fn claude_snapshot_restoration_preserves_host_permission_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("history.sqlite");
+        rusqlite::Connection::open(&database).unwrap().execute_batch(
+            "CREATE TABLE provider_history_snapshots (provider TEXT, session_id TEXT, history_json TEXT, updated_at INTEGER, PRIMARY KEY(provider, session_id));"
+        ).unwrap();
+        let permission = json!({"decision": "deny", "source": "validator_error", "reason": "Validator unavailable"});
+        let row = json!({"id": "call", "kind": "tool", "title": "Bash", "status": "failed", "body": r#"{"input":{"command":"git status"},"output":"denied"}"#});
+        let mut original = row.clone();
+        original["permission"] = permission.clone();
+        original["denied"] = json!(true);
+        original["denialReason"] = json!("Validator unavailable");
+        let mut first = json!({"sessionId": "session", "history": [original]});
+        keep_history_snapshot(database.clone(), &mut first).await;
+        let mut resumed = json!({"sessionId": "session", "history": [row.clone()]});
+        keep_history_snapshot(database.clone(), &mut resumed).await;
+        assert_eq!(resumed["history"][0]["permission"], permission);
+        let restored = retained_history(&database, "session").unwrap().unwrap();
+        let audit: Value =
+            serde_json::from_str(restored[0].item.tool_audit_json.as_deref().unwrap()).unwrap();
+        assert_eq!(audit["permission"], permission);
+        assert_eq!(audit["denied"], true);
+        let mut other = json!({"sessionId": "other-session", "history": [row]});
+        keep_history_snapshot(database, &mut other).await;
+        assert!(other["history"][0]["permission"].is_null());
     }
 
     fn ticket_stage_tools() -> Vec<nakode_protocol::ExternalToolDefinition> {

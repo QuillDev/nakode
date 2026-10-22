@@ -63,6 +63,8 @@ state.
 - Local process execution, file mutation, workspace policy, and supervision
 - Approval policy, permission envelopes, unattended mode, and cancellation for
   in-process sessions
+- Claude permission provenance distinguishes policy, validator, approval, runtime interruption,
+  and unattributed SDK cancellation without changing permission enforcement. `docs/claude-permission-provenance.md`.
 - Shared skills and their provider-specific materialization
 - Shared memory, provenance, scopes, confidence, and supersession
 - Provider enablement and user model-default preferences
