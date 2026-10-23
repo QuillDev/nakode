@@ -39,8 +39,8 @@ const MAX_ENDPOINT_BYTES: usize = 512;
 /// Largest log tail one inspection returns.
 pub(crate) const MAX_LOG_TAIL_BYTES: u32 = 64 * 1024;
 pub(crate) const DEFAULT_LOG_TAIL_BYTES: u32 = 8 * 1024;
-/// Terminal records returned by a list beside every unended task.
-const RECENT_ENDED_TASKS: usize = 50;
+/// Failure diagnostics expire after seven days; actionable records do not.
+const DIAGNOSTIC_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
 const OWNER_DELETION_GRACE: Duration = Duration::from_secs(3);
@@ -305,6 +305,128 @@ impl BackgroundTaskService {
             .ok_or_else(|| format!("unknown background task {task_id}"))
     }
 
+    /// Idempotent exact-ID stop acknowledgement for integrations and tools.
+    pub(crate) async fn stop_ack(
+        self: &Arc<Self>,
+        scope: Option<&CallerScope>,
+        task_id: &str,
+        grace: Option<Duration>,
+    ) -> Result<(), String> {
+        if let Some(scope) = scope
+            && self.authorized(scope, task_id).is_err()
+        {
+            return self.dismiss(Some(scope), task_id).await;
+        }
+        match self.stop(task_id, StopReason::Requested, grace).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // A concurrent successful exit/stop/delete may already have removed the row.
+                // A receipt is required; arbitrary missing identities never acknowledge success.
+                if self.with_store(|store| store.get(task_id))?.is_none() {
+                    self.dismiss(scope, task_id).await
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    /// Acknowledges only a confirmed terminal failure; never sends a signal.
+    pub(crate) async fn dismiss(
+        &self,
+        scope: Option<&CallerScope>,
+        task_id: &str,
+    ) -> Result<(), String> {
+        let coordination = self.coordination.lock().await;
+        let Some(record) = self.with_store(|store| store.get(task_id))? else {
+            let receipt = self.with_store(|store| store.receipt(task_id))?;
+            return match receipt {
+                Some((owner, run))
+                    if scope.is_none_or(|scope| {
+                        scope.owner == owner
+                            && scope
+                                .run_id
+                                .as_ref()
+                                .is_none_or(|id| run.as_ref() == Some(id))
+                    }) =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!("unknown background task {task_id}")),
+            };
+        };
+        if scope.is_some_and(|scope| !scope.may_access(&record)) {
+            return Err(format!("unknown background task {task_id}"));
+        }
+        if !record.state.ended() || coordination.stopping.contains(task_id) {
+            return Err("background task is not a confirmed terminal failure".to_owned());
+        }
+        self.confirm_gone(&record).await?;
+        self.remove(&record)
+    }
+
+    fn remove(&self, record: &TaskRecord) -> Result<(), String> {
+        self.with_store(|store| store.remove(record))?;
+        self.purge_logs(&record.task_id);
+        if let Ok(mut exits) = self.leader_exits.lock() {
+            exits.remove(&record.task_id);
+        }
+        Ok(())
+    }
+
+    /// Never trust persisted paths for deletion: only generated task-owned diagnostic names.
+    fn purge_logs(&self, task_id: &str) {
+        if !task_id.starts_with("bgt_")
+            || !task_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return;
+        }
+        let log = self.log_directory.join(format!("{task_id}.log"));
+        for path in [&log, &crate::service_log::archive_path(&log)] {
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                report_failure(&format!("could not remove task diagnostic: {error}"));
+            }
+        }
+    }
+
+    fn collect_diagnostics(&self) {
+        let Ok(records) = self.with_store(|store| store.list(None)) else {
+            return;
+        };
+        let cutoff = now_ms().saturating_sub(DIAGNOSTIC_RETENTION_MS);
+        for record in records {
+            if record.state.ended() && record.ended_at_ms.is_some_and(|ended| ended < cutoff) {
+                self.purge_logs(&record.task_id);
+            }
+        }
+        // A crash between the registry transaction and unlink must not leak diagnostics.
+        let Ok(entries) = std::fs::read_dir(&self.log_directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id) = name
+                .strip_suffix(".log.1")
+                .or_else(|| name.strip_suffix(".log"))
+            else {
+                continue;
+            };
+            if self
+                .with_store(|store| store.receipt(id))
+                .is_ok_and(|receipt| receipt.is_some())
+            {
+                self.purge_logs(id);
+            }
+        }
+    }
+
     // ---- Owner-integration operations used by the public API ----
 
     /// Every task in this runtime, or every task of one owner, including orphans.
@@ -366,7 +488,11 @@ impl BackgroundTaskService {
         if let Ok(current) = self.record(task_id) {
             record.owner_deleted_at_ms = current.owner_deleted_at_ms;
         }
-        let saved = self.save(&mut record);
+        let saved = if record.state.ended() {
+            self.remove(&record)
+        } else {
+            self.save(&mut record)
+        };
         coordination.stopping.remove(task_id);
         saved.map(|()| view(&record))
     }
@@ -433,24 +559,27 @@ impl BackgroundTaskService {
             }
         };
         // Stop concurrently so cleanup takes one grace period, not one per task.
-        let stops = records
-            .into_iter()
-            .filter(|record| !record.state.ended())
-            .map(|record| async move {
-                let _ = self
-                    .stop(
-                        &record.task_id,
-                        StopReason::OwnerDeleted,
-                        Some(OWNER_DELETION_GRACE),
-                    )
-                    .await;
-                // A stop that was already in progress settles on its own schedule.
-                self.wait_for_stop(&record.task_id).await;
-                let gone = self
-                    .record(&record.task_id)
-                    .is_ok_and(|current| current.state.ended());
-                (record.task_id, gone)
-            });
+        let stops = records.into_iter().map(|record| async move {
+            if record.state.ended() {
+                let coordination = self.coordination.lock().await;
+                let gone = self.confirm_gone(&record).await.is_ok() && self.remove(&record).is_ok();
+                drop(coordination);
+                return (record.task_id, gone);
+            }
+            let _ = self
+                .stop(
+                    &record.task_id,
+                    StopReason::OwnerDeleted,
+                    Some(OWNER_DELETION_GRACE),
+                )
+                .await;
+            // A stop that was already in progress settles on its own schedule.
+            self.wait_for_stop(&record.task_id).await;
+            let gone = self
+                .with_store(|store| store.receipt(&record.task_id))
+                .is_ok_and(|receipt| receipt.is_some());
+            (record.task_id, gone)
+        });
         let mut cleanup = OwnerCleanup::default();
         for (task_id, gone) in futures_util::future::join_all(stops).await {
             if gone {
@@ -501,21 +630,9 @@ fn view(record: &TaskRecord) -> BackgroundTaskView {
 }
 
 impl BackgroundTaskService {
-    /// Every unended task plus the most recent ended ones, oldest first.
+    /// Failures remain actionable until acknowledged, without a recent-history cap.
     fn bounded_views(records: Vec<TaskRecord>) -> Vec<BackgroundTaskView> {
-        let ended = records.iter().filter(|record| record.state.ended()).count();
-        let mut skip = ended.saturating_sub(RECENT_ENDED_TASKS);
-        records
-            .into_iter()
-            .filter(|record| {
-                if record.state.ended() && skip > 0 {
-                    skip -= 1;
-                    return false;
-                }
-                true
-            })
-            .map(|record| view(&record))
-            .collect()
+        records.into_iter().map(|record| view(&record)).collect()
     }
 
     async fn detail(&self, record: TaskRecord, log_tail_bytes: u32) -> BackgroundTaskDetail {
@@ -549,6 +666,37 @@ impl BackgroundTaskService {
 
 #[cfg(unix)]
 impl BackgroundTaskService {
+    fn processes(
+        &self,
+        record: &TaskRecord,
+        table: &os::ProcessTable,
+    ) -> Result<os::TaskProcesses, String> {
+        let Some(group) = record.process_id else {
+            if record.state == TaskState::FailedToStart || record.state == TaskState::Stopped {
+                return Ok(os::TaskProcesses::default());
+            }
+            return Err("background task process identity is unknown".to_owned());
+        };
+        let start = record
+            .process_start
+            .as_deref()
+            .filter(|start| !start.is_empty())
+            .ok_or_else(|| "background task process identity is unknown".to_owned())?;
+        let mut tracked = self.with_store(|store| store.tracked(&record.task_id))?;
+        let processes = table.tracked_task_processes(group, start, &mut tracked);
+        self.with_store(|store| store.track(&record.task_id, &tracked))?;
+        Ok(processes)
+    }
+
+    async fn confirm_gone(&self, record: &TaskRecord) -> Result<(), String> {
+        let table = os::ProcessTable::capture().await?;
+        if self.processes(record, &table)?.is_empty() {
+            Ok(())
+        } else {
+            Err("background task still has live processes".to_owned())
+        }
+    }
+
     /// Spawns the leader in its own process group with output appended to the task log.
     async fn launch(
         self: &Arc<Self>,
@@ -625,7 +773,11 @@ impl BackgroundTaskService {
                     signal: None,
                 },
             };
-            if let Ok(mut exits) = service.leader_exits.lock() {
+            if let Ok(mut exits) = service.leader_exits.lock()
+                && service
+                    .with_store(|store| store.get(&task_id))
+                    .is_ok_and(|record| record.is_some())
+            {
                 exits.insert(task_id, exit);
             }
             service.wake.notify_one();
@@ -641,7 +793,13 @@ impl BackgroundTaskService {
             return;
         };
         let leader_start = record.process_start.clone().unwrap_or_default();
-        let mut tracked = HashMap::new();
+        let mut tracked = match self.with_store(|store| store.tracked(&record.task_id)) {
+            Ok(tracked) => tracked,
+            Err(error) => {
+                fail_cleanup(record, &error);
+                return;
+            }
+        };
         let mut failures = Vec::new();
         for (signal, wait) in [(Signal::SIGTERM, grace), (Signal::SIGKILL, KILL_SETTLE)] {
             let processes = match os::ProcessTable::capture().await {
@@ -651,6 +809,10 @@ impl BackgroundTaskService {
                     return;
                 }
             };
+            if let Err(error) = self.with_store(|store| store.track(&record.task_id, &tracked)) {
+                fail_cleanup(record, &error);
+                return;
+            }
             if processes.is_empty() {
                 self.finish_stopped(record);
                 return;
@@ -685,9 +847,10 @@ impl BackgroundTaskService {
     /// The task's process group, or `None` after recording that no process was ever started.
     fn resolve_identity(record: &mut TaskRecord) -> Option<i32> {
         if record.process_id.is_none() {
-            record.state = TaskState::Stopped;
-            record.detail = Some("no process was started; nothing was signalled".to_owned());
-            record.ended_at_ms = Some(now_ms());
+            fail_cleanup(
+                record,
+                "no process identity was recorded; cleanup cannot be verified",
+            );
         }
         record.process_id
     }
@@ -714,7 +877,7 @@ impl BackgroundTaskService {
     /// running tasks are reported `unknown`, never ended.
     async fn reconcile(self: &Arc<Self>) -> bool {
         let coordination = self.coordination.lock().await;
-        let records = match self.with_store(TaskStore::list_unended) {
+        let records = match self.with_store(|store| store.list(None)) {
             Ok(records) => records,
             Err(error) => {
                 report_failure(&error);
@@ -745,7 +908,13 @@ impl BackgroundTaskService {
             match record.state {
                 TaskState::Launching => Self::reconcile_launch(&mut record, &table),
                 TaskState::Running | TaskState::CleanupFailed | TaskState::Unknown => {
-                    reconcile_running(&mut record, &table);
+                    match self.processes(&record, &table) {
+                        Ok(processes) => reconcile_running(&mut record, &processes),
+                        Err(error) => {
+                            record.state = TaskState::Unknown;
+                            record.detail = Some(error);
+                        }
+                    }
                 }
                 TaskState::Stopping => {
                     // Resume the interrupted stop with its original reason.
@@ -758,7 +927,25 @@ impl BackgroundTaskService {
                     record.supervision = String::from("adopted");
                     stops.push((record.task_id.clone(), reason));
                 }
-                _ => continue,
+                TaskState::Exited | TaskState::Stopped | TaskState::FailedToStart => {
+                    if self.confirm_gone(&record).await.is_err() {
+                        record.state = TaskState::Unknown;
+                        record.ended_at_ms = None;
+                        record.detail = Some(
+                            "terminal record could not be verified; cleanup required".to_owned(),
+                        );
+                    }
+                }
+            }
+            if record.state.ended()
+                && (record.stop_reason.is_some()
+                    || record.exit_code == Some(0)
+                    || record.owner_deleted_at_ms.is_some())
+            {
+                if let Err(error) = self.remove(&record) {
+                    report_failure(&error);
+                }
+                continue;
             }
             // A deleted owner's surviving tasks are stopped, whether or not the deletion settled.
             if record.state == TaskState::Running
@@ -819,17 +1006,10 @@ fn fail_cleanup(record: &mut TaskRecord, detail: &str) {
 }
 
 #[cfg(unix)]
-fn reconcile_running(record: &mut TaskRecord, table: &os::ProcessTable) {
-    let Some(group) = record.process_id else {
-        record.state = TaskState::Unknown;
-        record.detail = Some("no process identity was recorded".to_owned());
-        return;
-    };
-    let processes =
-        table.task_processes(group, record.process_start.as_deref().unwrap_or_default());
+fn reconcile_running(record: &mut TaskRecord, processes: &os::TaskProcesses) {
     if processes.is_empty() {
         let failed_cleanup = record.state == TaskState::CleanupFailed;
-        record.state = if failed_cleanup {
+        record.state = if failed_cleanup && record.stop_reason.is_some() {
             TaskState::Stopped
         } else {
             TaskState::Exited
@@ -868,6 +1048,7 @@ impl BackgroundTaskService {
 
     /// Settles running tasks whose process tree has gone and keeps live logs bounded.
     async fn observe(&self) {
+        self.collect_diagnostics();
         let unended = match self.with_store(TaskStore::list_unended) {
             Ok(records) => records,
             Err(error) => {
@@ -882,7 +1063,7 @@ impl BackgroundTaskService {
         let watched = unended
             .into_iter()
             .filter(|record| {
-                record.state == TaskState::Running
+                matches!(record.state, TaskState::Running | TaskState::CleanupFailed)
                     || (record.state == TaskState::Unknown && record.process_id.is_some())
             })
             .collect::<Vec<_>>();
@@ -903,11 +1084,9 @@ impl BackgroundTaskService {
             }
         };
         for record in watched {
-            let Some(group) = record.process_id else {
+            let Ok(processes) = self.processes(&record, &table) else {
                 continue;
             };
-            let processes =
-                table.task_processes(group, record.process_start.as_deref().unwrap_or_default());
             let exit = self.leader_exit(&record.task_id);
             if processes.is_empty() {
                 self.settle_exit(&record.task_id, exit).await;
@@ -968,7 +1147,14 @@ impl BackgroundTaskService {
         let Ok(mut record) = self.record(task_id) else {
             return;
         };
-        if !matches!(record.state, TaskState::Running | TaskState::Unknown) {
+        if !matches!(
+            record.state,
+            TaskState::Running | TaskState::Unknown | TaskState::CleanupFailed
+        ) {
+            return;
+        }
+        // A child waiter owns the exit status. Do not race it and lose a known successful exit.
+        if record.supervision == "child" && exit.is_none() {
             return;
         }
         record.state = TaskState::Exited;
@@ -984,7 +1170,12 @@ impl BackgroundTaskService {
             record.detail.as_deref().unwrap_or_default(),
         );
         let _ = crate::service_log::rotate_if_oversized(Path::new(&record.log_path));
-        if let Err(error) = self.save(&mut record) {
+        let result = if record.exit_code == Some(0) || record.stop_reason.is_some() {
+            self.remove(&record)
+        } else {
+            self.save(&mut record)
+        };
+        if let Err(error) = result {
             report_failure(&error);
         }
         drop(coordination);
@@ -993,6 +1184,10 @@ impl BackgroundTaskService {
 
 #[cfg(not(unix))]
 impl BackgroundTaskService {
+    async fn confirm_gone(&self, _record: &TaskRecord) -> Result<(), String> {
+        Err("background task process state is unavailable".to_owned())
+    }
+
     async fn launch(
         self: &Arc<Self>,
         _record: &mut TaskRecord,

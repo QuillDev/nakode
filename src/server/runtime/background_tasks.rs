@@ -1,5 +1,5 @@
 use super::{NativeServerRuntime, ServerCore};
-use crate::background_tasks::{self, StopReason};
+use crate::background_tasks;
 use nakode_protocol::{Command, ErrorCode, Query, QueryResult, ServiceError, Snapshot};
 
 impl NativeServerRuntime {
@@ -61,7 +61,9 @@ impl NativeServerRuntime {
                 None
             }
             nakode_server::ServerRequest::Command {
-                command: Command::StopBackgroundTask { task_id },
+                command:
+                    command @ (Command::DismissBackgroundTask { .. }
+                    | Command::StopBackgroundTask { .. }),
                 expected_revision,
                 respond,
                 ..
@@ -69,30 +71,38 @@ impl NativeServerRuntime {
                 if expected_revision.is_some() {
                     let _ = respond.send(Err(ServiceError {
                         code: ErrorCode::InvalidRequest,
-                        message: "background tasks use exact task identities, not session revision fences"
-                            .to_owned(),
+                        message: "background tasks use exact task identities, not session revision fences".to_owned(),
                         retryable: false,
                     }));
                     return None;
                 }
                 tokio::spawn(async move {
-                    let result = match service() {
-                        Ok(service) => service
-                            .stop(&task_id, StopReason::Requested, None)
-                            .await
-                            .map_err(task_error),
-                        Err(error) => Err(error),
-                    };
+                    let result = execute_command(command).await;
                     let _ =
-                        respond
-                            .send(result.map(|view| {
-                                ServerCore::accepted(Some(view.task_id), Vec::new()).0
-                            }));
+                        respond.send(result.map(|id| ServerCore::accepted(Some(id), Vec::new()).0));
                 });
                 None
             }
             request => Some(request),
         }
+    }
+}
+
+async fn execute_command(command: Command) -> Result<String, ServiceError> {
+    let service = service()?;
+    match command {
+        Command::DismissBackgroundTask { task_id } => {
+            service.dismiss(None, &task_id).await.map_err(task_error)?;
+            Ok(task_id)
+        }
+        Command::StopBackgroundTask { task_id } => {
+            service
+                .stop_ack(None, &task_id, None)
+                .await
+                .map_err(task_error)?;
+            Ok(task_id)
+        }
+        _ => unreachable!("only background task commands are dispatched here"),
     }
 }
 

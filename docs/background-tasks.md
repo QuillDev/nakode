@@ -1,78 +1,74 @@
 # Managed background tasks
 
-Long-running non-AI processes (dev servers, workers, watchers) that agents start through the
-`background_tasks` tool and owner integrations inspect through the public API. Finite work such as
-installs and builds stays with `bash`. Implementation: `src/background_tasks/`.
+Nakode supervises session-owned dev servers, workers and watchers. Finite builds and installs use
+`bash`. FStack and other clients use the public API/SDK, never the registry directly.
 
 ## Ownership and lifetime
 
-- The Nakode server process spawns every task. Providers, the Claude bridge and tool shells are
-  never the parent, so a task survives the tool call, the turn, a closed session and a provider
-  restart.
-- The owner is the calling session's authenticated logical owner (`ToolContext.session` for
-  in-process providers, the bridge's `DelegationScope` for Claude). Tool arguments cannot name an
-  owner. Without a logical owner the tool is absent (Claude) or refuses (in-process).
-- A native delegated run sees and stops only the tasks it started; the owning session sees all of
-  its tasks. Agents never see other owners' tasks.
-- Deleting the owning logical session fences new launches and marks its tasks before the durable
-  deletion. A failed deletion clears the marks and leaves the tasks running. After the deletion
-  commits, the tasks are stopped concurrently in the background (3 s grace) so deletion never waits
-  on process shutdown. Tasks that could not be proven stopped stay `cleanup_failed` orphan records
-  (`owner_deleted_at_ms`); deletion is not blocked by them, because a process that ignores SIGKILL
-  or escaped containment would otherwise make the session undeletable.
-- If the runtime stops between marking and cleanup, restart reconciliation stops every marked task.
-  This includes the rare case where the runtime stopped before a deletion committed, so the session
-  survives without those tasks.
-- Closing or archiving a session does not stop its tasks.
+- The authenticated creating logical session owns each task. Native runs are additionally scoped to
+  their own launches. Tool arguments cannot choose an owner; integrations are authenticated against
+  the execution machine. A Chat does not own tasks launched by its durable Ticket/General children.
+- Tasks survive tool completion, turns, retained close/reopen and provider changes. Only logical
+  deletion fences new launches and stops that exact session's tasks; guarded child deletion remains
+  a separate operation. Failed deletion lifts the fence and preserves unexpected failure records.
+- Committed deletion stops live trees concurrently (3 s grace), removes confirmed-clean operational
+  records and diagnostics, and retains surviving/uncertain cleanup as actionable orphan records.
+  An interrupted deletion marker is reconciled at runtime startup, without deleting application data.
 
-## Public API
+## Lifecycle and acknowledgement
 
-Capability `BackgroundTasks`. `ListBackgroundTasks` (optional owner filter), `GetBackgroundTask`
-(status, log tail, endpoint probes) and `StopBackgroundTask` (exact task id). This surface is for
-the authenticated owner integration: it sees every task on this machine, including orphans, and can
-stop one without its original owner. Lists return every unended task plus the 50 most recent ended
-ones. Each runtime reports only its own machine; aggregating machines is the client's job.
+- Intentional stops are removed after the whole managed tree is confirmed gone, regardless of shell
+  exit code or signal. Natural success (known exit code 0) is removed after whole-tree confirmation.
+- Unexpected failures (`exited`, `failed_to_start`) remain actionable until explicit dismissal. An
+  adopted task that disappears has unknown exit status and is retained, never guessed successful.
+- `cleanup_failed`, `unknown`, and trees with live descendants are not terminal service failures.
+  They remain actionable and cannot be dismissed. Running means alive, not ready; endpoint TCP
+  probes report accepting/refused/unknown from the execution machine, not application readiness.
+- Public `DismissBackgroundTask` and SDK `dismiss_background_task` acknowledge an exact task ID.
+  The real `background_tasks` tool exposes `dismiss` for its authenticated owner/run. Neither path
+  stops, restarts or resumes processes. Authorized acknowledgement needs no second confirmation.
+- Dismissal serializes with stop/deletion/monitor transitions and rechecks the process table. Live,
+  surviving, cleanup-failed, unknown, missing-identity or unreachable state refuses acknowledgement.
+  Minimal durable ID/owner/run receipts make retries idempotent, including after restart, without
+  retaining command text, logs or operational task records. Arbitrary missing IDs are not receipts.
 
-## States
+## API and projections
 
-`launching`, `running`, `stopping`, `exited`, `stopped`, `failed_to_start`, `cleanup_failed`,
-`unknown`. Only `exited`, `stopped` and `failed_to_start` are terminal. `running` means the process
-tree is alive, not that a service is ready; endpoint probes only report whether a TCP connect on
-the execution machine succeeded. `localhost` endpoints are on the execution machine.
+`ListBackgroundTasks` returns the complete live/actionable inventory (optionally filtered by owner),
+without a recent-terminal-history cap. `GetBackgroundTask` returns status, bounded log tail and
+endpoint probes. `StopBackgroundTask` targets an exact task; its receipt can remain valid after the
+operational record has already been removed. Clients must replace inventory snapshots, including
+removals, rather than union terminal rows back into state. Normal service selectors use live states
+only; attention views retain failures and uncertain cleanup. An unreachable machine is unknown,
+not a successful empty inventory.
 
-## Identity, launch and restart
+## Identity, supervision and restart
 
-- Each task leads its own process group. Its identity is the group id plus the leader's `ps`
-  start time. A live leader with another start time proves the id was reused, so nothing is
-  signalled. With the leader gone, remaining group members are treated as survivors.
-- Launch is gated: the leader blocks reading stdin until the runtime has persisted its pid and
-  start time, and exits 125 without running the command if stdin closes first. An interrupted
-  launch is therefore either recorded and adoptable or provably never ran.
-- On startup the runtime reconciles every unended record: live tasks are adopted, finished ones are
-  settled, interrupted stops resume with their original reason, and a failed process listing marks
-  tasks `unknown` rather than forgetting them. Records are never deleted.
-- Stop sends SIGTERM to the group and to descendants that left it, waits the grace period, sends
-  SIGKILL, and reports `cleanup_failed` if anything is still alive 3 s later. Descendants seen during
-  a stop stay tracked by pid and start time, so one orphaned by the first signal is still killed.
-- A launch whose identity cannot be read from `ps` closes the gate and fails without running.
-- If processes cannot be listed, running tasks become `unknown` and are re-verified later; startup
-  reconciliation is retried until it succeeds.
+Tasks lead their own process group. Identity combines leader PID and OS start time. A reused leader
+PID is never signalled; known descendants retain their own PID/start-time identities independently.
+The launch gate persists identity before releasing the command. Startup reconciles existing terminal
+records as well as active ones, removing stale confirmed successes/stops and retaining failures.
 
-## Logs
+Process observations persist escaped descendants so later reparenting and restart do not discard
+already-observed members. Stop sends SIGTERM, waits the grace period, then SIGKILL and waits 3 s;
+surviving or unverified trees remain `cleanup_failed`. Process-list failures never prove absence.
 
-stdout and stderr append to `<data dir>/background-tasks/<task id>.log`. Every 2 s, and when a task
-ends, a log above 5 MiB is rotated to `.log.1` by copy and truncate, so a few lines written during
-rotation can be lost and a very fast writer can briefly exceed the cap. Inspection reads at most
-64 KiB, spanning the archive when needed. Logs are kept after a task
-ends.
+## Diagnostics retention
 
-## Limitations
+- Active/uncertain tasks keep two rotated log generations: rotation checks every 2 s above 5 MiB,
+  approximately 10 MiB per task with transient writer overshoot. Inspection returns at most 64 KiB.
+- Successful removal, intentional confirmed stop, dismissal and confirmed owner-deletion cleanup
+  immediately unlink task-owned `.log`/`.log.1` files. A monitor sweep retries crash-interrupted
+  unlinking using durable receipts.
+- Terminal actionable failures retain diagnostics for at most seven days after their terminal
+  timestamp (plus the 2 s sweep interval); their actionable records do not expire. No archive UI.
+- Only generated task filenames in the task log directory are eligible for removal. Persisted cwd,
+  command and log-path text never authorize deleting application files, databases or volumes.
+- Minimal acknowledgement receipts persist without diagnostic payloads for exact-ID idempotency.
 
-- Unix only. Windows reports the capability as unavailable.
-- Containment is the process group plus parent links. A process that double-forks, reparents to
-  init, or hands itself to launchd or systemd cannot be attributed and is not stopped.
-- Adopted tasks (after a runtime restart) have no exit code or signal, because only the original
-  parent can collect them.
-- `ps` start times have one-second granularity; a reused pid inside the same second as the original
-  leader's start is not distinguishable.
-- No scheduling, dependencies or automatic restart.
+## Platform limits
+
+Unix only. Containment is process groups plus observed parent links: a process that completely
+escapes before it can be observed (double fork or launchd/systemd hand-off) cannot be attributed.
+Adopted processes have no collectable exit status. OS start-time precision is one second. Rotation
+uses copy/truncate and can lose a few concurrent log lines. No scheduling, restart or resume product.

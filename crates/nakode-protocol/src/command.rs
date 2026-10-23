@@ -323,6 +323,10 @@ pub enum Command {
     },
     /// Terminates one exact managed background task's process tree. Owner integrations may stop
     /// orphaned tasks; an already ended task is success.
+    /// Acknowledges an exact confirmed terminal failure without process side effects.
+    DismissBackgroundTask {
+        task_id: String,
+    },
     StopBackgroundTask {
         task_id: String,
     },

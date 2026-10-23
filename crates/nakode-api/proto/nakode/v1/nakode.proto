@@ -51,6 +51,7 @@ service NakodeService {
   rpc GetBackgroundTask(GetBackgroundTaskRequest) returns (BackgroundTaskDetail);
   // Terminates one exact task's whole process tree; an already ended task is success.
   rpc StopBackgroundTask(StopBackgroundTaskRequest) returns (MutationResult);
+  rpc DismissBackgroundTask(DismissBackgroundTaskRequest) returns (MutationResult);
   rpc ListChildQuestions(ListChildQuestionsRequest) returns (ChildQuestionSnapshot);
   rpc AnswerChildQuestions(AnswerChildQuestionsRequest) returns (MutationResult);
   rpc CreateSession(CreateSessionRequest) returns (MutationResult);
@@ -261,6 +262,10 @@ message GetBackgroundTaskRequest {
   uint32 log_tail_bytes = 2;
 }
 message StopBackgroundTaskRequest {
+  MutationOptions mutation = 1;
+  string task_id = 2;
+}
+message DismissBackgroundTaskRequest {
   MutationOptions mutation = 1;
   string task_id = 2;
 }

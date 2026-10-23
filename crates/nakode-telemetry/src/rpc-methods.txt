@@ -26,6 +26,7 @@
 /nakode.v1.NakodeService/ListBackgroundTasks
 /nakode.v1.NakodeService/GetBackgroundTask
 /nakode.v1.NakodeService/StopBackgroundTask
+/nakode.v1.NakodeService/DismissBackgroundTask
 /nakode.v1.NakodeService/ListChildQuestions
 /nakode.v1.NakodeService/AnswerChildQuestions
 /nakode.v1.NakodeService/CreateSession
@@ -44,8 +45,8 @@
 /nakode.v1.NakodeService/PruneSession
 /nakode.v1.NakodeService/ListActiveSessions
 /nakode.v1.NakodeService/ListSessionStatuses
-/nakode.v1.NakodeService/ClearSelf
 /nakode.v1.NakodeService/DeleteSession
+/nakode.v1.NakodeService/ClearSelf
 /nakode.v1.NakodeService/GetSession
 /nakode.v1.NakodeService/WatchSession
 /nakode.v1.NakodeService/SendPrompt
@@ -55,6 +56,7 @@
 /nakode.v1.NakodeService/SteerTurn
 /nakode.v1.NakodeService/CancelTurn
 /nakode.v1.NakodeService/CancelSessionWork
+/nakode.v1.NakodeService/InterruptSessionWork
 /nakode.v1.NakodeService/CompactContext
 /nakode.v1.NakodeService/ResolveInteraction
 /nakode.v1.NakodeService/ConfigureSessionTools

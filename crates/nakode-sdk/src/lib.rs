@@ -1872,6 +1872,12 @@ impl NakodeClient {
         "BackgroundTasks"
     );
 
+    typed_mutation!(
+        dismiss_background_task,
+        api::DismissBackgroundTaskRequest,
+        "BackgroundTasks"
+    );
+
     /// Reads ordered inert reports without opening either session or starting inference.
     ///
     /// # Errors

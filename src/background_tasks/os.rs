@@ -84,15 +84,19 @@ impl ProcessTable {
         leader_start: &str,
         tracked: &mut HashMap<i32, String>,
     ) -> TaskProcesses {
-        if let Some(leader) = self.entries.get(&group)
-            && leader.start != leader_start
-        {
-            return TaskProcesses::default();
-        }
+        tracked.retain(|pid, start| {
+            self.entries
+                .get(pid)
+                .is_some_and(|entry| !entry.zombie && &entry.start == start)
+        });
+        let reused = self
+            .entries
+            .get(&group)
+            .is_some_and(|leader| leader.start != leader_start);
         let members = self
             .entries
             .values()
-            .filter(|entry| entry.group == group && !entry.zombie)
+            .filter(|entry| !reused && entry.group == group && !entry.zombie)
             .map(|entry| entry.pid)
             .collect::<HashSet<_>>();
         let mut descendants = tracked

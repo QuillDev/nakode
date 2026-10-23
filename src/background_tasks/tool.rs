@@ -15,7 +15,7 @@ use crate::{
 
 pub(crate) const BACKGROUND_TASKS_TOOL_NAME: &str = "background_tasks";
 
-const DESCRIPTION: &str = "Manage long-running background processes such as dev servers, workers and watchers on this session's execution machine. The Nakode runtime supervises them: they keep running after this call and this turn, are stopped when this session is deleted, and write a bounded log. `start` launches a shell command; `list` shows this session's tasks; `inspect` returns status, a log tail and endpoint probes; `stop` terminates one task's whole process tree. Running only means the processes are alive, not that the service is ready: check the log or endpoints. Endpoints are addresses on the execution machine, so localhost there is not the owner's localhost. Use bash for finite commands such as installs and builds.";
+const DESCRIPTION: &str = "Manage long-running background processes such as dev servers, workers and watchers on this session's execution machine. The Nakode runtime supervises them: they keep running after this call and this turn, are stopped when this session is deleted, and write a bounded log. `start` launches a shell command; `list` shows this session's tasks; `inspect` returns status, a log tail and endpoint probes; `stop` terminates one task's whole process tree; `dismiss` acknowledges a confirmed terminal failure without stopping processes. Successful exits and intentional whole-tree stops are removed automatically. Running only means the processes are alive, not that the service is ready: check the log or endpoints. Endpoints are addresses on the execution machine, so localhost there is not the owner's localhost. Use bash for finite commands such as installs and builds.";
 
 pub(crate) struct BackgroundTasksTool;
 
@@ -118,6 +118,10 @@ pub(crate) async fn execute_tool_call(
                 .map(|seconds| Duration::from_secs_f64(seconds).min(MAX_STOP_GRACE));
             json!({"task": service.stop_for(&scope, task_id(arguments)?, grace).await?})
         }
+        "dismiss" => {
+            service.dismiss(Some(&scope), task_id(arguments)?).await?;
+            json!({"dismissed": task_id(arguments)?})
+        }
         other => return Err(format!("unknown background_tasks action {other:?}")),
     };
     serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
@@ -184,12 +188,12 @@ pub(crate) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["start", "list", "inspect", "stop"]},
+            "action": {"type": "string", "enum": ["start", "list", "inspect", "stop", "dismiss"]},
             "command": {"type": "string", "description": "start: shell command to run"},
             "name": {"type": "string", "description": "start: short label, such as web dev server"},
             "cwd": {"type": "string", "description": "start: working directory; workspace-relative or absolute"},
             "endpoints": {"type": "array", "items": {"type": "string"}, "maxItems": 8, "description": "start: addresses the task will serve on the execution machine, such as http://127.0.0.1:3000"},
-            "task_id": {"type": "string", "description": "inspect/stop: exact task id"},
+            "task_id": {"type": "string", "description": "inspect/stop/dismiss: exact task id"},
             "log_bytes": {"type": "integer", "minimum": 0, "maximum": MAX_LOG_TAIL_BYTES, "description": "inspect: log tail size; default 8192"},
             "grace_seconds": {"type": "number", "minimum": 0, "maximum": 60, "description": "stop: seconds between SIGTERM and SIGKILL; default 5"}
         },

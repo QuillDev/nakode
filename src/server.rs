@@ -801,9 +801,11 @@ impl ServerCore {
             | Command::AnswerChildQuestions { .. } => Err(DomainCommandError::Invalid(
                 "linked child operations require the persistence runtime".to_owned(),
             )),
-            Command::StopBackgroundTask { .. } => Err(DomainCommandError::Invalid(
-                "background tasks require the persistence runtime".to_owned(),
-            )),
+            Command::StopBackgroundTask { .. } | Command::DismissBackgroundTask { .. } => {
+                Err(DomainCommandError::Invalid(
+                    "background tasks require the persistence runtime".to_owned(),
+                ))
+            }
             Command::CreateSession {
                 parent_session_id: Some(_),
                 ..
@@ -4953,7 +4955,8 @@ impl ServerCore {
             Command::DeleteSession { .. }
             | Command::ClearSelf { .. }
             | Command::PruneSession { .. }
-            | Command::StopBackgroundTask { .. } => None,
+            | Command::StopBackgroundTask { .. }
+            | Command::DismissBackgroundTask { .. } => None,
         }
     }
 

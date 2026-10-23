@@ -163,6 +163,11 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     fixed("NakodeService", "ListBackgroundTasks", RequestLane::Query),
     fixed("NakodeService", "GetBackgroundTask", RequestLane::Query),
     fixed("NakodeService", "StopBackgroundTask", RequestLane::Control),
+    fixed(
+        "NakodeService",
+        "DismissBackgroundTask",
+        RequestLane::Control,
+    ),
     fixed("NakodeService", "ListChildReports", RequestLane::Query),
     fixed("NakodeService", "GetSoul", RequestLane::Query),
     fixed("NakodeService", "SaveSoul", RequestLane::Control),
