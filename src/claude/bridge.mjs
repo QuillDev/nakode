@@ -157,9 +157,9 @@ function desktopTool(name, session, turn) {
 function backgroundTasksTool(session, turn) {
   return tool(
     "background_tasks",
-    "Manage long-running background processes such as dev servers, workers and watchers on this session's execution machine. The Nakode runtime supervises them: they keep running after this call and this turn, are stopped when this session is deleted, and write a bounded log. `start` launches a shell command; `list` shows this session's tasks; `inspect` returns status, a log tail and endpoint probes; `stop` terminates one task's whole process tree. Running only means the processes are alive, not that the service is ready: check the log or endpoints. Endpoints are addresses on the execution machine, so localhost there is not the owner's localhost. Use Bash for finite commands such as installs and builds; prefer this tool over Bash run_in_background for anything that must outlive the turn.",
+    "Manage long-running background processes such as dev servers, workers and watchers on this session's execution machine. The Nakode runtime supervises them: they keep running after this call and this turn, are stopped when this session is deleted, and write a bounded log. `start` launches a shell command; `list` shows this session's tasks; `inspect` returns status, a log tail and endpoint probes; `stop` terminates one task's whole process tree; `dismiss` acknowledges a confirmed terminal failure without process side effects. Successful exits and intentional confirmed stops are removed automatically. Running only means the processes are alive, not that the service is ready: check the log or endpoints. Endpoints are addresses on the execution machine, so localhost there is not the owner's localhost. Use Bash for finite commands such as installs and builds; prefer this tool over Bash run_in_background for anything that must outlive the turn.",
     {
-      action: z.enum(["start", "list", "inspect", "stop"]),
+      action: z.enum(["start", "list", "inspect", "stop", "dismiss"]),
       command: z.string().min(1).optional().describe("start: shell command to run"),
       name: z.string().min(1).max(120).optional().describe("start: short label, such as web dev server"),
       cwd: z.string().min(1).optional().describe("start: working directory; workspace-relative or absolute"),
@@ -168,7 +168,7 @@ function backgroundTasksTool(session, turn) {
         .max(8)
         .optional()
         .describe("start: addresses the task will serve on the execution machine, such as http://127.0.0.1:3000"),
-      task_id: z.string().min(1).optional().describe("inspect/stop: exact task id"),
+      task_id: z.string().min(1).optional().describe("inspect/stop/dismiss: exact task id"),
       log_bytes: z.number().int().min(0).max(65536).optional().describe("inspect: log tail size; default 8192"),
       grace_seconds: z.number().min(0).max(60).optional().describe("stop: seconds between SIGTERM and SIGKILL; default 5"),
     },

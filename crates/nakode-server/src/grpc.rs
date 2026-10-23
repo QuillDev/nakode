@@ -991,6 +991,15 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
 
+    command_rpc!(
+        dismiss_background_task,
+        api::DismissBackgroundTaskRequest,
+        input,
+        protocol::Command::DismissBackgroundTask {
+            task_id: input.task_id,
+        }
+    );
+
     async fn list_child_reports(
         &self,
         request: tonic::Request<api::ListChildReportsRequest>,

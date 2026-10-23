@@ -258,7 +258,7 @@ async fn ownership_comes_from_the_caller_scope() {
 }
 
 #[tokio::test]
-async fn owner_deletion_fences_launches_terminates_tasks_and_keeps_orphan_records() {
+async fn owner_deletion_fences_launches_terminates_tasks_and_removes_clean_records() {
     let fixture = Fixture::new();
     let service = fixture.service();
     let scope = owner("owner-a");
@@ -287,12 +287,8 @@ async fn owner_deletion_fences_launches_terminates_tasks_and_keeps_orphan_record
     assert!(cleanup.incomplete.is_empty());
     assert!(!alive(group));
     let inventory = service.inventory(None).unwrap();
-    assert_eq!(inventory.tasks.len(), 1);
-    assert_eq!(
-        inventory.tasks[0].stop_reason.as_deref(),
-        Some("owner_deleted")
-    );
-    assert!(inventory.tasks[0].owner_deleted_at_ms.is_some());
+    assert!(inventory.tasks.is_empty());
+    assert!(!fixture.logs.join(format!("{}.log", task.task_id)).exists());
 }
 
 #[tokio::test]
@@ -350,8 +346,7 @@ async fn a_restart_stops_tasks_whose_owner_deletion_did_not_settle() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(!alive(group));
-    let record = restarted.record(&task.task_id).unwrap();
-    assert_eq!(record.stop_reason.as_deref(), Some("owner_deleted"));
+    eventually(async || restarted.inventory(None).unwrap().tasks.is_empty()).await;
 }
 
 #[tokio::test]
@@ -525,9 +520,7 @@ async fn an_interrupted_stop_resumes_after_restart() {
 
     let restarted = fixture.service();
     restarted.reconcile().await;
-    eventually(async || restarted.record(&task.task_id).unwrap().state == TaskState::Stopped).await;
-    let record = restarted.record(&task.task_id).unwrap();
-    assert_eq!(record.stop_reason.as_deref(), Some("owner_deleted"));
+    eventually(async || restarted.inventory(None).unwrap().tasks.is_empty()).await;
     assert!(!alive(group));
 }
 
@@ -578,6 +571,251 @@ async fn logs_are_bounded_and_include_the_archived_generation() {
     let (tail, truncated) = super::read_log_tail(&log, 4);
     assert_eq!(tail, "wer\n");
     assert!(truncated);
+}
+
+#[tokio::test]
+async fn success_is_removed_and_failure_dismissal_is_scoped_durable_and_idempotent() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let scope = owner("owner-a");
+    let success = service
+        .start(&scope, fixture.request("echo success; exit 0"))
+        .await
+        .unwrap();
+    eventually(async || {
+        service.observe().await;
+        service.list_for(&scope).unwrap().is_empty()
+    })
+    .await;
+    assert!(
+        !fixture
+            .logs
+            .join(format!("{}.log", success.task_id))
+            .exists()
+    );
+    let failed = service
+        .start(&scope, fixture.request("echo failure; exit 9"))
+        .await
+        .unwrap();
+    eventually(async || {
+        service.observe().await;
+        service.record(&failed.task_id).unwrap().state == TaskState::Exited
+    })
+    .await;
+    assert!(
+        service
+            .dismiss(Some(&owner("other")), &failed.task_id)
+            .await
+            .is_err()
+    );
+    let delegate = CallerScope {
+        run_id: Some("other-run".to_owned()),
+        ..scope.clone()
+    };
+    assert!(
+        service
+            .dismiss(Some(&delegate), &failed.task_id)
+            .await
+            .is_err()
+    );
+    let restarted = fixture.service();
+    assert!(restarted.reconcile().await);
+    assert_eq!(restarted.list_for(&scope).unwrap().len(), 1);
+    let (first, second) = tokio::join!(
+        restarted.dismiss(Some(&scope), &failed.task_id),
+        restarted.dismiss(Some(&scope), &failed.task_id),
+    );
+    first.unwrap();
+    second.unwrap();
+    assert!(
+        !fixture
+            .logs
+            .join(format!("{}.log", failed.task_id))
+            .exists()
+    );
+    let again = fixture.service();
+    assert!(again.reconcile().await);
+    assert!(again.inventory(None).unwrap().tasks.is_empty());
+    again.dismiss(Some(&scope), &failed.task_id).await.unwrap();
+    assert!(
+        again
+            .dismiss(Some(&owner("other")), &failed.task_id)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn dismissal_refuses_live_uncertain_and_cleanup_failed_without_signalling() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let scope = owner("owner-a");
+    let task = service
+        .start(&scope, fixture.request("sleep 300"))
+        .await
+        .unwrap();
+    let mut record = service.record(&task.task_id).unwrap();
+    for state in [
+        TaskState::Running,
+        TaskState::Unknown,
+        TaskState::CleanupFailed,
+        TaskState::Exited,
+    ] {
+        record.state = state;
+        service.save(&mut record).unwrap();
+        assert!(service.dismiss(Some(&scope), &task.task_id).await.is_err());
+        assert!(alive(record.process_id.unwrap()));
+    }
+    record.state = TaskState::Running;
+    service.save(&mut record).unwrap();
+    service
+        .stop_for(&scope, &task.task_id, Some(Duration::ZERO))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn intentional_nonzero_and_signal_stops_remove_records_without_touching_application_files() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let scope = owner("owner-a");
+    let application = fixture.workspace.join("application.sqlite3");
+    std::fs::write(&application, "application data").unwrap();
+    for command in [
+        "exec sleep 300",
+        "trap 'exit 23' TERM; while :; do sleep 0.1; done",
+    ] {
+        let task = service
+            .start(&scope, fixture.request(command))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        service
+            .stop_for(&scope, &task.task_id, Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert!(service.list_for(&scope).unwrap().is_empty());
+        assert!(!fixture.logs.join(format!("{}.log", task.task_id)).exists());
+    }
+    assert_eq!(
+        std::fs::read_to_string(application).unwrap(),
+        "application data"
+    );
+}
+
+#[tokio::test]
+async fn diagnostic_gc_preserves_actionable_failures_and_never_uses_persisted_application_paths() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let application = fixture.workspace.join("application.db");
+    std::fs::write(&application, "keep").unwrap();
+    let mut record = bare_record(&fixture, "bgt_old_failure", TaskState::FailedToStart);
+    record.log_path = application.display().to_string();
+    record.ended_at_ms = Some(now_ms() - super::DIAGNOSTIC_RETENTION_MS - 1);
+    let log = fixture.logs.join("bgt_old_failure.log");
+    std::fs::write(&log, "expired diagnostic").unwrap();
+    service.with_store(|store| store.insert(&record)).unwrap();
+    service.collect_diagnostics();
+    assert!(!log.exists());
+    assert_eq!(service.inventory(None).unwrap().tasks.len(), 1);
+    assert_eq!(std::fs::read_to_string(&application).unwrap(), "keep");
+    service.dismiss(None, &record.task_id).await.unwrap();
+    assert_eq!(std::fs::read_to_string(application).unwrap(), "keep");
+}
+
+#[tokio::test]
+async fn failed_owner_deletion_retains_a_concurrent_crash_and_other_owners() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let scope = owner("owner-a");
+    let crashed = service
+        .start(&scope, fixture.request("sleep 0.2; exit 19"))
+        .await
+        .unwrap();
+    let unrelated = service
+        .start(&owner("other"), fixture.request("sleep 300"))
+        .await
+        .unwrap();
+    service.begin_owner_deletion(&scope.owner).await;
+    eventually(async || {
+        service.observe().await;
+        service.record(&crashed.task_id).unwrap().state == TaskState::Exited
+    })
+    .await;
+    service.finish_owner_deletion(&scope.owner, false).await;
+    assert_eq!(service.list_for(&scope).unwrap()[0].exit_code, Some(19));
+    service.begin_owner_deletion(&scope.owner).await;
+    service
+        .finish_owner_deletion(&scope.owner, true)
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(service.list_for(&scope).unwrap().is_empty());
+    assert_eq!(service.list_for(&owner("other")).unwrap().len(), 1);
+    service
+        .stop_ack(
+            Some(&owner("other")),
+            &unrelated.task_id,
+            Some(Duration::ZERO),
+        )
+        .await
+        .unwrap();
+    service
+        .stop_ack(Some(&owner("other")), &unrelated.task_id, None)
+        .await
+        .unwrap();
+    assert!(
+        service
+            .stop_ack(Some(&scope), &unrelated.task_id, None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn stale_success_is_reconciled_but_all_failures_remain_actionable() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    for index in 0..60 {
+        let record = bare_record(
+            &fixture,
+            &format!("bgt_failure_{index}"),
+            TaskState::FailedToStart,
+        );
+        service.with_store(|store| store.insert(&record)).unwrap();
+    }
+    let mut clean = bare_record(&fixture, "bgt_stale_success", TaskState::Exited);
+    clean.process_id = Some(i32::MAX);
+    clean.process_start = Some("not a live identity".to_owned());
+    clean.exit_code = Some(0);
+    service.with_store(|store| store.insert(&clean)).unwrap();
+    assert!(service.reconcile().await);
+    assert_eq!(service.inventory(None).unwrap().tasks.len(), 60);
+    assert!(service.record(&clean.task_id).is_err());
+}
+
+#[tokio::test]
+async fn a_successful_leader_with_survivors_is_not_removed_or_dismissible() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let scope = owner("owner-a");
+    let task = service
+        .start(&scope, fixture.request("sleep 300 & exit 0"))
+        .await
+        .unwrap();
+    eventually(async || service.leader_exit(&task.task_id).is_some()).await;
+    service.observe().await;
+    assert_eq!(
+        service.record(&task.task_id).unwrap().state,
+        TaskState::Running
+    );
+    assert!(service.dismiss(Some(&scope), &task.task_id).await.is_err());
+    service
+        .stop_for(&scope, &task.task_id, Some(Duration::ZERO))
+        .await
+        .unwrap();
+    assert!(service.inventory(None).unwrap().tasks.is_empty());
 }
 
 #[test]

@@ -34,7 +34,18 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS background_tasks (
  CREATE INDEX IF NOT EXISTS background_tasks_owner
    ON background_tasks(owner_session_id, created_at_ms);
  CREATE INDEX IF NOT EXISTS background_tasks_state
-   ON background_tasks(state);";
+   ON background_tasks(state);
+ CREATE TABLE IF NOT EXISTS background_task_receipts (
+   task_id TEXT PRIMARY KEY,
+   owner_session_id TEXT NOT NULL,
+   origin_run_id TEXT
+ );
+ CREATE TABLE IF NOT EXISTS background_task_processes (
+   task_id TEXT NOT NULL,
+   process_id INTEGER NOT NULL,
+   process_start TEXT NOT NULL,
+   PRIMARY KEY (task_id, process_id)
+ );";
 
 const COLUMNS: &str =
     "task_id, name, owner_session_id, origin_run_id, origin_turn_id, origin_call_id,
@@ -245,6 +256,87 @@ impl TaskStore {
             .map_err(|error| failure(&error))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| failure(&error))
+    }
+
+    /// Atomically replace an operational record with a minimal acknowledgement receipt.
+    pub(crate) fn remove(&self, record: &TaskRecord) -> Result<(), String> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|error| failure(&error))?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO background_task_receipts VALUES (?1, ?2, ?3)",
+                params![
+                    record.task_id,
+                    record.owner_session_id,
+                    record.origin_run_id
+                ],
+            )
+            .map_err(|error| failure(&error))?;
+        transaction
+            .execute(
+                "DELETE FROM background_task_processes WHERE task_id = ?1",
+                [&record.task_id],
+            )
+            .map_err(|error| failure(&error))?;
+        transaction
+            .execute(
+                "DELETE FROM background_tasks WHERE task_id = ?1",
+                [&record.task_id],
+            )
+            .map_err(|error| failure(&error))?;
+        transaction.commit().map_err(|error| failure(&error))
+    }
+
+    pub(crate) fn receipt(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, String> {
+        self.connection.query_row(
+            "SELECT owner_session_id, origin_run_id FROM background_task_receipts WHERE task_id = ?1",
+            [task_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|error| failure(&error))
+    }
+
+    pub(crate) fn tracked(
+        &self,
+        task_id: &str,
+    ) -> Result<std::collections::HashMap<i32, String>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT process_id, process_start FROM background_task_processes WHERE task_id = ?1",
+        ).map_err(|error| failure(&error))?;
+        statement
+            .query_map([task_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| failure(&error))?
+            .collect::<Result<_, _>>()
+            .map_err(|error| failure(&error))
+    }
+
+    pub(crate) fn track(
+        &self,
+        task_id: &str,
+        tracked: &std::collections::HashMap<i32, String>,
+    ) -> Result<(), String> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|error| failure(&error))?;
+        transaction
+            .execute(
+                "DELETE FROM background_task_processes WHERE task_id = ?1",
+                [task_id],
+            )
+            .map_err(|error| failure(&error))?;
+        for (pid, start) in tracked {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO background_task_processes SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM background_tasks WHERE task_id = ?1)",
+                    params![task_id, pid, start],
+                )
+                .map_err(|error| failure(&error))?;
+        }
+        transaction.commit().map_err(|error| failure(&error))
     }
 
     /// Tasks whose processes may still be alive.
