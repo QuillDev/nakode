@@ -14,10 +14,15 @@ installs and builds stays with `bash`. Implementation: `src/background_tasks/`.
   owner. Without a logical owner the tool is absent (Claude) or refuses (in-process).
 - A native delegated run sees and stops only the tasks it started; the owning session sees all of
   its tasks. Agents never see other owners' tasks.
-- Deleting the owning logical session fences new launches, stops its tasks (3 s grace), then
-  commits the deletion. Tasks that could not be proven stopped stay `cleanup_failed` and are marked
-  orphaned (`owner_deleted_at_ms`). Deletion is not blocked by a failed cleanup, because a process
-  that ignores SIGKILL or escaped containment would otherwise make the session undeletable.
+- Deleting the owning logical session fences new launches and marks its tasks before the durable
+  deletion. A failed deletion clears the marks and leaves the tasks running. After the deletion
+  commits, the tasks are stopped concurrently in the background (3 s grace) so deletion never waits
+  on process shutdown. Tasks that could not be proven stopped stay `cleanup_failed` orphan records
+  (`owner_deleted_at_ms`); deletion is not blocked by them, because a process that ignores SIGKILL
+  or escaped containment would otherwise make the session undeletable.
+- If the runtime stops between marking and cleanup, restart reconciliation stops every marked task.
+  This includes the rare case where the runtime stopped before a deletion committed, so the session
+  survives without those tasks.
 - Closing or archiving a session does not stop its tasks.
 
 ## Public API
@@ -47,13 +52,18 @@ the execution machine succeeded. `localhost` endpoints are on the execution mach
   settled, interrupted stops resume with their original reason, and a failed process listing marks
   tasks `unknown` rather than forgetting them. Records are never deleted.
 - Stop sends SIGTERM to the group and to descendants that left it, waits the grace period, sends
-  SIGKILL, and reports `cleanup_failed` if anything is still alive 3 s later.
+  SIGKILL, and reports `cleanup_failed` if anything is still alive 3 s later. Descendants seen during
+  a stop stay tracked by pid and start time, so one orphaned by the first signal is still killed.
+- A launch whose identity cannot be read from `ps` closes the gate and fails without running.
+- If processes cannot be listed, running tasks become `unknown` and are re-verified later; startup
+  reconciliation is retried until it succeeds.
 
 ## Logs
 
-stdout and stderr append to `<data dir>/background-tasks/<task id>.log`. The monitor rotates a log
-above 5 MiB to `.log.1` by copy and truncate, so a few lines written during rotation can be lost.
-Inspection returns at most 64 KiB, spanning the archive when needed. Logs are kept after a task
+stdout and stderr append to `<data dir>/background-tasks/<task id>.log`. Every 2 s, and when a task
+ends, a log above 5 MiB is rotated to `.log.1` by copy and truncate, so a few lines written during
+rotation can be lost and a very fast writer can briefly exceed the cap. Inspection reads at most
+64 KiB, spanning the archive when needed. Logs are kept after a task
 ends.
 
 ## Limitations

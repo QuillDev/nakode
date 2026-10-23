@@ -116,7 +116,7 @@ async fn a_task_outlives_its_call_and_stop_terminates_the_whole_tree() {
 
     // Still running after the starting call returned, with its output captured.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    service.observe(false).await;
+    service.observe().await;
     let detail = service
         .inspect_for(&scope, &task.task_id, 4096)
         .await
@@ -164,6 +164,32 @@ async fn stop_reaches_descendants_that_left_the_process_group() {
 }
 
 #[tokio::test]
+async fn stop_keeps_escalating_to_descendants_orphaned_by_the_first_signal() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let scope = owner("owner-a");
+    let escaped_pid = pid_file(&fixture, "stubborn.pid");
+    // The escaped job ignores SIGTERM; the shell that parents it dies of SIGTERM, so the job is
+    // reparented and can no longer be found through parent links.
+    let command = format!(
+        "set -m; sh -c 'trap \"\" TERM; exec sleep 300' & echo $! > {}; wait",
+        escaped_pid.display()
+    );
+    let task = service
+        .start(&scope, fixture.request(&command))
+        .await
+        .unwrap();
+    let escaped = read_pid(&escaped_pid).await;
+
+    let stopped = service
+        .stop_for(&scope, &task.task_id, Some(Duration::from_millis(500)))
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, "stopped");
+    eventually(async || !alive(escaped)).await;
+}
+
+#[tokio::test]
 async fn a_natural_exit_is_recorded_with_its_code() {
     let fixture = Fixture::new();
     let service = fixture.service();
@@ -173,7 +199,7 @@ async fn a_natural_exit_is_recorded_with_its_code() {
         .await
         .unwrap();
     eventually(async || {
-        service.observe(false).await;
+        service.observe().await;
         service.record(&task.task_id).unwrap().state == TaskState::Exited
     })
     .await;
@@ -241,17 +267,24 @@ async fn owner_deletion_fences_launches_terminates_tasks_and_keeps_orphan_record
         .unwrap();
     let group = i32::try_from(task.process_id.unwrap()).unwrap();
 
-    let cleanup = service.begin_owner_deletion("owner-a").await;
-    assert_eq!(cleanup.stopped, vec![task.task_id.clone()]);
-    assert!(cleanup.incomplete.is_empty());
-    assert!(!alive(group));
+    service.begin_owner_deletion("owner-a").await;
+    // Nothing is signalled before the deletion commits.
+    assert!(alive(group));
     let refused = service
         .start(&scope, fixture.request("sleep 300"))
         .await
         .unwrap_err();
     assert!(refused.contains("being deleted"));
 
-    service.finish_owner_deletion("owner-a", true).await;
+    let cleanup = service
+        .finish_owner_deletion("owner-a", true)
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(cleanup.stopped, vec![task.task_id.clone()]);
+    assert!(cleanup.incomplete.is_empty());
+    assert!(!alive(group));
     let inventory = service.inventory(None).unwrap();
     assert_eq!(inventory.tasks.len(), 1);
     assert_eq!(
@@ -265,8 +298,25 @@ async fn owner_deletion_fences_launches_terminates_tasks_and_keeps_orphan_record
 async fn a_failed_deletion_lifts_the_launch_fence() {
     let fixture = Fixture::new();
     let service = fixture.service();
+    let running = service
+        .start(&owner("owner-a"), fixture.request("sleep 300"))
+        .await
+        .unwrap();
     service.begin_owner_deletion("owner-a").await;
-    service.finish_owner_deletion("owner-a", false).await;
+    assert!(
+        service
+            .finish_owner_deletion("owner-a", false)
+            .await
+            .is_none()
+    );
+    // The surviving session keeps its task, unmarked.
+    let kept = service.inventory(None).unwrap().tasks;
+    assert_eq!(kept[0].state, "running");
+    assert!(kept[0].owner_deleted_at_ms.is_none());
+    service
+        .stop(&running.task_id, StopReason::Requested, None)
+        .await
+        .unwrap();
     let task = service
         .start(&owner("owner-a"), fixture.request("sleep 300"))
         .await
@@ -275,6 +325,32 @@ async fn a_failed_deletion_lifts_the_launch_fence() {
         .stop(&task.task_id, StopReason::Requested, None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_restart_stops_tasks_whose_owner_deletion_did_not_settle() {
+    let fixture = Fixture::new();
+    let first = fixture.service();
+    let task = first
+        .start(&owner("owner-a"), fixture.request("sleep 300"))
+        .await
+        .unwrap();
+    let group = i32::try_from(task.process_id.unwrap()).unwrap();
+    // The runtime stops after marking the owner deleted but before cleaning up.
+    first.begin_owner_deletion("owner-a").await;
+    drop(first);
+
+    let restarted = fixture.service();
+    assert!(restarted.reconcile().await);
+    for _ in 0..100 {
+        if !alive(group) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!alive(group));
+    let record = restarted.record(&task.task_id).unwrap();
+    assert_eq!(record.stop_reason.as_deref(), Some("owner_deleted"));
 }
 
 #[tokio::test]

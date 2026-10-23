@@ -2244,8 +2244,9 @@ impl NativeServerRuntime {
             let canonical_id = nakode_protocol::SessionId::from(delete_session_id.clone());
             remove_session_release_effect(&mut effects, &delete_session_id);
             let terminated_shell_ids = self.terminate_deleted_session_work(&canonical_id).await;
-            // Fences new launches by this owner, then terminates its managed process trees.
-            // Trees that cannot be proven gone remain as cleanup_failed recovery records.
+            // Fences new launches by this owner and marks its managed tasks. Their process trees
+            // are stopped in the background once the deletion commits; trees that cannot be
+            // proven gone remain as cleanup_failed orphan records.
             let background_tasks = crate::background_tasks::service();
             if let Some(service) = &background_tasks {
                 service.begin_owner_deletion(&delete_session_id).await;
@@ -2326,9 +2327,12 @@ impl NativeServerRuntime {
             crate::session_environment::remove(&delete_session_id);
             crate::tools::desktop::record_discard(&delete_session_id);
             if let Some(service) = &background_tasks {
-                service
-                    .finish_owner_deletion(&delete_session_id, true)
-                    .await;
+                // Cleanup runs off the actor; its outcome is recorded on each task.
+                drop(
+                    service
+                        .finish_owner_deletion(&delete_session_id, true)
+                        .await,
+                );
             }
         }
         self.complete_native_delegations(&effects);

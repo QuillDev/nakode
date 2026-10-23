@@ -70,6 +70,20 @@ impl ProcessTable {
     /// Group members come first, then descendants that changed group but are still parented by a
     /// member. An empty result means the task has no live process.
     pub(crate) fn task_processes(&self, group: i32, leader_start: &str) -> TaskProcesses {
+        self.tracked_task_processes(group, leader_start, &mut HashMap::new())
+    }
+
+    /// Like [`Self::task_processes`], but remembers escaped descendants across listings.
+    ///
+    /// A descendant whose parent died is reparented and would no longer be found through parent
+    /// links. `tracked` maps each descendant seen so far to its start time, so it stays part of
+    /// the task while it is alive with that same identity.
+    pub(crate) fn tracked_task_processes(
+        &self,
+        group: i32,
+        leader_start: &str,
+        tracked: &mut HashMap<i32, String>,
+    ) -> TaskProcesses {
         if let Some(leader) = self.entries.get(&group)
             && leader.start != leader_start
         {
@@ -81,15 +95,34 @@ impl ProcessTable {
             .filter(|entry| entry.group == group && !entry.zombie)
             .map(|entry| entry.pid)
             .collect::<HashSet<_>>();
-        let mut descendants = Vec::new();
-        let mut frontier = members.iter().copied().collect::<Vec<_>>();
-        let mut seen = members.clone();
+        let mut descendants = tracked
+            .iter()
+            .filter(|(pid, start)| {
+                !members.contains(pid)
+                    && self
+                        .entries
+                        .get(pid)
+                        .is_some_and(|entry| !entry.zombie && &entry.start == *start)
+            })
+            .map(|(pid, _)| *pid)
+            .collect::<Vec<_>>();
+        let mut frontier = members
+            .iter()
+            .chain(&descendants)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut seen = frontier.iter().copied().collect::<HashSet<_>>();
         while let Some(parent) = frontier.pop() {
             for entry in self.entries.values() {
                 if entry.parent == parent && !entry.zombie && seen.insert(entry.pid) {
                     descendants.push(entry.pid);
                     frontier.push(entry.pid);
                 }
+            }
+        }
+        for pid in &descendants {
+            if let Some(entry) = self.entries.get(pid) {
+                tracked.insert(*pid, entry.start.clone());
             }
         }
         let mut members = members.into_iter().collect::<Vec<_>>();
@@ -214,6 +247,41 @@ mod tests {
         let table = ProcessTable::parse(listing);
         let processes = table.task_processes(600, "Thu Oct 23 09:00:00 2026");
         assert_eq!(processes.members, vec![601, 602]);
+    }
+
+    #[test]
+    fn a_tracked_descendant_stays_in_the_task_after_reparenting() {
+        let mut tracked = HashMap::new();
+        let before = ProcessTable::parse(LISTING);
+        before.tracked_task_processes(500, "Thu Oct 23 09:00:00 2026", &mut tracked);
+        // 501 died, so its escaped child 502 was reparented to init.
+        let after = ProcessTable::parse(
+            "\
+  500     1   500 Ss   Thu Oct 23 09:00:00 2026
+  502     1   777 S    Thu Oct 23 09:00:02 2026
+",
+        );
+        let processes = after.tracked_task_processes(500, "Thu Oct 23 09:00:00 2026", &mut tracked);
+        assert_eq!(processes.descendants, vec![502]);
+        assert!(
+            after
+                .task_processes(500, "Thu Oct 23 09:00:00 2026")
+                .descendants
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_tracked_descendant_with_a_reused_id_is_not_the_task() {
+        let mut tracked = HashMap::from([(502, "Thu Oct 23 09:00:02 2026".to_owned())]);
+        let table = ProcessTable::parse(
+            "\
+  500     1   500 Ss   Thu Oct 23 09:00:00 2026
+  502     1   502 S    Thu Oct 23 11:00:00 2026
+",
+        );
+        let processes = table.tracked_task_processes(500, "Thu Oct 23 09:00:00 2026", &mut tracked);
+        assert!(processes.descendants.is_empty());
     }
 
     #[test]

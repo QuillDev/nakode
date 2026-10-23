@@ -43,13 +43,13 @@ pub(crate) const DEFAULT_LOG_TAIL_BYTES: u32 = 8 * 1024;
 const RECENT_ENDED_TASKS: usize = 50;
 
 const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
+const OWNER_DELETION_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const MAX_STOP_GRACE: Duration = Duration::from_secs(60);
 /// How long SIGKILL may take to be observed before cleanup is reported as failed.
 const KILL_SETTLE: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Interval between process checks and log size checks.
 const MONITOR_INTERVAL: Duration = Duration::from_secs(2);
-/// Monitor ticks between log size checks.
-const ROTATION_TICKS: u32 = 15;
 
 static SERVICE: OnceLock<Arc<BackgroundTaskService>> = OnceLock::new();
 
@@ -74,8 +74,8 @@ pub(crate) async fn initialize(database: &Path) -> Result<Arc<BackgroundTaskServ
         .join("background-tasks");
     let created = BackgroundTaskService::open(database, &log_directory)?;
     let service = SERVICE.get_or_init(|| created).clone();
-    service.reconcile().await;
-    service.clone().spawn_monitor();
+    let reconciled = service.reconcile().await;
+    service.clone().spawn_monitor(reconciled);
     Ok(service)
 }
 
@@ -360,62 +360,53 @@ impl BackgroundTaskService {
         );
         self.terminate(&mut record, grace.unwrap_or(DEFAULT_STOP_GRACE))
             .await;
+        let _ = crate::service_log::rotate_if_oversized(Path::new(&record.log_path));
+        let mut coordination = self.coordination.lock().await;
+        // Owner deletion may have marked the task while it was stopping.
+        if let Ok(current) = self.record(task_id) {
+            record.owner_deleted_at_ms = current.owner_deleted_at_ms;
+        }
         let saved = self.save(&mut record);
-        self.coordination.lock().await.stopping.remove(task_id);
+        coordination.stopping.remove(task_id);
         saved.map(|()| view(&record))
     }
 
-    /// Fences new launches for `owner` and terminates all of its tasks.
+    /// Fences new launches for `owner` and marks its tasks as belonging to a deleted owner.
     ///
-    /// Called before a logical session's durable deletion. Tasks that cannot be proven stopped
-    /// stay `cleanup_failed`; [`Self::finish_owner_deletion`] then marks them orphaned.
-    pub(crate) async fn begin_owner_deletion(self: &Arc<Self>, owner: &str) -> OwnerCleanup {
-        self.coordination
-            .lock()
-            .await
-            .deleting_owners
-            .insert(owner.to_owned());
-        let records = match self.with_store(|store| store.list(Some(owner))) {
-            Ok(records) => records,
-            Err(error) => {
-                report_failure(&error);
-                return OwnerCleanup::default();
-            }
-        };
-        // Stop concurrently so deletion waits for one grace period, not one per task.
-        let stops = records
-            .into_iter()
-            .filter(|record| !record.state.ended())
-            .map(|record| async move {
-                let stopped = self
-                    .stop(
-                        &record.task_id,
-                        StopReason::OwnerDeleted,
-                        Some(Duration::from_secs(3)),
-                    )
-                    .await;
-                (record.task_id, stopped)
-            });
-        let mut cleanup = OwnerCleanup::default();
-        for (task_id, stopped) in futures_util::future::join_all(stops).await {
-            match stopped {
-                Ok(view) if view.state == TaskState::Stopped.as_str() => {
-                    cleanup.stopped.push(task_id)
-                }
-                _ => cleanup.incomplete.push(task_id),
-            }
-        }
-        cleanup
+    /// Called before a logical session's durable deletion. Nothing is signalled yet, so a failed
+    /// deletion leaves the session's tasks running. Should the runtime stop before the deletion
+    /// settles, restart reconciliation stops the marked tasks.
+    pub(crate) async fn begin_owner_deletion(&self, owner: &str) {
+        let mut coordination = self.coordination.lock().await;
+        coordination.deleting_owners.insert(owner.to_owned());
+        self.mark_owner_deleted(owner, Some(now_ms()));
     }
 
-    /// Records the owner deletion outcome. A committed deletion leaves every remaining record
-    /// as an orphan visible to owner integrations; a failed one lifts the launch fence.
-    pub(crate) async fn finish_owner_deletion(&self, owner: &str, committed: bool) {
-        let mut coordination = self.coordination.lock().await;
+    /// Records the owner deletion outcome.
+    ///
+    /// A failed deletion lifts the fence and the marks. A committed one stops every unended task
+    /// of the owner in the background, so deletion never waits for process grace periods; tasks
+    /// that cannot be proven gone remain `cleanup_failed` orphan records. Returns that cleanup.
+    pub(crate) async fn finish_owner_deletion(
+        self: &Arc<Self>,
+        owner: &str,
+        committed: bool,
+    ) -> Option<tokio::task::JoinHandle<OwnerCleanup>> {
         if !committed {
+            let mut coordination = self.coordination.lock().await;
             coordination.deleting_owners.remove(owner);
-            return;
+            self.mark_owner_deleted(owner, None);
+            return None;
         }
+        let service = Arc::clone(self);
+        let owner = owner.to_owned();
+        Some(tokio::spawn(async move {
+            service.stop_owner_tasks(&owner).await
+        }))
+    }
+
+    /// Callers hold the coordination lock so the mark cannot race a stop's final save.
+    fn mark_owner_deleted(&self, owner: &str, deleted_at_ms: Option<i64>) {
         let records = match self.with_store(|store| store.list(Some(owner))) {
             Ok(records) => records,
             Err(error) => {
@@ -423,14 +414,60 @@ impl BackgroundTaskService {
                 return;
             }
         };
-        let now = now_ms();
         for mut record in records {
-            if record.owner_deleted_at_ms.is_none() {
-                record.owner_deleted_at_ms = Some(now);
+            if record.owner_deleted_at_ms.is_some() != deleted_at_ms.is_some() {
+                record.owner_deleted_at_ms = deleted_at_ms;
                 if let Err(error) = self.save(&mut record) {
                     report_failure(&error);
                 }
             }
+        }
+    }
+
+    async fn stop_owner_tasks(self: &Arc<Self>, owner: &str) -> OwnerCleanup {
+        let records = match self.with_store(|store| store.list(Some(owner))) {
+            Ok(records) => records,
+            Err(error) => {
+                report_failure(&error);
+                return OwnerCleanup::default();
+            }
+        };
+        // Stop concurrently so cleanup takes one grace period, not one per task.
+        let stops = records
+            .into_iter()
+            .filter(|record| !record.state.ended())
+            .map(|record| async move {
+                let _ = self
+                    .stop(
+                        &record.task_id,
+                        StopReason::OwnerDeleted,
+                        Some(OWNER_DELETION_GRACE),
+                    )
+                    .await;
+                // A stop that was already in progress settles on its own schedule.
+                self.wait_for_stop(&record.task_id).await;
+                let gone = self
+                    .record(&record.task_id)
+                    .is_ok_and(|current| current.state.ended());
+                (record.task_id, gone)
+            });
+        let mut cleanup = OwnerCleanup::default();
+        for (task_id, gone) in futures_util::future::join_all(stops).await {
+            if gone {
+                cleanup.stopped.push(task_id);
+            } else {
+                cleanup.incomplete.push(task_id);
+            }
+        }
+        cleanup
+    }
+
+    async fn wait_for_stop(&self, task_id: &str) {
+        let deadline = tokio::time::Instant::now() + MAX_STOP_GRACE + KILL_SETTLE * 2;
+        while self.coordination.lock().await.stopping.contains(task_id)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
@@ -548,18 +585,24 @@ impl BackgroundTaskService {
             .ok_or_else(|| "the started process has no id".to_owned())?;
         // The gated leader waits on stdin. Its identity is durable before the command may run,
         // so an interrupted launch either never ran the command or is recorded and adoptable.
-        let start = os::ProcessTable::capture()
-            .await
-            .ok()
-            .and_then(|table| table.start_of(pid).map(str::to_owned));
-        record.process_id = Some(pid);
-        record.process_start = start;
         let mut release = child.stdin.take();
-        if let Err(error) = self.save(record) {
-            // Closing the gate without a release line makes the leader exit unrun.
+        record.process_id = Some(pid);
+        let identified = os::ProcessTable::capture().await.and_then(|table| {
+            table
+                .start_of(pid)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("process {pid} was not visible in the process list"))
+        });
+        let saved = identified.and_then(|start| {
+            record.process_start = Some(start);
+            self.save(record)
+        });
+        if let Err(error) = saved {
+            // Without a durable identity the task could not be stopped safely later. Closing the
+            // gate without a release line makes the leader exit without running the command.
             drop(release);
             let _ = child.wait().await;
-            return Err(error);
+            return Err(format!("{error}; the command never ran"));
         }
         if let Some(mut gate) = release.take() {
             use tokio::io::AsyncWriteExt as _;
@@ -598,10 +641,11 @@ impl BackgroundTaskService {
             return;
         };
         let leader_start = record.process_start.clone().unwrap_or_default();
+        let mut tracked = HashMap::new();
         let mut failures = Vec::new();
         for (signal, wait) in [(Signal::SIGTERM, grace), (Signal::SIGKILL, KILL_SETTLE)] {
             let processes = match os::ProcessTable::capture().await {
-                Ok(table) => table.task_processes(group, &leader_start),
+                Ok(table) => table.tracked_task_processes(group, &leader_start, &mut tracked),
                 Err(error) => {
                     fail_cleanup(record, &error);
                     return;
@@ -612,13 +656,15 @@ impl BackgroundTaskService {
                 return;
             }
             failures.extend(os::signal_task(group, &processes, signal));
-            if wait_until_gone(group, &leader_start, wait).await {
+            if wait_until_gone(group, &leader_start, &mut tracked, wait).await {
                 self.finish_stopped(record);
                 return;
             }
         }
         let remaining = match os::ProcessTable::capture().await {
-            Ok(table) => table.task_processes(group, &leader_start).all(),
+            Ok(table) => table
+                .tracked_task_processes(group, &leader_start, &mut tracked)
+                .all(),
             Err(_) => Vec::new(),
         };
         let mut detail = format!(
@@ -663,40 +709,45 @@ impl BackgroundTaskService {
     }
 
     /// Restart reconciliation: every unended row is verified against the live process table.
-    async fn reconcile(self: &Arc<Self>) {
+    ///
+    /// Returns `false` when processes could not be listed; the monitor then retries. Until then
+    /// running tasks are reported `unknown`, never ended.
+    async fn reconcile(self: &Arc<Self>) -> bool {
+        let coordination = self.coordination.lock().await;
         let records = match self.with_store(TaskStore::list_unended) {
             Ok(records) => records,
             Err(error) => {
                 report_failure(&error);
-                return;
+                return false;
             }
         };
         if records.is_empty() {
-            return;
+            return true;
         }
         let table = match os::ProcessTable::capture().await {
             Ok(table) => table,
             Err(error) => {
-                // Unverifiable tasks are never reported as ended.
                 for mut record in records {
-                    record.detail = Some(format!("runtime restarted; {error}"));
                     if record.state == TaskState::Running {
                         record.state = TaskState::Unknown;
+                        record.detail = Some(format!("runtime restarted; {error}"));
+                        let _ = self.save(&mut record);
                     }
-                    let _ = self.save(&mut record);
                 }
-                return;
+                return false;
             }
         };
+        let mut stops = Vec::new();
         for mut record in records {
+            if coordination.stopping.contains(&record.task_id) {
+                continue;
+            }
             match record.state {
                 TaskState::Launching => Self::reconcile_launch(&mut record, &table),
-                TaskState::Running | TaskState::CleanupFailed => {
+                TaskState::Running | TaskState::CleanupFailed | TaskState::Unknown => {
                     reconcile_running(&mut record, &table);
                 }
                 TaskState::Stopping => {
-                    let service = Arc::clone(self);
-                    let task_id = record.task_id.clone();
                     // Resume the interrupted stop with its original reason.
                     let reason = if record.stop_reason.as_deref() == Some("owner_deleted") {
                         StopReason::OwnerDeleted
@@ -705,18 +756,29 @@ impl BackgroundTaskService {
                     };
                     record.state = TaskState::Running;
                     record.supervision = String::from("adopted");
-                    let _ = self.save(&mut record);
-                    tokio::spawn(async move {
-                        let _ = service.stop(&task_id, reason, None).await;
-                    });
-                    continue;
+                    stops.push((record.task_id.clone(), reason));
                 }
                 _ => continue,
+            }
+            // A deleted owner's surviving tasks are stopped, whether or not the deletion settled.
+            if record.state == TaskState::Running
+                && record.owner_deleted_at_ms.is_some()
+                && !stops.iter().any(|(task_id, _)| task_id == &record.task_id)
+            {
+                stops.push((record.task_id.clone(), StopReason::OwnerDeleted));
             }
             if let Err(error) = self.save(&mut record) {
                 report_failure(&error);
             }
         }
+        drop(coordination);
+        for (task_id, reason) in stops {
+            let service = Arc::clone(self);
+            tokio::spawn(async move {
+                let _ = service.stop(&task_id, reason, None).await;
+            });
+        }
+        true
     }
 
     /// A launch interrupted before release never ran its command; after release it is adopted.
@@ -775,7 +837,8 @@ fn reconcile_running(record: &mut TaskRecord, table: &os::ProcessTable) {
         record.detail =
             Some("ended while the runtime was not supervising it; exit status unknown".to_owned());
         record.ended_at_ms = Some(now_ms());
-    } else if record.state == TaskState::Running {
+    } else if matches!(record.state, TaskState::Running | TaskState::Unknown) {
+        record.state = TaskState::Running;
         record.supervision = String::from("adopted");
         record.detail = Some(format!(
             "adopted after a runtime restart with {} live processes; exit status will be unknown",
@@ -786,50 +849,60 @@ fn reconcile_running(record: &mut TaskRecord, table: &os::ProcessTable) {
 
 #[cfg(unix)]
 impl BackgroundTaskService {
-    fn spawn_monitor(self: Arc<Self>) {
+    fn spawn_monitor(self: Arc<Self>, reconciled: bool) {
         tokio::spawn(async move {
-            let mut ticks = 0_u32;
+            let mut reconciled = reconciled;
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(MONITOR_INTERVAL) => {}
                     () = self.wake.notified() => {}
                 }
-                ticks = ticks.wrapping_add(1);
-                self.observe(ticks.is_multiple_of(ROTATION_TICKS)).await;
+                if !reconciled {
+                    reconciled = self.reconcile().await;
+                    continue;
+                }
+                self.observe().await;
             }
         });
     }
 
-    /// Marks running tasks whose process tree has gone as exited, and bounds their logs.
-    async fn observe(&self, rotate: bool) {
-        let running = {
-            let coordination = self.coordination.lock().await;
-            match self.with_store(TaskStore::list_unended) {
-                Ok(records) => records
-                    .into_iter()
-                    .filter(|record| {
-                        // Unknown tasks with an identity are re-verified, never assumed ended.
-                        (record.state == TaskState::Running
-                            || (record.state == TaskState::Unknown && record.process_id.is_some()))
-                            && !coordination.stopping.contains(&record.task_id)
-                    })
-                    .collect::<Vec<_>>(),
-                Err(error) => {
-                    report_failure(&error);
-                    return;
-                }
+    /// Settles running tasks whose process tree has gone and keeps live logs bounded.
+    async fn observe(&self) {
+        let unended = match self.with_store(TaskStore::list_unended) {
+            Ok(records) => records,
+            Err(error) => {
+                report_failure(&error);
+                return;
             }
         };
-        if running.is_empty() {
+        for record in &unended {
+            let _ = crate::service_log::rotate_if_oversized(Path::new(&record.log_path));
+        }
+        // Unknown tasks with an identity are re-verified, never assumed ended.
+        let watched = unended
+            .into_iter()
+            .filter(|record| {
+                record.state == TaskState::Running
+                    || (record.state == TaskState::Unknown && record.process_id.is_some())
+            })
+            .collect::<Vec<_>>();
+        if watched.is_empty() {
             return;
         }
-        let Ok(table) = os::ProcessTable::capture().await else {
-            return;
-        };
-        for record in running {
-            if rotate {
-                let _ = crate::service_log::rotate_if_oversized(Path::new(&record.log_path));
+        let table = match os::ProcessTable::capture().await {
+            Ok(table) => table,
+            Err(error) => {
+                for record in watched {
+                    self.update_observed(&record.task_id, TaskState::Running, |record| {
+                        record.state = TaskState::Unknown;
+                        record.detail = Some(format!("could not verify processes: {error}"));
+                    })
+                    .await;
+                }
+                return;
             }
+        };
+        for record in watched {
             let Some(group) = record.process_id else {
                 continue;
             };
@@ -839,25 +912,50 @@ impl BackgroundTaskService {
             if processes.is_empty() {
                 self.settle_exit(&record.task_id, exit).await;
             } else if record.state == TaskState::Unknown {
-                let mut record = record;
-                record.state = TaskState::Running;
-                record.supervision = String::from("adopted");
-                record.detail = Some(format!(
-                    "process identity re-verified with {} live processes",
-                    processes.count()
-                ));
-                let _ = self.save(&mut record);
+                self.update_observed(&record.task_id, TaskState::Unknown, |record| {
+                    record.state = TaskState::Running;
+                    record.detail = Some(format!(
+                        "process identity re-verified with {} live processes",
+                        processes.count()
+                    ));
+                })
+                .await;
             } else if let Some(exit) = exit
                 && record.detail.is_none()
             {
-                let mut record = record;
-                record.detail = Some(format!(
-                    "leader exited ({}); {} processes still running",
-                    describe_exit(exit),
-                    processes.count()
-                ));
-                let _ = self.save(&mut record);
+                self.update_observed(&record.task_id, TaskState::Running, |record| {
+                    record.detail = Some(format!(
+                        "leader exited ({}); {} processes still running",
+                        describe_exit(exit),
+                        processes.count()
+                    ));
+                })
+                .await;
             }
+        }
+    }
+
+    /// Applies a monitor observation to the current record unless its state changed or a stop
+    /// claimed it after the observation was made.
+    async fn update_observed(
+        &self,
+        task_id: &str,
+        expected: TaskState,
+        change: impl FnOnce(&mut TaskRecord),
+    ) {
+        let coordination = self.coordination.lock().await;
+        if coordination.stopping.contains(task_id) {
+            return;
+        }
+        let Ok(mut record) = self.record(task_id) else {
+            return;
+        };
+        if record.state != expected {
+            return;
+        }
+        change(&mut record);
+        if let Err(error) = self.save(&mut record) {
+            report_failure(&error);
         }
     }
 
@@ -885,6 +983,7 @@ impl BackgroundTaskService {
             &record.log_path,
             record.detail.as_deref().unwrap_or_default(),
         );
+        let _ = crate::service_log::rotate_if_oversized(Path::new(&record.log_path));
         if let Err(error) = self.save(&mut record) {
             report_failure(&error);
         }
@@ -908,9 +1007,11 @@ impl BackgroundTaskService {
             Some("managed background tasks are not supported on this operating system".to_owned());
     }
 
-    async fn reconcile(self: &Arc<Self>) {}
+    async fn reconcile(self: &Arc<Self>) -> bool {
+        true
+    }
 
-    fn spawn_monitor(self: Arc<Self>) {}
+    fn spawn_monitor(self: Arc<Self>, _reconciled: bool) {}
 }
 
 /// Whether managed background tasks can run on this platform.
@@ -919,11 +1020,18 @@ pub(crate) const fn supported() -> bool {
 }
 
 #[cfg(unix)]
-async fn wait_until_gone(group: i32, leader_start: &str, limit: Duration) -> bool {
+async fn wait_until_gone(
+    group: i32,
+    leader_start: &str,
+    tracked: &mut HashMap<i32, String>,
+    limit: Duration,
+) -> bool {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
         if let Ok(table) = os::ProcessTable::capture().await
-            && table.task_processes(group, leader_start).is_empty()
+            && table
+                .tracked_task_processes(group, leader_start, tracked)
+                .is_empty()
         {
             return true;
         }
@@ -1001,19 +1109,40 @@ fn validate_start(request: &StartRequest) -> Result<(), String> {
 }
 
 /// The last `limit` bytes of the live log, preceded by the archived generation when the live
-/// file alone is shorter. Reports whether earlier content was left out.
+/// file alone is shorter. Reports whether earlier content was left out. Reads at most `limit`
+/// bytes from each file, however large it is.
 fn read_log_tail(log: &Path, limit: u32) -> (String, bool) {
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let live = std::fs::read(log).unwrap_or_default();
-    let mut combined = Vec::new();
-    if live.len() < limit {
-        let archive = std::fs::read(crate::service_log::archive_path(log)).unwrap_or_default();
-        combined.extend_from_slice(&archive);
+    let limit = u64::from(limit);
+    let (live, mut truncated) = read_file_tail(log, limit);
+    let mut tail = Vec::new();
+    let missing = limit.saturating_sub(u64::try_from(live.len()).unwrap_or(u64::MAX));
+    if !truncated && missing > 0 {
+        let (archive, archive_truncated) =
+            read_file_tail(&crate::service_log::archive_path(log), missing);
+        truncated = archive_truncated;
+        tail = archive;
+    } else if !truncated {
+        truncated = crate::service_log::archive_path(log).exists();
     }
-    combined.extend_from_slice(&live);
-    let truncated = combined.len() > limit;
-    let tail = &combined[combined.len().saturating_sub(limit)..];
-    (String::from_utf8_lossy(tail).into_owned(), truncated)
+    tail.extend_from_slice(&live);
+    (String::from_utf8_lossy(&tail).into_owned(), truncated)
+}
+
+/// The last `limit` bytes of a file, and whether it holds more. A missing file is empty.
+fn read_file_tail(path: &Path, limit: u64) -> (Vec<u8>, bool) {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (Vec::new(), false);
+    };
+    let length = file.metadata().map_or(0, |metadata| metadata.len());
+    let start = length.saturating_sub(limit);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (Vec::new(), false);
+    }
+    let mut bytes = Vec::new();
+    let _ = file.take(limit).read_to_end(&mut bytes);
+    (bytes, start > 0)
 }
 
 fn append_log_note(log: &str, note: &str) {
