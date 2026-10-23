@@ -50,7 +50,7 @@ Prefix resolution does not apply. Backend teardown precedes the transaction, so 
 race refusal may leave the provider stopped while history is retained. Callers
 authenticate the requesting orchestrator themselves; the fence is not authority.
 `PruneSession` refuses a fence. Older servers ignore the field, so callers must
-confirm support out of band before relying on it.
+see `DeletionParentFence` in `GetServerInfo` capabilities before relying on it.
 
 ## Verification
 

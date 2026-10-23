@@ -2490,6 +2490,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .map(|value| format!("{value:?}"))
                 .chain(self.additional_capabilities.iter().cloned())
                 .chain(std::iter::once("SessionRouting".to_owned()))
+                // DeleteSession enforces `parent_fence`; older servers silently drop the field.
+                .chain(std::iter::once("DeletionParentFence".to_owned()))
                 .collect(),
             server_id: self.server_id.clone(),
             build_revision: self.endpoint.build_revision().map(str::to_owned),
@@ -4268,6 +4270,12 @@ mod tests {
         let response = response.into_inner();
 
         assert_eq!(response.server_id, "server-test");
+        assert!(
+            response
+                .capabilities
+                .iter()
+                .any(|value| value == "DeletionParentFence")
+        );
         assert_eq!(
             response.build_revision.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
