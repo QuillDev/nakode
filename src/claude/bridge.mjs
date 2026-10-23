@@ -29,6 +29,9 @@ const approvals = new Map();
 const externalToolCalls = new Map();
 const providerToolCalls = new Map();
 const providerToolPermissions = new Map();
+// SDK wire uuid of a delivered tool-result message -> the tool_call events it produced. A refusal
+// fallback names retracted messages by this uuid, so their calls can be re-attributed.
+const providerToolResultMessages = new Map();
 const streamMessageIds = new Map();
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
@@ -863,8 +866,13 @@ function permissionBatchHook(turnId) {
   return (input) => {
     const permissions = (input.tool_calls || []).flatMap((call) => {
       const recorded = providerToolPermissions.get(call.tool_use_id);
-      if (!recorded || recorded.turnId !== turnId || recorded.permission.decision === "allow") return [];
-      return [{ callId: call.tool_use_id, ...recorded.permission }];
+      if (recorded && recorded.turnId !== turnId) return [];
+      const attributed = recorded && recorded.permission.decision !== "allow";
+      if (attributed) return [{ callId: call.tool_use_id, ...recorded.permission }];
+      // The batch can run before the SDK delivers the tool-result message, so the generic
+      // cancellation text is checked here too. It never becomes an owner stop.
+      if (!isSdkCancellation(call.tool_response)) return [];
+      return [{ callId: call.tool_use_id, ...unattributedCancellation(turnId, recorded?.permission.mode) }];
     });
     return permissions.length === 0 ? {} : {
       hookSpecificOutput: {
@@ -950,23 +958,21 @@ function emitUserToolResults(turnId, message) {
       const started = providerToolCalls.get(block.tool_use_id);
       providerToolCalls.delete(block.tool_use_id);
       let recorded = providerToolPermissions.get(block.tool_use_id);
+      // A delivered replacement result replaces the retraction of the earlier one.
+      if (recorded?.permission.source === "sdk_retracted") {
+        recorded = undefined;
+        providerToolPermissions.delete(block.tool_use_id);
+      }
       // This exact SDK fallback is also used for internal cancellation/skipped siblings. Matching
       // it only establishes UNKNOWN provenance, never an owner stop or a policy decision.
-      if (block.is_error && block.content === SDK_CANCELLATION_TEXT &&
+      if (block.is_error && isSdkCancellation(block.content) &&
           (!recorded || recorded.permission.decision === "allow")) {
-        const runtimeSignal = runs.get(turnId)?.signal;
-        const permission = runtimeSignal?.aborted
-          ? interruptedPermission(turnId, recorded?.permission.mode)
-          : {
-              decision: "unknown", source: "sdk_unknown",
-              reason: "Claude SDK reported cancellation without an attributed Nakode stop or denial. Execution outcome is unconfirmed; do not retry automatically.",
-              mode: recorded?.permission.mode,
-            };
+        const permission = unattributedCancellation(turnId, recorded?.permission.mode);
         recorded = { name: started?.name || "Tool", turnId, permission };
         providerToolPermissions.set(block.tool_use_id, recorded);
       }
       const permission = recorded?.permission;
-      write({
+      const event = {
         event: "tool_call",
         turnId,
         callId: block.tool_use_id,
@@ -977,9 +983,76 @@ function emitUserToolResults(turnId, message) {
         denied: permission?.decision === "deny",
         denialReason: permission && permission.decision !== "allow" ? permission.reason : undefined,
         permission,
-      });
+      };
+      write(event);
+      if (message.uuid) {
+        const events = providerToolResultMessages.get(message.uuid) || [];
+        providerToolResultMessages.set(message.uuid, [...events, event]);
+      }
     }
   }
+}
+
+function isSdkCancellation(output) {
+  if (Array.isArray(output) && output.length === 1 && output[0]?.type === "text") {
+    return output[0].text === SDK_CANCELLATION_TEXT;
+  }
+  return output === SDK_CANCELLATION_TEXT;
+}
+
+// Generic SDK cancellation text proves only that the SDK did not run the call to completion.
+// A Nakode stop always aborts the runtime controller first, so only that establishes a stop.
+function unattributedCancellation(turnId, mode) {
+  if (runs.get(turnId)?.signal.aborted) return interruptedPermission(turnId, mode);
+  return {
+    decision: "unknown",
+    source: "sdk_unknown",
+    reason: "Claude SDK reported cancellation, but Nakode received no stop or denial for this call, so it is not an owner stop. Execution outcome is unconfirmed; check whether it took effect before relying on it, and do not replay it automatically.",
+    mode,
+  };
+}
+
+// A model refusal fallback discards the refused response, including tool results the SDK had
+// already delivered as cancelled. Those calls were neither denied nor stopped by anyone.
+function retractToolResults(turnId, uuids, cause) {
+  let retracted = 0;
+  for (const uuid of uuids || []) {
+    const events = providerToolResultMessages.get(uuid) || [];
+    providerToolResultMessages.delete(uuid);
+    for (const event of events) {
+      if (event.turnId !== turnId) continue;
+      const recorded = providerToolPermissions.get(event.callId);
+      const decision = recorded?.permission.decision;
+      if (decision && decision !== "allow" && recorded.permission.source !== "sdk_unknown") continue;
+      const permission = {
+        decision: "unknown",
+        source: "sdk_retracted",
+        reason: `Claude SDK retracted this call's result during ${cause}. Nobody stopped or denied it; its outcome is unconfirmed, so check whether it took effect before relying on it, and do not replay it automatically.`,
+        mode: recorded?.permission.mode,
+      };
+      providerToolPermissions.set(event.callId, { name: event.name, turnId, permission });
+      write({ ...event, denied: false, denialReason: permission.reason, permission });
+      retracted += 1;
+    }
+  }
+  return retracted;
+}
+
+function sdkRefusal(turnId, message) {
+  const model = message.original_model || "Claude";
+  const category = message.api_refusal_category ? ` (${message.api_refusal_category})` : "";
+  if (message.subtype === "model_refusal_fallback") {
+    const retracted = retractToolResults(turnId, message.retracted_message_uuids, "a model refusal fallback");
+    write({
+      event: "warning",
+      message: `${model} refused this response${category}; Claude SDK retried on ${message.fallback_model || "a fallback model"} and retracted ${retracted} tool result(s). This was not an owner stop.`,
+    });
+    return;
+  }
+  write({
+    event: "warning",
+    message: `${model} refused this turn${category} and no fallback model ran, so the turn ended. This was not an owner stop.`,
+  });
 }
 
 function emitStreamEvent(turnId, message, session) {
@@ -1184,6 +1257,9 @@ async function sendTurn(command) {
     await processLifecycle.started();
     write({ event: "turn_started", turnId: command.turnId });
     for await (const message of stream) {
+      // Retract superseded results first, so this message's replacement is the final projection.
+      if (Array.isArray(message.supersedes))
+        retractToolResults(command.turnId, message.supersedes, "a model refusal fallback");
       if (message.type === "stream_event")
         emitStreamEvent(command.turnId, message, session);
       else if (message.type === "assistant")
@@ -1192,6 +1268,11 @@ async function sendTurn(command) {
         emitUserToolResults(command.turnId, message);
       else if (message.type === "system" && message.subtype === "permission_denied")
         sdkPermissionDenied(command.turnId, message);
+      else if (
+        message.type === "system" &&
+        (message.subtype === "model_refusal_fallback" || message.subtype === "model_refusal_no_fallback")
+      )
+        sdkRefusal(command.turnId, message);
       else if (message.type === "result") {
         await emitNativeAgentHistory(
           command.workspace,
@@ -1237,6 +1318,9 @@ async function sendTurn(command) {
       [...providerToolPermissions].filter(([, recorded]) => recorded.turnId === command.turnId),
     );
     for (const callId of turnPermissions.keys()) providerToolPermissions.delete(callId);
+    for (const [uuid, events] of providerToolResultMessages) {
+      if (events.some((event) => event.turnId === command.turnId)) providerToolResultMessages.delete(uuid);
+    }
     runs.delete(command.turnId);
   }
 
