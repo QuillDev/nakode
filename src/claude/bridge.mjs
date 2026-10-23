@@ -1172,6 +1172,8 @@ function emitStreamEvent(turnId, message, session) {
 // that as the generic user-cancellation text, so the agent stops with no owner stop.
 // Streaming input therefore stays open until no background task can start another turn.
 const BACKGROUND_SETTLE_GRACE_MS = 2000;
+// A task notification usually starts a follow-up turn, but not always (e.g. ambient tasks).
+const ANNOUNCED_TURN_GRACE_MS = 15000;
 
 function turnInput(command) {
   let settle;
@@ -1180,6 +1182,7 @@ function turnInput(command) {
   });
   let liveTasks = 0;
   let idle = false;
+  let announced = false;
   let grace = null;
   const clearGrace = () => {
     if (grace !== null) clearTimeout(grace);
@@ -1192,7 +1195,7 @@ function turnInput(command) {
   const settleWhenIdle = () => {
     if (!idle || liveTasks > 0 || grace !== null) return;
     // A finished task normally announces its follow-up turn first; the grace absorbs reordering.
-    grace = setTimeout(close, BACKGROUND_SETTLE_GRACE_MS);
+    grace = setTimeout(close, announced ? ANNOUNCED_TURN_GRACE_MS : BACKGROUND_SETTLE_GRACE_MS);
   };
   const prompt = (async function* () {
     yield {
@@ -1215,13 +1218,15 @@ function turnInput(command) {
     observe(message) {
       if (message.type === "result") {
         idle = true;
+        announced = false;
         if (liveTasks === 0) close();
       } else if (message.type === "system" && message.subtype === "background_tasks_changed") {
         liveTasks = (message.tasks || []).filter((task) => !task.ambient).length;
         settleWhenIdle();
       } else if (message.type === "system" && message.subtype === "task_notification") {
-        idle = false;
+        announced = true;
         clearGrace();
+        settleWhenIdle();
       } else if (message.type === "stream_event" || message.type === "assistant") {
         idle = false;
         clearGrace();
