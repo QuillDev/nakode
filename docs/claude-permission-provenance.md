@@ -44,11 +44,12 @@ requests fail with an `AbortError("Stream closed")`, the SDK-callback PreToolUse
 and the tool call is cancelled with the generic STOP text. Nakode received no stop, so it was
 `sdk_unknown`.
 
-The bridge now always sends streaming input and keeps it open after a `result` while
-non-ambient background tasks are live (`background_tasks_changed`), or while a `task_notification`
-announces a follow-up turn. Input closes at the first idle `result`, or after a short grace once the
-task list empties with no follow-up turn. Turns with background tasks stay open while those tasks
-run, as Claude Code's process already did.
+The bridge now always sends streaming input, sets `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`, and
+keeps input open until Claude Code reports `session_state_changed` `idle`. Claude Code emits `idle`
+only after the last background-driven turn, so follow-up turns keep their hooks however late they
+start. Turns with background tasks stay open while those tasks run, as Claude Code's process already
+did. A CLI that emits no session state falls back to closing at the first `result` (the old
+behaviour, still attributed as `sdk_unknown`).
 
 Remaining limits: other SDK-internal cancellations (refusal fallback, ambient watchers, unknown
 CLI paths) still yield `sdk_unknown`/`sdk_retracted`. The model is told not to stop for them, but it

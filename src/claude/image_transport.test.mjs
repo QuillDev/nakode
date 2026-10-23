@@ -6,7 +6,7 @@ import test from "node:test";
 // This verifies SDK input encoding, not live Anthropic acceptance.
 test("Claude sends image+text and image-only SDK messages in new and resumed sessions", async () => {
   const source = readFileSync(new URL("./bridge.mjs", import.meta.url), "utf8");
-  const start = source.indexOf("const BACKGROUND_SETTLE_GRACE_MS");
+  const start = source.indexOf("// The SDK closes Claude Code's stdin at the first result");
   const end = source.indexOf("/**\n * The Claude Code to run", start);
   assert.ok(start > 0 && end > start);
   const requests = [];

@@ -36,7 +36,11 @@ function fixture(mode = "bypassPermissions") {
   // sendTurn runs against a scripted SDK stream; inference and process supervision stay isolated.
   let sdkMessages = [];
   let sdk = null;
-  const query = ({ prompt }) => (sdk ? sdk(prompt) : sdkMessages);
+  let lastOptions = null;
+  const query = ({ prompt, options }) => {
+    lastOptions = options;
+    return sdk ? sdk(prompt) : sdkMessages;
+  };
   const streamMessageIds = new Map();
   const providerProcessLifecycle = () => ({
     spawn() {}, async started() {}, async released() {}, didStart: () => true,
@@ -68,6 +72,7 @@ function fixture(mode = "bypassPermissions") {
       return emitted.at(-1);
     },
     useSdk(stream) { sdk = stream; },
+    sdkOptions: () => lastOptions,
     async turn(messages = [], beforeResults = null) {
       sdkMessages = (async function* () {
         for (const message of messages) {
@@ -296,9 +301,10 @@ test("a runtime stop during a turn is never reported as unattributed", async () 
   assert.equal(f.emitted.some((event) => event.event === "warning"), false);
 });
 
-// Models Claude Code's input lifetime: once the SDK finishes the prompt iterable it closes stdin,
-// and a later hook-gated tool call fails with the generic cancellation text ("Stream closed").
-function backgroundTaskSdk(f, { followUpTurn = true, notify = followUpTurn } = {}) {
+// Models Claude Code 2.1.304's observed input lifetime: once the SDK finishes the prompt iterable
+// it closes stdin, and a later hook-gated tool call fails with the generic cancellation text
+// ("Stream closed"). With session state events, `idle` follows only the last background turn.
+function backgroundTaskSdk(f, { sessionState = true } = {}) {
   const pause = () => new Promise((resolve) => setImmediate(resolve));
   return async function* (prompt) {
     let inputClosed = false;
@@ -310,17 +316,17 @@ function backgroundTaskSdk(f, { followUpTurn = true, notify = followUpTurn } = {
       { type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, is_error: inputClosed,
         content: inputClosed ? SDK_CANCELLATION_TEXT : "ok" }] } },
     ];
+    if (sessionState) yield { type: "system", subtype: "session_state_changed", state: "running" };
     yield { type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "ci", task_type: "local_bash" }] };
     yield* toolTurn("first", "gh pr checks 202");
     yield { type: "result", subtype: "success", result: "waiting on CI" };
     await pause();
-    if (notify) yield { type: "system", subtype: "task_notification", task_id: "ci", status: "completed" };
+    yield { type: "system", subtype: "task_notification", task_id: "ci", status: "completed" };
     yield { type: "system", subtype: "background_tasks_changed", tasks: [] };
     await pause();
-    if (followUpTurn) {
-      yield* toolTurn("after-notification", "gh pr checks 202");
-      yield { type: "result", subtype: "success", result: "checks passed" };
-    }
+    yield* toolTurn("after-notification", "gh pr checks 202");
+    yield { type: "result", subtype: "success", result: "checks passed" };
+    if (sessionState) yield { type: "system", subtype: "session_state_changed", state: "idle" };
     await drained;
     f.inputClosedAtEnd = inputClosed;
   };
@@ -337,25 +343,19 @@ test("originating path: a background-task turn keeps its tool calls instead of S
   ]);
   assert.equal(results.some((event) => event.permission?.source === "sdk_unknown"), false);
   assert.equal(f.emitted.some((event) => event.event === "warning"), false);
-  assert.equal(f.inputClosedAtEnd, true); // input still closes once no task can start a turn
+  assert.equal(f.inputClosedAtEnd, true); // input still closes once the session is idle
   assert.equal(f.emitted.at(-2).status, "finished");
+  assert.equal(f.sdkOptions().env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, "1");
 });
 
-test("input closes after a finished background task that starts no follow-up turn", async (t) => {
-  for (const notify of [false, true]) {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const f = fixture();
-    f.useSdk(backgroundTaskSdk(f, { followUpTurn: false, notify }));
-    const turn = f.turn();
-    for (let tick = 0; tick < 20 && f.inputClosedAtEnd === undefined; tick += 1) {
-      await new Promise((resolve) => setImmediate(resolve));
-      t.mock.timers.tick(1000);
-    }
-    await turn;
-    t.mock.timers.reset();
-    assert.equal(f.inputClosedAtEnd, true);
-    assert.equal(f.emitted.at(-2).event, "turn_completed");
-  }
+test("without session state the turn still ends, and the cancellation stays attributed as unknown", async () => {
+  const f = fixture();
+  f.useSdk(backgroundTaskSdk(f, { sessionState: false }));
+  await f.turn();
+  assert.equal(f.inputClosedAtEnd, true);
+  const late = f.emitted.find((event) => event.callId === "after-notification" && event.status === "error");
+  assert.equal(late.permission.source, "sdk_unknown");
+  assert.match(f.emitted.find((event) => event.event === "warning").message, /not an owner stop/);
 });
 
 test("refusal notices never relabel a runtime stop or a policy denial", async () => {

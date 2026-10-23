@@ -1170,33 +1170,15 @@ function emitStreamEvent(turnId, message, session) {
 // (background Bash, Monitor) can then start another turn in the same process, where every SDK
 // callback, including Nakode's PreToolUse hook, fails with "Stream closed". Claude Code reports
 // that as the generic user-cancellation text, so the agent stops with no owner stop.
-// Streaming input therefore stays open until no background task can start another turn.
-const BACKGROUND_SETTLE_GRACE_MS = 2000;
-// A task notification usually starts a follow-up turn, but not always (e.g. ambient tasks).
-const ANNOUNCED_TURN_GRACE_MS = 15000;
-
+// Streaming input therefore stays open until Claude Code reports the session idle, which it does
+// only after background work can no longer start a turn. A CLI that reports no session state
+// keeps the previous close-at-first-result behaviour rather than risking a turn that never ends.
 function turnInput(command) {
   let settle;
   const settled = new Promise((resolve) => {
     settle = resolve;
   });
-  let liveTasks = 0;
-  let idle = false;
-  let announced = false;
-  let grace = null;
-  const clearGrace = () => {
-    if (grace !== null) clearTimeout(grace);
-    grace = null;
-  };
-  const close = () => {
-    clearGrace();
-    settle();
-  };
-  const settleWhenIdle = () => {
-    if (!idle || liveTasks > 0 || grace !== null) return;
-    // A finished task normally announces its follow-up turn first; the grace absorbs reordering.
-    grace = setTimeout(close, announced ? ANNOUNCED_TURN_GRACE_MS : BACKGROUND_SETTLE_GRACE_MS);
-  };
+  let reportsSessionState = false;
   const prompt = (async function* () {
     yield {
       type: "user",
@@ -1214,22 +1196,13 @@ function turnInput(command) {
   })();
   return {
     prompt,
-    close,
+    close: () => settle(),
     observe(message) {
-      if (message.type === "result") {
-        idle = true;
-        announced = false;
-        if (liveTasks === 0) close();
-      } else if (message.type === "system" && message.subtype === "background_tasks_changed") {
-        liveTasks = (message.tasks || []).filter((task) => !task.ambient).length;
-        settleWhenIdle();
-      } else if (message.type === "system" && message.subtype === "task_notification") {
-        announced = true;
-        clearGrace();
-        settleWhenIdle();
-      } else if (message.type === "stream_event" || message.type === "assistant") {
-        idle = false;
-        clearGrace();
+      if (message.type === "system" && message.subtype === "session_state_changed") {
+        reportsSessionState = true;
+        if (message.state === "idle") settle();
+      } else if (message.type === "result" && !reportsSessionState) {
+        settle();
       }
     },
   };
@@ -1283,7 +1256,12 @@ async function sendTurn(command) {
     cwd: command.workspace,
     ...claudeExecutable(),
     // The session's variables (GH_TOKEN, git credentials, account environment) for its tools.
-    env: { ...process.env, ...(command.environment || {}) },
+    env: {
+      ...process.env,
+      ...(command.environment || {}),
+      // Lets turnInput keep input open until background work can no longer start a turn.
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+    },
     model,
     systemPrompt: {
       type: "preset",
